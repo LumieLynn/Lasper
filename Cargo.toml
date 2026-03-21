@@ -1,0 +1,25 @@
+[package]
+name = "lasper"
+version = "0.1.0"
+edition = "2021"
+description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
+
+[[bin]]
+name = "lasper"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+dirs = "5"
+libc = "0.2"
+async-trait = "0.1"
+thiserror = "1"
