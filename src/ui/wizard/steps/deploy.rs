@@ -33,8 +33,8 @@ impl IStep for DeployStep {
             ])
             .split(area);
 
-        let done = context.deploy_done.load(Ordering::SeqCst);
-        let success = context.deploy_success.load(Ordering::SeqCst);
+        let done = context.deploy.done.load(Ordering::SeqCst);
+        let success = context.deploy.success.load(Ordering::SeqCst);
 
         let (status_text, _status_color) = if !done {
             ("Deploying... please wait.", Color::Yellow)
@@ -48,14 +48,14 @@ impl IStep for DeployStep {
             .focused(true)
             .render(f, chunks[0]);
 
-        let logs = context.deploy_logs.lock().unwrap();
+        let logs = context.deploy.logs.lock().unwrap();
         let log_len = logs.len();
         
         // Auto-scroll to bottom if not done.
         let scroll = if !done && log_len > 0 {
             log_len - 1
         } else {
-            context.deploy_scroll
+            context.deploy.scroll
         };
 
         let log_items: Vec<ListItem> = logs.iter().map(|l| {
@@ -78,25 +78,25 @@ impl IStep for DeployStep {
     }
 
     async fn handle_key(&mut self, key: KeyEvent, context: &mut WizardContext) -> StepAction {
-        let done = context.deploy_done.load(Ordering::SeqCst);
-        let log_len = context.deploy_logs.lock().unwrap().len();
+        let done = context.deploy.done.load(Ordering::SeqCst);
+        let log_len = context.deploy.logs.lock().unwrap().len();
 
         match key.code {
             KeyCode::Up => {
-                if done && context.deploy_scroll > 0 {
-                    context.deploy_scroll -= 1;
+                if done && context.deploy.scroll > 0 {
+                    context.deploy.scroll -= 1;
                 }
                 StepAction::None
             }
             KeyCode::Down => {
-                if done && log_len > 0 && context.deploy_scroll < log_len - 1 {
-                    context.deploy_scroll += 1;
+                if done && log_len > 0 && context.deploy.scroll < log_len - 1 {
+                    context.deploy.scroll += 1;
                 }
                 StepAction::None
             }
             KeyCode::Enter | KeyCode::Esc => {
                 if done {
-                    if context.deploy_success.load(Ordering::SeqCst) {
+                    if context.deploy.success.load(Ordering::SeqCst) {
                         StepAction::CloseRefresh
                     } else {
                         StepAction::Close

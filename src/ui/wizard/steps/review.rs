@@ -29,9 +29,9 @@ impl IStep for ReviewStep {
             ])
             .split(area);
 
-        Input::new(" Preview .nspawn configuration ", &context.preview)
+        Input::new(" Preview .nspawn configuration ", &context.review.preview)
             .focused(true)
-            .scroll(context.preview_scroll as u16)
+            .scroll(context.review.preview_scroll as u16)
             .render(f, chunks[0]);
 
         render_hint(f, chunks[1], &["[↑/↓] scroll", "[Enter] deploy!", "[Esc] back"][..]);
@@ -41,11 +41,11 @@ impl IStep for ReviewStep {
         match key.code {
             KeyCode::Esc => StepAction::Prev,
             KeyCode::Up => {
-                if context.preview_scroll > 0 { context.preview_scroll -= 1; }
+                if context.review.preview_scroll > 0 { context.review.preview_scroll -= 1; }
                 StepAction::None
             }
             KeyCode::Down => {
-                context.preview_scroll += 1;
+                context.review.preview_scroll += 1;
                 StepAction::None
             }
             KeyCode::Enter => {
@@ -54,11 +54,11 @@ impl IStep for ReviewStep {
                 tokio::spawn(run_deploy_task(
                     deployer,
                     storage,
-                    context.name.clone(),
+                    context.basic.name.clone(),
                     cp.cfg,
-                    context.deploy_logs.clone(),
-                    context.deploy_done.clone(),
-                    context.deploy_success.clone(),
+                    context.deploy.logs.clone(),
+                    context.deploy.done.clone(),
+                    context.deploy.success.clone(),
                 ));
                 StepAction::Next
             }

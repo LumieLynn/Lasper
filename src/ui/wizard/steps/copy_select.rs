@@ -37,7 +37,7 @@ impl IStep for CopySelectStep {
         }).collect();
 
         ScrollableList::new(" Select container to clone ", items)
-            .selected(Some(context.copy_cursor))
+            .selected(Some(context.source.copy_cursor))
             .render(f, chunks[0]);
 
         render_hint(f, chunks[1], &["[↑/↓] navigate", "[Enter] clone", "[Esc] back"][..]);
@@ -48,17 +48,17 @@ impl IStep for CopySelectStep {
         match key.code {
             KeyCode::Esc => StepAction::Prev,
             KeyCode::Up => {
-                if context.copy_cursor > 0 { context.copy_cursor -= 1; }
+                if context.source.copy_cursor > 0 { context.source.copy_cursor -= 1; }
                 StepAction::None
             }
             KeyCode::Down => {
-                if count > 0 { context.copy_cursor = (context.copy_cursor + 1).min(count - 1); }
+                if count > 0 { context.source.copy_cursor = (context.source.copy_cursor + 1).min(count - 1); }
                 StepAction::None
             }
             KeyCode::Enter => {
-                if let Some(entry) = context.entries.get(context.copy_cursor) {
-                    context.clone_source = entry.name.clone();
-                    context.name = format!("{}-clone", entry.name);
+                if let Some(entry) = context.entries.get(context.source.copy_cursor) {
+                    context.source.clone_source = entry.name.clone();
+                    context.basic.name = format!("{}-clone", entry.name);
                     StepAction::Next
                 } else {
                     StepAction::None

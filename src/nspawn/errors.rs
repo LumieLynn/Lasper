@@ -1,5 +1,5 @@
-use thiserror::Error;
 use std::path::PathBuf;
+use thiserror::Error;
 
 #[allow(dead_code)]
 #[derive(Error, Debug)]
@@ -33,6 +33,9 @@ pub enum NspawnError {
 
     #[error("Deployment failed: {0}")]
     DeployError(String),
+
+    #[error("DBus error: {0}")]
+    Dbus(#[from] zbus::Error),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),

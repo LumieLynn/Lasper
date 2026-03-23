@@ -7,7 +7,20 @@ use ratatui::{
 };
 
 use crate::app::{App, DetailPane};
-use crate::nspawn::ContainerState;
+
+const IMPORTANT_KEYS: &[&str] = &[
+    "Name",
+    "State",
+    "Class",
+    "Enabled",
+    "IPAddresses",
+    "MainPID",
+    "Leader",
+    "Timestamp",
+    "Type",
+    "ReadOnly",
+    "Usage",
+];
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
@@ -22,8 +35,9 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
     let selected = match app.detail_pane {
         DetailPane::Properties => 0,
-        DetailPane::Logs => 1,
-        DetailPane::Config => 2,
+        DetailPane::Details => 1,
+        DetailPane::Logs => 2,
+        DetailPane::Config => 3,
     };
 
     // Dim logs tab if container is stopped
@@ -32,13 +46,14 @@ fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
         .map(|e| !e.state.is_running())
         .unwrap_or(true);
     let log_label = if stopped {
-        " Logs (stopped) "
+        " Logs (poweroff) "
     } else {
         " Logs "
     };
 
     let titles = vec![
         Line::from(" Properties "),
+        Line::from(" Details "),
         Line::from(log_label),
         Line::from(" Config "),
     ];
@@ -58,6 +73,7 @@ fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
 fn render_pane(f: &mut Frame, app: &mut App, area: Rect) {
     match app.detail_pane {
         DetailPane::Properties => render_properties(f, app, area),
+        DetailPane::Details => render_full_details(f, app, area),
         DetailPane::Logs => render_logs(f, app, area),
         DetailPane::Config => render_config(f, app, area),
     }
@@ -68,6 +84,65 @@ fn render_pane(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_properties(f: &mut Frame, app: &App, area: Rect) {
     if app.entries.is_empty() {
         f.render_widget(empty_block(" Properties "), area);
+        return;
+    }
+
+    let mut pairs: Vec<(&String, &String)> = app
+        .properties
+        .iter()
+        .filter(|(k, _)| IMPORTANT_KEYS.contains(&k.as_str()))
+        .collect();
+
+    // Sort pairs by IMPORTANT_KEYS order
+    pairs.sort_by_key(|(k, _)| {
+        IMPORTANT_KEYS
+            .iter()
+            .position(|&ik| ik == k.as_str())
+            .unwrap_or(usize::MAX)
+    });
+
+    let rows: Vec<Row> = pairs
+        .iter()
+        .map(|(k, v)| {
+            let val_style = if k.as_str() == "Enabled" {
+                match v.as_str() {
+                    "enabled" | "enabled-runtime" => Style::default().fg(Color::Green),
+                    "disabled" => Style::default().fg(Color::Red),
+                    _ => Style::default().fg(Color::Yellow),
+                }
+            } else if k.as_str() == "State" {
+                match v.as_str() {
+                    "running" => Style::default().fg(Color::Green),
+                    "poweroff" => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(Color::Yellow),
+                }
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Row::new(vec![
+                Cell::from(k.as_str()).style(Style::default().fg(Color::Cyan)),
+                Cell::from(v.as_str()).style(val_style),
+            ])
+        })
+        .collect();
+
+    let widths = [Constraint::Percentage(35), Constraint::Percentage(65)];
+
+    let table = Table::new(rows, widths)
+        .block(
+            Block::default()
+                .title(" Properties (Summary) ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
+        )
+        .row_highlight_style(Style::default().fg(Color::Cyan));
+
+    f.render_widget(table, area);
+}
+
+fn render_full_details(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.entries.is_empty() {
+        f.render_widget(empty_block(" All Details "), area);
         return;
     }
 
@@ -86,32 +161,17 @@ fn render_properties(f: &mut Frame, app: &App, area: Rect) {
 
     let widths = [Constraint::Percentage(35), Constraint::Percentage(65)];
 
-    // State badge at top
-    let state_line = if let Some(e) = app.selected_entry() {
-        let (icon, color) = match &e.state {
-            ContainerState::Running => ("● running", Color::Green),
-            ContainerState::Starting => ("◑ starting", Color::Yellow),
-            ContainerState::Exiting => ("◐ exiting", Color::Yellow),
-            ContainerState::Stopped => ("○ stopped", Color::DarkGray),
-        };
-        (icon, color)
-    } else {
-        ("○ none", Color::DarkGray)
-    };
-
     let table = Table::new(rows, widths)
         .block(
             Block::default()
-                .title(format!(
-                    " Properties  {} ",
-                    Span::styled(state_line.0, Style::default().fg(state_line.1))
-                ))
+                .title(" Full Details (Scroll with ↑/↓) ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded),
         )
-        .row_highlight_style(Style::default().fg(Color::Cyan));
+        .highlight_symbol(">> ")
+        .row_highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-    f.render_widget(table, area);
+    f.render_stateful_widget(table, area, &mut app.details_state);
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────────────

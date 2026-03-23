@@ -32,14 +32,14 @@ impl IStep for BasicStep {
             ])
             .split(area);
 
-        let name_val = if context.field_idx == 0 { format!("{}_", context.name) } else { context.name.clone() };
+        let name_val = if context.basic.field_idx == 0 { format!("{}_", context.basic.name) } else { context.basic.name.clone() };
         Input::new(" Container name (required) ", &name_val)
-            .focused(context.field_idx == 0)
+            .focused(context.basic.field_idx == 0)
             .render(f, chunks[0]);
 
-        let host_val = if context.field_idx == 1 { format!("{}_", context.hostname) } else { context.hostname.clone() };
+        let host_val = if context.basic.field_idx == 1 { format!("{}_", context.basic.hostname) } else { context.basic.hostname.clone() };
         Input::new(" Hostname (optional, defaults to name) ", &host_val)
-            .focused(context.field_idx == 1)
+            .focused(context.basic.field_idx == 1)
             .render(f, chunks[2]);
 
         render_hint(f, chunks[4], &["[Tab] switch field", "[Enter] next", "[Esc] back"][..]);
@@ -48,26 +48,26 @@ impl IStep for BasicStep {
     async fn handle_key(&mut self, key: KeyEvent, context: &mut WizardContext) -> StepAction {
         match key.code {
             KeyCode::Esc => StepAction::Prev,
-            KeyCode::Tab => { context.field_idx = 1 - context.field_idx; StepAction::None }
+            KeyCode::Tab => { context.basic.field_idx = 1 - context.basic.field_idx; StepAction::None }
             KeyCode::Backspace => {
-                if context.field_idx == 0 { context.name.pop(); }
-                else { context.hostname.pop(); }
+                if context.basic.field_idx == 0 { context.basic.name.pop(); }
+                else { context.basic.hostname.pop(); }
                 StepAction::None
             }
             KeyCode::Char(c) => {
-                if context.field_idx == 0 { context.name.push(c); }
-                else { context.hostname.push(c); }
+                if context.basic.field_idx == 0 { context.basic.name.push(c); }
+                else { context.basic.hostname.push(c); }
                 StepAction::None
             }
             KeyCode::Enter => {
-                if context.name.is_empty() {
+                if context.basic.name.is_empty() {
                     StepAction::Status("Container name is required".into(), StatusLevel::Error)
                 } else {
-                    context.field_idx = 0;
-                    if context.source_kind == SourceKind::Copy {
+                    context.basic.field_idx = 0;
+                    if context.source.kind == SourceKind::Copy {
                         let cp = context.build_config();
-                        context.preview = cp.preview;
-                        context.preview_scroll = 0;
+                        context.review.preview = cp.preview;
+                        context.review.preview_scroll = 0;
                     }
                     StepAction::Next
                 }

@@ -75,22 +75,22 @@ impl IStep for SourceStep {
         }
 
         ScrollableList::new(" Select base — [↑/↓] navigate, [Enter] select ", items)
-            .selected(Some(context.source_cursor))
+            .selected(Some(context.source.cursor))
             .render(f, chunks[0]);
 
-        let cur = context.source_cursor;
+        let cur = context.source.cursor;
         match cur {
             1 => {
-                let val = if context.field_idx == 0 {
-                    format!("{}█", context.oci_url)
+                let val = if context.source.field_idx == 0 {
+                    format!("{}█", context.source.oci_url)
                 } else {
-                    context.oci_url.clone()
+                    context.source.oci_url.clone()
                 };
                 Input::new(
                     " OCI URL (e.g. alpine, docker://ubuntu, nvcr.io/...) ",
                     &val,
                 )
-                .focused(context.field_idx == 0)
+                .focused(context.source.field_idx == 0)
                 .render(f, chunks[1]);
 
                 f.render_widget(
@@ -111,42 +111,42 @@ impl IStep for SourceStep {
                 );
             }
             2 => {
-                let m_val = if context.field_idx == 0 {
-                    format!("{}█", context.deboot_mirror)
+                let m_val = if context.source.field_idx == 0 {
+                    format!("{}█", context.source.deboot_mirror)
                 } else {
-                    context.deboot_mirror.clone()
+                    context.source.deboot_mirror.clone()
                 };
                 Input::new(" Mirror (leave blank for default) ", &m_val)
-                    .focused(context.field_idx == 0)
+                    .focused(context.source.field_idx == 0)
                     .render(f, chunks[1]);
 
-                let s_val = if context.field_idx == 1 {
-                    format!("{}█", context.deboot_suite)
+                let s_val = if context.source.field_idx == 1 {
+                    format!("{}█", context.source.deboot_suite)
                 } else {
-                    context.deboot_suite.clone()
+                    context.source.deboot_suite.clone()
                 };
                 Input::new(" Suite (default: bookworm) ", &s_val)
-                    .focused(context.field_idx == 1)
+                    .focused(context.source.field_idx == 1)
                     .render(f, chunks[2]);
             }
             3 => {
-                let val = if context.field_idx == 0 {
-                    format!("{}█", context.pacstrap_pkgs)
+                let val = if context.source.field_idx == 0 {
+                    format!("{}█", context.source.pacstrap_pkgs)
                 } else {
-                    context.pacstrap_pkgs.clone()
+                    context.source.pacstrap_pkgs.clone()
                 };
                 Input::new(" Packages (space separated) ", &val)
-                    .focused(context.field_idx == 0)
+                    .focused(context.source.field_idx == 0)
                     .render(f, chunks[1]);
             }
             4 => {
-                let val = if context.field_idx == 0 {
-                    format!("{}█", context.disk_path)
+                let val = if context.source.field_idx == 0 {
+                    format!("{}█", context.source.disk_path)
                 } else {
-                    context.disk_path.clone()
+                    context.source.disk_path.clone()
                 };
                 Input::new(" Local file path (.raw, .tar) ", &val)
-                    .focused(context.field_idx == 0)
+                    .focused(context.source.field_idx == 0)
                     .render(f, chunks[1]);
             }
             _ => {
@@ -171,78 +171,78 @@ impl IStep for SourceStep {
         match key.code {
             KeyCode::Esc => StepAction::Close,
             KeyCode::Up => {
-                if context.source_cursor > 0 {
-                    context.source_cursor -= 1;
+                if context.source.cursor > 0 {
+                    context.source.cursor -= 1;
                 }
-                context.field_idx = 0;
+                context.source.field_idx = 0;
                 StepAction::None
             }
             KeyCode::Down => {
-                context.source_cursor = (context.source_cursor + 1).min(4);
-                context.field_idx = 0;
+                context.source.cursor = (context.source.cursor + 1).min(4);
+                context.source.field_idx = 0;
                 StepAction::None
             }
             KeyCode::Enter => {
-                let cur = context.source_cursor;
+                let cur = context.source.cursor;
                 if cur == 0 {
-                    context.source_kind = SourceKind::Copy;
+                    context.source.kind = SourceKind::Copy;
                     StepAction::Next
                 } else {
-                    context.source_kind = match cur {
+                    context.source.kind = match cur {
                         1 => SourceKind::Oci,
                         2 => SourceKind::Debootstrap,
                         3 => SourceKind::Pacstrap,
                         _ => SourceKind::DiskImage,
                     };
-                    context.field_idx = 0;
+                    context.source.field_idx = 0;
                     StepAction::Next
                 }
             }
             KeyCode::Tab => {
-                if context.source_cursor == 2 {
-                    context.field_idx = 1 - context.field_idx;
+                if context.source.cursor == 2 {
+                    context.source.field_idx = 1 - context.source.field_idx;
                 }
                 StepAction::None
             }
             KeyCode::Backspace => {
-                match context.source_cursor {
+                match context.source.cursor {
                     1 => {
-                        context.oci_url.pop();
+                        context.source.oci_url.pop();
                     }
                     2 => {
-                        if context.field_idx == 0 {
-                            context.deboot_mirror.pop();
+                        if context.source.field_idx == 0 {
+                            context.source.deboot_mirror.pop();
                         } else {
-                            context.deboot_suite.pop();
+                            context.source.deboot_suite.pop();
                         }
                     }
                     3 => {
-                        context.pacstrap_pkgs.pop();
+                        context.source.pacstrap_pkgs.pop();
                     }
                     4 => {
-                        context.disk_path.pop();
+                        context.source.disk_path.pop();
                     }
                     _ => {}
                 }
                 StepAction::None
             }
             KeyCode::Char(c) => {
-                match context.source_cursor {
+                match context.source.cursor {
                     1 => {
-                        context.oci_url.push(c);
+                        context.source.oci_url.push(c);
                     }
                     2 => {
-                        if context.field_idx == 0 {
-                            context.deboot_mirror.push(c);
+                        if context.source.field_idx == 0 {
+                            context.source.deboot_mirror.push(c);
                         } else {
-                            context.deboot_suite.push(c);
+                            context.source.deboot_suite.push(c);
                         }
                     }
                     3 => {
-                        context.pacstrap_pkgs.push(c);
+                        context.source.pacstrap_pkgs.push(c);
                     }
                     4 => {
-                        context.disk_path.push(c);
+                        context.source.disk_path.push(c);
                     }
                     _ => {}
                 }

@@ -238,12 +238,15 @@ pub async fn setup_wayland_shell_env(rootfs: &Path, user: &CreateUser) -> Result
     };
     let env_script_path = format!("{}/.wayland-env", home_dir);
 
-    let script_content = r#"
+    let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+
+    let script_content = format!(r#"
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
-export WAYLAND_DISPLAY=wayland-0
+export WAYLAND_DISPLAY=wayland-socket
+export DISPLAY={}
 mkdir -p "$XDG_RUNTIME_DIR"
-ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
-"#;
+ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
+"#, host_display);
 
     let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
     std::fs::write(&full_path, script_content).map_err(|e| NspawnError::Io(full_path, e))?;
@@ -257,12 +260,14 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
             home_dir.trim_start_matches('/')
         ));
         let _ = std::fs::create_dir_all(&fish_dir);
-        let fish_script = r#"
+        let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        let fish_script = format!(r#"
 set -lx XDG_RUNTIME_DIR /run/user/(id -u)
-set -lx WAYLAND_DISPLAY wayland-0
+set -lx WAYLAND_DISPLAY wayland-socket
+set -lx DISPLAY {}
 mkdir -p $XDG_RUNTIME_DIR
-ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY
-"#;
+ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
+"#, host_display);
         std::fs::write(fish_dir.join("wayland-env.fish"), fish_script)
             .map_err(|e| NspawnError::Io(fish_dir.join("wayland-env.fish"), e))?;
         return Ok(());
@@ -543,5 +548,17 @@ mod tests {
         assert!(content.contains("BindReadOnly=/tmp/a:/mnt/a"));
         assert!(content.contains("Bind=/tmp/b:/mnt/b"));
         assert!(content.contains("Bind=/dev/fuse"));
+    }
+
+    #[test]
+    fn test_gui_passthrough_config() {
+        let mut cfg = ContainerConfig::default();
+        cfg.wayland_socket = true;
+        
+        let content = nspawn_config_content(&cfg);
+        
+        assert!(content.contains("PrivateUsers=no"));
+        assert!(!content.contains("Environment=WAYLAND_DISPLAY="));
+        assert!(!content.contains("Environment=DISPLAY="));
     }
 }

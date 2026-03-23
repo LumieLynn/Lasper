@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::nspawn::StatusLevel;
-use crate::ui::{container_list, detail_panel};
+use crate::ui::{container_list, detail_panel, widgets::power_menu::PowerMenu};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -27,6 +27,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
+    if app.show_power_menu { PowerMenu::new(app.power_menu_selected).render(f, area); }
     if app.show_wizard  { app.wizard.render(f, area); }
     if app.show_help    { render_help(f); }
 }
@@ -41,11 +42,20 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" ⚠  READ-ONLY — run with sudo for full control ",
             Style::default().fg(Color::Black).bg(Color::Yellow))
     };
-    let line = Line::from(vec![
+
+    let mut spans = vec![
         Span::styled(" Lasper ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
         badge,
-        Span::styled(format!("  {} container(s)", app.entries.len()), Style::default().fg(Color::DarkGray)),
-    ]);
+    ];
+
+    if !app.dbus_active {
+        spans.push(Span::styled(" ⚡ CMD-MODE ",
+            Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)));
+    }
+
+    spans.push(Span::styled(format!("  {} container(s)", app.entries.len()), Style::default().fg(Color::DarkGray)));
+
+    let line = Line::from(spans);
     f.render_widget(
         Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 40))),
         area,
@@ -76,9 +86,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     } else {
         Line::from(vec![
             kspan("[j/k]"), hspan(" nav "),
+            kspan("[p]"),   hspan(" prop "),
+            kspan("[d]"),   hspan(" det "),
             kspan("[s]"),   hspan(" start "),
-            kspan("[S]"),   hspan(" stop "),
-            kspan("[x]"),   hspan(" terminate "),
+            kspan("[S]"),   hspan(" poweroff "),
+            kspan("[x/⏎]"), hspan(" actions "),
             kspan("[n/a]"), hspan(" new/import "),
             kspan("[r]"),   hspan(" refresh "),
             kspan("[?]"),   hspan(" help "),
@@ -111,12 +123,13 @@ fn render_help(f: &mut Frame) {
         hrow("k / ↑", "Select previous"),
         Line::from(""),
         hrow("p    ", "Properties pane"),
+        hrow("d    ", "Full details pane"),
         hrow("l    ", "Logs pane (running only)"),
         hrow("c    ", "Config pane (.nspawn file)"),
         Line::from(""),
         hrow("s    ", "Start container  [root]"),
-        hrow("S    ", "Stop container   [root]"),
-        hrow("x    ", "Terminate force  [root]"),
+        hrow("S    ", "Poweroff container [root]"),
+        hrow("x / ⏎", "Actions / Power menu  [root]"),
         Line::from(""),
         hrow("n    ", "New container / Import wizard  [root]"),
         Line::from(""),

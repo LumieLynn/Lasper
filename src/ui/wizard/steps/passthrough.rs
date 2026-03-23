@@ -41,17 +41,17 @@ impl IStep for PassthroughStep {
 
         f.render_widget(Paragraph::new("  Select quick passthrough options for this container.  \n  (NVIDIA will perform a host scan upon proceeding)").style(Style::default().fg(Color::White)), chunks[0]);
 
-        Checkbox::new("Generic GPU Passthrough (/dev/dri, /dev/mali)", context.generic_gpu)
-            .focused(context.passthrough_field == 0)
+        Checkbox::new("Generic GPU Passthrough (/dev/dri, /dev/mali)", context.passthrough.generic_gpu)
+            .focused(context.passthrough.field_idx == 0)
             .render(f, chunks[2]);
 
-        let wayland_label = if context.net_mode == 0 { "Wayland Socket Passthrough" } else { "Wayland (Requires Host Network)" };
-        Checkbox::new(wayland_label, context.wayland_socket)
-            .focused(context.passthrough_field == 1)
+        let wayland_label = if context.network.mode == 0 { "Wayland Socket Passthrough" } else { "Wayland (Requires Host Network)" };
+        Checkbox::new(wayland_label, context.passthrough.wayland_socket)
+            .focused(context.passthrough.field_idx == 1)
             .render(f, chunks[4]);
 
-        Checkbox::new("NVIDIA Driver & GPU Passthrough (Scan host)", context.nvidia_enabled)
-            .focused(context.passthrough_field == 2)
+        Checkbox::new("NVIDIA Driver & GPU Passthrough (Scan host)", context.passthrough.nvidia_enabled)
+            .focused(context.passthrough.field_idx == 2)
             .render(f, chunks[6]);
 
         render_hint(f, chunks[8], &["[Space/Tab] toggle", "[↑/↓] select", "[Enter] apply & next", "[Esc] back"][..]);
@@ -61,35 +61,35 @@ impl IStep for PassthroughStep {
         match key.code {
             KeyCode::Esc => StepAction::Prev,
             KeyCode::Up => {
-                if context.passthrough_field > 0 { context.passthrough_field -= 1; }
+                if context.passthrough.field_idx > 0 { context.passthrough.field_idx -= 1; }
                 StepAction::None
             }
             KeyCode::Down | KeyCode::Tab => {
-                context.passthrough_field = (context.passthrough_field + 1) % 3;
+                context.passthrough.field_idx = (context.passthrough.field_idx + 1) % 3;
                 StepAction::None
             }
             KeyCode::Char(' ') => {
-                if context.passthrough_field == 2 {
-                    context.nvidia_enabled = !context.nvidia_enabled;
-                    if context.nvidia_enabled && !context.nvidia_loaded {
+                if context.passthrough.field_idx == 2 {
+                    context.passthrough.nvidia_enabled = !context.passthrough.nvidia_enabled;
+                    if context.passthrough.nvidia_enabled && !context.passthrough.nvidia_loaded {
                         return StepAction::Status("Detecting NVIDIA hardware...".into(), StatusLevel::Info);
                     }
-                } else if context.passthrough_field == 0 {
-                    context.generic_gpu = !context.generic_gpu;
-                } else if context.passthrough_field == 1 && context.net_mode == 0 {
-                    context.wayland_socket = !context.wayland_socket;
+                } else if context.passthrough.field_idx == 0 {
+                    context.passthrough.generic_gpu = !context.passthrough.generic_gpu;
+                } else if context.passthrough.field_idx == 1 && context.network.mode == 0 {
+                    context.passthrough.wayland_socket = !context.passthrough.wayland_socket;
                 }
                 StepAction::None
             }
             KeyCode::Enter => {
-                if context.nvidia_enabled && !context.nvidia_loaded {
+                if context.passthrough.nvidia_enabled && !context.passthrough.nvidia_loaded {
                     // Try to load it now
                     let info = detect_nvidia().await;
-                    context.nvidia = info;
-                    context.nvidia_loaded = true;
-                    context.nvidia_devices_sel = vec![true; context.nvidia.devices.len()];
-                    context.nvidia_sysro_sel = vec![true; context.nvidia.system_ro.len()];
-                    context.nvidia_libs_sel = vec![true; context.nvidia.driver_files.len()];
+                    context.passthrough.nvidia = info;
+                    context.passthrough.nvidia_loaded = true;
+                    context.passthrough.nvidia_devices_sel = vec![true; context.passthrough.nvidia.devices.len()];
+                    context.passthrough.nvidia_sysro_sel = vec![true; context.passthrough.nvidia.system_ro.len()];
+                    context.passthrough.nvidia_libs_sel = vec![true; context.passthrough.nvidia.driver_files.len()];
                     StepAction::Next
                 } else {
                     StepAction::Next

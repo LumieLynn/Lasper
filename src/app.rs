@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, Terminal, widgets::TableState};
 use std::io::Stdout;
 
 use crate::events::{AppEvent, EventHandler};
@@ -19,7 +19,7 @@ use crate::ui::wizard::{Wizard, StepAction as WizardAction};
 
 /// The currently active detail pane in the main UI.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DetailPane { Properties, Logs, Config }
+pub enum DetailPane { Properties, Details, Logs, Config }
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
@@ -33,6 +33,7 @@ pub struct App {
 
     pub detail_pane: DetailPane,
     pub properties: HashMap<String, String>,
+    pub details_state: TableState,
     pub log_lines: Vec<String>,
     pub log_scroll: u16,        // lines scrolled in Logs pane
     pub config_content: Option<String>,
@@ -45,7 +46,9 @@ pub struct App {
     pub status_expiry: Option<Instant>,
 
     pub show_help: bool,
-
+    pub show_power_menu: bool,
+    pub power_menu_selected: usize,
+    pub dbus_active: bool,
     pub manager: Box<dyn NspawnManager>,
 }
 
@@ -58,6 +61,7 @@ impl App {
             selected: 0,
             detail_pane: DetailPane::Properties,
             properties: HashMap::new(),
+            details_state: TableState::default(),
             log_lines: Vec::new(),
             log_scroll: 0,
             config_content: None,
@@ -67,6 +71,9 @@ impl App {
             status_message: None,
             status_expiry: None,
             show_help: false,
+            show_power_menu: false,
+            power_menu_selected: 0,
+            dbus_active: true, // Default to true, will be updated on refresh
             manager: Box::new(SystemdManager::new(is_root)),
         }
     }
@@ -104,7 +111,8 @@ impl App {
     }
 
     pub async fn refresh(&mut self) {
-        if self.show_wizard || self.show_help { return; }
+        if self.show_wizard || self.show_help || self.show_power_menu { return; }
+        self.dbus_active = self.manager.is_dbus_available().await;
         match self.manager.list_all().await {
             Ok(entries) => {
                 self.entries = entries;
@@ -126,12 +134,22 @@ impl App {
             }
         };
         match self.detail_pane {
-            DetailPane::Properties => {
+            DetailPane::Properties | DetailPane::Details => {
                 if entry.state.is_running() {
                     match self.manager.get_properties(&entry.name).await {
                         Ok(mut p) => {
                             if !entry.all_addresses.is_empty() {
                                 p.insert("IPAddresses".into(), entry.all_addresses.join(", "));
+                            }
+                            if let Some(ufs) = p.get("UnitFileState") {
+                                p.insert("Enabled".into(), ufs.clone());
+                            }
+                            // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
+                            if let Some(image_type) = &entry.image_type {
+                                if let Some(machine_type) = p.remove("Type") {
+                                    p.insert("Class".into(), machine_type);
+                                }
+                                p.insert("Type".into(), image_type.clone());
                             }
                             self.properties = p;
                         }
@@ -143,6 +161,13 @@ impl App {
                     self.properties.insert("ReadOnly".into(), entry.readonly.to_string());
                     if let Some(u) = &entry.usage { self.properties.insert("Usage".into(), u.clone()); }
                     self.properties.insert("State".into(), entry.state.label().into());
+
+                    // Try to get UnitFileState for enabled status
+                    if let Ok(p) = self.manager.get_properties(&entry.name).await {
+                        if let Some(ufs) = p.get("UnitFileState") {
+                            self.properties.insert("Enabled".into(), ufs.clone());
+                        }
+                    }
                 }
             }
             DetailPane::Logs => {
@@ -182,6 +207,33 @@ impl App {
             return;
         }
         if self.show_help { self.show_help = false; return; }
+        if self.show_power_menu {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.show_power_menu = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.power_menu_selected = self.power_menu_selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.power_menu_selected = (self.power_menu_selected + 1).min(6);
+                }
+                KeyCode::Enter => {
+                    let idx = self.power_menu_selected;
+                    self.show_power_menu = false;
+                    match idx {
+                        0 => self.action_start().await,
+                        1 => self.action_poweroff().await,
+                        2 => self.action_reboot().await,
+                        3 => self.action_terminate().await,
+                        4 => self.action_kill().await,
+                        5 => self.action_enable().await,
+                        6 => self.action_disable().await,
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
 
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -196,15 +248,55 @@ impl App {
             KeyCode::Down if self.detail_pane == DetailPane::Logs => { self.log_scroll += 1; }
             KeyCode::PageUp   if self.detail_pane == DetailPane::Logs => { self.log_scroll = self.log_scroll.saturating_sub(10); }
             KeyCode::PageDown if self.detail_pane == DetailPane::Logs => { self.log_scroll += 10; }
+
+            // Details tab scrolling
+            KeyCode::Up if self.detail_pane == DetailPane::Details => {
+                let i = match self.details_state.selected() {
+                    Some(i) => if i == 0 { 0 } else { i - 1 },
+                    None => 0,
+                };
+                self.details_state.select(Some(i));
+            }
+            KeyCode::Down if self.detail_pane == DetailPane::Details => {
+                let i = match self.details_state.selected() {
+                    Some(i) => (i + 1).min(self.properties.len().saturating_sub(1)),
+                    None => 0,
+                };
+                self.details_state.select(Some(i));
+            }
+            KeyCode::PageUp if self.detail_pane == DetailPane::Details => {
+                let i = match self.details_state.selected() {
+                    Some(i) => i.saturating_sub(10),
+                    None => 0,
+                };
+                self.details_state.select(Some(i));
+            }
+            KeyCode::PageDown if self.detail_pane == DetailPane::Details => {
+                let i = match self.details_state.selected() {
+                    Some(i) => (i + 10).min(self.properties.len().saturating_sub(1)),
+                    None => 0,
+                };
+                self.details_state.select(Some(i));
+            }
             // General navigation
             KeyCode::Char('j') | KeyCode::Down => self.select_next(),
             KeyCode::Char('k') | KeyCode::Up   => self.select_prev(),
             KeyCode::Char('p') => { self.detail_pane = DetailPane::Properties; self.refresh_detail().await; }
+            KeyCode::Char('d') => {
+                self.detail_pane = DetailPane::Details;
+                self.details_state.select(Some(0));
+                self.refresh_detail().await;
+            }
             KeyCode::Char('l') => { self.detail_pane = DetailPane::Logs; self.log_scroll = 0; self.refresh_detail().await; }
             KeyCode::Char('c') => { self.detail_pane = DetailPane::Config; self.config_scroll = 0; self.refresh_detail().await; }
             KeyCode::Char('s') => self.action_start().await,
-            KeyCode::Char('S') => self.action_stop().await,
-            KeyCode::Char('x') => self.action_terminate().await,
+            KeyCode::Char('S') => self.action_poweroff().await,
+            KeyCode::Char('x') | KeyCode::Enter => {
+                if !self.entries.is_empty() {
+                    self.show_power_menu = true;
+                    self.power_menu_selected = 0;
+                }
+            }
             KeyCode::Char('n') | KeyCode::Char('a') => {
                 if self.is_root {
                     self.wizard = Wizard::new(self.is_root);
@@ -249,11 +341,11 @@ impl App {
         }
     }
 
-    async fn action_stop(&mut self) {
+    async fn action_poweroff(&mut self) {
         if let Some(e) = self.entries.get(self.selected) {
             if e.state.is_running() {
-                match self.manager.stop(&e.name).await {
-                    Ok(_) => self.set_status(format!("Stopped {}", e.name), StatusLevel::Success),
+                match self.manager.poweroff(&e.name).await {
+                    Ok(_) => self.set_status(format!("Powered off {}", e.name), StatusLevel::Success),
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }
@@ -267,6 +359,47 @@ impl App {
                     Ok(_) => self.set_status(format!("Terminated {}", e.name), StatusLevel::Success),
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
+            }
+        }
+    }
+
+    async fn action_reboot(&mut self) {
+        if let Some(e) = self.entries.get(self.selected) {
+            if e.state.is_running() {
+                match self.manager.reboot(&e.name).await {
+                    Ok(_) => self.set_status(format!("Rebooting {}", e.name), StatusLevel::Success),
+                    Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+                }
+            }
+        }
+    }
+
+    async fn action_kill(&mut self) {
+        if let Some(e) = self.entries.get(self.selected) {
+            if e.state.is_running() {
+                // For now, just send SIGTERM via kill
+                match self.manager.kill(&e.name, "SIGTERM").await {
+                    Ok(_) => self.set_status(format!("Sent SIGTERM to {}", e.name), StatusLevel::Success),
+                    Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+                }
+            }
+        }
+    }
+
+    async fn action_enable(&mut self) {
+        if let Some(e) = self.entries.get(self.selected) {
+            match self.manager.enable(&e.name).await {
+                Ok(_) => self.set_status(format!("Enabled {}", e.name), StatusLevel::Success),
+                Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+            }
+        }
+    }
+
+    async fn action_disable(&mut self) {
+        if let Some(e) = self.entries.get(self.selected) {
+            match self.manager.disable(&e.name).await {
+                Ok(_) => self.set_status(format!("Disabled {}", e.name), StatusLevel::Success),
+                Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
             }
         }
     }

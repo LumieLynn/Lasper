@@ -1,6 +1,6 @@
 [package]
 name = "lasper"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
 
@@ -23,3 +23,5 @@ dirs = "5"
 libc = "0.2"
 async-trait = "0.1"
 thiserror = "1"
+zbus = "4.4"
+futures-util = "0.3"

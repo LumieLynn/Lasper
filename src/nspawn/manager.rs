@@ -6,14 +6,12 @@ use async_trait::async_trait;
 #[async_trait]
 #[allow(dead_code)]
 pub trait NspawnManager: Send + Sync {
-    /// List all containers (running and stopped).
+    /// List all containers (running and poweroff).
     async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
 
     /// Start a container by name.
     async fn start(&self, name: &str) -> Result<()>;
 
-    /// Stop a container by name.
-    async fn stop(&self, name: &str) -> Result<()>;
 
     /// Terminate a container forcefully.
     async fn terminate(&self, name: &str) -> Result<()>;
@@ -25,10 +23,28 @@ pub trait NspawnManager: Send + Sync {
     async fn get_properties(&self, name: &str)
         -> Result<std::collections::HashMap<String, String>>;
 
+    /// Enable automatic container start at boot.
+    async fn enable(&self, name: &str) -> Result<()>;
+
+    /// Disable automatic container start at boot.
+    async fn disable(&self, name: &str) -> Result<()>;
+
+    /// Power off a container gracefully.
+    async fn poweroff(&self, name: &str) -> Result<()>;
+
+    /// Reboot a container.
+    async fn reboot(&self, name: &str) -> Result<()>;
+
+    /// Send a signal to processes of a container.
+    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+
     /// Create a new container with the given configuration and storage backend.
     async fn create(
         &self,
         cfg: &ContainerConfig,
         storage: &dyn super::storage::StorageBackend,
     ) -> Result<()>;
+
+    /// Check if DBus is available and being used.
+    async fn is_dbus_available(&self) -> bool;
 }

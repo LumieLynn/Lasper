@@ -16,7 +16,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
             ContainerState::Running  => ("● ", Color::Green),
             ContainerState::Starting => ("◑ ", Color::Yellow),
             ContainerState::Exiting  => ("◐ ", Color::Yellow),
-            ContainerState::Stopped  => ("○ ", Color::DarkGray),
+            ContainerState::Off      => ("○ ", Color::DarkGray),
         };
 
         let type_hint = e.image_type.as_deref().unwrap_or("");
