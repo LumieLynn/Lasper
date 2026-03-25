@@ -46,9 +46,13 @@ pub struct StorageState {
 
 pub struct UserState {
     pub root_password: String,
-    pub enabled: bool,
-    pub user: CreateUser,
+    pub users: Vec<CreateUser>,
     pub field_idx: usize,
+    pub user_cursor: usize,
+    pub is_editing: bool,
+    pub editing_user: CreateUser,
+    pub editing_idx: Option<usize>,
+    pub edit_field_idx: usize,
 }
 
 pub struct NetworkState {
@@ -135,9 +139,13 @@ impl WizardContext {
             },
             user: UserState {
                 root_password: String::new(),
-                enabled: false,
-                user: CreateUser::default(),
+                users: Vec::new(),
                 field_idx: 0,
+                user_cursor: 0,
+                is_editing: false,
+                editing_user: CreateUser::default(),
+                editing_idx: None,
+                edit_field_idx: 0,
             },
             network: NetworkState {
                 mode: 0,
@@ -246,9 +254,7 @@ impl WizardContext {
         };
         let storage_type = self.storage.info.types[self.storage.type_idx].0;
 
-        let users = if self.user.enabled && !self.user.user.username.is_empty() {
-            vec![self.user.user.clone()]
-        } else { vec![] };
+        let users = self.user.users.clone();
 
         let cfg = ContainerConfig {
             name: self.basic.name.clone(),
