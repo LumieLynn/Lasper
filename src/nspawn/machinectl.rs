@@ -16,9 +16,9 @@ use zbus::zvariant::OwnedObjectPath;
     default_path = "/org/freedesktop/machine1"
 )]
 trait Manager {
-    /// Returns a list of machines. Signature: a(ssssso)
-    /// (name, class, service, root-directory, object-path)
-    fn list_machines(&self) -> zbus::Result<Vec<(String, String, String, String, OwnedObjectPath)>>;
+    /// Returns a list of machines. Signature: a(ssso)
+    /// (name, class, service, object-path)
+    fn list_machines(&self) -> zbus::Result<Vec<(String, String, String, OwnedObjectPath)>>;
 
     /// Returns a list of images. Signature: a(ssbttto)
     /// (name, type, read-only, creation-time, modification-time, usage, object-path)
@@ -27,11 +27,7 @@ trait Manager {
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
 
-    fn start_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
-    fn stop_machine(&self, name: &str, mode: &str) -> zbus::Result<()>;
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
-    fn reboot_machine(&self, name: &str) -> zbus::Result<()>;
-    fn power_off_machine(&self, name: &str) -> zbus::Result<()>;
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
 
     /// Returns IP addresses for a machine. Signature: a(iay)
@@ -47,8 +43,9 @@ trait Machine {
     fn name(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
-    #[zbus(property)]
-    fn addresses(&self) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
+
+    /// GetAddresses() method — returns a(iay)
+    fn get_addresses(&self) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
 }
 
 // ── Unified data model ────────────────────────────────────────────────────────
@@ -154,7 +151,7 @@ impl SystemdManager {
         let mut entries = Vec::new();
         let mut running_names = HashMap::new();
 
-        for (name, _class, _service, _root, _path) in machines {
+        for (name, _class, _service, _path) in machines {
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
             let formatted: Vec<String> = addrs
                 .into_iter()
@@ -362,8 +359,17 @@ impl NspawnManager for SystemdManager {
 
     async fn start(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if let Some(proxy) = self.manager_proxy().await {
-            if let Ok(_) = proxy.start_machine(name).await {
+        // machinectl start uses org.freedesktop.systemd1.Manager.StartUnit
+        if let Some(conn) = self.connection().await {
+            let unit = format!("systemd-nspawn@{}.service", name);
+            let result = conn.call_method(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.systemd1.Manager"),
+                "StartUnit",
+                &(&unit, "fail"),
+            ).await;
+            if result.is_ok() {
                 return Ok(());
             }
         }
@@ -383,8 +389,10 @@ impl NspawnManager for SystemdManager {
 
     async fn poweroff(&self, name: &str) -> Result<()> {
         self.require_root()?;
+        // machinectl poweroff = KillMachine(name, "leader", SIGRTMIN+4)
         if let Some(proxy) = self.manager_proxy().await {
-            if let Ok(_) = proxy.power_off_machine(name).await {
+            let sig = libc::SIGRTMIN() + 4;
+            if proxy.kill_machine(name, "leader", sig).await.is_ok() {
                 return Ok(());
             }
         }
@@ -393,8 +401,9 @@ impl NspawnManager for SystemdManager {
 
     async fn reboot(&self, name: &str) -> Result<()> {
         self.require_root()?;
+        // machinectl reboot = KillMachine(name, "leader", SIGINT)
         if let Some(proxy) = self.manager_proxy().await {
-            if let Ok(_) = proxy.reboot_machine(name).await {
+            if proxy.kill_machine(name, "leader", libc::SIGINT).await.is_ok() {
                 return Ok(());
             }
         }
