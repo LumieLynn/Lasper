@@ -47,4 +47,7 @@ pub trait NspawnManager: Send + Sync {
 
     /// Check if DBus is available and being used.
     async fn is_dbus_available(&self) -> bool;
+
+    /// Returns true if the last operation fell back to CLI (and resets the flag).
+    fn did_fallback(&self) -> bool;
 }

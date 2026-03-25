@@ -121,6 +121,11 @@ impl App {
             Err(e) => log::error!("list_all: {}", e),
         }
         self.refresh_detail().await;
+
+        // Check if any DBus call fell back to CLI during this refresh
+        if self.dbus_active && self.manager.did_fallback() {
+            self.set_status("⚡ DBus call failed — used CLI fallback".into(), StatusLevel::Warn);
+        }
     }
 
     async fn refresh_detail(&mut self) {
@@ -334,7 +339,10 @@ impl App {
         if let Some(e) = self.entries.get(self.selected) {
             if !e.state.is_running() {
                 match self.manager.start(&e.name).await {
-                    Ok(_) => self.set_status(format!("Started {}", e.name), StatusLevel::Success),
+                    Ok(_) => {
+                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        self.set_status(format!("Started {}{}", e.name, suffix), StatusLevel::Success);
+                    }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }
@@ -345,7 +353,10 @@ impl App {
         if let Some(e) = self.entries.get(self.selected) {
             if e.state.is_running() {
                 match self.manager.poweroff(&e.name).await {
-                    Ok(_) => self.set_status(format!("Powered off {}", e.name), StatusLevel::Success),
+                    Ok(_) => {
+                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        self.set_status(format!("Powered off {}{}", e.name, suffix), StatusLevel::Success);
+                    }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }
@@ -356,7 +367,10 @@ impl App {
         if let Some(e) = self.entries.get(self.selected) {
             if e.state.is_running() {
                 match self.manager.terminate(&e.name).await {
-                    Ok(_) => self.set_status(format!("Terminated {}", e.name), StatusLevel::Success),
+                    Ok(_) => {
+                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        self.set_status(format!("Terminated {}{}", e.name, suffix), StatusLevel::Success);
+                    }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }
@@ -367,7 +381,10 @@ impl App {
         if let Some(e) = self.entries.get(self.selected) {
             if e.state.is_running() {
                 match self.manager.reboot(&e.name).await {
-                    Ok(_) => self.set_status(format!("Rebooting {}", e.name), StatusLevel::Success),
+                    Ok(_) => {
+                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        self.set_status(format!("Rebooting {}{}", e.name, suffix), StatusLevel::Success);
+                    }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }
@@ -379,7 +396,10 @@ impl App {
             if e.state.is_running() {
                 // For now, just send SIGTERM via kill
                 match self.manager.kill(&e.name, "SIGTERM").await {
-                    Ok(_) => self.set_status(format!("Sent SIGTERM to {}", e.name), StatusLevel::Success),
+                    Ok(_) => {
+                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        self.set_status(format!("Sent SIGTERM to {}{}", e.name, suffix), StatusLevel::Success);
+                    }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
             }

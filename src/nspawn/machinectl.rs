@@ -4,6 +4,7 @@ use super::errors::{NspawnError, Result};
 use super::manager::NspawnManager;
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
 use zbus::{proxy, Connection};
 use zbus::zvariant::OwnedObjectPath;
@@ -96,6 +97,7 @@ pub struct ContainerEntry {
 pub struct SystemdManager {
     is_root: bool,
     conn: std::sync::Arc<tokio::sync::OnceCell<Option<Connection>>>,
+    last_fallback: AtomicBool,
 }
 
 impl SystemdManager {
@@ -103,7 +105,12 @@ impl SystemdManager {
         Self {
             is_root,
             conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            last_fallback: AtomicBool::new(false),
         }
+    }
+
+    fn mark_fallback(&self) {
+        self.last_fallback.store(true, Ordering::Relaxed);
     }
 
     async fn connection(&self) -> Option<&Connection> {
@@ -152,6 +159,7 @@ impl SystemdManager {
         let mut running_names = HashMap::new();
 
         for (name, _class, _service, _path) in machines {
+            if name == ".host" { continue; }
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
             let formatted: Vec<String> = addrs
                 .into_iter()
@@ -161,6 +169,7 @@ impl SystemdManager {
         }
 
         for (name, img_type, readonly, _cr, _mod, usage, _path) in images {
+            if name == ".host" { continue; }
             let addrs = running_names.get(&name).cloned().unwrap_or_default();
             let state = if running_names.contains_key(&name) {
                 ContainerState::Running
@@ -185,6 +194,7 @@ impl SystemdManager {
 
         // Handle machines without images (e.g. transient)
         for (name, addrs) in running_names {
+            if name == ".host" { continue; }
             if !entries.iter().any(|e: &ContainerEntry| e.name == name) {
                 entries.push(ContainerEntry {
                     name: name.clone(),
@@ -213,6 +223,7 @@ impl SystemdManager {
         if !self.is_root {
             return Ok(running
                 .into_iter()
+                .filter(|(name, _)| name != ".host")
                 .map(|(name, addrs)| ContainerEntry {
                     state: ContainerState::Running,
                     name,
@@ -246,6 +257,7 @@ impl SystemdManager {
                 continue;
             }
             let name = parts[0].to_string();
+            if name == ".host" { continue; }
             let addrs = running.get(&name).cloned().unwrap_or_default();
             let addr = addrs.first().cloned();
             let state = if running.contains_key(&name) {
@@ -266,6 +278,7 @@ impl SystemdManager {
         }
 
         for (name, addrs) in &running {
+            if name == ".host" { continue; }
             if !entries.iter().any(|e| &e.name == name) {
                 entries.push(ContainerEntry {
                     name: name.clone(),
@@ -327,6 +340,7 @@ impl SystemdManager {
                 continue;
             }
             current_machine = parts[0].to_string();
+            if current_machine == ".host" { continue; }
             let mut ips = Vec::new();
             if let Some(addr) = parts.get(5).copied() {
                 if !addr.is_empty() && addr != "-" {
@@ -350,7 +364,10 @@ impl NspawnManager for SystemdManager {
         if let Some(proxy) = self.manager_proxy().await {
             match self.list_all_dbus(&proxy).await {
                 Ok(entries) => return Ok(entries),
-                Err(e) => log::warn!("DBus list_all failed, falling back to command: {}", e),
+                Err(e) => {
+                    log::warn!("DBus list_all failed, falling back to command: {}", e);
+                    self.mark_fallback();
+                }
             }
         }
 
@@ -373,6 +390,7 @@ impl NspawnManager for SystemdManager {
                 return Ok(());
             }
         }
+        self.mark_fallback();
         self.run_machinectl(&["start", name]).await
     }
 
@@ -380,10 +398,11 @@ impl NspawnManager for SystemdManager {
     async fn terminate(&self, name: &str) -> Result<()> {
         self.require_root()?;
         if let Some(proxy) = self.manager_proxy().await {
-            if let Ok(_) = proxy.terminate_machine(name).await {
+            if proxy.terminate_machine(name).await.is_ok() {
                 return Ok(());
             }
         }
+        self.mark_fallback();
         self.run_machinectl(&["terminate", name]).await
     }
 
@@ -396,6 +415,7 @@ impl NspawnManager for SystemdManager {
                 return Ok(());
             }
         }
+        self.mark_fallback();
         self.run_machinectl(&["poweroff", name]).await
     }
 
@@ -407,6 +427,7 @@ impl NspawnManager for SystemdManager {
                 return Ok(());
             }
         }
+        self.mark_fallback();
         self.run_machinectl(&["reboot", name]).await
     }
 
@@ -424,10 +445,11 @@ impl NspawnManager for SystemdManager {
         self.require_root()?;
         if let Some(proxy) = self.manager_proxy().await {
             let sig = signal.parse::<i32>().unwrap_or(15); // Default to SIGTERM
-            if let Ok(_) = proxy.kill_machine(name, "all", sig).await {
+            if proxy.kill_machine(name, "all", sig).await.is_ok() {
                 return Ok(());
             }
         }
+        self.mark_fallback();
         self.run_machinectl(&["kill", "-s", signal, name]).await
     }
 
@@ -542,6 +564,10 @@ impl NspawnManager for SystemdManager {
 
     async fn is_dbus_available(&self) -> bool {
         self.connection().await.is_some()
+    }
+
+    fn did_fallback(&self) -> bool {
+        self.last_fallback.swap(false, Ordering::Relaxed)
     }
 }
 

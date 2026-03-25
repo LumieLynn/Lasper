@@ -80,6 +80,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         let color = match level {
             StatusLevel::Info    => Color::White,
             StatusLevel::Success => Color::Green,
+            StatusLevel::Warn    => Color::Rgb(255, 140, 0),
             StatusLevel::Error   => Color::Red,
         };
         Line::from(vec![Span::raw("  "), Span::styled(msg.as_str(), Style::default().fg(color))])
