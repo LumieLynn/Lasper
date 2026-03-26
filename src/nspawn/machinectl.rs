@@ -1,4 +1,4 @@
-//! High-level wrapper around `machinectl` and `journalctl` commands.
+//! DBus and CLI wrapper for managing systemd-nspawn containers via systemd-machined (`org.freedesktop.machine1`).
 
 use super::errors::{NspawnError, Result};
 use super::manager::NspawnManager;
@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::process::Command;
-use zbus::{proxy, Connection};
 use zbus::zvariant::OwnedObjectPath;
+use zbus::{proxy, Connection};
 
 // ── DBus Proxies ─────────────────────────────────────────────────────────────
 
@@ -23,7 +23,9 @@ trait Manager {
 
     /// Returns a list of images. Signature: a(ssbttto)
     /// (name, type, read-only, creation-time, modification-time, usage, object-path)
-    fn list_images(&self) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
+    fn list_images(
+        &self,
+    ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
 
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
@@ -51,7 +53,6 @@ trait Machine {
 
 // ── Unified data model ────────────────────────────────────────────────────────
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum ContainerState {
     Running,
     Off,
@@ -114,10 +115,9 @@ impl SystemdManager {
     }
 
     async fn connection(&self) -> Option<&Connection> {
-        let conn_opt = self.conn
-            .get_or_init(|| async {
-                Connection::system().await.ok()
-            })
+        let conn_opt = self
+            .conn
+            .get_or_init(|| async { Connection::system().await.ok() })
             .await;
         conn_opt.as_ref()
     }
@@ -159,7 +159,9 @@ impl SystemdManager {
         let mut running_names = HashMap::new();
 
         for (name, _class, _service, _path) in machines {
-            if name == ".host" { continue; }
+            if name == ".host" {
+                continue;
+            }
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
             let formatted: Vec<String> = addrs
                 .into_iter()
@@ -169,7 +171,9 @@ impl SystemdManager {
         }
 
         for (name, img_type, readonly, _cr, _mod, usage, _path) in images {
-            if name == ".host" { continue; }
+            if name == ".host" {
+                continue;
+            }
             let addrs = running_names.get(&name).cloned().unwrap_or_default();
             let state = if running_names.contains_key(&name) {
                 ContainerState::Running
@@ -194,7 +198,9 @@ impl SystemdManager {
 
         // Handle machines without images (e.g. transient)
         for (name, addrs) in running_names {
-            if name == ".host" { continue; }
+            if name == ".host" {
+                continue;
+            }
             if !entries.iter().any(|e: &ContainerEntry| e.name == name) {
                 entries.push(ContainerEntry {
                     name: name.clone(),
@@ -257,7 +263,9 @@ impl SystemdManager {
                 continue;
             }
             let name = parts[0].to_string();
-            if name == ".host" { continue; }
+            if name == ".host" {
+                continue;
+            }
             let addrs = running.get(&name).cloned().unwrap_or_default();
             let addr = addrs.first().cloned();
             let state = if running.contains_key(&name) {
@@ -278,7 +286,9 @@ impl SystemdManager {
         }
 
         for (name, addrs) in &running {
-            if name == ".host" { continue; }
+            if name == ".host" {
+                continue;
+            }
             if !entries.iter().any(|e| &e.name == name) {
                 entries.push(ContainerEntry {
                     name: name.clone(),
@@ -340,7 +350,9 @@ impl SystemdManager {
                 continue;
             }
             current_machine = parts[0].to_string();
-            if current_machine == ".host" { continue; }
+            if current_machine == ".host" {
+                continue;
+            }
             let mut ips = Vec::new();
             if let Some(addr) = parts.get(5).copied() {
                 if !addr.is_empty() && addr != "-" {
@@ -379,13 +391,15 @@ impl NspawnManager for SystemdManager {
         // machinectl start uses org.freedesktop.systemd1.Manager.StartUnit
         if let Some(conn) = self.connection().await {
             let unit = format!("systemd-nspawn@{}.service", name);
-            let result = conn.call_method(
-                Some("org.freedesktop.systemd1"),
-                "/org/freedesktop/systemd1",
-                Some("org.freedesktop.systemd1.Manager"),
-                "StartUnit",
-                &(&unit, "fail"),
-            ).await;
+            let result = conn
+                .call_method(
+                    Some("org.freedesktop.systemd1"),
+                    "/org/freedesktop/systemd1",
+                    Some("org.freedesktop.systemd1.Manager"),
+                    "StartUnit",
+                    &(&unit, "fail"),
+                )
+                .await;
             if result.is_ok() {
                 return Ok(());
             }
@@ -393,7 +407,6 @@ impl NspawnManager for SystemdManager {
         self.mark_fallback();
         self.run_machinectl(&["start", name]).await
     }
-
 
     async fn terminate(&self, name: &str) -> Result<()> {
         self.require_root()?;
@@ -423,7 +436,11 @@ impl NspawnManager for SystemdManager {
         self.require_root()?;
         // machinectl reboot = KillMachine(name, "leader", SIGINT)
         if let Some(proxy) = self.manager_proxy().await {
-            if proxy.kill_machine(name, "leader", libc::SIGINT).await.is_ok() {
+            if proxy
+                .kill_machine(name, "leader", libc::SIGINT)
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
         }
@@ -496,8 +513,14 @@ impl NspawnManager for SystemdManager {
 
                     if let Ok(builder) = builder {
                         if let Ok(props_proxy) = builder.build().await {
-                            let interface: zbus::names::InterfaceName = "org.freedesktop.machine1.Machine".try_into().unwrap_or_else(|_| "org.freedesktop.machine1.Machine".try_into().unwrap());
-                            if let Ok(all_props) = props_proxy.get_all(Some(interface).into()).await {
+                            let interface: zbus::names::InterfaceName =
+                                "org.freedesktop.machine1.Machine"
+                                    .try_into()
+                                    .unwrap_or_else(|_| {
+                                        "org.freedesktop.machine1.Machine".try_into().unwrap()
+                                    });
+                            if let Ok(all_props) = props_proxy.get_all(Some(interface).into()).await
+                            {
                                 for (k, v) in all_props {
                                     map.insert(k, value_to_string(v.into()));
                                 }
@@ -518,7 +541,8 @@ impl NspawnManager for SystemdManager {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     if let Some((k, v)) = line.split_once('=') {
-                        map.entry(k.trim().to_string()).or_insert_with(|| v.trim().to_string());
+                        map.entry(k.trim().to_string())
+                            .or_insert_with(|| v.trim().to_string());
                     }
                 }
             }
@@ -553,218 +577,12 @@ impl NspawnManager for SystemdManager {
         Ok(map)
     }
 
-    async fn create(
-        &self,
-        _cfg: &super::models::ContainerConfig,
-        _storage: &dyn super::storage::StorageBackend,
-    ) -> Result<()> {
-        // This will be implemented when refactoring the creation logic.
-        todo!("Implement create in SystemdManager")
-    }
-
     async fn is_dbus_available(&self) -> bool {
         self.connection().await.is_some()
     }
 
     fn did_fallback(&self) -> bool {
         self.last_fallback.swap(false, Ordering::Relaxed)
-    }
-}
-
-/// Normalizes an OCI image reference for use with skopeo.
-/// If it already contains a transport (e.g. docker://), it is returned as is.
-/// Otherwise, docker:// is prepended.
-fn normalize_oci_image_ref(image_ref: &str) -> String {
-    let transports = [
-        "docker://",
-        "oci:",
-        "dir:",
-        "docker-archive:",
-        "docker-daemon:",
-        "ostree:",
-        "containers-storage:",
-    ];
-    if transports.iter().any(|t| image_ref.starts_with(t)) || image_ref.contains("://") {
-        image_ref.to_string()
-    } else {
-        format!("docker://{}", image_ref)
-    }
-}
-
-/// Import an OCI registry image as a nspawn rootfs directory.
-pub async fn import_oci_image(
-    image_ref: &str,
-    local_name: &str,
-    dest: &std::path::Path,
-) -> Result<()> {
-    check_tool("skopeo")?;
-    check_tool("umoci")?;
-
-    let normalized_ref = normalize_oci_image_ref(image_ref);
-    let tmp_oci = format!("/tmp/lasper-oci-{}-{}", local_name, std::process::id());
-    let bundle_dir = format!("/tmp/lasper-bundle-{}-{}", local_name, std::process::id());
-
-    // Closure for cleanup
-    let cleanup = || {
-        let t = tmp_oci.clone();
-        let b = bundle_dir.clone();
-        async move {
-            let _ = tokio::fs::remove_dir_all(&t).await;
-            let _ = tokio::fs::remove_dir_all(&b).await;
-        }
-    };
-
-    log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci);
-    let skopeo = Command::new("skopeo")
-        .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci)])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
-
-    if !skopeo.status.success() {
-        cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "skopeo copy".into(),
-            String::from_utf8_lossy(&skopeo.stderr).trim().to_string(),
-        ));
-    }
-
-    log::info!("umoci unpack --image {}:latest {}", tmp_oci, bundle_dir);
-    let umoci = Command::new("umoci")
-        .args([
-            "unpack",
-            "--image",
-            &format!("{}:latest", tmp_oci),
-            &bundle_dir,
-        ])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
-
-    if !umoci.status.success() {
-        cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "umoci unpack".into(),
-            String::from_utf8_lossy(&umoci.stderr).trim().to_string(),
-        ));
-    }
-
-    // Move rootfs content to dest
-    let rootfs_source = std::path::Path::new(&bundle_dir).join("rootfs");
-    if !rootfs_source.exists() {
-        cleanup().await;
-        return Err(NspawnError::DeployError(
-            "umoci unpack did not create rootfs directory".into(),
-        ));
-    }
-
-    log::info!(
-        "Moving rootfs from {} to {}",
-        rootfs_source.display(),
-        dest.display()
-    );
-
-    // Ensure dest directory exists (or at least its parent)
-    if let Some(parent) = dest.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-
-    // Use 'cp -a' to copy contents including dotfiles, then cleanup
-    let copy_out = Command::new("cp")
-        .args([
-            "-a",
-            &format!("{}/.", rootfs_source.to_string_lossy()),
-            &dest.to_string_lossy(),
-        ])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
-
-    if !copy_out.status.success() {
-        cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "cp rootfs".into(),
-            String::from_utf8_lossy(&copy_out.stderr).trim().to_string(),
-        ));
-    }
-
-    cleanup().await;
-    log::info!("OCI image imported to {}", dest.display());
-    Ok(())
-}
-
-/// Import a local disk image (.raw/.tar/.tar.gz/.qcow2) via `importctl`.
-pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::Path) -> Result<()> {
-    check_tool("importctl")?;
-
-    let subcommand = if path.ends_with(".tar")
-        || path.ends_with(".tar.gz")
-        || path.ends_with(".tar.xz")
-        || path.ends_with(".tar.zst")
-    {
-        "import-tar"
-    } else {
-        "import-raw"
-    };
-
-    log::info!("importctl {} {} {}", subcommand, path, local_name);
-    let out = Command::new("importctl")
-        .args([subcommand, path, local_name])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("importctl"), e))?;
-
-    if !out.status.success() {
-        return Err(NspawnError::CommandFailed(
-            "importctl".into(),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        ));
-    }
-
-    let default_dest = std::path::PathBuf::from(format!("/var/lib/machines/{}", local_name));
-    if dest != default_dest {
-        log::info!("Moving imported image to {}", dest.display());
-        tokio::fs::rename(&default_dest, dest)
-            .await
-            .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
-    }
-
-    Ok(())
-}
-
-pub fn check_tool(name: &str) -> Result<()> {
-    let found = std::env::var_os("PATH")
-        .unwrap_or_default()
-        .to_string_lossy()
-        .split(':')
-        .map(|d| std::path::PathBuf::from(d).join(name))
-        .any(|p| p.is_file());
-    if found {
-        Ok(())
-    } else {
-        Err(NspawnError::ToolNotFound(name.to_string()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_normalize_oci_image_ref() {
-        assert_eq!(normalize_oci_image_ref("ubuntu"), "docker://ubuntu");
-        assert_eq!(
-            normalize_oci_image_ref("docker://ubuntu"),
-            "docker://ubuntu"
-        );
-        assert_eq!(
-            normalize_oci_image_ref("nvcr.io/nvidia/cuda:12.0"),
-            "docker://nvcr.io/nvidia/cuda:12.0"
-        );
-        assert_eq!(
-            normalize_oci_image_ref("oci:/tmp/myimage:latest"),
-            "oci:/tmp/myimage:latest"
-        );
     }
 }
 

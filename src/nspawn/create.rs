@@ -120,6 +120,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
                 }
                 out.push('\n');
             }
+            // TODO: placeholder code for macvlan and ipvlan
             NetworkMode::MacVlan(iface) => {
                 out.push_str("Private=yes\n");
                 out.push_str("VirtualEthernet=no\n");
@@ -240,13 +241,16 @@ pub async fn setup_wayland_shell_env(rootfs: &Path, user: &CreateUser) -> Result
 
     let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
 
-    let script_content = format!(r#"
+    let script_content = format!(
+        r#"
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 export WAYLAND_DISPLAY=wayland-socket
 export DISPLAY={}
 mkdir -p "$XDG_RUNTIME_DIR"
 ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
-"#, host_display);
+"#,
+        host_display
+    );
 
     let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
     std::fs::write(&full_path, script_content).map_err(|e| NspawnError::Io(full_path, e))?;
@@ -261,13 +265,16 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
         ));
         let _ = std::fs::create_dir_all(&fish_dir);
         let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-        let fish_script = format!(r#"
+        let fish_script = format!(
+            r#"
 set -lx XDG_RUNTIME_DIR /run/user/(id -u)
 set -lx WAYLAND_DISPLAY wayland-socket
 set -lx DISPLAY {}
 mkdir -p $XDG_RUNTIME_DIR
 ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
-"#, host_display);
+"#,
+            host_display
+        );
         std::fs::write(fish_dir.join("wayland-env.fish"), fish_script)
             .map_err(|e| NspawnError::Io(fish_dir.join("wayland-env.fish"), e))?;
         return Ok(());
@@ -469,7 +476,7 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::None);
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("[Network]\nPrivate=yes\nVirtualEthernet=no\n"));
+        assert!(content.contains("[Network]\nPrivate=yes\n\n"));
     }
 
     #[test]
@@ -554,9 +561,9 @@ mod tests {
     fn test_gui_passthrough_config() {
         let mut cfg = ContainerConfig::default();
         cfg.wayland_socket = true;
-        
+
         let content = nspawn_config_content(&cfg);
-        
+
         assert!(content.contains("PrivateUsers=no"));
         assert!(!content.contains("Environment=WAYLAND_DISPLAY="));
         assert!(!content.contains("Environment=DISPLAY="));

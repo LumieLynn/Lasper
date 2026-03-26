@@ -1,6 +1,6 @@
 use super::errors::Result;
 use super::machinectl::ContainerEntry;
-use super::models::ContainerConfig;
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -37,13 +37,6 @@ pub trait NspawnManager: Send + Sync {
 
     /// Send a signal to processes of a container.
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
-
-    /// Create a new container with the given configuration and storage backend.
-    async fn create(
-        &self,
-        cfg: &ContainerConfig,
-        storage: &dyn super::storage::StorageBackend,
-    ) -> Result<()>;
 
     /// Check if DBus is available and being used.
     async fn is_dbus_available(&self) -> bool;
