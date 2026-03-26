@@ -56,7 +56,9 @@ trait Machine {
 pub enum ContainerState {
     Running,
     Off,
+    #[allow(dead_code)]
     Starting,
+    #[allow(dead_code)]
     Exiting,
 }
 

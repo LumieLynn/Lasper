@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 /// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
-#[allow(dead_code)]
 pub struct NspawnConfig {
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub content: String,
 }

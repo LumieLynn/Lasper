@@ -4,7 +4,6 @@ use super::machinectl::ContainerEntry;
 use async_trait::async_trait;
 
 #[async_trait]
-#[allow(dead_code)]
 pub trait NspawnManager: Send + Sync {
     /// List all containers (running and poweroff).
     async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
