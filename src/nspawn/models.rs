@@ -91,3 +91,60 @@ pub struct ContainerConfig {
     /// Raw storage specific configuration (only used if storage type is Raw).
     pub raw_config: Option<RawStorageConfig>,
 }
+
+// ── Unified data model ────────────────────────────────────────────────────────
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContainerState {
+    Running,
+    Off,
+    #[allow(dead_code)]
+    Starting,
+    #[allow(dead_code)]
+    Exiting,
+}
+
+impl ContainerState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Off => "poweroff",
+            Self::Starting => "starting",
+            Self::Exiting => "exiting",
+        }
+    }
+    pub fn is_running(&self) -> bool {
+        matches!(self, Self::Running | Self::Starting | Self::Exiting)
+    }
+}
+
+/// A container known to machinectl — either running, poweroff, or both.
+#[derive(Debug, Clone)]
+pub struct ContainerEntry {
+    /// The name used by machinectl
+    pub name: String,
+    /// Current lifecycle state
+    pub state: ContainerState,
+    /// Image type ("directory", "raw", "tar", …) — from list-images, None if only seen running
+    pub image_type: Option<String>,
+    /// Whether the image is read-only (from list-images)
+    pub readonly: bool,
+    /// Disk usage string (from list-images)
+    pub usage: Option<String>,
+    /// Network address (from list, only when running)
+    pub address: Option<String>,
+    /// All network addresses
+    pub all_addresses: Vec<String>,
+}
+
+/// Strongly-typed properties for a machine/container.
+#[derive(Debug, Clone, Default)]
+pub struct MachineProperties {
+    /// All raw properties returned by systemd DBus / machinectl show.
+    pub properties: std::collections::HashMap<String, String>,
+    // Placeholders for future metrics
+    #[allow(dead_code)]
+    pub cpu_usage: Option<f64>,
+    #[allow(dead_code)]
+    pub memory_usage: Option<u64>,
+}
+

@@ -10,8 +10,8 @@ use std::io::Stdout;
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     StatusLevel,
-    manager::NspawnManager,
-    machinectl::{ContainerEntry, SystemdManager},
+    manager::{NspawnManager, DefaultManager},
+    models::ContainerEntry,
 };
 use crate::ui::wizard::{Wizard, StepAction as WizardAction};
 
@@ -49,7 +49,7 @@ pub struct App {
     pub show_power_menu: bool,
     pub power_menu_selected: usize,
     pub dbus_active: bool,
-    pub manager: Box<dyn NspawnManager>,
+    pub manager: std::sync::Arc<dyn NspawnManager>,
 }
 
 impl App {
@@ -74,7 +74,7 @@ impl App {
             show_power_menu: false,
             power_menu_selected: 0,
             dbus_active: true, // Default to true, will be updated on refresh
-            manager: Box::new(SystemdManager::new(is_root)),
+            manager: std::sync::Arc::new(DefaultManager::new(is_root)),
         }
     }
 
@@ -84,8 +84,30 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
         let mut events = EventHandler::new(100);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let manager_clone = self.manager.clone();
+        
+        tokio::spawn(async move {
+            loop {
+                if let Ok(entries) = manager_clone.list_all().await {
+                    let _ = tx.send(entries).await;
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        });
+
         self.refresh().await;
         loop {
+            while let Ok(entries) = rx.try_recv() {
+                let prev_name = self.entries.get(self.selected).map(|e| e.name.clone());
+                self.entries = entries;
+                self.selected = prev_name
+                    .and_then(|name| self.entries.iter().position(|e| e.name == name))
+                    .unwrap_or(0)
+                    .min(self.entries.len().saturating_sub(1));
+                self.refresh_detail().await;
+            }
+
             terminal.draw(|f| crate::ui::draw(f, self))?;
             match events.rx.recv().await {
                 Some(AppEvent::Key(key)) => self.handle_key(key).await,
@@ -107,7 +129,6 @@ impl App {
                 self.status_expiry = None;
             }
         }
-        self.refresh().await;
     }
 
     pub async fn refresh(&mut self) {
@@ -115,8 +136,12 @@ impl App {
         self.dbus_active = self.manager.is_dbus_available().await;
         match self.manager.list_all().await {
             Ok(entries) => {
+                let prev_name = self.entries.get(self.selected).map(|e| e.name.clone());
                 self.entries = entries;
-                self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+                self.selected = prev_name
+                    .and_then(|name| self.entries.iter().position(|e| e.name == name))
+                    .unwrap_or(0)
+                    .min(self.entries.len().saturating_sub(1));
             }
             Err(e) => log::error!("list_all: {}", e),
         }
@@ -140,37 +165,40 @@ impl App {
         };
         match self.detail_pane {
             DetailPane::Properties | DetailPane::Details => {
-                if entry.state.is_running() {
-                    match self.manager.get_properties(&entry.name).await {
-                        Ok(mut p) => {
-                            if !entry.all_addresses.is_empty() {
-                                p.insert("IPAddresses".into(), entry.all_addresses.join(", "));
-                            }
-                            if let Some(ufs) = p.get("UnitFileState") {
-                                p.insert("Enabled".into(), ufs.clone());
-                            }
-                            // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
-                            if let Some(image_type) = &entry.image_type {
-                                if let Some(machine_type) = p.remove("Type") {
-                                    p.insert("Class".into(), machine_type);
-                                }
-                                p.insert("Type".into(), image_type.clone());
-                            }
-                            self.properties = p;
+                match self.manager.get_properties(&entry.name).await {
+                    Ok(machine_props) => {
+                        let mut p = machine_props.properties;
+                        if !entry.all_addresses.is_empty() {
+                            p.insert("IPAddresses".into(), entry.all_addresses.join(", "));
                         }
-                        Err(e) => { self.properties.clear(); log::debug!("{e}"); }
-                    }
-                } else {
-                    self.properties.clear();
-                    if let Some(t) = &entry.image_type { self.properties.insert("Type".into(), t.clone()); }
-                    self.properties.insert("ReadOnly".into(), entry.readonly.to_string());
-                    if let Some(u) = &entry.usage { self.properties.insert("Usage".into(), u.clone()); }
-                    self.properties.insert("State".into(), entry.state.label().into());
-
-                    // Try to get UnitFileState for enabled status
-                    if let Ok(p) = self.manager.get_properties(&entry.name).await {
                         if let Some(ufs) = p.get("UnitFileState") {
-                            self.properties.insert("Enabled".into(), ufs.clone());
+                            p.insert("Enabled".into(), ufs.clone());
+                        }
+                        // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
+                        if let Some(image_type) = &entry.image_type {
+                            if let Some(machine_type) = p.remove("Type") {
+                                p.insert("Class".into(), machine_type);
+                            }
+                            p.insert("Type".into(), image_type.clone());
+                        }
+                        
+                        // For stopped containers, manually ensure expected static fields
+                        if !entry.state.is_running() {
+                            p.insert("ReadOnly".into(), entry.readonly.to_string());
+                            if let Some(u) = &entry.usage { p.insert("Usage".into(), u.clone()); }
+                            p.insert("State".into(), entry.state.label().into());
+                        }
+                        
+                        self.properties = p;
+                    }
+                    Err(e) => { 
+                        self.properties.clear(); 
+                        log::debug!("{e}"); 
+                        if !entry.state.is_running() {
+                            if let Some(t) = &entry.image_type { self.properties.insert("Type".into(), t.clone()); }
+                            self.properties.insert("ReadOnly".into(), entry.readonly.to_string());
+                            if let Some(u) = &entry.usage { self.properties.insert("Usage".into(), u.clone()); }
+                            self.properties.insert("State".into(), entry.state.label().into());
                         }
                     }
                 }

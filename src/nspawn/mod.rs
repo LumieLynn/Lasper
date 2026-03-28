@@ -4,14 +4,14 @@ pub mod config;
 pub mod create;
 pub mod deploy;
 pub mod errors;
-pub mod machinectl;
+pub mod provider;
 pub mod manager;
 pub mod models;
 pub mod nvidia;
 pub mod storage;
 
-pub use machinectl::ContainerEntry;
-pub use machinectl::ContainerState;
+pub use models::ContainerEntry;
+pub use models::ContainerState;
 
 /// Severity level for status messages shown in the UI.
 #[derive(Debug, Clone, PartialEq)]
