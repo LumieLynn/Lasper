@@ -27,9 +27,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
-    if app.show_power_menu { PowerMenu::new(app.power_menu_selected).render(f, area); }
-    if app.show_wizard  { app.wizard.render(f, area); }
-    if app.show_help    { render_help(f); }
+    if app.ui.show_power_menu { PowerMenu::new(app.ui.power_menu_selected).render(f, area); }
+    if app.ui.show_wizard  { app.wizard.render(f, area); }
+    if app.ui.show_help    { render_help(f); }
 }
 
 
@@ -65,6 +65,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 // ── Content ───────────────────────────────────────────────────────────────────
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
+    app.ui.pane_height = area.height.saturating_sub(2);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])

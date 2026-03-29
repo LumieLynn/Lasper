@@ -33,7 +33,7 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let selected = match app.detail_pane {
+    let selected = match app.ui.detail_pane {
         DetailPane::Properties => 0,
         DetailPane::Details => 1,
         DetailPane::Logs => 2,
@@ -71,7 +71,7 @@ fn render_sub_tabs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_pane(f: &mut Frame, app: &mut App, area: Rect) {
-    match app.detail_pane {
+    match app.ui.detail_pane {
         DetailPane::Properties => render_properties(f, app, area),
         DetailPane::Details => render_full_details(f, app, area),
         DetailPane::Logs => render_logs(f, app, area),
@@ -87,8 +87,25 @@ fn render_properties(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let mut pairs: Vec<(&String, &String)> = app
-        .properties
+    let props = match &app.properties {
+        Ok(p) => p,
+        Err(e) => {
+            let error_text = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(e, Style::default().fg(Color::Red)),
+                ]),
+            ];
+            f.render_widget(
+                Paragraph::new(error_text).block(detail_block(" Properties (Summary) ")).wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+    };
+
+    let mut pairs: Vec<(&String, &String)> = props
         .iter()
         .filter(|(k, _)| IMPORTANT_KEYS.contains(&k.as_str()))
         .collect();
@@ -146,7 +163,25 @@ fn render_full_details(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let mut pairs: Vec<(&String, &String)> = app.properties.iter().collect();
+    let props = match &app.properties {
+        Ok(p) => p,
+        Err(e) => {
+            let error_text = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("  Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(e, Style::default().fg(Color::Red)),
+                ]),
+            ];
+            f.render_widget(
+                Paragraph::new(error_text).block(detail_block(" Full Details (Scroll with ↑/↓) ")).wrap(Wrap { trim: false }),
+                area,
+            );
+            return;
+        }
+    };
+
+    let mut pairs: Vec<(&String, &String)> = props.iter().collect();
     pairs.sort_by_key(|(k, _)| k.as_str());
 
     let rows: Vec<Row> = pairs
@@ -171,7 +206,7 @@ fn render_full_details(f: &mut Frame, app: &mut App, area: Rect) {
         .highlight_symbol(">> ")
         .row_highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
 
-    f.render_stateful_widget(table, area, &mut app.details_state);
+    f.render_stateful_widget(table, area, &mut app.ui.details_state);
 }
 
 // ── Logs ──────────────────────────────────────────────────────────────────────
@@ -198,7 +233,7 @@ fn render_logs(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines)
             .block(detail_block(" Logs "))
             .wrap(Wrap { trim: false })
-            .scroll((app.log_scroll, 0)),
+            .scroll((app.ui.log_scroll, 0)),
         area,
     );
 }
@@ -248,7 +283,7 @@ fn render_config(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines)
             .block(detail_block(" Config "))
             .wrap(Wrap { trim: false })
-            .scroll((app.config_scroll, 0)),
+            .scroll((app.ui.config_scroll, 0)),
         area,
     );
 }

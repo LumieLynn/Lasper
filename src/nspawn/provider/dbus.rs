@@ -177,51 +177,14 @@ impl DbusProvider {
         let mut map = HashMap::new();
 
         // 1) Try machine1 properties (only works for running/registered machines)
-        if let Ok(proxy) = ManagerProxy::new(&conn).await {
-            if let Ok(path) = proxy.get_machine(name).await {
-                let builder = zbus::fdo::PropertiesProxy::builder(&conn)
-                    .destination("org.freedesktop.machine1")
-                    .and_then(|b| b.path(path));
-
-                if let Ok(builder) = builder {
-                    if let Ok(props_proxy) = builder.build().await {
-                        let interface: zbus::names::InterfaceName =
-                            "org.freedesktop.machine1.Machine".try_into().unwrap();
-                        if let Ok(all_props) = props_proxy.get_all(Some(interface).into()).await {
-                            for (k, v) in all_props {
-                                map.insert(k, value_to_string(v.into()));
-                            }
-                        }
-                    }
-                }
-            }
+        if let Ok(m1_props) = get_machine1_properties(&conn, name).await {
+            map.extend(m1_props);
         }
 
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
-        let unit = format!("systemd-nspawn@{}.service", name);
-        if let Ok(reply) = conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "LoadUnit",
-            &(&unit,),
-        ).await {
-            if let Ok(unit_path) = reply.body().deserialize::<zbus::zvariant::OwnedObjectPath>() {
-                let builder = zbus::fdo::PropertiesProxy::builder(&conn)
-                    .destination("org.freedesktop.systemd1")
-                    .and_then(|b| b.path(unit_path));
-
-                if let Ok(builder) = builder {
-                    if let Ok(props_proxy) = builder.build().await {
-                        let interface: zbus::names::InterfaceName =
-                            "org.freedesktop.systemd1.Unit".try_into().unwrap();
-                        if let Ok(all_props) = props_proxy.get_all(Some(interface).into()).await {
-                            for (k, v) in all_props {
-                                map.entry(k).or_insert_with(|| value_to_string(v.into()));
-                            }
-                        }
-                    }
-                }
+        if let Ok(sd_props) = get_systemd1_properties(&conn, name).await {
+            for (k, v) in sd_props {
+                map.entry(k).or_insert(v);
             }
         }
 
@@ -236,16 +199,55 @@ impl DbusProvider {
     }
 }
 
+async fn get_machine1_properties(conn: &Connection, name: &str) -> zbus::Result<HashMap<String, String>> {
+    let proxy = ManagerProxy::new(conn).await?;
+    let path = proxy.get_machine(name).await?;
+    let b = zbus::fdo::PropertiesProxy::builder(conn)
+        .destination("org.freedesktop.machine1")?
+        .path(path)?;
+    let props_proxy = b.build().await?;
+    let interface: zbus::names::InterfaceName = "org.freedesktop.machine1.Machine".try_into().unwrap();
+    let all_props = props_proxy.get_all(Some(interface).into()).await?;
+    let mut map = HashMap::new();
+    for (k, v) in all_props {
+        map.insert(k, value_to_string(v.into()));
+    }
+    Ok(map)
+}
+
+async fn get_systemd1_properties(conn: &Connection, name: &str) -> zbus::Result<HashMap<String, String>> {
+    let unit = format!("systemd-nspawn@{}.service", name);
+    let reply = conn.call_method(
+        Some("org.freedesktop.systemd1"),
+        "/org/freedesktop/systemd1",
+        Some("org.freedesktop.systemd1.Manager"),
+        "LoadUnit",
+        &(&unit,),
+    ).await?;
+    let unit_path = reply.body().deserialize::<zbus::zvariant::OwnedObjectPath>()?;
+    let b = zbus::fdo::PropertiesProxy::builder(conn)
+        .destination("org.freedesktop.systemd1")?
+        .path(unit_path)?;
+    let props_proxy = b.build().await?;
+    let interface: zbus::names::InterfaceName = "org.freedesktop.systemd1.Unit".try_into().unwrap();
+    let all_props = props_proxy.get_all(Some(interface).into()).await?;
+    let mut map = HashMap::new();
+    for (k, v) in all_props {
+        map.insert(k, value_to_string(v.into()));
+    }
+    Ok(map)
+}
+
 fn format_address(family: i32, data: &[u8]) -> String {
     match family {
-        2 => {
+        libc::AF_INET => {
             if data.len() == 4 {
                 format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3])
             } else {
                 String::new()
             }
         }
-        10 => {
+        libc::AF_INET6 => {
             if data.len() == 16 {
                 let mut s = String::new();
                 for i in 0..8 {
