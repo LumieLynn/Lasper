@@ -4,7 +4,7 @@ pub mod actions;
 pub mod handlers;
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal, widgets::TableState};
 use std::io::Stdout;
@@ -120,13 +120,6 @@ impl App {
         self.refresh().await;
         loop {
             while let Ok(entries) = rx.try_recv() {
-                if let Some(time) = self.data.action_cooldown {
-                    if Instant::now().duration_since(time) < Duration::from_secs(2) {
-                        continue;
-                    } else {
-                        self.data.action_cooldown = None;
-                    }
-                }
                 let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
                 self.data.entries = entries;
                 self.data.selected = prev_name

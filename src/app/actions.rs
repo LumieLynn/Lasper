@@ -105,9 +105,19 @@ impl App {
         }
     }
 
+    pub fn check_action_cooldown(&mut self) -> bool {
+        if let Some(time) = self.data.action_cooldown {
+            if Instant::now().duration_since(time) < Duration::from_secs(2) {
+                return false;
+            }
+        }
+        self.data.action_cooldown = Some(Instant::now());
+        true
+    }
+
     pub async fn action_start(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             if !e.state.is_running() {
                 match self.data.manager.start(&e.name).await {
                     Ok(_) => {
@@ -121,8 +131,8 @@ impl App {
     }
 
     pub async fn action_poweroff(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
                 match self.data.manager.poweroff(&e.name).await {
                     Ok(_) => {
@@ -136,8 +146,8 @@ impl App {
     }
 
     pub async fn action_terminate(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
                 match self.data.manager.terminate(&e.name).await {
                     Ok(_) => {
@@ -151,8 +161,8 @@ impl App {
     }
 
     pub async fn action_reboot(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
                 match self.data.manager.reboot(&e.name).await {
                     Ok(_) => {
@@ -166,8 +176,8 @@ impl App {
     }
 
     pub async fn action_kill(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
                 // For now, just send SIGTERM via kill
                 match self.data.manager.kill(&e.name, "SIGTERM").await {
@@ -182,8 +192,8 @@ impl App {
     }
 
     pub async fn action_enable(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             match self.data.manager.enable(&e.name).await {
                 Ok(_) => self.set_status(format!("Enabled {}", e.name), StatusLevel::Success),
                 Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -192,8 +202,8 @@ impl App {
     }
 
     pub async fn action_disable(&mut self) {
+        if !self.check_action_cooldown() { return; }
         if let Some(e) = self.data.entries.get(self.data.selected) {
-            self.data.action_cooldown = Some(Instant::now());
             match self.data.manager.disable(&e.name).await {
                 Ok(_) => self.set_status(format!("Disabled {}", e.name), StatusLevel::Success),
                 Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
