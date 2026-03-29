@@ -19,6 +19,14 @@ impl BasicStep {
 impl IStep for BasicStep {
     fn title(&self) -> String { "Basic Settings".into() }
 
+    fn next_step(&self, context: &WizardContext) -> Option<Box<dyn IStep>> {
+        if context.source.kind == crate::ui::wizard::context::SourceKind::Copy {
+            Some(Box::new(crate::ui::wizard::steps::review::ReviewStep::new()))
+        } else {
+            Some(Box::new(crate::ui::wizard::steps::storage::StorageStep::new()))
+        }
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

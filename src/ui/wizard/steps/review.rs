@@ -19,6 +19,10 @@ impl ReviewStep {
 impl IStep for ReviewStep {
     fn title(&self) -> String { "Review Configuration".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::deploy::DeployStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

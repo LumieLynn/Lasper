@@ -22,6 +22,10 @@ impl DevicesStep {
 impl IStep for DevicesStep {
     fn title(&self) -> String { "Devices & Bind Mounts".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::review::ReviewStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

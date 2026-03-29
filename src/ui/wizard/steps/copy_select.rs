@@ -21,6 +21,10 @@ impl CopySelectStep {
 impl IStep for CopySelectStep {
     fn title(&self) -> String { "Select Container to Clone".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::basic::BasicStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

@@ -34,6 +34,11 @@ pub trait IStep {
     
     /// Processes a key event for this step and returns the resulting action.
     async fn handle_key(&mut self, key: KeyEvent, context: &mut self::context::WizardContext) -> StepAction;
+
+    /// Return the next step this step leads to, to build the state machine dynamically.
+    fn next_step(&self, _context: &self::context::WizardContext) -> Option<Box<dyn IStep>> {
+        None
+    }
 }
 
 pub mod steps;

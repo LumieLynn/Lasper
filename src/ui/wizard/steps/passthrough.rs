@@ -22,6 +22,10 @@ impl PassthroughStep {
 impl IStep for PassthroughStep {
     fn title(&self) -> String { "Hardware & Display Passthrough".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::devices::DevicesStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

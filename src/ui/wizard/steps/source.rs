@@ -26,6 +26,14 @@ impl IStep for SourceStep {
         "Source Selection".into()
     }
 
+    fn next_step(&self, context: &WizardContext) -> Option<Box<dyn IStep>> {
+        if context.source.kind == crate::ui::wizard::context::SourceKind::Copy {
+            Some(Box::new(crate::ui::wizard::steps::copy_select::CopySelectStep::new()))
+        } else {
+            Some(Box::new(crate::ui::wizard::steps::basic::BasicStep::new()))
+        }
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

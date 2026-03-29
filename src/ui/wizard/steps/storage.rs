@@ -23,6 +23,10 @@ impl StorageStep {
 impl IStep for StorageStep {
     fn title(&self) -> String { "Storage Backend".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::user::UserStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)

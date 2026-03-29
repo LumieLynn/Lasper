@@ -98,40 +98,10 @@ impl Wizard {
     }
 
     fn next_step(&mut self) {
-        let next: Option<Box<dyn IStep>> = match self.current_step_idx {
-            0 => { // From Source
-                if self.context.source.kind == SourceKind::Copy {
-                    Some(Box::new(steps::copy_select::CopySelectStep::new()))
-                } else {
-                    Some(Box::new(steps::basic::BasicStep::new()))
-                }
-            }
-            1 => { // From CopySelect or Basic
-                 if self.context.source.kind == SourceKind::Copy {
-                     Some(Box::new(steps::basic::BasicStep::new()))
-                 } else {
-                     Some(Box::new(steps::storage::StorageStep::new()))
-                 }
-            }
-            2 => { // From Basic (Clone) or Storage
-                 if self.context.source.kind == SourceKind::Copy {
-                     Some(Box::new(steps::review::ReviewStep::new()))
-                 } else {
-                     Some(Box::new(steps::user::UserStep::new()))
-                 }
-            }
-            3 => { // From Review (Clone) or User
-                 if self.context.source.kind == SourceKind::Copy {
-                     Some(Box::new(steps::deploy::DeployStep::new()))
-                 } else {
-                     Some(Box::new(steps::network::NetworkStep::new()))
-                 }
-            }
-            4 => Some(Box::new(steps::passthrough::PassthroughStep::new())),
-            5 => Some(Box::new(steps::devices::DevicesStep::new())),
-            6 => Some(Box::new(steps::review::ReviewStep::new())),
-            7 => Some(Box::new(steps::deploy::DeployStep::new())),
-            _ => None,
+        let next = if let Some(current) = self.steps.get(self.current_step_idx) {
+            current.next_step(&self.context)
+        } else {
+            None
         };
 
         if let Some(s) = next {

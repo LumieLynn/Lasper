@@ -25,6 +25,10 @@ impl UserStep {
 impl IStep for UserStep {
     fn title(&self) -> String { "User Setup".into() }
 
+    fn next_step(&self, _context: &WizardContext) -> Option<Box<dyn IStep>> {
+        Some(Box::new(crate::ui::wizard::steps::network::NetworkStep::new()))
+    }
+
     fn render(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
         if context.user.is_editing {
             self.render_edit(f, area, context);
