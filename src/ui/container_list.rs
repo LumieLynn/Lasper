@@ -11,7 +11,7 @@ use crate::nspawn::ContainerState;
 use crate::ui::widgets::list::ScrollableList;
 
 pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
-    let items: Vec<ListItem> = app.entries.iter().map(|e| {
+    let items: Vec<ListItem> = app.data.entries.iter().map(|e| {
         let (icon, color) = match &e.state {
             ContainerState::Running  => ("● ", Color::Green),
             ContainerState::Starting => ("◑ ", Color::Yellow),
@@ -42,13 +42,13 @@ pub fn render(f: &mut Frame, app: &mut App, area: Rect) {
         ListItem::new(Line::from(spans))
     }).collect();
 
-    let selected = if app.entries.is_empty() { None } else { Some(app.selected) };
+    let selected = if app.data.entries.is_empty() { None } else { Some(app.data.selected) };
     
     ScrollableList::new(" Containers ", items)
         .selected(selected)
         .render(f, area);
 
-    if app.entries.is_empty() {
+    if app.data.entries.is_empty() {
         let hint = if app.is_root {
             "  No containers in /var/lib/machines"
         } else {

@@ -6,39 +6,39 @@ use super::{App, DetailPane};
 impl App {
     pub async fn refresh(&mut self) {
         if self.ui.show_wizard || self.ui.show_help || self.ui.show_power_menu { return; }
-        self.dbus_active = self.manager.is_dbus_available().await;
-        match self.manager.list_all().await {
+        self.data.dbus_active = self.data.manager.is_dbus_available().await;
+        match self.data.manager.list_all().await {
             Ok(entries) => {
-                let prev_name = self.entries.get(self.selected).map(|e| e.name.clone());
-                self.entries = entries;
-                self.selected = prev_name
-                    .and_then(|name| self.entries.iter().position(|e| e.name == name))
+                let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
+                self.data.entries = entries;
+                self.data.selected = prev_name
+                    .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
                     .unwrap_or(0)
-                    .min(self.entries.len().saturating_sub(1));
+                    .min(self.data.entries.len().saturating_sub(1));
             }
             Err(e) => log::error!("list_all: {}", e),
         }
         self.refresh_detail().await;
 
         // Check if any DBus call fell back to CLI during this refresh
-        if self.dbus_active && self.manager.did_fallback() {
+        if self.data.dbus_active && self.data.manager.did_fallback() {
             self.set_status("⚡ DBus call failed — used CLI fallback".into(), StatusLevel::Warn);
         }
     }
 
     pub async fn refresh_detail(&mut self) {
-        let entry: ContainerEntry = match self.entries.get(self.selected) {
+        let entry: ContainerEntry = match self.data.entries.get(self.data.selected) {
             Some(e) => e.clone(),
             Option::None => {
-                self.properties = Ok(HashMap::new());
-                self.log_lines.clear();
-                self.config_content = Option::None;
+                self.data.properties = Ok(HashMap::new());
+                self.data.log_lines.clear();
+                self.data.config_content = Option::None;
                 return;
             }
         };
         match self.ui.detail_pane {
             DetailPane::Properties | DetailPane::Details => {
-                match self.manager.get_properties(&entry.name).await {
+                match self.data.manager.get_properties(&entry.name).await {
                     Ok(machine_props) => {
                         let mut p = machine_props.properties;
                         if !entry.all_addresses.is_empty() {
@@ -62,56 +62,56 @@ impl App {
                             p.insert("State".into(), entry.state.label().into());
                         }
                         
-                        self.properties = Ok(p);
+                        self.data.properties = Ok(p);
                     }
                     Err(e) => { 
                         log::debug!("{e}"); 
-                        self.properties = Err(e.to_string());
+                        self.data.properties = Err(e.to_string());
                     }
                 }
             }
             DetailPane::Logs => {
                 if entry.state.is_running() {
-                    match self.manager.get_logs(&entry.name, 100).await {
-                        Ok(l) => self.log_lines = l,
-                        Err(e) => self.log_lines = vec![format!("Error: {e}")],
+                    match self.data.manager.get_logs(&entry.name, 100).await {
+                        Ok(l) => self.data.log_lines = l,
+                        Err(e) => self.data.log_lines = vec![format!("Error: {e}")],
                     }
                 } else {
-                    self.log_lines = vec!["Container is not running.".into()];
+                    self.data.log_lines = vec!["Container is not running.".into()];
                 }
             }
             DetailPane::Config => {
                 let new_content = crate::nspawn::config::NspawnConfig::load(&entry.name).map(|c| c.content);
-                if self.config_content != new_content { self.ui.config_scroll = 0; }
-                self.config_content = new_content;
+                if self.data.config_content != new_content { self.ui.config_scroll = 0; }
+                self.data.config_content = new_content;
             }
         }
     }
 
     pub fn set_status(&mut self, msg: String, level: StatusLevel) {
-        self.status_message = Some((msg, level));
-        self.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+        self.ui.status_message = Some((msg, level));
+        self.ui.status_expiry = Some(Instant::now() + Duration::from_secs(4));
     }
 
     pub fn select_next(&mut self) {
-        if !self.entries.is_empty() {
-            self.selected = (self.selected + 1) % self.entries.len();
+        if !self.data.entries.is_empty() {
+            self.data.selected = (self.data.selected + 1) % self.data.entries.len();
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.entries.is_empty() {
-            self.selected = if self.selected == 0 { self.entries.len() - 1 } else { self.selected - 1 };
+        if !self.data.entries.is_empty() {
+            self.data.selected = if self.data.selected == 0 { self.data.entries.len() - 1 } else { self.data.selected - 1 };
         }
     }
 
     pub async fn action_start(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
             if !e.state.is_running() {
-                match self.manager.start(&e.name).await {
+                match self.data.manager.start(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
                         self.set_status(format!("Started {}{}", e.name, suffix), StatusLevel::Success);
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -121,12 +121,12 @@ impl App {
     }
 
     pub async fn action_poweroff(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
-                match self.manager.poweroff(&e.name).await {
+                match self.data.manager.poweroff(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
                         self.set_status(format!("Powered off {}{}", e.name, suffix), StatusLevel::Success);
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -136,12 +136,12 @@ impl App {
     }
 
     pub async fn action_terminate(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
-                match self.manager.terminate(&e.name).await {
+                match self.data.manager.terminate(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
                         self.set_status(format!("Terminated {}{}", e.name, suffix), StatusLevel::Success);
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -151,12 +151,12 @@ impl App {
     }
 
     pub async fn action_reboot(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
-                match self.manager.reboot(&e.name).await {
+                match self.data.manager.reboot(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
                         self.set_status(format!("Rebooting {}{}", e.name, suffix), StatusLevel::Success);
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -166,13 +166,13 @@ impl App {
     }
 
     pub async fn action_kill(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
             if e.state.is_running() {
                 // For now, just send SIGTERM via kill
-                match self.manager.kill(&e.name, "SIGTERM").await {
+                match self.data.manager.kill(&e.name, "SIGTERM").await {
                     Ok(_) => {
-                        let suffix = if self.manager.did_fallback() { " (via CLI fallback)" } else { "" };
+                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
                         self.set_status(format!("Sent SIGTERM to {}{}", e.name, suffix), StatusLevel::Success);
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
@@ -182,9 +182,9 @@ impl App {
     }
 
     pub async fn action_enable(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
-            match self.manager.enable(&e.name).await {
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
+            match self.data.manager.enable(&e.name).await {
                 Ok(_) => self.set_status(format!("Enabled {}", e.name), StatusLevel::Success),
                 Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
             }
@@ -192,9 +192,9 @@ impl App {
     }
 
     pub async fn action_disable(&mut self) {
-        if let Some(e) = self.entries.get(self.selected) {
-            self.action_cooldown = Some(Instant::now());
-            match self.manager.disable(&e.name).await {
+        if let Some(e) = self.data.entries.get(self.data.selected) {
+            self.data.action_cooldown = Some(Instant::now());
+            match self.data.manager.disable(&e.name).await {
                 Ok(_) => self.set_status(format!("Disabled {}", e.name), StatusLevel::Success),
                 Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
             }
@@ -202,6 +202,6 @@ impl App {
     }
 
     pub fn selected_entry(&self) -> Option<&ContainerEntry> {
-        self.entries.get(self.selected)
+        self.data.entries.get(self.data.selected)
     }
 }

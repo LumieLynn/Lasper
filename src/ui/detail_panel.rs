@@ -82,12 +82,12 @@ fn render_pane(f: &mut Frame, app: &mut App, area: Rect) {
 // ── Properties ────────────────────────────────────────────────────────────────
 
 fn render_properties(f: &mut Frame, app: &App, area: Rect) {
-    if app.entries.is_empty() {
+    if app.data.entries.is_empty() {
         f.render_widget(empty_block(" Properties "), area);
         return;
     }
 
-    let props = match &app.properties {
+    let props = match &app.data.properties {
         Ok(p) => p,
         Err(e) => {
             let error_text = vec![
@@ -158,12 +158,12 @@ fn render_properties(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_full_details(f: &mut Frame, app: &mut App, area: Rect) {
-    if app.entries.is_empty() {
+    if app.data.entries.is_empty() {
         f.render_widget(empty_block(" All Details "), area);
         return;
     }
 
-    let props = match &app.properties {
+    let props = match &app.data.properties {
         Ok(p) => p,
         Err(e) => {
             let error_text = vec![
@@ -212,18 +212,18 @@ fn render_full_details(f: &mut Frame, app: &mut App, area: Rect) {
 // ── Logs ──────────────────────────────────────────────────────────────────────
 
 fn render_logs(f: &mut Frame, app: &App, area: Rect) {
-    if app.entries.is_empty() {
+    if app.data.entries.is_empty() {
         f.render_widget(empty_block(" Logs "), area);
         return;
     }
 
-    let lines: Vec<Line> = if app.log_lines.is_empty() {
+    let lines: Vec<Line> = if app.data.log_lines.is_empty() {
         vec![Line::from(Span::styled(
             "No log output.",
             Style::default().fg(Color::DarkGray),
         ))]
     } else {
-        app.log_lines
+        app.data.log_lines
             .iter()
             .map(|l| Line::from(Span::raw(l.as_str())))
             .collect()
@@ -241,12 +241,12 @@ fn render_logs(f: &mut Frame, app: &App, area: Rect) {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 fn render_config(f: &mut Frame, app: &App, area: Rect) {
-    if app.entries.is_empty() {
+    if app.data.entries.is_empty() {
         f.render_widget(empty_block(" Config "), area);
         return;
     }
 
-    let text = match &app.config_content {
+    let text = match &app.data.config_content {
         Some(c) => c.clone(),
         Option::None => {
             let name = app.selected_entry().map(|e| e.name.as_str()).unwrap_or("?");

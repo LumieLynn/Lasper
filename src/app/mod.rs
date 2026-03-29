@@ -6,7 +6,6 @@ pub mod handlers;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use anyhow::Result;
-use crossterm::event::KeyEvent;
 use ratatui::{backend::CrosstermBackend, Terminal, widgets::TableState};
 use std::io::Stdout;
 
@@ -24,7 +23,7 @@ use crate::ui::wizard::Wizard;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailPane { Properties, Details, Logs, Config }
 
-pub struct UiState {
+pub struct AppUi {
     pub detail_pane: DetailPane,
     pub details_state: TableState,
     pub log_scroll: u16,
@@ -34,10 +33,15 @@ pub struct UiState {
     pub show_power_menu: bool,
     pub power_menu_selected: usize,
     pub pane_height: u16,
+
+    pub wizard: Wizard,
+
+    pub status_message: Option<(String, StatusLevel)>,
+    pub status_expiry: Option<Instant>,
 }
 
-impl Default for UiState {
-    fn default() -> Self {
+impl AppUi {
+    pub fn new(is_root: bool) -> Self {
         Self {
             detail_pane: DetailPane::Properties,
             details_state: TableState::default(),
@@ -48,34 +52,32 @@ impl Default for UiState {
             show_power_menu: false,
             power_menu_selected: 0,
             pane_height: 10,
+            wizard: Wizard::new(is_root),
+            status_message: None,
+            status_expiry: None,
         }
     }
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
 
+pub struct AppData {
+    pub entries: Vec<ContainerEntry>,
+    pub selected: usize,
+    pub properties: Result<HashMap<String, String>, String>,
+    pub log_lines: Vec<String>,
+    pub config_content: Option<String>,
+    pub dbus_active: bool,
+    pub manager: std::sync::Arc<dyn NspawnManager>,
+    pub action_cooldown: Option<Instant>,
+}
+
 /// Global application state.
 pub struct App {
     pub is_root: bool,
     pub should_quit: bool,
-
-    pub entries: Vec<ContainerEntry>,
-    pub selected: usize,
-
-    pub properties: Result<HashMap<String, String>, String>,
-    pub log_lines: Vec<String>,
-    pub config_content: Option<String>,
-
-    pub wizard: Wizard,
-
-    pub status_message: Option<(String, StatusLevel)>,
-    pub status_expiry: Option<Instant>,
-
-    pub dbus_active: bool,
-    pub manager: std::sync::Arc<dyn NspawnManager>,
-
-    pub ui: UiState,
-    pub action_cooldown: Option<Instant>,
+    pub data: AppData,
+    pub ui: AppUi,
 }
 
 impl App {
@@ -83,18 +85,17 @@ impl App {
         Self {
             is_root,
             should_quit: false,
-            entries: Vec::new(),
-            selected: 0,
-            properties: Ok(HashMap::new()),
-            log_lines: Vec::new(),
-            config_content: None,
-            wizard: Wizard::new(is_root),
-            status_message: None,
-            status_expiry: None,
-            dbus_active: true,
-            manager: std::sync::Arc::new(DefaultManager::new(is_root)),
-            ui: UiState::default(),
-            action_cooldown: None,
+            data: AppData {
+                entries: Vec::new(),
+                selected: 0,
+                properties: Ok(HashMap::new()),
+                log_lines: Vec::new(),
+                config_content: None,
+                dbus_active: true,
+                manager: std::sync::Arc::new(DefaultManager::new(is_root)),
+                action_cooldown: None,
+            },
+            ui: AppUi::new(is_root),
         }
     }
 
@@ -105,7 +106,7 @@ impl App {
     ) -> Result<()> {
         let mut events = EventHandler::new(100);
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let manager_clone = self.manager.clone();
+        let manager_clone = self.data.manager.clone();
         
         tokio::spawn(async move {
             loop {
@@ -119,19 +120,19 @@ impl App {
         self.refresh().await;
         loop {
             while let Ok(entries) = rx.try_recv() {
-                if let Some(time) = self.action_cooldown {
+                if let Some(time) = self.data.action_cooldown {
                     if Instant::now().duration_since(time) < Duration::from_secs(2) {
                         continue;
                     } else {
-                        self.action_cooldown = None;
+                        self.data.action_cooldown = None;
                     }
                 }
-                let prev_name = self.entries.get(self.selected).map(|e| e.name.clone());
-                self.entries = entries;
-                self.selected = prev_name
-                    .and_then(|name| self.entries.iter().position(|e| e.name == name))
+                let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
+                self.data.entries = entries;
+                self.data.selected = prev_name
+                    .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
                     .unwrap_or(0)
-                    .min(self.entries.len().saturating_sub(1));
+                    .min(self.data.entries.len().saturating_sub(1));
                 self.refresh_detail().await;
             }
 
@@ -150,10 +151,10 @@ impl App {
 
     async fn tick(&mut self) {
         // Expire status message
-        if let Some(exp) = self.status_expiry {
+        if let Some(exp) = self.ui.status_expiry {
             if Instant::now() >= exp {
-                self.status_message = None;
-                self.status_expiry = None;
+                self.ui.status_message = None;
+                self.ui.status_expiry = None;
             }
         }
     }

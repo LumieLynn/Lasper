@@ -7,7 +7,7 @@ use super::{App, DetailPane};
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
         if self.ui.show_wizard {
-            match self.wizard.handle_key(key, &self.entries, self.is_root).await {
+            match self.ui.wizard.handle_key(key, &self.data.entries, self.is_root).await {
                 WizardAction::None => {}
                 WizardAction::Close => { self.ui.show_wizard = false; }
                 WizardAction::CloseRefresh => {
@@ -75,7 +75,7 @@ impl App {
                 self.ui.details_state.select(Some(i));
             }
             KeyCode::Down if self.ui.detail_pane == DetailPane::Details => {
-                let len = self.properties.as_ref().map(|p| p.len()).unwrap_or(0);
+                let len = self.data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
                 let i = match self.ui.details_state.selected() {
                     Some(i) => (i + 1).min(len.saturating_sub(1)),
                     None => 0,
@@ -90,7 +90,7 @@ impl App {
                 self.ui.details_state.select(Some(i));
             }
             KeyCode::PageDown if self.ui.detail_pane == DetailPane::Details => {
-                let len = self.properties.as_ref().map(|p| p.len()).unwrap_or(0);
+                let len = self.data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
                 let i = match self.ui.details_state.selected() {
                     Some(i) => (i + step as usize).min(len.saturating_sub(1)),
                     None => 0,
@@ -111,14 +111,14 @@ impl App {
             KeyCode::Char('s') => self.action_start().await,
             KeyCode::Char('S') => self.action_poweroff().await,
             KeyCode::Char('x') | KeyCode::Enter => {
-                if !self.entries.is_empty() {
+                if !self.data.entries.is_empty() {
                     self.ui.show_power_menu = true;
                     self.ui.power_menu_selected = 0;
                 }
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
                 if self.is_root {
-                    self.wizard = Wizard::new(self.is_root);
+                    self.ui.wizard = Wizard::new(self.is_root);
                     self.ui.show_wizard = true;
                 } else {
                     self.set_status("Root required — run: sudo lasper".into(), StatusLevel::Error);

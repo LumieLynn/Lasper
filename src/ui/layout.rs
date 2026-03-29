@@ -28,7 +28,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Overlays (highest priority last so they render on top)
     if app.ui.show_power_menu { PowerMenu::new(app.ui.power_menu_selected).render(f, area); }
-    if app.ui.show_wizard  { app.wizard.render(f, area); }
+    if app.ui.show_wizard  { app.ui.wizard.render(f, area); }
     if app.ui.show_help    { render_help(f); }
 }
 
@@ -48,12 +48,12 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         badge,
     ];
 
-    if !app.dbus_active {
+    if !app.data.dbus_active {
         spans.push(Span::styled(" ⚡ CMD-MODE ",
             Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)));
     }
 
-    spans.push(Span::styled(format!("  {} container(s)", app.entries.len()), Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(format!("  {} container(s)", app.data.entries.len()), Style::default().fg(Color::DarkGray)));
 
     let line = Line::from(spans);
     f.render_widget(
@@ -77,7 +77,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 // ── Status bar ────────────────────────────────────────────────────────────────
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
-    let line = if let Some((msg, level)) = &app.status_message {
+    let line = if let Some((msg, level)) = &app.ui.status_message {
         let color = match level {
             StatusLevel::Info    => Color::White,
             StatusLevel::Success => Color::Green,
