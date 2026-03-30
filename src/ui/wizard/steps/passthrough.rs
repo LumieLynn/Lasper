@@ -8,8 +8,6 @@ use crossterm::event::{KeyCode, KeyEvent};
 use crate::ui::wizard::{IStep, StepAction, WizardContext};
 use crate::ui::wizard::render_hint;
 use crate::ui::widgets::checkbox::Checkbox;
-use crate::nspawn::StatusLevel;
-use crate::nspawn::nvidia::detect_nvidia;
 use async_trait::async_trait;
 
 pub struct PassthroughStep;
@@ -54,7 +52,12 @@ impl IStep for PassthroughStep {
             .focused(context.passthrough.field_idx == 1)
             .render(f, chunks[4]);
 
-        Checkbox::new("NVIDIA Driver & GPU Passthrough (Scan host)", context.passthrough.nvidia_enabled)
+        let nvidia_label = if context.passthrough.nvidia_toolkit_installed {
+            "NVIDIA Driver & GPU Passthrough (Scan host)"
+        } else {
+            "NVIDIA Driver & GPU Passthrough (Missing: nvidia-container-toolkit)"
+        };
+        Checkbox::new(nvidia_label, context.passthrough.nvidia_enabled)
             .focused(context.passthrough.field_idx == 2)
             .render(f, chunks[6]);
 
@@ -74,9 +77,8 @@ impl IStep for PassthroughStep {
             }
             KeyCode::Char(' ') => {
                 if context.passthrough.field_idx == 2 {
-                    context.passthrough.nvidia_enabled = !context.passthrough.nvidia_enabled;
-                    if context.passthrough.nvidia_enabled && !context.passthrough.nvidia_loaded {
-                        return StepAction::Status("Detecting NVIDIA hardware...".into(), StatusLevel::Info);
+                    if context.passthrough.nvidia_toolkit_installed {
+                        context.passthrough.nvidia_enabled = !context.passthrough.nvidia_enabled;
                     }
                 } else if context.passthrough.field_idx == 0 {
                     context.passthrough.generic_gpu = !context.passthrough.generic_gpu;
@@ -85,20 +87,7 @@ impl IStep for PassthroughStep {
                 }
                 StepAction::None
             }
-            KeyCode::Enter => {
-                if context.passthrough.nvidia_enabled && !context.passthrough.nvidia_loaded {
-                    // Try to load it now
-                    let info = detect_nvidia().await;
-                    context.passthrough.nvidia = info;
-                    context.passthrough.nvidia_loaded = true;
-                    context.passthrough.nvidia_devices_sel = vec![true; context.passthrough.nvidia.devices.len()];
-                    context.passthrough.nvidia_sysro_sel = vec![true; context.passthrough.nvidia.system_ro.len()];
-                    context.passthrough.nvidia_libs_sel = vec![true; context.passthrough.nvidia.driver_files.len()];
-                    StepAction::Next
-                } else {
-                    StepAction::Next
-                }
-            }
+            KeyCode::Enter => StepAction::Next,
             _ => StepAction::None,
         }
     }

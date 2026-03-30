@@ -88,6 +88,8 @@ pub struct ContainerConfig {
     pub users: Vec<CreateUser>,
     /// Whether to enable Wayland socket passthrough.
     pub wayland_socket: bool,
+    /// Whether to enable NVIDIA GPU passthrough (JIT managed).
+    pub nvidia_gpu: bool,
     /// Raw storage specific configuration (only used if storage type is Raw).
     pub raw_config: Option<RawStorageConfig>,
 }

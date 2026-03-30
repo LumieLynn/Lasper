@@ -4,7 +4,6 @@ use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode,
 use crate::nspawn::create::{nspawn_config_content, systemd_override_content};
 use crate::nspawn::storage::{StorageBackend, StorageType};
 use crate::nspawn::deploy::Deployer;
-use crate::nspawn::nvidia::NvidiaInfo;
 
 /// The different methods available for acquiring a rootfs.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -70,17 +69,13 @@ pub struct PassthroughState {
     pub generic_gpu: bool,
     pub wayland_socket: bool,
     pub nvidia_enabled: bool,
+    pub nvidia_toolkit_installed: bool,
     pub field_idx: usize,
-    pub nvidia: NvidiaInfo,
-    pub nvidia_devices_sel: Vec<bool>,
-    pub nvidia_sysro_sel: Vec<bool>,
-    pub nvidia_libs_sel: Vec<bool>,
     pub bind_input: String,
     pub bind_list: Vec<BindMount>,
     pub device_cursor: usize,
-    pub device_block: usize, // 0: GPU, 1: RO, 2: Libs, 3: Input, 4: List
+    pub device_block: usize, // 3: Input, 4: List (0,1,2 reserved for NVIDIA)
     pub device_h_scroll: usize,
-    pub nvidia_loaded: bool,
 }
 
 pub struct ReviewState {
@@ -161,17 +156,13 @@ impl WizardContext {
                 generic_gpu: false,
                 wayland_socket: false,
                 nvidia_enabled: false,
+                nvidia_toolkit_installed: crate::nspawn::nvidia::is_nvidia_toolkit_installed(),
                 field_idx: 0,
-                nvidia: NvidiaInfo { devices: vec![], system_ro: vec![], driver_files: vec![] },
-                nvidia_devices_sel: Vec::new(),
-                nvidia_sysro_sel: Vec::new(),
-                nvidia_libs_sel: Vec::new(),
                 bind_input: String::new(),
                 bind_list: Vec::new(),
                 device_cursor: 0,
-                device_block: 0,
+                device_block: 3, // Start at Custom Bind Input
                 device_h_scroll: 0,
-                nvidia_loaded: false,
             },
             review: ReviewState {
                 preview: String::new(),
@@ -196,20 +187,7 @@ impl WizardContext {
     }
 
     pub fn build_config(&self) -> ContainerConfigWithPreview {
-        let mut device_binds: Vec<String> = if self.passthrough.nvidia_enabled {
-            self.passthrough.nvidia.devices.iter().enumerate()
-                .filter(|(i, _)| self.passthrough.nvidia_devices_sel.get(*i).copied().unwrap_or(false))
-                .map(|(_, d)| d.clone()).collect()
-        } else {
-            vec![]
-        };
-        
         let mut bind_mounts = self.passthrough.bind_list.clone();
-
-        if self.passthrough.generic_gpu {
-            if std::path::Path::new("/dev/dri").exists() { device_binds.push("/dev/dri".into()); }
-            if std::path::Path::new("/dev/mali0").exists() { device_binds.push("/dev/mali0".into()); }
-        }
 
         if self.passthrough.wayland_socket {
             bind_mounts.push(BindMount {
@@ -237,21 +215,16 @@ impl WizardContext {
             });
         }
 
-        device_binds.sort();
-        device_binds.dedup();
-
-        let readonly_binds: Vec<String> = if self.passthrough.nvidia_enabled {
-            let mut list: Vec<String> = self.passthrough.nvidia.system_ro.iter().enumerate()
-                .filter(|(i, _)| self.passthrough.nvidia_sysro_sel.get(*i).copied().unwrap_or(false))
-                .map(|(_, d)| d.clone()).collect();
-            let libs: Vec<String> = self.passthrough.nvidia.driver_files.iter().enumerate()
-                .filter(|(i, _)| self.passthrough.nvidia_libs_sel.get(*i).copied().unwrap_or(false))
-                .map(|(_, d)| d.clone()).collect();
-            list.extend(libs);
-            list
+        let device_binds = if self.passthrough.generic_gpu {
+            let mut devs = vec![];
+            if std::path::Path::new("/dev/dri").exists() { devs.push("/dev/dri".into()); }
+            if std::path::Path::new("/dev/mali0").exists() { devs.push("/dev/mali0".into()); }
+            devs
         } else {
             vec![]
         };
+
+        let readonly_binds = vec![];
         let storage_type = self.storage.info.types[self.storage.type_idx].0;
 
         let users = self.user.users.clone();
@@ -264,11 +237,11 @@ impl WizardContext {
             bind_mounts,
             device_binds,
             readonly_binds,
-            full_capabilities: self.passthrough.generic_gpu || (!self.passthrough.nvidia.devices.is_empty()
-                && self.passthrough.nvidia_devices_sel.iter().any(|&b| b)),
+            full_capabilities: self.passthrough.generic_gpu || self.passthrough.nvidia_enabled,
             root_password: if self.user.root_password.is_empty() { Option::None } else { Some(self.user.root_password.clone()) },
             users,
             wayland_socket: self.passthrough.wayland_socket,
+            nvidia_gpu: self.passthrough.nvidia_enabled,
             raw_config: if storage_type == StorageType::Raw {
                 Some(crate::nspawn::models::RawStorageConfig {
                     size: self.storage.raw_size.clone(),
@@ -289,9 +262,9 @@ impl WizardContext {
         content.push_str(&format!(" Storage: {} ({})\n", storage_type.label(), storage_type.get_path(&self.basic.name).display()));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
         content.push_str(&nspawn_config_content(&cfg));
-        if !cfg.device_binds.is_empty() {
+        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
             content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
-            content.push_str(&systemd_override_content(&cfg.device_binds));
+            content.push_str(&systemd_override_content(&cfg.device_binds, cfg.nvidia_gpu));
         }
 
         ContainerConfigWithPreview { cfg, preview: content }

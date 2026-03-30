@@ -38,18 +38,29 @@ impl DefaultManager {
     }
 
     fn require_root(&self) -> Result<()> {
-        if !self.is_root { Err(NspawnError::PermissionDenied) } else { Ok(()) }
+        if !self.is_root {
+            Err(NspawnError::PermissionDenied)
+        } else {
+            Ok(())
+        }
     }
 
     fn mark_fallback(&self) {
         self.last_fallback.store(true, Ordering::Relaxed);
     }
+
+    async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
+        super::nvidia::ensure_gpu_passthrough(name, &self.dbus).await
+    }
 }
+
 
 #[async_trait]
 impl NspawnManager for DefaultManager {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
-        if !self.is_root { return self.cli.list_all().await; }
+        if !self.is_root {
+            return self.cli.list_all().await;
+        }
         if self.dbus.is_available().await {
             match self.dbus.list_all().await {
                 Ok(entries) => return Ok(entries),
@@ -67,6 +78,8 @@ impl NspawnManager for DefaultManager {
 
     async fn start(&self, name: &str) -> Result<()> {
         self.require_root()?;
+        self._ensure_gpu_passthrough(name).await?;
+
         if self.dbus.is_available().await {
             match self.dbus.start(name).await {
                 Ok(()) => return Ok(()),

@@ -1,270 +1,373 @@
 //! NVIDIA GPU and driver detection logic for host passthrough.
 
+use super::errors::{NspawnError, Result};
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use super::errors::{NspawnError, Result};
 
-/// Hardware and driver information detected on the host.
-#[derive(Debug, Clone)]
-pub struct NvidiaInfo {
-    /// Device files found in /dev (e.g., /dev/nvidia0).
-    pub devices: Vec<String>,
-    /// Read-only system paths (e.g., /proc/driver/nvidia).
-    pub system_ro: Vec<String>,
-    /// Library/binary files found via package manager, ldconfig, or fallback scan.
-    pub driver_files: Vec<String>,
+/// Hardware and driver information detected on the host for mounting.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NvidiaState {
+    /// Host driver version when this state was captured.
+    pub driver_version: String,
+    /// Host paths to bind-mount into the container (read-only).
+    pub readonly_binds: Vec<String>,
+    /// Device files to bind-mount (read-write).
+    pub device_binds: Vec<String>,
 }
 
-/// Perform a comprehensive scan of the host for NVIDIA devices and drivers.
-pub async fn detect_nvidia() -> NvidiaInfo {
-    log::info!("Starting NVIDIA host scan...");
-    let devices = detect_nvidia_devices();
-    let system_ro = detect_nvidia_system_ro();
-    let driver_files = detect_nvidia_driver_files().await;
-    
-    log::info!("NVIDIA scan complete: {} devices, {} system paths, {} driver files found", 
-        devices.len(), system_ro.len(), driver_files.len());
-    
-    NvidiaInfo { devices, system_ro, driver_files }
-}
-
-fn detect_nvidia_devices() -> Vec<String> {
-    let candidates = [
-        "/dev/nvidia0", "/dev/nvidia1", "/dev/nvidia2", "/dev/nvidia3",
-        "/dev/nvidia4", "/dev/nvidia5", "/dev/nvidia6", "/dev/nvidia7",
-        "/dev/nvidiactl", "/dev/nvidia-modeset",
-        "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
-        "/dev/nvidia-caps", "/dev/nvidia-nvswitchctl",
-        "/dev/dri",
-    ];
-    candidates.iter()
-        .filter(|p| Path::new(p).exists())
-        .map(|p| p.to_string())
-        .collect()
-}
-
-fn detect_nvidia_system_ro() -> Vec<String> {
-    let candidates = [
-        "/proc/driver/nvidia",
-        "/sys/devices/pci0000:00",
-        "/sys/class/drm",
-        "/sys/module/nvidia",
-        "/sys/module/nvidia_modeset",
-        "/sys/module/nvidia_drm",
-        "/sys/module/nvidia_uvm",
-    ];
-    candidates.iter()
-        .filter(|p| Path::new(p).exists())
-        .map(|p| p.to_string())
-        .collect()
-}
-
-/// Detect driver libraries using the system package manager and ldconfig.
-async fn detect_nvidia_driver_files() -> Vec<String> {
-    let mut all_files = Vec::new();
-
-    // 1. Try ldconfig (fast and accurate for libraries)
-    if let Ok(ld_files) = query_ldconfig().await {
-        all_files.extend(ld_files);
+impl NvidiaState {
+    pub fn all_paths(&self) -> Vec<String> {
+        let mut paths = self.readonly_binds.clone();
+        paths.extend(self.device_binds.clone());
+        paths
     }
-
-    // 2. Try package managers for binaries and other files
-    if which("pacman") {
-        if let Ok(files) = query_pacman().await {
-            all_files.extend(files);
-        }
-    } else if which("dpkg") {
-        if let Ok(files) = query_dpkg().await {
-            all_files.extend(files);
-        }
-    } else if which("rpm") {
-        if let Ok(files) = query_rpm().await {
-            all_files.extend(files);
-        }
-    }
-
-    // 3. Last resort fallback
-    if all_files.is_empty() {
-        all_files.extend(fallback_nvidia_scan());
-    }
-
-    dedup(all_files)
 }
 
-/// Use ldconfig -p to find libraries.
-async fn query_ldconfig() -> Result<Vec<String>> {
-    let out = Command::new("ldconfig")
-        .arg("-p")
-        .output()
+/// Get the current NVIDIA driver version on the host.
+pub async fn get_host_driver_version() -> Result<String> {
+    let path = "/sys/module/nvidia/version";
+    tokio::fs::read_to_string(path)
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("ldconfig"), e))?;
-    
-    let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.contains("libnvidia-") || line.contains("libcuda.so") || line.contains("libnvcuvid.so") {
-            if let Some(pos) = line.rfind("=>") {
-                let path = line[pos + 2..].trim();
-                if Path::new(path).exists() {
-                    files.push(path.to_string());
+        .map(|s| s.trim().to_string())
+        .map_err(|e| NspawnError::Io(PathBuf::from(path), e))
+}
+
+/// Perform a comprehensive scan of the host using nvidia-container-cli and dynamic directory scans.
+pub async fn get_nvidia_state() -> Result<NvidiaState> {
+    let mut state = NvidiaState {
+        driver_version: get_host_driver_version().await.unwrap_or_default(),
+        ..Default::default()
+    };
+
+    // 1. Get base mounts from nvidia-container-cli
+    let cli_list = run_nvidia_container_cli_list().await?;
+    for path in cli_list {
+        if path.starts_with("/dev/") {
+            state.device_binds.push(path);
+        } else {
+            state.readonly_binds.push(path);
+        }
+    }
+
+    // 2. Dynamic scan for Graphics/EGL/Vulkan JSONs
+    let standard_dirs = [
+        "/usr/share/glvnd/egl_vendor.d",
+        "/usr/share/vulkan/icd.d",
+        "/usr/share/vulkan/implicit_layer.d",
+        "/usr/share/egl/egl_external_platform.d",
+        "/etc/vulkan/icd.d",
+        "/etc/glvnd/egl_vendor.d",
+    ];
+
+    for &dir in &standard_dirs {
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let file_name = entry.file_name().to_string_lossy().to_lowercase();
+                if file_name.contains("nvidia") && file_name.ends_with(".json") {
+                    state
+                        .readonly_binds
+                        .push(entry.path().to_string_lossy().into_owned());
                 }
             }
         }
     }
-    Ok(files)
+
+    // 3. Resolve symlinks for .so files
+    let mut resolved_libs = Vec::new();
+    for path in &state.readonly_binds {
+        if path.contains(".so") {
+            if let Ok(aliases) = resolve_so_aliases(path).await {
+                resolved_libs.extend(aliases);
+            }
+        }
+    }
+    state.readonly_binds.extend(resolved_libs);
+
+    // 4. Cleanup and dedup
+    state.device_binds = dedup(state.device_binds);
+    state.readonly_binds = dedup(state.readonly_binds);
+
+    Ok(state)
 }
 
-/// pacman: detect installed nvidia packages first, then query each.
-async fn query_pacman() -> Result<Vec<String>> {
-    let out = Command::new("pacman")
-        .args(["-Qq"])
+/// Physically remove legacy 0-byte driver files inside the container using systemd-nspawn.
+pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Result<()> {
+    // Construct a shell script to check for 0-byte files and delete them.
+    // Safety: only delete if file exists and has size 0 ( ! -s ).
+    // Heuristic: also look for any residual nvidia/cuda 0-byte files.
+    let mut script = String::from("for f in");
+    for path in death_list {
+        script.push_str(&format!(" '{}'", path));
+    }
+    script.push_str("; do [ -f \"$f\" ] && [ ! -s \"$f\" ] && rm -v \"$f\"; done; ");
+    script.push_str("find /usr/lib /etc /usr/share -maxdepth 4 -type f \\( -name '*nvidia*' -o -name '*cuda*' \\) -size 0 -delete -print");
+
+    log::info!("Cleaning up legacy driver files in container {}...", name);
+
+    let out = Command::new("systemd-nspawn")
+        .arg("-M")
+        .arg(name)
+        .arg("-q")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(&script)
         .output()
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("pacman"), e))?;
+        .map_err(|e| {
+            NspawnError::Runtime(format!("Failed to execute cleanup in container: {}", e))
+        })?;
 
-    let installed: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("nvidia") || l.contains("cuda"))
-        .map(|l| l.to_string())
-        .collect();
-
-    if installed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    for pkg in &installed {
-        let out = Command::new("pacman")
-            .args(["-Ql", pkg])
-            .output()
-            .await
-            .map_err(|e| NspawnError::Io(PathBuf::from("pacman"), e))?;
-
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
-            if is_nvidia_driver_file(&path) {
-                files.push(path);
-            }
-        }
-    }
-    Ok(files)
-}
-
-/// dpkg: find nvidia packages, then query files.
-async fn query_dpkg() -> Result<Vec<String>> {
-    let out = Command::new("dpkg-query")
-        .args(["-W", "-f=${Package} ${Status}\n"])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("dpkg-query"), e))?;
-
-    let pkgs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("install ok installed") && (l.contains("nvidia") || l.contains("cuda")))
-        .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
-        .collect();
-
-    if pkgs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    for pkg in &pkgs {
-        let out = Command::new("dpkg")
-            .args(["-L", pkg])
-            .output()
-            .await
-            .map_err(|e| NspawnError::Io(PathBuf::from("dpkg"), e))?;
-        for path in String::from_utf8_lossy(&out.stdout).lines() {
-            if is_nvidia_driver_file(path) {
-                files.push(path.to_string());
-            }
-        }
-    }
-    Ok(files)
-}
-
-/// rpm: find nvidia packages, then query files.
-async fn query_rpm() -> Result<Vec<String>> {
-    let out = Command::new("rpm")
-        .args(["-qa"])
-        .output()
-        .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("rpm"), e))?;
-
-    let pkgs: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("nvidia") || l.contains("cuda"))
-        .map(|l| l.to_string())
-        .collect();
-
-    if pkgs.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut files = Vec::new();
-    for pkg in &pkgs {
-        let out = Command::new("rpm")
-            .args(["-ql", pkg])
-            .output()
-            .await
-            .map_err(|e| NspawnError::Io(PathBuf::from("rpm"), e))?;
-        for path in String::from_utf8_lossy(&out.stdout).lines() {
-            if is_nvidia_driver_file(path) {
-                files.push(path.to_string());
-            }
-        }
-    }
-    Ok(files)
-}
-
-/// Last resort: scan common paths for nvidia files.
-fn fallback_nvidia_scan() -> Vec<String> {
-    let search_dirs = [
-        "/usr/lib/x86_64-linux-gnu",
-        "/usr/lib",
-        "/usr/lib64",
-        "/usr/lib32",
-        "/usr/bin",
-    ];
-    let mut found = Vec::new();
-    for dir in &search_dirs {
-        if let Ok(rd) = std::fs::read_dir(dir) {
-            for entry in rd.flatten() {
-                let name = entry.file_name();
-                let s = name.to_string_lossy();
-                if s.starts_with("libnvidia") || s.starts_with("libcuda")
-                    || s.starts_with("nvidia-") || s.starts_with("nvcc")
-                {
-                    found.push(entry.path().to_string_lossy().to_string());
-                }
-            }
-        }
-    }
-    found
-}
-
-/// Filter predicate: is this path a relevant nvidia driver file?
-fn is_nvidia_driver_file(path: &str) -> bool {
-    if path.is_empty() || path.ends_with('/') {
-        return false;
-    }
-    let p = Path::new(path);
-    let file = p.file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_default();
-
-    let is_match = (file.starts_with("libnvidia")
-        || file.starts_with("libcuda")
-        || file.starts_with("libnvcuvid")
-        || file.starts_with("libnvoptix")
-        || file.starts_with("nvidia-"))
-        && (file.contains(".so") || !file.contains('.'));
-    
-    if cfg!(test) {
-        is_match
+    if !out.status.success() {
+        log::warn!(
+            "In-container cleanup reported issues: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     } else {
-        is_match && p.is_file()
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if !stdout.trim().is_empty() {
+            log::debug!("Cleanup output:\n{}", stdout);
+        }
     }
+
+    Ok(())
+}
+
+/// Check if nvidia-container-toolkit is installed on the host.
+pub fn is_nvidia_toolkit_installed() -> bool {
+    which::which("nvidia-container-cli").is_ok()
+}
+
+async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
+    let out = Command::new("nvidia-container-cli")
+        .arg("list")
+        .output()
+        .await
+        .map_err(|_| {
+            NspawnError::Runtime(
+                "Dependency missing: Please install 'nvidia-container-toolkit' on the host.".into(),
+            )
+        })?;
+
+    let paths = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Ok(paths)
+}
+
+pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
+    let path = PathBuf::from(format!("/var/lib/lasper/states/{}.json", name));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| NspawnError::Io(path.clone(), e))?;
+    let state: NvidiaState = serde_json::from_str(&content)?;
+    Ok(Some(state))
+}
+
+pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
+    let out = Command::new("systemd-nspawn")
+        .arg("-M")
+        .arg(name)
+        .arg("-q")
+        .arg("--")
+        .arg("cat")
+        .arg("/etc/.lasper-nvidia.json")
+        .output()
+        .await;
+
+    match out {
+        Ok(o) if o.status.success() => {
+            let state: NvidiaState = serde_json::from_slice(&o.stdout)?;
+            Ok(Some(state))
+        }
+        _ => Ok(None),
+    }
+}
+
+pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
+    let dir = PathBuf::from("/var/lib/lasper/states");
+    if !dir.exists() {
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            log::warn!("Failed to create state directory {}: {}", dir.display(), e);
+        }
+    }
+    let path = dir.join(format!("{}.json", name));
+    let content = serde_json::to_string_pretty(state)?;
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|e| NspawnError::Io(path, e))?;
+    Ok(())
+}
+
+pub async fn save_internal_state(name: &str, state: &NvidiaState) -> Result<()> {
+    let content = serde_json::to_string(state)?;
+    // Use base64 to avoid shell escape issues if needed, but JSON is mostly safe.
+    // However, to be absolutely safe, we'll use a temp file or similar if we can.
+    // For now, let's use a simple sh -c 'cat > ...'
+    let out = Command::new("systemd-nspawn")
+        .arg("-M")
+        .arg(name)
+        .arg("-q")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(format!(
+            "cat > /etc/.lasper-nvidia.json <<'EOF'\n{}\nEOF",
+            content
+        ))
+        .output()
+        .await
+        .map_err(|e| NspawnError::Runtime(format!("Failed to write internal state: {}", e)))?;
+
+    if !out.status.success() {
+        return Err(NspawnError::Runtime(format!(
+            "Failed to save internal state: {}",
+            String::from_utf8_lossy(&out.stderr)
+        )));
+    }
+    Ok(())
+}
+
+pub fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<String> {
+    let old_paths = old.all_paths();
+    let new_paths = new.all_paths();
+    old_paths
+        .into_iter()
+        .filter(|p| !new_paths.contains(p))
+        .collect()
+}
+
+pub async fn ensure_gpu_passthrough(
+    name: &str,
+    dbus: &crate::nspawn::provider::dbus::DbusProvider,
+) -> Result<()> {
+    // 1. Semantic Marker Check
+    let config = match super::config::NspawnConfig::load(name) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    if !config.is_gpu_enabled() {
+        return Ok(());
+    }
+
+    log::info!("GPU Passthrough enabled for {}, checking state...", name);
+
+    // 2. State Diff Engine
+    let host_state = get_nvidia_state().await?;
+    let external_cache = get_external_state(name).await?.unwrap_or_default();
+
+    // If driver updated on host, we MUST check internal truth
+    let mut old_state = external_cache.clone();
+    if external_cache.driver_version != host_state.driver_version {
+        if let Ok(Some(internal)) = get_internal_state(name).await {
+            old_state = internal;
+        }
+    }
+
+    if old_state.driver_version == host_state.driver_version && !old_state.driver_version.is_empty()
+    {
+        log::debug!("GPU state match for {}, skipping re-assembly.", name);
+        // We still inject persistent to be safe
+        inject_persistent_device_allow(name, &host_state).await?;
+        let _ = dbus.reload_daemon().await;
+        return Ok(());
+    }
+
+    log::info!(
+        "GPU driver change detected ({} -> {}), performing surgery...",
+        old_state.driver_version,
+        host_state.driver_version
+    );
+
+    let death_list = calculate_death_list(&old_state, &host_state);
+
+    // 3. Physical Cleanup
+    cleanup_container_garbage(name, &death_list).await?;
+
+    // 4. AST mutation
+    super::config::NspawnConfig::update_gpu_passthrough(name, &host_state, &death_list).await?;
+
+    // 5. Persistent Injection & Dual-Track Sync
+    save_external_state(name, &host_state).await?;
+    save_internal_state(name, &host_state).await?;
+    inject_persistent_device_allow(name, &host_state).await?;
+
+    // 6. Zero-overhead Reload
+    dbus.reload_daemon().await?;
+
+    Ok(())
+}
+
+async fn inject_persistent_device_allow(name: &str, state: &NvidiaState) -> Result<()> {
+    let dir = PathBuf::from(format!(
+        "/etc/systemd/system/systemd-nspawn@{}.service.d",
+        name
+    ));
+    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+        return Err(NspawnError::Io(dir, e));
+    }
+
+    let path = dir.join("10-lasper-nvidia.conf");
+    let mut content = String::from("[Service]\n");
+    for dev in &state.device_binds {
+        content.push_str(&format!("DeviceAllow={} rw\n", dev));
+    }
+
+    tokio::fs::write(&path, content)
+        .await
+        .map_err(|e| NspawnError::Io(path, e))?;
+
+    // Cleanup old transient one if present
+    let transient_path = format!(
+        "/run/systemd/system/systemd-nspawn@{}.service.d/10-lasper-nvidia.conf",
+        name
+    );
+    let _ = tokio::fs::remove_file(transient_path).await;
+
+    Ok(())
+}
+
+/// For a given .so path (which might be a versioned file), find it and all its aliases in the same dir.
+/// E.g. if we have libcuda.so.595.58.03, we also want libcuda.so.1 and libcuda.so if they point to it.
+async fn resolve_so_aliases(path: &str) -> Result<Vec<String>> {
+    let p = Path::new(path);
+    let dir = p
+        .parent()
+        .ok_or_else(|| NspawnError::Runtime("Invalid lib path".into()))?;
+    let file_name = p
+        .file_name()
+        .ok_or_else(|| NspawnError::Runtime("Invalid lib path".into()))?
+        .to_string_lossy();
+
+    // Extract base name, e.g. "libcuda.so" from "libcuda.so.595.58.03"
+    let base_name = if let Some(pos) = file_name.find(".so") {
+        &file_name[..pos + 3]
+    } else {
+        &file_name
+    };
+
+    let mut aliases = Vec::new();
+    let mut entries = tokio::fs::read_dir(dir)
+        .await
+        .map_err(|e| NspawnError::Io(dir.to_path_buf(), e))?;
+
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| NspawnError::Io(dir.to_path_buf(), e))?
+    {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(base_name) {
+            aliases.push(entry.path().to_string_lossy().into_owned());
+        }
+    }
+    Ok(aliases)
 }
 
 fn dedup(mut v: Vec<String>) -> Vec<String> {
@@ -273,28 +376,9 @@ fn dedup(mut v: Vec<String>) -> Vec<String> {
     v
 }
 
-fn which(cmd: &str) -> bool {
-    std::env::var_os("PATH")
-        .unwrap_or_default()
-        .to_string_lossy()
-        .split(':')
-        .any(|d| Path::new(d).join(cmd).is_file())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_nvidia_driver_file() {
-        assert!(is_nvidia_driver_file("/usr/lib/libnvidia-glcore.so.535.104.05"));
-        assert!(is_nvidia_driver_file("/usr/lib/libcuda.so.1"));
-        assert!(is_nvidia_driver_file("/usr/bin/nvidia-smi"));
-        
-        assert!(!is_nvidia_driver_file("/usr/lib/libc.so.6"));
-        assert!(!is_nvidia_driver_file("/usr/lib/"));
-        assert!(!is_nvidia_driver_file(""));
-    }
 
     #[test]
     fn test_dedup() {

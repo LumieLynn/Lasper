@@ -57,6 +57,11 @@ pub fn detect_physical_interfaces() -> Vec<String> {
 pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
     let mut out = String::new();
 
+    if cfg.nvidia_gpu {
+        out.push_str("[General]\n");
+        out.push_str("X-Lasper-Nvidia-Enabled=true\n\n");
+    }
+
     // ── [Exec] ────────────────────────────────────────────────────────────────
     out.push_str("[Exec]\n");
     out.push_str("Boot=yes\n");
@@ -70,28 +75,6 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
         out.push_str(&format!("Hostname={}\n", cfg.hostname));
     }
     out.push('\n');
-
-    // ── [Files] ───────────────────────────────────────────────────────────────
-    let has_files = !cfg.device_binds.is_empty()
-        || !cfg.readonly_binds.is_empty()
-        || !cfg.bind_mounts.is_empty();
-    if has_files {
-        out.push_str("[Files]\n");
-        for dev in &cfg.device_binds {
-            out.push_str(&format!("Bind={dev}\n"));
-        }
-        for ro in &cfg.readonly_binds {
-            out.push_str(&format!("BindReadOnly={ro}\n"));
-        }
-        for bm in &cfg.bind_mounts {
-            if bm.readonly {
-                out.push_str(&format!("BindReadOnly={}:{}\n", bm.source, bm.target));
-            } else {
-                out.push_str(&format!("Bind={}:{}\n", bm.source, bm.target));
-            }
-        }
-        out.push('\n');
-    }
 
     // ── [Network] ─────────────────────────────────────────────────────────────
     if let Some(mode) = &cfg.network {
@@ -139,21 +122,39 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
         }
     }
 
+    // ── [Files] ───────────────────────────────────────────────────────────────
+    let has_files = !cfg.device_binds.is_empty()
+        || !cfg.readonly_binds.is_empty()
+        || !cfg.bind_mounts.is_empty();
+    if has_files {
+        out.push_str("[Files]\n");
+        for dev in &cfg.device_binds {
+            out.push_str(&format!("Bind={dev}\n"));
+        }
+        for ro in &cfg.readonly_binds {
+            out.push_str(&format!("BindReadOnly={ro}\n"));
+        }
+        for bm in &cfg.bind_mounts {
+            if bm.readonly {
+                out.push_str(&format!("BindReadOnly={}:{}\n", bm.source, bm.target));
+            } else {
+                out.push_str(&format!("Bind={}:{}\n", bm.source, bm.target));
+            }
+        }
+        out.push('\n');
+    }
+
     out
 }
 
-/// Write the config to `/etc/systemd/nspawn/<name>.nspawn`.
-pub fn write_nspawn_config(cfg: &ContainerConfig) -> Result<()> {
-    std::fs::create_dir_all("/etc/systemd/nspawn")
-        .map_err(|e| NspawnError::Io(PathBuf::from("/etc/systemd/nspawn"), e))?;
-    let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", cfg.name));
-    let content = nspawn_config_content(cfg);
-    std::fs::write(&path, content).map_err(|e| NspawnError::Io(path, e))
-}
 
 /// Generate the content for a systemd service override.
-pub fn systemd_override_content(device_binds: &[String]) -> String {
+pub fn systemd_override_content(device_binds: &[String], nvidia_gpu: bool) -> String {
     let mut content = String::from("[Service]\n");
+    if nvidia_gpu {
+        // Enable Cgroup delegation for nested containers if GPU is used
+        content.push_str("Delegate=yes\n");
+    }
     for dev in device_binds {
         content.push_str(&format!("DeviceAllow={} rw\n", dev));
     }
@@ -161,8 +162,8 @@ pub fn systemd_override_content(device_binds: &[String]) -> String {
 }
 
 /// Write a systemd service override to allow devices via cgroups.
-pub fn write_systemd_override(name: &str, device_binds: &[String]) -> Result<()> {
-    if device_binds.is_empty() {
+pub fn write_systemd_override(name: &str, device_binds: &[String], nvidia_gpu: bool) -> Result<()> {
+    if device_binds.is_empty() && !nvidia_gpu {
         return Ok(());
     }
 
@@ -170,7 +171,7 @@ pub fn write_systemd_override(name: &str, device_binds: &[String]) -> Result<()>
     std::fs::create_dir_all(&dir).map_err(|e| NspawnError::Io(PathBuf::from(&dir), e))?;
 
     let path = format!("{}/override.conf", dir);
-    let content = systemd_override_content(device_binds);
+    let content = systemd_override_content(device_binds, nvidia_gpu);
 
     std::fs::write(&path, content).map_err(|e| NspawnError::Io(PathBuf::from(&path), e))?;
 

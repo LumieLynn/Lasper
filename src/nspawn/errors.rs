@@ -37,6 +37,12 @@ pub enum NspawnError {
     #[error("DBus error: {0}")]
     Dbus(#[from] zbus::Error),
 
+    #[error("Serialization error: {0}")]
+    Serde(#[from] serde_json::Error),
+
+    #[error("Runtime error: {0}")]
+    Runtime(String),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 }

@@ -197,6 +197,19 @@ impl DbusProvider {
             })
         }
     }
+
+    pub async fn reload_daemon(&self) -> Result<()> {
+        let conn = self.connection().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        conn.call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "Reload",
+            &(),
+        )
+        .await.map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
 }
 
 async fn get_machine1_properties(conn: &Connection, name: &str) -> zbus::Result<HashMap<String, String>> {

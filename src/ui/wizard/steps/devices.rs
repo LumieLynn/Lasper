@@ -1,5 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
     text::Span,
     widgets::{ListItem, Paragraph},
     Frame,
@@ -40,41 +41,7 @@ impl IStep for DevicesStep {
             .split(area);
 
         if context.passthrough.nvidia_enabled {
-            let constraints = match context.passthrough.device_block {
-                0 => [Constraint::Percentage(45), Constraint::Percentage(27), Constraint::Percentage(28)],
-                1 => [Constraint::Percentage(27), Constraint::Percentage(45), Constraint::Percentage(28)],
-                2 => [Constraint::Percentage(27), Constraint::Percentage(28), Constraint::Percentage(45)],
-                _ => [Constraint::Percentage(33), Constraint::Percentage(33), Constraint::Percentage(34)],
-            };
-
-            let nv_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints(constraints)
-                .split(chunks[0]);
-
-            let render_nv_list = |f: &mut Frame, area: Rect, title: &str, items: &Vec<String>, sel: &Vec<bool>, block_idx: usize| {
-                let is_focused = context.passthrough.device_block == block_idx;
-                let list_width = (area.width as usize).saturating_sub(6);
-
-                let list_items: Vec<ListItem> = items.iter().enumerate().map(|(i, s)| {
-                    let is_sel = sel.get(i).copied().unwrap_or(false);
-                    let prefix = if is_sel { "[x] " } else { "[ ] " };
-                    let display_s = if is_focused && context.passthrough.device_cursor == i {
-                        s.chars().skip(context.passthrough.device_h_scroll).take(list_width).collect::<String>()
-                    } else {
-                        s.chars().take(list_width).collect::<String>()
-                    };
-                    ListItem::new(Span::raw(format!("{}{}", prefix, display_s)))
-                }).collect();
-
-                ScrollableList::new(title, list_items)
-                    .selected(if is_focused { Some(context.passthrough.device_cursor) } else { None })
-                    .render(f, area);
-            };
-
-            render_nv_list(f, nv_chunks[0], " GPU Devices ", &context.passthrough.nvidia.devices, &context.passthrough.nvidia_devices_sel, 0);
-            render_nv_list(f, nv_chunks[1], " System RO ", &context.passthrough.nvidia.system_ro, &context.passthrough.nvidia_sysro_sel, 1);
-            render_nv_list(f, nv_chunks[2], " Driver Libs ", &context.passthrough.nvidia.driver_files, &context.passthrough.nvidia_libs_sel, 2);
+            f.render_widget(Paragraph::new("\n  NVIDIA GPU Passthrough is ENABLED.\n  (Lasper will automatically manage devices and libraries via JIT assembly)").style(Style::default().fg(Color::Cyan)), chunks[0]);
         } else {
             f.render_widget(Paragraph::new("\n  NVIDIA passthrough is disabled. Skip to bind mounts below."), chunks[0]);
         }
@@ -109,15 +76,13 @@ impl IStep for DevicesStep {
         match key.code {
             KeyCode::Esc => StepAction::Prev,
             KeyCode::Tab => {
-                context.passthrough.device_block = (context.passthrough.device_block + 1) % 5;
-                if !context.passthrough.nvidia_enabled && context.passthrough.device_block < 3 { context.passthrough.device_block = 3; }
+                context.passthrough.device_block = if context.passthrough.device_block == 3 { 4 } else { 3 };
                 context.passthrough.device_cursor = 0;
                 context.passthrough.device_h_scroll = 0;
                 StepAction::None
             }
             KeyCode::BackTab => {
-                context.passthrough.device_block = if context.passthrough.device_block == 0 { 4 } else { context.passthrough.device_block - 1 };
-                if !context.passthrough.nvidia_enabled && context.passthrough.device_block < 3 { context.passthrough.device_block = 4; }
+                context.passthrough.device_block = if context.passthrough.device_block == 3 { 4 } else { 3 };
                 context.passthrough.device_cursor = 0;
                 context.passthrough.device_h_scroll = 0;
                 StepAction::None
@@ -135,25 +100,11 @@ impl IStep for DevicesStep {
                 StepAction::None
             }
             KeyCode::Down => {
-                let max = match context.passthrough.device_block {
-                    0 => context.passthrough.nvidia.devices.len(),
-                    1 => context.passthrough.nvidia.system_ro.len(),
-                    2 => context.passthrough.nvidia.driver_files.len(),
-                    4 => context.passthrough.bind_list.len(),
-                    _ => 0,
-                };
+                let max = if context.passthrough.device_block == 4 { context.passthrough.bind_list.len() } else { 0 };
                 if context.passthrough.device_cursor + 1 < max { context.passthrough.device_cursor += 1; context.passthrough.device_h_scroll = 0; }
                 StepAction::None
             }
-            KeyCode::Char(' ') => {
-                match context.passthrough.device_block {
-                    0 => if let Some(b) = context.passthrough.nvidia_devices_sel.get_mut(context.passthrough.device_cursor) { *b = !*b; }
-                    1 => if let Some(b) = context.passthrough.nvidia_sysro_sel.get_mut(context.passthrough.device_cursor) { *b = !*b; }
-                    2 => if let Some(b) = context.passthrough.nvidia_libs_sel.get_mut(context.passthrough.device_cursor) { *b = !*b; }
-                    _ => {}
-                }
-                StepAction::None
-            }
+            KeyCode::Char(' ') => StepAction::None,
             KeyCode::F(5) => {
                 if let Some(bm) = WizardContext::parse_bind_mount(&context.passthrough.bind_input) {
                     context.passthrough.bind_list.push(bm);
