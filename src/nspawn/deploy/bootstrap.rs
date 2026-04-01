@@ -1,5 +1,6 @@
 //! Debootstrap and Pacstrap deployment implementations.
 
+#[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -22,7 +23,7 @@ impl Deployer for DebootstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: Arc<Mutex<Vec<String>>>,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
         let mut args = vec![];
         if cfg.users.iter().any(|u| u.sudoer) {
@@ -49,7 +50,7 @@ impl Deployer for PacstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: Arc<Mutex<Vec<String>>>,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
         let mut args = vec!["-c".into(), rootfs.to_string_lossy().to_string(), "base".into()];
         if cfg.users.iter().any(|u| u.sudoer) {
@@ -61,7 +62,7 @@ impl Deployer for PacstrapDeployer {
     }
 }
 
-async fn run_command(prog: &str, args: Vec<String>, logs: Arc<Mutex<Vec<String>>>) -> Result<()> {
+async fn run_command(prog: &str, args: Vec<String>, logs: tokio::sync::mpsc::UnboundedSender<String>) -> Result<()> {
     let mut cmd = Command::new(prog);
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -74,12 +75,12 @@ async fn run_command(prog: &str, args: Vec<String>, logs: Arc<Mutex<Vec<String>>
     let l1 = logs.clone();
     tokio::spawn(async move {
         let mut r = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = r.next_line().await { l1.lock().unwrap().push(line); }
+        while let Ok(Some(line)) = r.next_line().await { let _ = l1.send(line); }
     });
     let l2 = logs.clone();
     tokio::spawn(async move {
         let mut r = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = r.next_line().await { l2.lock().unwrap().push(line); }
+        while let Ok(Some(line)) = r.next_line().await { let _ = l2.send(line); }
     });
     
     let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;

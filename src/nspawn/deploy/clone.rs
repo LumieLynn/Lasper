@@ -1,5 +1,6 @@
 //! Container cloning deployment implementation.
 
+#[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -24,13 +25,10 @@ impl Deployer for CloneDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
-        logs: Arc<Mutex<Vec<String>>>,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
         
-        {
-            let mut l = logs.lock().unwrap();
-            l.push(format!("Cloning container {} to {}...", self.source_name, name));
-        }
+        let _ = logs.send(format!("Cloning container {} to {}...", self.source_name, name));
 
         let out = Command::new("machinectl")
             .args(["clone", &self.source_name, name])
@@ -46,10 +44,10 @@ impl Deployer for CloneDeployer {
 
         // Clone configs
         if let Err(e) = create::clone_nspawn_config(&self.source_name, name) {
-             logs.lock().unwrap().push(format!("WARNING: Failed to clone .nspawn config: {}", e));
+             let _ = logs.send(format!("WARNING: Failed to clone .nspawn config: {}", e));
         }
         if let Err(e) = create::clone_systemd_override(&self.source_name, name) {
-             logs.lock().unwrap().push(format!("WARNING: Failed to clone systemd override: {}", e));
+             let _ = logs.send(format!("WARNING: Failed to clone systemd override: {}", e));
         }
 
         Ok(())

@@ -5,10 +5,10 @@ pub mod clone;
 pub mod image;
 
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::models::{ContainerConfig, NetworkMode};
 use crate::nspawn::storage::StorageBackend;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[async_trait::async_trait]
 pub trait Deployer: Send + Sync {
@@ -18,7 +18,7 @@ pub trait Deployer: Send + Sync {
         name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: Arc<Mutex<Vec<String>>>,
+        logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()>;
 
     /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
@@ -33,13 +33,12 @@ pub async fn run_deploy_task(
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
-    logs: Arc<Mutex<Vec<String>>>,
+    logs: tokio::sync::mpsc::UnboundedSender<String>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
 ) {
     if let Err(e) = run_deploy_internal(deployer, storage, name, cfg, logs.clone()).await {
-        let mut l = logs.lock().unwrap();
-        l.push(format!("FATAL ERROR: {}", e));
+        let _ = logs.send(format!("FATAL ERROR: {}", e));
         success.store(false, Ordering::SeqCst);
     } else {
         success.store(true, Ordering::SeqCst);
@@ -52,11 +51,10 @@ async fn run_deploy_internal(
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
-    logs: Arc<Mutex<Vec<String>>>,
+    logs: tokio::sync::mpsc::UnboundedSender<String>,
 ) -> Result<()> {
     let push_log = |s: String| {
-        let mut l = logs.lock().unwrap();
-        l.push(s);
+        let _ = logs.send(s);
     };
 
     push_log(format!("=== Deploying '{}' ===", name));
@@ -141,8 +139,7 @@ async fn run_deploy_internal(
         }
 
         if let Some(mode) = &cfg.network {
-            use crate::nspawn::models::NetworkMode;
-            if matches!(
+                        if matches!(
                 mode,
                 NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
             ) {

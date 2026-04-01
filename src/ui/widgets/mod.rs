@@ -1,6 +1,6 @@
-//! Reusable UI widgets for the Lasper TUI.
-
-pub mod checkbox;
-pub mod input;
-pub mod list;
 pub mod power_menu;
+
+pub mod inputs;
+pub mod selectors;
+pub mod composites;
+pub mod display;

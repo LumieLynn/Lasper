@@ -1,5 +1,6 @@
 //! OCI and Disk Image deployment implementations.
 
+#[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -19,7 +20,7 @@ impl Deployer for OciDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: Arc<Mutex<Vec<String>>>,
+        _logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
         import_oci_image(&self.url, name, rootfs).await
     }
@@ -36,7 +37,7 @@ impl Deployer for DiskImageDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: Arc<Mutex<Vec<String>>>,
+        _logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
         import_disk_image(&self.path, name, rootfs).await
     }

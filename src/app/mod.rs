@@ -34,14 +34,15 @@ pub struct AppUi {
     pub power_menu_selected: usize,
     pub pane_height: u16,
 
-    pub wizard: Wizard,
+    pub wizard: Option<Wizard>,
 
     pub status_message: Option<(String, StatusLevel)>,
     pub status_expiry: Option<Instant>,
+    pub backend_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ui::core::BackendCommand>>,
 }
 
 impl AppUi {
-    pub fn new(is_root: bool) -> Self {
+    pub fn new(_is_root: bool) -> Self {
         Self {
             detail_pane: DetailPane::Properties,
             details_state: TableState::default(),
@@ -52,9 +53,10 @@ impl AppUi {
             show_power_menu: false,
             power_menu_selected: 0,
             pane_height: 10,
-            wizard: Wizard::new(is_root),
+            wizard: None,
             status_message: None,
             status_expiry: None,
+            backend_tx: None,
         }
     }
 }
@@ -105,21 +107,23 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     ) -> Result<()> {
         let mut events = EventHandler::new(100);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let manager_clone = self.data.manager.clone();
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
+        let (backend_tx, mut backend_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ui::core::BackendCommand>();
+        self.ui.backend_tx = Some(backend_tx);
         
+        let manager_clone = self.data.manager.clone();
         tokio::spawn(async move {
             loop {
                 if let Ok(entries) = manager_clone.list_all().await {
-                    let _ = tx.send(entries).await;
+                    let _ = refresh_tx.send(entries).await;
                 }
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
 
         self.refresh().await;
         loop {
-            while let Ok(entries) = rx.try_recv() {
+            while let Ok(entries) = refresh_rx.try_recv() {
                 let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
                 self.data.entries = entries;
                 self.data.selected = prev_name
@@ -130,10 +134,63 @@ impl App {
             }
 
             terminal.draw(|f| crate::ui::draw(f, self))?;
-            match events.rx.recv().await {
-                Some(AppEvent::Key(key)) => self.handle_key(key).await,
-                Some(AppEvent::Tick) => self.tick().await,
-                Option::None => break,
+            
+            tokio::select! {
+                Some(event) = events.rx.recv() => {
+                    match event {
+                        AppEvent::Key(key) => self.handle_key(key).await,
+                        AppEvent::Tick => self.tick().await,
+                        AppEvent::BackendResult(res) => {
+                            if let Some(wizard) = &mut self.ui.wizard {
+                                wizard.process_message(crate::ui::core::AppMessage::BackendResult(res));
+                            }
+                        }
+                    }
+                }
+                Some(cmd) = backend_rx.recv() => {
+                    let tx = events.tx.clone();
+                    tokio::spawn(async move {
+                        match cmd {
+                            crate::ui::core::BackendCommand::SubmitConfig(ctx) => {
+                                let built = ctx.build_config();
+                                let (deployer, storage) = ctx.get_deployer_and_storage();
+                                let name = built.cfg.name.clone();
+                                let cfg = built.cfg;
+
+                                // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
+                                let (log_mpsc_tx, mut log_mpsc_rx) =
+                                    tokio::sync::mpsc::unbounded_channel::<String>();
+                                let log_bcast_tx = ctx.deploy.log_tx.clone();
+                                tokio::spawn(async move {
+                                    while let Some(msg) = log_mpsc_rx.recv().await {
+                                        let _ = log_bcast_tx.send(msg);
+                                    }
+                                });
+
+                                let done = ctx.deploy.done.clone();
+                                let success = ctx.deploy.success.clone();
+
+                                // Run the real deployment in its own task
+                                tokio::spawn(async move {
+                                    crate::nspawn::deploy::run_deploy_task(
+                                        deployer, storage, name, cfg, log_mpsc_tx, done, success,
+                                    )
+                                    .await;
+                                });
+
+                                // Immediately navigate the wizard to the Deploy step
+                                let _ = tx.send(AppEvent::BackendResult(
+                                    crate::ui::core::BackendResponse::DeployStarted,
+                                )).await;
+                            }
+                            crate::ui::core::BackendCommand::ValidateBridge(_) => {
+                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                                let _ = tx.send(AppEvent::BackendResult(crate::ui::core::BackendResponse::ValidationSuccess)).await;
+                            }
+                        }
+                    });
+                }
+                else => break,
             }
             if self.should_quit { events.stop(); break; }
         }

@@ -26,7 +26,7 @@ impl Default for NetworkMode {
 }
 
 /// A port forwarding rule (host -> container).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
     pub host: u16,
     pub container: u16,
@@ -34,7 +34,7 @@ pub struct PortForward {
 }
 
 /// A host path to bind-mount into the container.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindMount {
     pub source: String,
     pub target: String,
@@ -42,7 +42,7 @@ pub struct BindMount {
 }
 
 /// User configuration to be applied after the container is bootstrapped.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUser {
     pub username: String,
     pub password: String,
@@ -53,7 +53,7 @@ pub struct CreateUser {
 }
 
 /// Configuration for raw file storage.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RawStorageConfig {
     pub size: String,
     pub fs_type: String,
@@ -71,7 +71,7 @@ impl Default for RawStorageConfig {
 }
 
 /// Complete configuration for a new container.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub name: String,
     pub hostname: String,
@@ -120,7 +120,7 @@ impl ContainerState {
 }
 
 /// A container known to machinectl — either running, poweroff, or both.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContainerEntry {
     /// The name used by machinectl
     pub name: String,

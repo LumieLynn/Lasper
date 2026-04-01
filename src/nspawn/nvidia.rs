@@ -134,10 +134,7 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
     Ok(())
 }
 
-/// Check if nvidia-container-toolkit is installed on the host.
-pub fn is_nvidia_toolkit_installed() -> bool {
-    which::which("nvidia-container-cli").is_ok()
-}
+
 
 async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
     let out = Command::new("nvidia-container-cli")

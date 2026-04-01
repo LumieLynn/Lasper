@@ -1,98 +1,201 @@
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
 use crate::nspawn::ContainerEntry;
-use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::create::{nspawn_config_content, systemd_override_content};
-use crate::nspawn::storage::{StorageBackend, StorageType};
+use crate::nspawn::models::{CreateUser, BindMount, PortForward, NetworkMode};
+use crate::nspawn::storage::{StorageBackend, StorageType, StorageInfo};
 use crate::nspawn::deploy::Deployer;
+pub use crate::ui::wizard::builder::{ContainerConfigBuilder, ContainerConfigWithPreview, SourceKind, SourceConfig, BasicConfig, StorageConfig, UserConfig, NetworkConfig, PassthroughConfig};
+use tokio::sync::broadcast;
 
-/// The different methods available for acquiring a rootfs.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SourceKind {
-    Copy,
-    Oci,
-    Debootstrap,
-    Pacstrap,
-    DiskImage,
-}
-
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceState {
     pub kind: SourceKind,
-    pub cursor: usize,
     pub oci_url: String,
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub pacstrap_pkgs: String,
     pub disk_path: String,
-    pub copy_cursor: usize,
     pub clone_source: String,
-    pub field_idx: usize,
+    pub copy_idx: usize,
 }
 
+impl SourceState {
+    pub fn extract_config(&self) -> SourceConfig {
+        SourceConfig {
+            kind: self.kind,
+            oci_url: self.oci_url.clone(),
+            deboot_mirror: self.deboot_mirror.clone(),
+            deboot_suite: self.deboot_suite.clone(),
+            pacstrap_pkgs: self.pacstrap_pkgs.clone(),
+            disk_path: self.disk_path.clone(),
+            clone_source: self.clone_source.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct BasicState {
     pub name: String,
     pub hostname: String,
-    pub field_idx: usize,
 }
 
+impl BasicState {
+    pub fn extract_config(&self) -> BasicConfig {
+        BasicConfig {
+            name: self.name.clone(),
+            hostname: self.hostname.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct StorageState {
     pub type_idx: usize,
-    pub info: crate::nspawn::storage::StorageInfo,
-    pub field_idx: usize,
+    pub info: StorageInfo,
     pub raw_size: String,
     pub raw_fs: String,
     pub raw_partition: bool,
 }
 
+impl StorageState {
+    pub fn extract_config(&self) -> StorageConfig {
+        let (st, _) = self.info.types[self.type_idx].clone();
+        StorageConfig {
+            storage_type: st,
+            raw_config: if st == StorageType::Raw {
+                Some(crate::nspawn::models::RawStorageConfig {
+                    size: self.raw_size.clone(),
+                    fs_type: self.raw_fs.clone(),
+                    use_partition_table: self.raw_partition,
+                })
+            } else {
+                None
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct UserState {
     pub root_password: String,
     pub users: Vec<CreateUser>,
-    pub field_idx: usize,
-    pub user_cursor: usize,
-    pub is_editing: bool,
-    pub editing_user: CreateUser,
-    pub editing_idx: Option<usize>,
-    pub edit_field_idx: usize,
 }
 
+impl UserState {
+    pub fn extract_config(&self) -> UserConfig {
+        UserConfig {
+            root_password: if self.root_password.is_empty() { None } else { Some(self.root_password.clone()) },
+            users: self.users.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct NetworkState {
     pub mode: usize,
     pub bridge_name: String,
     pub bridge_list: Vec<String>,
-    pub bridge_cursor: usize,
-    pub port_input: String,
     pub port_list: Vec<PortForward>,
-    pub field_block: usize, // 0: Mode, 1: Bridge, 2: Port Input, 3: Port List
-    pub h_scroll: usize,
 }
 
+impl NetworkState {
+    pub fn network_mode(&self) -> Option<NetworkMode> {
+        match self.mode {
+            0 => Some(NetworkMode::Host),
+            1 => Some(NetworkMode::None),
+            2 => Some(NetworkMode::Veth),
+            3 => Some(NetworkMode::Bridge(self.bridge_name.clone())),
+            _ => None,
+        }
+    }
+
+    pub fn extract_config(&self) -> NetworkConfig {
+        NetworkConfig {
+            mode: self.network_mode(),
+            port_forwards: self.port_list.clone(),
+        }
+    }
+
+    pub fn parse_port(input: &str) -> Option<PortForward> {
+        let parts: Vec<&str> = input.split(':').collect();
+        if parts.len() < 2 { return None; }
+        let host = parts[0].parse::<u16>().ok()?;
+        let rest = parts[1];
+        let (container_str, proto) = if rest.contains('/') {
+            let p: Vec<&str> = rest.split('/').collect();
+            (p[0], p[1].to_string())
+        } else {
+            (rest, "tcp".to_string())
+        };
+        let container = container_str.parse::<u16>().ok()?;
+        Some(PortForward { host, container, proto })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
-    pub generic_gpu: bool,
+    pub full_capabilities: bool,
     pub wayland_socket: bool,
-    pub nvidia_enabled: bool,
+    pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
-    pub field_idx: usize,
-    pub bind_input: String,
-    pub bind_list: Vec<BindMount>,
-    pub device_cursor: usize,
-    pub device_block: usize, // 3: Input, 4: List (0,1,2 reserved for NVIDIA)
-    pub device_h_scroll: usize,
+    pub bind_mounts: Vec<BindMount>,
 }
 
+impl PassthroughState {
+    pub fn extract_config(&self, mode: Option<NetworkMode>) -> PassthroughConfig {
+        let is_host_nw = matches!(mode, Some(NetworkMode::Host));
+        PassthroughConfig {
+            bind_mounts: self.bind_mounts.clone(),
+            device_binds: vec![], // Managed by bridge or nvidia-ctk
+            full_capabilities: self.full_capabilities,
+            wayland_socket: self.wayland_socket && is_host_nw,
+            nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
+        }
+    }
+
+    pub fn parse_bind_mount(input: &str) -> Option<BindMount> {
+        let parts: Vec<&str> = input.split(':').collect();
+        if parts.len() < 2 { return None; }
+        let source = parts[0].to_string();
+        let rest = parts[1];
+        let (target, readonly) = if rest.contains(":ro") {
+            (rest.replace(":ro", ""), true)
+        } else if rest.contains(":rw") {
+            (rest.replace(":rw", ""), false)
+        } else {
+            (rest.to_string(), false)
+        };
+        Some(BindMount { source, target, readonly })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReviewState {
     pub preview: String,
-    pub preview_scroll: u16,
 }
 
+#[derive(Clone)]
 pub struct DeployState {
-    pub logs: Arc<Mutex<Vec<String>>>,
+    pub log_tx: broadcast::Sender<String>,
     pub done: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
-    pub scroll: usize,
 }
 
-/// Holds the state for the multi-step container creation wizard, shared between steps.
+impl PartialEq for DeployState {
+    fn eq(&self, _other: &Self) -> bool { true }
+}
+
+impl std::fmt::Debug for DeployState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeployState")
+            .field("done", &self.done)
+            .field("success", &self.success)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Holds shared data for the multi-step container creation wizard.
+#[derive(Debug, Clone, PartialEq)]
 pub struct WizardContext {
-    pub entries: Vec<ContainerEntry>,
     pub source: SourceState,
     pub basic: BasicState,
     pub storage: StorageState,
@@ -101,243 +204,90 @@ pub struct WizardContext {
     pub passthrough: PassthroughState,
     pub review: ReviewState,
     pub deploy: DeployState,
+    pub entries: Vec<ContainerEntry>,
 }
 
 impl WizardContext {
-    pub fn new(_is_root: bool) -> Self {
+    pub fn new(entries: Vec<ContainerEntry>) -> Self {
+        let nvidia_toolkit_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
         Self {
-            entries: Vec::new(),
             source: SourceState {
                 kind: SourceKind::Copy,
-                cursor: 0,
-                oci_url: String::new(),
-                deboot_mirror: String::new(),
-                deboot_suite: String::new(),
-                pacstrap_pkgs: String::new(),
-                disk_path: String::new(),
-                copy_cursor: 0,
-                clone_source: String::new(),
-                field_idx: 0,
+                oci_url: "".to_string(),
+                deboot_mirror: "".to_string(),
+                deboot_suite: "".to_string(),
+                pacstrap_pkgs: "".to_string(),
+                disk_path: "".to_string(),
+                clone_source: entries.first().map(|e| e.name.clone()).unwrap_or_default(),
+                copy_idx: 0,
             },
             basic: BasicState {
-                name: String::new(),
-                hostname: String::new(),
-                field_idx: 0,
+                name: "".to_string(),
+                hostname: "".to_string(),
             },
             storage: StorageState {
                 type_idx: 0,
                 info: crate::nspawn::storage::detect_available_storage_types(),
-                field_idx: 0,
                 raw_size: "2G".to_string(),
                 raw_fs: "ext4".to_string(),
                 raw_partition: false,
             },
             user: UserState {
-                root_password: String::new(),
-                users: Vec::new(),
-                field_idx: 0,
-                user_cursor: 0,
-                is_editing: false,
-                editing_user: CreateUser::default(),
-                editing_idx: None,
-                edit_field_idx: 0,
+                root_password: "".to_string(),
+                users: vec![],
             },
-            network: NetworkState {
-                mode: 0,
-                bridge_name: String::new(),
-                bridge_list: Vec::new(),
-                bridge_cursor: 0,
-                port_input: String::new(),
-                port_list: Vec::new(),
-                field_block: 0,
-                h_scroll: 0,
+            network: {
+                let bridges = crate::nspawn::network::detect_bridges();
+                let default_bridge = bridges.first().cloned().unwrap_or_else(|| "br0".to_string());
+                NetworkState {
+                    mode: 0,
+                    bridge_name: default_bridge,
+                    bridge_list: bridges,
+                    port_list: vec![],
+                }
             },
             passthrough: PassthroughState {
-                generic_gpu: false,
+                full_capabilities: false,
                 wayland_socket: false,
-                nvidia_enabled: false,
-                nvidia_toolkit_installed: crate::nspawn::nvidia::is_nvidia_toolkit_installed(),
-                field_idx: 0,
-                bind_input: String::new(),
-                bind_list: Vec::new(),
-                device_cursor: 0,
-                device_block: 3, // Start at Custom Bind Input
-                device_h_scroll: 0,
+                nvidia_gpu: false,
+                nvidia_toolkit_installed,
+                bind_mounts: vec![],
             },
             review: ReviewState {
-                preview: String::new(),
-                preview_scroll: 0,
+                preview: "".to_string(),
             },
-            deploy: DeployState {
-                logs: Arc::new(Mutex::new(Vec::new())),
-                done: Arc::new(AtomicBool::new(false)),
-                success: Arc::new(AtomicBool::new(false)),
-                scroll: 0,
+            deploy: {
+                let (log_tx, _) = broadcast::channel(1000);
+                DeployState {
+                    log_tx,
+                    done: Arc::new(AtomicBool::new(false)),
+                    success: Arc::new(AtomicBool::new(false)),
+                }
             },
+            entries,
         }
     }
 
-    pub fn network_mode(&self) -> Option<NetworkMode> {
-        match self.network.mode {
-            1 => Some(NetworkMode::None),
-            2 => Some(NetworkMode::Veth),
-            3 => Some(NetworkMode::Bridge(self.network.bridge_name.clone())),
-            _ => Some(NetworkMode::Host),
+    pub fn builder(&self) -> ContainerConfigBuilder {
+        ContainerConfigBuilder {
+            source: Some(self.source.extract_config()),
+            basic: Some(self.basic.extract_config()),
+            storage: Some(self.storage.extract_config()),
+            user: Some(self.user.extract_config()),
+            network: Some(self.network.extract_config()),
+            passthrough: Some(self.passthrough.extract_config(self.network.network_mode())),
         }
     }
 
     pub fn build_config(&self) -> ContainerConfigWithPreview {
-        let mut bind_mounts = self.passthrough.bind_list.clone();
-
-        if self.passthrough.wayland_socket {
-            bind_mounts.push(BindMount {
-                source: Self::find_wayland_socket(),
-                target: "/mnt/wayland-socket".into(),
-                readonly: false,
-            });
-            bind_mounts.push(BindMount {
-                source: "/tmp/.X11-unix".into(),
-                target: "/tmp/.X11-unix".into(),
-                readonly: false,
-            });
-            bind_mounts.push(BindMount {
-                source: "/dev/shm".into(),
-                target: "/dev/shm".into(),
-                readonly: false,
-            });
-        }
-
-        if self.network.mode == 0 {
-            bind_mounts.push(BindMount {
-                source: "/etc/resolv.conf".into(),
-                target: "/etc/resolv.conf".into(),
-                readonly: true,
-            });
-        }
-
-        let device_binds = if self.passthrough.generic_gpu {
-            let mut devs = vec![];
-            if std::path::Path::new("/dev/dri").exists() { devs.push("/dev/dri".into()); }
-            if std::path::Path::new("/dev/mali0").exists() { devs.push("/dev/mali0".into()); }
-            devs
-        } else {
-            vec![]
-        };
-
-        let readonly_binds = vec![];
-        let storage_type = self.storage.info.types[self.storage.type_idx].0;
-
-        let users = self.user.users.clone();
-
-        let cfg = ContainerConfig {
-            name: self.basic.name.clone(),
-            hostname: if self.basic.hostname.is_empty() { self.basic.name.clone() } else { self.basic.hostname.clone() },
-            network: self.network_mode(),
-            port_forwards: self.network.port_list.clone(),
-            bind_mounts,
-            device_binds,
-            readonly_binds,
-            full_capabilities: self.passthrough.generic_gpu || self.passthrough.nvidia_enabled,
-            root_password: if self.user.root_password.is_empty() { Option::None } else { Some(self.user.root_password.clone()) },
-            users,
-            wayland_socket: self.passthrough.wayland_socket,
-            nvidia_gpu: self.passthrough.nvidia_enabled,
-            raw_config: if storage_type == StorageType::Raw {
-                Some(crate::nspawn::models::RawStorageConfig {
-                    size: self.storage.raw_size.clone(),
-                    fs_type: self.storage.raw_fs.clone(),
-                    use_partition_table: self.storage.raw_partition,
-                })
-            } else { None },
-        };
-
-        if self.source.kind == SourceKind::Copy {
-             let mut content = format!(" [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n", 
-                self.source.clone_source, self.basic.name);
-             content.push_str(" All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.");
-             return ContainerConfigWithPreview { cfg, preview: content };
-        }
-
-        let mut content = format!(" [DEPLOYMENT PREVIEW — {}]\n\n", self.basic.name);
-        content.push_str(&format!(" Storage: {} ({})\n", storage_type.label(), storage_type.get_path(&self.basic.name).display()));
-        content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
-        content.push_str(&nspawn_config_content(&cfg));
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
-            content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
-            content.push_str(&systemd_override_content(&cfg.device_binds, cfg.nvidia_gpu));
-        }
-
-        ContainerConfigWithPreview { cfg, preview: content }
+        self.builder().build_config()
     }
 
-    pub fn find_wayland_socket() -> String {
-        let uid = std::env::var("SUDO_UID").unwrap_or_else(|_| "1000".to_string());
-        let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", uid));
-        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "wayland-0".to_string());
-        let path_str = format!("{}/{}", xdg, display);
-        if std::path::Path::new(&path_str).exists() { return path_str; }
-        if let Ok(entries) = std::fs::read_dir(&xdg) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("wayland-") && !name.ends_with(".lock") {
-                    return entry.path().to_string_lossy().into_owned();
-                }
-            }
-        }
-        "/run/user/1000/wayland-0".to_string()
+    pub fn build_preview_nspawn(&self) -> String {
+        self.build_config().preview
     }
 
     pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        use crate::nspawn::storage::*;
-        use crate::nspawn::deploy::*;
-
-        let storage: Box<dyn StorageBackend> = match self.storage.info.types[self.storage.type_idx].0 {
-            StorageType::Directory => Box::new(DirectoryBackend),
-            StorageType::Subvolume => Box::new(SubvolumeBackend),
-            StorageType::Raw => Box::new(RawBackend {
-                config: crate::nspawn::models::RawStorageConfig {
-                    size: self.storage.raw_size.clone(),
-                    fs_type: self.storage.raw_fs.clone(),
-                    use_partition_table: self.storage.raw_partition,
-                },
-            }),
-        };
-
-        let deployer: Box<dyn Deployer> = match self.source.kind {
-            SourceKind::Copy => Box::new(clone::CloneDeployer { source_name: self.source.clone_source.clone() }),
-            SourceKind::Oci => Box::new(image::OciDeployer { url: self.source.oci_url.clone() }),
-            SourceKind::DiskImage => Box::new(image::DiskImageDeployer { path: self.source.disk_path.clone() }),
-            SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer { 
-                mirror: self.source.deboot_mirror.clone(), 
-                suite: if self.source.deboot_suite.is_empty() { "bookworm".to_string() } else { self.source.deboot_suite.clone() }
-            }),
-            SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer { packages: self.source.pacstrap_pkgs.clone() }),
-        };
-
-        (deployer, storage)
+        self.builder().get_deployer_and_storage()
     }
-
-    pub fn parse_port(s: &str) -> Option<PortForward> {
-        let (s, proto) = if let Some(p) = s.strip_suffix("/udp") { (p, "udp") }
-            else { (s.strip_suffix("/tcp").unwrap_or(s), "tcp") };
-        let mut p = s.splitn(2, ':');
-        let host: u16 = p.next()?.parse().ok()?;
-        let container: u16 = p.next()?.parse().ok()?;
-        Some(PortForward { host, container, proto: proto.to_string() })
-    }
-
-    pub fn parse_bind_mount(s: &str) -> Option<BindMount> {
-        let parts: Vec<&str> = s.split(':').collect();
-        if parts.len() < 2 { return None; }
-        Some(BindMount {
-            source: parts[0].to_string(),
-            target: parts[1].to_string(),
-            readonly: parts.get(2).map(|&r| r == "ro").unwrap_or(false),
-        })
-    }
-}
-
-pub struct ContainerConfigWithPreview {
-    pub cfg: ContainerConfig,
-    pub preview: String,
 }

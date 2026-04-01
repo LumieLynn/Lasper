@@ -30,6 +30,7 @@ impl StorageType {
 }
 
 /// Information about the available storage backends on the host.
+#[derive(Clone, Debug, PartialEq)]
 pub struct StorageInfo {
     pub types: Vec<(StorageType, bool)>, // (type, supported)
 }

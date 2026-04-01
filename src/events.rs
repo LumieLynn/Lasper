@@ -10,11 +10,13 @@ use tokio::sync::mpsc;
 pub enum AppEvent {
     Key(KeyEvent),
     Tick,
+    BackendResult(crate::ui::core::BackendResponse),
 }
 
 /// Merges keyboard input and periodic ticks into one channel.
 /// Call `stop()` when the app quits to release the blocking reader thread.
 pub struct EventHandler {
+    pub tx: mpsc::Sender<AppEvent>,
     pub rx: mpsc::Receiver<AppEvent>,
     quit:   Arc<AtomicBool>,
 }
@@ -48,18 +50,18 @@ impl EventHandler {
         });
 
         // Periodic tick
-        let tx_tick = tx;
+        let tx_tick_clone = tx.clone();
         tokio::spawn(async move {
             let interval = Duration::from_millis(tick_rate_ms);
             loop {
                 tokio::time::sleep(interval).await;
-                if tx_tick.send(AppEvent::Tick).await.is_err() {
+                if tx_tick_clone.send(AppEvent::Tick).await.is_err() {
                     break;
                 }
             }
         });
 
-        Self { rx, quit }
+        Self { tx, rx, quit }
     }
 
     /// Signal the blocking keyboard thread to exit within ≤50ms.

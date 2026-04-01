@@ -7,17 +7,22 @@ use super::{App, DetailPane};
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
         if self.ui.show_wizard {
-            match self.ui.wizard.handle_key(key, &self.data.entries, self.is_root).await {
-                WizardAction::None => {}
-                WizardAction::Close => { self.ui.show_wizard = false; }
-                WizardAction::CloseRefresh => {
-                    self.ui.show_wizard = false;
-                    self.refresh().await;
+            if let Some(wizard) = &mut self.ui.wizard {
+                match wizard.handle_key(key) {
+                    WizardAction::None => {}
+                    WizardAction::Close => { self.ui.show_wizard = false; self.ui.wizard = None; }
+                    WizardAction::CloseRefresh => {
+                        self.ui.show_wizard = false;
+                        self.ui.wizard = None;
+                        self.refresh().await;
+                    }
+                    WizardAction::Status(msg, level) => {
+                        self.set_status(msg, level);
+                    }
+                    WizardAction::Next | WizardAction::Prev => {}
                 }
-                WizardAction::Status(msg, level) => {
-                    self.set_status(msg, level);
-                }
-                WizardAction::Next | WizardAction::Prev => {}
+            } else {
+                self.ui.show_wizard = false;
             }
             return;
         }
@@ -118,8 +123,11 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
                 if self.is_root {
-                    self.ui.wizard = Wizard::new(self.is_root);
-                    self.ui.show_wizard = true;
+                    let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
+                    if let Some(tx) = &self.ui.backend_tx {
+                        self.ui.wizard = Some(Wizard::new(self.data.entries.clone(), nvidia_installed, tx.clone()));
+                        self.ui.show_wizard = true;
+                    }
                 } else {
                     self.set_status("Root required — run: sudo lasper".into(), StatusLevel::Error);
                 }

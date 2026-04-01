@@ -1,74 +1,49 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, BorderType, Borders, Clear, List, ListItem, ListState},
-    Frame,
-};
+use crate::ui::core::{Component, EventResult};
+use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use ratatui::{layout::Rect, Frame};
 
 pub struct PowerMenu {
-    pub selected: usize,
+    list: SelectableList<String>,
 }
 
 impl PowerMenu {
     pub fn new(selected: usize) -> Self {
-        Self { selected }
-    }
-
-    pub fn render(self, f: &mut Frame, area: Rect) {
         let items = vec![
-            ListItem::new(Line::from("  Start")),
-            ListItem::new(Line::from("  Poweroff")),
-            ListItem::new(Line::from("  Reboot")),
-            ListItem::new(Line::from("  Terminate")),
-            ListItem::new(Line::from("  Kill (SIGTERM)")),
-            ListItem::new(Line::from("  Enable (at boot)")),
-            ListItem::new(Line::from("  Disable (at boot)")),
+            "  ▶  Start Container".to_string(),
+            "  ⏹  Poweroff (soft)".to_string(),
+            "  ↻  Reboot Container".to_string(),
+            "  ⚠  Terminate (force)".to_string(),
+            "  ☠  Kill (SIGKILL)".to_string(),
+            "  ⬆  Enable at Boot".to_string(),
+            "  ⬇  Disable at Boot".to_string(),
         ];
 
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .title(" Actions ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(Color::Cyan)),
-            )
-            .highlight_style(
-                Style::default()
-                    .bg(Color::Rgb(50, 50, 80))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("> ");
+        let mut list = SelectableList::new(" [ Power Actions ] ", items, |s| s.clone());
+        list.select(selected);
 
-        let mut state = ListState::default();
-        state.select(Some(self.selected));
-
-        // Center the menu using a fixed width and height that fits the items
-        let area = centered_rect(30, 9, area);
-
-        f.render_widget(Clear, area);
-        f.render_stateful_widget(list, area, &mut state);
+        Self { list }
     }
 }
 
-fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(height),
-            Constraint::Fill(1),
-        ])
-        .split(r);
+impl Component for PowerMenu {
+    fn render(&mut self, f: &mut Frame, area: Rect) {
+        // Use fixed height for 7 items + borders + title
+        let menu_height = 9; 
+        let menu_width = 32;
+        
+        // Manual centering
+        let x = area.x + (area.width.saturating_sub(menu_width)) / 2;
+        let y = area.y + (area.height.saturating_sub(menu_height)) / 2;
+        
+        let area = Rect::new(x, y, menu_width.min(area.width), menu_height.min(area.height));
+        
+        f.render_widget(ratatui::widgets::Clear, area);
+        self.list.set_focus(true);
+        self.list.render(f, area);
+    }
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Fill(1),
-            Constraint::Length(width),
-            Constraint::Fill(1),
-        ])
-        .split(popup_layout[1])[1]
+    fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> EventResult {
+        // Main app handles keys for PowerMenu directly in handlers.rs
+        EventResult::Ignored
+    }
 }

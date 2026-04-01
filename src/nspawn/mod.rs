@@ -7,6 +7,7 @@ pub mod errors;
 pub mod provider;
 pub mod manager;
 pub mod models;
+pub mod network;
 pub mod nvidia;
 pub mod storage;
 

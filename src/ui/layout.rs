@@ -8,7 +8,10 @@ use ratatui::{
 
 use crate::app::App;
 use crate::nspawn::StatusLevel;
-use crate::ui::{container_list, detail_panel, widgets::power_menu::PowerMenu};
+use crate::ui::{
+    views::container_list, views::detail_panel, centered_rect, 
+    widgets::power_menu::PowerMenu, core::Component
+};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -28,7 +31,11 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Overlays (highest priority last so they render on top)
     if app.ui.show_power_menu { PowerMenu::new(app.ui.power_menu_selected).render(f, area); }
-    if app.ui.show_wizard  { app.ui.wizard.render(f, area); }
+    if app.ui.show_wizard  { 
+        if let Some(w) = &mut app.ui.wizard {
+            w.render(f, area);
+        }
+    }
     if app.ui.show_help    { render_help(f); }
 }
 
@@ -57,7 +64,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 
     let line = Line::from(spans);
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 40))),
+        Paragraph::new(line).style(Style::default()),
         area,
     );
 }
@@ -101,7 +108,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
     };
 
     f.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Color::Rgb(30, 30, 40))),
+        Paragraph::new(line).style(Style::default()),
         area,
     );
 }
@@ -116,7 +123,7 @@ fn hspan(s: &'static str) -> Span<'static> {
 // ── Help overlay ──────────────────────────────────────────────────────────────
 
 fn render_help(f: &mut Frame) {
-    let area = centered_rect(52, 26, f.area());
+    let area = centered_rect(50, 85, f.area());
     f.render_widget(Clear, area);
     let rows: Vec<Line> = vec![
         Line::from(Span::styled("  Keybindings", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
@@ -162,21 +169,3 @@ fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
 
 // ── Utility ───────────────────────────────────────────────────────────────────
 
-pub fn centered_rect(w_pct: u16, h_pct: u16, r: Rect) -> Rect {
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - h_pct) / 2),
-            Constraint::Percentage(h_pct),
-            Constraint::Percentage((100 - h_pct) / 2),
-        ])
-        .split(r);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - w_pct) / 2),
-            Constraint::Percentage(w_pct),
-            Constraint::Percentage((100 - w_pct) / 2),
-        ])
-        .split(vert[1])[1]
-}
