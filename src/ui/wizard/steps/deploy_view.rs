@@ -1,6 +1,9 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -108,9 +111,20 @@ impl Component for DeployStepView {
         // Deployment finished — allow closing
         match key.code {
             KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => {
-                EventResult::Message(AppMessage::Close)
+                EventResult::Message(AppMessage::Wizard(WizardMessage::Close))
             }
+
             _ => self.log_list.handle_key(key),
         }
+    }
+
+    fn validate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl StepComponent for DeployStepView {
+    fn commit_to_context(&self, _ctx: &mut WizardContext) {
+        // Deploy is terminal state
     }
 }

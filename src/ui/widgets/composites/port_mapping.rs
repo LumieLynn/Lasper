@@ -1,5 +1,6 @@
 use crate::nspawn::models::PortForward;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::number_box::NumberBox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
@@ -29,8 +30,9 @@ impl PortMappingBox {
                 .with_max_value(65535)
                 .with_min_value(1),
             protocol: RadioGroup::new("Protocol", vec!["tcp".to_string(), "udp".to_string()], 0),
-            btn_ok: Button::new("OK", AppMessage::DialogSubmit),
-            btn_cancel: Button::new("Cancel", AppMessage::DialogCancel),
+            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
         }
@@ -148,7 +150,7 @@ impl Component for PortMappingBox {
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
-            EventResult::Message(AppMessage::DialogSubmit) => {
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
                 let mut valid = true;
                 if self.host_port.validate().is_err() {
                     valid = false;
@@ -174,9 +176,10 @@ impl Component for PortMappingBox {
                     proto,
                 }))
             }
-            EventResult::Message(AppMessage::DialogCancel) => {
-                EventResult::Message(AppMessage::DialogCancel)
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
             }
+
             EventResult::FocusNext => {
                 let crefs: Vec<&dyn Component> = vec![
                     &self.host_port,

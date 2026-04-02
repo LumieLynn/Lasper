@@ -1,4 +1,4 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -13,8 +13,8 @@ pub struct RadioGroup {
     selected_idx: usize,
     focused: bool,
     enabled: bool,
-    on_change: Option<Box<dyn Fn(usize) -> AppMessage>>,
 }
+
 
 impl RadioGroup {
     pub fn new(label: impl Into<String>, options: Vec<String>, initial_idx: usize) -> Self {
@@ -24,9 +24,9 @@ impl RadioGroup {
             selected_idx: initial_idx,
             focused: false,
             enabled: true,
-            on_change: None,
         }
     }
+
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -37,13 +37,12 @@ impl RadioGroup {
         self.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self
-    where
-        F: Fn(usize) -> AppMessage + 'static,
-    {
-        self.on_change = Some(Box::new(f));
-        self
+    pub fn set_selected_idx(&mut self, idx: usize) {
+        if idx < self.options.len() {
+            self.selected_idx = idx;
+        }
     }
+
 
     pub fn selected_idx(&self) -> usize {
         self.selected_idx
@@ -91,22 +90,18 @@ impl Component for RadioGroup {
             KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_idx > 0 {
                     self.selected_idx -= 1;
-                    if let Some(on_change) = &self.on_change {
-                        return EventResult::Message(on_change(self.selected_idx));
-                    }
                     return EventResult::Consumed;
                 }
                 EventResult::Ignored
+
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected_idx < self.options.len().saturating_sub(1) {
                     self.selected_idx += 1;
-                    if let Some(on_change) = &self.on_change {
-                        return EventResult::Message(on_change(self.selected_idx));
-                    }
                     return EventResult::Consumed;
                 }
                 EventResult::Ignored
+
             }
             _ => EventResult::Ignored,
         }

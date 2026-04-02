@@ -8,7 +8,8 @@ use ratatui::{
 };
 
 use crate::nspawn::{ContainerEntry, ContainerState};
-use crate::ui::core::{AppMessage, EventResult};
+use crate::ui::core::{AppMessage, EventResult, ListMessage};
+
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
 
 pub struct ContainerListComponent;
@@ -60,9 +61,10 @@ impl ContainerListComponent {
     /// j/↓ → ListNext, k/↑ → ListPrev. All other keys are Ignored.
     pub fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => EventResult::Message(AppMessage::ListNext),
-            KeyCode::Char('k') | KeyCode::Up => EventResult::Message(AppMessage::ListPrev),
+            KeyCode::Char('j') | KeyCode::Down => EventResult::Message(AppMessage::List(ListMessage::Next)),
+            KeyCode::Char('k') | KeyCode::Up => EventResult::Message(AppMessage::List(ListMessage::Prev)),
             _ => EventResult::Ignored,
         }
     }
+
 }

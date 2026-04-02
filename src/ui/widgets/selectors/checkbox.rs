@@ -1,4 +1,4 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -12,8 +12,8 @@ pub struct Checkbox {
     checked: bool,
     focused: bool,
     enabled: bool,
-    on_change: Option<Box<dyn Fn(bool) -> AppMessage>>,
 }
+
 
 impl Checkbox {
     pub fn new(label: impl Into<String>, initial_checked: bool) -> Self {
@@ -22,9 +22,9 @@ impl Checkbox {
             checked: initial_checked,
             focused: false,
             enabled: true,
-            on_change: None,
         }
     }
+
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -35,13 +35,10 @@ impl Checkbox {
         self.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self
-    where
-        F: Fn(bool) -> AppMessage + 'static,
-    {
-        self.on_change = Some(Box::new(f));
-        self
+    pub fn set_checked(&mut self, checked: bool) {
+        self.checked = checked;
     }
+
 
     pub fn checked(&self) -> bool {
         self.checked
@@ -77,11 +74,9 @@ impl Component for Checkbox {
             KeyCode::BackTab => EventResult::FocusPrev,
             KeyCode::Char(' ') => {
                 self.checked = !self.checked;
-                if let Some(on_change) = &self.on_change {
-                    return EventResult::Message(on_change(self.checked));
-                }
                 EventResult::Consumed
             }
+
             _ => EventResult::Ignored,
         }
     }

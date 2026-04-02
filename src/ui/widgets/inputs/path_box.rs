@@ -1,4 +1,4 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
@@ -6,25 +6,22 @@ use ratatui::{layout::Rect, Frame};
 pub struct PathBox {
     base: TextInputBase,
     validator: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
-    on_change: Option<Box<dyn Fn(String) -> AppMessage>>,
 }
+
 
 impl PathBox {
     pub fn new(label: impl Into<String>, initial_value: String) -> Self {
         Self {
             base: TextInputBase::new(label, initial_value),
             validator: None,
-            on_change: None,
         }
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self
-    where
-        F: Fn(String) -> AppMessage + 'static,
-    {
-        self.on_change = Some(Box::new(f));
-        self
+
+    pub fn set_value(&mut self, value: String) {
+        self.base.input = tui_input::Input::from(value);
     }
+
 
     pub fn with_validator<F>(mut self, f: F) -> Self
     where
@@ -45,19 +42,9 @@ impl Component for PathBox {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        let prev_val = self.base.input.value().to_string();
-        let res = self.base.handle_key(key);
-
-        if let EventResult::Consumed = res {
-            let new_val = self.base.input.value().to_string();
-            if new_val != prev_val {
-                if let Some(on_change) = &self.on_change {
-                    return EventResult::Message(on_change(new_val));
-                }
-            }
-        }
-        res
+        self.base.handle_key(key)
     }
+
 
     fn set_focus(&mut self, focused: bool) {
         self.base.focused = focused;

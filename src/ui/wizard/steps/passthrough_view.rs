@@ -1,7 +1,8 @@
 use crate::nspawn::models::NetworkMode;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::wizard::context::PassthroughConfig;
+use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -34,20 +35,21 @@ impl PassthroughStepView {
             "Wayland Socket Passthrough (Requires Host Network)"
         };
 
+        // Strict enforcement: if not host network, wayland_socket must be false
+        let initial_wayland = if is_host_nw { initial_data.wayland_socket } else { false };
+
         let mut view = Self {
             generic_gpu: Checkbox::new(
                 "Generic GPU Passthrough (/dev/dri, /dev/mali)",
                 initial_data.full_capabilities,
-            )
-            .with_on_change(|v| AppMessage::GenericGpuUpdated(v)),
-            wayland_socket: Checkbox::new(wayland_label, initial_data.wayland_socket)
-                .with_on_change(|v| AppMessage::WaylandSocketUpdated(v))
+            ),
+            wayland_socket: Checkbox::new(wayland_label, initial_wayland)
                 .with_enabled(is_host_nw),
             nvidia_gpu: Checkbox::new(nvidia_label, initial_data.nvidia_gpu)
-                .with_on_change(|v| AppMessage::NvidiaGpuUpdated(v))
                 .with_enabled(nvidia_toolkit_installed),
             focus: FocusTracker::new(),
         };
+
         view.update_focus();
         view
     }
@@ -128,5 +130,19 @@ impl Component for PassthroughStepView {
             }
             _ => res,
         }
+    }
+
+    fn validate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl StepComponent for PassthroughStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        ctx.passthrough.full_capabilities = self.generic_gpu.checked();
+        ctx.passthrough.nvidia_gpu = self.nvidia_gpu.checked();
+        
+        let is_host_nw = matches!(ctx.network.network_mode(), Some(NetworkMode::Host));
+        ctx.passthrough.wayland_socket = self.wayland_socket.checked() && is_host_nw;
     }
 }

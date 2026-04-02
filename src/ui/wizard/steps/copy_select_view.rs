@@ -1,6 +1,9 @@
 use crate::nspawn::ContainerEntry;
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
@@ -12,8 +15,8 @@ impl CopySelectStepView {
     pub fn new(entries: &[ContainerEntry], initial_cursor: usize) -> Self {
         let mut list = SelectableList::new(" Select container to clone ", entries.to_vec(), |e| {
             format!("  {} ({})", e.name, e.state.label())
-        })
-        .with_on_change(|idx| AppMessage::SourceCloneIdxUpdated(idx));
+        });
+
 
         list.select(initial_cursor);
 
@@ -37,4 +40,19 @@ impl Component for CopySelectStepView {
     fn is_focused(&self) -> bool {
         self.list.is_focused()
     }
+    fn validate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
 }
+
+impl StepComponent for CopySelectStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        if let Some(idx) = self.list.selected_idx() {
+            ctx.source.copy_idx = idx;
+            if let Some(entry) = self.list.selected_item() {
+                ctx.source.clone_source = entry.name.clone();
+            }
+        }
+    }
+}
+

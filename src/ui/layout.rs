@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::nspawn::StatusLevel;
-use crate::ui::{centered_rect, core::Component, widgets::power_menu::PowerMenu};
+use crate::ui::{centered_rect, core::Component};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -27,8 +27,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
-    if app.ui.show_power_menu {
-        PowerMenu::new(app.ui.power_menu_selected).render(f, area);
+    if let Some(pm) = &mut app.ui.power_menu {
+        pm.render(f, area);
     }
     if app.ui.show_wizard {
         if let Some(w) = &mut app.ui.wizard {

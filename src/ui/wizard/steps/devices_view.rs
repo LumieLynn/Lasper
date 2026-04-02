@@ -1,8 +1,10 @@
 use crate::nspawn::models::BindMount;
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::composites::bind_mount::BindMountBox;
 use crate::ui::widgets::composites::editable_list::EditableList;
-use crate::ui::wizard::context::PassthroughConfig;
+use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -31,8 +33,9 @@ impl DevicesStepView {
                         if bm.readonly { "ro" } else { "rw" }
                     )
                 },
-                |idx| AppMessage::BindMountRemoved(idx),
+                |idx| AppMessage::Wizard(WizardMessage::BindMountRemoved(idx)),
             ),
+
             bind_editor: None,
             nvidia_enabled: initial_data.nvidia_gpu,
         }
@@ -88,22 +91,24 @@ impl Component for DevicesStepView {
             }
             let res = editor.handle_key(key);
             match &res {
-                EventResult::Message(AppMessage::BindMountAdded(bm)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::BindMountAdded(bm))) => {
                     self.bind_list.add_item(bm.clone());
                     self.bind_editor = None;
                 }
-                EventResult::Message(AppMessage::DialogCancel) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
                     self.bind_editor = None;
                     return EventResult::Consumed;
                 }
                 _ => {}
             }
             return res;
+
         }
 
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.bind_editor = Some(BindMountBox::new(|bm| AppMessage::BindMountAdded(bm)));
+                self.bind_editor = Some(BindMountBox::new(|bm| AppMessage::Wizard(WizardMessage::BindMountAdded(bm))));
+
                 self.bind_editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
@@ -119,5 +124,15 @@ impl Component for DevicesStepView {
 
     fn is_focused(&self) -> bool {
         self.bind_list.is_focused()
+    }
+
+    fn validate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl StepComponent for DevicesStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        ctx.passthrough.bind_mounts = self.bind_list.items().to_vec();
     }
 }

@@ -1,6 +1,7 @@
 use super::{ActivePanel, App};
 use crate::nspawn::StatusLevel;
-use crate::ui::core::{AppMessage, EventResult};
+use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
+
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::wizard::Wizard;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -39,18 +40,12 @@ impl App {
         }
 
         // ── Overlay: power menu ───────────────────────────────────────────────
-        if self.ui.show_power_menu {
+        if let Some(pm) = &mut self.ui.power_menu {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.ui.show_power_menu = false,
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.ui.power_menu_selected = self.ui.power_menu_selected.saturating_sub(1);
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    self.ui.power_menu_selected = (self.ui.power_menu_selected + 1).min(6);
-                }
+                KeyCode::Esc | KeyCode::Char('q') => self.ui.power_menu = None,
                 KeyCode::Enter => {
-                    let idx = self.ui.power_menu_selected;
-                    self.ui.show_power_menu = false;
+                    let idx = pm.get_selected();
+                    self.ui.power_menu = None;
                     match idx {
                         0 => self.action_start().await,
                         1 => self.action_poweroff().await,
@@ -62,7 +57,9 @@ impl App {
                         _ => {}
                     }
                 }
-                _ => {}
+                _ => {
+                    let _ = pm.handle_key(key);
+                }
             }
             return;
         }
@@ -96,8 +93,7 @@ impl App {
             }
             KeyCode::Char('x') | KeyCode::Enter => {
                 if !self.data.entries.is_empty() {
-                    self.ui.show_power_menu = true;
-                    self.ui.power_menu_selected = 0;
+                    self.ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
                 }
                 return;
             }
@@ -142,11 +138,11 @@ impl App {
 
     async fn handle_container_list_result(&mut self, result: EventResult) {
         match result {
-            EventResult::Message(AppMessage::ListNext) => {
+            EventResult::Message(AppMessage::List(ListMessage::Next)) => {
                 self.select_next();
                 self.refresh_detail().await;
             }
-            EventResult::Message(AppMessage::ListPrev) => {
+            EventResult::Message(AppMessage::List(ListMessage::Prev)) => {
                 self.select_prev();
                 self.refresh_detail().await;
             }
@@ -154,10 +150,11 @@ impl App {
         }
     }
 
+
     /// Processes an `EventResult` produced by the detail panel.
     async fn handle_detail_panel_result(&mut self, result: EventResult) {
         match result {
-            EventResult::Message(AppMessage::DetailPaneChanged(_pane)) => {
+            EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(_pane))) => {
                 // The active_pane is already updated inside the component.
                 // Just trigger a data refresh for the new pane.
                 self.refresh_detail().await;
@@ -166,4 +163,5 @@ impl App {
             _ => {}
         }
     }
+
 }

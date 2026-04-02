@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 impl App {
     pub async fn refresh(&mut self) {
-        if self.ui.show_wizard || self.ui.show_help || self.ui.show_power_menu {
+        if self.ui.show_wizard || self.ui.show_help || self.ui.power_menu.is_some() {
             return;
         }
         self.data.dbus_active = self.data.manager.is_dbus_available().await;

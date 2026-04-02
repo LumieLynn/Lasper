@@ -153,8 +153,23 @@ async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
     Ok(paths)
 }
 
+fn get_state_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("LASPER_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("lasper").join("states");
+    }
+    if let Some(home) = dirs::home_dir() {
+        home.join(".local").join("state").join("lasper").join("states")
+    } else {
+        PathBuf::from("/var/lib/lasper/states")
+    }
+}
+
 pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
-    let path = PathBuf::from(format!("/var/lib/lasper/states/{}.json", name));
+    let dir = get_state_dir();
+    let path = dir.join(format!("{}.json", name));
     if !path.exists() {
         return Ok(None);
     }
@@ -186,7 +201,7 @@ pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
-    let dir = PathBuf::from("/var/lib/lasper/states");
+    let dir = get_state_dir();
     if !dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&dir).await {
             log::warn!("Failed to create state directory {}: {}", dir.display(), e);

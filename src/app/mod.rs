@@ -44,15 +44,14 @@ pub struct AppUi {
 
     pub show_wizard: bool,
     pub show_help: bool,
-    pub show_power_menu: bool,
-    pub power_menu_selected: usize,
+    pub power_menu: Option<crate::ui::widgets::power_menu::PowerMenu>,
     pub pane_height: u16,
 
     pub wizard: Option<Wizard>,
 
     pub status_message: Option<(String, StatusLevel)>,
     pub status_expiry: Option<Instant>,
-    pub backend_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::ui::core::BackendCommand>>,
+    pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>>,
 }
 
 impl AppUi {
@@ -63,8 +62,7 @@ impl AppUi {
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
-            show_power_menu: false,
-            power_menu_selected: 0,
+            power_menu: None,
             pane_height: 10,
             wizard: None,
             status_message: None,
@@ -126,7 +124,7 @@ impl App {
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
         let (backend_tx, mut backend_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::ui::core::BackendCommand>();
+            tokio::sync::mpsc::channel::<crate::ui::core::BackendCommand>(100);
         self.ui.backend_tx = Some(backend_tx);
 
         let manager_clone = self.data.manager.clone();
@@ -153,6 +151,10 @@ impl App {
                     .unwrap_or(0)
                     .min(self.data.entries.len().saturating_sub(1));
                 self.refresh_detail().await;
+
+                if let Some(wizard) = &mut self.ui.wizard {
+                    wizard.context.entries = self.data.entries.clone();
+                }
             }
 
             terminal.draw(|f| crate::ui::draw(f, self))?;
@@ -164,7 +166,7 @@ impl App {
                         AppEvent::Tick => self.tick().await,
                         AppEvent::BackendResult(res) => {
                             if let Some(wizard) = &mut self.ui.wizard {
-                                wizard.process_message(crate::ui::core::AppMessage::BackendResult(res));
+                                wizard.process_message(crate::ui::core::AppMessage::Backend(res));
                             }
                         }
                     }
@@ -181,7 +183,7 @@ impl App {
 
                                 // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
                                 let (log_mpsc_tx, mut log_mpsc_rx) =
-                                    tokio::sync::mpsc::unbounded_channel::<String>();
+                                    tokio::sync::mpsc::channel::<String>(100);
                                 let log_bcast_tx = ctx.deploy.log_tx.clone();
                                 tokio::spawn(async move {
                                     while let Some(msg) = log_mpsc_rx.recv().await {

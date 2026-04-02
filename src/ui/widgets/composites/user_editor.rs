@@ -1,6 +1,8 @@
 use crate::nspawn::models::CreateUser;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+
 use crate::ui::widgets::inputs::button::Button;
+use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -11,9 +13,10 @@ use ratatui::{
 
 pub struct UserEditor {
     username: TextBox,
-    password: TextBox,
+    password: PasswordBox,
     shell: TextBox,
     sudoer: Checkbox,
+
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
@@ -47,11 +50,13 @@ impl UserEditor {
     pub fn new(on_submit: impl Fn(CreateUser) -> AppMessage + 'static) -> Self {
         let mut editor = Self {
             username: TextBox::new(" Username ", String::new()).with_validator(validate_username),
-            password: TextBox::new(" Password (optional) ", String::new()),
+            password: PasswordBox::new(" Password (optional) ", String::new()),
             shell: TextBox::new(" Shell ", "/bin/bash".to_string()),
+
             sudoer: Checkbox::new(" Add to sudo/wheel group ", false),
-            btn_ok: Button::new("OK", AppMessage::DialogSubmit),
-            btn_cancel: Button::new("Cancel", AppMessage::DialogCancel),
+            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
         };
@@ -62,8 +67,9 @@ impl UserEditor {
     pub fn with_user(mut self, user: &CreateUser) -> Self {
         self.username =
             TextBox::new(" Username ", user.username.clone()).with_validator(validate_username);
-        self.password = TextBox::new(" Password (optional) ", user.password.clone());
+        self.password = PasswordBox::new(" Password (optional) ", user.password.clone());
         self.shell = TextBox::new(" Shell ", user.shell.clone());
+
         self.sudoer = Checkbox::new(" Add to sudo/wheel group ", user.sudoer);
         self.update_focus();
         self
@@ -170,6 +176,7 @@ impl Component for UserEditor {
                     sudoer: self.sudoer.checked(),
                 };
                 return EventResult::Message((self.on_submit)(user));
+
             }
             _ => {}
         }
@@ -185,7 +192,7 @@ impl Component for UserEditor {
 
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
-            EventResult::Message(AppMessage::DialogSubmit) => {
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
                 let mut valid = true;
                 if self.username.validate().is_err() {
                     valid = false;
@@ -207,10 +214,12 @@ impl Component for UserEditor {
                     sudoer: self.sudoer.checked(),
                 };
                 EventResult::Message((self.on_submit)(user))
+
             }
-            EventResult::Message(AppMessage::DialogCancel) => {
-                EventResult::Message(AppMessage::DialogCancel)
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
             }
+
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed

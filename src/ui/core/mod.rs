@@ -1,57 +1,53 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMessage {
-    StepNext,
-    StepPrev,
+    Global(GlobalMessage),
+    Wizard(WizardMessage),
+    Container(ContainerMessage),
+    List(ListMessage),
+    Backend(BackendResponse),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GlobalMessage {
+    Exit,
+    Refresh,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum WizardMessage {
+    NextStep,
+    PrevStep,
     Submit,
     Close,
-
-    // Source State
-    SourceUrlUpdated(String),
-    SourceKindUpdated(crate::ui::wizard::context::SourceKind),
-    SourceMirrorUpdated(String),
-    SourceSuiteUpdated(String),
-    SourcePkgsUpdated(String),
-    SourceDiskPathUpdated(String),
-    SourceCloneIdxUpdated(usize),
-
-    // Basic State
-    BaseNameUpdated(String),
-    BaseHostnameUpdated(String),
-
-    // Storage State
-    StorageTypeUpdated(usize),
-    StorageSizeUpdated(String),
-    StorageFsUpdated(String),
-    StoragePartitionUpdated(bool),
-
-    // User State
-    RootPasswordUpdated(String),
-    UserAdded(crate::nspawn::models::CreateUser),
-    UserRemoved(usize),
-
-    // Network State
-    NetworkModeUpdated(usize),
-    NetworkBridgeUpdated(String),
-    PortForwardAdded(crate::nspawn::models::PortForward),
-    PortForwardRemoved(usize),
     DialogSubmit,
     DialogCancel,
 
-    // Passthrough State
-    GenericGpuUpdated(bool),
-    WaylandSocketUpdated(bool),
-    NvidiaGpuUpdated(bool),
+    // Macro-events for atomic data changes
+    UserAdded(crate::nspawn::models::CreateUser),
+    UserRemoved(usize),
+    PortForwardAdded(crate::nspawn::models::PortForward),
+    PortForwardRemoved(usize),
     BindMountAdded(crate::nspawn::models::BindMount),
     BindMountRemoved(usize),
-
-    // Main UI — container list navigation
-    ListNext,
-    ListPrev,
-    DetailPaneChanged(crate::app::DetailPane),
-
-    // Backend communication
-    BackendResult(BackendResponse),
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContainerMessage {
+    Start,
+    Stop,
+    Remove,
+    PaneChanged(crate::app::DetailPane),
+}
+
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListMessage {
+    Next,
+    Prev,
+}
+
+
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {

@@ -23,6 +23,10 @@ impl PowerMenu {
 
         Self { list }
     }
+
+    pub fn get_selected(&self) -> usize {
+        self.list.selected_idx().unwrap_or(0)
+    }
 }
 
 impl Component for PowerMenu {
@@ -47,8 +51,7 @@ impl Component for PowerMenu {
         self.list.render(f, area);
     }
 
-    fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> EventResult {
-        // Main app handles keys for PowerMenu directly in handlers.rs
-        EventResult::Ignored
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> EventResult {
+        self.list.handle_key(key)
     }
 }

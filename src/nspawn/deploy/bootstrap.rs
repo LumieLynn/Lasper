@@ -23,7 +23,7 @@ impl Deployer for DebootstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::UnboundedSender<String>,
+        logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         let mut args = vec![];
         if cfg.users.iter().any(|u| u.sudoer) {
@@ -50,7 +50,7 @@ impl Deployer for PacstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::UnboundedSender<String>,
+        logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         let mut args = vec![
             "-c".into(),
@@ -69,7 +69,7 @@ impl Deployer for PacstrapDeployer {
 async fn run_command(
     prog: &str,
     args: Vec<String>,
-    logs: tokio::sync::mpsc::UnboundedSender<String>,
+    logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let mut cmd = Command::new(prog);
     cmd.args(args);
@@ -92,14 +92,14 @@ async fn run_command(
     tokio::spawn(async move {
         let mut r = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = r.next_line().await {
-            let _ = l1.send(line);
+            let _ = l1.send(line).await;
         }
     });
     let l2 = logs.clone();
     tokio::spawn(async move {
         let mut r = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = r.next_line().await {
-            let _ = l2.send(line);
+            let _ = l2.send(line).await;
         }
     });
 

@@ -8,7 +8,8 @@ use ratatui::{
 };
 
 use crate::app::{AppData, DetailPane};
-use crate::ui::core::{AppMessage, EventResult};
+use crate::ui::core::{AppMessage, ContainerMessage, EventResult};
+
 
 const IMPORTANT_KEYS: &[&str] = &[
     "Name",
@@ -114,23 +115,24 @@ impl DetailPanel {
             // ─── Pane switching ────────────────────────────────────────────
             KeyCode::Char('p') => {
                 self.active_pane = DetailPane::Properties;
-                return EventResult::Message(AppMessage::DetailPaneChanged(DetailPane::Properties));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Properties)));
             }
             KeyCode::Char('d') => {
                 self.active_pane = DetailPane::Details;
                 self.details_state.select(Some(0));
-                return EventResult::Message(AppMessage::DetailPaneChanged(DetailPane::Details));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Details)));
             }
             KeyCode::Char('l') => {
                 self.active_pane = DetailPane::Logs;
                 self.log_scroll = 0;
-                return EventResult::Message(AppMessage::DetailPaneChanged(DetailPane::Logs));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Logs)));
             }
             KeyCode::Char('c') => {
                 self.active_pane = DetailPane::Config;
                 self.config_scroll = 0;
-                return EventResult::Message(AppMessage::DetailPaneChanged(DetailPane::Config));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Config)));
             }
+
 
             // ─── Logs scrolling ────────────────────────────────────────────
             KeyCode::Up if self.active_pane == DetailPane::Logs => {

@@ -1,9 +1,11 @@
 use crate::nspawn::models::CreateUser;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::composites::editable_list::EditableList;
 use crate::ui::widgets::composites::user_editor::UserEditor;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
-use crate::ui::wizard::context::UserConfig;
+use crate::ui::wizard::context::{UserConfig, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -28,14 +30,14 @@ impl UserStepView {
             root_password: PasswordBox::new(
                 " Root Password (optional) ",
                 initial_data.root_password.clone().unwrap_or_default(),
-            )
-            .with_on_change(|v| AppMessage::RootPasswordUpdated(v)),
+            ),
             user_list: EditableList::new(
                 " Regular Users ",
                 users,
                 |u| format!("  {} {}", u.username, if u.sudoer { "[sudo]" } else { "" }),
-                |idx| AppMessage::UserRemoved(idx),
+                |idx| AppMessage::Wizard(WizardMessage::UserRemoved(idx)),
             ),
+
 
             editor: None,
             focus: FocusTracker::new(),
@@ -106,12 +108,12 @@ impl Component for UserStepView {
             }
             let res = editor.handle_key(key);
             match &res {
-                EventResult::Message(AppMessage::UserAdded(user)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::UserAdded(user))) => {
                     self.user_list.add_item(user.clone());
                     self.editor = None;
                     self.update_focus();
                 }
-                EventResult::Message(AppMessage::DialogCancel) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
                     self.editor = None;
                     self.update_focus();
                     return EventResult::Consumed;
@@ -119,6 +121,7 @@ impl Component for UserStepView {
                 _ => {}
             }
             return res;
+
         }
 
         match key.code {
@@ -131,7 +134,8 @@ impl Component for UserStepView {
                 return EventResult::Consumed;
             }
             KeyCode::Char('a') | KeyCode::Char('A') if self.user_list.is_focused() => {
-                self.editor = Some(UserEditor::new(|u| AppMessage::UserAdded(u)));
+                self.editor = Some(UserEditor::new(|u| AppMessage::Wizard(WizardMessage::UserAdded(u))));
+
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
@@ -141,6 +145,10 @@ impl Component for UserStepView {
         let mut comps: Vec<&mut dyn Component> = vec![&mut self.root_password, &mut self.user_list];
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
+            EventResult::Message(AppMessage::Wizard(WizardMessage::UserRemoved(_))) => {
+                self.update_focus();
+                res
+            }
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed
@@ -151,6 +159,7 @@ impl Component for UserStepView {
             }
             _ => res,
         }
+
     }
 
     fn set_focus(&mut self, focused: bool) {
@@ -168,7 +177,14 @@ impl Component for UserStepView {
 
     fn validate(&mut self) -> Result<(), String> {
         self.root_password.validate()?;
-        self.user_list.validate()?;
         Ok(())
     }
+}
+
+impl StepComponent for UserStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        ctx.user.root_password = self.root_password.value().to_string();
+        ctx.user.users = self.user_list.items().to_vec();
+    }
+
 }

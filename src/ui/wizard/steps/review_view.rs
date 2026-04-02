@@ -1,5 +1,8 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::display::text_block::TextBlock;
+use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{layout::Rect, Frame};
 
@@ -23,9 +26,10 @@ impl Component for ReviewStepView {
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Enter => return EventResult::Message(AppMessage::Submit),
+            KeyCode::Enter => return EventResult::Message(AppMessage::Wizard(WizardMessage::Submit)),
             _ => {}
         }
+
         self.preview.handle_key(key)
     }
 
@@ -35,5 +39,15 @@ impl Component for ReviewStepView {
 
     fn is_focused(&self) -> bool {
         self.preview.is_focused()
+    }
+
+    fn validate(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+impl StepComponent for ReviewStepView {
+    fn commit_to_context(&self, _ctx: &mut WizardContext) {
+        // Preview is read-only view of context
     }
 }

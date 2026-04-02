@@ -1,8 +1,9 @@
 use crate::nspawn::ContainerEntry;
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{AppMessage, EventResult, WizardMessage};
 use crate::ui::wizard::context::{SourceKind, WizardContext};
-use crate::ui::wizard::steps;
+use crate::ui::wizard::steps::{self, StepComponent};
 use crate::ui::wizard::{StepAction, WizardStep};
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -14,8 +15,9 @@ use std::collections::HashMap;
 pub struct Wizard {
     pub step: WizardStep,
     pub context: WizardContext,
-    pub views: HashMap<WizardStep, Box<dyn Component>>,
-    pub command_tx: tokio::sync::mpsc::UnboundedSender<crate::ui::core::BackendCommand>,
+    pub views: HashMap<WizardStep, Box<dyn StepComponent>>,
+
+    pub command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
     pub loading: bool,
 }
 
@@ -23,7 +25,7 @@ impl Wizard {
     pub fn new(
         entries: Vec<ContainerEntry>,
         nvidia_toolkit_installed: bool,
-        command_tx: tokio::sync::mpsc::UnboundedSender<crate::ui::core::BackendCommand>,
+        command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
     ) -> Self {
         let mut context = WizardContext::new(entries);
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
@@ -306,116 +308,125 @@ impl Wizard {
 
     pub fn process_message(&mut self, msg: AppMessage) -> StepAction {
         match msg {
-            AppMessage::StepNext => return self.handle_action(StepAction::Next),
-            AppMessage::Submit => {
-                self.loading = true;
-                let _ = self
-                    .command_tx
-                    .send(crate::ui::core::BackendCommand::SubmitConfig(Box::new(
-                        self.context.clone(),
-                    )));
-                return StepAction::None;
-            }
-            AppMessage::StepPrev => return self.handle_action(StepAction::Prev),
-            AppMessage::Close => return StepAction::Close,
+            AppMessage::Wizard(wiz_msg) => match wiz_msg {
+                WizardMessage::NextStep => self.handle_action(StepAction::Next),
+                WizardMessage::PrevStep => self.handle_action(StepAction::Prev),
+                WizardMessage::Close => StepAction::Close,
+                WizardMessage::Submit => {
+                    if self.context.source.kind == SourceKind::Copy {
+                        let source_cfg = self.context.source.clone_source.clone();
+                        if !self.context.entries.iter().any(|e| e.name == source_cfg) {
+                            return StepAction::Status(
+                                format!(
+                                    "Validation Error: Source container '{}' no longer exists",
+                                    source_cfg
+                                ),
+                                crate::nspawn::StatusLevel::Error,
+                            );
+                        }
+                    }
+                    let target_name = self.context.basic.name.clone();
+                    if self.context.entries.iter().any(|e| e.name == target_name) {
+                        return StepAction::Status(
+                            format!(
+                                "Validation Error: Container '{}' already exists",
+                                target_name
+                            ),
+                            crate::nspawn::StatusLevel::Error,
+                        );
+                    }
 
-            AppMessage::BackendResult(res) => {
+                    self.loading = true;
+                    let tx = self.command_tx.clone();
+                    let cmd = crate::ui::core::BackendCommand::SubmitConfig(Box::new(
+                        self.context.clone(),
+                    ));
+                    if tx.try_send(cmd).is_err() {
+                        self.loading = false;
+                        return StepAction::Status(
+                            "Internal error: Backend channel busy or closed".into(),
+                            crate::nspawn::StatusLevel::Error,
+                        );
+                    }
+                    StepAction::None
+                }
+                WizardMessage::UserAdded(u) => {
+                    self.context.user.users.push(u);
+                    StepAction::None
+                }
+                WizardMessage::UserRemoved(idx) => {
+                    if idx < self.context.user.users.len() {
+                        self.context.user.users.remove(idx);
+                    }
+                    StepAction::None
+                }
+                WizardMessage::PortForwardAdded(p) => {
+                    self.context.network.port_list.push(p);
+                    StepAction::None
+                }
+                WizardMessage::PortForwardRemoved(idx) => {
+                    if idx < self.context.network.port_list.len() {
+                        self.context.network.port_list.remove(idx);
+                    }
+                    StepAction::None
+                }
+                WizardMessage::BindMountAdded(b) => {
+                    self.context.passthrough.bind_mounts.push(b);
+                    StepAction::None
+                }
+                WizardMessage::BindMountRemoved(idx) => {
+                    if idx < self.context.passthrough.bind_mounts.len() {
+                        self.context.passthrough.bind_mounts.remove(idx);
+                    }
+                    StepAction::None
+                }
+                WizardMessage::DialogSubmit | WizardMessage::DialogCancel => StepAction::None,
+            },
+
+            AppMessage::Backend(res) => {
                 self.loading = false;
                 match res {
                     crate::ui::core::BackendResponse::ValidationSuccess => {
-                        return self.handle_action(StepAction::Next);
+                        self.handle_action(StepAction::Next)
                     }
-                    crate::ui::core::BackendResponse::ValidationError(e) => {
-                        return StepAction::Status(
-                            format!("Error: {}", e),
-                            crate::nspawn::StatusLevel::Error,
-                        );
-                    }
+                    crate::ui::core::BackendResponse::ValidationError(e) => StepAction::Status(
+                        format!("Error: {}", e),
+                        crate::nspawn::StatusLevel::Error,
+                    ),
                     crate::ui::core::BackendResponse::DeployStarted => {
-                        return self.handle_action(StepAction::Next);
+                        self.handle_action(StepAction::Next)
                     }
-                    crate::ui::core::BackendResponse::DeployFailed(e) => {
-                        return StepAction::Status(
-                            format!("Deploy Failed: {}", e),
-                            crate::nspawn::StatusLevel::Error,
-                        );
-                    }
+                    crate::ui::core::BackendResponse::DeployFailed(e) => StepAction::Status(
+                        format!("Deploy Failed: {}", e),
+                        crate::nspawn::StatusLevel::Error,
+                    ),
                 }
             }
-
-            // Source State
-            AppMessage::SourceUrlUpdated(url) => self.context.source.oci_url = url,
-            AppMessage::SourceKindUpdated(kind) => self.context.source.kind = kind,
-            AppMessage::SourceMirrorUpdated(m) => self.context.source.deboot_mirror = m,
-            AppMessage::SourceSuiteUpdated(s) => self.context.source.deboot_suite = s,
-            AppMessage::SourcePkgsUpdated(p) => self.context.source.pacstrap_pkgs = p,
-            AppMessage::SourceDiskPathUpdated(d) => self.context.source.disk_path = d,
-            AppMessage::SourceCloneIdxUpdated(idx) => {
-                self.context.source.copy_idx = idx;
-                if let Some(entry) = self.context.entries.get(idx).cloned() {
-                    self.context.source.clone_source = entry.name;
-                }
-            }
-
-            // Basic State
-            AppMessage::BaseNameUpdated(n) => self.context.basic.name = n,
-            AppMessage::BaseHostnameUpdated(h) => self.context.basic.hostname = h,
-
-            // Storage State
-            AppMessage::StorageTypeUpdated(idx) => self.context.storage.type_idx = idx,
-            AppMessage::StorageSizeUpdated(s) => self.context.storage.raw_size = s,
-            AppMessage::StorageFsUpdated(f) => self.context.storage.raw_fs = f,
-            AppMessage::StoragePartitionUpdated(p) => self.context.storage.raw_partition = p,
-
-            // User State
-            AppMessage::RootPasswordUpdated(p) => self.context.user.root_password = p,
-            AppMessage::UserAdded(u) => self.context.user.users.push(u),
-            AppMessage::UserRemoved(idx) => {
-                if idx < self.context.user.users.len() {
-                    self.context.user.users.remove(idx);
-                }
-            }
-
-            // Network State
-            AppMessage::NetworkModeUpdated(mode) => self.context.network.mode = mode,
-            AppMessage::NetworkBridgeUpdated(b) => self.context.network.bridge_name = b,
-            AppMessage::PortForwardAdded(p) => self.context.network.port_list.push(p),
-            AppMessage::PortForwardRemoved(idx) => {
-                if idx < self.context.network.port_list.len() {
-                    self.context.network.port_list.remove(idx);
-                }
-            }
-
-            // Passthrough State
-            AppMessage::GenericGpuUpdated(g) => self.context.passthrough.full_capabilities = g,
-            AppMessage::WaylandSocketUpdated(w) => self.context.passthrough.wayland_socket = w,
-            AppMessage::NvidiaGpuUpdated(n) => self.context.passthrough.nvidia_gpu = n,
-            AppMessage::BindMountAdded(b) => self.context.passthrough.bind_mounts.push(b),
-            AppMessage::BindMountRemoved(idx) => {
-                if idx < self.context.passthrough.bind_mounts.len() {
-                    self.context.passthrough.bind_mounts.remove(idx);
-                }
-            }
-            AppMessage::DialogSubmit | AppMessage::DialogCancel => {} // Handled by inline editors
-            // Main-UI-only messages, never meaningful inside the wizard
-            AppMessage::DetailPaneChanged(_) | AppMessage::ListNext | AppMessage::ListPrev => {}
+            _ => StepAction::None,
         }
-        StepAction::None
     }
+
 
     fn handle_action(&mut self, action: StepAction) -> StepAction {
         match action {
             StepAction::Next => {
                 if let Some(view) = self.views.get_mut(&self.step) {
-                    if let Err(_) = view.validate() {
-                        return StepAction::None;
+                    if let Err(e) = view.validate() {
+                        return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
                     }
+                    view.commit_to_context(&mut self.context);
                 }
 
+
                 if let Some(next_step) = self.resolve_next_step(self.step) {
+                    // Evict downstream views that depend on preceding configuration
+                    if self.step == WizardStep::Network {
+                        self.views.remove(&WizardStep::Passthrough);
+                        self.views.remove(&WizardStep::Devices);
+                    }
+                    
                     self.step = next_step;
                     // Always rebuild Review so its preview reflects the latest context.
-                    // Passthrough and Devices are kept alive to preserve user input.
                     if self.step == WizardStep::Review {
                         self.views.remove(&self.step);
                     }
@@ -423,7 +434,11 @@ impl Wizard {
                 StepAction::None
             }
             StepAction::Prev => {
+                if let Some(view) = self.views.get_mut(&self.step) {
+                    view.commit_to_context(&mut self.context);
+                }
                 if let Some(prev_step) = self.resolve_prev_step(self.step) {
+
                     self.step = prev_step;
                     // Same: only evict Review on back-navigation.
                     if self.step == WizardStep::Review {

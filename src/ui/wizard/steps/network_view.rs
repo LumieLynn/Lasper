@@ -1,11 +1,13 @@
 use crate::nspawn::models::{NetworkMode, PortForward};
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::composites::editable_list::EditableList;
 use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crate::ui::wizard::context::NetworkConfig;
+use crate::ui::wizard::context::{NetworkConfig, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::Frame;
@@ -54,8 +56,7 @@ impl NetworkStepView {
         bridge_list.select(bridge_idx);
 
         let mut view = Self {
-            mode_selector: RadioGroup::new(" Network Mode ", modes, mode_idx)
-                .with_on_change(|idx| AppMessage::NetworkModeUpdated(idx)),
+            mode_selector: RadioGroup::new(" Network Mode ", modes, mode_idx),
             bridge_list,
             custom_bridge: TextBox::new(" Custom Bridge Name ", initial_bridge.clone())
                 .with_validator(|v| {
@@ -64,14 +65,14 @@ impl NetworkStepView {
                     } else {
                         Ok(())
                     }
-                })
-                .with_on_change(|v| AppMessage::NetworkBridgeUpdated(v)),
+                }),
             port_list: EditableList::new(
                 " Configured Port Forwards ",
                 initial_data.port_forwards.clone(),
                 |p| format!("  {}:{}/{}", p.host, p.container, p.proto),
-                |idx| AppMessage::PortForwardRemoved(idx),
+                |idx| AppMessage::Wizard(WizardMessage::PortForwardRemoved(idx)),
             ),
+
             port_editor: None,
             focus: FocusTracker::new(),
             bridge_options_len,
@@ -82,7 +83,8 @@ impl NetworkStepView {
 
     pub fn with_port_editor(mut self, enabled: bool) -> Self {
         if enabled {
-            self.port_editor = Some(PortMappingBox::new(|p| AppMessage::PortForwardAdded(p)));
+            self.port_editor = Some(PortMappingBox::new(|p| AppMessage::Wizard(WizardMessage::PortForwardAdded(p))));
+
             if let Some(ref mut editor) = self.port_editor {
                 editor.set_focus(true);
             }
@@ -210,12 +212,12 @@ impl Component for NetworkStepView {
             }
             let res = editor.handle_key(key);
             match &res {
-                EventResult::Message(AppMessage::PortForwardAdded(map)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardAdded(map))) => {
                     self.port_list.add_item(map.clone());
                     self.port_editor = None;
                     self.update_focus();
                 }
-                EventResult::Message(AppMessage::DialogCancel) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
                     self.port_editor = None;
                     self.update_focus();
                     return EventResult::Consumed;
@@ -223,6 +225,7 @@ impl Component for NetworkStepView {
                 _ => {}
             }
             return res;
+
         }
 
         match key.code {
@@ -235,7 +238,8 @@ impl Component for NetworkStepView {
                 return EventResult::Consumed;
             }
             KeyCode::Char('a') | KeyCode::Char('A') if self.port_list.is_focused() => {
-                self.port_editor = Some(PortMappingBox::new(|p| AppMessage::PortForwardAdded(p)));
+                self.port_editor = Some(PortMappingBox::new(|p| AppMessage::Wizard(WizardMessage::PortForwardAdded(p))));
+
                 self.port_editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
@@ -257,11 +261,16 @@ impl Component for NetworkStepView {
 
         if self.focus.active_idx < visible.len() {
             let res = visible[self.focus.active_idx].handle_key(key);
-            match &res {
-                EventResult::Message(AppMessage::NetworkModeUpdated(_))
-                | EventResult::Message(AppMessage::NetworkBridgeUpdated(_)) => {
+            if let EventResult::Consumed = res {
+                if self.focus.active_idx == 0 || (mode == 3 && self.focus.active_idx == 1) {
                     self.update_focus();
                 }
+            }
+            match &res {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardRemoved(_))) => {
+                    self.update_focus();
+                }
+
                 EventResult::FocusNext => {
                     self.skip_next();
                     return EventResult::Consumed;
@@ -297,10 +306,21 @@ impl Component for NetworkStepView {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        if self.is_custom_bridge() {
+        if self.mode_selector.selected_idx() == 3 && self.is_custom_bridge() {
             self.custom_bridge.validate()?;
         }
-        self.port_list.validate()?;
         Ok(())
+    }
+}
+
+impl StepComponent for NetworkStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        ctx.network.mode = self.mode_selector.selected_idx();
+        if self.is_custom_bridge() {
+            ctx.network.bridge_name = self.custom_bridge.value().to_string();
+        } else {
+            ctx.network.bridge_name = self.bridge_list.selected_item().cloned().unwrap_or_default();
+        }
+        ctx.network.port_list = self.port_list.items().to_vec();
     }
 }

@@ -1,4 +1,4 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -13,9 +13,9 @@ pub struct SelectableList<T> {
     label: String,
     focused: bool,
     enabled: bool,
-    on_change: Option<Box<dyn Fn(usize) -> AppMessage>>,
     display_fn: Box<dyn Fn(&T) -> String>,
 }
+
 
 impl<T> SelectableList<T> {
     pub fn new(
@@ -33,9 +33,9 @@ impl<T> SelectableList<T> {
             label: label.into(),
             focused: false,
             enabled: true,
-            on_change: None,
             display_fn: Box::new(display_fn),
         }
+
     }
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
@@ -47,13 +47,10 @@ impl<T> SelectableList<T> {
         self.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self
-    where
-        F: Fn(usize) -> AppMessage + 'static,
-    {
-        self.on_change = Some(Box::new(f));
-        self
+    pub fn items(&self) -> &[T] {
+        &self.items
     }
+
 
     pub fn selected_idx(&self) -> Option<usize> {
         self.state.selected()
@@ -193,22 +190,14 @@ impl<T> Component for SelectableList<T> {
             KeyCode::BackTab => EventResult::FocusPrev,
             KeyCode::Down | KeyCode::Char('j') => {
                 self.next();
-                if let Some(on_change) = &self.on_change {
-                    if let Some(idx) = self.state.selected() {
-                        return EventResult::Message(on_change(idx));
-                    }
-                }
                 EventResult::Consumed
             }
+
             KeyCode::Up | KeyCode::Char('k') => {
                 self.previous();
-                if let Some(on_change) = &self.on_change {
-                    if let Some(idx) = self.state.selected() {
-                        return EventResult::Message(on_change(idx));
-                    }
-                }
                 EventResult::Consumed
             }
+
             _ => EventResult::Ignored,
         }
     }

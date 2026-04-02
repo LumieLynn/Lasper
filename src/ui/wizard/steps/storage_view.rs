@@ -1,8 +1,10 @@
 use crate::nspawn::storage::{StorageInfo, StorageType};
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crate::ui::wizard::context::StorageConfig;
+use crate::ui::wizard::context::{StorageConfig, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -25,8 +27,8 @@ impl StorageStepView {
         let mut list = SelectableList::new(" Storage Options ", types, |(st, supported)| {
             let status = if *supported { "" } else { " (unsupported)" };
             format!("{}{}", st.label(), status)
-        })
-        .with_on_change(|idx| AppMessage::StorageTypeUpdated(idx));
+        });
+
 
         let type_idx = info
             .types
@@ -54,8 +56,8 @@ impl StorageStepView {
                     } else {
                         Ok(())
                     }
-                })
-                .with_on_change(|v| AppMessage::StorageSizeUpdated(v)),
+                }),
+
             raw_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", raw_cfg.fs_type)
                 .with_validator(|v| {
                     if v.trim().is_empty() {
@@ -63,8 +65,8 @@ impl StorageStepView {
                     } else {
                         Ok(())
                     }
-                })
-                .with_on_change(|v| AppMessage::StorageFsUpdated(v)),
+                }),
+
             info,
             focus: FocusTracker::new(),
         };
@@ -177,11 +179,13 @@ impl Component for StorageStepView {
 
         let res = comps[self.focus.active_idx].handle_key(key);
 
-        match res {
-            EventResult::Message(AppMessage::StorageTypeUpdated(_)) => {
+        if let EventResult::Consumed = res {
+            if self.focus.active_idx == 0 {
                 self.update_focus();
-                res
             }
+        }
+        match res {
+
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed
@@ -204,11 +208,25 @@ impl Component for StorageStepView {
         }
     }
 
+    fn is_enabled(&self) -> bool {
+        true
+    }
+
     fn validate(&mut self) -> Result<(), String> {
         if self.is_raw_selected() {
             self.raw_size.validate()?;
             self.raw_fs.validate()?;
         }
         Ok(())
+    }
+}
+
+impl StepComponent for StorageStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        if let Some(idx) = self.list.selected_idx() {
+            ctx.storage.type_idx = idx;
+        }
+        ctx.storage.raw_size = self.raw_size.value().to_string();
+        ctx.storage.raw_fs = self.raw_fs.value().to_string();
     }
 }

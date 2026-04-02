@@ -30,6 +30,10 @@ impl<T> EditableList<T> {
     pub fn remove_item(&mut self, idx: usize) {
         self.list.remove_item(idx);
     }
+
+    pub fn items(&self) -> &[T] {
+        self.list.items()
+    }
 }
 
 impl<T> Component for EditableList<T> {

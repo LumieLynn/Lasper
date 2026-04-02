@@ -20,7 +20,7 @@ impl Deployer for OciDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: tokio::sync::mpsc::UnboundedSender<String>,
+        _logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         import_oci_image(&self.url, name, rootfs).await
     }
@@ -37,7 +37,7 @@ impl Deployer for DiskImageDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: tokio::sync::mpsc::UnboundedSender<String>,
+        _logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         import_disk_image(&self.path, name, rootfs).await
     }

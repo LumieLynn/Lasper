@@ -1,4 +1,4 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::core::{Component, EventResult};
 use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
@@ -8,8 +8,8 @@ pub struct NumberBox {
     base: TextInputBase,
     min_value: u32,
     max_value: u32,
-    on_change: Option<Box<dyn Fn(u32) -> AppMessage>>,
 }
+
 
 impl NumberBox {
     pub fn new(label: impl Into<String>, initial_value: u32) -> Self {
@@ -17,9 +17,9 @@ impl NumberBox {
             base: TextInputBase::new(label, initial_value.to_string()),
             min_value: 0,
             max_value: u32::MAX,
-            on_change: None,
         }
     }
+
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.base.enabled = enabled;
@@ -30,13 +30,10 @@ impl NumberBox {
         self.base.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self
-    where
-        F: Fn(u32) -> AppMessage + 'static,
-    {
-        self.on_change = Some(Box::new(f));
-        self
+    pub fn set_value(&mut self, value: u32) {
+        self.base.input = tui_input::Input::from(value.to_string());
     }
+
 
     pub fn with_max_value(mut self, max: u32) -> Self {
         self.max_value = max;
@@ -77,12 +74,10 @@ impl Component for NumberBox {
             if let Ok(num) = val_str.parse::<u32>() {
                 if num <= self.max_value {
                     self.base.input = temp_input;
-                    if let Some(on_change) = &self.on_change {
-                        return EventResult::Message(on_change(num));
-                    }
                     return EventResult::Consumed;
                 }
             }
+
             return EventResult::Consumed;
         }
         EventResult::Ignored

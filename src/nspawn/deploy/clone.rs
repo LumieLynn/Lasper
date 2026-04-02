@@ -25,12 +25,12 @@ impl Deployer for CloneDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::UnboundedSender<String>,
+        logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         let _ = logs.send(format!(
             "Cloning container {} to {}...",
             self.source_name, name
-        ));
+        )).await;
 
         let out = Command::new("machinectl")
             .args(["clone", &self.source_name, name])
@@ -49,10 +49,10 @@ impl Deployer for CloneDeployer {
 
         // Clone configs
         if let Err(e) = create::clone_nspawn_config(&self.source_name, name) {
-            let _ = logs.send(format!("WARNING: Failed to clone .nspawn config: {}", e));
+            let _ = logs.send(format!("WARNING: Failed to clone .nspawn config: {}", e)).await;
         }
         if let Err(e) = create::clone_systemd_override(&self.source_name, name) {
-            let _ = logs.send(format!("WARNING: Failed to clone systemd override: {}", e));
+            let _ = logs.send(format!("WARNING: Failed to clone systemd override: {}", e)).await;
         }
 
         Ok(())

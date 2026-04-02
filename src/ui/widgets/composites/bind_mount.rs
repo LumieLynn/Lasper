@@ -1,5 +1,6 @@
 use crate::nspawn::models::BindMount;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
@@ -47,8 +48,9 @@ impl BindMountBox {
                     Ok(())
                 }),
             readonly: Checkbox::new("Read Only", false),
-            btn_ok: Button::new("OK", AppMessage::DialogSubmit),
-            btn_cancel: Button::new("Cancel", AppMessage::DialogCancel),
+            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
         }
@@ -165,7 +167,7 @@ impl Component for BindMountBox {
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
-            EventResult::Message(AppMessage::DialogSubmit) => {
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
                 let mut valid = true;
                 if self.source_path.validate().is_err() {
                     valid = false;
@@ -190,9 +192,10 @@ impl Component for BindMountBox {
                     readonly,
                 }))
             }
-            EventResult::Message(AppMessage::DialogCancel) => {
-                EventResult::Message(AppMessage::DialogCancel)
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
             }
+
             EventResult::FocusNext => {
                 let crefs: Vec<&dyn Component> = vec![
                     &self.source_path,

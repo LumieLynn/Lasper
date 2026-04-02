@@ -1,8 +1,10 @@
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crate::ui::wizard::context::{SourceConfig, SourceKind};
+use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
+use crate::ui::wizard::steps::StepComponent;
+
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -32,35 +34,23 @@ impl SourceStepView {
         ];
 
         let kind_list =
-            SelectableList::new(" Select base ", kinds, |s| s.clone()).with_on_change(|idx| {
-                let kind = match idx {
-                    0 => SourceKind::Copy,
-                    1 => SourceKind::Oci,
-                    2 => SourceKind::Debootstrap,
-                    3 => SourceKind::Pacstrap,
-                    _ => SourceKind::DiskImage,
-                };
-                AppMessage::SourceKindUpdated(kind)
-            });
+            SelectableList::new(" Select base ", kinds, |s| s.clone());
+
 
         let mut view = Self {
             kind_list,
             oci_url: TextBox::new(" OCI URL (e.g. alpine, docker://ubuntu) ", initial_data.oci_url.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) })
-                .with_on_change(|v| AppMessage::SourceUrlUpdated(v)),
-            deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone())
-                .with_on_change(|v| AppMessage::SourceMirrorUpdated(v)),
+                .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) }),
+            deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone()),
             deboot_suite: TextBox::new(" Suite (default: bookworm) ", initial_data.deboot_suite.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) })
-                .with_on_change(|v| AppMessage::SourceSuiteUpdated(v)),
-            pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone())
-                .with_on_change(|v| AppMessage::SourcePkgsUpdated(v)),
+                .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) }),
+            pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone()),
             disk_path: TextBox::new(" Local file path (.raw, .tar) ", initial_data.disk_path.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("Path required".into()) } else { Ok(()) })
-                .with_on_change(|v| AppMessage::SourceDiskPathUpdated(v)),
+                .with_validator(|v| if v.trim().is_empty() { Err("Path required".into()) } else { Ok(()) }),
             oci_tip: TextBlock::new(" [!] OCI Important Note ", "OCI imports extract the rootfs only. You must manually configure the init program and entrypoint."),
             focus: FocusTracker::new(),
         };
+
         view.update_focus();
         view
     }
@@ -195,11 +185,14 @@ impl Component for SourceStepView {
         }
 
         let res = comps[self.focus.active_idx].handle_key(key);
-        match res {
-            EventResult::Message(AppMessage::SourceKindUpdated(_)) => {
+        if let EventResult::Consumed = res {
+            // If the kind list changed, we need to update focus since visible inputs change
+            if self.focus.active_idx == 0 {
                 self.update_focus();
-                res
             }
+        }
+        match res {
+
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed
@@ -238,5 +231,23 @@ impl Component for SourceStepView {
             _ => {}
         }
         Ok(())
+    }
+}
+
+impl StepComponent for SourceStepView {
+    fn commit_to_context(&self, ctx: &mut WizardContext) {
+        let idx = self.kind_list.selected_idx().unwrap_or(0);
+        ctx.source.kind = match idx {
+            0 => SourceKind::Copy,
+            1 => SourceKind::Oci,
+            2 => SourceKind::Debootstrap,
+            3 => SourceKind::Pacstrap,
+            _ => SourceKind::DiskImage,
+        };
+        ctx.source.oci_url = self.oci_url.value().to_string();
+        ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
+        ctx.source.deboot_suite = self.deboot_suite.value().to_string();
+        ctx.source.pacstrap_pkgs = self.pacstrap_pkgs.value().to_string();
+        ctx.source.disk_path = self.disk_path.value().to_string();
     }
 }
