@@ -1,3 +1,5 @@
+use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
@@ -5,8 +7,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use crate::ui::core::{AppMessage, Component, EventResult};
-use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 
 pub struct PasswordBox {
     base: TextInputBase,
@@ -23,15 +23,17 @@ impl PasswordBox {
         }
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(String) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(String) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
     }
 
     pub fn with_validator<F>(mut self, f: F) -> Self
-    where F: Fn(&str) -> Result<(), String> + 'static
+    where
+        F: Fn(&str) -> Result<(), String> + 'static,
     {
         self.validator = Some(Box::new(f));
         self
@@ -49,7 +51,7 @@ impl Component for PasswordBox {
         } else {
             Style::default().fg(Color::White)
         };
-        
+
         let title = if let Some(err) = &self.base.error_msg {
             let label = self.base.label.trim();
             format!(" {} [{}] ", label, err)
@@ -69,24 +71,20 @@ impl Component for PasswordBox {
         let visible_len = total_len.saturating_sub(scroll);
         let visible_masked = "*".repeat(visible_len);
 
-        let paragraph = Paragraph::new(visible_masked)
-            .block(block);
+        let paragraph = Paragraph::new(visible_masked).block(block);
 
         f.render_widget(paragraph, area);
 
         if self.base.focused && self.base.enabled {
             let cursor_pos = self.base.input.visual_cursor().saturating_sub(scroll);
-            f.set_cursor_position((
-                area.x + 1 + cursor_pos as u16,
-                area.y + 1,
-            ));
+            f.set_cursor_position((area.x + 1 + cursor_pos as u16, area.y + 1));
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let prev_val = self.base.input.value().to_string();
         let res = self.base.handle_key(key);
-        
+
         if let EventResult::Consumed = res {
             let new_val = self.base.input.value().to_string();
             if new_val != prev_val {
@@ -105,7 +103,7 @@ impl Component for PasswordBox {
     fn is_focused(&self) -> bool {
         self.base.focused
     }
-    
+
     fn validate(&mut self) -> Result<(), String> {
         let val = self.base.input.value().to_string();
         if let Some(validator) = &self.validator {

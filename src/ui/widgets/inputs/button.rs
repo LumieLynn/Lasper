@@ -1,3 +1,4 @@
+use crate::ui::core::{AppMessage, Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -5,7 +6,6 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use crate::ui::core::{AppMessage, Component, EventResult};
 
 pub struct Button {
     label: String,
@@ -32,17 +32,24 @@ impl Component for Button {
         };
 
         let label = format!(" {} ", self.label);
-        let block = Block::default().borders(Borders::ALL).border_style(if self.focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) });
-        
-        let p = Paragraph::new(label).style(style).block(block).alignment(ratatui::layout::Alignment::Center);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(if self.focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            });
+
+        let p = Paragraph::new(label)
+            .style(style)
+            .block(block)
+            .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(p, area);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => {
-                EventResult::Message(self.msg.clone())
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => EventResult::Message(self.msg.clone()),
             _ => EventResult::Ignored,
         }
     }

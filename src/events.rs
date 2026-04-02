@@ -1,6 +1,9 @@
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use std::{
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::sync::mpsc;
@@ -18,7 +21,7 @@ pub enum AppEvent {
 pub struct EventHandler {
     pub tx: mpsc::Sender<AppEvent>,
     pub rx: mpsc::Receiver<AppEvent>,
-    quit:   Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
 }
 
 impl EventHandler {

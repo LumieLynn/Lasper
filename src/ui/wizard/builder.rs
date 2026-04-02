@@ -1,8 +1,7 @@
-use crate::nspawn::models::{ContainerConfig, BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::create::{nspawn_config_content, systemd_override_content};
-use crate::nspawn::storage::{StorageBackend, StorageType};
 use crate::nspawn::deploy::Deployer;
-
+use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::storage::{StorageBackend, StorageType};
 
 /// The different methods available for acquiring a rootfs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -70,13 +69,17 @@ pub struct ContainerConfigBuilder {
 
 impl ContainerConfigBuilder {
     pub fn build_config(&self) -> ContainerConfigWithPreview {
-        let passthrough = self.passthrough.as_ref().cloned().unwrap_or(PassthroughConfig {
-            bind_mounts: vec![],
-            device_binds: vec![],
-            full_capabilities: false,
-            wayland_socket: false,
-            nvidia_gpu: false,
-        });
+        let passthrough = self
+            .passthrough
+            .as_ref()
+            .cloned()
+            .unwrap_or(PassthroughConfig {
+                bind_mounts: vec![],
+                device_binds: vec![],
+                full_capabilities: false,
+                wayland_socket: false,
+                nvidia_gpu: false,
+            });
 
         let basic = self.basic.as_ref().cloned().unwrap_or(BasicConfig {
             name: "unknown".to_string(),
@@ -116,15 +119,24 @@ impl ContainerConfigBuilder {
 
         if let Some(source) = &self.source {
             if source.kind == SourceKind::Copy {
-                let mut content = format!(" [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n", 
-                    source.clone_source, basic.name);
+                let mut content = format!(
+                    " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n",
+                    source.clone_source, basic.name
+                );
                 content.push_str(" All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.");
-                return ContainerConfigWithPreview { cfg, preview: content };
+                return ContainerConfigWithPreview {
+                    cfg,
+                    preview: content,
+                };
             }
         }
 
         let mut content = format!(" [DEPLOYMENT PREVIEW — {}]\n\n", basic.name);
-        content.push_str(&format!(" Storage: {} ({})\n", storage.storage_type.label(), storage.storage_type.get_path(&basic.name).display()));
+        content.push_str(&format!(
+            " Storage: {} ({})\n",
+            storage.storage_type.label(),
+            storage.storage_type.get_path(&basic.name).display()
+        ));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
         content.push_str(&nspawn_config_content(&cfg));
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
@@ -132,12 +144,15 @@ impl ContainerConfigBuilder {
             content.push_str(&systemd_override_content(&cfg.device_binds, cfg.nvidia_gpu));
         }
 
-        ContainerConfigWithPreview { cfg, preview: content }
+        ContainerConfigWithPreview {
+            cfg,
+            preview: content,
+        }
     }
 
     pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        use crate::nspawn::storage::*;
         use crate::nspawn::deploy::*;
+        use crate::nspawn::storage::*;
 
         let storage_cfg = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
             storage_type: StorageType::Directory,
@@ -148,11 +163,13 @@ impl ContainerConfigBuilder {
             StorageType::Directory => Box::new(DirectoryBackend),
             StorageType::Subvolume => Box::new(SubvolumeBackend),
             StorageType::Raw => Box::new(RawBackend {
-                config: storage_cfg.raw_config.unwrap_or(crate::nspawn::models::RawStorageConfig {
-                    size: "2G".to_string(),
-                    fs_type: "ext4".to_string(),
-                    use_partition_table: false,
-                }),
+                config: storage_cfg
+                    .raw_config
+                    .unwrap_or(crate::nspawn::models::RawStorageConfig {
+                        size: "2G".to_string(),
+                        fs_type: "ext4".to_string(),
+                        use_partition_table: false,
+                    }),
             }),
         };
 
@@ -167,14 +184,26 @@ impl ContainerConfigBuilder {
         });
 
         let deployer: Box<dyn Deployer> = match source.kind {
-            SourceKind::Copy => Box::new(clone::CloneDeployer { source_name: source.clone_source.clone() }),
-            SourceKind::Oci => Box::new(image::OciDeployer { url: source.oci_url.clone() }),
-            SourceKind::DiskImage => Box::new(image::DiskImageDeployer { path: source.disk_path.clone() }),
-            SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer { 
-                mirror: source.deboot_mirror.clone(), 
-                suite: if source.deboot_suite.is_empty() { "bookworm".to_string() } else { source.deboot_suite.clone() }
+            SourceKind::Copy => Box::new(clone::CloneDeployer {
+                source_name: source.clone_source.clone(),
             }),
-            SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer { packages: source.pacstrap_pkgs.clone() }),
+            SourceKind::Oci => Box::new(image::OciDeployer {
+                url: source.oci_url.clone(),
+            }),
+            SourceKind::DiskImage => Box::new(image::DiskImageDeployer {
+                path: source.disk_path.clone(),
+            }),
+            SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer {
+                mirror: source.deboot_mirror.clone(),
+                suite: if source.deboot_suite.is_empty() {
+                    "bookworm".to_string()
+                } else {
+                    source.deboot_suite.clone()
+                },
+            }),
+            SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer {
+                packages: source.pacstrap_pkgs.clone(),
+            }),
         };
 
         (deployer, storage)

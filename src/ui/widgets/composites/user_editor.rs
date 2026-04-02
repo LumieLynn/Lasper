@@ -1,13 +1,13 @@
-use crate::ui::core::{AppMessage, Component, FocusTracker, EventResult};
-use crossterm::event::{KeyEvent, KeyCode};
+use crate::nspawn::models::CreateUser;
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::widgets::inputs::button::Button;
+use crate::ui::widgets::inputs::text_box::TextBox;
+use crate::ui::widgets::selectors::checkbox::Checkbox;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
 };
-use crate::ui::widgets::inputs::text_box::TextBox;
-use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::widgets::inputs::button::Button;
-use crate::nspawn::models::CreateUser;
 
 pub struct UserEditor {
     username: TextBox,
@@ -60,7 +60,8 @@ impl UserEditor {
     }
 
     pub fn with_user(mut self, user: &CreateUser) -> Self {
-        self.username = TextBox::new(" Username ", user.username.clone()).with_validator(validate_username);
+        self.username =
+            TextBox::new(" Username ", user.username.clone()).with_validator(validate_username);
         self.password = TextBox::new(" Password (optional) ", user.password.clone());
         self.shell = TextBox::new(" Shell ", user.shell.clone());
         self.sudoer = Checkbox::new(" Add to sudo/wheel group ", user.sudoer);
@@ -81,13 +82,27 @@ impl UserEditor {
     }
 
     fn next(&mut self) {
-        let comps: Vec<&dyn Component> = vec![&self.username, &self.password, &self.shell, &self.sudoer, &self.btn_ok, &self.btn_cancel];
+        let comps: Vec<&dyn Component> = vec![
+            &self.username,
+            &self.password,
+            &self.shell,
+            &self.sudoer,
+            &self.btn_ok,
+            &self.btn_cancel,
+        ];
         self.focus.next(&comps);
         self.update_focus();
     }
 
     fn prev(&mut self) {
-        let comps: Vec<&dyn Component> = vec![&self.username, &self.password, &self.shell, &self.sudoer, &self.btn_ok, &self.btn_cancel];
+        let comps: Vec<&dyn Component> = vec![
+            &self.username,
+            &self.password,
+            &self.shell,
+            &self.sudoer,
+            &self.btn_ok,
+            &self.btn_cancel,
+        ];
         self.focus.prev(&comps);
         self.update_focus();
     }
@@ -111,15 +126,12 @@ impl Component for UserEditor {
         self.password.render(f, chunks[1]);
         self.shell.render(f, chunks[2]);
         self.sudoer.render(f, chunks[3]);
-        
+
         let btn_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[5]);
-            
+
         let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
         let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
         self.btn_ok.render(f, ok_area);
@@ -138,11 +150,19 @@ impl Component for UserEditor {
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
                 let mut valid = true;
-                if self.username.validate().is_err() { valid = false; }
-                if self.password.validate().is_err() { valid = false; }
-                if self.shell.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.username.validate().is_err() {
+                    valid = false;
+                }
+                if self.password.validate().is_err() {
+                    valid = false;
+                }
+                if self.shell.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let user = CreateUser {
                     username: self.username.value().to_string(),
                     password: self.password.value().to_string(),
@@ -162,16 +182,24 @@ impl Component for UserEditor {
             &mut self.btn_ok,
             &mut self.btn_cancel,
         ];
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::Message(AppMessage::DialogSubmit) => {
                 let mut valid = true;
-                if self.username.validate().is_err() { valid = false; }
-                if self.password.validate().is_err() { valid = false; }
-                if self.shell.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.username.validate().is_err() {
+                    valid = false;
+                }
+                if self.password.validate().is_err() {
+                    valid = false;
+                }
+                if self.shell.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let user = CreateUser {
                     username: self.username.value().to_string(),
                     password: self.password.value().to_string(),

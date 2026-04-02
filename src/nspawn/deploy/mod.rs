@@ -118,7 +118,10 @@ async fn run_deploy_internal(
                         nspawn_content = mutated;
                     }
                     Err(e) => {
-                        push_log(format!("WARNING: Failed to apply NVIDIA AST surgery: {}", e));
+                        push_log(format!(
+                            "WARNING: Failed to apply NVIDIA AST surgery: {}",
+                            e
+                        ));
                     }
                 }
             }
@@ -139,7 +142,7 @@ async fn run_deploy_internal(
         }
 
         if let Some(mode) = &cfg.network {
-                        if matches!(
+            if matches!(
                 mode,
                 NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
             ) {

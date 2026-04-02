@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::nspawn::StatusLevel;
-use crate::ui::{centered_rect, widgets::power_menu::PowerMenu, core::Component};
+use crate::ui::{centered_rect, core::Component, widgets::power_menu::PowerMenu};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -27,43 +27,64 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
-    if app.ui.show_power_menu { PowerMenu::new(app.ui.power_menu_selected).render(f, area); }
+    if app.ui.show_power_menu {
+        PowerMenu::new(app.ui.power_menu_selected).render(f, area);
+    }
     if app.ui.show_wizard {
         if let Some(w) = &mut app.ui.wizard {
             w.render(f, area);
         }
     }
-    if app.ui.show_help { render_help(f); }
+    if app.ui.show_help {
+        render_help(f);
+    }
 }
-
 
 // ── Title ─────────────────────────────────────────────────────────────────────
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let badge = if app.is_root {
-        Span::styled(" ⚡ ROOT ", Style::default().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD))
+        Span::styled(
+            " ⚡ ROOT ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
     } else {
-        Span::styled(" ⚠  READ-ONLY — run with sudo for full control ",
-            Style::default().fg(Color::Black).bg(Color::Yellow))
+        Span::styled(
+            " ⚠  READ-ONLY — run with sudo for full control ",
+            Style::default().fg(Color::Black).bg(Color::Yellow),
+        )
     };
 
     let mut spans = vec![
-        Span::styled(" Lasper ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " Lasper ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         badge,
     ];
 
     if !app.data.dbus_active {
-        spans.push(Span::styled(" ⚡ CMD-MODE ",
-            Style::default().fg(Color::Black).bg(Color::Rgb(255, 140, 0)).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            " ⚡ CMD-MODE ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(255, 140, 0))
+                .add_modifier(Modifier::BOLD),
+        ));
     }
 
-    spans.push(Span::styled(format!("  {} container(s)", app.data.entries.len()), Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("  {} container(s)", app.data.entries.len()),
+        Style::default().fg(Color::DarkGray),
+    ));
 
     let line = Line::from(spans);
-    f.render_widget(
-        Paragraph::new(line).style(Style::default()),
-        area,
-    );
+    f.render_widget(Paragraph::new(line).style(Style::default()), area);
 }
 
 // ── Content ───────────────────────────────────────────────────────────────────
@@ -72,7 +93,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.pane_height = area.height.saturating_sub(2);
     app.ui.detail_panel.pane_height = app.ui.pane_height;
 
-    let list_focused   = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
+    let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
     let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
     app.ui.detail_panel.set_focus(detail_focused);
 
@@ -82,7 +103,12 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         .split(area);
 
     app.ui.container_list.render_with_data(
-        f, cols[0], &app.data.entries, app.data.selected, app.is_root, list_focused,
+        f,
+        cols[0],
+        &app.data.entries,
+        app.data.selected,
+        app.is_root,
+        list_focused,
     );
     app.ui.detail_panel.render_with_data(f, cols[1], &app.data);
 }
@@ -92,43 +118,61 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let line = if let Some((msg, level)) = &app.ui.status_message {
         let color = match level {
-            StatusLevel::Info    => Color::White,
+            StatusLevel::Info => Color::White,
             StatusLevel::Success => Color::Green,
-            StatusLevel::Warn    => Color::Rgb(255, 140, 0),
-            StatusLevel::Error   => Color::Red,
+            StatusLevel::Warn => Color::Rgb(255, 140, 0),
+            StatusLevel::Error => Color::Red,
         };
-        Line::from(vec![Span::raw("  "), Span::styled(msg.as_str(), Style::default().fg(color))])
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(msg.as_str(), Style::default().fg(color)),
+        ])
     } else {
         match app.ui.active_panel {
             crate::app::ActivePanel::ContainerList => Line::from(vec![
-                kspan("[j/k]"), hspan(" nav "),
-                kspan("[Tab]"), hspan(" → detail "),
-                kspan("[s]"),   hspan(" start "),
-                kspan("[S]"),   hspan(" poweroff "),
-                kspan("[x/⏎]"), hspan(" actions "),
-                kspan("[n/a]"), hspan(" new "),
-                kspan("[r]"),   hspan(" refresh "),
-                kspan("[?]"),   hspan(" help "),
-                kspan("[q]"),   hspan(" quit"),
+                kspan("[j/k]"),
+                hspan(" nav "),
+                kspan("[Tab]"),
+                hspan(" → detail "),
+                kspan("[s]"),
+                hspan(" start "),
+                kspan("[S]"),
+                hspan(" poweroff "),
+                kspan("[x/⏎]"),
+                hspan(" actions "),
+                kspan("[n/a]"),
+                hspan(" new "),
+                kspan("[r]"),
+                hspan(" refresh "),
+                kspan("[?]"),
+                hspan(" help "),
+                kspan("[q]"),
+                hspan(" quit"),
             ]),
             crate::app::ActivePanel::DetailPanel => Line::from(vec![
-                kspan("[p]"),       hspan(" prop "),
-                kspan("[d]"),       hspan(" det "),
-                kspan("[l]"),       hspan(" logs "),
-                kspan("[c]"),       hspan(" config "),
-                kspan("[↑/↓]"),    hspan(" scroll "),
-                kspan("[PgUp/Dn]"), hspan(" page "),
-                kspan("[Tab]"),     hspan(" → list "),
-                kspan("[?]"),       hspan(" help "),
-                kspan("[q]"),       hspan(" quit"),
+                kspan("[p]"),
+                hspan(" prop "),
+                kspan("[d]"),
+                hspan(" det "),
+                kspan("[l]"),
+                hspan(" logs "),
+                kspan("[c]"),
+                hspan(" config "),
+                kspan("[↑/↓]"),
+                hspan(" scroll "),
+                kspan("[PgUp/Dn]"),
+                hspan(" page "),
+                kspan("[Tab]"),
+                hspan(" → list "),
+                kspan("[?]"),
+                hspan(" help "),
+                kspan("[q]"),
+                hspan(" quit"),
             ]),
         }
     };
 
-    f.render_widget(
-        Paragraph::new(line).style(Style::default()),
-        area,
-    );
+    f.render_widget(Paragraph::new(line).style(Style::default()), area);
 }
 
 fn kspan(s: &'static str) -> Span<'static> {
@@ -144,7 +188,12 @@ fn render_help(f: &mut Frame) {
     let area = centered_rect(50, 85, f.area());
     f.render_widget(Clear, area);
     let rows: Vec<Line> = vec![
-        Line::from(Span::styled("  Keybindings", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "  Keybindings",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
         hrow("j / ↓", "Select next container"),
         hrow("k / ↑", "Select previous container"),
@@ -166,11 +215,16 @@ fn render_help(f: &mut Frame) {
         hrow("?    ", "Toggle help"),
         hrow("q    ", "Quit"),
         Line::from(""),
-        Line::from(Span::styled("  Press any key to close", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled(
+            "  Press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
     f.render_widget(
         Paragraph::new(rows).block(
-            Block::default().title(" Help ").borders(Borders::ALL)
+            Block::default()
+                .title(" Help ")
+                .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         area,

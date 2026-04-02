@@ -1,11 +1,10 @@
 //! UI module containing layout and widget rendering logic.
 
 pub mod core;
-pub mod views;
 pub mod layout;
+pub mod views;
 pub mod widgets;
 pub mod wizard;
-
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},

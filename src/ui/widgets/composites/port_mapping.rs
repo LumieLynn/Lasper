@@ -1,13 +1,13 @@
-use crossterm::event::{KeyEvent, KeyCode};
+use crate::nspawn::models::PortForward;
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::widgets::inputs::button::Button;
+use crate::ui::widgets::inputs::number_box::NumberBox;
+use crate::ui::widgets::selectors::radio_group::RadioGroup;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
 };
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
-use crate::ui::widgets::inputs::number_box::NumberBox;
-use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::widgets::inputs::button::Button;
-use crate::nspawn::models::PortForward;
 
 pub struct PortMappingBox {
     host_port: NumberBox,
@@ -22,8 +22,12 @@ pub struct PortMappingBox {
 impl PortMappingBox {
     pub fn new(on_submit: impl Fn(PortForward) -> AppMessage + 'static) -> Self {
         Self {
-            host_port: NumberBox::new("Host Port", 0).with_max_value(65535).with_min_value(1),
-            container_port: NumberBox::new("Container Port", 0).with_max_value(65535).with_min_value(1),
+            host_port: NumberBox::new("Host Port", 0)
+                .with_max_value(65535)
+                .with_min_value(1),
+            container_port: NumberBox::new("Container Port", 0)
+                .with_max_value(65535)
+                .with_min_value(1),
             protocol: RadioGroup::new("Protocol", vec!["tcp".to_string(), "udp".to_string()], 0),
             btn_ok: Button::new("OK", AppMessage::DialogSubmit),
             btn_cancel: Button::new("Cancel", AppMessage::DialogCancel),
@@ -66,15 +70,12 @@ impl Component for PortMappingBox {
         self.host_port.render(f, chunks[0]);
         self.container_port.render(f, chunks[1]);
         self.protocol.render(f, chunks[2]);
-        
+
         let btn_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[4]);
-            
+
         let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
         let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
         self.btn_ok.render(f, ok_area);
@@ -84,23 +85,41 @@ impl Component for PortMappingBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> = vec![&self.host_port, &self.container_port, &self.protocol, &self.btn_ok, &self.btn_cancel];
+                let comps: Vec<&dyn Component> = vec![
+                    &self.host_port,
+                    &self.container_port,
+                    &self.protocol,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.next(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> = vec![&self.host_port, &self.container_port, &self.protocol, &self.btn_ok, &self.btn_cancel];
+                let comps: Vec<&dyn Component> = vec![
+                    &self.host_port,
+                    &self.container_port,
+                    &self.protocol,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.prev(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
                 let mut valid = true;
-                if self.host_port.validate().is_err() { valid = false; }
-                if self.container_port.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.host_port.validate().is_err() {
+                    valid = false;
+                }
+                if self.container_port.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let host = self.host_port.value() as u16;
                 let container = self.container_port.value() as u16;
                 let proto = match self.protocol.selected_idx() {
@@ -108,8 +127,12 @@ impl Component for PortMappingBox {
                     1 => "udp".to_string(),
                     _ => "tcp".to_string(),
                 };
-                
-                return EventResult::Message((self.on_submit)(PortForward { host, container, proto }));
+
+                return EventResult::Message((self.on_submit)(PortForward {
+                    host,
+                    container,
+                    proto,
+                }));
             }
             _ => {}
         }
@@ -121,16 +144,22 @@ impl Component for PortMappingBox {
             &mut self.btn_ok,
             &mut self.btn_cancel,
         ];
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
-        
+
         match res {
             EventResult::Message(AppMessage::DialogSubmit) => {
                 let mut valid = true;
-                if self.host_port.validate().is_err() { valid = false; }
-                if self.container_port.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.host_port.validate().is_err() {
+                    valid = false;
+                }
+                if self.container_port.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let host = self.host_port.value() as u16;
                 let container = self.container_port.value() as u16;
                 let proto = match self.protocol.selected_idx() {
@@ -138,20 +167,36 @@ impl Component for PortMappingBox {
                     1 => "udp".to_string(),
                     _ => "tcp".to_string(),
                 };
-                
-                EventResult::Message((self.on_submit)(PortForward { host, container, proto }))
+
+                EventResult::Message((self.on_submit)(PortForward {
+                    host,
+                    container,
+                    proto,
+                }))
             }
             EventResult::Message(AppMessage::DialogCancel) => {
                 EventResult::Message(AppMessage::DialogCancel)
             }
             EventResult::FocusNext => {
-                let crefs: Vec<&dyn Component> = vec![&self.host_port, &self.container_port, &self.protocol, &self.btn_ok, &self.btn_cancel];
+                let crefs: Vec<&dyn Component> = vec![
+                    &self.host_port,
+                    &self.container_port,
+                    &self.protocol,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.next(&crefs);
                 self.update_focus();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let crefs: Vec<&dyn Component> = vec![&self.host_port, &self.container_port, &self.protocol, &self.btn_ok, &self.btn_cancel];
+                let crefs: Vec<&dyn Component> = vec![
+                    &self.host_port,
+                    &self.container_port,
+                    &self.protocol,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.prev(&crefs);
                 self.update_focus();
                 EventResult::Consumed

@@ -3,7 +3,7 @@ use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::wizard::context::{SourceKind, WizardContext};
 use crate::ui::wizard::steps;
 use crate::ui::wizard::{StepAction, WizardStep};
-use crossterm::event::{KeyEvent, KeyCode};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::{Block, Borders, Clear},
@@ -194,14 +194,12 @@ impl Wizard {
             EventResult::Consumed => StepAction::None,
             EventResult::FocusNext => self.handle_action(StepAction::Next),
             EventResult::FocusPrev => self.handle_action(StepAction::Prev),
-            EventResult::Ignored => {
-                match key.code {
-                    KeyCode::Esc => self.handle_action(StepAction::Prev),
-                    KeyCode::Char('q') => StepAction::Close,
-                    KeyCode::Enter => self.handle_action(StepAction::Next),
-                    _ => StepAction::None,
-                }
-            }
+            EventResult::Ignored => match key.code {
+                KeyCode::Esc => self.handle_action(StepAction::Prev),
+                KeyCode::Char('q') => StepAction::Close,
+                KeyCode::Enter => self.handle_action(StepAction::Next),
+                _ => StepAction::None,
+            },
         }
     }
 
@@ -400,9 +398,7 @@ impl Wizard {
             }
             AppMessage::DialogSubmit | AppMessage::DialogCancel => {} // Handled by inline editors
             // Main-UI-only messages, never meaningful inside the wizard
-            AppMessage::DetailPaneChanged(_)
-            | AppMessage::ListNext
-            | AppMessage::ListPrev => {}
+            AppMessage::DetailPaneChanged(_) | AppMessage::ListNext | AppMessage::ListPrev => {}
         }
         StepAction::None
     }

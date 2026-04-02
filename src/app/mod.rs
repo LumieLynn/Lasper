@@ -3,31 +3,39 @@
 pub mod actions;
 pub mod handlers;
 
-use std::collections::HashMap;
-use std::time::Instant;
 use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use std::collections::HashMap;
 use std::io::Stdout;
+use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    StatusLevel,
-    manager::{NspawnManager, DefaultManager},
+    manager::{DefaultManager, NspawnManager},
     models::ContainerEntry,
+    StatusLevel,
 };
-use crate::ui::wizard::Wizard;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
+use crate::ui::wizard::Wizard;
 
 // ── Simple enums ──────────────────────────────────────────────────────────────
 
 /// The currently active detail pane in the main UI.
 #[derive(Debug, Clone, PartialEq)]
-pub enum DetailPane { Properties, Details, Logs, Config }
+pub enum DetailPane {
+    Properties,
+    Details,
+    Logs,
+    Config,
+}
 
 /// Which top-level panel has keyboard focus.
 #[derive(Debug, Clone, PartialEq)]
-pub enum ActivePanel { ContainerList, DetailPanel }
+pub enum ActivePanel {
+    ContainerList,
+    DetailPanel,
+}
 
 pub struct AppUi {
     pub active_panel: ActivePanel,
@@ -68,7 +76,7 @@ impl AppUi {
     pub fn toggle_focus(&mut self) {
         self.active_panel = match self.active_panel {
             ActivePanel::ContainerList => ActivePanel::DetailPanel,
-            ActivePanel::DetailPanel   => ActivePanel::ContainerList,
+            ActivePanel::DetailPanel => ActivePanel::ContainerList,
         };
     }
 }
@@ -114,15 +122,13 @@ impl App {
     }
 
     /// Starts the main application loop.
-    pub async fn run(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    ) -> Result<()> {
+    pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
-        let (backend_tx, mut backend_rx) = tokio::sync::mpsc::unbounded_channel::<crate::ui::core::BackendCommand>();
+        let (backend_tx, mut backend_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::ui::core::BackendCommand>();
         self.ui.backend_tx = Some(backend_tx);
-        
+
         let manager_clone = self.data.manager.clone();
         tokio::spawn(async move {
             loop {
@@ -136,7 +142,11 @@ impl App {
         self.refresh().await;
         loop {
             while let Ok(entries) = refresh_rx.try_recv() {
-                let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
+                let prev_name = self
+                    .data
+                    .entries
+                    .get(self.data.selected)
+                    .map(|e| e.name.clone());
                 self.data.entries = entries;
                 self.data.selected = prev_name
                     .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
@@ -146,7 +156,7 @@ impl App {
             }
 
             terminal.draw(|f| crate::ui::draw(f, self))?;
-            
+
             tokio::select! {
                 Some(event) = events.rx.recv() => {
                     match event {
@@ -204,7 +214,10 @@ impl App {
                 }
                 else => break,
             }
-            if self.should_quit { events.stop(); break; }
+            if self.should_quit {
+                events.stop();
+                break;
+            }
         }
         Ok(())
     }

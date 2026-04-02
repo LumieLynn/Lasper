@@ -1,10 +1,7 @@
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{
-    layout::Rect,
-    Frame,
-};
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{layout::Rect, Frame};
 
 pub struct EditableList<T> {
     list: SelectableList<T>,

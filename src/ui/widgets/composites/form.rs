@@ -1,6 +1,6 @@
-use crate::ui::core::{Component, FocusTracker, EventResult};
+use crate::ui::core::{Component, EventResult, FocusTracker};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use crossterm::event::{KeyEvent, KeyCode};
 
 pub struct FormContainer {
     children: Vec<Box<dyn Component>>,
@@ -10,9 +10,9 @@ pub struct FormContainer {
 
 impl FormContainer {
     pub fn new(children: Vec<Box<dyn Component>>) -> Self {
-        let mut form = Self { 
+        let mut form = Self {
             focus: FocusTracker::new(),
-            children, 
+            children,
             height_hints: vec![3; 100], // Default height 3 for most inputs, capped at 100 children
         };
         form.update_focus();
@@ -46,15 +46,28 @@ impl FormContainer {
 
 impl Component for FormContainer {
     fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        if self.children.is_empty() { return; }
-        
-        if area.height < self.children.len() as u16 * 2 {
-            let msg = format!("Terminal too small! Requires at least {} height (currently {})", self.children.len() * 2, area.height);
-            f.render_widget(ratatui::widgets::Paragraph::new(msg).style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)), area);
+        if self.children.is_empty() {
             return;
         }
-        
-        let constraints: Vec<Constraint> = self.children.iter().enumerate()
+
+        if area.height < self.children.len() as u16 * 2 {
+            let msg = format!(
+                "Terminal too small! Requires at least {} height (currently {})",
+                self.children.len() * 2,
+                area.height
+            );
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(msg)
+                    .style(ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                area,
+            );
+            return;
+        }
+
+        let constraints: Vec<Constraint> = self
+            .children
+            .iter()
+            .enumerate()
             .map(|(i, _)| Constraint::Length(*self.height_hints.get(i).unwrap_or(&3)))
             .collect();
 
@@ -71,7 +84,9 @@ impl Component for FormContainer {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if self.children.is_empty() { return EventResult::Ignored; }
+        if self.children.is_empty() {
+            return EventResult::Ignored;
+        }
 
         match key.code {
             KeyCode::Tab => {
@@ -98,13 +113,13 @@ impl Component for FormContainer {
             _ => res,
         }
     }
-    
+
     fn set_focus(&mut self, focused: bool) {
         if focused {
             self.update_focus();
         } else {
-            for child in &mut self.children { 
-                child.set_focus(false); 
+            for child in &mut self.children {
+                child.set_focus(false);
             }
         }
     }

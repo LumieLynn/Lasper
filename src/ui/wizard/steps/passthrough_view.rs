@@ -1,9 +1,12 @@
-use crate::ui::core::{AppMessage, Component, FocusTracker, EventResult};
+use crate::nspawn::models::NetworkMode;
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::wizard::context::PassthroughConfig;
-use crate::nspawn::models::NetworkMode;
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{layout::{Constraint, Direction, Layout, Rect}, Frame};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    Frame,
+};
 
 pub struct PassthroughStepView {
     generic_gpu: Checkbox,
@@ -13,7 +16,11 @@ pub struct PassthroughStepView {
 }
 
 impl PassthroughStepView {
-    pub fn new(initial_data: &PassthroughConfig, nw_mode: Option<NetworkMode>, nvidia_toolkit_installed: bool) -> Self {
+    pub fn new(
+        initial_data: &PassthroughConfig,
+        nw_mode: Option<NetworkMode>,
+        nvidia_toolkit_installed: bool,
+    ) -> Self {
         let nvidia_label = if nvidia_toolkit_installed {
             "NVIDIA Driver & GPU Passthrough (Scan host)"
         } else {
@@ -28,8 +35,11 @@ impl PassthroughStepView {
         };
 
         let mut view = Self {
-            generic_gpu: Checkbox::new("Generic GPU Passthrough (/dev/dri, /dev/mali)", initial_data.full_capabilities)
-                .with_on_change(|v| AppMessage::GenericGpuUpdated(v)),
+            generic_gpu: Checkbox::new(
+                "Generic GPU Passthrough (/dev/dri, /dev/mali)",
+                initial_data.full_capabilities,
+            )
+            .with_on_change(|v| AppMessage::GenericGpuUpdated(v)),
             wayland_socket: Checkbox::new(wayland_label, initial_data.wayland_socket)
                 .with_on_change(|v| AppMessage::WaylandSocketUpdated(v))
                 .with_enabled(is_host_nw),
@@ -52,11 +62,7 @@ impl PassthroughStepView {
     }
 
     fn get_components(&self) -> Vec<&dyn Component> {
-        vec![
-            &self.generic_gpu,
-            &self.wayland_socket,
-            &self.nvidia_gpu,
-        ]
+        vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu]
     }
 }
 
@@ -80,16 +86,17 @@ impl Component for PassthroughStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> = vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
+                let comps: Vec<&dyn Component> =
+                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
                 self.focus.next(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> = vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
+                let comps: Vec<&dyn Component> =
+                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
                 self.focus.prev(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
@@ -102,17 +109,19 @@ impl Component for PassthroughStepView {
             &mut self.wayland_socket,
             &mut self.nvidia_gpu,
         ];
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::FocusNext => {
-                let comps: Vec<&dyn Component> = vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
+                let comps: Vec<&dyn Component> =
+                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
                 self.focus.next(&comps);
                 self.update_focus();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let comps: Vec<&dyn Component> = vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
+                let comps: Vec<&dyn Component> =
+                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
                 self.focus.prev(&comps);
                 self.update_focus();
                 EventResult::Consumed

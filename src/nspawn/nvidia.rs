@@ -134,8 +134,6 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
     Ok(())
 }
 
-
-
 async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
     let out = Command::new("nvidia-container-cli")
         .arg("list")

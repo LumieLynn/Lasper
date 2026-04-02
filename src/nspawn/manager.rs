@@ -54,7 +54,6 @@ impl DefaultManager {
     }
 }
 
-
 #[async_trait]
 impl NspawnManager for DefaultManager {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {

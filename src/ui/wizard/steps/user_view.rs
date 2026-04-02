@@ -1,16 +1,20 @@
-use crate::ui::core::{AppMessage, Component, FocusTracker, EventResult};
-use crate::ui::widgets::inputs::password_box::PasswordBox;
+use crate::nspawn::models::CreateUser;
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
 use crate::ui::widgets::composites::editable_list::EditableList;
 use crate::ui::widgets::composites::user_editor::UserEditor;
+use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::wizard::context::UserConfig;
-use crate::nspawn::models::CreateUser;
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{layout::{Constraint, Direction, Layout, Rect}, Frame, style::{Color, Style}, widgets::Paragraph};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::Paragraph,
+    Frame,
+};
 
 pub struct UserStepView {
     root_password: PasswordBox,
     user_list: EditableList<CreateUser>,
-    
 
     editor: Option<UserEditor>,
     focus: FocusTracker,
@@ -19,15 +23,18 @@ pub struct UserStepView {
 impl UserStepView {
     pub fn new(initial_data: &UserConfig) -> Self {
         let users = initial_data.users.clone();
-        
+
         let mut view = Self {
-            root_password: PasswordBox::new(" Root Password (optional) ", initial_data.root_password.clone().unwrap_or_default())
-                .with_on_change(|v| AppMessage::RootPasswordUpdated(v)),
+            root_password: PasswordBox::new(
+                " Root Password (optional) ",
+                initial_data.root_password.clone().unwrap_or_default(),
+            )
+            .with_on_change(|v| AppMessage::RootPasswordUpdated(v)),
             user_list: EditableList::new(
                 " Regular Users ",
                 users,
                 |u| format!("  {} {}", u.username, if u.sudoer { "[sudo]" } else { "" }),
-                |idx| AppMessage::UserRemoved(idx)
+                |idx| AppMessage::UserRemoved(idx),
             ),
 
             editor: None,
@@ -38,10 +45,8 @@ impl UserStepView {
     }
 
     fn update_focus(&mut self) {
-        let mut components: Vec<&mut dyn Component> = vec![
-            &mut self.root_password,
-            &mut self.user_list,
-        ];
+        let mut components: Vec<&mut dyn Component> =
+            vec![&mut self.root_password, &mut self.user_list];
         self.focus.update_focus(&mut components, true);
     }
 
@@ -61,13 +66,15 @@ impl UserStepView {
 impl Component for UserStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.editor {
-             let inner_area = crate::ui::centered_rect(60, 85, f.area());
-             f.render_widget(ratatui::widgets::Clear, inner_area);
-             let block = ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title(" Add/Edit User ");
-             let editor_area = block.inner(inner_area);
-             f.render_widget(block, inner_area);
-             editor.render(f, editor_area);
-             return;
+            let inner_area = crate::ui::centered_rect(60, 85, f.area());
+            f.render_widget(ratatui::widgets::Clear, inner_area);
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Add/Edit User ");
+            let editor_area = block.inner(inner_area);
+            f.render_widget(block, inner_area);
+            editor.render(f, editor_area);
+            return;
         }
 
         let chunks = Layout::default()
@@ -83,9 +90,12 @@ impl Component for UserStepView {
 
         self.root_password.render(f, chunks[0]);
         self.user_list.render(f, chunks[2]);
-        
+
         let hint = " [Tab] switch, [A]dd user, [D]elete user, [Enter] next ";
-        f.render_widget(Paragraph::new(hint).style(Style::default().fg(Color::Yellow)), chunks[3]);
+        f.render_widget(
+            Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+            chunks[3],
+        );
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {

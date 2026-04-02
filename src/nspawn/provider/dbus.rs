@@ -11,7 +11,9 @@ use zbus::{proxy, Connection};
 )]
 trait Manager {
     fn list_machines(&self) -> zbus::Result<Vec<(String, String, String, OwnedObjectPath)>>;
-    fn list_images(&self) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
+    fn list_images(
+        &self,
+    ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
@@ -61,7 +63,10 @@ impl DbusProvider {
     }
 
     pub async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
-        let proxy = self.manager_proxy().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
         let machines = proxy.list_machines().await.map_err(NspawnError::Dbus)?;
         let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
 
@@ -133,7 +138,10 @@ impl DbusProvider {
     }
 
     pub async fn start(&self, name: &str) -> Result<()> {
-        let conn = self.connection().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let unit = format!("systemd-nspawn@{}.service", name);
         conn.call_method(
             Some("org.freedesktop.systemd1"),
@@ -142,38 +150,66 @@ impl DbusProvider {
             "StartUnit",
             &(&unit, "fail"),
         )
-        .await.map_err(NspawnError::Dbus)?;
+        .await
+        .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub async fn terminate(&self, name: &str) -> Result<()> {
-        let proxy = self.manager_proxy().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy.terminate_machine(name).await.map_err(NspawnError::Dbus)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .terminate_machine(name)
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub async fn poweroff(&self, name: &str) -> Result<()> {
-        let proxy = self.manager_proxy().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let sig = libc::SIGRTMIN() + 4;
-        proxy.kill_machine(name, "leader", sig).await.map_err(NspawnError::Dbus)?;
+        proxy
+            .kill_machine(name, "leader", sig)
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub async fn reboot(&self, name: &str) -> Result<()> {
-        let proxy = self.manager_proxy().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy.kill_machine(name, "leader", libc::SIGINT).await.map_err(NspawnError::Dbus)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .kill_machine(name, "leader", libc::SIGINT)
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub async fn kill(&self, name: &str, signal: &str) -> Result<()> {
-        let proxy = self.manager_proxy().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let sig = signal.parse::<i32>().unwrap_or(15);
-        proxy.kill_machine(name, "all", sig).await.map_err(NspawnError::Dbus)?;
+        proxy
+            .kill_machine(name, "all", sig)
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        let conn = self.connection().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let mut map = HashMap::new();
 
         // 1) Try machine1 properties (only works for running/registered machines)
@@ -189,7 +225,9 @@ impl DbusProvider {
         }
 
         if map.is_empty() {
-            Err(NspawnError::Dbus(zbus::Error::Failure("No properties found".into())))
+            Err(NspawnError::Dbus(zbus::Error::Failure(
+                "No properties found".into(),
+            )))
         } else {
             Ok(MachineProperties {
                 properties: map,
@@ -199,7 +237,10 @@ impl DbusProvider {
     }
 
     pub async fn reload_daemon(&self) -> Result<()> {
-        let conn = self.connection().await.ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         conn.call_method(
             Some("org.freedesktop.systemd1"),
             "/org/freedesktop/systemd1",
@@ -207,19 +248,24 @@ impl DbusProvider {
             "Reload",
             &(),
         )
-        .await.map_err(NspawnError::Dbus)?;
+        .await
+        .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 }
 
-async fn get_machine1_properties(conn: &Connection, name: &str) -> zbus::Result<HashMap<String, String>> {
+async fn get_machine1_properties(
+    conn: &Connection,
+    name: &str,
+) -> zbus::Result<HashMap<String, String>> {
     let proxy = ManagerProxy::new(conn).await?;
     let path = proxy.get_machine(name).await?;
     let b = zbus::fdo::PropertiesProxy::builder(conn)
         .destination("org.freedesktop.machine1")?
         .path(path)?;
     let props_proxy = b.build().await?;
-    let interface: zbus::names::InterfaceName = "org.freedesktop.machine1.Machine".try_into().unwrap();
+    let interface: zbus::names::InterfaceName =
+        "org.freedesktop.machine1.Machine".try_into().unwrap();
     let all_props = props_proxy.get_all(Some(interface).into()).await?;
     let mut map = HashMap::new();
     for (k, v) in all_props {
@@ -228,16 +274,23 @@ async fn get_machine1_properties(conn: &Connection, name: &str) -> zbus::Result<
     Ok(map)
 }
 
-async fn get_systemd1_properties(conn: &Connection, name: &str) -> zbus::Result<HashMap<String, String>> {
+async fn get_systemd1_properties(
+    conn: &Connection,
+    name: &str,
+) -> zbus::Result<HashMap<String, String>> {
     let unit = format!("systemd-nspawn@{}.service", name);
-    let reply = conn.call_method(
-        Some("org.freedesktop.systemd1"),
-        "/org/freedesktop/systemd1",
-        Some("org.freedesktop.systemd1.Manager"),
-        "LoadUnit",
-        &(&unit,),
-    ).await?;
-    let unit_path = reply.body().deserialize::<zbus::zvariant::OwnedObjectPath>()?;
+    let reply = conn
+        .call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "LoadUnit",
+            &(&unit,),
+        )
+        .await?;
+    let unit_path = reply
+        .body()
+        .deserialize::<zbus::zvariant::OwnedObjectPath>()?;
     let b = zbus::fdo::PropertiesProxy::builder(conn)
         .destination("org.freedesktop.systemd1")?
         .path(unit_path)?;
@@ -267,7 +320,10 @@ fn format_address(family: i32, data: &[u8]) -> String {
                     if i > 0 {
                         s.push(':');
                     }
-                    s.push_str(&format!("{:x}", u16::from_be_bytes([data[i * 2], data[i * 2 + 1]])));
+                    s.push_str(&format!(
+                        "{:x}",
+                        u16::from_be_bytes([data[i * 2], data[i * 2 + 1]])
+                    ));
                 }
                 s
             } else {
@@ -285,15 +341,15 @@ fn format_size(bytes: u64) -> String {
     const TI_B: u64 = GI_B * 1024;
 
     if bytes >= TI_B {
-         format!("{:.1}T", bytes as f64 / TI_B as f64)
+        format!("{:.1}T", bytes as f64 / TI_B as f64)
     } else if bytes >= GI_B {
-         format!("{:.1}G", bytes as f64 / GI_B as f64)
+        format!("{:.1}G", bytes as f64 / GI_B as f64)
     } else if bytes >= MI_B {
-         format!("{:.1}M", bytes as f64 / MI_B as f64)
+        format!("{:.1}M", bytes as f64 / MI_B as f64)
     } else if bytes >= KI_B {
-         format!("{:.1}K", bytes as f64 / KI_B as f64)
+        format!("{:.1}K", bytes as f64 / KI_B as f64)
     } else {
-         format!("{}B", bytes)
+        format!("{}B", bytes)
     }
 }
 

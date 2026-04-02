@@ -45,7 +45,6 @@ impl WizardStep {
             WizardStep::Deploy => "Deployment Progress",
         }
     }
-
 }
 
 pub fn render_hint(f: &mut ratatui::Frame, area: ratatui::layout::Rect, hints: &[&str]) {

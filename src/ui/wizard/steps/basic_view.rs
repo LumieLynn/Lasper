@@ -32,8 +32,13 @@ impl BasicStepView {
                     )
                     .with_validator(|v| {
                         let s = v.trim();
-                        if s.is_empty() { return Ok(()); }
-                        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.') {
+                        if s.is_empty() {
+                            return Ok(());
+                        }
+                        if !s
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+                        {
                             return Err("Invalid hostname characters".into());
                         }
                         Ok(())

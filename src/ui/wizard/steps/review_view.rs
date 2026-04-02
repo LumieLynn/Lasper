@@ -1,6 +1,6 @@
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::display::text_block::TextBlock;
-use crossterm::event::{KeyEvent, KeyCode};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{layout::Rect, Frame};
 
 pub struct ReviewStepView {

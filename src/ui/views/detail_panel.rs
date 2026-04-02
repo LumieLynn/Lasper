@@ -95,9 +95,9 @@ impl DetailPanel {
     fn render_pane(&mut self, f: &mut Frame, data: &AppData, area: Rect) {
         match self.active_pane {
             DetailPane::Properties => render_properties(f, data, area),
-            DetailPane::Details    => render_full_details(f, data, area, &mut self.details_state),
-            DetailPane::Logs       => render_logs(f, data, area, self.log_scroll),
-            DetailPane::Config     => render_config(f, data, area, self.config_scroll),
+            DetailPane::Details => render_full_details(f, data, area, &mut self.details_state),
+            DetailPane::Logs => render_logs(f, data, area, self.log_scroll),
+            DetailPane::Config => render_config(f, data, area, self.config_scroll),
         }
     }
 
@@ -170,7 +170,9 @@ impl DetailPanel {
 
             // ─── Details table navigation (clamped by cached details_len) ──
             KeyCode::Up if self.active_pane == DetailPane::Details => {
-                let i = self.details_state.selected()
+                let i = self
+                    .details_state
+                    .selected()
                     .map(|i| i.saturating_sub(1))
                     .unwrap_or(0);
                 self.details_state.select(Some(i));
@@ -178,14 +180,18 @@ impl DetailPanel {
             }
             KeyCode::Down if self.active_pane == DetailPane::Details => {
                 let max = self.details_len.saturating_sub(1);
-                let i = self.details_state.selected()
+                let i = self
+                    .details_state
+                    .selected()
                     .map(|i| (i + 1).min(max))
                     .unwrap_or(0);
                 self.details_state.select(Some(i));
                 return EventResult::Consumed;
             }
             KeyCode::PageUp if self.active_pane == DetailPane::Details => {
-                let i = self.details_state.selected()
+                let i = self
+                    .details_state
+                    .selected()
                     .map(|i| i.saturating_sub(step as usize))
                     .unwrap_or(0);
                 self.details_state.select(Some(i));
@@ -193,7 +199,9 @@ impl DetailPanel {
             }
             KeyCode::PageDown if self.active_pane == DetailPane::Details => {
                 let max = self.details_len.saturating_sub(1);
-                let i = self.details_state.selected()
+                let i = self
+                    .details_state
+                    .selected()
                     .map(|i| (i + step as usize).min(max))
                     .unwrap_or(0);
                 self.details_state.select(Some(i));
@@ -217,16 +225,22 @@ fn render_sub_tabs(
 ) {
     let selected = match active_pane {
         DetailPane::Properties => 0,
-        DetailPane::Details    => 1,
-        DetailPane::Logs       => 2,
-        DetailPane::Config     => 3,
+        DetailPane::Details => 1,
+        DetailPane::Logs => 2,
+        DetailPane::Config => 3,
     };
 
     let stopped = data.entries.is_empty()
-        || data.entries.get(data.selected)
+        || data
+            .entries
+            .get(data.selected)
             .map(|e| !e.state.is_running())
             .unwrap_or(true);
-    let log_label = if stopped { " Logs (poweroff) " } else { " Logs " };
+    let log_label = if stopped {
+        " Logs (poweroff) "
+    } else {
+        " Logs "
+    };
 
     let titles = vec![
         Line::from(" Properties "),
@@ -235,7 +249,11 @@ fn render_sub_tabs(
         Line::from(" Config "),
     ];
 
-    let highlight_color = if focused { Color::Cyan } else { Color::DarkGray };
+    let highlight_color = if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    };
 
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -263,7 +281,10 @@ fn render_properties(f: &mut Frame, data: &AppData, area: Rect) {
             let error_text = vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "  Error: ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(e.clone(), Style::default().fg(Color::Red)),
                 ]),
             ];
@@ -332,7 +353,10 @@ fn render_full_details(
             let error_text = vec![
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("  Error: ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "  Error: ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(e.clone(), Style::default().fg(Color::Red)),
                 ]),
             ];
@@ -369,7 +393,11 @@ fn render_full_details(
                 .border_type(BorderType::Rounded),
         )
         .highlight_symbol(">> ")
-        .row_highlight_style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+        .row_highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        );
 
     f.render_stateful_widget(table, area, state);
 }
@@ -414,8 +442,15 @@ fn render_config(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     let text = match &data.config_content {
         Some(c) => c.clone(),
         None => {
-            let name = data.entries.get(data.selected).map(|e| e.name.as_str()).unwrap_or("?");
-            format!("No config file found at /etc/systemd/nspawn/{}.nspawn", name)
+            let name = data
+                .entries
+                .get(data.selected)
+                .map(|e| e.name.as_str())
+                .unwrap_or("?");
+            format!(
+                "No config file found at /etc/systemd/nspawn/{}.nspawn",
+                name
+            )
         }
     };
 
@@ -425,7 +460,9 @@ fn render_config(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
             if l.starts_with('[') && l.ends_with(']') {
                 Line::from(Span::styled(
                     l.to_owned(),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ))
             } else if let Some(pos) = l.find('=') {
                 let (k, v) = l.split_at(pos);
@@ -434,7 +471,10 @@ fn render_config(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                     Span::styled(v.to_owned(), Style::default().fg(Color::White)),
                 ])
             } else {
-                Line::from(Span::styled(l.to_owned(), Style::default().fg(Color::DarkGray)))
+                Line::from(Span::styled(
+                    l.to_owned(),
+                    Style::default().fg(Color::DarkGray),
+                ))
             }
         })
         .collect();

@@ -1,14 +1,14 @@
 //! Container cloning deployment implementation.
 
+use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::deploy::Deployer;
 use crate::nspawn::create;
+use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::ContainerConfig;
 
 pub struct CloneDeployer {
     pub source_name: String,
@@ -27,27 +27,32 @@ impl Deployer for CloneDeployer {
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
-        
-        let _ = logs.send(format!("Cloning container {} to {}...", self.source_name, name));
+        let _ = logs.send(format!(
+            "Cloning container {} to {}...",
+            self.source_name, name
+        ));
 
         let out = Command::new("machinectl")
             .args(["clone", &self.source_name, name])
             .output()
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-        
+
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed("machinectl clone".into(), String::from_utf8_lossy(&out.stderr).trim().to_string()));
+            return Err(NspawnError::CommandFailed(
+                "machinectl clone".into(),
+                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            ));
         }
 
         // machinectl clone creates the container in /var/lib/machines/NAME automatically.
 
         // Clone configs
         if let Err(e) = create::clone_nspawn_config(&self.source_name, name) {
-             let _ = logs.send(format!("WARNING: Failed to clone .nspawn config: {}", e));
+            let _ = logs.send(format!("WARNING: Failed to clone .nspawn config: {}", e));
         }
         if let Err(e) = create::clone_systemd_override(&self.source_name, name) {
-             let _ = logs.send(format!("WARNING: Failed to clone systemd override: {}", e));
+            let _ = logs.send(format!("WARNING: Failed to clone systemd override: {}", e));
         }
 
         Ok(())

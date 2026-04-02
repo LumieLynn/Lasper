@@ -1,9 +1,9 @@
+use crate::nspawn::models::BindMount;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::widgets::inputs::button::Button;
-use crate::nspawn::models::BindMount;
-use crossterm::event::{KeyEvent, KeyCode};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
@@ -22,19 +22,28 @@ pub struct BindMountBox {
 impl BindMountBox {
     pub fn new(on_submit: impl Fn(BindMount) -> AppMessage + 'static) -> Self {
         Self {
-            source_path: PathBox::new("Source Path", "/".to_string())
-                .with_validator(|v| {
-                    let path = std::path::Path::new(v.trim());
-                    if v.trim().is_empty() { return Err("Path required".into()); }
-                    if !path.is_absolute() { return Err("Must be absolute path".into()); }
-                    if !path.exists() { return Err("Path does not exist".into()); }
-                    Ok(())
-                }),
+            source_path: PathBox::new("Source Path", "/".to_string()).with_validator(|v| {
+                let path = std::path::Path::new(v.trim());
+                if v.trim().is_empty() {
+                    return Err("Path required".into());
+                }
+                if !path.is_absolute() {
+                    return Err("Must be absolute path".into());
+                }
+                if !path.exists() {
+                    return Err("Path does not exist".into());
+                }
+                Ok(())
+            }),
             target_path: PathBox::new("Target Path (optional, defaults to source)", "".to_string())
                 .with_validator(|v| {
                     let trimmed = v.trim();
-                    if trimmed.is_empty() { return Ok(()); }
-                    if !std::path::Path::new(trimmed).is_absolute() { return Err("Must be absolute path".into()); }
+                    if trimmed.is_empty() {
+                        return Ok(());
+                    }
+                    if !std::path::Path::new(trimmed).is_absolute() {
+                        return Err("Must be absolute path".into());
+                    }
                     Ok(())
                 }),
             readonly: Checkbox::new("Read Only", false),
@@ -79,15 +88,12 @@ impl Component for BindMountBox {
         self.source_path.render(f, chunks[0]);
         self.target_path.render(f, chunks[1]);
         self.readonly.render(f, chunks[2]);
-        
+
         let btn_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(50),
-                Constraint::Percentage(50),
-            ])
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[4]);
-            
+
         let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
         let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
         self.btn_ok.render(f, ok_area);
@@ -97,31 +103,53 @@ impl Component for BindMountBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> = vec![&self.source_path, &self.target_path, &self.readonly, &self.btn_ok, &self.btn_cancel];
+                let comps: Vec<&dyn Component> = vec![
+                    &self.source_path,
+                    &self.target_path,
+                    &self.readonly,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.next(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> = vec![&self.source_path, &self.target_path, &self.readonly, &self.btn_ok, &self.btn_cancel];
+                let comps: Vec<&dyn Component> = vec![
+                    &self.source_path,
+                    &self.target_path,
+                    &self.readonly,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.prev(&comps);
                 self.update_focus();
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
                 let mut valid = true;
-                if self.source_path.validate().is_err() { valid = false; }
-                if self.target_path.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.source_path.validate().is_err() {
+                    valid = false;
+                }
+                if self.target_path.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let source = self.source_path.value().trim().to_string();
                 let mut target = self.target_path.value().trim().to_string();
                 if target.is_empty() {
                     target = source.clone();
                 }
                 let readonly = self.readonly.checked();
-                
-                return EventResult::Message((self.on_submit)(BindMount { source, target, readonly }));
+
+                return EventResult::Message((self.on_submit)(BindMount {
+                    source,
+                    target,
+                    readonly,
+                }));
             }
             _ => {}
         }
@@ -133,36 +161,58 @@ impl Component for BindMountBox {
             &mut self.btn_ok,
             &mut self.btn_cancel,
         ];
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
             EventResult::Message(AppMessage::DialogSubmit) => {
                 let mut valid = true;
-                if self.source_path.validate().is_err() { valid = false; }
-                if self.target_path.validate().is_err() { valid = false; }
-                if !valid { return EventResult::Consumed; }
-                
+                if self.source_path.validate().is_err() {
+                    valid = false;
+                }
+                if self.target_path.validate().is_err() {
+                    valid = false;
+                }
+                if !valid {
+                    return EventResult::Consumed;
+                }
+
                 let source = self.source_path.value().trim().to_string();
                 let mut target = self.target_path.value().trim().to_string();
                 if target.is_empty() {
                     target = source.clone();
                 }
                 let readonly = self.readonly.checked();
-                
-                EventResult::Message((self.on_submit)(BindMount { source, target, readonly }))
+
+                EventResult::Message((self.on_submit)(BindMount {
+                    source,
+                    target,
+                    readonly,
+                }))
             }
             EventResult::Message(AppMessage::DialogCancel) => {
                 EventResult::Message(AppMessage::DialogCancel)
             }
             EventResult::FocusNext => {
-                let crefs: Vec<&dyn Component> = vec![&self.source_path, &self.target_path, &self.readonly, &self.btn_ok, &self.btn_cancel];
+                let crefs: Vec<&dyn Component> = vec![
+                    &self.source_path,
+                    &self.target_path,
+                    &self.readonly,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.next(&crefs);
                 self.update_focus();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let crefs: Vec<&dyn Component> = vec![&self.source_path, &self.target_path, &self.readonly, &self.btn_ok, &self.btn_cancel];
+                let crefs: Vec<&dyn Component> = vec![
+                    &self.source_path,
+                    &self.target_path,
+                    &self.readonly,
+                    &self.btn_ok,
+                    &self.btn_cancel,
+                ];
                 self.focus.prev(&crefs);
                 self.update_focus();
                 EventResult::Consumed

@@ -1,7 +1,7 @@
-use crossterm::event::KeyEvent;
-use ratatui::{layout::Rect, Frame};
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::inputs::text_input_base::TextInputBase;
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, Frame};
 
 pub struct TextBox {
     base: TextInputBase,
@@ -27,15 +27,17 @@ impl TextBox {
         self.base.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(String) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(String) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
     }
 
-    pub fn with_validator<F>(mut self, f: F) -> Self 
-    where F: Fn(&str) -> Result<(), String> + 'static 
+    pub fn with_validator<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<(), String> + 'static,
     {
         self.validator = Some(Box::new(f));
         self
@@ -54,7 +56,7 @@ impl Component for TextBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let prev_val = self.base.input.value().to_string();
         let res = self.base.handle_key(key);
-        
+
         if let EventResult::Consumed = res {
             let new_val = self.base.input.value().to_string();
             if new_val != prev_val {

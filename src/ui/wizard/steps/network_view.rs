@@ -1,12 +1,12 @@
-use crate::ui::core::{AppMessage, Component, FocusTracker, EventResult};
+use crate::nspawn::models::{NetworkMode, PortForward};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
+use crate::ui::widgets::composites::editable_list::EditableList;
+use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crate::ui::widgets::composites::editable_list::EditableList;
-use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::wizard::context::NetworkConfig;
-use crate::nspawn::models::{NetworkMode, PortForward};
-use crossterm::event::{KeyEvent, KeyCode};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
@@ -34,7 +34,7 @@ impl NetworkStepView {
         let mut bridges = scanned_bridges.to_vec();
         bridges.push(" >> Custom Bridge... ".into());
         let bridge_options_len = bridges.len();
-        
+
         let initial_bridge = match &initial_data.mode {
             Some(NetworkMode::Bridge(name)) => name.clone(),
             _ => String::new(),
@@ -44,7 +44,10 @@ impl NetworkStepView {
         let bridge_idx = if is_custom {
             bridges.len() - 1
         } else {
-            scanned_bridges.iter().position(|b| b == &initial_bridge).unwrap_or(0)
+            scanned_bridges
+                .iter()
+                .position(|b| b == &initial_bridge)
+                .unwrap_or(0)
         };
 
         let mut bridge_list = SelectableList::new(" Select Bridge ", bridges, |s| s.clone());
@@ -55,13 +58,19 @@ impl NetworkStepView {
                 .with_on_change(|idx| AppMessage::NetworkModeUpdated(idx)),
             bridge_list,
             custom_bridge: TextBox::new(" Custom Bridge Name ", initial_bridge.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("Bridge name required".into()) } else { Ok(()) })
+                .with_validator(|v| {
+                    if v.trim().is_empty() {
+                        Err("Bridge name required".into())
+                    } else {
+                        Ok(())
+                    }
+                })
                 .with_on_change(|v| AppMessage::NetworkBridgeUpdated(v)),
             port_list: EditableList::new(
                 " Configured Port Forwards ",
                 initial_data.port_forwards.clone(),
                 |p| format!("  {}:{}/{}", p.host, p.container, p.proto),
-                |idx| AppMessage::PortForwardRemoved(idx)
+                |idx| AppMessage::PortForwardRemoved(idx),
             ),
             port_editor: None,
             focus: FocusTracker::new(),
@@ -142,13 +151,15 @@ impl NetworkStepView {
 impl Component for NetworkStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.port_editor {
-             let inner_area = crate::ui::centered_rect(60, 60, f.area());
-             f.render_widget(ratatui::widgets::Clear, inner_area);
-             let block = ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title(" Add Port Forward ");
-             let editor_area = block.inner(inner_area);
-             f.render_widget(block, inner_area);
-             editor.render(f, editor_area);
-             return;
+            let inner_area = crate::ui::centered_rect(60, 60, f.area());
+            f.render_widget(ratatui::widgets::Clear, inner_area);
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Add Port Forward ");
+            let editor_area = block.inner(inner_area);
+            f.render_widget(block, inner_area);
+            editor.render(f, editor_area);
+            return;
         }
 
         let mode = self.mode_selector.selected_idx();
@@ -161,33 +172,33 @@ impl Component for NetworkStepView {
                 ratatui::layout::Constraint::Length(1), // Hint
             ])
             .split(area);
-        
+
         self.mode_selector.render(f, chunks[0]);
-        
+
         if mode == 3 {
-             let mid_chunks = ratatui::layout::Layout::default()
+            let mid_chunks = ratatui::layout::Layout::default()
                 .constraints([
                     ratatui::layout::Constraint::Percentage(50),
                     ratatui::layout::Constraint::Percentage(50),
                 ])
                 .direction(ratatui::layout::Direction::Horizontal)
                 .split(chunks[1]);
-             self.bridge_list.render(f, mid_chunks[0]);
-             if self.is_custom_bridge() {
-                 let right_chunks = ratatui::layout::Layout::default()
-                     .direction(ratatui::layout::Direction::Vertical)
-                     .constraints([
-                         ratatui::layout::Constraint::Length(3),
-                         ratatui::layout::Constraint::Min(0),
-                     ])
-                     .split(mid_chunks[1]);
-                 self.custom_bridge.render(f, right_chunks[0]);
-                 self.port_list.render(f, right_chunks[1]);
-             } else {
-                 self.port_list.render(f, mid_chunks[1]);
-             }
+            self.bridge_list.render(f, mid_chunks[0]);
+            if self.is_custom_bridge() {
+                let right_chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        ratatui::layout::Constraint::Length(3),
+                        ratatui::layout::Constraint::Min(0),
+                    ])
+                    .split(mid_chunks[1]);
+                self.custom_bridge.render(f, right_chunks[0]);
+                self.port_list.render(f, right_chunks[1]);
+            } else {
+                self.port_list.render(f, mid_chunks[1]);
+            }
         } else if mode != 0 {
-             self.port_list.render(f, chunks[1]);
+            self.port_list.render(f, chunks[1]);
         }
     }
 
@@ -247,7 +258,8 @@ impl Component for NetworkStepView {
         if self.focus.active_idx < visible.len() {
             let res = visible[self.focus.active_idx].handle_key(key);
             match &res {
-                EventResult::Message(AppMessage::NetworkModeUpdated(_)) | EventResult::Message(AppMessage::NetworkBridgeUpdated(_)) => {
+                EventResult::Message(AppMessage::NetworkModeUpdated(_))
+                | EventResult::Message(AppMessage::NetworkBridgeUpdated(_)) => {
                     self.update_focus();
                 }
                 EventResult::FocusNext => {
@@ -278,7 +290,10 @@ impl Component for NetworkStepView {
     }
 
     fn is_focused(&self) -> bool {
-        self.mode_selector.is_focused() || self.bridge_list.is_focused() || self.custom_bridge.is_focused() || self.port_list.is_focused()
+        self.mode_selector.is_focused()
+            || self.bridge_list.is_focused()
+            || self.custom_bridge.is_focused()
+            || self.port_list.is_focused()
     }
 
     fn validate(&mut self) -> Result<(), String> {

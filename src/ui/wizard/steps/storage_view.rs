@@ -1,10 +1,14 @@
+use crate::nspawn::storage::{StorageInfo, StorageType};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
 use crate::ui::wizard::context::StorageConfig;
-use crate::nspawn::storage::{StorageType, StorageInfo};
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{layout::{Constraint, Direction, Layout, Rect}, Frame, widgets::Paragraph};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    widgets::Paragraph,
+    Frame,
+};
 
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
@@ -17,32 +21,49 @@ pub struct StorageStepView {
 impl StorageStepView {
     pub fn new(initial_data: &StorageConfig, info: StorageInfo) -> Self {
         let types = info.types.clone();
-        
-        let mut list = SelectableList::new(
-            " Storage Options ",
-            types,
-            |(st, supported)| {
-                let status = if *supported { "" } else { " (unsupported)" };
-                format!("{}{}", st.label(), status)
-            }
-        ).with_on_change(|idx| AppMessage::StorageTypeUpdated(idx));
-        
-        let type_idx = info.types.iter().position(|(t, _)| *t == initial_data.storage_type).unwrap_or(0);
+
+        let mut list = SelectableList::new(" Storage Options ", types, |(st, supported)| {
+            let status = if *supported { "" } else { " (unsupported)" };
+            format!("{}{}", st.label(), status)
+        })
+        .with_on_change(|idx| AppMessage::StorageTypeUpdated(idx));
+
+        let type_idx = info
+            .types
+            .iter()
+            .position(|(t, _)| *t == initial_data.storage_type)
+            .unwrap_or(0);
         list.select(type_idx);
-        
-        let raw_cfg = initial_data.raw_config.clone().unwrap_or(crate::nspawn::models::RawStorageConfig {
-            size: "2G".to_string(),
-            fs_type: "ext4".to_string(),
-            use_partition_table: false,
-        });
+
+        let raw_cfg =
+            initial_data
+                .raw_config
+                .clone()
+                .unwrap_or(crate::nspawn::models::RawStorageConfig {
+                    size: "2G".to_string(),
+                    fs_type: "ext4".to_string(),
+                    use_partition_table: false,
+                });
 
         let mut view = Self {
             list,
             raw_size: TextBox::new(" Raw Image Size (e.g. 2G, 500M) ", raw_cfg.size)
-                .with_validator(|v| if v.trim().is_empty() { Err("Size required".into()) } else { Ok(()) })
+                .with_validator(|v| {
+                    if v.trim().is_empty() {
+                        Err("Size required".into())
+                    } else {
+                        Ok(())
+                    }
+                })
                 .with_on_change(|v| AppMessage::StorageSizeUpdated(v)),
             raw_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", raw_cfg.fs_type)
-                .with_validator(|v| if v.trim().is_empty() { Err("Filesystem required".into()) } else { Ok(()) })
+                .with_validator(|v| {
+                    if v.trim().is_empty() {
+                        Err("Filesystem required".into())
+                    } else {
+                        Ok(())
+                    }
+                })
                 .with_on_change(|v| AppMessage::StorageFsUpdated(v)),
             info,
             focus: FocusTracker::new(),
@@ -87,7 +108,7 @@ impl StorageStepView {
             comps.push(&mut self.raw_size);
             comps.push(&mut self.raw_fs);
         }
-        
+
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);
         }
@@ -115,8 +136,11 @@ impl Component for StorageStepView {
             .constraints(constraints)
             .split(area);
 
-        f.render_widget(Paragraph::new("Select storage backend for the container rootfs:"), chunks[0]);
-        
+        f.render_widget(
+            Paragraph::new("Select storage backend for the container rootfs:"),
+            chunks[0],
+        );
+
         self.update_focus();
 
         self.list.render(f, chunks[1]);
@@ -146,11 +170,11 @@ impl Component for StorageStepView {
             comps.push(&mut self.raw_size);
             comps.push(&mut self.raw_fs);
         }
-        
+
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);
         }
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
@@ -179,7 +203,7 @@ impl Component for StorageStepView {
             self.raw_fs.set_focus(false);
         }
     }
-    
+
     fn validate(&mut self) -> Result<(), String> {
         if self.is_raw_selected() {
             self.raw_size.validate()?;

@@ -1,11 +1,11 @@
-use crossterm::event::{KeyEvent, KeyCode};
+use crate::ui::core::{AppMessage, Component, EventResult};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
-use crate::ui::core::{AppMessage, Component, EventResult};
 
 pub struct SelectableList<T> {
     items: Vec<T>,
@@ -18,7 +18,11 @@ pub struct SelectableList<T> {
 }
 
 impl<T> SelectableList<T> {
-    pub fn new(label: impl Into<String>, items: Vec<T>, display_fn: impl Fn(&T) -> String + 'static) -> Self {
+    pub fn new(
+        label: impl Into<String>,
+        items: Vec<T>,
+        display_fn: impl Fn(&T) -> String + 'static,
+    ) -> Self {
         let mut state = ListState::default();
         if !items.is_empty() {
             state.select(Some(0));
@@ -43,8 +47,9 @@ impl<T> SelectableList<T> {
         self.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(usize) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(usize) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
@@ -53,7 +58,7 @@ impl<T> SelectableList<T> {
     pub fn selected_idx(&self) -> Option<usize> {
         self.state.selected()
     }
-    
+
     pub fn selected_item(&self) -> Option<&T> {
         self.state.selected().and_then(|idx| self.items.get(idx))
     }
@@ -68,10 +73,11 @@ impl<T> SelectableList<T> {
         self.items = items;
         if let Some(i) = self.state.selected() {
             if i >= self.items.len() {
-                self.state.select(if self.items.is_empty() { None } else { Some(0) });
+                self.state
+                    .select(if self.items.is_empty() { None } else { Some(0) });
             }
         } else if !self.items.is_empty() {
-             self.state.select(Some(0));
+            self.state.select(Some(0));
         }
     }
 
@@ -144,16 +150,26 @@ impl<T> SelectableList<T> {
             Style::default().fg(Color::White)
         };
 
-        let items: Vec<ListItem> = self.items.iter().map(|item| {
-            ListItem::new((self.display_fn)(item))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .items
+            .iter()
+            .map(|item| ListItem::new((self.display_fn)(item)))
+            .collect();
 
-        let mut list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(self.label.as_str()).border_style(style));
+        let mut list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(self.label.as_str())
+                .border_style(style),
+        );
 
         if self.enabled {
             list = list
-                .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .highlight_symbol(">> ");
         }
 

@@ -1,3 +1,4 @@
+use crate::ui::core::EventResult;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -5,9 +6,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-pub use tui_input::Input;
 use tui_input::backend::crossterm::EventHandler;
-use crate::ui::core::EventResult;
+pub use tui_input::Input;
 
 pub struct TextInputBase {
     pub input: Input,
@@ -57,11 +57,8 @@ impl TextInputBase {
             let width = area.width.saturating_sub(2);
             let scroll = self.input.visual_scroll(width as usize);
             let cursor_pos = self.input.visual_cursor().saturating_sub(scroll);
-            
-            f.set_cursor_position((
-                area.x + 1 + cursor_pos as u16,
-                area.y + 1,
-            ));
+
+            f.set_cursor_position((area.x + 1 + cursor_pos as u16, area.y + 1));
         }
     }
 
@@ -75,7 +72,11 @@ impl TextInputBase {
             KeyCode::BackTab => EventResult::FocusPrev,
             KeyCode::Esc => EventResult::Ignored,
             _ => {
-                if self.input.handle_event(&crossterm::event::Event::Key(key)).is_some() {
+                if self
+                    .input
+                    .handle_event(&crossterm::event::Event::Key(key))
+                    .is_some()
+                {
                     EventResult::Consumed
                 } else {
                     EventResult::Ignored

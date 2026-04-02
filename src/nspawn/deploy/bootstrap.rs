@@ -1,15 +1,15 @@
 //! Debootstrap and Pacstrap deployment implementations.
 
+use async_trait::async_trait;
+use std::process::Stdio;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
-use tokio::process::Command;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use std::process::Stdio;
-use async_trait::async_trait;
+use tokio::process::Command;
 
-use crate::nspawn::models::ContainerConfig;
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::ContainerConfig;
 
 pub struct DebootstrapDeployer {
     pub mirror: String,
@@ -52,7 +52,11 @@ impl Deployer for PacstrapDeployer {
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> Result<()> {
-        let mut args = vec!["-c".into(), rootfs.to_string_lossy().to_string(), "base".into()];
+        let mut args = vec![
+            "-c".into(),
+            rootfs.to_string_lossy().to_string(),
+            "base".into(),
+        ];
         if cfg.users.iter().any(|u| u.sudoer) {
             args.push("sudo".into());
         }
@@ -62,30 +66,52 @@ impl Deployer for PacstrapDeployer {
     }
 }
 
-async fn run_command(prog: &str, args: Vec<String>, logs: tokio::sync::mpsc::UnboundedSender<String>) -> Result<()> {
+async fn run_command(
+    prog: &str,
+    args: Vec<String>,
+    logs: tokio::sync::mpsc::UnboundedSender<String>,
+) -> Result<()> {
     let mut cmd = Command::new(prog);
     cmd.args(args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;
-    
-    let stdout = child.stdout.take().ok_or_else(|| NspawnError::StorageError("Failed to capture stdout".into()))?;
-    let stderr = child.stderr.take().ok_or_else(|| NspawnError::StorageError("Failed to capture stderr".into()))?;
-    
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| NspawnError::StorageError("Failed to capture stdout".into()))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| NspawnError::StorageError("Failed to capture stderr".into()))?;
+
     let l1 = logs.clone();
     tokio::spawn(async move {
         let mut r = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = r.next_line().await { let _ = l1.send(line); }
+        while let Ok(Some(line)) = r.next_line().await {
+            let _ = l1.send(line);
+        }
     });
     let l2 = logs.clone();
     tokio::spawn(async move {
         let mut r = BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = r.next_line().await { let _ = l2.send(line); }
+        while let Ok(Some(line)) = r.next_line().await {
+            let _ = l2.send(line);
+        }
     });
-    
-    let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;
     if !status.success() {
-        return Err(NspawnError::CommandFailed(prog.into(), format!("exited with status {}", status)));
+        return Err(NspawnError::CommandFailed(
+            prog.into(),
+            format!("exited with status {}", status),
+        ));
     }
     Ok(())
 }

@@ -22,7 +22,9 @@ pub enum NetworkMode {
 }
 
 impl Default for NetworkMode {
-    fn default() -> Self { NetworkMode::Veth }
+    fn default() -> Self {
+        NetworkMode::Veth
+    }
 }
 
 /// A port forwarding rule (host -> container).
@@ -149,4 +151,3 @@ pub struct MachineProperties {
     #[allow(dead_code)]
     pub memory_usage: Option<u64>,
 }
-

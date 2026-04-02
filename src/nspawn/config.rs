@@ -34,7 +34,8 @@ impl NspawnConfig {
         let in_general = conf.get_from(Some("General"), enabled_msg);
         let in_global = conf.get_from(None::<&str>, enabled_msg);
 
-        in_general.or(in_global)
+        in_general
+            .or(in_global)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
     }
@@ -46,8 +47,8 @@ impl NspawnConfig {
         death_list: &[String],
     ) -> Result<()> {
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| NspawnError::Io(path.clone(), e))?;
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| NspawnError::Io(path.clone(), e))?;
 
         let final_content = Self::apply_gpu_passthrough_to_content(content, new_state, death_list)?;
 
@@ -74,12 +75,16 @@ impl NspawnConfig {
             let trimmed = line.trim();
             if trimmed.starts_with("X-Lasper-Nvidia-Begin=") {
                 if start_idx.is_some() {
-                    return Err(NspawnError::Runtime("Duplicate X-Lasper-Nvidia-Begin marker".into()));
+                    return Err(NspawnError::Runtime(
+                        "Duplicate X-Lasper-Nvidia-Begin marker".into(),
+                    ));
                 }
                 start_idx = Some(i);
             } else if trimmed.starts_with("X-Lasper-Nvidia-End=") {
                 if end_idx.is_some() {
-                    return Err(NspawnError::Runtime("Duplicate X-Lasper-Nvidia-End marker".into()));
+                    return Err(NspawnError::Runtime(
+                        "Duplicate X-Lasper-Nvidia-End marker".into(),
+                    ));
                 }
                 end_idx = Some(i);
             }
@@ -109,7 +114,9 @@ impl NspawnConfig {
                 Ok((new_lines.join("\n"), death_list))
             }
             (None, None) => Ok((content.to_string(), Vec::new())),
-            _ => Err(NspawnError::Runtime("Incomplete markers found: one is missing".into())),
+            _ => Err(NspawnError::Runtime(
+                "Incomplete markers found: one is missing".into(),
+            )),
         }
     }
 
@@ -122,9 +129,8 @@ impl NspawnConfig {
         // 1. Purge existing block using markers
         let (clean_content, _extracted_deaths) = Self::purge_nvidia_block(&content)?;
 
-        let original_conf = Ini::load_from_str(&clean_content).map_err(|e| {
-            NspawnError::Runtime(format!("Failed to parse .nspawn as INI: {}", e))
-        })?;
+        let original_conf = Ini::load_from_str(&clean_content)
+            .map_err(|e| NspawnError::Runtime(format!("Failed to parse .nspawn as INI: {}", e)))?;
 
         // 2. Rebuild Ini to ensure clean section structure
         let mut new_conf = Ini::new();
@@ -139,47 +145,58 @@ impl NspawnConfig {
                     if key == "Bind" && new_state.device_binds.iter().any(|v| v == value) {
                         continue;
                     }
-                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value) {
+                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value)
+                    {
                         continue;
                     }
                 }
 
                 if new_conf.section(section_str).is_none() {
-                    new_conf.with_section(section_str).set(key.to_string(), value.to_string());
+                    new_conf
+                        .with_section(section_str)
+                        .set(key.to_string(), value.to_string());
                 } else {
-                    new_conf.section_mut(section_str).unwrap().append(key.to_string(), value.to_string());
+                    new_conf
+                        .section_mut(section_str)
+                        .unwrap()
+                        .append(key.to_string(), value.to_string());
                 }
             }
         }
 
         // 3. Add New Managed Block to [Files]
         if !new_state.device_binds.is_empty() || !new_state.readonly_binds.is_empty() {
-             // Ensure [Files] section exists
-             if new_conf.section(Some("Files")).is_none() {
-                 new_conf.with_section(Some("Files")).set("__placeholder", "");
-                 new_conf.section_mut(Some("Files")).unwrap().remove("__placeholder");
-             }
-             let s = new_conf.section_mut(Some("Files")).unwrap();
-             
-             // Markers
-             s.append("X-Lasper-Nvidia-Begin", &new_state.driver_version);
-             for dev in &new_state.device_binds {
-                 s.append("Bind", dev.clone());
-             }
-             for ro in &new_state.readonly_binds {
-                 s.append("BindReadOnly", ro.clone());
-             }
-             s.append("X-Lasper-Nvidia-End", "true");
+            // Ensure [Files] section exists
+            if new_conf.section(Some("Files")).is_none() {
+                new_conf
+                    .with_section(Some("Files"))
+                    .set("__placeholder", "");
+                new_conf
+                    .section_mut(Some("Files"))
+                    .unwrap()
+                    .remove("__placeholder");
+            }
+            let s = new_conf.section_mut(Some("Files")).unwrap();
+
+            // Markers
+            s.append("X-Lasper-Nvidia-Begin", &new_state.driver_version);
+            for dev in &new_state.device_binds {
+                s.append("Bind", dev.clone());
+            }
+            for ro in &new_state.readonly_binds {
+                s.append("BindReadOnly", ro.clone());
+            }
+            s.append("X-Lasper-Nvidia-End", "true");
         }
 
         // 4. Serialize back to buffer
         let mut buffer = Vec::new();
-        new_conf.write_to(&mut buffer)
+        new_conf
+            .write_to(&mut buffer)
             .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
-        
+
         Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
-
 }
 
 #[cfg(test)]
@@ -225,16 +242,22 @@ mod tests {
         let mut new_state = crate::nspawn::nvidia::NvidiaState::default();
         new_state.driver_version = "550.54".into();
         new_state.device_binds = vec!["/dev/nvidia0".into(), "/dev/nvidiactl".into()];
-        
-        let mutated = NspawnConfig::apply_gpu_passthrough_to_content(content.into(), &new_state, &[]).unwrap();
-        
+
+        let mutated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content.into(), &new_state, &[])
+                .unwrap();
+
         // Should have markers (rust-ini might add spaces, so we check for fragments)
         assert!(mutated.contains("X-Lasper-Nvidia-Begin"));
         assert!(mutated.contains("550.54"));
         assert!(mutated.contains("X-Lasper-Nvidia-End"));
-        
+
         // Should have only ONE /dev/nvidia0 bind
         let count = mutated.matches("/dev/nvidia0").count();
-        assert_eq!(count, 1, "Should have exactly one /dev/nvidia0 entry, but found {}: \n{}", count, mutated);
+        assert_eq!(
+            count, 1,
+            "Should have exactly one /dev/nvidia0 entry, but found {}: \n{}",
+            count, mutated
+        );
     }
 }

@@ -1,12 +1,12 @@
+use crate::ui::core::{Component, EventResult};
 use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
-    style::{Color, Style, Modifier},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph},
+    widgets::Paragraph,
     Frame,
 };
-use crate::ui::core::{Component, EventResult};
 
 pub struct PropertyRow {
     key: String,
@@ -25,8 +25,16 @@ impl PropertyRow {
 impl Component for PropertyRow {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let line = Line::from(vec![
-            Span::styled(format!("{}: ", self.key), Style::default().fg(Color::DarkGray)),
-            Span::styled(self.value.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}: ", self.key),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                self.value.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]);
 
         let paragraph = Paragraph::new(line);

@@ -1,7 +1,7 @@
-use crossterm::event::KeyEvent;
-use ratatui::{layout::Rect, Frame};
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::inputs::text_input_base::TextInputBase;
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, Frame};
 use tui_input::backend::crossterm::EventHandler;
 
 pub struct NumberBox {
@@ -30,8 +30,9 @@ impl NumberBox {
         self.base.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(u32) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(u32) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
@@ -41,7 +42,7 @@ impl NumberBox {
         self.max_value = max;
         self
     }
-    
+
     pub fn with_min_value(mut self, min: u32) -> Self {
         self.min_value = min;
         self
@@ -59,7 +60,7 @@ impl Component for NumberBox {
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let mut temp_input = self.base.input.clone();
-        
+
         let res = self.base.handle_key(key);
         if let EventResult::FocusNext | EventResult::FocusPrev = res {
             return res;
@@ -67,12 +68,12 @@ impl Component for NumberBox {
 
         if let Some(_) = temp_input.handle_event(&crossterm::event::Event::Key(key)) {
             let val_str = temp_input.value();
-            
+
             if val_str.is_empty() {
                 self.base.input = temp_input;
                 return EventResult::Consumed;
             }
-            
+
             if let Ok(num) = val_str.parse::<u32>() {
                 if num <= self.max_value {
                     self.base.input = temp_input;

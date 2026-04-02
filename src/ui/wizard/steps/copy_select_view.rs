@@ -1,6 +1,6 @@
+use crate::nspawn::ContainerEntry;
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crate::nspawn::ContainerEntry;
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
@@ -10,14 +10,13 @@ pub struct CopySelectStepView {
 
 impl CopySelectStepView {
     pub fn new(entries: &[ContainerEntry], initial_cursor: usize) -> Self {
-        let mut list = SelectableList::new(
-            " Select container to clone ",
-            entries.to_vec(),
-            |e| format!("  {} ({})", e.name, e.state.label())
-        ).with_on_change(|idx| AppMessage::SourceCloneIdxUpdated(idx));
-        
+        let mut list = SelectableList::new(" Select container to clone ", entries.to_vec(), |e| {
+            format!("  {} ({})", e.name, e.state.label())
+        })
+        .with_on_change(|idx| AppMessage::SourceCloneIdxUpdated(idx));
+
         list.select(initial_cursor);
-        
+
         Self { list }
     }
 }

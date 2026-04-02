@@ -1,11 +1,11 @@
-use crossterm::event::{KeyEvent, KeyCode};
+use crate::ui::core::{Component, EventResult};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
-use crate::ui::core::{Component, EventResult};
 
 pub struct TextBlock {
     label: String,

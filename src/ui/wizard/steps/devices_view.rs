@@ -1,10 +1,15 @@
-use crate::ui::core::{AppMessage, Component, EventResult};
-use crate::ui::widgets::composites::editable_list::EditableList;
-use crate::ui::widgets::composites::bind_mount::BindMountBox;
-use crate::ui::wizard::context::PassthroughConfig;
 use crate::nspawn::models::BindMount;
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{layout::{Constraint, Direction, Layout, Rect}, Frame, style::{Color, Style}, widgets::Paragraph};
+use crate::ui::core::{AppMessage, Component, EventResult};
+use crate::ui::widgets::composites::bind_mount::BindMountBox;
+use crate::ui::widgets::composites::editable_list::EditableList;
+use crate::ui::wizard::context::PassthroughConfig;
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::Paragraph,
+    Frame,
+};
 
 pub struct DevicesStepView {
     bind_list: EditableList<BindMount>,
@@ -18,8 +23,15 @@ impl DevicesStepView {
             bind_list: EditableList::new(
                 " Configured Bind Mounts ",
                 initial_data.bind_mounts.clone(),
-                |bm| format!("  {}:{} ({})", bm.source, bm.target, if bm.readonly { "ro" } else { "rw" }),
-                |idx| AppMessage::BindMountRemoved(idx)
+                |bm| {
+                    format!(
+                        "  {}:{} ({})",
+                        bm.source,
+                        bm.target,
+                        if bm.readonly { "ro" } else { "rw" }
+                    )
+                },
+                |idx| AppMessage::BindMountRemoved(idx),
             ),
             bind_editor: None,
             nvidia_enabled: initial_data.nvidia_gpu,
@@ -30,13 +42,15 @@ impl DevicesStepView {
 impl Component for DevicesStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.bind_editor {
-             let inner_area = crate::ui::centered_rect(60, 60, f.area());
-             f.render_widget(ratatui::widgets::Clear, inner_area);
-             let block = ratatui::widgets::Block::default().borders(ratatui::widgets::Borders::ALL).title(" Add Bind Mount ");
-             let editor_area = block.inner(inner_area);
-             f.render_widget(block, inner_area);
-             editor.render(f, editor_area);
-             return;
+            let inner_area = crate::ui::centered_rect(60, 60, f.area());
+            f.render_widget(ratatui::widgets::Clear, inner_area);
+            let block = ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::ALL)
+                .title(" Add Bind Mount ");
+            let editor_area = block.inner(inner_area);
+            f.render_widget(block, inner_area);
+            editor.render(f, editor_area);
+            return;
         }
 
         let chunks = Layout::default()
@@ -58,9 +72,12 @@ impl Component for DevicesStepView {
 
         self.bind_list.set_focus(true);
         self.bind_list.render(f, chunks[1]);
-        
+
         let footer = " [A]dd mount, [D]elete mount, [Enter] next ";
-        f.render_widget(Paragraph::new(footer).style(Style::default().fg(Color::Yellow)), chunks[2]);
+        f.render_widget(
+            Paragraph::new(footer).style(Style::default().fg(Color::Yellow)),
+            chunks[2],
+        );
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {

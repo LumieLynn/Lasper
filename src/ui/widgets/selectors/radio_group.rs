@@ -1,11 +1,11 @@
-use crossterm::event::{KeyEvent, KeyCode};
+use crate::ui::core::{AppMessage, Component, EventResult};
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
-use crate::ui::core::{AppMessage, Component, EventResult};
 
 pub struct RadioGroup {
     label: String,
@@ -37,8 +37,9 @@ impl RadioGroup {
         self.enabled = enabled;
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(usize) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(usize) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
@@ -61,7 +62,11 @@ impl Component for RadioGroup {
 
         let mut spans = vec![];
         for (i, opt) in self.options.iter().enumerate() {
-            let symbol = if i == self.selected_idx { "(●)" } else { "(○)" };
+            let symbol = if i == self.selected_idx {
+                "(●)"
+            } else {
+                "(○)"
+            };
             spans.push(format!("{} {}", symbol, opt));
         }
 
@@ -79,7 +84,7 @@ impl Component for RadioGroup {
         if !self.enabled {
             return EventResult::Ignored;
         }
-        
+
         match key.code {
             KeyCode::Tab => EventResult::FocusNext,
             KeyCode::BackTab => EventResult::FocusPrev,

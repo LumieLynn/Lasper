@@ -101,7 +101,6 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
     out
 }
 
-
 /// Generate the content for a systemd service override.
 pub fn systemd_override_content(device_binds: &[String], nvidia_gpu: bool) -> String {
     let mut content = String::from("[Service]\n");

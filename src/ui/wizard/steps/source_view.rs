@@ -193,7 +193,7 @@ impl Component for SourceStepView {
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);
         }
-        
+
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::Message(AppMessage::SourceKindUpdated(_)) => {
@@ -224,7 +224,7 @@ impl Component for SourceStepView {
             self.disk_path.set_focus(false);
         }
     }
-    
+
     fn validate(&mut self) -> Result<(), String> {
         let cursor = self.kind_list.selected_idx().unwrap_or(0);
         match cursor {

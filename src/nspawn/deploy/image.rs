@@ -1,13 +1,13 @@
 //! OCI and Disk Image deployment implementations.
 
+use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
-use async_trait::async_trait;
 use tokio::process::Command;
 
-use crate::nspawn::models::ContainerConfig;
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::ContainerConfig;
 
 pub struct OciDeployer {
     pub url: String,
