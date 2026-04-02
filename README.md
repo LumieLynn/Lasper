@@ -6,12 +6,12 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 
 ## Features
 
-- **Container Management**: Start, stop, and terminate systemd-nspawn containers. View container properties and journal logs directly in the terminal.
-- **Creation Wizard**: Interactively generate `.nspawn` configurations (network modes, port forwarding, bind mounts, user namespaces).
+- **Container Management**: Start, stop, restart, enable/disable, and terminate systemd-nspawn containers. View properties, full details, and journal logs directly in the terminal via a unified dashboard.
+- **Creation Wizard**: Interactively generate `.nspawn` configurations with background task execution for image provisioning and deployment.
 - **Image Provisioning**:
   - Pull and extract OCI (Docker/Podman) images via `skopeo` and `umoci`.
   - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
-- **Hardware Passthrough**: Automated NVIDIA GPU device allocation and Wayland/X11 socket mounting for GUI apps.
+- **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
 - **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
 
 ## Prerequisites
@@ -19,6 +19,7 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 - `systemd-container` (provides `machinectl` and `systemd-nspawn`)
 - Root privileges (run via `sudo`)
 - *Optional*: `skopeo` and `umoci` (for OCI image support)
+- `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
 ## ⚠️ Before You Begin – Must Read
 
@@ -50,23 +51,30 @@ sudo lasper
 
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
-- `Enter` : Select / Next Step
-- `Esc` : Back / Cancel
-- `n` / `a` : Create a new container
-- `s` / `S` / `x` : Start / Stop / Terminate selected container
-- `p` / `l` / `c` : Switch views (Properties / Logs / Config)
+- `Enter` / `x` : Open Action Power Menu (Start, Poweroff, Reboot, Terminate, Kill, Enable, Disable)
+- `Tab` : Toggle Focus (Container List ↔ Detail Panel)
+- `n` / `a` : Create a new container (Creation Wizard)
+- `s` : Start selected container
+- `S` : Poweroff selected container
+- `p` / `d` / `l` / `c` : Switch view panes (Properties / All Details / Logs / Config)
+- `r` : Manual refresh data
+- `?` : Show help
 - `q` : Quit
+- `Esc` : Back / Close Overlays
 
 ## Roadmap / TODO
 
-- [ ] Better UI layout.
-- [ ] Resource monitoring.
-- [ ] `.raw` file custom partition.
-- [ ] DBus integration via `zbus` (replace `machinectl` CLI parsing).
-- [ ] Advanced networking config (`macvlan`, `ipvlan`, IP address customizing, etc.).
-- [ ] Global `config.toml` for overriding defaults and writing custom pre/post-deployment hooks.
+- [x] Component-based TUI architecture & Responsive layout.
+- [x] DBus integration via `zbus` (with automatic CLI fallback for legacy systems).
+- [x] Asynchronous background task scheduling for long-running deployments.
+- [ ] Resource monitoring (CPU/Memory/I/O usage).
+- [ ] Interactive .nspawn configuration editor.
+- [ ] `.raw` file custom partition support.
+- [ ] Advanced networking config (`macvlan`, `ipvlan`, static IP customizing, etc.).
+- [ ] Global `config.toml` for overriding default settings.
+- [ ] Better OCI import support.
+- [ ] Customizable post-deployment hooks and scripts.
 - [ ] Customizable deployment scripts.
-- [ ] Background task scheduling for long-running deployments.
 
 ## License
 
