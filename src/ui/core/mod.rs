@@ -44,6 +44,11 @@ pub enum AppMessage {
     BindMountAdded(crate::nspawn::models::BindMount),
     BindMountRemoved(usize),
 
+    // Main UI — container list navigation
+    ListNext,
+    ListPrev,
+    DetailPaneChanged(crate::app::DetailPane),
+
     // Backend communication
     BackendResult(BackendResponse),
 }

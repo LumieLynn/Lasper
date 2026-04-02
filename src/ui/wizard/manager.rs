@@ -399,6 +399,10 @@ impl Wizard {
                 }
             }
             AppMessage::DialogSubmit | AppMessage::DialogCancel => {} // Handled by inline editors
+            // Main-UI-only messages, never meaningful inside the wizard
+            AppMessage::DetailPaneChanged(_)
+            | AppMessage::ListNext
+            | AppMessage::ListPrev => {}
         }
         StepAction::None
     }
@@ -414,10 +418,9 @@ impl Wizard {
 
                 if let Some(next_step) = self.resolve_next_step(self.step) {
                     self.step = next_step;
-                    if matches!(
-                        self.step,
-                        WizardStep::Passthrough | WizardStep::Devices | WizardStep::Review
-                    ) {
+                    // Always rebuild Review so its preview reflects the latest context.
+                    // Passthrough and Devices are kept alive to preserve user input.
+                    if self.step == WizardStep::Review {
                         self.views.remove(&self.step);
                     }
                 }
@@ -426,10 +429,8 @@ impl Wizard {
             StepAction::Prev => {
                 if let Some(prev_step) = self.resolve_prev_step(self.step) {
                     self.step = prev_step;
-                    if matches!(
-                        self.step,
-                        WizardStep::Passthrough | WizardStep::Devices | WizardStep::Review
-                    ) {
+                    // Same: only evict Review on back-navigation.
+                    if self.step == WizardStep::Review {
                         self.views.remove(&self.step);
                     }
                 }

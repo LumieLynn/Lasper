@@ -1,9 +1,12 @@
-use std::sync::{Arc, Mutex, atomic::AtomicBool};
-use crate::nspawn::ContainerEntry;
-use crate::nspawn::models::{CreateUser, BindMount, PortForward, NetworkMode};
-use crate::nspawn::storage::{StorageBackend, StorageType, StorageInfo};
 use crate::nspawn::deploy::Deployer;
-pub use crate::ui::wizard::builder::{ContainerConfigBuilder, ContainerConfigWithPreview, SourceKind, SourceConfig, BasicConfig, StorageConfig, UserConfig, NetworkConfig, PassthroughConfig};
+use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::storage::{StorageBackend, StorageInfo, StorageType};
+use crate::nspawn::ContainerEntry;
+pub use crate::ui::wizard::builder::{
+    BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
+    PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
+};
+use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,7 +86,11 @@ pub struct UserState {
 impl UserState {
     pub fn extract_config(&self) -> UserConfig {
         UserConfig {
-            root_password: if self.root_password.is_empty() { None } else { Some(self.root_password.clone()) },
+            root_password: if self.root_password.is_empty() {
+                None
+            } else {
+                Some(self.root_password.clone())
+            },
             users: self.users.clone(),
         }
     }
@@ -117,7 +124,9 @@ impl NetworkState {
 
     pub fn parse_port(input: &str) -> Option<PortForward> {
         let parts: Vec<&str> = input.split(':').collect();
-        if parts.len() < 2 { return None; }
+        if parts.len() < 2 {
+            return None;
+        }
         let host = parts[0].parse::<u16>().ok()?;
         let rest = parts[1];
         let (container_str, proto) = if rest.contains('/') {
@@ -127,7 +136,11 @@ impl NetworkState {
             (rest, "tcp".to_string())
         };
         let container = container_str.parse::<u16>().ok()?;
-        Some(PortForward { host, container, proto })
+        Some(PortForward {
+            host,
+            container,
+            proto,
+        })
     }
 }
 
@@ -154,7 +167,9 @@ impl PassthroughState {
 
     pub fn parse_bind_mount(input: &str) -> Option<BindMount> {
         let parts: Vec<&str> = input.split(':').collect();
-        if parts.len() < 2 { return None; }
+        if parts.len() < 2 {
+            return None;
+        }
         let source = parts[0].to_string();
         let rest = parts[1];
         let (target, readonly) = if rest.contains(":ro") {
@@ -164,7 +179,11 @@ impl PassthroughState {
         } else {
             (rest.to_string(), false)
         };
-        Some(BindMount { source, target, readonly })
+        Some(BindMount {
+            source,
+            target,
+            readonly,
+        })
     }
 }
 
@@ -181,7 +200,9 @@ pub struct DeployState {
 }
 
 impl PartialEq for DeployState {
-    fn eq(&self, _other: &Self) -> bool { true }
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
 }
 
 impl std::fmt::Debug for DeployState {
@@ -238,7 +259,10 @@ impl WizardContext {
             },
             network: {
                 let bridges = crate::nspawn::network::detect_bridges();
-                let default_bridge = bridges.first().cloned().unwrap_or_else(|| "br0".to_string());
+                let default_bridge = bridges
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "br0".to_string());
                 NetworkState {
                     mode: 0,
                     bridge_name: default_bridge,

@@ -1,15 +1,21 @@
+use super::{App, DetailPane};
+use crate::nspawn::{models::ContainerEntry, StatusLevel};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use crate::nspawn::{StatusLevel, models::ContainerEntry};
-use super::{App, DetailPane};
 
 impl App {
     pub async fn refresh(&mut self) {
-        if self.ui.show_wizard || self.ui.show_help || self.ui.show_power_menu { return; }
+        if self.ui.show_wizard || self.ui.show_help || self.ui.show_power_menu {
+            return;
+        }
         self.data.dbus_active = self.data.manager.is_dbus_available().await;
         match self.data.manager.list_all().await {
             Ok(entries) => {
-                let prev_name = self.data.entries.get(self.data.selected).map(|e| e.name.clone());
+                let prev_name = self
+                    .data
+                    .entries
+                    .get(self.data.selected)
+                    .map(|e| e.name.clone());
                 self.data.entries = entries;
                 self.data.selected = prev_name
                     .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
@@ -22,7 +28,10 @@ impl App {
 
         // Check if any DBus call fell back to CLI during this refresh
         if self.data.dbus_active && self.data.manager.did_fallback() {
-            self.set_status("⚡ DBus call failed — used CLI fallback".into(), StatusLevel::Warn);
+            self.set_status(
+                "⚡ DBus call failed — used CLI fallback".into(),
+                StatusLevel::Warn,
+            );
         }
     }
 
@@ -36,7 +45,7 @@ impl App {
                 return;
             }
         };
-        match self.ui.detail_pane {
+        match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
                 match self.data.manager.get_properties(&entry.name).await {
                     Ok(machine_props) => {
@@ -54,18 +63,20 @@ impl App {
                             }
                             p.insert("Type".into(), image_type.clone());
                         }
-                        
+
                         // For stopped containers, manually ensure expected static fields
                         if !entry.state.is_running() {
                             p.insert("ReadOnly".into(), entry.readonly.to_string());
-                            if let Some(u) = &entry.usage { p.insert("Usage".into(), u.clone()); }
+                            if let Some(u) = &entry.usage {
+                                p.insert("Usage".into(), u.clone());
+                            }
                             p.insert("State".into(), entry.state.label().into());
                         }
-                        
+
                         self.data.properties = Ok(p);
                     }
-                    Err(e) => { 
-                        log::debug!("{e}"); 
+                    Err(e) => {
+                        log::debug!("{e}");
                         self.data.properties = Err(e.to_string());
                     }
                 }
@@ -81,8 +92,11 @@ impl App {
                 }
             }
             DetailPane::Config => {
-                let new_content = crate::nspawn::config::NspawnConfig::load(&entry.name).map(|c| c.content);
-                if self.data.config_content != new_content { self.ui.config_scroll = 0; }
+                let new_content =
+                    crate::nspawn::config::NspawnConfig::load(&entry.name).map(|c| c.content);
+                if self.data.config_content != new_content {
+                    self.ui.detail_panel.config_scroll = 0;
+                }
                 self.data.config_content = new_content;
             }
         }
@@ -101,7 +115,11 @@ impl App {
 
     pub fn select_prev(&mut self) {
         if !self.data.entries.is_empty() {
-            self.data.selected = if self.data.selected == 0 { self.data.entries.len() - 1 } else { self.data.selected - 1 };
+            self.data.selected = if self.data.selected == 0 {
+                self.data.entries.len() - 1
+            } else {
+                self.data.selected - 1
+            };
         }
     }
 
@@ -116,13 +134,22 @@ impl App {
     }
 
     pub async fn action_start(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             if !e.state.is_running() {
                 match self.data.manager.start(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
-                        self.set_status(format!("Started {}{}", e.name, suffix), StatusLevel::Success);
+                        let suffix = if self.data.manager.did_fallback() {
+                            " (via CLI fallback)"
+                        } else {
+                            ""
+                        };
+                        self.set_status(
+                            format!("Started {}{}", e.name, suffix),
+                            StatusLevel::Success,
+                        );
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
@@ -131,13 +158,22 @@ impl App {
     }
 
     pub async fn action_poweroff(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             if e.state.is_running() {
                 match self.data.manager.poweroff(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
-                        self.set_status(format!("Powered off {}{}", e.name, suffix), StatusLevel::Success);
+                        let suffix = if self.data.manager.did_fallback() {
+                            " (via CLI fallback)"
+                        } else {
+                            ""
+                        };
+                        self.set_status(
+                            format!("Powered off {}{}", e.name, suffix),
+                            StatusLevel::Success,
+                        );
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
@@ -146,13 +182,22 @@ impl App {
     }
 
     pub async fn action_terminate(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             if e.state.is_running() {
                 match self.data.manager.terminate(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
-                        self.set_status(format!("Terminated {}{}", e.name, suffix), StatusLevel::Success);
+                        let suffix = if self.data.manager.did_fallback() {
+                            " (via CLI fallback)"
+                        } else {
+                            ""
+                        };
+                        self.set_status(
+                            format!("Terminated {}{}", e.name, suffix),
+                            StatusLevel::Success,
+                        );
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
@@ -161,13 +206,22 @@ impl App {
     }
 
     pub async fn action_reboot(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             if e.state.is_running() {
                 match self.data.manager.reboot(&e.name).await {
                     Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
-                        self.set_status(format!("Rebooting {}{}", e.name, suffix), StatusLevel::Success);
+                        let suffix = if self.data.manager.did_fallback() {
+                            " (via CLI fallback)"
+                        } else {
+                            ""
+                        };
+                        self.set_status(
+                            format!("Rebooting {}{}", e.name, suffix),
+                            StatusLevel::Success,
+                        );
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
@@ -176,14 +230,23 @@ impl App {
     }
 
     pub async fn action_kill(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             if e.state.is_running() {
                 // For now, just send SIGTERM via kill
                 match self.data.manager.kill(&e.name, "SIGTERM").await {
                     Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() { " (via CLI fallback)" } else { "" };
-                        self.set_status(format!("Sent SIGTERM to {}{}", e.name, suffix), StatusLevel::Success);
+                        let suffix = if self.data.manager.did_fallback() {
+                            " (via CLI fallback)"
+                        } else {
+                            ""
+                        };
+                        self.set_status(
+                            format!("Sent SIGTERM to {}{}", e.name, suffix),
+                            StatusLevel::Success,
+                        );
                     }
                     Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
                 }
@@ -192,7 +255,9 @@ impl App {
     }
 
     pub async fn action_enable(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             match self.data.manager.enable(&e.name).await {
                 Ok(_) => self.set_status(format!("Enabled {}", e.name), StatusLevel::Success),
@@ -202,16 +267,14 @@ impl App {
     }
 
     pub async fn action_disable(&mut self) {
-        if !self.check_action_cooldown() { return; }
+        if !self.check_action_cooldown() {
+            return;
+        }
         if let Some(e) = self.data.entries.get(self.data.selected) {
             match self.data.manager.disable(&e.name).await {
                 Ok(_) => self.set_status(format!("Disabled {}", e.name), StatusLevel::Success),
                 Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
             }
         }
-    }
-
-    pub fn selected_entry(&self) -> Option<&ContainerEntry> {
-        self.data.entries.get(self.data.selected)
     }
 }

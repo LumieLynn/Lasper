@@ -1,9 +1,15 @@
 use crate::ui::core::{AppMessage, Component, EventResult};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::selectors::selectable_list::SelectableList;
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{layout::{Constraint, Direction, Layout, Rect}, Frame};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    Frame,
+};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use tokio::sync::broadcast;
 
@@ -17,7 +23,11 @@ pub struct DeployStepView {
 }
 
 impl DeployStepView {
-    pub fn new(log_tx: broadcast::Sender<String>, done: Arc<AtomicBool>, success: Arc<AtomicBool>) -> Self {
+    pub fn new(
+        log_tx: broadcast::Sender<String>,
+        done: Arc<AtomicBool>,
+        success: Arc<AtomicBool>,
+    ) -> Self {
         let rx = log_tx.subscribe();
         Self {
             log_rx: Some(rx),
@@ -39,7 +49,8 @@ impl DeployStepView {
                         changed = true;
                     }
                     Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                        self.internal_logs.push(format!("[{} logs skipped due to lag]", n));
+                        self.internal_logs
+                            .push(format!("[{} logs skipped due to lag]", n));
                         changed = true;
                     }
                     Err(_) => break, // Empty or Closed
@@ -76,7 +87,7 @@ impl Component for DeployStepView {
             "FAILED: Deployment encountered an error.".to_string()
         };
         self.status_block.set_content(status);
-        
+
         self.update_logs();
 
         self.status_block.render(f, chunks[0]);

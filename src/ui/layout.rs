@@ -8,10 +8,7 @@ use ratatui::{
 
 use crate::app::App;
 use crate::nspawn::StatusLevel;
-use crate::ui::{
-    views::container_list, views::detail_panel, centered_rect, 
-    widgets::power_menu::PowerMenu, core::Component
-};
+use crate::ui::{centered_rect, widgets::power_menu::PowerMenu, core::Component};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -31,12 +28,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
     // Overlays (highest priority last so they render on top)
     if app.ui.show_power_menu { PowerMenu::new(app.ui.power_menu_selected).render(f, area); }
-    if app.ui.show_wizard  { 
+    if app.ui.show_wizard {
         if let Some(w) = &mut app.ui.wizard {
             w.render(f, area);
         }
     }
-    if app.ui.show_help    { render_help(f); }
+    if app.ui.show_help { render_help(f); }
 }
 
 
@@ -73,12 +70,21 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.pane_height = area.height.saturating_sub(2);
+    app.ui.detail_panel.pane_height = app.ui.pane_height;
+
+    let list_focused   = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
+    let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
+    app.ui.detail_panel.set_focus(detail_focused);
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
-    container_list::render(f, app, cols[0]);
-    detail_panel::render(f, app, cols[1]);
+
+    app.ui.container_list.render_with_data(
+        f, cols[0], &app.data.entries, app.data.selected, app.is_root, list_focused,
+    );
+    app.ui.detail_panel.render_with_data(f, cols[1], &app.data);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -93,18 +99,30 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         };
         Line::from(vec![Span::raw("  "), Span::styled(msg.as_str(), Style::default().fg(color))])
     } else {
-        Line::from(vec![
-            kspan("[j/k]"), hspan(" nav "),
-            kspan("[p]"),   hspan(" prop "),
-            kspan("[d]"),   hspan(" det "),
-            kspan("[s]"),   hspan(" start "),
-            kspan("[S]"),   hspan(" poweroff "),
-            kspan("[x/⏎]"), hspan(" actions "),
-            kspan("[n/a]"), hspan(" new/import "),
-            kspan("[r]"),   hspan(" refresh "),
-            kspan("[?]"),   hspan(" help "),
-            kspan("[q]"),   hspan(" quit"),
-        ])
+        match app.ui.active_panel {
+            crate::app::ActivePanel::ContainerList => Line::from(vec![
+                kspan("[j/k]"), hspan(" nav "),
+                kspan("[Tab]"), hspan(" → detail "),
+                kspan("[s]"),   hspan(" start "),
+                kspan("[S]"),   hspan(" poweroff "),
+                kspan("[x/⏎]"), hspan(" actions "),
+                kspan("[n/a]"), hspan(" new "),
+                kspan("[r]"),   hspan(" refresh "),
+                kspan("[?]"),   hspan(" help "),
+                kspan("[q]"),   hspan(" quit"),
+            ]),
+            crate::app::ActivePanel::DetailPanel => Line::from(vec![
+                kspan("[p]"),       hspan(" prop "),
+                kspan("[d]"),       hspan(" det "),
+                kspan("[l]"),       hspan(" logs "),
+                kspan("[c]"),       hspan(" config "),
+                kspan("[↑/↓]"),    hspan(" scroll "),
+                kspan("[PgUp/Dn]"), hspan(" page "),
+                kspan("[Tab]"),     hspan(" → list "),
+                kspan("[?]"),       hspan(" help "),
+                kspan("[q]"),       hspan(" quit"),
+            ]),
+        }
     };
 
     f.render_widget(
@@ -128,13 +146,14 @@ fn render_help(f: &mut Frame) {
     let rows: Vec<Line> = vec![
         Line::from(Span::styled("  Keybindings", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(""),
-        hrow("j / ↓", "Select next"),
-        hrow("k / ↑", "Select previous"),
+        hrow("j / ↓", "Select next container"),
+        hrow("k / ↑", "Select previous container"),
         Line::from(""),
         hrow("p    ", "Properties pane"),
         hrow("d    ", "Full details pane"),
         hrow("l    ", "Logs pane (running only)"),
         hrow("c    ", "Config pane (.nspawn file)"),
+        hrow("↑/↓  ", "Scroll / navigate in detail pane"),
         Line::from(""),
         hrow("s    ", "Start container  [root]"),
         hrow("S    ", "Poweroff container [root]"),
@@ -142,8 +161,8 @@ fn render_help(f: &mut Frame) {
         Line::from(""),
         hrow("n    ", "New container / Import wizard  [root]"),
         Line::from(""),
+        hrow("Tab  ", "Toggle focus: list ↔ detail panel"),
         hrow("r    ", "Refresh list"),
-
         hrow("?    ", "Toggle help"),
         hrow("q    ", "Quit"),
         Line::from(""),
@@ -152,7 +171,7 @@ fn render_help(f: &mut Frame) {
     f.render_widget(
         Paragraph::new(rows).block(
             Block::default().title(" Help ").borders(Borders::ALL)
-                .style(Style::default().fg(Color::Cyan).bg(Color::Rgb(20, 20, 30))),
+                .border_style(Style::default().fg(Color::Cyan)),
         ),
         area,
     );
@@ -168,4 +187,3 @@ fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
 }
 
 // ── Utility ───────────────────────────────────────────────────────────────────
-

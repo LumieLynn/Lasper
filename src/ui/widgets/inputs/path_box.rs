@@ -1,13 +1,7 @@
-use crossterm::event::{KeyEvent, KeyCode};
-use ratatui::{
-    layout::Rect,
-    style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
-    Frame,
-};
-use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crate::ui::core::{AppMessage, Component, EventResult};
-use std::path::Path;
+use crate::ui::widgets::inputs::text_input_base::TextInputBase;
+use crossterm::event::KeyEvent;
+use ratatui::{layout::Rect, Frame};
 
 pub struct PathBox {
     base: TextInputBase,
@@ -24,15 +18,17 @@ impl PathBox {
         }
     }
 
-    pub fn with_on_change<F>(mut self, f: F) -> Self 
-    where F: Fn(String) -> AppMessage + 'static 
+    pub fn with_on_change<F>(mut self, f: F) -> Self
+    where
+        F: Fn(String) -> AppMessage + 'static,
     {
         self.on_change = Some(Box::new(f));
         self
     }
-    
+
     pub fn with_validator<F>(mut self, f: F) -> Self
-    where F: Fn(&str) -> Result<(), String> + 'static
+    where
+        F: Fn(&str) -> Result<(), String> + 'static,
     {
         self.validator = Some(Box::new(f));
         self
@@ -51,7 +47,7 @@ impl Component for PathBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let prev_val = self.base.input.value().to_string();
         let res = self.base.handle_key(key);
-        
+
         if let EventResult::Consumed = res {
             let new_val = self.base.input.value().to_string();
             if new_val != prev_val {

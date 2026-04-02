@@ -128,10 +128,14 @@ impl<T> SelectableList<T> {
         };
         self.state.select(Some(i));
     }
-}
 
-impl<T> Component for SelectableList<T> {
-    fn render(&mut self, f: &mut Frame, area: Rect) {
+    /// Inherent method — callers don't need the `Component` trait in scope.
+    pub fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Inherent render method — callers don't need the `Component` trait in scope.
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let style = if !self.enabled {
             Style::default().fg(Color::DarkGray)
         } else if self.focused {
@@ -154,6 +158,13 @@ impl<T> Component for SelectableList<T> {
         }
 
         f.render_stateful_widget(list, area, &mut self.state);
+    }
+}
+
+impl<T> Component for SelectableList<T> {
+    fn render(&mut self, f: &mut Frame, area: Rect) {
+        // Delegate to the inherent method — single implementation.
+        SelectableList::render(self, f, area);
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -187,7 +198,7 @@ impl<T> Component for SelectableList<T> {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        self.focused = focused;
+        SelectableList::set_focus(self, focused);
     }
 
     fn is_focused(&self) -> bool {

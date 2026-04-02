@@ -1,16 +1,21 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use super::{ActivePanel, App};
+use crate::nspawn::StatusLevel;
+use crate::ui::core::{AppMessage, EventResult};
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::wizard::Wizard;
-use crate::nspawn::StatusLevel;
-use super::{App, DetailPane};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
+        // ── Overlay: wizard ───────────────────────────────────────────────────
         if self.ui.show_wizard {
             if let Some(wizard) = &mut self.ui.wizard {
                 match wizard.handle_key(key) {
                     WizardAction::None => {}
-                    WizardAction::Close => { self.ui.show_wizard = false; self.ui.wizard = None; }
+                    WizardAction::Close => {
+                        self.ui.show_wizard = false;
+                        self.ui.wizard = None;
+                    }
                     WizardAction::CloseRefresh => {
                         self.ui.show_wizard = false;
                         self.ui.wizard = None;
@@ -26,7 +31,14 @@ impl App {
             }
             return;
         }
-        if self.ui.show_help { self.ui.show_help = false; return; }
+
+        // ── Overlay: help ─────────────────────────────────────────────────────
+        if self.ui.show_help {
+            self.ui.show_help = false;
+            return;
+        }
+
+        // ── Overlay: power menu ───────────────────────────────────────────────
         if self.ui.show_power_menu {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.ui.show_power_menu = false,
@@ -55,85 +67,102 @@ impl App {
             return;
         }
 
-        let step = (self.ui.pane_height / 2).max(1);
+        // Update pane_height into the detail panel before processing keys.
+        self.ui.detail_panel.pane_height = self.ui.pane_height;
 
+        // ── Global keys ───────────────────────────────────────────────────────
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
+                return;
             }
-            // Detail pane scrolling
-            KeyCode::Up   if self.ui.detail_pane == DetailPane::Config => { self.ui.config_scroll = self.ui.config_scroll.saturating_sub(1); }
-            KeyCode::Down if self.ui.detail_pane == DetailPane::Config => { self.ui.config_scroll += 1; }
-            KeyCode::PageUp   if self.ui.detail_pane == DetailPane::Config => { self.ui.config_scroll = self.ui.config_scroll.saturating_sub(step); }
-            KeyCode::PageDown if self.ui.detail_pane == DetailPane::Config => { self.ui.config_scroll += step; }
-            KeyCode::Up   if self.ui.detail_pane == DetailPane::Logs => { self.ui.log_scroll = self.ui.log_scroll.saturating_sub(1); }
-            KeyCode::Down if self.ui.detail_pane == DetailPane::Logs => { self.ui.log_scroll += 1; }
-            KeyCode::PageUp   if self.ui.detail_pane == DetailPane::Logs => { self.ui.log_scroll = self.ui.log_scroll.saturating_sub(step); }
-            KeyCode::PageDown if self.ui.detail_pane == DetailPane::Logs => { self.ui.log_scroll += step; }
-
-            // Details tab scrolling
-            KeyCode::Up if self.ui.detail_pane == DetailPane::Details => {
-                let i = match self.ui.details_state.selected() {
-                    Some(i) => if i == 0 { 0 } else { i - 1 },
-                    None => 0,
-                };
-                self.ui.details_state.select(Some(i));
+            KeyCode::Char('?') => {
+                self.ui.show_help = true;
+                return;
             }
-            KeyCode::Down if self.ui.detail_pane == DetailPane::Details => {
-                let len = self.data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
-                let i = match self.ui.details_state.selected() {
-                    Some(i) => (i + 1).min(len.saturating_sub(1)),
-                    None => 0,
-                };
-                self.ui.details_state.select(Some(i));
+            // Focus toggle
+            KeyCode::Tab => {
+                self.ui.toggle_focus();
+                return;
             }
-            KeyCode::PageUp if self.ui.detail_pane == DetailPane::Details => {
-                let i = match self.ui.details_state.selected() {
-                    Some(i) => i.saturating_sub(step as usize),
-                    None => 0,
-                };
-                self.ui.details_state.select(Some(i));
+            // Container actions (always global regardless of focus)
+            KeyCode::Char('s') => {
+                self.action_start().await;
+                return;
             }
-            KeyCode::PageDown if self.ui.detail_pane == DetailPane::Details => {
-                let len = self.data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
-                let i = match self.ui.details_state.selected() {
-                    Some(i) => (i + step as usize).min(len.saturating_sub(1)),
-                    None => 0,
-                };
-                self.ui.details_state.select(Some(i));
+            KeyCode::Char('S') => {
+                self.action_poweroff().await;
+                return;
             }
-            // General navigation
-            KeyCode::Char('j') | KeyCode::Down => self.select_next(),
-            KeyCode::Char('k') | KeyCode::Up   => self.select_prev(),
-            KeyCode::Char('p') => { self.ui.detail_pane = DetailPane::Properties; self.refresh_detail().await; }
-            KeyCode::Char('d') => {
-                self.ui.detail_pane = DetailPane::Details;
-                self.ui.details_state.select(Some(0));
-                self.refresh_detail().await;
-            }
-            KeyCode::Char('l') => { self.ui.detail_pane = DetailPane::Logs; self.ui.log_scroll = 0; self.refresh_detail().await; }
-            KeyCode::Char('c') => { self.ui.detail_pane = DetailPane::Config; self.ui.config_scroll = 0; self.refresh_detail().await; }
-            KeyCode::Char('s') => self.action_start().await,
-            KeyCode::Char('S') => self.action_poweroff().await,
             KeyCode::Char('x') | KeyCode::Enter => {
                 if !self.data.entries.is_empty() {
                     self.ui.show_power_menu = true;
                     self.ui.power_menu_selected = 0;
                 }
+                return;
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
                 if self.is_root {
                     let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
                     if let Some(tx) = &self.ui.backend_tx {
-                        self.ui.wizard = Some(Wizard::new(self.data.entries.clone(), nvidia_installed, tx.clone()));
+                        self.ui.wizard = Some(Wizard::new(
+                            self.data.entries.clone(),
+                            nvidia_installed,
+                            tx.clone(),
+                        ));
                         self.ui.show_wizard = true;
                     }
                 } else {
-                    self.set_status("Root required — run: sudo lasper".into(), StatusLevel::Error);
+                    self.set_status(
+                        "Root required — run: sudo lasper".into(),
+                        StatusLevel::Error,
+                    );
                 }
+                return;
             }
-            KeyCode::Char('r') => self.refresh().await,
-            KeyCode::Char('?') => self.ui.show_help = true,
+            KeyCode::Char('r') => {
+                self.refresh().await;
+                return;
+            }
+            _ => {}
+        }
+
+        // ── Route to focused panel ────────────────────────────────────────────
+        match self.ui.active_panel {
+            ActivePanel::ContainerList => {
+                let result = self.ui.container_list.handle_key(key);
+                self.handle_container_list_result(result).await;
+            }
+            ActivePanel::DetailPanel => {
+                let result = self.ui.detail_panel.handle_key(key);
+                self.handle_detail_panel_result(result).await;
+            }
+        }
+    }
+
+    async fn handle_container_list_result(&mut self, result: EventResult) {
+        match result {
+            EventResult::Message(AppMessage::ListNext) => {
+                self.select_next();
+                self.refresh_detail().await;
+            }
+            EventResult::Message(AppMessage::ListPrev) => {
+                self.select_prev();
+                self.refresh_detail().await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Processes an `EventResult` produced by the detail panel.
+    async fn handle_detail_panel_result(&mut self, result: EventResult) {
+        match result {
+            EventResult::Message(AppMessage::DetailPaneChanged(_pane)) => {
+                // The active_pane is already updated inside the component.
+                // Just trigger a data refresh for the new pane.
+                self.refresh_detail().await;
+            }
+            EventResult::Consumed | EventResult::Ignored => {}
             _ => {}
         }
     }

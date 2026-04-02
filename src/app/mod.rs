@@ -6,7 +6,7 @@ pub mod handlers;
 use std::collections::HashMap;
 use std::time::Instant;
 use anyhow::Result;
-use ratatui::{backend::CrosstermBackend, Terminal, widgets::TableState};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::Stdout;
 
 use crate::events::{AppEvent, EventHandler};
@@ -16,6 +16,8 @@ use crate::nspawn::{
     models::ContainerEntry,
 };
 use crate::ui::wizard::Wizard;
+use crate::ui::views::container_list::ContainerListComponent;
+use crate::ui::views::detail_panel::DetailPanel;
 
 // ── Simple enums ──────────────────────────────────────────────────────────────
 
@@ -23,11 +25,15 @@ use crate::ui::wizard::Wizard;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailPane { Properties, Details, Logs, Config }
 
+/// Which top-level panel has keyboard focus.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivePanel { ContainerList, DetailPanel }
+
 pub struct AppUi {
-    pub detail_pane: DetailPane,
-    pub details_state: TableState,
-    pub log_scroll: u16,
-    pub config_scroll: u16,
+    pub active_panel: ActivePanel,
+    pub container_list: ContainerListComponent,
+    pub detail_panel: DetailPanel,
+
     pub show_wizard: bool,
     pub show_help: bool,
     pub show_power_menu: bool,
@@ -44,10 +50,9 @@ pub struct AppUi {
 impl AppUi {
     pub fn new(_is_root: bool) -> Self {
         Self {
-            detail_pane: DetailPane::Properties,
-            details_state: TableState::default(),
-            log_scroll: 0,
-            config_scroll: 0,
+            active_panel: ActivePanel::ContainerList,
+            container_list: ContainerListComponent::new(),
+            detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
             show_power_menu: false,
@@ -58,6 +63,13 @@ impl AppUi {
             status_expiry: None,
             backend_tx: None,
         }
+    }
+
+    pub fn toggle_focus(&mut self) {
+        self.active_panel = match self.active_panel {
+            ActivePanel::ContainerList => ActivePanel::DetailPanel,
+            ActivePanel::DetailPanel   => ActivePanel::ContainerList,
+        };
     }
 }
 
