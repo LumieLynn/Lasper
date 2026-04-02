@@ -11,6 +11,20 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![
+            &mut $self.username,
+            &mut $self.password,
+            &mut $self.shell,
+            &mut $self.sudoer,
+            &mut $self.btn_ok,
+            &mut $self.btn_cancel,
+        ];
+        comps
+    }};
+}
+
 pub struct UserEditor {
     username: TextBox,
     password: PasswordBox,
@@ -76,40 +90,19 @@ impl UserEditor {
     }
 
     fn update_focus(&mut self) {
-        let mut components: Vec<&mut dyn Component> = vec![
-            &mut self.username,
-            &mut self.password,
-            &mut self.shell,
-            &mut self.sudoer,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-        self.focus.update_focus(&mut components, true);
+        let mut comps = active_comps!(self);
+        self.focus.update_focus(&mut comps, true);
     }
 
     fn next(&mut self) {
-        let comps: Vec<&dyn Component> = vec![
-            &self.username,
-            &self.password,
-            &self.shell,
-            &self.sudoer,
-            &self.btn_ok,
-            &self.btn_cancel,
-        ];
-        self.focus.next(&comps);
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
         self.update_focus();
     }
 
     fn prev(&mut self) {
-        let comps: Vec<&dyn Component> = vec![
-            &self.username,
-            &self.password,
-            &self.shell,
-            &self.sudoer,
-            &self.btn_ok,
-            &self.btn_cancel,
-        ];
-        self.focus.prev(&comps);
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
         self.update_focus();
     }
 }
@@ -180,15 +173,7 @@ impl Component for UserEditor {
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.username,
-            &mut self.password,
-            &mut self.shell,
-            &mut self.sudoer,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {

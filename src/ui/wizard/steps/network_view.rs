@@ -12,6 +12,24 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let mode = $self.mode_selector.selected_idx();
+        let is_custom = $self.is_custom_bridge();
+        let mut visible: Vec<&mut dyn Component> = vec![&mut $self.mode_selector];
+        if mode == 3 {
+            visible.push(&mut $self.bridge_list);
+            if is_custom {
+                visible.push(&mut $self.custom_bridge);
+            }
+        }
+        if mode != 0 {
+            visible.push(&mut $self.port_list);
+        }
+        visible
+    }};
+}
+
 pub struct NetworkStepView {
     mode_selector: RadioGroup,
     bridge_list: SelectableList<String>,
@@ -101,53 +119,22 @@ impl NetworkStepView {
     }
 
     fn update_focus(&mut self) {
-        let mode = self.mode_selector.selected_idx();
-        let is_custom_bridge = self.is_custom_bridge();
-        let mut visible: Vec<&mut dyn Component> = vec![&mut self.mode_selector];
-        if mode == 3 {
-            visible.push(&mut self.bridge_list);
-            if is_custom_bridge {
-                visible.push(&mut self.custom_bridge);
-            }
-        }
-        if mode != 0 {
-            visible.push(&mut self.port_list);
-        }
+        let mut visible = active_comps!(self);
         if self.focus.active_idx >= visible.len() {
             self.focus.active_idx = visible.len().saturating_sub(1);
         }
         self.focus.update_focus(&mut visible, true);
     }
 
-    fn skip_next(&mut self) {
-        let mode = self.mode_selector.selected_idx();
-        let mut visible: Vec<&dyn Component> = vec![&self.mode_selector];
-        if mode == 3 {
-            visible.push(&self.bridge_list);
-            if self.is_custom_bridge() {
-                visible.push(&self.custom_bridge);
-            }
-        }
-        if mode != 0 {
-            visible.push(&self.port_list);
-        }
-        self.focus.next(&visible);
+    fn next(&mut self) {
+        let mut visible = active_comps!(self);
+        self.focus.next(&mut visible);
         self.update_focus();
     }
 
-    fn skip_prev(&mut self) {
-        let mode = self.mode_selector.selected_idx();
-        let mut visible: Vec<&dyn Component> = vec![&self.mode_selector];
-        if mode == 3 {
-            visible.push(&self.bridge_list);
-            if self.is_custom_bridge() {
-                visible.push(&self.custom_bridge);
-            }
-        }
-        if mode != 0 {
-            visible.push(&self.port_list);
-        }
-        self.focus.prev(&visible);
+    fn prev(&mut self) {
+        let mut visible = active_comps!(self);
+        self.focus.prev(&mut visible);
         self.update_focus();
     }
 }
@@ -231,11 +218,11 @@ impl Component for NetworkStepView {
 
         match key.code {
             KeyCode::Tab => {
-                self.skip_next();
+                self.next();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                self.skip_prev();
+                self.prev();
                 return EventResult::Consumed;
             }
             KeyCode::Char('a') | KeyCode::Char('A') if self.port_list.is_focused() => {
@@ -250,17 +237,7 @@ impl Component for NetworkStepView {
         }
 
         let mode = self.mode_selector.selected_idx();
-        let is_custom = self.is_custom_bridge();
-        let mut visible: Vec<&mut dyn Component> = vec![&mut self.mode_selector];
-        if mode == 3 {
-            visible.push(&mut self.bridge_list);
-            if is_custom {
-                visible.push(&mut self.custom_bridge);
-            }
-        }
-        if mode != 0 {
-            visible.push(&mut self.port_list);
-        }
+        let mut visible = active_comps!(self);
 
         if self.focus.active_idx < visible.len() {
             let res = visible[self.focus.active_idx].handle_key(key);
@@ -275,11 +252,11 @@ impl Component for NetworkStepView {
                 }
 
                 EventResult::FocusNext => {
-                    self.skip_next();
+                    self.next();
                     return EventResult::Consumed;
                 }
                 EventResult::FocusPrev => {
-                    self.skip_prev();
+                    self.prev();
                     return EventResult::Consumed;
                 }
                 _ => {}

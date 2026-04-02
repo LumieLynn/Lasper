@@ -97,7 +97,7 @@ impl FocusTracker {
         Self { active_idx: 0 }
     }
 
-    pub fn next(&mut self, components: &[&dyn Component]) {
+    pub fn next<T: std::ops::Deref<Target = dyn Component>>(&mut self, components: &[T]) {
         if components.is_empty() {
             return;
         }
@@ -111,7 +111,7 @@ impl FocusTracker {
         }
     }
 
-    pub fn prev(&mut self, components: &[&dyn Component]) {
+    pub fn prev<T: std::ops::Deref<Target = dyn Component>>(&mut self, components: &[T]) {
         if components.is_empty() {
             return;
         }
@@ -130,4 +130,19 @@ impl FocusTracker {
             child.set_focus(parent_focused && i == self.active_idx && child.is_focusable());
         }
     }
+}
+
+#[macro_export]
+macro_rules! focus_action {
+    // Process list with custom initialization (not strictly necessary but flexible)
+    ($self:ident, $action:ident, { $($init:stmt)* }, $comps:expr $(, $args:expr)*) => {{
+        $($init)*
+        let mut comps: Vec<&mut dyn Component> = $comps;
+        $self.focus.$action(&mut comps $(, $args)*)
+    }};
+    // Process standard list
+    ($self:ident, $action:ident, $comps:expr $(, $args:expr)*) => {{
+        let mut comps: Vec<&mut dyn Component> = $comps;
+        $self.focus.$action(&mut comps $(, $args)*)
+    }};
 }

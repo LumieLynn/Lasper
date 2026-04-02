@@ -14,6 +14,13 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![&mut $self.root_password, &mut $self.user_list];
+        comps
+    }};
+}
+
 pub struct UserStepView {
     root_password: PasswordBox,
     user_list: EditableList<CreateUser>,
@@ -46,20 +53,19 @@ impl UserStepView {
     }
 
     fn update_focus(&mut self) {
-        let mut components: Vec<&mut dyn Component> =
-            vec![&mut self.root_password, &mut self.user_list];
-        self.focus.update_focus(&mut components, true);
+        let mut comps = active_comps!(self);
+        self.focus.update_focus(&mut comps, true);
     }
 
     fn next(&mut self) {
-        let comps: Vec<&dyn Component> = vec![&self.root_password, &self.user_list];
-        self.focus.next(&comps);
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
         self.update_focus();
     }
 
     fn prev(&mut self) {
-        let comps: Vec<&dyn Component> = vec![&self.root_password, &self.user_list];
-        self.focus.prev(&comps);
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
         self.update_focus();
     }
 }
@@ -142,7 +148,7 @@ impl Component for UserStepView {
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.root_password, &mut self.user_list];
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::Message(AppMessage::Wizard(WizardMessage::UserRemoved(_))) => {

@@ -12,6 +12,18 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let is_raw = $self.is_raw_selected();
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
+        if is_raw {
+            comps.push(&mut $self.raw_size);
+            comps.push(&mut $self.raw_fs);
+        }
+        comps
+    }};
+}
+
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
     raw_size: TextBox,
@@ -81,40 +93,24 @@ impl StorageStepView {
         false
     }
 
-    fn next(&mut self) {
-        let is_raw = self.is_raw_selected();
-        let mut comps: Vec<&dyn Component> = vec![&self.list];
-        if is_raw {
-            comps.push(&self.raw_size);
-            comps.push(&self.raw_fs);
-        }
-        self.focus.next(&comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let is_raw = self.is_raw_selected();
-        let mut comps: Vec<&dyn Component> = vec![&self.list];
-        if is_raw {
-            comps.push(&self.raw_size);
-            comps.push(&self.raw_fs);
-        }
-        self.focus.prev(&comps);
-        self.update_focus();
-    }
-
     fn update_focus(&mut self) {
-        let is_raw = self.is_raw_selected();
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.list];
-        if is_raw {
-            comps.push(&mut self.raw_size);
-            comps.push(&mut self.raw_fs);
-        }
-
+        let mut comps = active_comps!(self);
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);
         }
         self.focus.update_focus(&mut comps, true);
+    }
+
+    fn next(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
+        self.update_focus();
+    }
+
+    fn prev(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
+        self.update_focus();
     }
 }
 
@@ -166,12 +162,7 @@ impl Component for StorageStepView {
             _ => {}
         }
 
-        let is_raw = self.is_raw_selected();
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.list];
-        if is_raw {
-            comps.push(&mut self.raw_size);
-            comps.push(&mut self.raw_fs);
-        }
+        let mut comps = active_comps!(self);
 
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);

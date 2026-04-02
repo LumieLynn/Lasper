@@ -9,6 +9,17 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![
+            &mut $self.generic_gpu,
+            &mut $self.wayland_socket,
+            &mut $self.nvidia_gpu,
+        ];
+        comps
+    }};
+}
+
 pub struct PassthroughStepView {
     generic_gpu: Checkbox,
     wayland_socket: Checkbox,
@@ -58,16 +69,20 @@ impl PassthroughStepView {
     }
 
     fn update_focus(&mut self) {
-        let mut components: Vec<&mut dyn Component> = vec![
-            &mut self.generic_gpu,
-            &mut self.wayland_socket,
-            &mut self.nvidia_gpu,
-        ];
-        self.focus.update_focus(&mut components, true);
+        let mut comps = active_comps!(self);
+        self.focus.update_focus(&mut comps, true);
     }
 
-    fn get_components(&self) -> Vec<&dyn Component> {
-        vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu]
+    fn next(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
+        self.update_focus();
+    }
+
+    fn prev(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
+        self.update_focus();
     }
 }
 
@@ -93,42 +108,25 @@ impl Component for PassthroughStepView {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> =
-                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
-                self.focus.next(&comps);
-                self.update_focus();
+                self.next();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> =
-                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
-                self.focus.prev(&comps);
-                self.update_focus();
+                self.prev();
                 return EventResult::Consumed;
             }
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.generic_gpu,
-            &mut self.wayland_socket,
-            &mut self.nvidia_gpu,
-        ];
-
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::FocusNext => {
-                let comps: Vec<&dyn Component> =
-                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
-                self.focus.next(&comps);
-                self.update_focus();
+                self.next();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let comps: Vec<&dyn Component> =
-                    vec![&self.generic_gpu, &self.wayland_socket, &self.nvidia_gpu];
-                self.focus.prev(&comps);
-                self.update_focus();
+                self.prev();
                 EventResult::Consumed
             }
             _ => res,

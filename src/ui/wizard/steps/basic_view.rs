@@ -6,6 +6,13 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
+        comps
+    }};
+}
+
 pub struct BasicStepView {
     name: TextBox,
     hostname: TextBox,
@@ -56,19 +63,19 @@ impl BasicStepView {
     }
 
     fn update_focus(&mut self) {
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.name, &mut self.hostname];
+        let mut comps = active_comps!(self);
         self.focus.update_focus(&mut comps, true);
     }
 
     fn next(&mut self) {
-        let refs: Vec<&dyn Component> = vec![&self.name, &self.hostname];
-        self.focus.next(&refs);
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
         self.update_focus();
     }
 
     fn prev(&mut self) {
-        let refs: Vec<&dyn Component> = vec![&self.name, &self.hostname];
-        self.focus.prev(&refs);
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
         self.update_focus();
     }
 }
@@ -97,7 +104,7 @@ impl Component for BasicStepView {
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.name, &mut self.hostname];
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::FocusNext => {

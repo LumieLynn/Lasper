@@ -11,6 +11,24 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let cursor = $self.kind_list.selected_idx().unwrap_or(0);
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.kind_list];
+        match cursor {
+            1 => comps.push(&mut $self.oci_url),
+            2 => {
+                comps.push(&mut $self.deboot_mirror);
+                comps.push(&mut $self.deboot_suite);
+            }
+            3 => comps.push(&mut $self.pacstrap_pkgs),
+            4 => comps.push(&mut $self.disk_path),
+            _ => {}
+        }
+        comps
+    }};
+}
+
 pub struct SourceStepView {
     kind_list: SelectableList<String>,
     oci_url: TextBox,
@@ -53,58 +71,24 @@ impl SourceStepView {
         view
     }
 
-    fn next(&mut self) {
-        let cursor = self.kind_list.selected_idx().unwrap_or(0);
-        let mut comps: Vec<&dyn Component> = vec![&self.kind_list];
-        match cursor {
-            1 => comps.push(&self.oci_url),
-            2 => {
-                comps.push(&self.deboot_mirror);
-                comps.push(&self.deboot_suite);
-            }
-            3 => comps.push(&self.pacstrap_pkgs),
-            4 => comps.push(&self.disk_path),
-            _ => {}
-        }
-        self.focus.next(&comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let cursor = self.kind_list.selected_idx().unwrap_or(0);
-        let mut comps: Vec<&dyn Component> = vec![&self.kind_list];
-        match cursor {
-            1 => comps.push(&self.oci_url),
-            2 => {
-                comps.push(&self.deboot_mirror);
-                comps.push(&self.deboot_suite);
-            }
-            3 => comps.push(&self.pacstrap_pkgs),
-            4 => comps.push(&self.disk_path),
-            _ => {}
-        }
-        self.focus.prev(&comps);
-        self.update_focus();
-    }
-
     fn update_focus(&mut self) {
-        let cursor = self.kind_list.selected_idx().unwrap_or(0);
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.kind_list];
-        match cursor {
-            1 => comps.push(&mut self.oci_url),
-            2 => {
-                comps.push(&mut self.deboot_mirror);
-                comps.push(&mut self.deboot_suite);
-            }
-            3 => comps.push(&mut self.pacstrap_pkgs),
-            4 => comps.push(&mut self.disk_path),
-            _ => {}
-        }
-        // clamp focus internally inside update_focus to prevent out of bounds when selection changes
+        let mut comps = active_comps!(self);
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);
         }
         self.focus.update_focus(&mut comps, true);
+    }
+
+    fn next(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
+        self.update_focus();
+    }
+
+    fn prev(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
+        self.update_focus();
     }
 }
 
@@ -165,18 +149,7 @@ impl Component for SourceStepView {
             _ => {}
         }
 
-        let cursor = self.kind_list.selected_idx().unwrap_or(0);
-        let mut comps: Vec<&mut dyn Component> = vec![&mut self.kind_list];
-        match cursor {
-            1 => comps.push(&mut self.oci_url),
-            2 => {
-                comps.push(&mut self.deboot_mirror);
-                comps.push(&mut self.deboot_suite);
-            }
-            3 => comps.push(&mut self.pacstrap_pkgs),
-            4 => comps.push(&mut self.disk_path),
-            _ => {}
-        }
+        let mut comps = active_comps!(self);
 
         if self.focus.active_idx >= comps.len() {
             self.focus.active_idx = comps.len().saturating_sub(1);

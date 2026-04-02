@@ -10,6 +10,19 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![
+            &mut $self.source_path,
+            &mut $self.target_path,
+            &mut $self.readonly,
+            &mut $self.btn_ok,
+            &mut $self.btn_cancel,
+        ];
+        comps
+    }};
+}
+
 pub struct BindMountBox {
     source_path: PathBox,
     target_path: PathBox,
@@ -57,20 +70,20 @@ impl BindMountBox {
     }
 
     fn update_focus(&mut self) {
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.source_path,
-            &mut self.target_path,
-            &mut self.readonly,
-        ];
+        let mut comps = active_comps!(self);
         self.focus.update_focus(&mut comps, true);
-        let mut components: Vec<&mut dyn Component> = vec![
-            &mut self.source_path,
-            &mut self.target_path,
-            &mut self.readonly,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-        self.focus.update_focus(&mut components, true);
+    }
+
+    fn next(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
+        self.update_focus();
+    }
+
+    fn prev(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
+        self.update_focus();
     }
 }
 
@@ -105,27 +118,11 @@ impl Component for BindMountBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> = vec![
-                    &self.source_path,
-                    &self.target_path,
-                    &self.readonly,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.next(&comps);
-                self.update_focus();
+                self.next();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> = vec![
-                    &self.source_path,
-                    &self.target_path,
-                    &self.readonly,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.prev(&comps);
-                self.update_focus();
+                self.prev();
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
@@ -156,14 +153,7 @@ impl Component for BindMountBox {
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.source_path,
-            &mut self.target_path,
-            &mut self.readonly,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
@@ -197,27 +187,11 @@ impl Component for BindMountBox {
             }
 
             EventResult::FocusNext => {
-                let crefs: Vec<&dyn Component> = vec![
-                    &self.source_path,
-                    &self.target_path,
-                    &self.readonly,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.next(&crefs);
-                self.update_focus();
+                self.next();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let crefs: Vec<&dyn Component> = vec![
-                    &self.source_path,
-                    &self.target_path,
-                    &self.readonly,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.prev(&crefs);
-                self.update_focus();
+                self.prev();
                 EventResult::Consumed
             }
             _ => res,

@@ -10,6 +10,19 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let comps: Vec<&mut dyn Component> = vec![
+            &mut $self.host_port,
+            &mut $self.container_port,
+            &mut $self.protocol,
+            &mut $self.btn_ok,
+            &mut $self.btn_cancel,
+        ];
+        comps
+    }};
+}
+
 pub struct PortMappingBox {
     host_port: NumberBox,
     container_port: NumberBox,
@@ -39,20 +52,20 @@ impl PortMappingBox {
     }
 
     fn update_focus(&mut self) {
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.host_port,
-            &mut self.container_port,
-            &mut self.protocol,
-        ];
+        let mut comps = active_comps!(self);
         self.focus.update_focus(&mut comps, true);
-        let mut components: Vec<&mut dyn Component> = vec![
-            &mut self.host_port,
-            &mut self.container_port,
-            &mut self.protocol,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-        self.focus.update_focus(&mut components, true);
+    }
+
+    fn next(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.next(&mut comps);
+        self.update_focus();
+    }
+
+    fn prev(&mut self) {
+        let mut comps = active_comps!(self);
+        self.focus.prev(&mut comps);
+        self.update_focus();
     }
 }
 
@@ -87,27 +100,11 @@ impl Component for PortMappingBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Tab => {
-                let comps: Vec<&dyn Component> = vec![
-                    &self.host_port,
-                    &self.container_port,
-                    &self.protocol,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.next(&comps);
-                self.update_focus();
+                self.next();
                 return EventResult::Consumed;
             }
             KeyCode::BackTab => {
-                let comps: Vec<&dyn Component> = vec![
-                    &self.host_port,
-                    &self.container_port,
-                    &self.protocol,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.prev(&comps);
-                self.update_focus();
+                self.prev();
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
@@ -139,14 +136,7 @@ impl Component for PortMappingBox {
             _ => {}
         }
 
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut self.host_port,
-            &mut self.container_port,
-            &mut self.protocol,
-            &mut self.btn_ok,
-            &mut self.btn_cancel,
-        ];
-
+        let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
 
         match res {
@@ -181,27 +171,11 @@ impl Component for PortMappingBox {
             }
 
             EventResult::FocusNext => {
-                let crefs: Vec<&dyn Component> = vec![
-                    &self.host_port,
-                    &self.container_port,
-                    &self.protocol,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.next(&crefs);
-                self.update_focus();
+                self.next();
                 EventResult::Consumed
             }
             EventResult::FocusPrev => {
-                let crefs: Vec<&dyn Component> = vec![
-                    &self.host_port,
-                    &self.container_port,
-                    &self.protocol,
-                    &self.btn_ok,
-                    &self.btn_cancel,
-                ];
-                self.focus.prev(&crefs);
-                self.update_focus();
+                self.prev();
                 EventResult::Consumed
             }
             _ => res,
