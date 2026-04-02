@@ -99,20 +99,20 @@ impl NetworkStepView {
         view
     }
 
-    pub fn with_port_editor(mut self, enabled: bool) -> Self {
-        if enabled {
-            self.port_editor = Some(PortMappingBox::new(|p| {
-                AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
-            }));
+    // pub fn with_port_editor(mut self, enabled: bool) -> Self {
+    //     if enabled {
+    //         self.port_editor = Some(PortMappingBox::new(|p| {
+    //             AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
+    //         }));
 
-            if let Some(ref mut editor) = self.port_editor {
-                editor.set_focus(true);
-            }
-        } else {
-            self.port_editor = None;
-        }
-        self
-    }
+    //         if let Some(ref mut editor) = self.port_editor {
+    //             editor.set_focus(true);
+    //         }
+    //     } else {
+    //         self.port_editor = None;
+    //     }
+    //     self
+    // }
 
     fn is_custom_bridge(&self) -> bool {
         self.bridge_list.selected_idx() == Some(self.bridge_options_len - 1)

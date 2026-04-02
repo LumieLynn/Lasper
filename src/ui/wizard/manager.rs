@@ -41,74 +41,11 @@ impl Wizard {
         }
     }
 
-    /// Synchronizes the active view with the current step.
-    /// Recreates the view from context if it doesn't exist.
+    /// Look for builded view.
     fn sync_view(&mut self) {
-        if self.active_view.is_some() {
-            return;
+        if self.active_view.is_none() {
+            self.active_view = Some(steps::build_view(self.step, &self.context));
         }
-
-        let view: Box<dyn StepComponent> = match self.step {
-            WizardStep::Source => {
-                let initial = self.context.source.extract_config();
-                Box::new(steps::source_view::SourceStepView::new(&initial))
-            }
-            WizardStep::CopySelect => Box::new(steps::copy_select_view::CopySelectStepView::new(
-                &self.context.entries,
-                self.context.source.copy_idx,
-            )),
-            WizardStep::Basic => {
-                let initial = self.context.basic.extract_config();
-                Box::new(steps::basic_view::BasicStepView::new(&initial))
-            }
-            WizardStep::Storage => {
-                let initial = self.context.storage.extract_config();
-                Box::new(steps::storage_view::StorageStepView::new(
-                    &initial,
-                    self.context.storage.info.clone(),
-                ))
-            }
-            WizardStep::User => {
-                let initial = self.context.user.extract_config();
-                Box::new(steps::user_view::UserStepView::new(&initial))
-            }
-            WizardStep::Network => {
-                let initial = self.context.network.extract_config();
-                Box::new(steps::network_view::NetworkStepView::new(
-                    &initial,
-                    &self.context.network.bridge_list,
-                ))
-            }
-            WizardStep::Passthrough => {
-                let initial = self
-                    .context
-                    .passthrough
-                    .extract_config(self.context.network.network_mode());
-                let nw_mode = self.context.network.network_mode();
-                Box::new(steps::passthrough_view::PassthroughStepView::new(
-                    &initial,
-                    nw_mode,
-                    self.context.passthrough.nvidia_toolkit_installed,
-                ))
-            }
-            WizardStep::Devices => {
-                let initial = self
-                    .context
-                    .passthrough
-                    .extract_config(self.context.network.network_mode());
-                Box::new(steps::devices_view::DevicesStepView::new(&initial))
-            }
-            WizardStep::Review => {
-                let preview = self.context.build_preview_nspawn();
-                Box::new(steps::review_view::ReviewStepView::new(preview))
-            }
-            WizardStep::Deploy => Box::new(steps::deploy_view::DeployStepView::new(
-                self.context.deploy.log_tx.clone(),
-                self.context.deploy.done.clone(),
-                self.context.deploy.success.clone(),
-            )),
-        };
-        self.active_view = Some(view);
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
@@ -151,104 +88,56 @@ impl Wizard {
         }
     }
 
-    fn total_steps(&self) -> usize {
-        if self.context.source.kind == SourceKind::Copy {
-            5 // Source, CopySelect, Basic, Review, Deploy
+    pub fn active_flow(&self) -> Vec<WizardStep> {
+        let is_copy = self.context.source.kind == SourceKind::Copy;
+
+        if is_copy {
+            vec![
+                WizardStep::Source,
+                WizardStep::CopySelect,
+                WizardStep::Basic,
+                WizardStep::Review,
+                WizardStep::Deploy,
+            ]
         } else {
-            10 // Full Flow
+            vec![
+                WizardStep::Source,
+                WizardStep::Basic,
+                WizardStep::Storage,
+                WizardStep::User,
+                WizardStep::Network,
+                WizardStep::Passthrough,
+                WizardStep::Devices,
+                WizardStep::Review,
+                WizardStep::Deploy,
+            ]
         }
+    }
+
+    fn total_steps(&self) -> usize {
+        self.active_flow().len()
     }
 
     fn step_index(&self) -> usize {
-        let is_copy = self.context.source.kind == SourceKind::Copy;
-
-        match self.step {
-            WizardStep::Source => 0,
-            WizardStep::CopySelect => 1,
-            WizardStep::Basic => {
-                if is_copy {
-                    2
-                } else {
-                    1
-                }
-            }
-            WizardStep::Storage => 2,
-            WizardStep::User => 3,
-            WizardStep::Network => 4,
-            WizardStep::Passthrough => 5,
-            WizardStep::Devices => 6,
-            WizardStep::Review => {
-                if is_copy {
-                    3
-                } else {
-                    7
-                }
-            }
-            WizardStep::Deploy => {
-                if is_copy {
-                    4
-                } else {
-                    8
-                }
-            }
-        }
+        self.active_flow()
+            .iter()
+            .position(|&s| s == self.step)
+            .unwrap_or(0)
     }
 
     fn resolve_next_step(&self, current: WizardStep) -> Option<WizardStep> {
-        let is_copy = self.context.source.kind == SourceKind::Copy;
-
-        match current {
-            WizardStep::Source => {
-                if is_copy {
-                    Some(WizardStep::CopySelect)
-                } else {
-                    Some(WizardStep::Basic)
-                }
-            }
-            WizardStep::CopySelect => Some(WizardStep::Basic),
-            WizardStep::Basic => {
-                if is_copy {
-                    Some(WizardStep::Review)
-                } else {
-                    Some(WizardStep::Storage)
-                }
-            }
-            WizardStep::Storage => Some(WizardStep::User),
-            WizardStep::User => Some(WizardStep::Network),
-            WizardStep::Network => Some(WizardStep::Passthrough),
-            WizardStep::Passthrough => Some(WizardStep::Devices),
-            WizardStep::Devices => Some(WizardStep::Review),
-            WizardStep::Review => Some(WizardStep::Deploy),
-            WizardStep::Deploy => None,
-        }
+        let flow = self.active_flow();
+        let idx = flow.iter().position(|&s| s == current)?;
+        flow.get(idx + 1).copied()
     }
 
     fn resolve_prev_step(&self, current: WizardStep) -> Option<WizardStep> {
-        let is_copy = self.context.source.kind == SourceKind::Copy;
-
-        match current {
-            WizardStep::Deploy => Some(WizardStep::Review),
-            WizardStep::Review => {
-                if is_copy {
-                    Some(WizardStep::Basic)
-                } else {
-                    Some(WizardStep::Devices)
-                }
-            }
-            WizardStep::Devices => Some(WizardStep::Passthrough),
-            WizardStep::Passthrough => Some(WizardStep::Network),
-            WizardStep::Network => Some(WizardStep::User),
-            WizardStep::User => Some(WizardStep::Storage),
-            WizardStep::Storage => Some(WizardStep::Basic),
-            WizardStep::Basic => {
-                if is_copy {
-                    Some(WizardStep::CopySelect)
-                } else {
-                    Some(WizardStep::Source)
-                }
-            }
-            WizardStep::CopySelect => Some(WizardStep::Source),
-            WizardStep::Source => None,
+        let flow = self.active_flow();
+        let idx = flow.iter().position(|&s| s == current)?;
+        if idx > 0 {
+            Some(flow[idx - 1])
+        } else {
+            None
         }
     }
 
@@ -258,7 +147,9 @@ impl Wizard {
         }
 
         let res = if let Some(view) = &mut self.active_view {
-            view.handle_key(key)
+            let result = view.handle_key(key);
+            view.commit_to_context(&mut self.context);
+            result
         } else {
             EventResult::Ignored
         };
