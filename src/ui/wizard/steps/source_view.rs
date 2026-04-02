@@ -40,7 +40,7 @@ impl SourceStepView {
             oci_url: TextBox::new(" OCI URL (e.g. alpine, docker://ubuntu) ", initial_data.oci_url.clone())
                 .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) }),
             deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone()),
-            deboot_suite: TextBox::new(" Suite (default: bookworm) ", initial_data.deboot_suite.clone())
+            deboot_suite: TextBox::new(" Suite (example: bookworm) ", initial_data.deboot_suite.clone())
                 .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) }),
             pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone()),
             disk_path: TextBox::new(" Local file path (.raw, .tar) ", initial_data.disk_path.clone())

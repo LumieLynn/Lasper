@@ -156,7 +156,8 @@ impl DetailPanel {
             }
             KeyCode::Down if self.active_pane == DetailPane::Logs => {
                 let max = self.logs_len.saturating_sub(self.pane_height as usize);
-                self.log_scroll = (self.log_scroll + 1).min(max as u16);
+                let safe_max = max.min(u16::MAX as usize) as u16;
+                self.log_scroll = (self.log_scroll + 1).min(safe_max);
                 return EventResult::Consumed;
             }
             KeyCode::PageUp if self.active_pane == DetailPane::Logs => {
@@ -165,7 +166,8 @@ impl DetailPanel {
             }
             KeyCode::PageDown if self.active_pane == DetailPane::Logs => {
                 let max = self.logs_len.saturating_sub(self.pane_height as usize);
-                self.log_scroll = (self.log_scroll + step).min(max as u16);
+                let safe_max = max.min(u16::MAX as usize) as u16;
+                self.log_scroll = (self.log_scroll + step).min(safe_max);
                 return EventResult::Consumed;
             }
 
@@ -176,7 +178,8 @@ impl DetailPanel {
             }
             KeyCode::Down if self.active_pane == DetailPane::Config => {
                 let max = self.config_len.saturating_sub(self.pane_height as usize);
-                self.config_scroll = (self.config_scroll + 1).min(max as u16);
+                let safe_max = max.min(u16::MAX as usize) as u16;
+                self.config_scroll = (self.config_scroll + 1).min(safe_max);
                 return EventResult::Consumed;
             }
             KeyCode::PageUp if self.active_pane == DetailPane::Config => {
@@ -185,7 +188,8 @@ impl DetailPanel {
             }
             KeyCode::PageDown if self.active_pane == DetailPane::Config => {
                 let max = self.config_len.saturating_sub(self.pane_height as usize);
-                self.config_scroll = (self.config_scroll + step).min(max as u16);
+                let safe_max = max.min(u16::MAX as usize) as u16;
+                self.config_scroll = (self.config_scroll + step).min(safe_max);
                 return EventResult::Consumed;
             }
 

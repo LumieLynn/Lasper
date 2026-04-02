@@ -366,15 +366,13 @@ impl Wizard {
             }
             StepAction::Prev => {
                 if let Some(view) = &mut self.active_view {
-                    // Fix: Validate before committing on Prev to avoid "Dirty Data"
-                    if let Err(e) = view.validate() {
-                        return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
+                    // Try to save HEARTBEAT data, but don't block navigation if invalid
+                    if view.validate().is_ok() {
+                        view.commit_to_context(&mut self.context);
                     }
-                    view.commit_to_context(&mut self.context);
                 }
                 if let Some(prev_step) = self.resolve_prev_step(self.step) {
                     self.step = prev_step;
-                    // Evict view so it's recreated with fresh context
                     self.active_view = None;
                 }
                 StepAction::None
