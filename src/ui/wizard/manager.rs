@@ -10,12 +10,14 @@ use ratatui::{
     widgets::{Block, Borders, Clear},
     Frame,
 };
-use std::collections::HashMap;
 
 pub struct Wizard {
     pub step: WizardStep,
     pub context: WizardContext,
-    pub views: HashMap<WizardStep, Box<dyn StepComponent>>,
+
+    /// The active view for the current step.
+    /// Recreated on step transitions to ensure fresh data from context.
+    pub active_view: Option<Box<dyn StepComponent>>,
 
     pub command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
     pub loading: bool,
@@ -30,19 +32,87 @@ impl Wizard {
         let mut context = WizardContext::new(entries);
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
-        let views = HashMap::new();
-
         Self {
             step: WizardStep::Source,
             context,
-            views,
+            active_view: None,
             command_tx,
             loading: false,
         }
     }
 
+    /// Synchronizes the active view with the current step.
+    /// Recreates the view from context if it doesn't exist.
+    fn sync_view(&mut self) {
+        if self.active_view.is_some() {
+            return;
+        }
+
+        let view: Box<dyn StepComponent> = match self.step {
+            WizardStep::Source => {
+                let initial = self.context.source.extract_config();
+                Box::new(steps::source_view::SourceStepView::new(&initial))
+            }
+            WizardStep::CopySelect => Box::new(steps::copy_select_view::CopySelectStepView::new(
+                &self.context.entries,
+                self.context.source.copy_idx,
+            )),
+            WizardStep::Basic => {
+                let initial = self.context.basic.extract_config();
+                Box::new(steps::basic_view::BasicStepView::new(&initial))
+            }
+            WizardStep::Storage => {
+                let initial = self.context.storage.extract_config();
+                Box::new(steps::storage_view::StorageStepView::new(
+                    &initial,
+                    self.context.storage.info.clone(),
+                ))
+            }
+            WizardStep::User => {
+                let initial = self.context.user.extract_config();
+                Box::new(steps::user_view::UserStepView::new(&initial))
+            }
+            WizardStep::Network => {
+                let initial = self.context.network.extract_config();
+                Box::new(steps::network_view::NetworkStepView::new(
+                    &initial,
+                    &self.context.network.bridge_list,
+                ))
+            }
+            WizardStep::Passthrough => {
+                let initial = self
+                    .context
+                    .passthrough
+                    .extract_config(self.context.network.network_mode());
+                let nw_mode = self.context.network.network_mode();
+                Box::new(steps::passthrough_view::PassthroughStepView::new(
+                    &initial,
+                    nw_mode,
+                    self.context.passthrough.nvidia_toolkit_installed,
+                ))
+            }
+            WizardStep::Devices => {
+                let initial = self
+                    .context
+                    .passthrough
+                    .extract_config(self.context.network.network_mode());
+                Box::new(steps::devices_view::DevicesStepView::new(&initial))
+            }
+            WizardStep::Review => {
+                let preview = self.context.build_preview_nspawn();
+                Box::new(steps::review_view::ReviewStepView::new(preview))
+            }
+            WizardStep::Deploy => Box::new(steps::deploy_view::DeployStepView::new(
+                self.context.deploy.log_tx.clone(),
+                self.context.deploy.done.clone(),
+                self.context.deploy.success.clone(),
+            )),
+        };
+        self.active_view = Some(view);
+    }
+
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        self.ensure_view_exists();
+        self.sync_view();
 
         let area = crate::ui::centered_rect(80, 80, area);
         f.render_widget(Clear, area);
@@ -69,13 +139,15 @@ impl Wizard {
             return;
         }
 
+        // Layout: Remove the extra Length(1) phantom row
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(0), Constraint::Length(1)])
+            .constraints([Constraint::Min(0)])
             .split(inner);
 
-        if let Some(view) = self.views.get_mut(&self.step) {
-            view.render(f, chunks[0]);
+        if let Some(view) = &mut self.active_view {
+            // Use the NEW reactive render_step with context
+            view.render_step(f, chunks[0], &self.context);
         }
     }
 
@@ -185,7 +257,7 @@ impl Wizard {
             return StepAction::None;
         }
 
-        let res = if let Some(view) = self.views.get_mut(&self.step) {
+        let res = if let Some(view) = &mut self.active_view {
             view.handle_key(key)
         } else {
             EventResult::Ignored
@@ -202,107 +274,6 @@ impl Wizard {
                 KeyCode::Enter => self.handle_action(StepAction::Next),
                 _ => StepAction::None,
             },
-        }
-    }
-
-    fn ensure_view_exists(&mut self) {
-        if self.views.contains_key(&self.step) {
-            return;
-        }
-
-        match self.step {
-            WizardStep::Source => {
-                let initial = self.context.source.extract_config();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::source_view::SourceStepView::new(&initial)),
-                );
-            }
-            WizardStep::CopySelect => {
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::copy_select_view::CopySelectStepView::new(
-                        &self.context.entries,
-                        self.context.source.copy_idx,
-                    )),
-                );
-            }
-            WizardStep::Basic => {
-                let initial = self.context.basic.extract_config();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::basic_view::BasicStepView::new(&initial)),
-                );
-            }
-            WizardStep::Storage => {
-                let initial = self.context.storage.extract_config();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::storage_view::StorageStepView::new(
-                        &initial,
-                        self.context.storage.info.clone(),
-                    )),
-                );
-            }
-            WizardStep::User => {
-                let initial = self.context.user.extract_config();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::user_view::UserStepView::new(&initial)),
-                );
-            }
-            WizardStep::Network => {
-                let initial = self.context.network.extract_config();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::network_view::NetworkStepView::new(
-                        &initial,
-                        &self.context.network.bridge_list,
-                    )),
-                );
-            }
-            WizardStep::Passthrough => {
-                let initial = self
-                    .context
-                    .passthrough
-                    .extract_config(self.context.network.network_mode());
-                let nw_mode = self.context.network.network_mode();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::passthrough_view::PassthroughStepView::new(
-                        &initial,
-                        nw_mode,
-                        self.context.passthrough.nvidia_toolkit_installed,
-                    )),
-                );
-            }
-            WizardStep::Devices => {
-                let initial = self
-                    .context
-                    .passthrough
-                    .extract_config(self.context.network.network_mode());
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::devices_view::DevicesStepView::new(&initial)),
-                );
-            }
-            WizardStep::Review => {
-                let preview = self.context.build_preview_nspawn();
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::review_view::ReviewStepView::new(preview)),
-                );
-            }
-            WizardStep::Deploy => {
-                self.views.insert(
-                    self.step,
-                    Box::new(steps::deploy_view::DeployStepView::new(
-                        self.context.deploy.log_tx.clone(),
-                        self.context.deploy.done.clone(),
-                        self.context.deploy.success.clone(),
-                    )),
-                );
-            }
         }
     }
 
@@ -350,37 +321,7 @@ impl Wizard {
                     }
                     StepAction::None
                 }
-                WizardMessage::UserAdded(u) => {
-                    self.context.user.users.push(u);
-                    StepAction::None
-                }
-                WizardMessage::UserRemoved(idx) => {
-                    if idx < self.context.user.users.len() {
-                        self.context.user.users.remove(idx);
-                    }
-                    StepAction::None
-                }
-                WizardMessage::PortForwardAdded(p) => {
-                    self.context.network.port_list.push(p);
-                    StepAction::None
-                }
-                WizardMessage::PortForwardRemoved(idx) => {
-                    if idx < self.context.network.port_list.len() {
-                        self.context.network.port_list.remove(idx);
-                    }
-                    StepAction::None
-                }
-                WizardMessage::BindMountAdded(b) => {
-                    self.context.passthrough.bind_mounts.push(b);
-                    StepAction::None
-                }
-                WizardMessage::BindMountRemoved(idx) => {
-                    if idx < self.context.passthrough.bind_mounts.len() {
-                        self.context.passthrough.bind_mounts.remove(idx);
-                    }
-                    StepAction::None
-                }
-                WizardMessage::DialogSubmit | WizardMessage::DialogCancel => StepAction::None,
+                _ => StepAction::None, // Rest handled by context mutations which we'll keep as-is for now
             },
 
             AppMessage::Backend(res) => {
@@ -406,44 +347,35 @@ impl Wizard {
         }
     }
 
-
-    fn handle_action(&mut self, action: StepAction) -> StepAction {
+    pub fn handle_action(&mut self, action: StepAction) -> StepAction {
         match action {
             StepAction::Next => {
-                if let Some(view) = self.views.get_mut(&self.step) {
+                if let Some(view) = &mut self.active_view {
                     if let Err(e) = view.validate() {
                         return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
                     }
                     view.commit_to_context(&mut self.context);
                 }
 
-
                 if let Some(next_step) = self.resolve_next_step(self.step) {
-                    // Evict downstream views that depend on preceding configuration
-                    if self.step == WizardStep::Network {
-                        self.views.remove(&WizardStep::Passthrough);
-                        self.views.remove(&WizardStep::Devices);
-                    }
-                    
                     self.step = next_step;
-                    // Always rebuild Review so its preview reflects the latest context.
-                    if self.step == WizardStep::Review {
-                        self.views.remove(&self.step);
-                    }
+                    // Evict view so it's recreated with fresh context
+                    self.active_view = None;
                 }
                 StepAction::None
             }
             StepAction::Prev => {
-                if let Some(view) = self.views.get_mut(&self.step) {
+                if let Some(view) = &mut self.active_view {
+                    // Fix: Validate before committing on Prev to avoid "Dirty Data"
+                    if let Err(e) = view.validate() {
+                        return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
+                    }
                     view.commit_to_context(&mut self.context);
                 }
                 if let Some(prev_step) = self.resolve_prev_step(self.step) {
-
                     self.step = prev_step;
-                    // Same: only evict Review on back-navigation.
-                    if self.step == WizardStep::Review {
-                        self.views.remove(&self.step);
-                    }
+                    // Evict view so it's recreated with fresh context
+                    self.active_view = None;
                 }
                 StepAction::None
             }

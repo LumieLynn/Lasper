@@ -10,7 +10,6 @@ use ratatui::{
 use crate::app::{AppData, DetailPane};
 use crate::ui::core::{AppMessage, ContainerMessage, EventResult};
 
-
 const IMPORTANT_KEYS: &[&str] = &[
     "Name",
     "State",
@@ -53,9 +52,10 @@ pub struct DetailPanel {
     /// Height of the scrollable pane area — set by layout before handling keys.
     pub pane_height: u16,
     pub focused: bool,
-    /// Cached row count for the Details pane. Updated in render_with_data.
-    /// Used by handle_key to clamp selection without touching state during render.
+    /// Cached data lengths for clamping scrolling
     details_len: usize,
+    logs_len: usize,
+    config_len: usize,
 }
 
 impl DetailPanel {
@@ -68,6 +68,8 @@ impl DetailPanel {
             pane_height: 10,
             focused: false,
             details_len: 0,
+            logs_len: 0,
+            config_len: 0,
         }
     }
 
@@ -77,12 +79,18 @@ impl DetailPanel {
 
     /// Call this from layout / render_with_data before handle_key so
     /// the Details pane length is always in sync with live data.
-    fn sync_details_len(&mut self, data: &AppData) {
+    fn sync_data_lengths(&mut self, data: &AppData) {
         self.details_len = data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
+        self.logs_len = data.log_lines.len();
+        self.config_len = data
+            .config_content
+            .as_ref()
+            .map(|c| c.lines().count())
+            .unwrap_or(0);
     }
 
     pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &AppData) {
-        self.sync_details_len(data);
+        self.sync_data_lengths(data);
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -115,24 +123,31 @@ impl DetailPanel {
             // ─── Pane switching ────────────────────────────────────────────
             KeyCode::Char('p') => {
                 self.active_pane = DetailPane::Properties;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Properties)));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                    DetailPane::Properties,
+                )));
             }
             KeyCode::Char('d') => {
                 self.active_pane = DetailPane::Details;
                 self.details_state.select(Some(0));
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Details)));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                    DetailPane::Details,
+                )));
             }
             KeyCode::Char('l') => {
                 self.active_pane = DetailPane::Logs;
                 self.log_scroll = 0;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Logs)));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                    DetailPane::Logs,
+                )));
             }
             KeyCode::Char('c') => {
                 self.active_pane = DetailPane::Config;
                 self.config_scroll = 0;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(DetailPane::Config)));
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                    DetailPane::Config,
+                )));
             }
-
 
             // ─── Logs scrolling ────────────────────────────────────────────
             KeyCode::Up if self.active_pane == DetailPane::Logs => {
@@ -140,7 +155,8 @@ impl DetailPanel {
                 return EventResult::Consumed;
             }
             KeyCode::Down if self.active_pane == DetailPane::Logs => {
-                self.log_scroll += 1;
+                let max = self.logs_len.saturating_sub(self.pane_height as usize);
+                self.log_scroll = (self.log_scroll + 1).min(max as u16);
                 return EventResult::Consumed;
             }
             KeyCode::PageUp if self.active_pane == DetailPane::Logs => {
@@ -148,7 +164,8 @@ impl DetailPanel {
                 return EventResult::Consumed;
             }
             KeyCode::PageDown if self.active_pane == DetailPane::Logs => {
-                self.log_scroll += step;
+                let max = self.logs_len.saturating_sub(self.pane_height as usize);
+                self.log_scroll = (self.log_scroll + step).min(max as u16);
                 return EventResult::Consumed;
             }
 
@@ -158,7 +175,8 @@ impl DetailPanel {
                 return EventResult::Consumed;
             }
             KeyCode::Down if self.active_pane == DetailPane::Config => {
-                self.config_scroll += 1;
+                let max = self.config_len.saturating_sub(self.pane_height as usize);
+                self.config_scroll = (self.config_scroll + 1).min(max as u16);
                 return EventResult::Consumed;
             }
             KeyCode::PageUp if self.active_pane == DetailPane::Config => {
@@ -166,7 +184,8 @@ impl DetailPanel {
                 return EventResult::Consumed;
             }
             KeyCode::PageDown if self.active_pane == DetailPane::Config => {
-                self.config_scroll += step;
+                let max = self.config_len.saturating_sub(self.pane_height as usize);
+                self.config_scroll = (self.config_scroll + step).min(max as u16);
                 return EventResult::Consumed;
             }
 

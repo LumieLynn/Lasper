@@ -166,7 +166,10 @@ impl App {
                         AppEvent::Tick => self.tick().await,
                         AppEvent::BackendResult(res) => {
                             if let Some(wizard) = &mut self.ui.wizard {
-                                wizard.process_message(crate::ui::core::AppMessage::Backend(res));
+                                let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
+                                if let crate::ui::wizard::StepAction::Status(msg, level) = action {
+                                    self.set_status(msg, level);
+                                }
                             }
                         }
                     }

@@ -14,5 +14,10 @@ use crate::ui::wizard::context::WizardContext;
 
 pub trait StepComponent: Component {
     fn commit_to_context(&self, ctx: &mut WizardContext);
+    fn render_step(
+        &mut self,
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        context: &WizardContext,
+    );
 }
-

@@ -38,7 +38,6 @@ impl UserStepView {
                 |idx| AppMessage::Wizard(WizardMessage::UserRemoved(idx)),
             ),
 
-
             editor: None,
             focus: FocusTracker::new(),
         };
@@ -121,7 +120,6 @@ impl Component for UserStepView {
                 _ => {}
             }
             return res;
-
         }
 
         match key.code {
@@ -134,7 +132,9 @@ impl Component for UserStepView {
                 return EventResult::Consumed;
             }
             KeyCode::Char('a') | KeyCode::Char('A') if self.user_list.is_focused() => {
-                self.editor = Some(UserEditor::new(|u| AppMessage::Wizard(WizardMessage::UserAdded(u))));
+                self.editor = Some(UserEditor::new(|u| {
+                    AppMessage::Wizard(WizardMessage::UserAdded(u))
+                }));
 
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
@@ -159,7 +159,6 @@ impl Component for UserStepView {
             }
             _ => res,
         }
-
     }
 
     fn set_focus(&mut self, focused: bool) {
@@ -187,4 +186,7 @@ impl StepComponent for UserStepView {
         ctx.user.users = self.user_list.items().to_vec();
     }
 
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
+    }
 }

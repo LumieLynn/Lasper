@@ -161,7 +161,10 @@ fn get_state_dir() -> PathBuf {
         return PathBuf::from(xdg).join("lasper").join("states");
     }
     if let Some(home) = dirs::home_dir() {
-        home.join(".local").join("state").join("lasper").join("states")
+        home.join(".local")
+            .join("state")
+            .join("lasper")
+            .join("states")
     } else {
         PathBuf::from("/var/lib/lasper/states")
     }

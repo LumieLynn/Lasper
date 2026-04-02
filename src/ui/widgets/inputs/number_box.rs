@@ -10,7 +10,6 @@ pub struct NumberBox {
     max_value: u32,
 }
 
-
 impl NumberBox {
     pub fn new(label: impl Into<String>, initial_value: u32) -> Self {
         Self {
@@ -19,7 +18,6 @@ impl NumberBox {
             max_value: u32::MAX,
         }
     }
-
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.base.enabled = enabled;
@@ -33,7 +31,6 @@ impl NumberBox {
     pub fn set_value(&mut self, value: u32) {
         self.base.input = tui_input::Input::from(value.to_string());
     }
-
 
     pub fn with_max_value(mut self, max: u32) -> Self {
         self.max_value = max;

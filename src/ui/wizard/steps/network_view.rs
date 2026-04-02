@@ -83,7 +83,9 @@ impl NetworkStepView {
 
     pub fn with_port_editor(mut self, enabled: bool) -> Self {
         if enabled {
-            self.port_editor = Some(PortMappingBox::new(|p| AppMessage::Wizard(WizardMessage::PortForwardAdded(p))));
+            self.port_editor = Some(PortMappingBox::new(|p| {
+                AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
+            }));
 
             if let Some(ref mut editor) = self.port_editor {
                 editor.set_focus(true);
@@ -225,7 +227,6 @@ impl Component for NetworkStepView {
                 _ => {}
             }
             return res;
-
         }
 
         match key.code {
@@ -238,7 +239,9 @@ impl Component for NetworkStepView {
                 return EventResult::Consumed;
             }
             KeyCode::Char('a') | KeyCode::Char('A') if self.port_list.is_focused() => {
-                self.port_editor = Some(PortMappingBox::new(|p| AppMessage::Wizard(WizardMessage::PortForwardAdded(p))));
+                self.port_editor = Some(PortMappingBox::new(|p| {
+                    AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
+                }));
 
                 self.port_editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
@@ -319,8 +322,16 @@ impl StepComponent for NetworkStepView {
         if self.is_custom_bridge() {
             ctx.network.bridge_name = self.custom_bridge.value().to_string();
         } else {
-            ctx.network.bridge_name = self.bridge_list.selected_item().cloned().unwrap_or_default();
+            ctx.network.bridge_name = self
+                .bridge_list
+                .selected_item()
+                .cloned()
+                .unwrap_or_default();
         }
         ctx.network.port_list = self.port_list.items().to_vec();
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
     }
 }

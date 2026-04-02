@@ -127,4 +127,8 @@ impl StepComponent for DeployStepView {
     fn commit_to_context(&self, _ctx: &mut WizardContext) {
         // Deploy is terminal state
     }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
+    }
 }

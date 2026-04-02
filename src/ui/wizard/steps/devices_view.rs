@@ -102,12 +102,13 @@ impl Component for DevicesStepView {
                 _ => {}
             }
             return res;
-
         }
 
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.bind_editor = Some(BindMountBox::new(|bm| AppMessage::Wizard(WizardMessage::BindMountAdded(bm))));
+                self.bind_editor = Some(BindMountBox::new(|bm| {
+                    AppMessage::Wizard(WizardMessage::BindMountAdded(bm))
+                }));
 
                 self.bind_editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
@@ -134,5 +135,9 @@ impl Component for DevicesStepView {
 impl StepComponent for DevicesStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.passthrough.bind_mounts = self.bind_list.items().to_vec();
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
     }
 }

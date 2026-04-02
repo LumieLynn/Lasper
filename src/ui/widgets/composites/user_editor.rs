@@ -176,7 +176,6 @@ impl Component for UserEditor {
                     sudoer: self.sudoer.checked(),
                 };
                 return EventResult::Message((self.on_submit)(user));
-
             }
             _ => {}
         }
@@ -214,7 +213,6 @@ impl Component for UserEditor {
                     sudoer: self.sudoer.checked(),
                 };
                 EventResult::Message((self.on_submit)(user))
-
             }
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
                 EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))

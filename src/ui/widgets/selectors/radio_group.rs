@@ -15,7 +15,6 @@ pub struct RadioGroup {
     enabled: bool,
 }
 
-
 impl RadioGroup {
     pub fn new(label: impl Into<String>, options: Vec<String>, initial_idx: usize) -> Self {
         Self {
@@ -26,7 +25,6 @@ impl RadioGroup {
             enabled: true,
         }
     }
-
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -42,7 +40,6 @@ impl RadioGroup {
             self.selected_idx = idx;
         }
     }
-
 
     pub fn selected_idx(&self) -> usize {
         self.selected_idx
@@ -93,7 +90,6 @@ impl Component for RadioGroup {
                     return EventResult::Consumed;
                 }
                 EventResult::Ignored
-
             }
             KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
                 if self.selected_idx < self.options.len().saturating_sub(1) {
@@ -101,7 +97,6 @@ impl Component for RadioGroup {
                     return EventResult::Consumed;
                 }
                 EventResult::Ignored
-
             }
             _ => EventResult::Ignored,
         }

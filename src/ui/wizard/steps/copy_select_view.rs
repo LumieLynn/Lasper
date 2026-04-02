@@ -17,7 +17,6 @@ impl CopySelectStepView {
             format!("  {} ({})", e.name, e.state.label())
         });
 
-
         list.select(initial_cursor);
 
         Self { list }
@@ -54,5 +53,10 @@ impl StepComponent for CopySelectStepView {
             }
         }
     }
-}
 
+    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
+        // Reactive update: ensure list items match the latest background entries
+        self.list.set_items(context.entries.clone());
+        self.render(f, area);
+    }
+}

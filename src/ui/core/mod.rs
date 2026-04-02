@@ -40,14 +40,11 @@ pub enum ContainerMessage {
     PaneChanged(crate::app::DetailPane),
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum ListMessage {
     Next,
     Prev,
 }
-
-
 
 #[derive(Debug, Clone)]
 pub enum BackendCommand {

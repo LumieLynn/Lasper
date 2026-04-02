@@ -29,7 +29,6 @@ impl StorageStepView {
             format!("{}{}", st.label(), status)
         });
 
-
         let type_idx = info
             .types
             .iter()
@@ -58,14 +57,15 @@ impl StorageStepView {
                     }
                 }),
 
-            raw_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", raw_cfg.fs_type)
-                .with_validator(|v| {
+            raw_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", raw_cfg.fs_type).with_validator(
+                |v| {
                     if v.trim().is_empty() {
                         Err("Filesystem required".into())
                     } else {
                         Ok(())
                     }
-                }),
+                },
+            ),
 
             info,
             focus: FocusTracker::new(),
@@ -185,7 +185,6 @@ impl Component for StorageStepView {
             }
         }
         match res {
-
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed
@@ -228,5 +227,9 @@ impl StepComponent for StorageStepView {
         }
         ctx.storage.raw_size = self.raw_size.value().to_string();
         ctx.storage.raw_fs = self.raw_fs.value().to_string();
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
     }
 }

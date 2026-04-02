@@ -14,7 +14,6 @@ pub struct Checkbox {
     enabled: bool,
 }
 
-
 impl Checkbox {
     pub fn new(label: impl Into<String>, initial_checked: bool) -> Self {
         Self {
@@ -24,7 +23,6 @@ impl Checkbox {
             enabled: true,
         }
     }
-
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
@@ -38,7 +36,6 @@ impl Checkbox {
     pub fn set_checked(&mut self, checked: bool) {
         self.checked = checked;
     }
-
 
     pub fn checked(&self) -> bool {
         self.checked

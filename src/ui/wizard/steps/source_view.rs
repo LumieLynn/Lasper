@@ -33,9 +33,7 @@ impl SourceStepView {
             "[disk]        import local disk image (.raw, .tar)".to_string(),
         ];
 
-        let kind_list =
-            SelectableList::new(" Select base ", kinds, |s| s.clone());
-
+        let kind_list = SelectableList::new(" Select base ", kinds, |s| s.clone());
 
         let mut view = Self {
             kind_list,
@@ -192,7 +190,6 @@ impl Component for SourceStepView {
             }
         }
         match res {
-
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed
@@ -249,5 +246,9 @@ impl StepComponent for SourceStepView {
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
         ctx.source.pacstrap_pkgs = self.pacstrap_pkgs.value().to_string();
         ctx.source.disk_path = self.disk_path.value().to_string();
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
     }
 }

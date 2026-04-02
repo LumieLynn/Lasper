@@ -13,7 +13,6 @@ pub struct PasswordBox {
     validator: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
 }
 
-
 impl PasswordBox {
     pub fn new(label: impl Into<String>, initial_value: String) -> Self {
         Self {
@@ -22,7 +21,6 @@ impl PasswordBox {
         }
     }
 
-
     pub fn value(&self) -> &str {
         self.base.input.value()
     }
@@ -30,7 +28,6 @@ impl PasswordBox {
     pub fn set_value(&mut self, value: String) {
         self.base.input = tui_input::Input::from(value);
     }
-
 
     pub fn with_validator<F>(mut self, f: F) -> Self
     where
@@ -85,7 +82,6 @@ impl Component for PasswordBox {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         self.base.handle_key(key)
     }
-
 
     fn set_focus(&mut self, focused: bool) {
         self.base.focused = focused;

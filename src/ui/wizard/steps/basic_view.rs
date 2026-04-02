@@ -12,17 +12,25 @@ pub struct BasicStepView {
     focus: FocusTracker,
 }
 
-
 impl BasicStepView {
     pub fn new(initial_data: &BasicConfig) -> Self {
         let mut view = Self {
             name: TextBox::new(" Container name (required) ", initial_data.name.clone())
                 .with_validator(|v| {
-                    if v.trim().is_empty() {
-                        Err("Name cannot be empty".to_string())
-                    } else {
-                        Ok(())
+                    let s = v.trim();
+                    if s.is_empty() {
+                        return Err("Name cannot be empty".to_string());
                     }
+                    if !s
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                    {
+                        return Err("Invalid characters: use [a-zA-Z0-9_-]".to_string());
+                    }
+                    if s.len() > 64 {
+                        return Err("Name too long (max 64)".to_string());
+                    }
+                    Ok(())
                 }),
             hostname: TextBox::new(
                 " Hostname (optional, defaults to name) ",
@@ -64,7 +72,6 @@ impl BasicStepView {
         self.update_focus();
     }
 }
-
 
 impl Component for BasicStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
@@ -125,5 +132,9 @@ impl StepComponent for BasicStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.basic.name = self.name.value().to_string();
         ctx.basic.hostname = self.hostname.value().to_string();
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+        self.render(f, area);
     }
 }

@@ -150,7 +150,6 @@ impl App {
         }
     }
 
-
     /// Processes an `EventResult` produced by the detail panel.
     async fn handle_detail_panel_result(&mut self, result: EventResult) {
         match result {
@@ -163,5 +162,4 @@ impl App {
             _ => {}
         }
     }
-
 }

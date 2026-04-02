@@ -16,7 +16,6 @@ pub struct SelectableList<T> {
     display_fn: Box<dyn Fn(&T) -> String>,
 }
 
-
 impl<T> SelectableList<T> {
     pub fn new(
         label: impl Into<String>,
@@ -35,7 +34,6 @@ impl<T> SelectableList<T> {
             enabled: true,
             display_fn: Box::new(display_fn),
         }
-
     }
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
@@ -50,7 +48,6 @@ impl<T> SelectableList<T> {
     pub fn items(&self) -> &[T] {
         &self.items
     }
-
 
     pub fn selected_idx(&self) -> Option<usize> {
         self.state.selected()

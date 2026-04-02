@@ -26,7 +26,9 @@ impl Component for ReviewStepView {
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Enter => return EventResult::Message(AppMessage::Wizard(WizardMessage::Submit)),
+            KeyCode::Enter => {
+                return EventResult::Message(AppMessage::Wizard(WizardMessage::Submit))
+            }
             _ => {}
         }
 
@@ -49,5 +51,11 @@ impl Component for ReviewStepView {
 impl StepComponent for ReviewStepView {
     fn commit_to_context(&self, _ctx: &mut WizardContext) {
         // Preview is read-only view of context
+    }
+
+    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
+        // Reactive update: ensure preview reflects current context before rendering
+        self.preview.set_content(context.build_preview_nspawn());
+        self.render(f, area);
     }
 }

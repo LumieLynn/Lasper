@@ -61,10 +61,13 @@ impl ContainerListComponent {
     /// j/↓ → ListNext, k/↑ → ListPrev. All other keys are Ignored.
     pub fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => EventResult::Message(AppMessage::List(ListMessage::Next)),
-            KeyCode::Char('k') | KeyCode::Up => EventResult::Message(AppMessage::List(ListMessage::Prev)),
+            KeyCode::Char('j') | KeyCode::Down => {
+                EventResult::Message(AppMessage::List(ListMessage::Next))
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                EventResult::Message(AppMessage::List(ListMessage::Prev))
+            }
             _ => EventResult::Ignored,
         }
     }
-
 }
