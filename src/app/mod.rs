@@ -52,6 +52,7 @@ pub struct AppUi {
     pub status_message: Option<(String, StatusLevel)>,
     pub status_expiry: Option<Instant>,
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>>,
+    pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
 }
 
 impl AppUi {
@@ -68,6 +69,7 @@ impl AppUi {
             status_message: None,
             status_expiry: None,
             backend_tx: None,
+            app_tx: None,
         }
     }
 
@@ -90,6 +92,7 @@ pub struct AppData {
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
     pub action_cooldown: Option<Instant>,
+    pub transitions: std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
 }
 
 /// Global application state.
@@ -114,9 +117,44 @@ impl App {
                 dbus_active: true,
                 manager: std::sync::Arc::new(DefaultManager::new(is_root)),
                 action_cooldown: None,
+                transitions: std::collections::HashMap::new(),
             },
             ui: AppUi::new(is_root),
         }
+    }
+
+    /// Helper to apply active transitions (Starting/Exiting) to a list of entries.
+    pub fn merge_transitional_states(&mut self, mut entries: Vec<crate::nspawn::models::ContainerEntry>) -> Vec<crate::nspawn::models::ContainerEntry> {
+        let now = Instant::now();
+        let timeout = std::time::Duration::from_secs(10);
+
+        // Filter out timed out or resolved transitions.
+        self.data.transitions.retain(|name, (state, start_time)| {
+            if now.duration_since(*start_time) > timeout {
+                return false;
+            }
+            // If backend already matches the target, remove the transition.
+            if let Some(entry) = entries.iter().find(|e| &e.name == name) {
+                match state {
+                    crate::nspawn::models::ContainerState::Starting => {
+                        if entry.state == crate::nspawn::models::ContainerState::Running { return false; }
+                    }
+                    crate::nspawn::models::ContainerState::Exiting => {
+                        if entry.state == crate::nspawn::models::ContainerState::Off { return false; }
+                    }
+                    _ => {}
+                }
+            }
+            true
+        });
+
+        // Apply remaining transitions to the entry list.
+        for entry in &mut entries {
+            if let Some((trans_state, _)) = self.data.transitions.get(&entry.name) {
+                entry.state = trans_state.clone();
+            }
+        }
+        entries
     }
 
     /// Starts the main application loop.
@@ -126,6 +164,7 @@ impl App {
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::ui::core::BackendCommand>(100);
         self.ui.backend_tx = Some(backend_tx);
+        self.ui.app_tx = Some(events.tx.clone());
 
         let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::channel::<()>(2);
         self.data.manager.watch(dirty_tx.clone()).await;
@@ -149,7 +188,7 @@ impl App {
                     .entries
                     .get(self.data.selected)
                     .map(|e| e.name.clone());
-                self.data.entries = entries;
+                self.data.entries = self.merge_transitional_states(entries);
                 self.data.selected = prev_name
                     .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
                     .unwrap_or(0)
@@ -183,6 +222,10 @@ impl App {
                                     self.set_status(msg, level);
                                 }
                             }
+                        }
+                        AppEvent::ActionDone(msg, level) => {
+                            self.set_status(msg, level);
+                            self.refresh().await;
                         }
                     }
                 }

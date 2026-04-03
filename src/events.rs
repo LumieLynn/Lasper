@@ -14,6 +14,8 @@ pub enum AppEvent {
     Key(KeyEvent),
     Tick,
     BackendResult(crate::ui::core::BackendResponse),
+    /// Background action execution finished.
+    ActionDone(String, crate::nspawn::StatusLevel),
 }
 
 /// Merges keyboard input and periodic ticks into one channel.

@@ -47,10 +47,10 @@ impl App {
                     let idx = pm.get_selected();
                     self.ui.power_menu = None;
                     match idx {
-                        0 => self.action_start().await,
-                        1 => self.action_poweroff().await,
-                        2 => self.action_reboot().await,
-                        3 => self.action_terminate().await,
+                        0 => self.action_start(),
+                        1 => self.action_poweroff(),
+                        2 => self.action_reboot(),
+                        3 => self.action_terminate(),
                         4 => self.action_kill().await,
                         5 => self.action_enable().await,
                         6 => self.action_disable().await,
@@ -84,11 +84,11 @@ impl App {
             }
             // Container actions (always global regardless of focus)
             KeyCode::Char('s') => {
-                self.action_start().await;
+                self.action_start();
                 return;
             }
             KeyCode::Char('S') => {
-                self.action_poweroff().await;
+                self.action_poweroff();
                 return;
             }
             KeyCode::Char('x') | KeyCode::Enter => {

@@ -101,9 +101,7 @@ pub struct ContainerConfig {
 pub enum ContainerState {
     Running,
     Off,
-    #[allow(dead_code)]
     Starting,
-    #[allow(dead_code)]
     Exiting,
 }
 
