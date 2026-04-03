@@ -1,5 +1,5 @@
 use crate::ui::core::{Component, EventResult};
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use ratatui::{layout::Rect, Frame};
 
 pub struct PowerMenu {

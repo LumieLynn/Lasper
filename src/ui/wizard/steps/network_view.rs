@@ -1,10 +1,10 @@
 use crate::nspawn::models::{NetworkMode, PortForward};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::composites::editable_list::EditableList;
+use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 

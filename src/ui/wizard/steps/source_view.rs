@@ -1,7 +1,7 @@
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::text_box::TextBox;
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 

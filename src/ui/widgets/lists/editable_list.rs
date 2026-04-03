@@ -1,5 +1,5 @@
 use crate::ui::core::{AppMessage, Component, EventResult};
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{layout::Rect, Frame};
 

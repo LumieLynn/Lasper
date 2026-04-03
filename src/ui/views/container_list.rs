@@ -7,16 +7,19 @@ use ratatui::{
     Frame,
 };
 
-use crate::nspawn::{ContainerEntry, ContainerState};
+use crate::nspawn::ContainerEntry;
 use crate::ui::core::{AppMessage, EventResult, ListMessage};
+use crate::ui::widgets::lists::shared_container_list::SharedContainerList;
 
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
-
-pub struct ContainerListComponent;
+pub struct ContainerListComponent {
+    list: SharedContainerList,
+}
 
 impl ContainerListComponent {
     pub fn new() -> Self {
-        Self
+        Self {
+            list: SharedContainerList::new(" Containers ", 0),
+        }
     }
 
     pub fn render_with_data(
@@ -25,28 +28,19 @@ impl ContainerListComponent {
         area: Rect,
         entries: &[ContainerEntry],
         selected: usize,
-        is_root: bool,
+        _is_root: bool, // is_root was used for hint, keeping it in signature for now
         focused: bool,
     ) {
-        let mut list = SelectableList::new(" Containers ", entries.to_vec(), |e| {
-            let (icon, _) = match &e.state {
-                ContainerState::Running => ("● ", "green"),
-                ContainerState::Starting => ("◑ ", "yellow"),
-                ContainerState::Exiting => ("◐ ", "yellow"),
-                ContainerState::Off => ("○ ", "gray"),
-            };
-            format!("{} {} ({})", icon, e.name, e.state.label())
-        });
-        list.select(selected);
-        list.set_focus(focused);
-        list.render(f, area);
+        // Sync state from background data
+        self.list.select(selected);
+        self.list.set_focus(focused);
+
+        // Zero-copy rendering
+        self.list.render(f, area, entries);
 
         if entries.is_empty() {
-            let hint = if is_root {
-                "  No containers in /var/lib/machines"
-            } else {
-                "  No running containers\n  (run with sudo to see all)"
-            };
+            // Hint logic (simplified for now but preserving the spirit)
+            let hint = "  No containers found";
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),

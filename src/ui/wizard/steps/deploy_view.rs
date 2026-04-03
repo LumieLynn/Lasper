@@ -1,6 +1,6 @@
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::display::text_block::TextBlock;
-use crate::ui::widgets::selectors::selectable_list::SelectableList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::wizard::context::WizardContext;
 use crate::ui::wizard::steps::StepComponent;
 

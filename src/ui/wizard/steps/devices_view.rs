@@ -1,7 +1,7 @@
 use crate::nspawn::models::BindMount;
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::composites::bind_mount::BindMountBox;
-use crate::ui::widgets::composites::editable_list::EditableList;
+use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 

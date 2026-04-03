@@ -1,6 +1,6 @@
 use crate::nspawn::models::CreateUser;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::composites::editable_list::EditableList;
+use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::composites::user_editor::UserEditor;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::wizard::context::{UserConfig, WizardContext};
