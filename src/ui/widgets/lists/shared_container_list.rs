@@ -39,6 +39,18 @@ impl SharedContainerList {
     /// Renders the container list without taking ownership of data.
     /// Uses ContainerEntry references to build the UI list.
     pub fn render(&mut self, f: &mut Frame, area: Rect, entries: &[ContainerEntry]) {
+        // If background data changes and current selection is out of bounds, clamp it.
+        if let Some(current) = self.state.selected() {
+            if entries.is_empty() {
+                self.state.select(None);
+            } else {
+                let max_idx = entries.len().saturating_sub(1);
+                if current > max_idx {
+                    self.state.select(Some(max_idx));
+                }
+            }
+        }
+
         let items: Vec<ListItem> = entries
             .iter()
             .map(|e| {
@@ -90,12 +102,11 @@ impl SharedContainerList {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => {
                 let i = self.state.selected().unwrap_or(0);
-                self.state
-                    .select(Some(if i >= items_len.saturating_sub(1) {
-                        0
-                    } else {
-                        i + 1
-                    }));
+                self.state.select(Some(if i >= items_len.saturating_sub(1) {
+                    0
+                } else {
+                    i + 1
+                }));
                 true
             }
             KeyCode::Up | KeyCode::Char('k') => {
