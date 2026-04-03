@@ -3,7 +3,7 @@ use ratatui::{
     style::{Color, Style},
     symbols,
     text::Span,
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType},
+    widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType},
     Frame,
 };
 
@@ -20,6 +20,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         None => {
             let waiting = Block::default()
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .title(" Realtime Metrics ");
             let inner = waiting.inner(area);
             f.render_widget(waiting, area);
@@ -71,7 +72,8 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         .block(
             Block::default()
                 .title(" CPU Usage (%) ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
         )
         .x_axis(
             Axis::default()
@@ -123,7 +125,8 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         .block(
             Block::default()
                 .title(" Memory Usage ")
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded),
         )
         .x_axis(
             Axis::default()

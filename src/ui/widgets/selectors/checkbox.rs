@@ -3,7 +3,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
@@ -55,7 +55,10 @@ impl Component for Checkbox {
         let symbol = if self.checked { "[x]" } else { "[ ]" };
         let text = format!("{} {}", symbol, self.label);
 
-        let block = Block::default().borders(Borders::ALL).border_style(style);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(style);
 
         let paragraph = Paragraph::new(text).block(block);
         f.render_widget(paragraph, area);

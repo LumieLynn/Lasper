@@ -7,7 +7,7 @@ use crate::ui::wizard::{StepAction, WizardStep};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    widgets::{Block, Borders, Clear},
+    widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
 
@@ -62,6 +62,7 @@ impl Wizard {
                 self.total_steps()
             ))
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan));
 
         let inner = block.inner(area);
@@ -71,7 +72,12 @@ impl Wizard {
             let loading_area = crate::ui::centered_rect(30, 10, inner);
             let spinner = ratatui::widgets::Paragraph::new("\n  Processing... Please wait  ")
                 .alignment(ratatui::layout::Alignment::Center)
-                .block(Block::default().borders(Borders::ALL).title(" Working "));
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .title(" Working "),
+                );
             f.render_widget(spinner, loading_area);
             return;
         }

@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
@@ -45,16 +45,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let badge = if app.is_root {
         Span::styled(
-            " ⚡ ROOT ",
+            " [ ⚡ ROOT ] ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Green)
+                .fg(Color::Green)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
-            " ⚠  READ-ONLY — run with sudo for full control ",
-            Style::default().fg(Color::Black).bg(Color::Yellow),
+            " [ ⚠  READ-ONLY — run with sudo for full control ] ",
+            Style::default().fg(Color::Yellow),
         )
     };
 
@@ -70,10 +69,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 
     if !app.data.dbus_active {
         spans.push(Span::styled(
-            " ⚡ CMD-MODE ",
+            " [ ⚡ CMD-MODE ] ",
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(255, 140, 0))
+                .fg(Color::Rgb(255, 140, 0))
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -228,6 +226,7 @@ fn render_help(f: &mut Frame) {
             Block::default()
                 .title(" Help ")
                 .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         area,
