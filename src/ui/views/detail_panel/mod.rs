@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -47,6 +47,7 @@ impl DetailPanel {
     }
 
     fn sync_data_lengths(&mut self, data: &AppData) {
+        let old_logs_len = self.logs_len;
         self.details_len = data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
         self.logs_len = data.log_lines.len();
         self.config_len = data
@@ -54,10 +55,19 @@ impl DetailPanel {
             .as_ref()
             .map(|c| c.lines().count())
             .unwrap_or(0);
+
+        // Sticky autoscroll for Logs
+        if self.active_pane == DetailPane::Logs && self.logs_len > old_logs_len {
+            let max_scroll_old = old_logs_len.saturating_sub(self.pane_height as usize) as u16;
+            if self.log_scroll >= max_scroll_old {
+                let max_scroll_new =
+                    self.logs_len.saturating_sub(self.pane_height as usize);
+                self.log_scroll = max_scroll_new.min(u16::MAX as usize) as u16;
+            }
+        }
     }
 
     pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &AppData) {
-        self.sync_data_lengths(data);
 
         // Border
         let border_color = if self.focused {
@@ -76,6 +86,9 @@ impl DetailPanel {
 
         // Get inner area
         let inner_area = block.inner(area);
+        self.pane_height = inner_area.height;
+        self.sync_data_lengths(data);
+
         f.render_widget(Clear, area);
         f.render_widget(block, area);
 
@@ -86,6 +99,47 @@ impl DetailPanel {
             DetailPane::Logs => logs::render(f, data, inner_area, self.log_scroll),
             DetailPane::Config => configs::render(f, data, inner_area, self.config_scroll),
         }
+
+        // Render scrollbar
+        self.render_scrollbar(f, area);
+    }
+
+    fn render_scrollbar(&mut self, f: &mut Frame, area: Rect) {
+        let (max_scroll, position) = match self.active_pane {
+            DetailPane::Logs if self.logs_len > self.pane_height as usize => {
+                (
+                    self.logs_len.saturating_sub(self.pane_height as usize),
+                    self.log_scroll as usize,
+                )
+            }
+            DetailPane::Config if self.config_len > self.pane_height as usize => {
+                (
+                    self.config_len.saturating_sub(self.pane_height as usize),
+                    self.config_scroll as usize,
+                )
+            }
+            DetailPane::Details if self.details_len > 1 => (
+                self.details_len.saturating_sub(1),
+                self.details_state.selected().unwrap_or(0),
+            ),
+            _ => return,
+        };
+
+        let mut state = ScrollbarState::new(max_scroll).position(position);
+
+        let scrollbar = Scrollbar::default()
+            .orientation(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(Some("↑"))
+            .end_symbol(Some("↓"));
+
+        let scrollbar_area = Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height.saturating_sub(2),
+        };
+
+        f.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
     }
 
     fn get_tabs_line(&self, data: &AppData) -> Line<'static> {
@@ -159,7 +213,8 @@ impl DetailPanel {
             }
             KeyCode::Char('l') => {
                 self.active_pane = DetailPane::Logs;
-                self.log_scroll = 0;
+                let max = self.logs_len.saturating_sub(self.pane_height as usize);
+                self.log_scroll = max.min(u16::MAX as usize) as u16;
                 return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
                     DetailPane::Logs,
                 )));
