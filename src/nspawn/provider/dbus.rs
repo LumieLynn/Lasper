@@ -19,6 +19,10 @@ trait Manager {
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
     fn get_machine_addresses(&self, name: &str) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
+    #[zbus(signal)]
+    fn machine_new(&self, machine: String, path: OwnedObjectPath) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn machine_removed(&self, machine: String, path: OwnedObjectPath) -> zbus::Result<()>;
 }
 
 #[proxy(
@@ -251,6 +255,35 @@ impl DbusProvider {
         .await
         .map_err(NspawnError::Dbus)?;
         Ok(())
+    }
+
+    /// Block and watch for machine start/stop events. Sends a signal to tx whenever a change occurs.
+    pub async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+        use futures_util::StreamExt;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
+
+        let mut new_stream = proxy
+            .receive_machine_new()
+            .await
+            .map_err(NspawnError::Dbus)?;
+        let mut rm_stream = proxy
+            .receive_machine_removed()
+            .await
+            .map_err(NspawnError::Dbus)?;
+
+        loop {
+            tokio::select! {
+                Some(_) = new_stream.next() => {
+                    let _ = tx.send(()).await;
+                }
+                Some(_) = rm_stream.next() => {
+                    let _ = tx.send(()).await;
+                }
+            }
+        }
     }
 }
 

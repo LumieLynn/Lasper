@@ -127,17 +127,21 @@ impl App {
             tokio::sync::mpsc::channel::<crate::ui::core::BackendCommand>(100);
         self.ui.backend_tx = Some(backend_tx);
 
+        let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::channel::<()>(2);
+        self.data.manager.watch(dirty_tx.clone()).await;
+
         let manager_clone = self.data.manager.clone();
+        let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
-            loop {
+            while let Some(_) = dirty_rx.recv().await {
                 if let Ok(entries) = manager_clone.list_all().await {
-                    let _ = refresh_tx.send(entries).await;
+                    let _ = refresh_tx_clone.send(entries).await;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
 
-        self.refresh().await;
+        // Initial trigger
+        let _ = dirty_tx.send(()).await;
         loop {
             while let Ok(entries) = refresh_rx.try_recv() {
                 let prev_name = self
@@ -154,6 +158,14 @@ impl App {
 
                 if let Some(wizard) = &mut self.ui.wizard {
                     wizard.context.entries = self.data.entries.clone();
+                }
+
+                // Check if any DBus call fell back to CLI during this background refresh
+                if self.data.dbus_active && self.data.manager.did_fallback() {
+                    self.set_status(
+                        "DBus call failed — used CLI fallback".into(),
+                        crate::nspawn::StatusLevel::Warn,
+                    );
                 }
             }
 
