@@ -16,6 +16,8 @@ pub enum AppEvent {
     BackendResult(crate::ui::core::BackendResponse),
     /// Background action execution finished.
     ActionDone(String, crate::nspawn::StatusLevel),
+    /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
+    MetricsUpdate(String, f64, f64, f64),
 }
 
 /// Merges keyboard input and periodic ticks into one channel.

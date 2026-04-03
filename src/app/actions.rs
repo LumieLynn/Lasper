@@ -99,6 +99,9 @@ impl App {
                 }
                 self.data.config_content = new_content;
             }
+            DetailPane::Metrics => {
+                // Metrics are updated via AppEvent::MetricsUpdate
+            }
         }
     }
 

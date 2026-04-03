@@ -1,6 +1,7 @@
 pub mod configs;
 pub mod details;
 pub mod logs;
+pub mod metrics;
 pub mod properties;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -98,6 +99,7 @@ impl DetailPanel {
             DetailPane::Details => details::render(f, data, inner_area, &mut self.details_state),
             DetailPane::Logs => logs::render(f, data, inner_area, self.log_scroll),
             DetailPane::Config => configs::render(f, data, inner_area, self.config_scroll),
+            DetailPane::Metrics => metrics::render(f, data, inner_area),
         }
 
         // Render scrollbar
@@ -148,6 +150,7 @@ impl DetailPanel {
             DetailPane::Details => 1,
             DetailPane::Logs => 2,
             DetailPane::Config => 3,
+            DetailPane::Metrics => 4,
         };
 
         let stopped = data.entries.is_empty()
@@ -163,7 +166,7 @@ impl DetailPanel {
             " Logs "
         };
 
-        let labels = [" Properties ", " Details ", log_label, " Config "];
+        let labels = [" Properties ", " Details ", log_label, " Config ", " Metrics "];
 
         let mut spans = Vec::new();
 
@@ -224,6 +227,12 @@ impl DetailPanel {
                 self.config_scroll = 0;
                 return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
                     DetailPane::Config,
+                )));
+            }
+            KeyCode::Char('m') => {
+                self.active_pane = DetailPane::Metrics;
+                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                    DetailPane::Metrics,
                 )));
             }
 

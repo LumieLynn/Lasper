@@ -28,6 +28,32 @@ pub enum DetailPane {
     Details,
     Logs,
     Config,
+    Metrics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CpuRepresentation {
+    /// Aggregate usage across all cores (e.g., 230% for 2.3 cores)
+    Aggregate,
+    /// Normalized to total system capacity (e.g., 28% for 230% on an 8-core system)
+    Normalized,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerMetrics {
+    /// Time-series for CPU usage: (timestamp_offset_secs, percentage)
+    pub cpu_history: Vec<(f64, f64)>,
+    /// Time-series for RAM usage: (timestamp_offset_secs, megabytes)
+    pub ram_history: Vec<(f64, f64)>,
+}
+
+impl Default for ContainerMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_history: Vec::with_capacity(61),
+            ram_history: Vec::with_capacity(61),
+        }
+    }
 }
 
 /// Which top-level panel has keyboard focus.
@@ -92,7 +118,11 @@ pub struct AppData {
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
     pub action_cooldown: Option<Instant>,
-    pub transitions: std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
+    pub transitions:
+        std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
+    pub metrics: HashMap<String, ContainerMetrics>,
+    pub cpu_cores: usize,
+    pub cpu_representation: CpuRepresentation,
 }
 
 /// Global application state.
@@ -118,13 +148,21 @@ impl App {
                 manager: std::sync::Arc::new(DefaultManager::new(is_root)),
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
+                metrics: HashMap::new(),
+                cpu_cores: std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+                cpu_representation: CpuRepresentation::Aggregate,
             },
             ui: AppUi::new(is_root),
         }
     }
 
     /// Helper to apply active transitions (Starting/Exiting) to a list of entries.
-    pub fn merge_transitional_states(&mut self, mut entries: Vec<crate::nspawn::models::ContainerEntry>) -> Vec<crate::nspawn::models::ContainerEntry> {
+    pub fn merge_transitional_states(
+        &mut self,
+        mut entries: Vec<crate::nspawn::models::ContainerEntry>,
+    ) -> Vec<crate::nspawn::models::ContainerEntry> {
         let now = Instant::now();
         let timeout = std::time::Duration::from_secs(10);
 
@@ -137,10 +175,14 @@ impl App {
             if let Some(entry) = entries.iter().find(|e| &e.name == name) {
                 match state {
                     crate::nspawn::models::ContainerState::Starting => {
-                        if entry.state == crate::nspawn::models::ContainerState::Running { return false; }
+                        if entry.state == crate::nspawn::models::ContainerState::Running {
+                            return false;
+                        }
                     }
                     crate::nspawn::models::ContainerState::Exiting => {
-                        if entry.state == crate::nspawn::models::ContainerState::Off { return false; }
+                        if entry.state == crate::nspawn::models::ContainerState::Off {
+                            return false;
+                        }
                     }
                     _ => {}
                 }
@@ -157,57 +199,96 @@ impl App {
         entries
     }
 
+    /// Update entries and selection state from a background refresh.
+    async fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
+        let prev_name = self
+            .data
+            .entries
+            .get(self.data.selected)
+            .map(|e| e.name.clone());
+        self.data.entries = self.merge_transitional_states(entries);
+        self.data.selected = prev_name
+            .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
+            .unwrap_or(0)
+            .min(self.data.entries.len().saturating_sub(1));
+        self.refresh_detail().await;
+
+        if let Some(wizard) = &mut self.ui.wizard {
+            wizard.context.entries = self.data.entries.clone();
+        }
+
+        // Check if any DBus call fell back to CLI during this background refresh
+        if self.data.dbus_active && self.data.manager.did_fallback() {
+            self.set_status(
+                "DBus call failed — used CLI fallback".into(),
+                crate::nspawn::StatusLevel::Warn,
+            );
+        }
+    }
+
+    /// Forward backend response to the active wizard/context.
+    fn handle_backend_result(&mut self, res: crate::ui::core::BackendResponse) {
+        if let Some(wizard) = &mut self.ui.wizard {
+            let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
+            if let crate::ui::wizard::StepAction::Status(msg, level) = action {
+                self.set_status(msg, level);
+            }
+        }
+    }
+
+    /// Update metrics history for a container.
+    fn update_metrics(&mut self, name: String, time_x: f64, cpu: f64, ram: f64) {
+        let metrics = self.data.metrics.entry(name).or_default();
+        metrics.cpu_history.push((time_x, cpu));
+        metrics.ram_history.push((time_x, ram));
+        if metrics.cpu_history.len() > 60 {
+            metrics.cpu_history.remove(0);
+        }
+        if metrics.ram_history.len() > 60 {
+            metrics.ram_history.remove(0);
+        }
+    }
+
     /// Starts the main application loop.
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::ui::core::BackendCommand>(100);
+
         self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());
 
+        // Start nspawn metrics collection engine
+        crate::nspawn::metrics::spawn_collector(
+            events.tx.clone(),
+            self.data.cpu_cores,
+            self.data.cpu_representation,
+        );
+
+        // Start data monitoring engine (DBus + Inotify)
         let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::channel::<()>(2);
         self.data.manager.watch(dirty_tx.clone()).await;
 
+        // Start background refresh thread
         let manager_clone = self.data.manager.clone();
         let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
-            while let Some(_) = dirty_rx.recv().await {
+            while dirty_rx.recv().await.is_some() {
                 if let Ok(entries) = manager_clone.list_all().await {
                     let _ = refresh_tx_clone.send(entries).await;
                 }
             }
         });
 
-        // Initial trigger
         let _ = dirty_tx.send(()).await;
+
         loop {
             while let Ok(entries) = refresh_rx.try_recv() {
-                let prev_name = self
-                    .data
-                    .entries
-                    .get(self.data.selected)
-                    .map(|e| e.name.clone());
-                self.data.entries = self.merge_transitional_states(entries);
-                self.data.selected = prev_name
-                    .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
-                    .unwrap_or(0)
-                    .min(self.data.entries.len().saturating_sub(1));
-                self.refresh_detail().await;
-
-                if let Some(wizard) = &mut self.ui.wizard {
-                    wizard.context.entries = self.data.entries.clone();
-                }
-
-                // Check if any DBus call fell back to CLI during this background refresh
-                if self.data.dbus_active && self.data.manager.did_fallback() {
-                    self.set_status(
-                        "DBus call failed — used CLI fallback".into(),
-                        crate::nspawn::StatusLevel::Warn,
-                    );
-                }
+                self.sync_entries(entries).await;
             }
 
+            // Render a frame
             terminal.draw(|f| crate::ui::draw(f, self))?;
 
             tokio::select! {
@@ -215,65 +296,20 @@ impl App {
                     match event {
                         AppEvent::Key(key) => self.handle_key(key).await,
                         AppEvent::Tick => self.tick().await,
-                        AppEvent::BackendResult(res) => {
-                            if let Some(wizard) = &mut self.ui.wizard {
-                                let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
-                                if let crate::ui::wizard::StepAction::Status(msg, level) = action {
-                                    self.set_status(msg, level);
-                                }
-                            }
-                        }
+                        AppEvent::BackendResult(res) => self.handle_backend_result(res),
                         AppEvent::ActionDone(msg, level) => {
                             self.set_status(msg, level);
                             self.refresh().await;
                         }
+                        AppEvent::MetricsUpdate(name, time_x, cpu, ram) => self.update_metrics(name, time_x, cpu, ram),
                     }
                 }
                 Some(cmd) = backend_rx.recv() => {
-                    let tx = events.tx.clone();
-                    tokio::spawn(async move {
-                        match cmd {
-                            crate::ui::core::BackendCommand::SubmitConfig(ctx) => {
-                                let built = ctx.build_config();
-                                let (deployer, storage) = ctx.get_deployer_and_storage();
-                                let name = built.cfg.name.clone();
-                                let cfg = built.cfg;
-
-                                // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
-                                let (log_mpsc_tx, mut log_mpsc_rx) =
-                                    tokio::sync::mpsc::channel::<String>(100);
-                                let log_bcast_tx = ctx.deploy.log_tx.clone();
-                                tokio::spawn(async move {
-                                    while let Some(msg) = log_mpsc_rx.recv().await {
-                                        let _ = log_bcast_tx.send(msg);
-                                    }
-                                });
-
-                                let done = ctx.deploy.done.clone();
-                                let success = ctx.deploy.success.clone();
-
-                                // Run the real deployment in its own task
-                                tokio::spawn(async move {
-                                    crate::nspawn::deploy::run_deploy_task(
-                                        deployer, storage, name, cfg, log_mpsc_tx, done, success,
-                                    )
-                                    .await;
-                                });
-
-                                // Immediately navigate the wizard to the Deploy step
-                                let _ = tx.send(AppEvent::BackendResult(
-                                    crate::ui::core::BackendResponse::DeployStarted,
-                                )).await;
-                            }
-                            crate::ui::core::BackendCommand::ValidateBridge(_) => {
-                                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                                let _ = tx.send(AppEvent::BackendResult(crate::ui::core::BackendResponse::ValidationSuccess)).await;
-                            }
-                        }
-                    });
+                    crate::nspawn::handlers::handle_command(cmd, events.tx.clone());
                 }
                 else => break,
             }
+
             if self.should_quit {
                 events.stop();
                 break;
