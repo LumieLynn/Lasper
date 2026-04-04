@@ -10,10 +10,12 @@ use ratatui::{
 use crate::app::AppData;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
-    let container_name = match data.entries.get(data.selected) {
-        Some(e) => &e.name,
+    let entry = match data.entries.get(data.selected) {
+        Some(e) => e,
         None => return,
     };
+    let container_name = &entry.name;
+    let is_running = entry.state == crate::nspawn::models::ContainerState::Running;
 
     let metrics = match data.metrics.get(container_name) {
         Some(m) => m,
@@ -45,7 +47,11 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
     let cpu_dataset = Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(if is_running {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }))
         .data(cpu_data);
 
     // Calculate Y bounds for CPU based on min/max in current window
@@ -118,7 +124,11 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
     let ram_dataset = Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
-        .style(Style::default().fg(Color::Magenta))
+        .style(Style::default().fg(if is_running {
+            Color::Magenta
+        } else {
+            Color::DarkGray
+        }))
         .data(ram_data);
 
     let ram_chart = Chart::new(vec![ram_dataset])

@@ -4,7 +4,7 @@ use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
-    widgets::{Block, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 
@@ -59,6 +59,7 @@ impl Component for PasswordBox {
 
         let block = Block::default()
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .title(title)
             .border_style(style);
 
