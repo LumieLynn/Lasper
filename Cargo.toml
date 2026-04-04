@@ -10,8 +10,9 @@ path = "src/main.rs"
 
 [dependencies]
 ratatui = "0.29"
-crossterm = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

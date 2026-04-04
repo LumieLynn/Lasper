@@ -311,7 +311,6 @@ impl App {
             }
 
             if self.should_quit {
-                events.stop();
                 break;
             }
         }
