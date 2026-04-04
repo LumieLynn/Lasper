@@ -163,8 +163,7 @@ impl Wizard {
         match res {
             EventResult::Message(msg) => self.process_message(msg),
             EventResult::Consumed => StepAction::None,
-            EventResult::FocusNext => self.handle_action(StepAction::Next),
-            EventResult::FocusPrev => self.handle_action(StepAction::Prev),
+            EventResult::FocusNext | EventResult::FocusPrev => StepAction::None,
             EventResult::Ignored => match key.code {
                 KeyCode::Esc => self.handle_action(StepAction::Prev),
                 KeyCode::Char('q') => StepAction::Close,
