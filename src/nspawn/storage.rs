@@ -125,10 +125,12 @@ impl StorageBackend for DirectoryBackend {
 
     async fn delete(&self, name: &str) -> Result<()> {
         let path = self.get_path(name);
-        if path.exists() {
-            tokio::fs::remove_dir_all(&path)
-                .await
-                .map_err(|e| NspawnError::Io(path, e))?;
+        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                log::warn!("Directory already missing for deletion: {}", path.display());
+            } else {
+                return Err(NspawnError::Io(path, e));
+            }
         }
         Ok(())
     }
@@ -175,16 +177,20 @@ impl StorageBackend for SubvolumeBackend {
 
     async fn delete(&self, name: &str) -> Result<()> {
         let path = self.get_path(name);
-        if path.exists() {
-            let out = Command::new("btrfs")
-                .args(["subvolume", "delete", &path.to_string_lossy()])
-                .output()
-                .await
-                .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
-            if !out.status.success() {
+        let out = Command::new("btrfs")
+            .args(["subvolume", "delete", &path.to_string_lossy()])
+            .output()
+            .await
+            .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
+
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("no such file or directory") || err.contains("not a subvolume") {
+                log::warn!("Btrfs subvolume already missing for deletion: {}", path.display());
+            } else {
                 return Err(NspawnError::CommandFailed(
                     "btrfs subvolume delete".into(),
-                    String::from_utf8_lossy(&out.stderr).to_string(),
+                    err.to_string(),
                 ));
             }
         }
@@ -277,9 +283,6 @@ impl StorageBackend for RawBackend {
 
     async fn unmount(&self, name: &str) -> Result<()> {
         let mount_point = PathBuf::from(format!("/mnt/lasper-{}", name));
-        if !mount_point.exists() {
-            return Ok(());
-        }
 
         let out = Command::new("umount")
             .arg(&mount_point)
@@ -289,23 +292,29 @@ impl StorageBackend for RawBackend {
 
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            if !err.contains("not mounted") {
+            if !err.contains("not mounted") && !err.contains("no such file or directory") {
                 return Err(NspawnError::CommandFailed("umount".into(), err.to_string()));
             }
         }
 
         // Clean up mount point
-        let _ = tokio::fs::remove_dir(&mount_point).await;
+        if let Err(e) = tokio::fs::remove_dir(&mount_point).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::warn!("Failed to remove mount point {}: {}", mount_point.display(), e);
+            }
+        }
 
         Ok(())
     }
 
     async fn delete(&self, name: &str) -> Result<()> {
         let path = self.get_path(name);
-        if path.exists() {
-            tokio::fs::remove_file(&path)
-                .await
-                .map_err(|e| NspawnError::Io(path, e))?;
+        if let Err(e) = tokio::fs::remove_file(&path).await {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                log::warn!("Image file already missing for deletion: {}", path.display());
+            } else {
+                return Err(NspawnError::Io(path, e));
+            }
         }
         Ok(())
     }

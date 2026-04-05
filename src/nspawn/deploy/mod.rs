@@ -131,6 +131,9 @@ async fn run_deploy_internal(
 
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
+        if let Some(parent) = nspawn_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+        }
         std::fs::write(&nspawn_path, nspawn_content)
             .map_err(|e| NspawnError::Io(nspawn_path, e))?;
 

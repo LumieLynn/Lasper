@@ -247,8 +247,8 @@ impl Wizard {
         match action {
             StepAction::Next => {
                 if let Some(view) = &mut self.active_view {
-                    if let Err(e) = view.validate() {
-                        return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
+                    if view.validate().is_err() {
+                        return StepAction::None;
                     }
                     view.commit_to_context(&mut self.context);
                 }

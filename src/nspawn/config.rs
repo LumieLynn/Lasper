@@ -53,6 +53,9 @@ impl NspawnConfig {
         let final_content = Self::apply_gpu_passthrough_to_content(content, new_state, death_list)?;
 
         // Atomic write
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+        }
         let tmp_path = path.with_extension("nspawn.tmp");
         std::fs::write(&tmp_path, final_content)
             .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;

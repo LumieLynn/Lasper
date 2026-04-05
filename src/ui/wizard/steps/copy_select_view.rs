@@ -18,7 +18,7 @@ impl CopySelectStepView {
         Self {
             list: SharedContainerList::new(" Select container to clone ", initial_cursor),
             items_len: entries.len(),
-            focused: false,
+            focused: true,
         }
     }
 }

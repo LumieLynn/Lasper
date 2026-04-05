@@ -205,11 +205,7 @@ pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
 
 pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
     let dir = get_state_dir();
-    if !dir.exists() {
-        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-            log::warn!("Failed to create state directory {}: {}", dir.display(), e);
-        }
-    }
+    let _ = tokio::fs::create_dir_all(&dir).await;
     let path = dir.join(format!("{}.json", name));
     let content = serde_json::to_string_pretty(state)?;
     tokio::fs::write(&path, content)
@@ -322,9 +318,9 @@ async fn inject_persistent_device_allow(name: &str, state: &NvidiaState) -> Resu
         "/etc/systemd/system/systemd-nspawn@{}.service.d",
         name
     ));
-    if let Err(e) = tokio::fs::create_dir_all(&dir).await {
-        return Err(NspawnError::Io(dir, e));
-    }
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| NspawnError::Io(dir.clone(), e))?;
 
     let path = dir.join("10-lasper-nvidia.conf");
     let mut content = String::from("[Service]\n");

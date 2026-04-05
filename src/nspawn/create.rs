@@ -120,13 +120,13 @@ pub fn write_systemd_override(name: &str, device_binds: &[String], nvidia_gpu: b
         return Ok(());
     }
 
-    let dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
-    std::fs::create_dir_all(&dir).map_err(|e| NspawnError::Io(PathBuf::from(&dir), e))?;
+    let dir = PathBuf::from(format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name));
+    std::fs::create_dir_all(&dir).map_err(|e| NspawnError::Io(dir.clone(), e))?;
 
-    let path = format!("{}/override.conf", dir);
+    let path = dir.join("override.conf");
     let content = systemd_override_content(device_binds, nvidia_gpu);
 
-    std::fs::write(&path, content).map_err(|e| NspawnError::Io(PathBuf::from(&path), e))?;
+    std::fs::write(&path, content).map_err(|e| NspawnError::Io(path, e))?;
 
     let out = std::process::Command::new("systemctl")
         .arg("daemon-reload")
@@ -155,10 +155,10 @@ pub fn clone_systemd_override(source_name: &str, dest_name: &str) -> Result<()> 
         return Ok(());
     }
 
-    let dest_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", dest_name);
-    std::fs::create_dir_all(&dest_dir).map_err(|e| NspawnError::Io(PathBuf::from(&dest_dir), e))?;
+    let dest_dir = PathBuf::from(format!("/etc/systemd/system/systemd-nspawn@{}.service.d", dest_name));
+    std::fs::create_dir_all(&dest_dir).map_err(|e| NspawnError::Io(dest_dir.clone(), e))?;
 
-    let dest_path = format!("{}/override.conf", dest_dir);
+    let dest_path = dest_dir.join("override.conf");
     std::fs::copy(&source_path, &dest_path)
         .map_err(|e| NspawnError::Io(PathBuf::from(&dest_path), e))?;
 
@@ -207,6 +207,9 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
     );
 
     let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
+    if let Some(parent) = full_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+    }
     std::fs::write(&full_path, script_content).map_err(|e| NspawnError::Io(full_path, e))?;
 
     let shell = user.shell.as_str();
@@ -217,7 +220,7 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
             "{}/.config/fish/conf.d",
             home_dir.trim_start_matches('/')
         ));
-        let _ = std::fs::create_dir_all(&fish_dir);
+        std::fs::create_dir_all(&fish_dir).map_err(|e| NspawnError::Io(fish_dir.clone(), e))?;
         let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
         let fish_script = format!(
             r#"
@@ -229,8 +232,9 @@ ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
 "#,
             host_display
         );
-        std::fs::write(fish_dir.join("wayland-env.fish"), fish_script)
-            .map_err(|e| NspawnError::Io(fish_dir.join("wayland-env.fish"), e))?;
+        let script_path = fish_dir.join("wayland-env.fish");
+        std::fs::write(&script_path, fish_script)
+            .map_err(|e| NspawnError::Io(script_path, e))?;
         return Ok(());
     } else {
         ".bashrc"
@@ -293,10 +297,10 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
                 .await;
             if r.map(|o| o.status.success()).unwrap_or(false) {
                 let sudoers_dir = rootfs.join("etc/sudoers.d");
-                let _ = std::fs::create_dir_all(&sudoers_dir);
+                std::fs::create_dir_all(&sudoers_dir).map_err(|e| NspawnError::Io(sudoers_dir.clone(), e))?;
                 let sudoers_file = sudoers_dir.join(group);
                 let content = format!("%{} ALL=(ALL:ALL) ALL\n", group);
-                let _ = std::fs::write(&sudoers_file, content);
+                std::fs::write(&sudoers_file, content).map_err(|e| NspawnError::Io(sudoers_file.clone(), e))?;
 
                 #[cfg(unix)]
                 {
