@@ -7,8 +7,8 @@ pub enum NspawnError {
     #[error("Permission denied: root privileges required")]
     PermissionDenied,
 
-    #[error("Command '{0}' failed: {1}")]
-    CommandFailed(String, String),
+    #[error("Command Failed ({0}): {1}. Output: {2}")]
+    CommandFailed(String, String, String), // Context, Command, Error Output
 
     #[error("IO error in {0}: {1}")]
     Io(PathBuf, #[source] std::io::Error),
@@ -45,6 +45,16 @@ pub enum NspawnError {
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
+}
+
+impl NspawnError {
+    pub fn cmd_failed(context: impl Into<String>, cmd: impl Into<String>, output: &std::process::Output) -> Self {
+        Self::CommandFailed(
+            context.into(),
+            cmd.into(),
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NspawnError>;

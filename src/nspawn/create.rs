@@ -120,7 +120,10 @@ pub fn write_systemd_override(name: &str, device_binds: &[String], nvidia_gpu: b
         return Ok(());
     }
 
-    let dir = PathBuf::from(format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name));
+    let dir = PathBuf::from(format!(
+        "/etc/systemd/system/systemd-nspawn@{}.service.d",
+        name
+    ));
     std::fs::create_dir_all(&dir).map_err(|e| NspawnError::Io(dir.clone(), e))?;
 
     let path = dir.join("override.conf");
@@ -155,7 +158,10 @@ pub fn clone_systemd_override(source_name: &str, dest_name: &str) -> Result<()> 
         return Ok(());
     }
 
-    let dest_dir = PathBuf::from(format!("/etc/systemd/system/systemd-nspawn@{}.service.d", dest_name));
+    let dest_dir = PathBuf::from(format!(
+        "/etc/systemd/system/systemd-nspawn@{}.service.d",
+        dest_name
+    ));
     std::fs::create_dir_all(&dest_dir).map_err(|e| NspawnError::Io(dest_dir.clone(), e))?;
 
     let dest_path = dest_dir.join("override.conf");
@@ -233,8 +239,7 @@ ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
             host_display
         );
         let script_path = fish_dir.join("wayland-env.fish");
-        std::fs::write(&script_path, fish_script)
-            .map_err(|e| NspawnError::Io(script_path, e))?;
+        std::fs::write(&script_path, fish_script).map_err(|e| NspawnError::Io(script_path, e))?;
         return Ok(());
     } else {
         ".bashrc"
@@ -276,9 +281,10 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
     if !out.status.success() {
-        return Err(NspawnError::CommandFailed(
-            "useradd in container".into(),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "useradd in container",
+            format!("systemd-nspawn --directory {:?} useradd ...", rootfs),
+            &out,
         ));
     }
 
@@ -297,10 +303,12 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
                 .await;
             if r.map(|o| o.status.success()).unwrap_or(false) {
                 let sudoers_dir = rootfs.join("etc/sudoers.d");
-                std::fs::create_dir_all(&sudoers_dir).map_err(|e| NspawnError::Io(sudoers_dir.clone(), e))?;
+                std::fs::create_dir_all(&sudoers_dir)
+                    .map_err(|e| NspawnError::Io(sudoers_dir.clone(), e))?;
                 let sudoers_file = sudoers_dir.join(group);
                 let content = format!("%{} ALL=(ALL:ALL) ALL\n", group);
-                std::fs::write(&sudoers_file, content).map_err(|e| NspawnError::Io(sudoers_file.clone(), e))?;
+                std::fs::write(&sudoers_file, content)
+                    .map_err(|e| NspawnError::Io(sudoers_file.clone(), e))?;
 
                 #[cfg(unix)]
                 {
@@ -333,9 +341,10 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
         if !res.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "chpasswd in container".into(),
-                String::from_utf8_lossy(&res.stderr).trim().to_string(),
+            return Err(NspawnError::cmd_failed(
+                "chpasswd in container",
+                format!("systemd-nspawn --directory {:?} sh -c ...", rootfs),
+                &res,
             ));
         }
     }
@@ -364,9 +373,10 @@ pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
     if !res.status.success() {
-        return Err(NspawnError::CommandFailed(
-            "chpasswd for root in container".into(),
-            String::from_utf8_lossy(&res.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "chpasswd for root in container",
+            format!("systemd-nspawn --directory {:?} sh -c ...", rootfs),
+            &res,
         ));
     }
     Ok(())
@@ -395,9 +405,13 @@ pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
     if !res.status.success() {
-        return Err(NspawnError::CommandFailed(
-            "systemctl enable in container".into(),
-            String::from_utf8_lossy(&res.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "systemctl enable in container",
+            format!(
+                "systemd-nspawn --directory {:?} systemctl enable ...",
+                rootfs
+            ),
+            &res,
         ));
     }
 

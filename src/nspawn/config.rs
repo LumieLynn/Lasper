@@ -54,7 +54,8 @@ impl NspawnConfig {
 
         // Atomic write
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
         }
         let tmp_path = path.with_extension("nspawn.tmp");
         std::fs::write(&tmp_path, final_content)
@@ -181,8 +182,8 @@ impl NspawnConfig {
             }
             let s = new_conf.section_mut(Some("Files")).unwrap();
 
-            // Markers
-            s.append("X-Lasper-Nvidia-Begin", &new_state.driver_version);
+            // Markers (Phase 3: Static semantic tagging)
+            s.append("X-Lasper-Nvidia-Begin", "managed-by-lasper");
             for dev in &new_state.device_binds {
                 s.append("Bind", dev.clone());
             }
@@ -252,7 +253,7 @@ mod tests {
 
         // Should have markers (rust-ini might add spaces, so we check for fragments)
         assert!(mutated.contains("X-Lasper-Nvidia-Begin"));
-        assert!(mutated.contains("550.54"));
+        assert!(mutated.contains("managed-by-lasper"));
         assert!(mutated.contains("X-Lasper-Nvidia-End"));
 
         // Should have only ONE /dev/nvidia0 bind

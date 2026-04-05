@@ -64,6 +64,11 @@ async fn run_deploy_internal(
     // 1. Create storage
     let is_ext = deployer.is_external_storage_managed();
     if !is_ext {
+        log::info!(
+            "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
+            name,
+            storage.get_type().label()
+        );
         push_log!(format!(
             "Creating storage (type: {:?})...",
             storage.get_type()
@@ -73,6 +78,10 @@ async fn run_deploy_internal(
 
     // 2. Mount storage (returns rootfs path)
     let rootfs = if !is_ext {
+        log::info!(
+            "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
+            name
+        );
         push_log!("Mounting storage...".to_string());
         storage.mount(&name).await?
     } else {
@@ -84,6 +93,10 @@ async fn run_deploy_internal(
     // Use a scoped guard-like pattern to ensure unmount
     let result = async {
         // 3. Perform base deployment
+        log::info!(
+            "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
+            name
+        );
         deployer.deploy(&name, &cfg, &rootfs, logs.clone()).await?;
 
         // 4. Post-deployment configuration (skipped for clones as they are already configured)
@@ -132,12 +145,17 @@ async fn run_deploy_internal(
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
         if let Some(parent) = nspawn_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
         }
         std::fs::write(&nspawn_path, nspawn_content)
             .map_err(|e| NspawnError::Io(nspawn_path, e))?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
+            log::info!(
+                "[AUDIT] [Container: {}] [Step: Config] Writing systemd service override...",
+                name
+            );
             push_log!("Writing systemd service override...".to_string());
             crate::nspawn::create::write_systemd_override(
                 &name,

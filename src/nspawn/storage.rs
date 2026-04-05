@@ -9,7 +9,7 @@ use tokio::process::Command;
 pub enum StorageType {
     Directory,
     Subvolume,
-    Raw,
+    DiskImage,
 }
 
 impl StorageType {
@@ -17,7 +17,7 @@ impl StorageType {
         match self {
             Self::Directory => "Directory",
             Self::Subvolume => "Btrfs Subvolume",
-            Self::Raw => "Raw Sparse File",
+            Self::DiskImage => "Disk Image (Raw/Qcow2/Block)",
         }
     }
 
@@ -26,7 +26,7 @@ impl StorageType {
             Self::Directory | Self::Subvolume => {
                 PathBuf::from(format!("/var/lib/machines/{}", name))
             }
-            Self::Raw => PathBuf::from(format!("/var/lib/machines/{}.raw", name)),
+            Self::DiskImage => PathBuf::from(format!("/var/lib/machines/{}.raw", name)),
         }
     }
 }
@@ -41,7 +41,7 @@ pub fn detect_available_storage_types() -> StorageInfo {
     let machines_dir = Path::new("/var/lib/machines");
     let mut types = vec![
         (StorageType::Directory, true),
-        (StorageType::Raw, true),
+        (StorageType::DiskImage, true),
         (StorageType::Subvolume, false),
     ];
 
@@ -68,9 +68,10 @@ fn get_filesystem_type(path: &Path) -> Result<String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
-        Err(NspawnError::CommandFailed(
-            "stat".into(),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        Err(NspawnError::cmd_failed(
+            "stat filesystem type",
+            format!("stat -f -c %T {}", path.display()),
+            &out,
         ))
     }
 }
@@ -88,12 +89,44 @@ pub trait StorageBackend: Send + Sync {
     async fn mount(&self, name: &str) -> Result<PathBuf>;
 
     /// Unmount the storage.
-    async fn unmount(&self, _name: &str) -> Result<()>;
+    async fn unmount(&self, name: &str) -> Result<()>;
 
     #[allow(dead_code)]
     async fn delete(&self, name: &str) -> Result<()>;
     #[allow(dead_code)]
     async fn exists(&self, name: &str) -> bool;
+}
+
+/// Factory function to get the appropriate storage backend for an existing machine.
+pub fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
+    let base = PathBuf::from("/var/lib/machines").join(name);
+    
+    // 1. Check for well-known disk image extensions
+    let extensions = ["raw", "qcow2", "img", "iso"];
+    for ext in extensions {
+        let path = base.with_extension(ext);
+        if path.exists() {
+            return Box::new(DiskImageBackend {
+                config: Default::default(),
+            });
+        }
+    }
+
+    // 2. Check if a block device exists with this name (e.g. /dev/lasper-name)
+    let block_dev = PathBuf::from(format!("/dev/{}", name));
+    if block_dev.exists() {
+        if let Ok(meta) = std::fs::metadata(&block_dev) {
+            use std::os::unix::fs::FileTypeExt;
+            if meta.file_type().is_block_device() {
+                return Box::new(DiskImageBackend {
+                    config: Default::default(),
+                });
+            }
+        }
+    }
+
+    // 3. Fallback to directory/subvolume
+    Box::new(DirectoryBackend)
 }
 
 pub struct DirectoryBackend;
@@ -159,9 +192,10 @@ impl StorageBackend for SubvolumeBackend {
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "btrfs subvolume create".into(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
+            return Err(NspawnError::cmd_failed(
+                "btrfs subvolume create",
+                format!("btrfs subvolume create {}", path.display()),
+                &out,
             ));
         }
         Ok(path)
@@ -188,9 +222,10 @@ impl StorageBackend for SubvolumeBackend {
             if err.contains("no such file or directory") || err.contains("not a subvolume") {
                 log::warn!("Btrfs subvolume already missing for deletion: {}", path.display());
             } else {
-                return Err(NspawnError::CommandFailed(
-                    "btrfs subvolume delete".into(),
-                    err.to_string(),
+                return Err(NspawnError::cmd_failed(
+                    "btrfs subvolume delete",
+                    format!("btrfs subvolume delete {}", path.display()),
+                    &out,
                 ));
             }
         }
@@ -202,14 +237,14 @@ impl StorageBackend for SubvolumeBackend {
     }
 }
 
-pub struct RawBackend {
-    pub config: super::models::RawStorageConfig,
+pub struct DiskImageBackend {
+    pub config: super::models::DiskImageConfig,
 }
 
 #[async_trait::async_trait]
-impl StorageBackend for RawBackend {
+impl StorageBackend for DiskImageBackend {
     fn get_type(&self) -> StorageType {
-        StorageType::Raw
+        StorageType::DiskImage
     }
     fn get_path(&self, name: &str) -> PathBuf {
         PathBuf::from(format!("/var/lib/machines/{}.raw", name))
@@ -224,9 +259,10 @@ impl StorageBackend for RawBackend {
             .await
             .map_err(|e| NspawnError::Io(path.clone(), e))?;
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "truncate".into(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
+            return Err(NspawnError::cmd_failed(
+                "truncate sparse file",
+                format!("truncate -s {} {}", self.config.size, path.display()),
+                &out,
             ));
         }
 
@@ -242,9 +278,10 @@ impl StorageBackend for RawBackend {
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from(&mkfs_prog), e))?;
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                mkfs_prog,
-                String::from_utf8_lossy(&out.stderr).to_string(),
+            return Err(NspawnError::cmd_failed(
+                format!("filesystem format ({})", mkfs_prog),
+                format!("{} -F {}", mkfs_prog, path.display()),
+                &out,
             ));
         }
         Ok(path)
@@ -259,22 +296,22 @@ impl StorageBackend for RawBackend {
             .await
             .map_err(|e| NspawnError::Io(mount_point.clone(), e))?;
 
-        // Find/Setup loop device and mount in one go using 'mount -o loop'
-        let out = Command::new("mount")
+        // Use systemd-dissect for robust mounting (handles GPT/MBR/DPS)
+        let out = Command::new("systemd-dissect")
             .args([
-                "-o",
-                "loop",
+                "--mount",
                 &img_path.to_string_lossy(),
                 &mount_point.to_string_lossy(),
             ])
             .output()
             .await
-            .map_err(|e| NspawnError::Io(PathBuf::from("mount"), e))?;
+            .map_err(|e| NspawnError::Io(PathBuf::from("systemd-dissect"), e))?;
 
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "mount".into(),
-                String::from_utf8_lossy(&out.stderr).to_string(),
+            return Err(NspawnError::cmd_failed(
+                "systemd-dissect mount",
+                format!("systemd-dissect --mount {} {}", img_path.display(), mount_point.display()),
+                &out,
             ));
         }
 
@@ -284,16 +321,24 @@ impl StorageBackend for RawBackend {
     async fn unmount(&self, name: &str) -> Result<()> {
         let mount_point = PathBuf::from(format!("/mnt/lasper-{}", name));
 
-        let out = Command::new("umount")
-            .arg(&mount_point)
+        // Use systemd-dissect for robust unmounting
+        let out = Command::new("systemd-dissect")
+            .args([
+                "--umount",
+                &mount_point.to_string_lossy(),
+            ])
             .output()
             .await
-            .map_err(|e| NspawnError::Io(mount_point.clone(), e))?;
+            .map_err(|e| NspawnError::Io(PathBuf::from("systemd-dissect"), e))?;
 
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             if !err.contains("not mounted") && !err.contains("no such file or directory") {
-                return Err(NspawnError::CommandFailed("umount".into(), err.to_string()));
+                return Err(NspawnError::cmd_failed(
+                    "systemd-dissect umount",
+                    format!("systemd-dissect --umount {}", mount_point.display()),
+                    &out,
+                ));
             }
         }
 

@@ -33,7 +33,7 @@ pub struct BasicConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorageConfig {
     pub storage_type: StorageType,
-    pub raw_config: Option<crate::nspawn::models::RawStorageConfig>,
+    pub disk_config: Option<crate::nspawn::models::DiskImageConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -93,7 +93,7 @@ impl ContainerConfigBuilder {
 
         let storage = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
             storage_type: StorageType::Directory,
-            raw_config: None,
+            disk_config: None,
         });
 
         let user = self.user.as_ref().cloned().unwrap_or(UserConfig {
@@ -114,7 +114,7 @@ impl ContainerConfigBuilder {
             users: user.users.clone(),
             wayland_socket: passthrough.wayland_socket,
             nvidia_gpu: passthrough.nvidia_gpu,
-            raw_config: storage.raw_config.clone(),
+            disk_config: storage.disk_config.clone(),
         };
 
         if let Some(source) = &self.source {
@@ -156,16 +156,16 @@ impl ContainerConfigBuilder {
 
         let storage_cfg = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
             storage_type: StorageType::Directory,
-            raw_config: None,
+            disk_config: None,
         });
 
         let storage: Box<dyn StorageBackend> = match storage_cfg.storage_type {
             StorageType::Directory => Box::new(DirectoryBackend),
             StorageType::Subvolume => Box::new(SubvolumeBackend),
-            StorageType::Raw => Box::new(RawBackend {
+            StorageType::DiskImage => Box::new(DiskImageBackend {
                 config: storage_cfg
-                    .raw_config
-                    .unwrap_or(crate::nspawn::models::RawStorageConfig {
+                    .disk_config
+                    .unwrap_or(crate::nspawn::models::DiskImageConfig {
                         size: "2G".to_string(),
                         fs_type: "ext4".to_string(),
                         use_partition_table: false,

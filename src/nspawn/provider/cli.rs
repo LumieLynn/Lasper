@@ -21,9 +21,10 @@ impl CliProvider {
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                format!("machinectl {:?}", args),
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            return Err(NspawnError::cmd_failed(
+                "machinectl execution",
+                format!("machinectl {}", args.join(" ")),
+                &out,
             ));
         }
         Ok(())
@@ -39,9 +40,10 @@ impl CliProvider {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if !stderr.is_empty() && !stderr.contains("No machines") {
-                return Err(NspawnError::CommandFailed(
-                    "machinectl list".into(),
-                    stderr.trim().to_string(),
+                return Err(NspawnError::cmd_failed(
+                    "machinectl list",
+                    "machinectl list -l --no-legend --no-pager",
+                    &out,
                 ));
             }
             return Ok(HashMap::new());
@@ -108,9 +110,10 @@ impl CliProvider {
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "machinectl list-images".into(),
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            return Err(NspawnError::cmd_failed(
+                "machinectl list-images",
+                "machinectl list-images -l --no-legend --no-pager",
+                &out,
             ));
         }
 
@@ -267,6 +270,7 @@ impl CliProvider {
             return Err(NspawnError::CommandFailed(
                 format!("machinectl/systemctl show {}", name),
                 "No properties found".to_string(),
+                "The target machine might not exist or systemd-nspawn is not managing it.".to_string(),
             ));
         }
 

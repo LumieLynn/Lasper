@@ -41,9 +41,10 @@ impl Deployer for CloneDeployer {
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
         if !out.status.success() {
-            return Err(NspawnError::CommandFailed(
-                "machinectl clone".into(),
-                String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            return Err(NspawnError::cmd_failed(
+                "machinectl clone",
+                format!("machinectl clone {} {}", self.source_name, name),
+                &out,
             ));
         }
 

@@ -14,11 +14,11 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let is_raw = $self.is_raw_selected();
+        let is_disk = $self.is_disk_image_selected();
         let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
-        if is_raw {
-            comps.push(&mut $self.raw_size);
-            comps.push(&mut $self.raw_fs);
+        if is_disk {
+            comps.push(&mut $self.disk_size);
+            comps.push(&mut $self.disk_fs);
         }
         comps
     }};
@@ -26,8 +26,8 @@ macro_rules! active_comps {
 
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
-    raw_size: TextBox,
-    raw_fs: TextBox,
+    disk_size: TextBox,
+    disk_fs: TextBox,
     info: StorageInfo,
     focus: FocusTracker,
 }
@@ -48,11 +48,11 @@ impl StorageStepView {
             .unwrap_or(0);
         list.select(type_idx);
 
-        let raw_cfg =
+        let disk_cfg =
             initial_data
-                .raw_config
+                .disk_config
                 .clone()
-                .unwrap_or(crate::nspawn::models::RawStorageConfig {
+                .unwrap_or(crate::nspawn::models::DiskImageConfig {
                     size: "2G".to_string(),
                     fs_type: "ext4".to_string(),
                     use_partition_table: false,
@@ -60,7 +60,7 @@ impl StorageStepView {
 
         let mut view = Self {
             list,
-            raw_size: TextBox::new(" Raw Image Size (e.g. 2G, 500M) ", raw_cfg.size)
+            disk_size: TextBox::new(" Disk Volume Size (e.g. 2G, 500M) ", disk_cfg.size)
                 .with_validator(|v| {
                     if v.trim().is_empty() {
                         Err("Size required".into())
@@ -68,8 +68,7 @@ impl StorageStepView {
                         Ok(())
                     }
                 }),
-
-            raw_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", raw_cfg.fs_type).with_validator(
+            disk_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", disk_cfg.fs_type).with_validator(
                 |v| {
                     if v.trim().is_empty() {
                         Err("Filesystem required".into())
@@ -86,9 +85,9 @@ impl StorageStepView {
         view
     }
 
-    fn is_raw_selected(&self) -> bool {
+    fn is_disk_image_selected(&self) -> bool {
         if let Some((st, _)) = self.list.selected_item() {
-            return *st == StorageType::Raw;
+            return *st == StorageType::DiskImage;
         }
         false
     }
@@ -116,13 +115,13 @@ impl StorageStepView {
 
 impl Component for StorageStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        let is_raw = self.is_raw_selected();
+        let is_disk = self.is_disk_image_selected();
 
         let mut constraints = vec![
             Constraint::Length(1), // Title
             Constraint::Min(0),    // List
         ];
-        if is_raw {
+        if is_disk {
             constraints.push(Constraint::Length(3)); // Size
             constraints.push(Constraint::Length(3)); // FS
         }
@@ -143,9 +142,9 @@ impl Component for StorageStepView {
 
         self.list.render(f, chunks[1]);
 
-        if is_raw {
-            self.raw_size.render(f, chunks[2]);
-            self.raw_fs.render(f, chunks[3]);
+        if is_disk {
+            self.disk_size.render(f, chunks[2]);
+            self.disk_fs.render(f, chunks[3]);
         }
     }
 
@@ -193,8 +192,8 @@ impl Component for StorageStepView {
             self.update_focus();
         } else {
             self.list.set_focus(false);
-            self.raw_size.set_focus(false);
-            self.raw_fs.set_focus(false);
+            self.disk_size.set_focus(false);
+            self.disk_fs.set_focus(false);
         }
     }
 
@@ -203,9 +202,9 @@ impl Component for StorageStepView {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        if self.is_raw_selected() {
-            self.raw_size.validate()?;
-            self.raw_fs.validate()?;
+        if self.is_disk_image_selected() {
+            self.disk_size.validate()?;
+            self.disk_fs.validate()?;
         }
         Ok(())
     }
@@ -216,8 +215,8 @@ impl StepComponent for StorageStepView {
         if let Some(idx) = self.list.selected_idx() {
             ctx.storage.type_idx = idx;
         }
-        ctx.storage.raw_size = self.raw_size.value().to_string();
-        ctx.storage.raw_fs = self.raw_fs.value().to_string();
+        ctx.storage.disk_size = self.disk_size.value().to_string();
+        ctx.storage.disk_fs = self.disk_fs.value().to_string();
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {

@@ -54,9 +54,9 @@ impl BasicState {
 pub struct StorageState {
     pub type_idx: usize,
     pub info: StorageInfo,
-    pub raw_size: String,
-    pub raw_fs: String,
-    pub raw_partition: bool,
+    pub disk_size: String,
+    pub disk_fs: String,
+    pub disk_partition: bool,
 }
 
 impl StorageState {
@@ -64,11 +64,11 @@ impl StorageState {
         let (st, _) = self.info.types[self.type_idx].clone();
         StorageConfig {
             storage_type: st,
-            raw_config: if st == StorageType::Raw {
-                Some(crate::nspawn::models::RawStorageConfig {
-                    size: self.raw_size.clone(),
-                    fs_type: self.raw_fs.clone(),
-                    use_partition_table: self.raw_partition,
+            disk_config: if st == StorageType::DiskImage {
+                Some(crate::nspawn::models::DiskImageConfig {
+                    size: self.disk_size.clone(),
+                    fs_type: self.disk_fs.clone(),
+                    use_partition_table: self.disk_partition,
                 })
             } else {
                 None
@@ -249,9 +249,9 @@ impl WizardContext {
             storage: StorageState {
                 type_idx: 0,
                 info: crate::nspawn::storage::detect_available_storage_types(),
-                raw_size: "2G".to_string(),
-                raw_fs: "ext4".to_string(),
-                raw_partition: false,
+                disk_size: "2G".to_string(),
+                disk_fs: "ext4".to_string(),
+                disk_partition: false,
             },
             user: UserState {
                 root_password: "".to_string(),

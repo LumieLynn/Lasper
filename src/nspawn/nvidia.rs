@@ -24,56 +24,159 @@ impl NvidiaState {
     }
 }
 
-/// Get the current NVIDIA driver version on the host.
-pub async fn get_host_driver_version() -> Result<String> {
-    let path = "/sys/module/nvidia/version";
-    tokio::fs::read_to_string(path)
-        .await
-        .map(|s| s.trim().to_string())
-        .map_err(|e| NspawnError::Io(PathBuf::from(path), e))
+macro_rules! log_step {
+    ($name:expr, $step:expr, $msg:expr) => {
+        log::info!("[AUDIT] [Container: {}] [Step: {}] {}", $name, $step, $msg);
+    };
+    ($name:expr, $step:expr, $fmt:expr, $($arg:tt)*) => {
+        log::info!("[AUDIT] [Container: {}] [Step: {}] {}", $name, $step, format!($fmt, $($arg)*));
+    };
 }
 
-/// Perform a comprehensive scan of the host using nvidia-container-cli and dynamic directory scans.
+// CDI Parsing Structs for industry-standard discovery (ISO/IEC 20248 compliant)
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdiSpec {
+    container_edits: Option<CdiEdits>,
+    devices: Option<Vec<CdiDevice>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdiDevice {
+    #[allow(dead_code)]
+    name: String,
+    container_edits: Option<CdiEdits>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdiEdits {
+    device_nodes: Option<Vec<CdiDeviceNode>>,
+    mounts: Option<Vec<CdiMount>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdiDeviceNode {
+    path: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CdiMount {
+    host_path: String,
+}
+
+/// Get the current NVIDIA driver version on the host.
+/// Gracefully handles WSL and missing sysfs nodes.
+pub async fn get_host_driver_version() -> Result<String> {
+    let path = "/sys/module/nvidia/version";
+    match tokio::fs::read_to_string(path).await {
+        Ok(s) => Ok(s.trim().to_string()),
+        Err(_) => {
+            log::debug!(
+                "Could not read host driver version from {}, assuming unknown/WSL",
+                path
+            );
+            Ok("unknown_or_wsl".to_string())
+        }
+    }
+}
+
+/// Perform a comprehensive scan of the host using the official NVIDIA CDI standard.
 pub async fn get_nvidia_state() -> Result<NvidiaState> {
     let mut state = NvidiaState {
         driver_version: get_host_driver_version().await.unwrap_or_default(),
         ..Default::default()
     };
 
-    // 1. Get base mounts from nvidia-container-cli
-    let cli_list = run_nvidia_container_cli_list().await?;
-    for path in cli_list {
-        if path.starts_with("/dev/") {
-            state.device_binds.push(path);
-        } else {
-            state.readonly_binds.push(path);
-        }
+    // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp file
+    let tmp_path = format!("/tmp/lasper-cdi-{}.json", std::process::id());
+    let out = Command::new("nvidia-ctk")
+        .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path)])
+        .output()
+        .await
+        .map_err(|e| {
+            NspawnError::Runtime(format!("Failed to execute 'nvidia-ctk': {}. Please ensure nvidia-container-toolkit is installed.", e))
+        })?;
+
+    if !out.status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(NspawnError::cmd_failed(
+            "NVIDIA CDI Discovery",
+            format!(
+                "nvidia-ctk cdi generate --format=json --output={}",
+                tmp_path
+            ),
+            &out,
+        ));
     }
 
-    // 2. Dynamic scan for Graphics/EGL/Vulkan JSONs
-    let standard_dirs = [
-        "/usr/share/glvnd/egl_vendor.d",
-        "/usr/share/vulkan/icd.d",
-        "/usr/share/vulkan/implicit_layer.d",
-        "/usr/share/egl/egl_external_platform.d",
-        "/etc/vulkan/icd.d",
-        "/etc/glvnd/egl_vendor.d",
-    ];
+    // Check if the file was actually created and has content
+    let path = std::path::Path::new(&tmp_path);
+    if !path.exists() {
+        return Err(NspawnError::Runtime(format!(
+            "nvidia-ctk reported success but no CDI file was created at {}",
+            tmp_path
+        )));
+    }
 
-    for &dir in &standard_dirs {
-        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let file_name = entry.file_name().to_string_lossy().to_lowercase();
-                if file_name.contains("nvidia") && file_name.ends_with(".json") {
-                    state
-                        .readonly_binds
-                        .push(entry.path().to_string_lossy().into_owned());
-                }
+    let content = tokio::fs::read(&tmp_path)
+        .await
+        .map_err(|e| NspawnError::Io(std::path::PathBuf::from(&tmp_path), e))?;
+
+    if content.is_empty() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        log::warn!("nvidia-ctk generated an empty CDI file. Assuming no NVIDIA devices are present or driver is inactive.");
+        return Ok(state);
+    }
+
+    let spec: CdiSpec = match serde_json::from_slice(&content) {
+        Ok(s) => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            s
+        }
+        Err(e) => {
+            log::error!(
+                "CDI Raw Output (saved at {}): {}",
+                tmp_path,
+                String::from_utf8_lossy(&content)
+            );
+            return Err(NspawnError::Runtime(format!(
+                "Failed to parse CDI JSON (check {}): {}",
+                tmp_path, e
+            )));
+        }
+    };
+
+    // Collect edits from top-level or from devices
+    let mut all_edits = Vec::new();
+    if let Some(edits) = spec.container_edits {
+        all_edits.push(edits);
+    }
+    if let Some(devices) = spec.devices {
+        for dev in devices {
+            if let Some(edits) = dev.container_edits {
+                all_edits.push(edits);
             }
         }
     }
 
-    // 3. Resolve symlinks for .so files
+    for edits in all_edits {
+        if let Some(nodes) = edits.device_nodes {
+            for node in nodes {
+                state.device_binds.push(node.path);
+            }
+        }
+        if let Some(mounts) = edits.mounts {
+            for mount in mounts {
+                state.readonly_binds.push(mount.host_path);
+            }
+        }
+    }
+
+    // 2. Symlink Magic: Resolve aliases for .so files to ensure compatibility
     let mut resolved_libs = Vec::new();
     for path in &state.readonly_binds {
         if path.contains(".so") {
@@ -84,74 +187,94 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     }
     state.readonly_binds.extend(resolved_libs);
 
-    // 4. Cleanup and dedup
+    // 3. Cleanup and dedup
     state.device_binds = dedup(state.device_binds);
     state.readonly_binds = dedup(state.readonly_binds);
 
     Ok(state)
 }
 
-/// Physically remove legacy 0-byte driver files inside the container using systemd-nspawn.
 pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Result<()> {
-    // Construct a shell script to check for 0-byte files and delete them.
-    // Safety: only delete if file exists and has size 0 ( ! -s ).
-    // Heuristic: also look for any residual nvidia/cuda 0-byte files.
-    let mut script = String::from("for f in");
+    log_step!(
+        name,
+        "Cleanup",
+        "Inspecting and removing 0-byte driver files from host..."
+    );
+
+    // 1. Mount rootfs
+    let backend = super::storage::get_storage_backend_for(name);
+    let rootfs = backend.mount(name).await?;
+
+    // 2. Precise cleanup: Iterate and remove 0-byte files
     for path in death_list {
-        script.push_str(&format!(" '{}'", path));
-    }
-    script.push_str("; do [ -f \"$f\" ] && [ ! -s \"$f\" ] && rm -v \"$f\"; done; ");
-    script.push_str("find /usr/lib /etc /usr/share -maxdepth 4 -type f \\( -name '*nvidia*' -o -name '*cuda*' \\) -size 0 -delete -print");
-
-    log::info!("Cleaning up legacy driver files in container {}...", name);
-
-    let out = Command::new("systemd-nspawn")
-        .arg("-M")
-        .arg(name)
-        .arg("-q")
-        .arg("--")
-        .arg("/bin/sh")
-        .arg("-c")
-        .arg(&script)
-        .output()
-        .await
-        .map_err(|e| {
-            NspawnError::Runtime(format!("Failed to execute cleanup in container: {}", e))
-        })?;
-
-    if !out.status.success() {
-        log::warn!(
-            "In-container cleanup reported issues: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    } else {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if !stdout.trim().is_empty() {
-            log::debug!("Cleanup output:\n{}", stdout);
+        let target = rootfs.join(path.trim_start_matches('/'));
+        if target.exists() {
+            if let Ok(meta) = tokio::fs::metadata(&target).await {
+                if meta.len() == 0 {
+                    log_step!(name, "Cleanup", "Deleting 0-byte junk: {}", path);
+                    let _ = tokio::fs::remove_file(&target).await;
+                }
+            }
         }
     }
+
+    // 3. Fallback scan for broad cleanup (precision host-side find)
+    let scan_dirs = ["usr/lib", "etc", "usr/share"];
+    for dir in scan_dirs {
+        let dir_path = rootfs.join(dir);
+        if dir_path.exists() {
+            let _ = cleanup_recursive_0byte(&dir_path).await;
+        }
+    }
+
+    // 4. Unmount
+    let _ = backend.unmount(name).await;
 
     Ok(())
 }
 
-async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
-    let out = Command::new("nvidia-container-cli")
-        .arg("list")
-        .output()
+async fn cleanup_recursive_0byte(path: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(path)
         .await
-        .map_err(|_| {
-            NspawnError::Runtime(
-                "Dependency missing: Please install 'nvidia-container-toolkit' on the host.".into(),
-            )
-        })?;
-
-    let paths = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    Ok(paths)
+        .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let p = entry.path();
+        if p.is_dir() {
+            let _ = Box::pin(cleanup_recursive_0byte(&p)).await;
+        } else {
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
+            if (name.contains("nvidia") || name.contains("cuda"))
+                && entry.metadata().await.map(|m| m.len()).unwrap_or(1) == 0
+            {
+                let _ = tokio::fs::remove_file(&p).await;
+            }
+        }
+    }
+    Ok(())
 }
+
+// async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
+//     let out = Command::new("nvidia-container-cli")
+//         .arg("list")
+//         .output()
+//         .await
+//         .map_err(|_| {
+//             NspawnError::Runtime(
+//                 "Dependency missing: Please install 'nvidia-container-toolkit' on the host.".into(),
+//             )
+//         })?;
+
+//     let paths = String::from_utf8_lossy(&out.stdout)
+//         .lines()
+//         .map(|l| l.trim().to_string())
+//         .filter(|l| !l.is_empty())
+//         .collect();
+//     Ok(paths)
+// }
 
 fn get_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LASPER_STATE_DIR") {
@@ -184,23 +307,21 @@ pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
-    let out = Command::new("systemd-nspawn")
-        .arg("-M")
-        .arg(name)
-        .arg("-q")
-        .arg("--")
-        .arg("cat")
-        .arg("/etc/.lasper-nvidia.json")
-        .output()
-        .await;
+    let backend = super::storage::get_storage_backend_for(name);
+    let rootfs = backend.mount(name).await?;
+    let path = rootfs.join("etc/.lasper-nvidia.json");
 
-    match out {
-        Ok(o) if o.status.success() => {
-            let state: NvidiaState = serde_json::from_slice(&o.stdout)?;
-            Ok(Some(state))
+    let res = if path.exists() {
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) => serde_json::from_str(&content).ok(),
+            Err(_) => None,
         }
-        _ => Ok(None),
-    }
+    } else {
+        None
+    };
+
+    let _ = backend.unmount(name).await;
+    Ok(res)
 }
 
 pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
@@ -215,31 +336,18 @@ pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> 
 }
 
 pub async fn save_internal_state(name: &str, state: &NvidiaState) -> Result<()> {
-    let content = serde_json::to_string(state)?;
-    // Use base64 to avoid shell escape issues if needed, but JSON is mostly safe.
-    // However, to be absolutely safe, we'll use a temp file or similar if we can.
-    // For now, let's use a simple sh -c 'cat > ...'
-    let out = Command::new("systemd-nspawn")
-        .arg("-M")
-        .arg(name)
-        .arg("-q")
-        .arg("--")
-        .arg("sh")
-        .arg("-c")
-        .arg(format!(
-            "cat > /etc/.lasper-nvidia.json <<'EOF'\n{}\nEOF",
-            content
-        ))
-        .output()
-        .await
-        .map_err(|e| NspawnError::Runtime(format!("Failed to write internal state: {}", e)))?;
+    let content = serde_json::to_string_pretty(state)?;
 
-    if !out.status.success() {
-        return Err(NspawnError::Runtime(format!(
-            "Failed to save internal state: {}",
-            String::from_utf8_lossy(&out.stderr)
-        )));
+    let backend = super::storage::get_storage_backend_for(name);
+    let rootfs = backend.mount(name).await?;
+    let path = rootfs.join("etc/.lasper-nvidia.json");
+
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        let _ = backend.unmount(name).await;
+        return Err(NspawnError::Io(path, e));
     }
+
+    let _ = backend.unmount(name).await;
     Ok(())
 }
 
@@ -265,23 +373,39 @@ pub async fn ensure_gpu_passthrough(
         return Ok(());
     }
 
-    log::info!("GPU Passthrough enabled for {}, checking state...", name);
+    log_step!(
+        name,
+        "Lifecycle",
+        "GPU Passthrough enabled, initiating state synchronization..."
+    );
 
-    // 2. State Diff Engine
+    // 2. State Diff Engine (Declarative)
+    log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
     let host_state = get_nvidia_state().await?;
+    log_step!(
+        name,
+        "Detection",
+        "Detected driver: {}, {} libraries, {} devices.",
+        host_state.driver_version,
+        host_state.readonly_binds.len(),
+        host_state.device_binds.len()
+    );
+
     let external_cache = get_external_state(name).await?.unwrap_or_default();
 
-    // If driver updated on host, we MUST check internal truth
+    // Full-payload comparison for perfect state sync
     let mut old_state = external_cache.clone();
-    if external_cache.driver_version != host_state.driver_version {
+    if external_cache != host_state && !external_cache.driver_version.is_empty() {
         if let Ok(Some(internal)) = get_internal_state(name).await {
             old_state = internal;
         }
     }
 
-    if old_state.driver_version == host_state.driver_version && !old_state.driver_version.is_empty()
-    {
-        log::debug!("GPU state match for {}, skipping re-assembly.", name);
+    if old_state == host_state && !old_state.driver_version.is_empty() {
+        log::debug!(
+            "GPU state identity match for {}, skipping re-assembly.",
+            name
+        );
         // We still inject persistent to be safe
         inject_persistent_device_allow(name, &host_state).await?;
         let _ = dbus.reload_daemon().await;
@@ -295,21 +419,41 @@ pub async fn ensure_gpu_passthrough(
     );
 
     let death_list = calculate_death_list(&old_state, &host_state);
+    if !death_list.is_empty() {
+        log_step!(
+            name,
+            "Surgery",
+            "Marked {} files for removal/update.",
+            death_list.len()
+        );
+    }
 
     // 3. Physical Cleanup
     cleanup_container_garbage(name, &death_list).await?;
 
     // 4. AST mutation
+    log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
     super::config::NspawnConfig::update_gpu_passthrough(name, &host_state, &death_list).await?;
 
     // 5. Persistent Injection & Dual-Track Sync
+    log_step!(
+        name,
+        "Surgery",
+        "Persisting state and injecting persistent DeviceAllow rules..."
+    );
     save_external_state(name, &host_state).await?;
     save_internal_state(name, &host_state).await?;
     inject_persistent_device_allow(name, &host_state).await?;
 
     // 6. Zero-overhead Reload
+    log_step!(
+        name,
+        "Lifecycle",
+        "Reloading systemd daemon to commit changes."
+    );
     dbus.reload_daemon().await?;
 
+    log_step!(name, "Lifecycle", "GPU surgery successful.");
     Ok(())
 }
 
@@ -390,9 +534,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_dedup() {
-        let input = vec!["b".into(), "a".into(), "b".into(), "c".into(), "a".into()];
-        let expected = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        assert_eq!(dedup(input), expected);
+    fn test_parse_real_world_cdi_json() {
+        let json = r#"{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"0","containerEdits":{"deviceNodes":[{"path":"/dev/nvidia0"}]}}],"containerEdits":{"env":["NVIDIA_VISIBLE_DEVICES=void"],"deviceNodes":[{"path":"/dev/nvidiactl"}]}}"#;
+        let spec: CdiSpec = serde_json::from_str(json).unwrap();
+
+        let mut nodes = Vec::new();
+        if let Some(edits) = spec.container_edits {
+            for node in edits.device_nodes.unwrap() {
+                nodes.push(node.path);
+            }
+        }
+        for dev in spec.devices.unwrap() {
+            for node in dev.container_edits.unwrap().device_nodes.unwrap() {
+                nodes.push(node.path);
+            }
+        }
+
+        assert!(nodes.contains(&"/dev/nvidiactl".to_string()));
+        assert!(nodes.contains(&"/dev/nvidia0".to_string()));
     }
 }

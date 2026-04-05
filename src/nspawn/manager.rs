@@ -2,9 +2,9 @@ use super::errors::{NspawnError, Result};
 use super::models::{ContainerEntry, MachineProperties};
 use super::provider::{cli::CliProvider, dbus::DbusProvider};
 use async_trait::async_trait;
+use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use notify::{Watcher, RecursiveMode, RecommendedWatcher, Config, Event};
 
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {

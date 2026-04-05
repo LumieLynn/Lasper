@@ -72,7 +72,7 @@ async fn run_command(
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let mut cmd = Command::new(prog);
-    cmd.args(args);
+    cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = cmd
@@ -109,8 +109,9 @@ async fn run_command(
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from(prog), e))?;
     if !status.success() {
         return Err(NspawnError::CommandFailed(
-            prog.into(),
-            format!("exited with status {}", status),
+            format!("Bootstrap tool ({})", prog),
+            format!("{} {}", prog, args.join(" ")),
+            "Command failed. Check deployment logs for detailed output.".to_string(),
         ));
     }
     Ok(())

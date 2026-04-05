@@ -95,9 +95,10 @@ pub async fn import_oci_image(
 
     if !skopeo.status.success() {
         cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "skopeo copy".into(),
-            String::from_utf8_lossy(&skopeo.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "skopeo copy",
+            format!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci),
+            &skopeo,
         ));
     }
 
@@ -115,9 +116,10 @@ pub async fn import_oci_image(
 
     if !umoci.status.success() {
         cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "umoci unpack".into(),
-            String::from_utf8_lossy(&umoci.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "umoci unpack",
+            format!("umoci unpack --image {}:latest {}", tmp_oci, bundle_dir),
+            &umoci,
         ));
     }
 
@@ -154,9 +156,10 @@ pub async fn import_oci_image(
 
     if !copy_out.status.success() {
         cleanup().await;
-        return Err(NspawnError::CommandFailed(
-            "cp rootfs".into(),
-            String::from_utf8_lossy(&copy_out.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "cp rootfs content",
+            format!("cp -a {}/. {}", rootfs_source.display(), dest.display()),
+            &copy_out,
         ));
     }
 
@@ -187,9 +190,10 @@ pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::P
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("importctl"), e))?;
 
     if !out.status.success() {
-        return Err(NspawnError::CommandFailed(
-            "importctl".into(),
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        return Err(NspawnError::cmd_failed(
+            "importctl",
+            format!("importctl {} {} {}", subcommand, path, local_name),
+            &out,
         ));
     }
 

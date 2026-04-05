@@ -54,15 +54,15 @@ pub struct CreateUser {
     pub shell: String,
 }
 
-/// Configuration for raw file storage.
+/// Configuration for disk image storage.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RawStorageConfig {
+pub struct DiskImageConfig {
     pub size: String,
     pub fs_type: String,
     pub use_partition_table: bool,
 }
 
-impl Default for RawStorageConfig {
+impl Default for DiskImageConfig {
     fn default() -> Self {
         Self {
             size: "10G".to_string(),
@@ -92,8 +92,8 @@ pub struct ContainerConfig {
     pub wayland_socket: bool,
     /// Whether to enable NVIDIA GPU passthrough (JIT managed).
     pub nvidia_gpu: bool,
-    /// Raw storage specific configuration (only used if storage type is Raw).
-    pub raw_config: Option<RawStorageConfig>,
+    /// Disk image specific configuration (only used if storage type is DiskImage).
+    pub disk_config: Option<DiskImageConfig>,
 }
 
 // ── Unified data model ────────────────────────────────────────────────────────
