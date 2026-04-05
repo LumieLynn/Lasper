@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
+use crate::nspawn::utils::new_command;
 use tokio::process::Command;
 
 use crate::nspawn::create;
@@ -34,7 +35,7 @@ impl Deployer for CloneDeployer {
             ))
             .await;
 
-        let out = Command::new("machinectl")
+        let out = new_command("machinectl")
             .args(["clone", &self.source_name, name])
             .output()
             .await

@@ -3,6 +3,7 @@
 use super::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use super::utils::{new_command, new_sync_command};
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -60,7 +61,7 @@ pub fn detect_available_storage_types() -> StorageInfo {
 
 fn get_filesystem_type(path: &Path) -> Result<String> {
     // We can use 'stat -f -c %T <path>' to get the filesystem type name
-    let out = std::process::Command::new("stat")
+    let out = new_sync_command("stat")
         .args(["-f", "-c", "%T", &path.to_string_lossy()])
         .output()
         .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
@@ -186,7 +187,7 @@ impl StorageBackend for SubvolumeBackend {
 
     async fn create(&self, name: &str) -> Result<PathBuf> {
         let path = self.get_path(name);
-        let out = Command::new("btrfs")
+        let out = new_command("btrfs")
             .args(["subvolume", "create", &path.to_string_lossy()])
             .output()
             .await
@@ -211,7 +212,7 @@ impl StorageBackend for SubvolumeBackend {
 
     async fn delete(&self, name: &str) -> Result<()> {
         let path = self.get_path(name);
-        let out = Command::new("btrfs")
+        let out = new_command("btrfs")
             .args(["subvolume", "delete", &path.to_string_lossy()])
             .output()
             .await
@@ -253,7 +254,7 @@ impl StorageBackend for DiskImageBackend {
     async fn create(&self, name: &str) -> Result<PathBuf> {
         let path = self.get_path(name);
         // Create a sparse file of the specified size
-        let out = Command::new("truncate")
+        let out = new_command("truncate")
             .args(["-s", &self.config.size, &path.to_string_lossy()])
             .output()
             .await
@@ -272,7 +273,7 @@ impl StorageBackend for DiskImageBackend {
 
         // Format with the specified filesystem
         let mkfs_prog = format!("mkfs.{}", self.config.fs_type);
-        let out = Command::new(&mkfs_prog)
+        let out = new_command(&mkfs_prog)
             .args(["-F", &path.to_string_lossy()])
             .output()
             .await
@@ -297,7 +298,7 @@ impl StorageBackend for DiskImageBackend {
             .map_err(|e| NspawnError::Io(mount_point.clone(), e))?;
 
         // Use systemd-dissect for robust mounting (handles GPT/MBR/DPS)
-        let out = Command::new("systemd-dissect")
+        let out = new_command("systemd-dissect")
             .args([
                 "--mount",
                 &img_path.to_string_lossy(),
@@ -322,7 +323,7 @@ impl StorageBackend for DiskImageBackend {
         let mount_point = PathBuf::from(format!("/mnt/lasper-{}", name));
 
         // Use systemd-dissect for robust unmounting
-        let out = Command::new("systemd-dissect")
+        let out = new_command("systemd-dissect")
             .args([
                 "--umount",
                 &mount_point.to_string_lossy(),

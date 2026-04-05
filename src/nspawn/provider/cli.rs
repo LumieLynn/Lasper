@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
+use crate::nspawn::utils::new_command;
 use tokio::process::Command;
 
 #[derive(Clone)]
@@ -14,7 +15,7 @@ impl CliProvider {
     }
 
     async fn run_machinectl(&self, args: &[&str]) -> Result<()> {
-        let out = Command::new("machinectl")
+        let out = new_command("machinectl")
             .args(args)
             .output()
             .await
@@ -31,7 +32,7 @@ impl CliProvider {
     }
 
     pub async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
-        let out = Command::new("machinectl")
+        let out = new_command("machinectl")
             .args(["list", "-l", "--no-legend", "--no-pager"])
             .output()
             .await
@@ -103,7 +104,7 @@ impl CliProvider {
                 .collect());
         }
 
-        let out = Command::new("machinectl")
+        let out = new_command("machinectl")
             .args(["list-images", "-l", "--no-legend", "--no-pager"])
             .output()
             .await
@@ -202,7 +203,7 @@ impl CliProvider {
     }
 
     pub async fn get_logs(&self, name: &str, lines: usize) -> Result<Vec<String>> {
-        let out = Command::new("journalctl")
+        let out = new_command("journalctl")
             .args([
                 "-M",
                 name,
@@ -232,7 +233,7 @@ impl CliProvider {
     pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let mut map = HashMap::new();
 
-        let machine_out = Command::new("machinectl")
+        let machine_out = new_command("machinectl")
             .args(["show", name])
             .output()
             .await;
@@ -248,7 +249,7 @@ impl CliProvider {
             }
         }
 
-        let system_out = Command::new("systemctl")
+        let system_out = new_command("systemctl")
             .args(["show", &format!("systemd-nspawn@{}.service", name)])
             .output()
             .await;

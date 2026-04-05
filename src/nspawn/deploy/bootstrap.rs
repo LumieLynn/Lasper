@@ -5,6 +5,7 @@ use std::process::Stdio;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
+use crate::nspawn::utils::new_command;
 use tokio::process::Command;
 
 use crate::nspawn::deploy::Deployer;
@@ -71,7 +72,7 @@ async fn run_command(
     args: Vec<String>,
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    let mut cmd = Command::new(prog);
+    let mut cmd = new_command(prog);
     cmd.args(&args);
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 

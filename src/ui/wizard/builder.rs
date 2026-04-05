@@ -53,7 +53,7 @@ pub struct PassthroughConfig {
     pub bind_mounts: Vec<BindMount>,
     pub device_binds: Vec<String>,
     pub full_capabilities: bool,
-    pub wayland_socket: bool,
+    pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
 }
 
@@ -77,7 +77,7 @@ impl ContainerConfigBuilder {
                 bind_mounts: vec![],
                 device_binds: vec![],
                 full_capabilities: false,
-                wayland_socket: false,
+                wayland_socket: None,
                 nvidia_gpu: false,
             });
 
@@ -112,7 +112,7 @@ impl ContainerConfigBuilder {
             full_capabilities: passthrough.full_capabilities,
             root_password: user.root_password.clone(),
             users: user.users.clone(),
-            wayland_socket: passthrough.wayland_socket,
+            wayland_socket: passthrough.wayland_socket.clone(),
             nvidia_gpu: passthrough.nvidia_gpu,
             disk_config: storage.disk_config.clone(),
         };
@@ -139,9 +139,13 @@ impl ContainerConfigBuilder {
         ));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
         content.push_str(&nspawn_config_content(&cfg));
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
+        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() {
             content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
-            content.push_str(&systemd_override_content(&cfg.device_binds, cfg.nvidia_gpu));
+            content.push_str(&systemd_override_content(
+                &cfg.device_binds,
+                cfg.nvidia_gpu,
+                cfg.wayland_socket.is_some(),
+            ));
         }
 
         ContainerConfigWithPreview {

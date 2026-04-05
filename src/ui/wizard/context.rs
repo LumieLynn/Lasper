@@ -147,7 +147,7 @@ impl NetworkState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
     pub full_capabilities: bool,
-    pub wayland_socket: bool,
+    pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
     pub bind_mounts: Vec<BindMount>,
@@ -160,7 +160,7 @@ impl PassthroughState {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: vec![], // Managed by bridge or nvidia-ctk
             full_capabilities: self.full_capabilities,
-            wayland_socket: self.wayland_socket && is_host_nw,
+            wayland_socket: if is_host_nw { self.wayland_socket.clone() } else { None },
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
         }
     }
@@ -272,7 +272,7 @@ impl WizardContext {
             },
             passthrough: PassthroughState {
                 full_capabilities: false,
-                wayland_socket: false,
+                wayland_socket: None,
                 nvidia_gpu: false,
                 nvidia_toolkit_installed,
                 bind_mounts: vec![],

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
+use crate::nspawn::utils::new_command;
 use tokio::process::Command;
 
 use crate::nspawn::deploy::Deployer;
@@ -87,7 +88,7 @@ pub async fn import_oci_image(
     };
 
     log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci);
-    let skopeo = Command::new("skopeo")
+    let skopeo = new_command("skopeo")
         .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci)])
         .output()
         .await
@@ -103,7 +104,7 @@ pub async fn import_oci_image(
     }
 
     log::info!("umoci unpack --image {}:latest {}", tmp_oci, bundle_dir);
-    let umoci = Command::new("umoci")
+    let umoci = new_command("umoci")
         .args([
             "unpack",
             "--image",
@@ -144,7 +145,7 @@ pub async fn import_oci_image(
     }
 
     // Use 'cp -a' to copy contents including dotfiles, then cleanup
-    let copy_out = Command::new("cp")
+    let copy_out = new_command("cp")
         .args([
             "-a",
             &format!("{}/.", rootfs_source.to_string_lossy()),
@@ -183,7 +184,7 @@ pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::P
     };
 
     log::info!("importctl {} {} {}", subcommand, path, local_name);
-    let out = Command::new("importctl")
+    let out = new_command("importctl")
         .args([subcommand, path, local_name])
         .output()
         .await

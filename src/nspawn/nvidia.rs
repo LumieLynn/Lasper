@@ -3,6 +3,7 @@
 use super::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use super::utils::new_command;
 use tokio::process::Command;
 
 /// Hardware and driver information detected on the host for mounting.
@@ -93,7 +94,7 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
 
     // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp file
     let tmp_path = format!("/tmp/lasper-cdi-{}.json", std::process::id());
-    let out = Command::new("nvidia-ctk")
+    let out = new_command("nvidia-ctk")
         .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path)])
         .output()
         .await

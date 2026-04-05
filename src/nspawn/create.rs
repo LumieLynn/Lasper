@@ -2,76 +2,82 @@
 
 use super::errors::{NspawnError, Result};
 use super::models::{ContainerConfig, CreateUser, NetworkMode};
+use ini::Ini;
 use std::path::{Path, PathBuf};
+use super::utils::{new_command, new_sync_command};
 use tokio::process::Command;
 
 // ── .nspawn file generation ───────────────────────────────────────────────────
 
-/// Generate the content of a `.nspawn` container config file.
+/// Generate the content of a `.nspawn` container config file using AST.
 pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
-    let mut out = String::new();
+    let mut conf = Ini::new();
 
     if cfg.nvidia_gpu {
-        out.push_str("[General]\n");
-        out.push_str("X-Lasper-Nvidia-Enabled=true\n\n");
+        conf.with_section(Some("General"))
+            .set("X-Lasper-Nvidia-Enabled", "true");
     }
 
     // ── [Exec] ────────────────────────────────────────────────────────────────
-    out.push_str("[Exec]\n");
-    out.push_str("Boot=yes\n");
-    if cfg.wayland_socket {
-        out.push_str("PrivateUsers=no\n");
+    {
+        let mut exec = conf.with_section(Some("Exec"));
+        exec.set("Boot", "yes");
+        if cfg.wayland_socket.is_some() {
+            exec.set("PrivateUsers", "no");
+        }
+        if cfg.full_capabilities {
+            exec.set("Capability", "all");
+        }
+        if !cfg.hostname.is_empty() && cfg.hostname != cfg.name {
+            exec.set("Hostname", &cfg.hostname);
+        }
     }
-    if cfg.full_capabilities {
-        out.push_str("Capability=all\n");
-    }
-    if !cfg.hostname.is_empty() && cfg.hostname != cfg.name {
-        out.push_str(&format!("Hostname={}\n", cfg.hostname));
-    }
-    out.push('\n');
 
     // ── [Network] ─────────────────────────────────────────────────────────────
     if let Some(mode) = &cfg.network {
-        out.push_str("[Network]\n");
         match mode {
             NetworkMode::Host => {
-                // Offset machinectl's default veth by disabling it
-                out.push_str("VirtualEthernet=no\n\n");
+                conf.with_section(Some("Network"))
+                    .set("VirtualEthernet", "no");
             }
             NetworkMode::None => {
-                // Enable private network namespace and remove default veth
-                out.push_str("Private=yes\n\n");
+                conf.with_section(Some("Network")).set("Private", "yes");
             }
             NetworkMode::Veth => {
-                out.push_str("VirtualEthernet=yes\n");
+                conf.with_section(Some("Network"))
+                    .set("VirtualEthernet", "yes");
+                let net = conf.section_mut(Some("Network")).unwrap();
                 for pf in &cfg.port_forwards {
-                    out.push_str(&format!("Port={}:{}:{}\n", pf.proto, pf.host, pf.container));
+                    net.append("Port", format!("{}:{}:{}", pf.proto, pf.host, pf.container));
                 }
-                out.push('\n');
             }
             NetworkMode::Bridge(name) => {
-                out.push_str("VirtualEthernet=yes\n");
-                out.push_str(&format!("Bridge={name}\n"));
+                conf.with_section(Some("Network"))
+                    .set("VirtualEthernet", "yes")
+                    .set("Bridge", name.clone());
+                let net = conf.section_mut(Some("Network")).unwrap();
                 for pf in &cfg.port_forwards {
-                    out.push_str(&format!("Port={}:{}:{}\n", pf.proto, pf.host, pf.container));
+                    net.append("Port", format!("{}:{}:{}", pf.proto, pf.host, pf.container));
                 }
-                out.push('\n');
             }
             // TODO: placeholder code for macvlan and ipvlan
             NetworkMode::MacVlan(iface) => {
-                out.push_str("Private=yes\n");
-                out.push_str("VirtualEthernet=no\n");
-                out.push_str(&format!("MACVLAN={}\n\n", iface));
+                conf.with_section(Some("Network"))
+                    .set("Private", "yes")
+                    .set("VirtualEthernet", "no")
+                    .set("MACVLAN", iface.clone());
             }
             NetworkMode::IpVlan(iface) => {
-                out.push_str("Private=yes\n");
-                out.push_str("VirtualEthernet=no\n");
-                out.push_str(&format!("IPVLAN={}\n\n", iface));
+                conf.with_section(Some("Network"))
+                    .set("Private", "yes")
+                    .set("VirtualEthernet", "no")
+                    .set("IPVLAN", iface.clone());
             }
             NetworkMode::Interface(iface) => {
-                out.push_str("Private=yes\n");
-                out.push_str("VirtualEthernet=no\n");
-                out.push_str(&format!("Interface={}\n\n", iface));
+                conf.with_section(Some("Network"))
+                    .set("Private", "yes")
+                    .set("VirtualEthernet", "no")
+                    .set("Interface", iface.clone());
             }
         }
     }
@@ -79,44 +85,80 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> String {
     // ── [Files] ───────────────────────────────────────────────────────────────
     let has_files = !cfg.device_binds.is_empty()
         || !cfg.readonly_binds.is_empty()
-        || !cfg.bind_mounts.is_empty();
+        || !cfg.bind_mounts.is_empty()
+        || cfg.wayland_socket.is_some();
+
     if has_files {
-        out.push_str("[Files]\n");
+        // Use placeholder to ensure section is instantiated in Ini object before section_mut()
+        conf.with_section(Some("Files")).set("__ensure_files", "");
+        let files = conf.section_mut(Some("Files")).unwrap();
+        files.remove("__ensure_files");
+
         for dev in &cfg.device_binds {
-            out.push_str(&format!("Bind={dev}\n"));
+            files.append("Bind", dev.clone());
         }
         for ro in &cfg.readonly_binds {
-            out.push_str(&format!("BindReadOnly={ro}\n"));
+            files.append("BindReadOnly", ro.clone());
         }
         for bm in &cfg.bind_mounts {
             if bm.readonly {
-                out.push_str(&format!("BindReadOnly={}:{}\n", bm.source, bm.target));
+                files.append("BindReadOnly", format!("{}:{}", bm.source, bm.target));
             } else {
-                out.push_str(&format!("Bind={}:{}\n", bm.source, bm.target));
+                files.append("Bind", format!("{}:{}", bm.source, bm.target));
             }
         }
-        out.push('\n');
+
+        // Wayland and X11/GPU socket/device binding
+        if let Some(socket_name) = &cfg.wayland_socket {
+            // Robustly find the host's Wayland socket (handling missing ENV in sudo/su)
+            let xdg_runtime = std::env::var("XDG_RUNTIME_DIR").ok().or_else(|| {
+                std::env::var("SUDO_UID").ok().map(|uid| format!("/run/user/{}", uid))
+            }).unwrap_or_else(|| "/run/user/1000".to_string());
+
+            let host_wayland_sock = format!("{}/{}", xdg_runtime, socket_name);
+            files.append("Bind", format!("{}:/mnt/wayland-socket", host_wayland_sock));
+
+            // Passthrough X11 socket and GPU rendering requirements (Mesa/Intel/AMD)
+            files.append("Bind", "/tmp/.X11-unix");
+            files.append("Bind", "/dev/dri");
+        }
     }
 
-    out
+    // Serialize to string
+    let mut buffer = Vec::new();
+    conf.write_to(&mut buffer).unwrap_or_default();
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Generate the content for a systemd service override.
-pub fn systemd_override_content(device_binds: &[String], nvidia_gpu: bool) -> String {
+pub fn systemd_override_content(
+    device_binds: &[String],
+    nvidia_gpu: bool,
+    wayland_socket: bool,
+) -> String {
     let mut content = String::from("[Service]\n");
-    if nvidia_gpu {
-        // Enable Cgroup delegation for nested containers if GPU is used
+    // Enable Cgroup delegation if passthrough is used
+    if nvidia_gpu || wayland_socket {
         content.push_str("Delegate=yes\n");
     }
     for dev in device_binds {
         content.push_str(&format!("DeviceAllow={} rw\n", dev));
     }
+    // Allow access to Generic GPU (Mesa/Intel/AMD)
+    if wayland_socket {
+        content.push_str("DeviceAllow=/dev/dri rw\n");
+    }
     content
 }
 
 /// Write a systemd service override to allow devices via cgroups.
-pub fn write_systemd_override(name: &str, device_binds: &[String], nvidia_gpu: bool) -> Result<()> {
-    if device_binds.is_empty() && !nvidia_gpu {
+pub fn write_systemd_override(
+    name: &str,
+    device_binds: &[String],
+    nvidia_gpu: bool,
+    wayland_socket: bool,
+) -> Result<()> {
+    if device_binds.is_empty() && !nvidia_gpu && !wayland_socket {
         return Ok(());
     }
 
@@ -127,11 +169,11 @@ pub fn write_systemd_override(name: &str, device_binds: &[String], nvidia_gpu: b
     std::fs::create_dir_all(&dir).map_err(|e| NspawnError::Io(dir.clone(), e))?;
 
     let path = dir.join("override.conf");
-    let content = systemd_override_content(device_binds, nvidia_gpu);
+    let content = systemd_override_content(device_binds, nvidia_gpu, wayland_socket);
 
     std::fs::write(&path, content).map_err(|e| NspawnError::Io(path, e))?;
 
-    let out = std::process::Command::new("systemctl")
+    let out = new_sync_command("systemctl")
         .arg("daemon-reload")
         .output()
         .map_err(|e| NspawnError::Io(PathBuf::from("systemctl"), e))?;
@@ -168,7 +210,7 @@ pub fn clone_systemd_override(source_name: &str, dest_name: &str) -> Result<()> 
     std::fs::copy(&source_path, &dest_path)
         .map_err(|e| NspawnError::Io(PathBuf::from(&dest_path), e))?;
 
-    let _ = std::process::Command::new("systemctl")
+    let _ = new_sync_command("systemctl")
         .arg("daemon-reload")
         .output();
 
@@ -267,7 +309,7 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
         user.shell.as_str()
     };
 
-    let out = Command::new("systemd-nspawn")
+    let out = new_command("systemd-nspawn")
         .args([
             "--directory",
             &rootfs.to_string_lossy(),
@@ -290,7 +332,7 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
 
     if user.sudoer {
         for group in ["sudo", "wheel"] {
-            let r = Command::new("systemd-nspawn")
+            let r = new_command("systemd-nspawn")
                 .args([
                     "--directory",
                     &rootfs.to_string_lossy(),
@@ -440,7 +482,7 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::Host);
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("[Network]\nVirtualEthernet=no\n"));
+        assert!(content.contains("VirtualEthernet=no") || content.contains("VirtualEthernet = no"));
     }
 
     #[test]
@@ -448,7 +490,7 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::None);
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("[Network]\nPrivate=yes\n\n"));
+        assert!(content.contains("Private=yes"));
     }
 
     #[test]
@@ -456,7 +498,7 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::Veth);
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("[Network]\nVirtualEthernet=yes\n"));
+        assert!(content.contains("VirtualEthernet=yes"));
     }
 
     #[test]
@@ -464,7 +506,10 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::Bridge("virbr0".into()));
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("[Network]\nVirtualEthernet=yes\nBridge=virbr0\n"));
+        assert!(
+            content.contains("VirtualEthernet = yes") || content.contains("VirtualEthernet=yes")
+        );
+        assert!(content.contains("Bridge = virbr0") || content.contains("Bridge=virbr0"));
     }
 
     #[test]
@@ -472,9 +517,9 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.network = Some(NetworkMode::MacVlan("eth0".into()));
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("MACVLAN=eth0"));
-        assert!(content.contains("Private=yes"));
-        assert!(content.contains("VirtualEthernet=no"));
+        assert!(content.contains("MACVLAN=eth0") || content.contains("MACVLAN = eth0"));
+        assert!(content.contains("Private=yes") || content.contains("Private = yes"));
+        assert!(content.contains("VirtualEthernet=no") || content.contains("VirtualEthernet = no"));
     }
 
     #[test]
@@ -520,24 +565,30 @@ mod tests {
         cfg.device_binds = vec!["/dev/fuse".into()];
 
         let content = nspawn_config_content(&cfg);
-        assert!(content.contains("Hostname=test-host"));
-        assert!(content.contains("VirtualEthernet=yes"));
-        assert!(content.contains("Port=tcp:8080:80"));
-        assert!(content.contains("Port=tcp:2222:22"));
-        assert!(content.contains("BindReadOnly=/tmp/a:/mnt/a"));
-        assert!(content.contains("Bind=/tmp/b:/mnt/b"));
-        assert!(content.contains("Bind=/dev/fuse"));
+        assert!(content.contains("Hostname=test-host") || content.contains("Hostname = test-host"));
+        assert!(
+            content.contains("VirtualEthernet=yes") || content.contains("VirtualEthernet = yes")
+        );
+        assert!(content.contains("Port=tcp:8080:80") || content.contains("Port = tcp:8080:80"));
+        assert!(content.contains("Port=tcp:2222:22") || content.contains("Port = tcp:2222:22"));
+        assert!(
+            content.contains("BindReadOnly=/tmp/a:/mnt/a")
+                || content.contains("BindReadOnly = /tmp/a:/mnt/a")
+        );
+        assert!(content.contains("Bind=/tmp/b:/mnt/b") || content.contains("Bind = /tmp/b:/mnt/b"));
+        assert!(content.contains("Bind=/dev/fuse") || content.contains("Bind = /dev/fuse"));
     }
 
     #[test]
     fn test_gui_passthrough_config() {
         let mut cfg = ContainerConfig::default();
-        cfg.wayland_socket = true;
+        cfg.wayland_socket = Some("wayland-1".into());
 
         let content = nspawn_config_content(&cfg);
 
-        assert!(content.contains("PrivateUsers=no"));
-        assert!(!content.contains("Environment=WAYLAND_DISPLAY="));
-        assert!(!content.contains("Environment=DISPLAY="));
+        assert!(content.contains("PrivateUsers=no") || content.contains("PrivateUsers = no"));
+        assert!(content.contains("Bind=/run/user/1000/wayland-1:/mnt/wayland-socket") || content.contains("Bind = /run/user/1000/wayland-1:/mnt/wayland-socket"));
+        assert!(content.contains("Bind=/dev/dri") || content.contains("Bind = /dev/dri"));
+        assert!(content.contains("/mnt/wayland-socket"));
     }
 }

@@ -12,6 +12,7 @@ pub mod network;
 pub mod nvidia;
 pub mod provider;
 pub mod storage;
+pub mod utils;
 
 pub use models::ContainerEntry;
 pub use models::ContainerState;

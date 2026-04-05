@@ -113,7 +113,7 @@ async fn run_deploy_internal(
             push_log!(format!("Creating user {}...", user.username));
             crate::nspawn::create::create_user_in_container(&rootfs, user).await?;
 
-            if cfg.wayland_socket {
+            if cfg.wayland_socket.is_some() {
                 push_log!(format!("Setting up wayland env for {}...", user.username));
                 crate::nspawn::create::setup_wayland_shell_env(&rootfs, user).await?;
             }
@@ -151,7 +151,7 @@ async fn run_deploy_internal(
         std::fs::write(&nspawn_path, nspawn_content)
             .map_err(|e| NspawnError::Io(nspawn_path, e))?;
 
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu {
+        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Config] Writing systemd service override...",
                 name
@@ -161,6 +161,7 @@ async fn run_deploy_internal(
                 &name,
                 &cfg.device_binds,
                 cfg.nvidia_gpu,
+                cfg.wayland_socket.is_some(),
             )?;
         }
 

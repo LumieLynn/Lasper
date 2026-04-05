@@ -88,8 +88,8 @@ pub struct ContainerConfig {
     pub full_capabilities: bool,
     pub root_password: Option<String>,
     pub users: Vec<CreateUser>,
-    /// Whether to enable Wayland socket passthrough.
-    pub wayland_socket: bool,
+    /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.
+    pub wayland_socket: Option<String>,
     /// Whether to enable NVIDIA GPU passthrough (JIT managed).
     pub nvidia_gpu: bool,
     /// Disk image specific configuration (only used if storage type is DiskImage).
