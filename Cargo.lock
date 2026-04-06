@@ -785,6 +785,7 @@ dependencies = [
  "libc",
  "log",
  "notify",
+ "pciid-parser",
  "ratatui",
  "rust-ini",
  "serde",
@@ -1022,6 +1023,12 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "pciid-parser"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "978d5ddc523f0b9c63a3ccc75aef5b924962edf2097dd48f5b991df2951482f3"
 
 [[package]]
 name = "pin-project-lite"

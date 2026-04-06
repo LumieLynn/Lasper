@@ -104,14 +104,7 @@ impl ContainerConfigBuilder {
             users: vec![],
         });
 
-        let mut device_binds = passthrough.device_binds.clone();
-        if passthrough.graphics_acceleration {
-            for gpu in crate::nspawn::hw::gpu::discover_host_gpus() {
-                device_binds.extend(gpu.paths);
-            }
-        }
-        device_binds.sort();
-        device_binds.dedup();
+        let device_binds = passthrough.device_binds.clone();
 
         let cfg = ContainerConfig {
             name: basic.name.clone(),
@@ -178,8 +171,8 @@ impl ContainerConfigBuilder {
         });
 
         let storage: Box<dyn StorageBackend> = match storage_cfg.storage_type {
-            StorageType::Directory => Box::new(DirectoryBackend),
-            StorageType::Subvolume => Box::new(SubvolumeBackend),
+            StorageType::Directory => Box::new(DirectoryBackend) as Box<dyn StorageBackend>,
+            StorageType::Subvolume => Box::new(SubvolumeBackend) as Box<dyn StorageBackend>,
             StorageType::DiskImage => Box::new(DiskImageBackend {
                 config: storage_cfg
                     .disk_config
@@ -188,7 +181,7 @@ impl ContainerConfigBuilder {
                         fs_type: "ext4".to_string(),
                         use_partition_table: false,
                     }),
-            }),
+            }) as Box<dyn StorageBackend>,
         };
 
         let source = self.source.as_ref().cloned().unwrap_or(SourceConfig {
@@ -204,13 +197,13 @@ impl ContainerConfigBuilder {
         let deployer: Box<dyn Deployer> = match source.kind {
             SourceKind::Copy => Box::new(clone::CloneDeployer {
                 source_name: source.clone_source.clone(),
-            }),
+            }) as Box<dyn Deployer>,
             SourceKind::Oci => Box::new(image::OciDeployer {
                 url: source.oci_url.clone(),
-            }),
+            }) as Box<dyn Deployer>,
             SourceKind::DiskImage => Box::new(image::DiskImageDeployer {
                 path: source.disk_path.clone(),
-            }),
+            }) as Box<dyn Deployer>,
             SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer {
                 mirror: source.deboot_mirror.clone(),
                 suite: if source.deboot_suite.is_empty() {
@@ -218,10 +211,10 @@ impl ContainerConfigBuilder {
                 } else {
                     source.deboot_suite.clone()
                 },
-            }),
+            }) as Box<dyn Deployer>,
             SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer {
                 packages: source.pacstrap_pkgs.clone(),
-            }),
+            }) as Box<dyn Deployer>,
         };
 
         (deployer, storage)

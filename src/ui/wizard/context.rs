@@ -130,6 +130,7 @@ pub struct PassthroughState {
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
+    pub selected_gpu_nodes: Vec<String>,
     pub bind_mounts: Vec<BindMount>,
 }
 
@@ -138,7 +139,7 @@ impl PassthroughState {
         let is_host_nw = matches!(mode, Some(NetworkMode::Host));
         PassthroughConfig {
             bind_mounts: self.bind_mounts.clone(),
-            device_binds: vec![], // Managed by bridge or nvidia-ctk
+            device_binds: self.selected_gpu_nodes.clone(),
             privileged: self.privileged,
             graphics_acceleration: self.graphics_acceleration,
             wayland_socket: if is_host_nw { self.wayland_socket.clone() } else { None },
@@ -236,6 +237,7 @@ impl WizardContext {
                 wayland_socket: None,
                 nvidia_gpu: false,
                 nvidia_toolkit_installed,
+                selected_gpu_nodes: vec![],
                 bind_mounts: vec![],
             },
             review: ReviewState {
