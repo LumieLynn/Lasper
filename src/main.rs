@@ -13,20 +13,12 @@ mod nspawn;
 mod ui;
 
 use std::env;
-use std::ffi::{CStr, CString};
 use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
+use uzers::os::unix::UserExt;
 
 fn get_user_home(username: &str) -> Option<PathBuf> {
-    let username_c = CString::new(username).ok()?;
-    unsafe {
-        let pw = libc::getpwnam(username_c.as_ptr());
-        if !pw.is_null() {
-            let home = CStr::from_ptr((*pw).pw_dir);
-            return Some(PathBuf::from(home.to_string_lossy().into_owned()));
-        }
-    }
-    None
+    uzers::get_user_by_name(username).map(|u| u.home_dir().to_path_buf())
 }
 
 fn get_log_dir() -> PathBuf {
@@ -90,7 +82,7 @@ fn try_chown_to_sudo_user(path: &Path) {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Detect privilege level (uid 0 = root)
-    let is_root = unsafe { libc::getuid() } == 0;
+    let is_root = uzers::get_current_uid() == 0;
 
     // Setup file-based logging to $HOME/.local/state/lasper/
     let log_dir = get_log_dir();

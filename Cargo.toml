@@ -22,6 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 log = "0.4"
 dirs = "5"
 libc = "0.2"
+uzers = "0.12"
 async-trait = "0.1"
 thiserror = "1"
 zbus = "4.4"
