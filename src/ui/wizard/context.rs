@@ -1,6 +1,6 @@
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::storage::{StorageBackend, StorageInfo, StorageType};
+use crate::nspawn::utils::storage::{StorageBackend, StorageInfo, StorageType};
 use crate::nspawn::ContainerEntry;
 pub use crate::ui::wizard::builder::{
     BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
@@ -121,32 +121,12 @@ impl NetworkState {
             port_forwards: self.port_list.clone(),
         }
     }
-
-    pub fn parse_port(input: &str) -> Option<PortForward> {
-        let parts: Vec<&str> = input.split(':').collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        let host = parts[0].parse::<u16>().ok()?;
-        let rest = parts[1];
-        let (container_str, proto) = if rest.contains('/') {
-            let p: Vec<&str> = rest.split('/').collect();
-            (p[0], p[1].to_string())
-        } else {
-            (rest, "tcp".to_string())
-        };
-        let container = container_str.parse::<u16>().ok()?;
-        Some(PortForward {
-            host,
-            container,
-            proto,
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
-    pub full_capabilities: bool,
+    pub privileged: bool,
+    pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
@@ -159,31 +139,11 @@ impl PassthroughState {
         PassthroughConfig {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: vec![], // Managed by bridge or nvidia-ctk
-            full_capabilities: self.full_capabilities,
+            privileged: self.privileged,
+            graphics_acceleration: self.graphics_acceleration,
             wayland_socket: if is_host_nw { self.wayland_socket.clone() } else { None },
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
         }
-    }
-
-    pub fn parse_bind_mount(input: &str) -> Option<BindMount> {
-        let parts: Vec<&str> = input.split(':').collect();
-        if parts.len() < 2 {
-            return None;
-        }
-        let source = parts[0].to_string();
-        let rest = parts[1];
-        let (target, readonly) = if rest.contains(":ro") {
-            (rest.replace(":ro", ""), true)
-        } else if rest.contains(":rw") {
-            (rest.replace(":rw", ""), false)
-        } else {
-            (rest.to_string(), false)
-        };
-        Some(BindMount {
-            source,
-            target,
-            readonly,
-        })
     }
 }
 
@@ -248,7 +208,7 @@ impl WizardContext {
             },
             storage: StorageState {
                 type_idx: 0,
-                info: crate::nspawn::storage::detect_available_storage_types(),
+                info: crate::nspawn::utils::storage::detect_available_storage_types(),
                 disk_size: "2G".to_string(),
                 disk_fs: "ext4".to_string(),
                 disk_partition: false,
@@ -258,7 +218,7 @@ impl WizardContext {
                 users: vec![],
             },
             network: {
-                let bridges = crate::nspawn::network::detect_bridges();
+                let bridges = crate::nspawn::hw::network::detect_bridges();
                 let default_bridge = bridges
                     .first()
                     .cloned()
@@ -271,7 +231,8 @@ impl WizardContext {
                 }
             },
             passthrough: PassthroughState {
-                full_capabilities: false,
+                privileged: false,
+                graphics_acceleration: false,
                 wayland_socket: None,
                 nvidia_gpu: false,
                 nvidia_toolkit_installed,

@@ -84,8 +84,10 @@ pub struct ContainerConfig {
     pub device_binds: Vec<String>,
     /// Paths to bind-mount (read-only).
     pub readonly_binds: Vec<String>,
-    /// Whether to grant all capabilities (required for some hardware passthrough).
-    pub full_capabilities: bool,
+    /// Whether to grant all capabilities (privileged mode).
+    pub privileged: bool,
+    /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
+    pub graphics_acceleration: bool,
     pub root_password: Option<String>,
     pub users: Vec<CreateUser>,
     /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.

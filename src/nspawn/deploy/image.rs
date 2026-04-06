@@ -4,7 +4,6 @@ use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use crate::nspawn::utils::new_command;
-use tokio::process::Command;
 
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};

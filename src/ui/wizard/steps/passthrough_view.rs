@@ -1,8 +1,10 @@
 use crate::nspawn::models::NetworkMode;
 use crate::nspawn::utils::scan_available_wayland_sockets;
 use crate::ui::core::{Component, EventResult, FocusTracker};
+use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
+use crate::nspawn::hw::gpu::{discover_host_gpus, GpuDevice};
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -13,9 +15,11 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let wayland_selector_active = $self.wayland_socket.checked() && !$self.wayland_sockets.is_empty();
+        let wayland_socket_checked = $self.wayland_socket.checked();
+        let wayland_selector_active = wayland_socket_checked && !$self.wayland_sockets.is_empty();
+
         let mut comps: Vec<&mut dyn Component> = vec![
-            &mut $self.generic_gpu,
+            &mut $self.graphics_acceleration,
             &mut $self.wayland_socket,
         ];
 
@@ -24,16 +28,21 @@ macro_rules! active_comps {
         }
 
         comps.push(&mut $self.nvidia_gpu);
+        comps.push(&mut $self.privileged);
         comps
     }};
 }
 
 pub struct PassthroughStepView {
-    generic_gpu: Checkbox,
+    graphics_acceleration: Checkbox,
+    discovered_gpus: Vec<GpuDevice>,
+    gpu_details: TextBlock,
     wayland_socket: Checkbox,
     wayland_selector: RadioGroup,
     wayland_sockets: Vec<String>,
     nvidia_gpu: Checkbox,
+    privileged: Checkbox,
+    privilege_warning: TextBlock,
     focus: FocusTracker,
 }
 
@@ -80,16 +89,28 @@ impl PassthroughStepView {
             0
         };
 
+        let discovered_gpus = discover_host_gpus();
+        let mut gpu_info = String::new();
+        for gpu in &discovered_gpus {
+            gpu_info.push_str(&format!(" • {} ({})\n", gpu.name, gpu.paths.join(", ")));
+        }
+
+        let warning_text = " [!] WARNING: Privileged mode grants the container full host root capabilities. This allows the container to potentially take over the host system. Use only if standard passthrough fails and you trust the container payload.";
+
         let mut view = Self {
-            generic_gpu: Checkbox::new(
-                "Generic GPU Passthrough (/dev/dri, /dev/mali)",
-                initial_data.full_capabilities,
+            graphics_acceleration: Checkbox::new(
+                "Hardware Graphics Acceleration (Auto-detected)",
+                initial_data.graphics_acceleration,
             ),
+            discovered_gpus,
+            gpu_details: TextBlock::new("Hardware Details", gpu_info),
             wayland_socket: Checkbox::new(wayland_label, initial_wayland).with_enabled(is_host_nw),
             wayland_selector: RadioGroup::new("Source Socket", wayland_options, initial_socket_idx),
             wayland_sockets,
             nvidia_gpu: Checkbox::new(nvidia_label, initial_data.nvidia_gpu)
                 .with_enabled(nvidia_toolkit_installed),
+            privileged: Checkbox::new("Privileged Mode (NOT RECOMMENDED)", initial_data.privileged),
+            privilege_warning: TextBlock::new("SECURITY RISK", warning_text),
             focus: FocusTracker::new(),
         };
 
@@ -124,15 +145,27 @@ impl PassthroughStepView {
 impl Component for PassthroughStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let mut constraints = vec![
-            Constraint::Length(3), // Generic
-            Constraint::Length(3), // Wayland checkbox
+            Constraint::Length(3), // Acceleration
         ];
+
+        if self.graphics_acceleration.checked() && !self.discovered_gpus.is_empty() {
+             // TextBlock needs +2 lines for borders (top/bottom)
+            constraints.push(Constraint::Length(self.discovered_gpus.len() as u16 + 2));
+        }
+
+        constraints.push(Constraint::Length(3)); // Wayland checkbox
 
         if self.wayland_socket.checked() {
             constraints.push(Constraint::Length(3)); // Wayland selector
         }
 
         constraints.push(Constraint::Length(3)); // NVIDIA
+        constraints.push(Constraint::Length(3)); // Privileged
+        
+        if self.privileged.checked() {
+            constraints.push(Constraint::Length(5)); // Warning + Borders
+        }
+        
         constraints.push(Constraint::Min(0));
 
         let chunks = Layout::default()
@@ -141,8 +174,13 @@ impl Component for PassthroughStepView {
             .split(area);
 
         let mut current_idx = 0;
-        self.generic_gpu.render(f, chunks[current_idx]);
+        self.graphics_acceleration.render(f, chunks[current_idx]);
         current_idx += 1;
+
+        if self.graphics_acceleration.checked() && !self.discovered_gpus.is_empty() {
+            self.gpu_details.render(f, chunks[current_idx]);
+            current_idx += 1;
+        }
 
         self.wayland_socket.render(f, chunks[current_idx]);
         current_idx += 1;
@@ -153,6 +191,14 @@ impl Component for PassthroughStepView {
         }
 
         self.nvidia_gpu.render(f, chunks[current_idx]);
+        current_idx += 1;
+
+        self.privileged.render(f, chunks[current_idx]);
+        current_idx += 1;
+
+        if self.privileged.checked() {
+            self.privilege_warning.render(f, chunks[current_idx]);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -197,8 +243,9 @@ impl Component for PassthroughStepView {
 
 impl StepComponent for PassthroughStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
-        ctx.passthrough.full_capabilities = self.generic_gpu.checked();
+        ctx.passthrough.graphics_acceleration = self.graphics_acceleration.checked();
         ctx.passthrough.nvidia_gpu = self.nvidia_gpu.checked();
+        ctx.passthrough.privileged = self.privileged.checked();
 
         let is_host_nw = matches!(ctx.network.network_mode(), Some(crate::nspawn::models::NetworkMode::Host));
         

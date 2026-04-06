@@ -6,7 +6,6 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use crate::nspawn::utils::new_command;
-use tokio::process::Command;
 
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};

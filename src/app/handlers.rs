@@ -51,9 +51,9 @@ impl App {
                         1 => self.action_poweroff(),
                         2 => self.action_reboot(),
                         3 => self.action_terminate(),
-                        4 => self.action_kill().await,
-                        5 => self.action_enable().await,
-                        6 => self.action_disable().await,
+                        4 => self.action_kill(),
+                        5 => self.action_enable(),
+                        6 => self.action_disable(),
                         _ => {}
                     }
                 }

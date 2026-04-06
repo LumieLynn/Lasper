@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    manager::{DefaultManager, NspawnManager},
+    core::{DefaultManager, NspawnManager},
     models::ContainerEntry,
     StatusLevel,
 };
@@ -260,7 +260,7 @@ impl App {
         self.ui.app_tx = Some(events.tx.clone());
 
         // Start nspawn metrics collection engine
-        crate::nspawn::metrics::spawn_collector(
+        crate::nspawn::hw::metrics::spawn_collector(
             events.tx.clone(),
             self.data.cpu_cores,
             self.data.cpu_representation,
@@ -305,7 +305,7 @@ impl App {
                     }
                 }
                 Some(cmd) = backend_rx.recv() => {
-                    crate::nspawn::handlers::handle_command(cmd, events.tx.clone());
+                    crate::nspawn::core::handlers::handle_command(cmd, events.tx.clone());
                 }
                 else => break,
             }

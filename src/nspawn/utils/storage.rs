@@ -1,10 +1,9 @@
 //! Abstraction for different container storage backends.
 
-use super::errors::{NspawnError, Result};
+use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use super::utils::{new_command, new_sync_command};
-use tokio::process::Command;
+use super::{new_command, new_sync_command};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -239,7 +238,7 @@ impl StorageBackend for SubvolumeBackend {
 }
 
 pub struct DiskImageBackend {
-    pub config: super::models::DiskImageConfig,
+    pub config: crate::nspawn::models::DiskImageConfig,
 }
 
 #[async_trait::async_trait]

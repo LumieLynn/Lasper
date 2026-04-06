@@ -1,7 +1,8 @@
-use crate::nspawn::create::{nspawn_config_content, systemd_override_content};
+use crate::nspawn::config::nspawn_file::nspawn_config_content;
+use crate::nspawn::config::systemd_unit::systemd_override_content;
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::storage::{StorageBackend, StorageType};
+use crate::nspawn::utils::storage::{StorageBackend, StorageType};
 
 /// The different methods available for acquiring a rootfs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -52,7 +53,8 @@ pub struct NetworkConfig {
 pub struct PassthroughConfig {
     pub bind_mounts: Vec<BindMount>,
     pub device_binds: Vec<String>,
-    pub full_capabilities: bool,
+    pub privileged: bool,
+    pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
 }
@@ -76,7 +78,8 @@ impl ContainerConfigBuilder {
             .unwrap_or(PassthroughConfig {
                 bind_mounts: vec![],
                 device_binds: vec![],
-                full_capabilities: false,
+                privileged: false,
+                graphics_acceleration: false,
                 wayland_socket: None,
                 nvidia_gpu: false,
             });
@@ -101,15 +104,25 @@ impl ContainerConfigBuilder {
             users: vec![],
         });
 
+        let mut device_binds = passthrough.device_binds.clone();
+        if passthrough.graphics_acceleration {
+            for gpu in crate::nspawn::hw::gpu::discover_host_gpus() {
+                device_binds.extend(gpu.paths);
+            }
+        }
+        device_binds.sort();
+        device_binds.dedup();
+
         let cfg = ContainerConfig {
             name: basic.name.clone(),
             hostname: basic.hostname.clone(),
             network: nw.mode.clone(),
             port_forwards: nw.port_forwards.clone(),
             bind_mounts: passthrough.bind_mounts.clone(),
-            device_binds: passthrough.device_binds.clone(),
+            device_binds,
             readonly_binds: vec![],
-            full_capabilities: passthrough.full_capabilities,
+            privileged: passthrough.privileged,
+            graphics_acceleration: passthrough.graphics_acceleration,
             root_password: user.root_password.clone(),
             users: user.users.clone(),
             wayland_socket: passthrough.wayland_socket.clone(),
@@ -138,12 +151,13 @@ impl ContainerConfigBuilder {
             storage.storage_type.get_path(&basic.name).display()
         ));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
-        content.push_str(&nspawn_config_content(&cfg));
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() {
+        content.push_str(&nspawn_config_content(&cfg).unwrap_or_else(|e| format!(" [ERROR: {}]", e)));
+        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
             content.push_str(&systemd_override_content(
                 &cfg.device_binds,
                 cfg.nvidia_gpu,
+                cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
             ));
         }
@@ -156,7 +170,7 @@ impl ContainerConfigBuilder {
 
     pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::deploy::*;
-        use crate::nspawn::storage::*;
+        use crate::nspawn::utils::storage::*;
 
         let storage_cfg = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
             storage_type: StorageType::Directory,

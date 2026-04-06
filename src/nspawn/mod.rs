@@ -1,18 +1,14 @@
 //! Core logic for interacting with systemd-nspawn and machinectl.
 
+pub mod core;
 pub mod config;
-pub mod create;
+pub mod rootfs;
+pub mod hw;
+pub mod utils;
+
 pub mod deploy;
 pub mod errors;
-pub mod handlers;
-pub mod manager;
-pub mod metrics;
 pub mod models;
-pub mod network;
-pub mod nvidia;
-pub mod provider;
-pub mod storage;
-pub mod utils;
 
 pub use models::ContainerEntry;
 pub use models::ContainerState;

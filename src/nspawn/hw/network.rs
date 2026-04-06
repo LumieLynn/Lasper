@@ -18,6 +18,7 @@ pub fn detect_bridges() -> Vec<String> {
 }
 
 /// Autodetect physical (non-virtual) network interfaces on the host.
+#[allow(dead_code)]
 pub fn detect_physical_interfaces() -> Vec<String> {
     let mut interfaces = Vec::new();
     if let Ok(entries) = fs::read_dir("/sys/class/net") {

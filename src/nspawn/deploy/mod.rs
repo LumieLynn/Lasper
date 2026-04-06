@@ -6,7 +6,7 @@ pub mod image;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
-use crate::nspawn::storage::StorageBackend;
+use crate::nspawn::utils::storage::StorageBackend;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -106,25 +106,25 @@ async fn run_deploy_internal(
 
         if let Some(pwd) = &cfg.root_password {
             push_log!("Setting root password...".to_string());
-            crate::nspawn::create::set_root_password(&rootfs, pwd).await?;
+            crate::nspawn::rootfs::users::set_root_password(&rootfs, pwd).await?;
         }
 
         for user in &cfg.users {
             push_log!(format!("Creating user {}...", user.username));
-            crate::nspawn::create::create_user_in_container(&rootfs, user).await?;
+            crate::nspawn::rootfs::users::create_user_in_container(&rootfs, user).await?;
 
             if cfg.wayland_socket.is_some() {
                 push_log!(format!("Setting up wayland env for {}...", user.username));
-                crate::nspawn::create::setup_wayland_shell_env(&rootfs, user).await?;
+                crate::nspawn::rootfs::wayland::setup_wayland_shell_env(&rootfs, user).await?;
             }
         }
 
-        let mut nspawn_content = crate::nspawn::create::nspawn_config_content(&cfg);
+        let mut nspawn_content = crate::nspawn::config::nspawn_file::nspawn_config_content(&cfg)?;
 
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
-            if let Ok(state) = crate::nspawn::nvidia::get_nvidia_state().await {
-                match crate::nspawn::config::NspawnConfig::apply_gpu_passthrough_to_content(
+            if let Ok(state) = crate::nspawn::hw::nvidia::get_nvidia_state().await {
+                match crate::nspawn::config::nspawn_file::NspawnConfig::apply_gpu_passthrough_to_content(
                     nspawn_content.clone(),
                     &state,
                     &[],
@@ -142,6 +142,22 @@ async fn run_deploy_internal(
             }
         }
 
+        // Audit the security posture
+        let idmap_supported = crate::nspawn::utils::discovery::supports_idmap();
+        if idmap_supported {
+            log::info!("[AUDIT] [Container: {}] [Security: High] Using secure idmap for hardware passthrough.", name);
+            push_log!("Using secure idmap for hardware passthrough.".to_string());
+        } else if cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged {
+            log::warn!("[AUDIT] [Container: {}] [Security: Compromised] Disabling User Namespaces due to missing host idmap support.", name);
+            push_log!("WARNING: Legacy security mode (PrivateUsers=no) due to missing host idmap support.".to_string());
+        }
+
+        if cfg.privileged {
+            log::warn!("[AUDIT] [Container: {}] [Security: Dangerous] Privileged mode enabled. Capability=all granted.", name);
+            push_log!("DANGER: Privileged mode enabled (Capability=all).".to_string());
+        }
+    
+
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
         if let Some(parent) = nspawn_path.parent() {
@@ -151,16 +167,17 @@ async fn run_deploy_internal(
         std::fs::write(&nspawn_path, nspawn_content)
             .map_err(|e| NspawnError::Io(nspawn_path, e))?;
 
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() {
+        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Config] Writing systemd service override...",
                 name
             );
             push_log!("Writing systemd service override...".to_string());
-            crate::nspawn::create::write_systemd_override(
+            crate::nspawn::config::systemd_unit::write_systemd_override(
                 &name,
                 &cfg.device_binds,
                 cfg.nvidia_gpu,
+                cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
             )?;
         }
@@ -171,7 +188,7 @@ async fn run_deploy_internal(
                 NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
             ) {
                 push_log!("Enabling container network (systemd-networkd)...".to_string());
-                if let Err(e) = crate::nspawn::create::enable_container_networkd(&rootfs).await {
+                if let Err(e) = crate::nspawn::rootfs::network::enable_container_networkd(&rootfs).await {
                     push_log!(format!("WARNING: {} (might not be a systemd container)", e));
                 }
             }

@@ -336,52 +336,126 @@ impl App {
         });
     }
 
-    pub async fn action_kill(&mut self) {
+    pub fn action_kill(&mut self) {
         if !self.check_action_cooldown() {
             return;
         }
-        if let Some(e) = self.data.entries.get(self.data.selected) {
-            if e.state.is_running() {
-                // For now, just send SIGTERM via kill
-                match self.data.manager.kill(&e.name, "SIGTERM").await {
-                    Ok(_) => {
-                        let suffix = if self.data.manager.did_fallback() {
-                            " (via CLI fallback)"
-                        } else {
-                            ""
-                        };
-                        self.set_status(
-                            format!("Sent SIGTERM to {}{}", e.name, suffix),
+        let (name, manager, tx) = {
+            let e = match self.data.entries.get(self.data.selected) {
+                Some(e) => e,
+                None => return,
+            };
+            if !e.state.is_running() {
+                return;
+            }
+
+            let tx = match &self.ui.app_tx {
+                Some(tx) => tx.clone(),
+                None => return,
+            };
+            (e.name.clone(), self.data.manager.clone(), tx)
+        };
+
+        tokio::spawn(async move {
+            match manager.kill(&name, "SIGTERM").await {
+                Ok(_) => {
+                    let suffix = if manager.did_fallback() {
+                        " (via CLI fallback)"
+                    } else {
+                        ""
+                    };
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Sent SIGTERM to {}{}", name, suffix),
                             StatusLevel::Success,
-                        );
-                    }
-                    Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+                        ))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Error: {err}"),
+                            StatusLevel::Error,
+                        ))
+                        .await;
                 }
             }
-        }
+        });
     }
 
-    pub async fn action_enable(&mut self) {
+    pub fn action_enable(&mut self) {
         if !self.check_action_cooldown() {
             return;
         }
-        if let Some(e) = self.data.entries.get(self.data.selected) {
-            match self.data.manager.enable(&e.name).await {
-                Ok(_) => self.set_status(format!("Enabled {}", e.name), StatusLevel::Success),
-                Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+        let (name, manager, tx) = {
+            let e = match self.data.entries.get(self.data.selected) {
+                Some(e) => e,
+                None => return,
+            };
+            let tx = match &self.ui.app_tx {
+                Some(tx) => tx.clone(),
+                None => return,
+            };
+            (e.name.clone(), self.data.manager.clone(), tx)
+        };
+
+        tokio::spawn(async move {
+            match manager.enable(&name).await {
+                Ok(_) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Enabled {}", name),
+                            StatusLevel::Success,
+                        ))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Error: {err}"),
+                            StatusLevel::Error,
+                        ))
+                        .await;
+                }
             }
-        }
+        });
     }
 
-    pub async fn action_disable(&mut self) {
+    pub fn action_disable(&mut self) {
         if !self.check_action_cooldown() {
             return;
         }
-        if let Some(e) = self.data.entries.get(self.data.selected) {
-            match self.data.manager.disable(&e.name).await {
-                Ok(_) => self.set_status(format!("Disabled {}", e.name), StatusLevel::Success),
-                Err(err) => self.set_status(format!("Error: {err}"), StatusLevel::Error),
+        let (name, manager, tx) = {
+            let e = match self.data.entries.get(self.data.selected) {
+                Some(e) => e,
+                None => return,
+            };
+            let tx = match &self.ui.app_tx {
+                Some(tx) => tx.clone(),
+                None => return,
+            };
+            (e.name.clone(), self.data.manager.clone(), tx)
+        };
+
+        tokio::spawn(async move {
+            match manager.disable(&name).await {
+                Ok(_) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Disabled {}", name),
+                            StatusLevel::Success,
+                        ))
+                        .await;
+                }
+                Err(err) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Error: {err}"),
+                            StatusLevel::Error,
+                        ))
+                        .await;
+                }
             }
-        }
+        });
     }
 }

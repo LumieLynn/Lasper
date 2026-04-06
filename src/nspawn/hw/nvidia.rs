@@ -1,10 +1,9 @@
 //! NVIDIA GPU and driver detection logic for host passthrough.
 
-use super::errors::{NspawnError, Result};
+use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use super::utils::new_command;
-use tokio::process::Command;
+use crate::nspawn::utils::new_command;
 
 /// Hardware and driver information detected on the host for mounting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -203,7 +202,7 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
     );
 
     // 1. Mount rootfs
-    let backend = super::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
 
     // 2. Precise cleanup: Iterate and remove 0-byte files
@@ -258,25 +257,6 @@ async fn cleanup_recursive_0byte(path: &Path) -> Result<()> {
     Ok(())
 }
 
-// async fn run_nvidia_container_cli_list() -> Result<Vec<String>> {
-//     let out = Command::new("nvidia-container-cli")
-//         .arg("list")
-//         .output()
-//         .await
-//         .map_err(|_| {
-//             NspawnError::Runtime(
-//                 "Dependency missing: Please install 'nvidia-container-toolkit' on the host.".into(),
-//             )
-//         })?;
-
-//     let paths = String::from_utf8_lossy(&out.stdout)
-//         .lines()
-//         .map(|l| l.trim().to_string())
-//         .filter(|l| !l.is_empty())
-//         .collect();
-//     Ok(paths)
-// }
-
 fn get_state_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("LASPER_STATE_DIR") {
         return PathBuf::from(dir);
@@ -308,7 +288,7 @@ pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
-    let backend = super::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 
@@ -339,7 +319,7 @@ pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> 
 pub async fn save_internal_state(name: &str, state: &NvidiaState) -> Result<()> {
     let content = serde_json::to_string_pretty(state)?;
 
-    let backend = super::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 
@@ -363,10 +343,10 @@ pub fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<String>
 
 pub async fn ensure_gpu_passthrough(
     name: &str,
-    dbus: &crate::nspawn::provider::dbus::DbusProvider,
+    dbus: &crate::nspawn::core::provider::dbus::DbusProvider,
 ) -> Result<()> {
     // 1. Semantic Marker Check
-    let config = match super::config::NspawnConfig::load(name) {
+    let config = match crate::nspawn::config::nspawn_file::NspawnConfig::load(name) {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -434,7 +414,7 @@ pub async fn ensure_gpu_passthrough(
 
     // 4. AST mutation
     log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
-    super::config::NspawnConfig::update_gpu_passthrough(name, &host_state, &death_list).await?;
+    crate::nspawn::config::nspawn_file::NspawnConfig::update_gpu_passthrough(name, &host_state, &death_list).await?;
 
     // 5. Persistent Injection & Dual-Track Sync
     log_step!(

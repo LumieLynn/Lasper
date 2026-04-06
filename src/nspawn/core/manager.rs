@@ -1,6 +1,6 @@
-use super::errors::{NspawnError, Result};
-use super::models::{ContainerEntry, MachineProperties};
-use super::provider::{cli::CliProvider, dbus::DbusProvider};
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::core::provider::{cli::CliProvider, dbus::DbusProvider};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ impl DefaultManager {
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        super::nvidia::ensure_gpu_passthrough(name, &self.dbus).await
+        crate::nspawn::hw::nvidia::ensure_gpu_passthrough(name, &self.dbus).await
     }
 }
 
