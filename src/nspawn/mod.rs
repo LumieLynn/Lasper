@@ -5,6 +5,7 @@ pub mod config;
 pub mod rootfs;
 pub mod hw;
 pub mod utils;
+pub mod storage;
 
 pub mod deploy;
 pub mod errors;

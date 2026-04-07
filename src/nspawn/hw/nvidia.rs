@@ -202,7 +202,7 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
     );
 
     // 1. Mount rootfs
-    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
 
     // 2. Precise cleanup: Iterate and remove 0-byte files
@@ -288,7 +288,7 @@ pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
-    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 
@@ -319,7 +319,7 @@ pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> 
 pub async fn save_internal_state(name: &str, state: &NvidiaState) -> Result<()> {
     let content = serde_json::to_string_pretty(state)?;
 
-    let backend = crate::nspawn::utils::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name);
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 

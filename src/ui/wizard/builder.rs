@@ -2,7 +2,7 @@ use crate::nspawn::config::nspawn_file::nspawn_config_content;
 use crate::nspawn::config::systemd_unit::systemd_override_content;
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::utils::storage::{StorageBackend, StorageType};
+use crate::nspawn::storage::{StorageBackend, StorageType};
 
 /// The different methods available for acquiring a rootfs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -163,7 +163,7 @@ impl ContainerConfigBuilder {
 
     pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::deploy::*;
-        use crate::nspawn::utils::storage::*;
+        use crate::nspawn::storage::*;
 
         let storage_cfg = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
             storage_type: StorageType::Directory,
@@ -177,8 +177,13 @@ impl ContainerConfigBuilder {
                 config: storage_cfg
                     .disk_config
                     .unwrap_or(crate::nspawn::models::DiskImageConfig {
-                        size: "2G".to_string(),
-                        fs_type: "ext4".to_string(),
+                        source: crate::nspawn::models::DiskImageSource::CreateNew {
+                            size: "2G".to_string(),
+                            fs_type: "ext4".to_string(),
+                            format: crate::nspawn::models::DiskImageFormat::Raw,
+                            encrypted: false,
+                            passphrase: None,
+                        },
                         use_partition_table: false,
                     }),
             }) as Box<dyn StorageBackend>,

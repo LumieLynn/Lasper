@@ -14,6 +14,7 @@ pub struct SelectableList<T> {
     focused: bool,
     enabled: bool,
     display_fn: Box<dyn Fn(&T) -> String>,
+    is_item_enabled_fn: Option<Box<dyn Fn(&T) -> bool>>,
 }
 
 impl<T> SelectableList<T> {
@@ -33,7 +34,13 @@ impl<T> SelectableList<T> {
             focused: false,
             enabled: true,
             display_fn: Box::new(display_fn),
+            is_item_enabled_fn: None,
         }
+    }
+
+    pub fn with_item_enablement(mut self, f: impl Fn(&T) -> bool + 'static) -> Self {
+        self.is_item_enabled_fn = Some(Box::new(f));
+        self
     }
 
     pub fn with_enabled(mut self, enabled: bool) -> Self {
@@ -55,6 +62,15 @@ impl<T> SelectableList<T> {
 
     pub fn selected_item(&self) -> Option<&T> {
         self.state.selected().and_then(|idx| self.items.get(idx))
+    }
+
+    pub fn is_item_enabled(&self, idx: usize) -> bool {
+        if let Some(item) = self.items.get(idx) {
+            if let Some(ref f) = self.is_item_enabled_fn {
+                return f(item);
+            }
+        }
+        true
     }
 
     pub fn select(&mut self, index: usize) {
@@ -102,31 +118,45 @@ impl<T> SelectableList<T> {
     }
 
     pub fn next(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i >= self.items.len().saturating_sub(1) {
-                    0
-                } else {
-                    i + 1
-                }
+        if self.items.is_empty() {
+            return;
+        }
+
+        let start_idx = self.state.selected().unwrap_or(0);
+        let mut curr = (start_idx + 1) % self.items.len();
+
+        while curr != start_idx {
+            if self.is_item_enabled(curr) {
+                self.state.select(Some(curr));
+                return;
             }
-            None => 0,
-        };
-        self.state.select(Some(i));
+            curr = (curr + 1) % self.items.len();
+        }
     }
 
     pub fn previous(&mut self) {
-        let i = match self.state.selected() {
-            Some(i) => {
-                if i == 0 {
-                    self.items.len().saturating_sub(1)
-                } else {
-                    i - 1
-                }
-            }
-            None => 0,
+        if self.items.is_empty() {
+            return;
+        }
+
+        let start_idx = self.state.selected().unwrap_or(0);
+        let mut curr = if start_idx == 0 {
+            self.items.len() - 1
+        } else {
+            start_idx - 1
         };
-        self.state.select(Some(i));
+
+        while curr != start_idx {
+            if self.is_item_enabled(curr) {
+                self.state.select(Some(curr));
+                return;
+            }
+            curr = if curr == 0 {
+                self.items.len() - 1
+            } else {
+                curr - 1
+            };
+        }
     }
 
     /// Inherent method — callers don't need the `Component` trait in scope.
@@ -147,7 +177,16 @@ impl<T> SelectableList<T> {
         let items: Vec<ListItem> = self
             .items
             .iter()
-            .map(|item| ListItem::new((self.display_fn)(item)))
+            .enumerate()
+            .map(|(i, item)| {
+                let content = (self.display_fn)(item);
+                let item_style = if self.is_item_enabled(i) {
+                    Style::default()
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                ListItem::new(content).style(item_style)
+            })
             .collect();
 
         let mut list = List::new(items).block(

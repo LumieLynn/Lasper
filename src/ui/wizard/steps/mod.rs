@@ -38,10 +38,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
             &context.basic.extract_config(),
         )),
 
-        WizardStep::Storage => Box::new(storage_view::StorageStepView::new(
-            &context.storage.extract_config(),
-            context.storage.info.clone(),
-        )),
+        WizardStep::Storage => Box::new(storage_view::StorageStepView::new(&context.storage)),
 
         WizardStep::User => Box::new(user_view::UserStepView::new(&context.user.extract_config())),
 

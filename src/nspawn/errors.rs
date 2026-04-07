@@ -10,6 +10,12 @@ pub enum NspawnError {
     #[error("Command Failed ({0}): {1}. Output: {2}")]
     CommandFailed(String, String, String), // Context, Command, Error Output
 
+    #[error("{0}")]
+    Generic(String),
+
+    #[error("IO error: {0}")]
+    GenericIo(#[from] std::io::Error),
+
     #[error("IO error in {0}: {1}")]
     Io(PathBuf, #[source] std::io::Error),
 
@@ -24,6 +30,9 @@ pub enum NspawnError {
 
     #[error("Invalid configuration: {0}")]
     InvalidConfig(String),
+
+    #[error("Validation error: {0}")]
+    Validation(String),
 
     #[error("Tool '{0}' not found on PATH")]
     ToolNotFound(String),
@@ -54,6 +63,10 @@ impl NspawnError {
             cmd.into(),
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         )
+    }
+
+    pub fn mount_failed(msg: impl Into<String>) -> Self {
+        Self::StorageError(msg.into())
     }
 }
 

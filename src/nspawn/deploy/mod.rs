@@ -6,7 +6,7 @@ pub mod image;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
-use crate::nspawn::utils::storage::StorageBackend;
+use crate::nspawn::storage::StorageBackend;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
