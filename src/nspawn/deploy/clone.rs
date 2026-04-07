@@ -19,6 +19,10 @@ impl Deployer for CloneDeployer {
         true
     }
 
+    fn requires_post_config(&self) -> bool {
+        false
+    }
+
     async fn deploy(
         &self,
         name: &str,

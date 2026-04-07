@@ -30,8 +30,23 @@ pub struct DiskImageDeployer {
     pub path: String,
 }
 
+impl DiskImageDeployer {
+    fn is_tarball(&self) -> bool {
+        let p = self.path.to_lowercase();
+        p.ends_with(".tar")
+            || p.ends_with(".tar.gz")
+            || p.ends_with(".tar.xz")
+            || p.ends_with(".tar.zst")
+            || p.ends_with(".tgz")
+    }
+}
+
 #[async_trait]
 impl Deployer for DiskImageDeployer {
+    fn is_external_storage_managed(&self) -> bool {
+        !self.is_tarball()
+    }
+
     async fn deploy(
         &self,
         name: &str,
@@ -40,6 +55,160 @@ impl Deployer for DiskImageDeployer {
         _logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
         import_disk_image(&self.path, name, rootfs).await
+    }
+}
+
+pub struct NetworkImageDeployer {
+    pub url: String,
+    pub is_raw: bool,
+}
+
+#[async_trait]
+impl Deployer for NetworkImageDeployer {
+    fn is_external_storage_managed(&self) -> bool {
+        self.is_raw
+    }
+
+    async fn deploy(
+        &self,
+        name: &str,
+        _cfg: &ContainerConfig,
+        rootfs: &std::path::Path,
+        logs: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<()> {
+        let clean_url = self.url.trim();
+        // Use /var/cache/lasper for isolated downloads to bypass systemd-machined interference (Error 23)
+        let cache_dir = "/var/cache/lasper/downloads";
+        let _ = tokio::fs::create_dir_all(cache_dir).await;
+        let _ = tokio::fs::create_dir_all("/var/lib/machines").await;
+        
+        let _ = logs.send(format!("Downloading container from {}...", clean_url)).await;
+        check_tool("curl")?;
+
+        if self.is_raw {
+            check_tool("bash")?;
+            let _ = logs.send("Streaming and provisioning RAW disk image to cache...".into()).await;
+            
+            let dest = format!("/var/lib/machines/{}.raw", name);
+            let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
+            
+            // Phase 1: Download and decompress into isolated cache
+            let script = format!(
+                "set -o pipefail; case '{url}' in \
+                 *.xz)  curl -# -L -f -A 'Lasper/1.0' '{url}' | xz -d > '{cache_dest}' ;; \
+                 *.gz)  curl -# -L -f -A 'Lasper/1.0' '{url}' | gzip -d > '{cache_dest}' ;; \
+                 *.zst) curl -# -L -f -A 'Lasper/1.0' '{url}' | zstd -d > '{cache_dest}' ;; \
+                 *.bz2) curl -# -L -f -A 'Lasper/1.0' '{url}' | bzip2 -d > '{cache_dest}' ;; \
+                 *)     curl -# -L -f -A 'Lasper/1.0' '{url}' -o '{cache_dest}' ;; \
+                 esac",
+                url = clean_url,
+                cache_dest = cache_dest
+            );
+
+            let mut child = new_command("bash")
+                .args(["-c", &script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+
+            stream_curl_logs(&mut child, logs.clone());
+
+            let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+            if !status.success() {
+                let _ = tokio::fs::remove_file(&cache_dest).await;
+                return Err(NspawnError::DeployError(format!("Raw image download/extraction failed: {}", status)));
+            }
+
+            // Phase 2: Post-download validation in the cache zone
+            let _ = logs.send("Validating disk image integrity...".into()).await;
+            let validate = new_command("systemd-dissect")
+                .args(["--validate", &cache_dest])
+                .output()
+                .await
+                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("systemd-dissect"), e))?;
+
+            if !validate.status.success() {
+                let _ = tokio::fs::remove_file(&cache_dest).await;
+                return Err(NspawnError::DeployError("Downloaded file is not a valid disk image.".into()));
+            }
+
+            // Phase 3: Finalize — move to hot zone protected by systemd-machined
+            let _ = tokio::fs::rename(&cache_dest, &dest).await;
+        } else {
+            check_tool("tar")?;
+            check_tool("bash")?;
+            
+            let cache_tar = format!("{}/{}.tar.part", cache_dir, name);
+            let _ = logs.send("Downloading compressed tarball to cache...".into()).await;
+            
+            // Phase 1: Download to isolated cache file
+            let download_script = format!(
+                "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' '{}' -o '{}'", 
+                clean_url, cache_tar
+            );
+            
+            let mut child = new_command("bash")
+                .args(["-c", &download_script])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+
+            stream_curl_logs(&mut child, logs.clone());
+
+            let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+            if !status.success() {
+                let _ = tokio::fs::remove_file(&cache_tar).await;
+                return Err(NspawnError::DeployError(format!("Network download failed: {}", status)));
+            }
+
+            // Phase 2: Extract from local cache file directly into user-selected rootfs
+            let _ = logs.send("Extracting tarball to storage backend...".into()).await;
+            let extract_out = new_command("tar")
+                .args([
+                    "--numeric-owner",
+                    "-pxf",
+                    &cache_tar,
+                    "-C",
+                    &rootfs.to_string_lossy(),
+                ])
+                .output()
+                .await
+                .map_err(|e| NspawnError::Io(rootfs.to_path_buf(), e))?;
+
+            let _ = tokio::fs::remove_file(&cache_tar).await;
+            if !extract_out.status.success() {
+                return Err(NspawnError::cmd_failed(
+                    "tar -xf",
+                    format!("tar -xf {} -C {}", cache_tar, rootfs.display()),
+                    &extract_out,
+                ));
+            }
+        }
+
+
+        Ok(())
+    }
+}
+
+/// Helper function to stream curl progress logs (split by \r) to the TUI.
+fn stream_curl_logs(child: &mut tokio::process::Child, logs: tokio::sync::mpsc::Sender<String>) {
+    use tokio::io::AsyncBufReadExt;
+    if let Some(stderr) = child.stderr.take() {
+        tokio::spawn(async move {
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = Vec::new();
+            // Split by \r (carriage return) instead of \n to capture curl's progress bar updates correctly
+            while let Ok(bytes) = reader.read_until(b'\r', &mut buf).await {
+                if bytes == 0 { break; }
+                let line = String::from_utf8_lossy(&buf).trim().to_string();
+                if !line.is_empty() {
+                    let _ = logs.send(line).await;
+                }
+                buf.clear();
+            }
+        });
     }
 }
 
@@ -73,8 +242,12 @@ pub async fn import_oci_image(
     check_tool("umoci")?;
 
     let normalized_ref = normalize_oci_image_ref(image_ref);
-    let tmp_oci = format!("/tmp/lasper-oci-{}-{}", local_name, std::process::id());
-    let bundle_dir = format!("/tmp/lasper-bundle-{}-{}", local_name, std::process::id());
+    // Use /var/cache/lasper/oci-tmp instead of /tmp to avoid tmpfs RAM exhaustion or machined interference
+    let tmp_parent = "/var/cache/lasper/oci-tmp";
+    let _ = tokio::fs::create_dir_all(tmp_parent).await;
+
+    let tmp_oci = format!("{}/oci-{}-{}", tmp_parent, local_name, std::process::id());
+    let bundle_dir = format!("{}/bundle-{}-{}", tmp_parent, local_name, std::process::id());
 
     // Closure for cleanup
     let cleanup = || {
@@ -168,41 +341,61 @@ pub async fn import_oci_image(
     Ok(())
 }
 
-/// Import a local disk image (.raw/.tar/.tar.gz/.qcow2) via `importctl`.
+/// Import a local disk image (.raw/.tar/.tar.gz/.qcow2).
 pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::Path) -> Result<()> {
-    check_tool("importctl")?;
-
-    let subcommand = if path.ends_with(".tar")
-        || path.ends_with(".tar.gz")
-        || path.ends_with(".tar.xz")
-        || path.ends_with(".tar.zst")
+    let p = path.to_lowercase();
+    if p.ends_with(".tar")
+        || p.ends_with(".tar.gz")
+        || p.ends_with(".tar.xz")
+        || p.ends_with(".tar.zst")
+        || p.ends_with(".tgz")
     {
-        "import-tar"
-    } else {
-        "import-raw"
-    };
+        return import_disk_image_tar(path, dest).await;
+    }
 
-    log::info!("importctl {} {} {}", subcommand, path, local_name);
+    check_tool("importctl")?;
+    log::info!("importctl import-raw {} {}", path, local_name);
     let out = new_command("importctl")
-        .args([subcommand, path, local_name])
+        .args(["import-raw", path, local_name])
         .output()
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("importctl"), e))?;
 
     if !out.status.success() {
         return Err(NspawnError::cmd_failed(
-            "importctl",
-            format!("importctl {} {} {}", subcommand, path, local_name),
+            "importctl import-raw",
+            format!("importctl import-raw {} {}", path, local_name),
             &out,
         ));
     }
 
-    let default_dest = std::path::PathBuf::from(format!("/var/lib/machines/{}", local_name));
-    if dest != default_dest {
-        log::info!("Moving imported image to {}", dest.display());
-        tokio::fs::rename(&default_dest, dest)
-            .await
-            .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
+    // For raw imports, importctl already placed it in /var/lib/machines/NAME.
+    // mod.rs handles the path correctly when is_external_storage_managed is true.
+    Ok(())
+}
+
+async fn import_disk_image_tar(path: &str, dest: &std::path::Path) -> Result<()> {
+    check_tool("tar")?;
+    log::info!("Extracting tar {} to {}", path, dest.display());
+
+    let out = new_command("tar")
+        .args([
+            "--numeric-owner",
+            "-pxf",
+            path,
+            "-C",
+            &dest.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
+
+    if !out.status.success() {
+        return Err(NspawnError::cmd_failed(
+            "tar -xf",
+            format!("tar -xf {} -C {}", path, dest.display()),
+            &out,
+        ));
     }
 
     Ok(())

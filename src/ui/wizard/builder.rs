@@ -11,7 +11,8 @@ pub enum SourceKind {
     Oci,
     Debootstrap,
     Pacstrap,
-    DiskImage,
+    Pull,
+    LocalFile,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,8 +22,10 @@ pub struct SourceConfig {
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub pacstrap_pkgs: String,
-    pub disk_path: String,
+    pub local_path: String,
     pub clone_source: String,
+    pub pull_url: String,
+    pub is_pull_raw: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -195,8 +198,10 @@ impl ContainerConfigBuilder {
             deboot_mirror: String::new(),
             deboot_suite: String::new(),
             pacstrap_pkgs: String::new(),
-            disk_path: String::new(),
+            local_path: String::new(),
             clone_source: String::new(),
+            pull_url: String::new(),
+            is_pull_raw: false,
         });
 
         let deployer: Box<dyn Deployer> = match source.kind {
@@ -206,8 +211,12 @@ impl ContainerConfigBuilder {
             SourceKind::Oci => Box::new(image::OciDeployer {
                 url: source.oci_url.clone(),
             }) as Box<dyn Deployer>,
-            SourceKind::DiskImage => Box::new(image::DiskImageDeployer {
-                path: source.disk_path.clone(),
+            SourceKind::LocalFile => Box::new(image::DiskImageDeployer {
+                path: source.local_path.clone(),
+            }) as Box<dyn Deployer>,
+            SourceKind::Pull => Box::new(image::NetworkImageDeployer {
+                url: source.pull_url.clone(),
+                is_raw: source.is_pull_raw,
             }) as Box<dyn Deployer>,
             SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer {
                 mirror: source.deboot_mirror.clone(),

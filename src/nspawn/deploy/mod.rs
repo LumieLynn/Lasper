@@ -25,6 +25,12 @@ pub trait Deployer: Send + Sync {
     fn is_external_storage_managed(&self) -> bool {
         false
     }
+
+    /// Returns true if this deployer requires post-deployment configuration (passwords, etc).
+    /// Default is true. Clones might set this to false if they are already configured.
+    fn requires_post_config(&self) -> bool {
+        true
+    }
 }
 
 /// Orchestrates the asynchronous deployment of a new container.
@@ -76,22 +82,23 @@ async fn run_deploy_internal(
         storage.create(&name).await?;
     }
 
-    // 2. Mount storage (returns rootfs path)
-    let rootfs = if !is_ext {
-        log::info!(
-            "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
-            name
-        );
-        push_log!("Mounting storage...".to_string());
-        storage.mount(&name).await?
-    } else {
-        // For clones, machinectl clone handles everything.
-        // We use a dummy path since it won't be used for post-config anyway (skipped below).
-        std::path::PathBuf::from(format!("/var/lib/machines/{}", name))
-    };
+    // 2. Deployment & Configuration scoping
+    let mut dissect_mount_dir: Option<std::path::PathBuf> = None;
 
-    // Use a scoped guard-like pattern to ensure unmount
     let result = async {
+        // 2. Mount storage (returns rootfs path)
+        let rootfs = if !is_ext {
+            log::info!(
+                "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
+                name
+            );
+            push_log!("Mounting storage...".to_string());
+            storage.mount(&name).await?
+        } else {
+            // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
+            std::path::PathBuf::from(format!("/var/lib/machines/{}", name))
+        };
+
         // 3. Perform base deployment
         log::info!(
             "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
@@ -99,24 +106,57 @@ async fn run_deploy_internal(
         );
         deployer.deploy(&name, &cfg, &rootfs, logs.clone()).await?;
 
-        // 4. Post-deployment configuration (skipped for clones as they are already configured)
-        if is_ext {
+        // 4. Post-deployment configuration
+        if !deployer.requires_post_config() {
+            log::info!("[AUDIT] [Container: {}] [Step: Config] Skipping post-config for pre-configured clones.", name);
             return Ok(());
         }
 
-        if let Some(pwd) = &cfg.root_password {
-            push_log!("Setting root password...".to_string());
-            crate::nspawn::rootfs::users::set_root_password(&rootfs, pwd).await?;
+        // ---- systemd-dissect raw mounting ----
+        let mut actual_rootfs = rootfs.clone();
+
+        if !actual_rootfs.exists() {
+            let raw_path = std::path::PathBuf::from(format!("/var/lib/machines/{}.raw", name));
+            if raw_path.exists() && raw_path.is_file() {
+                let mount_point = std::path::PathBuf::from(format!("/tmp/lasper-dissect-{}", name));
+                let _ = tokio::fs::create_dir_all(&mount_point).await;
+                push_log!("Mounting raw image for configuration...".to_string());
+                
+                let out = crate::nspawn::utils::new_command("systemd-dissect")
+                    .args(["--mount", raw_path.to_str().unwrap(), mount_point.to_str().unwrap()])
+                    .output().await;
+
+                if let Ok(cmd) = out {
+                    if cmd.status.success() {
+                        actual_rootfs = mount_point.clone();
+                        dissect_mount_dir = Some(mount_point);
+                    } else {
+                        push_log!("WARNING: Failed to mount raw image with systemd-dissect.".into());
+                    }
+                }
+            }
         }
 
-        for user in &cfg.users {
-            push_log!(format!("Creating user {}...", user.username));
-            crate::nspawn::rootfs::users::create_user_in_container(&rootfs, user).await?;
+        let is_mounted_dir = actual_rootfs.exists() && actual_rootfs.is_dir();
 
-            if cfg.wayland_socket.is_some() {
-                push_log!(format!("Setting up wayland env for {}...", user.username));
-                crate::nspawn::rootfs::wayland::setup_wayland_shell_env(&rootfs, user).await?;
+        if is_mounted_dir {
+            if let Some(pwd) = &cfg.root_password {
+                push_log!("Setting root password...".to_string());
+                crate::nspawn::rootfs::users::set_root_password(&actual_rootfs, pwd).await?;
             }
+
+            for user in &cfg.users {
+                push_log!(format!("Creating user {}...", user.username));
+                crate::nspawn::rootfs::users::create_user_in_container(&actual_rootfs, user).await?;
+
+                if cfg.wayland_socket.is_some() {
+                    push_log!(format!("Setting up wayland env for {}...", user.username));
+                    crate::nspawn::rootfs::wayland::setup_wayland_shell_env(&actual_rootfs, user).await?;
+                }
+            }
+        } else {
+            log::warn!("[AUDIT] [Container: {}] rootfs is not a directory. Skipping internal modifications.", name);
+            push_log!("WARNING: Target is unmounted. Skipping passwords and user creation.".to_string());
         }
 
         let mut nspawn_content = crate::nspawn::config::nspawn_file::nspawn_config_content(&cfg)?;
@@ -156,7 +196,6 @@ async fn run_deploy_internal(
             log::warn!("[AUDIT] [Container: {}] [Security: Dangerous] Privileged mode enabled. Capability=all granted.", name);
             push_log!("DANGER: Privileged mode enabled (Capability=all).".to_string());
         }
-    
 
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
@@ -182,14 +221,16 @@ async fn run_deploy_internal(
             )?;
         }
 
-        if let Some(mode) = &cfg.network {
-            if matches!(
-                mode,
-                NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
-            ) {
-                push_log!("Enabling container network (systemd-networkd)...".to_string());
-                if let Err(e) = crate::nspawn::rootfs::network::enable_container_networkd(&rootfs).await {
-                    push_log!(format!("WARNING: {} (might not be a systemd container)", e));
+        if is_mounted_dir {
+            if let Some(mode) = &cfg.network {
+                if matches!(
+                    mode,
+                    NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
+                ) {
+                    push_log!("Enabling container network (systemd-networkd)...".to_string());
+                    if let Err(e) = crate::nspawn::rootfs::network::enable_container_networkd(&actual_rootfs).await {
+                        push_log!(format!("WARNING: {} (might not be a systemd container)", e));
+                    }
                 }
             }
         }
@@ -197,15 +238,43 @@ async fn run_deploy_internal(
     }
     .await;
 
-    // 5. Unmount storage
-    if !is_ext {
-        push_log!("Unmounting storage...".to_string());
-        if let Err(e) = storage.unmount(&name).await {
-            push_log!(format!("WARNING: Failed to unmount: {}", e));
-        }
+    // ---- Cleanup Guard ----
+
+    // 1. Unmount systemd-dissect if it was used
+    if let Some(mnt) = dissect_mount_dir {
+        push_log!("Unmounting raw image...".to_string());
+        let _ = crate::nspawn::utils::new_command("systemd-dissect")
+            .args(["--umount", mnt.to_str().unwrap()])
+            .output().await;
+        let _ = tokio::fs::remove_dir_all(&mnt).await;
     }
 
+    // 2. Unmount Lasper storage
+    if !is_ext {
+        push_log!("Unmounting storage...".to_string());
+        let _ = storage.unmount(&name).await;
+    }
+
+    // 3. Transactional Rollback
     if let Err(e) = result {
+        push_log!(format!("Deployment failed: {}", e));
+        push_log!("Rolling back broken container...".to_string());
+        
+        // Clean up host-side configurations to prevent "ghost configs"
+        let nspawn_path = format!("/etc/systemd/nspawn/{}.nspawn", name);
+        let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
+        let _ = tokio::fs::remove_file(&nspawn_path).await;
+        let _ = tokio::fs::remove_dir_all(&override_dir).await;
+
+        if is_ext {
+            // Cleanup systemd-managed storage (downloaded/imported junk)
+            let _ = crate::nspawn::utils::new_command("machinectl")
+                .args(["remove", &name])
+                .output().await;
+        } else {
+            // Cleanup Lasper-managed storage
+            let _ = storage.delete(&name).await;
+        }
         return Err(e);
     }
 

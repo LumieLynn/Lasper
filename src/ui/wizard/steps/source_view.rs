@@ -2,6 +2,7 @@ use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
+use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 
@@ -22,7 +23,11 @@ macro_rules! active_comps {
                 comps.push(&mut $self.deboot_suite);
             }
             3 => comps.push(&mut $self.pacstrap_pkgs),
-            4 => comps.push(&mut $self.disk_path),
+            4 => {
+                comps.push(&mut $self.pull_url);
+                comps.push(&mut $self.pull_format);
+            }
+            5 => comps.push(&mut $self.local_path),
             _ => {}
         }
         comps
@@ -35,7 +40,9 @@ pub struct SourceStepView {
     deboot_mirror: TextBox,
     deboot_suite: TextBox,
     pacstrap_pkgs: TextBox,
-    disk_path: TextBox,
+    local_path: TextBox,
+    pull_url: TextBox,
+    pull_format: RadioGroup,
     oci_tip: TextBlock,
 
     focus: FocusTracker,
@@ -48,10 +55,14 @@ impl SourceStepView {
             "[OCI]         import from registry (docker.io/…)".to_string(),
             "[debootstrap] bootstrap Debian/Ubuntu container".to_string(),
             "[pacstrap]    bootstrap Arch Linux container".to_string(),
-            "[disk]        import local disk image (.raw, .tar)".to_string(),
+            "[pull]        download via pull-tar/pull-raw".to_string(),
+            "[file]        import local filesystem/tarball (.tar, .raw)".to_string(),
         ];
 
         let kind_list = SelectableList::new(" Select base ", kinds, |s| s.clone());
+        if initial_data.kind == SourceKind::Pull {
+            // we'll set the index later or just let it be handled by context sync if needed
+        }
 
         let mut view = Self {
             kind_list,
@@ -61,11 +72,32 @@ impl SourceStepView {
             deboot_suite: TextBox::new(" Suite (example: bookworm) ", initial_data.deboot_suite.clone())
                 .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) }),
             pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone()),
-            disk_path: TextBox::new(" Local file path (.raw, .tar) ", initial_data.disk_path.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("Path required".into()) } else { Ok(()) }),
+            local_path: TextBox::new(" Local file path (.tar, .raw) ", initial_data.local_path.clone())
+                .with_validator(|v| {
+                    if v.trim().is_empty() { return Err("Path required".into()); }
+                    let path = std::path::Path::new(v);
+                    if !path.exists() { return Err("File not found".into()); }
+                    let s = v.to_lowercase();
+                    if s.ends_with(".tar") || s.ends_with(".tar.gz") || s.ends_with(".tar.xz") || s.ends_with(".tar.zst") || s.ends_with(".tgz") || s.ends_with(".raw") {
+                        Ok(())
+                    } else {
+                        Err("Unsupported format (tar/raw only)".into())
+                    }
+                }),
+            pull_url: TextBox::new(" Download URL (tar/raw) ", initial_data.pull_url.clone())
+                .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) }),
+            pull_format: RadioGroup::new(
+                " Pull Format ",
+                vec!["Tarball (.tar)".to_string(), "Raw Image (.raw)".to_string()],
+                if initial_data.is_pull_raw { 1 } else { 0 },
+            ),
             oci_tip: TextBlock::new(" [!] OCI Important Note ", "OCI imports extract the rootfs only. You must manually configure the init program and entrypoint."),
             focus: FocusTracker::new(),
         };
+
+        if initial_data.is_pull_raw {
+            view.pull_format.set_selected_idx(1);
+        }
 
         view.update_focus();
         view
@@ -107,8 +139,14 @@ impl Component for SourceStepView {
                 Constraint::Length(3),
                 Constraint::Length(3),
             ], // Deboot
-            3 | 4 => vec![Constraint::Min(0), Constraint::Length(3)], // Pacstrap/Disk
-            _ => vec![Constraint::Min(0)],                            // Copy/Clone
+            3 => vec![Constraint::Min(0), Constraint::Length(3)], // Pacstrap
+            4 => vec![
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ], // Pull
+            5 => vec![Constraint::Min(0), Constraint::Length(3)], // LocalFile
+            _ => vec![Constraint::Min(0)],                        // Copy/Clone
         };
 
         let chunks = Layout::default()
@@ -131,7 +169,11 @@ impl Component for SourceStepView {
                 self.deboot_suite.render(f, chunks[2]);
             }
             3 => self.pacstrap_pkgs.render(f, chunks[1]),
-            4 => self.disk_path.render(f, chunks[1]),
+            4 => {
+                self.pull_url.render(f, chunks[1]);
+                self.pull_format.render(f, chunks[2]);
+            }
+            5 => self.local_path.render(f, chunks[1]),
             _ => {}
         }
     }
@@ -184,7 +226,9 @@ impl Component for SourceStepView {
             self.deboot_mirror.set_focus(false);
             self.deboot_suite.set_focus(false);
             self.pacstrap_pkgs.set_focus(false);
-            self.disk_path.set_focus(false);
+            self.local_path.set_focus(false);
+            self.pull_url.set_focus(false);
+            self.pull_format.set_focus(false);
         }
     }
 
@@ -197,7 +241,8 @@ impl Component for SourceStepView {
                 self.deboot_suite.validate()?;
             }
             3 => self.pacstrap_pkgs.validate()?,
-            4 => self.disk_path.validate()?,
+            4 => self.pull_url.validate()?,
+            5 => self.local_path.validate()?,
             _ => {}
         }
         Ok(())
@@ -212,13 +257,16 @@ impl StepComponent for SourceStepView {
             1 => SourceKind::Oci,
             2 => SourceKind::Debootstrap,
             3 => SourceKind::Pacstrap,
-            _ => SourceKind::DiskImage,
+            4 => SourceKind::Pull,
+            _ => SourceKind::LocalFile,
         };
         ctx.source.oci_url = self.oci_url.value().to_string();
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
         ctx.source.pacstrap_pkgs = self.pacstrap_pkgs.value().to_string();
-        ctx.source.disk_path = self.disk_path.value().to_string();
+        ctx.source.local_path = self.local_path.value().to_string();
+        ctx.source.pull_url = self.pull_url.value().to_string();
+        ctx.source.is_pull_raw = self.pull_format.selected_idx() == 1;
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {

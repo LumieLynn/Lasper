@@ -106,17 +106,21 @@ impl Wizard {
                 WizardStep::Deploy,
             ]
         } else {
-            vec![
+            let mut flow = vec![
                 WizardStep::Source,
                 WizardStep::Basic,
-                WizardStep::Storage,
                 WizardStep::User,
                 WizardStep::Network,
                 WizardStep::Passthrough,
                 WizardStep::Devices,
                 WizardStep::Review,
                 WizardStep::Deploy,
-            ]
+            ];
+
+            if !self.context.source.is_storage_managed_externally() {
+                flow.insert(2, WizardStep::Storage);
+            }
+            flow
         }
     }
 

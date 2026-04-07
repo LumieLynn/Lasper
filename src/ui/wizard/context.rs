@@ -16,8 +16,10 @@ pub struct SourceState {
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub pacstrap_pkgs: String,
-    pub disk_path: String,
+    pub local_path: String,
     pub clone_source: String,
+    pub pull_url: String,
+    pub is_pull_raw: bool,
     pub copy_idx: usize,
 }
 
@@ -29,8 +31,25 @@ impl SourceState {
             deboot_mirror: self.deboot_mirror.clone(),
             deboot_suite: self.deboot_suite.clone(),
             pacstrap_pkgs: self.pacstrap_pkgs.clone(),
-            disk_path: self.disk_path.clone(),
+            local_path: self.local_path.clone(),
             clone_source: self.clone_source.clone(),
+            pull_url: self.pull_url.clone(),
+            is_pull_raw: self.is_pull_raw,
+        }
+    }
+
+    pub fn is_storage_managed_externally(&self) -> bool {
+        match self.kind {
+            SourceKind::Pull => self.is_pull_raw,
+            SourceKind::LocalFile => {
+                let p = self.local_path.to_lowercase();
+                !(p.ends_with(".tar")
+                    || p.ends_with(".tar.gz")
+                    || p.ends_with(".tar.xz")
+                    || p.ends_with(".tar.zst")
+                    || p.ends_with(".tgz"))
+            }
+            _ => false,
         }
     }
 }
@@ -230,8 +249,10 @@ impl WizardContext {
                 deboot_mirror: "".to_string(),
                 deboot_suite: "".to_string(),
                 pacstrap_pkgs: "".to_string(),
-                disk_path: "".to_string(),
+                local_path: "".to_string(),
                 clone_source: entries.first().map(|e| e.name.clone()).unwrap_or_default(),
+                pull_url: "".to_string(),
+                is_pull_raw: false,
                 copy_idx: 0,
             },
             basic: BasicState {
