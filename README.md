@@ -12,7 +12,7 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
   - Pull and extract OCI (Docker/Podman) images via `skopeo` and `umoci`.
   - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
 - **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
-- **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
+- **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images / block device (unfinished).
 
 ## Prerequisites
 
@@ -56,7 +56,7 @@ sudo lasper
 - `n` / `a` : Create a new container (Creation Wizard)
 - `s` : Start selected container
 - `S` : Poweroff selected container
-- `p` / `d` / `l` / `c` : Switch view panes (Properties / All Details / Logs / Config)
+- `p` / `d` / `l` / `c` / `m` : Switch view panes (Properties / All Details / Logs / Config / Monitoring)
 - `r` : Manual refresh data
 - `?` : Show help
 - `q` : Quit
@@ -67,7 +67,7 @@ sudo lasper
 - [x] Component-based TUI architecture & Responsive layout.
 - [x] DBus integration via `zbus` (with automatic CLI fallback for legacy systems).
 - [x] Asynchronous background task scheduling for long-running deployments.
-- [ ] Resource monitoring (CPU/Memory/I/O usage).
+- [x] Resource monitoring (CPU/Memory/I/O usage).
 - [ ] Interactive .nspawn configuration editor.
 - [ ] `.raw` file custom partition support.
 - [ ] Advanced networking config (`macvlan`, `ipvlan`, static IP customizing, etc.).
