@@ -9,12 +9,10 @@ pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let mut cmd = new_command("systemd-nspawn");
+    let mut cmd = new_command("systemctl");
     cmd.args([
-        "-q",
-        "--directory",
+        "--root",
         &rootfs.to_string_lossy(),
-        "systemctl",
         "enable",
         "systemd-networkd",
         "systemd-resolved",
@@ -23,29 +21,21 @@ pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
     let res = cmd
         .output()
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
+        .map_err(|e| NspawnError::Io(PathBuf::from("systemctl"), e))?;
     if !res.status.success() {
         return Err(NspawnError::cmd_failed(
             "systemctl enable in container",
             format!(
-                "systemd-nspawn --directory {:?} systemctl enable ...",
+                "systemctl --root {:?} enable ...",
                 rootfs
             ),
             &res,
         ));
     }
 
-    let script = "ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf";
-    let mut script_cmd = new_command("systemd-nspawn");
-    script_cmd.args([
-        "-q",
-        "--directory",
-        &rootfs.to_string_lossy(),
-        "sh",
-        "-c",
-        script,
-    ]);
-    let _ = script_cmd.output().await;
+    let resolv_conf = rootfs.join("etc/resolv.conf");
+    let _ = std::fs::remove_file(&resolv_conf);
+    let _ = std::os::unix::fs::symlink("../run/systemd/resolve/stub-resolv.conf", &resolv_conf);
 
     Ok(())
 }

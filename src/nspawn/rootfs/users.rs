@@ -11,11 +11,10 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
         user.shell.as_str()
     };
 
-    let out = new_command("systemd-nspawn")
+    let out = new_command("useradd")
         .args([
-            "--directory",
+            "--root",
             &rootfs.to_string_lossy(),
-            "useradd",
             "-m",
             "-s",
             shell,
@@ -23,22 +22,21 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
         ])
         .output()
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
+        .map_err(|e| NspawnError::Io(PathBuf::from("useradd"), e))?;
     if !out.status.success() {
         return Err(NspawnError::cmd_failed(
             "useradd in container",
-            format!("systemd-nspawn --directory {:?} useradd ...", rootfs),
+            format!("useradd --root {:?} ...", rootfs),
             &out,
         ));
     }
 
     if user.sudoer {
         for group in ["sudo", "wheel"] {
-            let r = new_command("systemd-nspawn")
+            let r = new_command("usermod")
                 .args([
-                    "--directory",
+                    "--root",
                     &rootfs.to_string_lossy(),
-                    "usermod",
                     "-aG",
                     group,
                     &user.username,
@@ -69,25 +67,30 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
     }
 
     if !user.password.is_empty() {
-        let script = format!("echo '{}:{}' | chpasswd", user.username, user.password);
-        let mut cmd = new_command("systemd-nspawn");
-        cmd.args([
-            "-q",
-            "--directory",
-            &rootfs.to_string_lossy(),
-            "sh",
-            "-c",
-            &script,
-        ]);
+        let mut cmd = new_command("chpasswd");
+        cmd.args(["--root", &rootfs.to_string_lossy()]);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
-        let res = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let cred = format!("{}:{}\n", user.username, user.password);
+            let _ = stdin.write_all(cred.as_bytes()).await;
+        }
+
+        let res = child
+            .wait_with_output()
             .await
-            .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
+            .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
         if !res.status.success() {
             return Err(NspawnError::cmd_failed(
                 "chpasswd in container",
-                format!("systemd-nspawn --directory {:?} sh -c ...", rootfs),
+                format!("chpasswd --root {:?}", rootfs),
                 &res,
             ));
         }
@@ -101,25 +104,30 @@ pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
     if password.is_empty() {
         return Ok(());
     }
-    let script = format!("echo 'root:{}' | chpasswd", password);
-    let mut cmd = new_command("systemd-nspawn");
-    cmd.args([
-        "-q",
-        "--directory",
-        &rootfs.to_string_lossy(),
-        "sh",
-        "-c",
-        &script,
-    ]);
+    let mut cmd = new_command("chpasswd");
+    cmd.args(["--root", &rootfs.to_string_lossy()]);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    let res = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use tokio::io::AsyncWriteExt;
+        let cred = format!("root:{}\n", password);
+        let _ = stdin.write_all(cred.as_bytes()).await;
+    }
+
+    let res = child
+        .wait_with_output()
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
+        .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
     if !res.status.success() {
         return Err(NspawnError::cmd_failed(
             "chpasswd for root in container",
-            format!("systemd-nspawn --directory {:?} sh -c ...", rootfs),
+            format!("chpasswd --root {:?}", rootfs),
             &res,
         ));
     }
