@@ -1,11 +1,10 @@
-use std::path::{Path, PathBuf};
-use ini::Ini;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
+use ini::Ini;
+use std::path::{Path, PathBuf};
 
 /// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
 pub struct NspawnConfig {
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub content: String,
 }
@@ -218,18 +217,20 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
     // ── [Exec] ────────────────────────────────────────────────────────────────
     {
         let mut exec = conf.with_section(Some("Exec"));
-        exec.set("Boot", "yes");
+        if cfg.boot {
+            exec.set("Boot", "yes");
+        } else {
+            exec.set("Boot", "no");
+        }
 
         // If idmap is NOT supported, we MUST disable PrivateUsers (the security compromise)
         // DRI and Wayland sockets typically don't work in a namespaced environment without it.
-        if !idmap_supported && (cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged) {
+        if !idmap_supported
+            && (cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged)
+        {
             exec.set("PrivateUsers", "no");
         }
-        
-        if cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged {
-            exec.set("PrivateIPC", "no");
-        }
-        
+
         if cfg.privileged {
             exec.set("Capability", "all");
         }
@@ -318,21 +319,25 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
         if let Some(socket_name) = &cfg.wayland_socket {
             let xdg_runtime = crate::nspawn::utils::discovery::get_xdg_runtime()?;
             let host_wayland_sock = format!("{}/{}", xdg_runtime, socket_name);
-            
-            files.append("Bind", format!("{}:/mnt/wayland-socket{}", host_wayland_sock, suffix));
+
+            files.append(
+                "Bind",
+                format!("{}:/mnt/wayland-socket{}", host_wayland_sock, suffix),
+            );
             files.append("Bind", format!("/tmp/.X11-unix:/tmp/.X11-unix{}", suffix));
-            
+
             if std::path::Path::new("/dev/dri").exists() {
                 files.append("Bind", "/dev/dri");
             }
         }
 
-        // Note: Individual device binds (/dev/dri, /dev/mali, etc.) are now 
+        // Note: Individual device binds (/dev/dri, /dev/mali, etc.) are now
         // dynamically discovered and populated in cfg.device_binds by builder.rs.
     }
 
     let mut buffer = Vec::new();
-    conf.write_to(&mut buffer).map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
+    conf.write_to(&mut buffer)
+        .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 

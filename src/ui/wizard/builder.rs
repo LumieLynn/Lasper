@@ -124,6 +124,7 @@ impl ContainerConfigBuilder {
             wayland_socket: passthrough.wayland_socket.clone(),
             nvidia_gpu: passthrough.nvidia_gpu,
             disk_config: storage.disk_config.clone(),
+            boot: if let Some(s) = &self.source { s.kind != SourceKind::Oci } else { true },
         };
 
         if let Some(source) = &self.source {

@@ -118,7 +118,7 @@ async fn run_deploy_internal(
         if !actual_rootfs.exists() {
             let raw_path = std::path::PathBuf::from(format!("/var/lib/machines/{}.raw", name));
             if raw_path.exists() && raw_path.is_file() {
-                let mount_point = std::path::PathBuf::from(format!("/tmp/lasper-dissect-{}", name));
+                let mount_point = std::path::PathBuf::from(format!("/var/cache/lasper/dissect-{}", name));
                 let _ = tokio::fs::create_dir_all(&mount_point).await;
                 push_log!("Mounting raw image for configuration...".to_string());
                 

@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
+use std::os::unix::fs::PermissionsExt;
 use crate::nspawn::utils::new_command;
 
 use crate::nspawn::deploy::Deployer;
@@ -232,6 +233,20 @@ fn normalize_oci_image_ref(image_ref: &str) -> String {
     }
 }
 
+async fn ensure_container_policy() -> Result<()> {
+    let policy_path = std::path::Path::new("/etc/containers/policy.json");
+    if !policy_path.exists() {
+        let default_policy = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
+        if let Some(parent) = policy_path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        tokio::fs::write(policy_path, default_policy)
+            .await
+            .map_err(|e| NspawnError::Io(policy_path.to_path_buf(), e))?;
+    }
+    Ok(())
+}
+
 /// Import an OCI registry image as a nspawn rootfs directory.
 pub async fn import_oci_image(
     image_ref: &str,
@@ -240,11 +255,12 @@ pub async fn import_oci_image(
 ) -> Result<()> {
     check_tool("skopeo")?;
     check_tool("umoci")?;
+    ensure_container_policy().await?;
 
     let normalized_ref = normalize_oci_image_ref(image_ref);
-    // Use /var/cache/lasper/oci-tmp instead of /tmp to avoid tmpfs RAM exhaustion or machined interference
-    let tmp_parent = "/var/cache/lasper/oci-tmp";
+    let tmp_parent = "/var/cache/lasper/oci-staging";
     let _ = tokio::fs::create_dir_all(tmp_parent).await;
+    let _ = std::fs::set_permissions(tmp_parent, std::fs::Permissions::from_mode(0o700));
 
     let tmp_oci = format!("{}/oci-{}-{}", tmp_parent, local_name, std::process::id());
     let bundle_dir = format!("{}/bundle-{}-{}", tmp_parent, local_name, std::process::id());
@@ -275,7 +291,31 @@ pub async fn import_oci_image(
         ));
     }
 
-    log::info!("umoci unpack --image {}:latest {}", tmp_oci, bundle_dir);
+    // Ensure dest directory exists (or at least its parent)
+    if let Some(parent) = dest.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+
+    log::info!("umoci raw-unpack --image {}:latest {}", tmp_oci, dest.display());
+    let umoci_raw = new_command("umoci")
+        .args([
+            "raw-unpack",
+            "--image",
+            &format!("{}:latest", tmp_oci),
+            &dest.to_string_lossy(),
+        ])
+        .output()
+        .await
+        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
+
+    if umoci_raw.status.success() {
+        cleanup().await;
+        log::info!("OCI image imported to {} via raw-unpack", dest.display());
+        return Ok(());
+    }
+
+    // Fallback to older `umoci unpack` if raw-unpack fails
+    log::warn!("umoci raw-unpack failed or missing, falling back to unpack: {:?}", String::from_utf8_lossy(&umoci_raw.stderr));
     let umoci = new_command("umoci")
         .args([
             "unpack",
@@ -310,11 +350,6 @@ pub async fn import_oci_image(
         rootfs_source.display(),
         dest.display()
     );
-
-    // Ensure dest directory exists (or at least its parent)
-    if let Some(parent) = dest.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
 
     // Use 'cp -a' to copy contents including dotfiles, then cleanup
     let copy_out = new_command("cp")

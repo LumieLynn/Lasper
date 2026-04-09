@@ -34,7 +34,9 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     };
 
     // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp file
-    let tmp_path = format!("/tmp/lasper-cdi-{}.json", std::process::id());
+    let cache_dir = "/var/cache/lasper";
+    let _ = tokio::fs::create_dir_all(cache_dir).await;
+    let tmp_path = format!("{}/cdi-{}.json", cache_dir, std::process::id());
     let out = new_command("nvidia-ctk")
         .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path)])
         .output()

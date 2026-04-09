@@ -112,7 +112,7 @@ impl Default for DiskImageConfig {
 }
 
 /// Complete configuration for a new container.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub name: String,
     pub hostname: String,
@@ -135,6 +135,35 @@ pub struct ContainerConfig {
     pub nvidia_gpu: bool,
     /// Disk image specific configuration (only used if storage type is DiskImage).
     pub disk_config: Option<DiskImageConfig>,
+    /// Whether to start an init process (Boot=yes). True by default. false for basic OCI containers.
+    #[serde(default = "default_boot")]
+    pub boot: bool,
+}
+
+fn default_boot() -> bool {
+    true
+}
+
+impl Default for ContainerConfig {
+    fn default() -> Self {
+        Self {
+            name: Default::default(),
+            hostname: Default::default(),
+            network: Default::default(),
+            port_forwards: Default::default(),
+            bind_mounts: Default::default(),
+            device_binds: Default::default(),
+            readonly_binds: Default::default(),
+            privileged: Default::default(),
+            graphics_acceleration: Default::default(),
+            root_password: Default::default(),
+            users: Default::default(),
+            wayland_socket: Default::default(),
+            nvidia_gpu: Default::default(),
+            disk_config: Default::default(),
+            boot: true,
+        }
+    }
 }
 
 // ── Unified data model ────────────────────────────────────────────────────────
