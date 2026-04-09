@@ -45,6 +45,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         WizardStep::Network => Box::new(network_view::NetworkStepView::new(
             &context.network.extract_config(),
             &context.network.bridge_list,
+            &context.network.physical_interfaces,
         )),
 
         WizardStep::Passthrough => Box::new(passthrough_view::PassthroughStepView::new(

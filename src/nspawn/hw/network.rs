@@ -29,16 +29,11 @@ pub fn detect_physical_interfaces() -> Vec<String> {
             }
 
             let path = entry.path();
-            // Filter out common virtual interfaces
-            let is_virtual = path.join("bridge").is_dir()
-                || path.join("brport").is_dir()
-                || path.join("tun_flags").exists()
-                || name.starts_with("veth")
-                || name.starts_with("docker")
-                || name.starts_with("br-");
 
-            if !is_virtual {
-                interfaces.push(name);
+            if let Ok(real_path) = fs::canonicalize(&path) {
+                if !real_path.to_string_lossy().contains("/devices/virtual/") {
+                    interfaces.push(name);
+                }
             }
         }
     }

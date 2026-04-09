@@ -74,7 +74,7 @@ pub struct StorageState {
     pub type_idx: usize,
     pub info: StorageInfo,
     pub creation_method_idx: usize, // 0: Create New, 1: Import Existing
-    pub disk_format_idx: usize,   // 0: Raw, 1: Qcow2, 2: Vdi, 3: Vmdk, 4: Vpc
+    pub disk_format_idx: usize,     // 0: Raw, 1: Qcow2, 2: Vdi, 3: Vmdk, 4: Vpc
     pub disk_size: String,
     pub disk_fs: String,
     pub disk_partition: bool,
@@ -96,7 +96,10 @@ impl StorageState {
                     crate::nspawn::models::DiskImageFormat::Vmdk,
                     crate::nspawn::models::DiskImageFormat::Vpc,
                 ];
-                let format = formats.get(self.disk_format_idx).cloned().unwrap_or(crate::nspawn::models::DiskImageFormat::Raw);
+                let format = formats
+                    .get(self.disk_format_idx)
+                    .cloned()
+                    .unwrap_or(crate::nspawn::models::DiskImageFormat::Raw);
 
                 let source = if self.creation_method_idx == 1 {
                     crate::nspawn::models::DiskImageSource::ImportExisting {
@@ -151,6 +154,8 @@ pub struct NetworkState {
     pub mode: usize,
     pub bridge_name: String,
     pub bridge_list: Vec<String>,
+    pub interface_name: String,
+    pub physical_interfaces: Vec<String>,
     pub port_list: Vec<PortForward>,
 }
 
@@ -161,6 +166,9 @@ impl NetworkState {
             1 => Some(NetworkMode::None),
             2 => Some(NetworkMode::Veth),
             3 => Some(NetworkMode::Bridge(self.bridge_name.clone())),
+            4 => Some(NetworkMode::MacVlan(self.interface_name.clone())),
+            5 => Some(NetworkMode::IpVlan(self.interface_name.clone())),
+            6 => Some(NetworkMode::Interface(self.interface_name.clone())),
             _ => None,
         }
     }
@@ -192,7 +200,11 @@ impl PassthroughState {
             device_binds: self.selected_gpu_nodes.clone(),
             privileged: self.privileged,
             graphics_acceleration: self.graphics_acceleration,
-            wayland_socket: if is_host_nw { self.wayland_socket.clone() } else { None },
+            wayland_socket: if is_host_nw {
+                self.wayland_socket.clone()
+            } else {
+                None
+            },
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
         }
     }
@@ -281,10 +293,19 @@ impl WizardContext {
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "br0".to_string());
+
+                let physical_interfaces = crate::nspawn::hw::network::detect_physical_interfaces();
+                let default_interface = physical_interfaces
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "eth0".to_string());
+
                 NetworkState {
                     mode: 0,
                     bridge_name: default_bridge,
                     bridge_list: bridges,
+                    interface_name: default_interface,
+                    physical_interfaces,
                     port_list: vec![],
                 }
             },

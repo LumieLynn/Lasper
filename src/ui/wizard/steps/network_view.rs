@@ -1,10 +1,10 @@
 use crate::nspawn::models::{NetworkMode, PortForward};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
-use crate::ui::widgets::selectors::radio_group::RadioGroup;
+use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
+use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 
@@ -15,15 +15,21 @@ use ratatui::Frame;
 macro_rules! active_comps {
     ($self:ident) => {{
         let mode = $self.mode_selector.selected_idx();
-        let is_custom = $self.is_custom_bridge();
+        let is_custom_bridge = $self.is_custom_bridge();
+        let is_custom_interface = $self.is_custom_interface();
         let mut visible: Vec<&mut dyn Component> = vec![&mut $self.mode_selector];
         if mode == 3 {
             visible.push(&mut $self.bridge_list);
-            if is_custom {
+            if is_custom_bridge {
                 visible.push(&mut $self.custom_bridge);
             }
+        } else if mode >= 4 {
+            visible.push(&mut $self.interface_list);
+            if is_custom_interface {
+                visible.push(&mut $self.custom_interface);
+            }
         }
-        if mode != 0 {
+        if mode == 2 || mode == 3 {
             visible.push(&mut $self.port_list);
         }
         visible
@@ -34,20 +40,38 @@ pub struct NetworkStepView {
     mode_selector: RadioGroup,
     bridge_list: SelectableList<String>,
     custom_bridge: TextBox,
+    interface_list: SelectableList<String>,
+    custom_interface: TextBox,
     port_list: EditableList<PortForward>,
     port_editor: Option<PortMappingBox>,
     focus: FocusTracker,
     bridge_options_len: usize,
+    interface_options_len: usize,
 }
 
 impl NetworkStepView {
-    pub fn new(initial_data: &NetworkConfig, scanned_bridges: &[String]) -> Self {
-        let modes = vec!["Host".into(), "None".into(), "Veth".into(), "Bridge".into()];
+    pub fn new(
+        initial_data: &NetworkConfig,
+        scanned_bridges: &[String],
+        scanned_interfaces: &[String],
+    ) -> Self {
+        let modes = vec![
+            "Host".into(),
+            "None".into(),
+            "Veth".into(),
+            "Bridge".into(),
+            "MacVlan".into(),
+            "IpVlan".into(),
+            "Physical".into(),
+        ];
         let mode_idx = match &initial_data.mode {
             Some(NetworkMode::Host) => 0,
             Some(NetworkMode::None) => 1,
             Some(NetworkMode::Veth) => 2,
             Some(NetworkMode::Bridge(_)) => 3,
+            Some(NetworkMode::MacVlan(_)) => 4,
+            Some(NetworkMode::IpVlan(_)) => 5,
+            Some(NetworkMode::Interface(_)) => 6,
             _ => 0,
         };
 
@@ -60,8 +84,9 @@ impl NetworkStepView {
             _ => String::new(),
         };
 
-        let is_custom = !initial_bridge.is_empty() && !scanned_bridges.contains(&initial_bridge);
-        let bridge_idx = if is_custom {
+        let is_custom_bridge =
+            !initial_bridge.is_empty() && !scanned_bridges.contains(&initial_bridge);
+        let bridge_idx = if is_custom_bridge {
             bridges.len() - 1
         } else {
             scanned_bridges
@@ -73,6 +98,32 @@ impl NetworkStepView {
         let mut bridge_list = SelectableList::new(" Select Bridge ", bridges, |s| s.clone());
         bridge_list.select(bridge_idx);
 
+        let mut interfaces = scanned_interfaces.to_vec();
+        interfaces.push(" >> Custom Interface... ".into());
+        let interface_options_len = interfaces.len();
+
+        let initial_interface = match &initial_data.mode {
+            Some(NetworkMode::MacVlan(name))
+            | Some(NetworkMode::IpVlan(name))
+            | Some(NetworkMode::Interface(name)) => name.clone(),
+            _ => String::new(),
+        };
+
+        let is_custom_iface =
+            !initial_interface.is_empty() && !scanned_interfaces.contains(&initial_interface);
+        let interface_idx = if is_custom_iface {
+            interfaces.len() - 1
+        } else {
+            scanned_interfaces
+                .iter()
+                .position(|i| i == &initial_interface)
+                .unwrap_or(0)
+        };
+
+        let mut interface_list =
+            SelectableList::new(" Select Interface ", interfaces, |s| s.clone());
+        interface_list.select(interface_idx);
+
         let mut view = Self {
             mode_selector: RadioGroup::new(" Network Mode ", modes, mode_idx),
             bridge_list,
@@ -80,6 +131,15 @@ impl NetworkStepView {
                 .with_validator(|v| {
                     if v.trim().is_empty() {
                         Err("Bridge name required".into())
+                    } else {
+                        Ok(())
+                    }
+                }),
+            interface_list,
+            custom_interface: TextBox::new(" Custom Interface Name ", initial_interface.clone())
+                .with_validator(|v| {
+                    if v.trim().is_empty() {
+                        Err("Interface name required".into())
                     } else {
                         Ok(())
                     }
@@ -94,6 +154,7 @@ impl NetworkStepView {
             port_editor: None,
             focus: FocusTracker::new(),
             bridge_options_len,
+            interface_options_len,
         };
         view.update_focus();
         view
@@ -116,6 +177,10 @@ impl NetworkStepView {
 
     fn is_custom_bridge(&self) -> bool {
         self.bridge_list.selected_idx() == Some(self.bridge_options_len - 1)
+    }
+
+    fn is_custom_interface(&self) -> bool {
+        self.interface_list.selected_idx() == Some(self.interface_options_len - 1)
     }
 
     fn update_focus(&mut self) {
@@ -188,7 +253,26 @@ impl Component for NetworkStepView {
             } else {
                 self.port_list.render(f, mid_chunks[1]);
             }
-        } else if mode != 0 {
+        } else if mode >= 4 {
+            let mid_chunks = ratatui::layout::Layout::default()
+                .constraints([
+                    ratatui::layout::Constraint::Percentage(50),
+                    ratatui::layout::Constraint::Percentage(50),
+                ])
+                .direction(ratatui::layout::Direction::Horizontal)
+                .split(chunks[1]);
+            self.interface_list.render(f, mid_chunks[0]);
+            if self.is_custom_interface() {
+                let right_chunks = ratatui::layout::Layout::default()
+                    .direction(ratatui::layout::Direction::Vertical)
+                    .constraints([
+                        ratatui::layout::Constraint::Length(3),
+                        ratatui::layout::Constraint::Min(0),
+                    ])
+                    .split(mid_chunks[1]);
+                self.custom_interface.render(f, right_chunks[0]);
+            }
+        } else if mode == 2 {
             self.port_list.render(f, chunks[1]);
         }
     }
@@ -242,7 +326,10 @@ impl Component for NetworkStepView {
         if self.focus.active_idx < visible.len() {
             let res = visible[self.focus.active_idx].handle_key(key);
             if let EventResult::Consumed = res {
-                if self.focus.active_idx == 0 || (mode == 3 && self.focus.active_idx == 1) {
+                if self.focus.active_idx == 0
+                    || (mode == 3 && self.focus.active_idx == 1)
+                    || (mode >= 4 && self.focus.active_idx == 1)
+                {
                     self.update_focus();
                 }
             }
@@ -274,6 +361,8 @@ impl Component for NetworkStepView {
             self.mode_selector.set_focus(false);
             self.bridge_list.set_focus(false);
             self.custom_bridge.set_focus(false);
+            self.interface_list.set_focus(false);
+            self.custom_interface.set_focus(false);
             self.port_list.set_focus(false);
         }
     }
@@ -282,12 +371,17 @@ impl Component for NetworkStepView {
         self.mode_selector.is_focused()
             || self.bridge_list.is_focused()
             || self.custom_bridge.is_focused()
+            || self.interface_list.is_focused()
+            || self.custom_interface.is_focused()
             || self.port_list.is_focused()
     }
 
     fn validate(&mut self) -> Result<(), String> {
         if self.mode_selector.selected_idx() == 3 && self.is_custom_bridge() {
             self.custom_bridge.validate()?;
+        }
+        if self.mode_selector.selected_idx() >= 4 && self.is_custom_interface() {
+            self.custom_interface.validate()?;
         }
         Ok(())
     }
@@ -296,14 +390,26 @@ impl Component for NetworkStepView {
 impl StepComponent for NetworkStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.network.mode = self.mode_selector.selected_idx();
-        if self.is_custom_bridge() {
-            ctx.network.bridge_name = self.custom_bridge.value().to_string();
-        } else {
-            ctx.network.bridge_name = self
-                .bridge_list
-                .selected_item()
-                .cloned()
-                .unwrap_or_default();
+        if self.mode_selector.selected_idx() == 3 {
+            if self.is_custom_bridge() {
+                ctx.network.bridge_name = self.custom_bridge.value().to_string();
+            } else {
+                ctx.network.bridge_name = self
+                    .bridge_list
+                    .selected_item()
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        } else if self.mode_selector.selected_idx() >= 4 {
+            if self.is_custom_interface() {
+                ctx.network.interface_name = self.custom_interface.value().to_string();
+            } else {
+                ctx.network.interface_name = self
+                    .interface_list
+                    .selected_item()
+                    .cloned()
+                    .unwrap_or_default();
+            }
         }
         ctx.network.port_list = self.port_list.items().to_vec();
     }
