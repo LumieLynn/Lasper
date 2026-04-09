@@ -1,6 +1,6 @@
 [package]
 name = "lasper"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
 

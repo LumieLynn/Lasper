@@ -88,11 +88,10 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
         if !res.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "chpasswd in container",
-                format!("chpasswd --root {:?}", rootfs),
-                &res,
-            ));
+            log::warn!(
+                "chpasswd in container failed, proceeding anyway: {}",
+                String::from_utf8_lossy(&res.stderr)
+            );
         }
     }
 
@@ -125,11 +124,10 @@ pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
     if !res.status.success() {
-        return Err(NspawnError::cmd_failed(
-            "chpasswd for root in container",
-            format!("chpasswd --root {:?}", rootfs),
-            &res,
-        ));
+        log::warn!(
+            "chpasswd for root in container failed, proceeding anyway: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
     }
     Ok(())
 }
