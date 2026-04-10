@@ -184,9 +184,6 @@ impl ContainerConfigBuilder {
                         source: crate::nspawn::models::DiskImageSource::CreateNew {
                             size: "2G".to_string(),
                             fs_type: "ext4".to_string(),
-                            format: crate::nspawn::models::DiskImageFormat::Raw,
-                            encrypted: false,
-                            passphrase: None,
                         },
                         use_partition_table: false,
                     }),

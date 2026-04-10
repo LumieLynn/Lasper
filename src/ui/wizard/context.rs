@@ -74,12 +74,9 @@ pub struct StorageState {
     pub type_idx: usize,
     pub info: StorageInfo,
     pub creation_method_idx: usize, // 0: Create New, 1: Import Existing
-    pub disk_format_idx: usize,     // 0: Raw, 1: Qcow2, 2: Vdi, 3: Vmdk, 4: Vpc
     pub disk_size: String,
     pub disk_fs: String,
     pub disk_partition: bool,
-    pub encrypted: bool,
-    pub passphrase: String,
     pub import_path: String,
 }
 
@@ -89,18 +86,6 @@ impl StorageState {
         StorageConfig {
             storage_type: st,
             disk_config: if st == StorageType::DiskImage {
-                let formats = [
-                    crate::nspawn::models::DiskImageFormat::Raw,
-                    crate::nspawn::models::DiskImageFormat::Qcow2,
-                    crate::nspawn::models::DiskImageFormat::Vdi,
-                    crate::nspawn::models::DiskImageFormat::Vmdk,
-                    crate::nspawn::models::DiskImageFormat::Vpc,
-                ];
-                let format = formats
-                    .get(self.disk_format_idx)
-                    .cloned()
-                    .unwrap_or(crate::nspawn::models::DiskImageFormat::Raw);
-
                 let source = if self.creation_method_idx == 1 {
                     crate::nspawn::models::DiskImageSource::ImportExisting {
                         path: self.import_path.clone(),
@@ -109,13 +94,6 @@ impl StorageState {
                     crate::nspawn::models::DiskImageSource::CreateNew {
                         size: self.disk_size.clone(),
                         fs_type: self.disk_fs.clone(),
-                        format,
-                        encrypted: self.encrypted,
-                        passphrase: if self.passphrase.is_empty() {
-                            None
-                        } else {
-                            Some(self.passphrase.clone())
-                        },
                     }
                 };
 
@@ -275,12 +253,9 @@ impl WizardContext {
                 type_idx: 0,
                 info: crate::nspawn::storage::detect::detect_available_storage_types(),
                 creation_method_idx: 0,
-                disk_format_idx: 0,
                 disk_size: "2G".to_string(),
                 disk_fs: "ext4".to_string(),
                 disk_partition: false,
-                encrypted: false,
-                passphrase: "".to_string(),
                 import_path: "".to_string(),
             },
             user: UserState {

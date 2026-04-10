@@ -1,7 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 
 #[derive(Clone)]
 pub struct CliProvider {
@@ -16,7 +16,7 @@ impl CliProvider {
     async fn run_machinectl(&self, args: &[&str]) -> Result<()> {
         let out = new_command("machinectl")
             .args(args)
-            .output()
+            .logged_output("machinectl")
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
@@ -33,7 +33,7 @@ impl CliProvider {
     pub async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
         let out = new_command("machinectl")
             .args(["list", "-l", "--no-legend", "--no-pager"])
-            .output()
+            .logged_output("machinectl")
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
@@ -105,7 +105,7 @@ impl CliProvider {
 
         let out = new_command("machinectl")
             .args(["list-images", "-l", "--no-legend", "--no-pager"])
-            .output()
+            .logged_output("machinectl")
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
@@ -211,7 +211,7 @@ impl CliProvider {
                 "--no-pager",
                 "--output=short",
             ])
-            .output()
+            .logged_output("journalctl")
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("journalctl"), e))?;
 
@@ -234,7 +234,7 @@ impl CliProvider {
 
         let machine_out = new_command("machinectl")
             .args(["show", name])
-            .output()
+            .logged_output("machinectl")
             .await;
 
         if let Ok(out) = machine_out {
@@ -250,7 +250,7 @@ impl CliProvider {
 
         let system_out = new_command("systemctl")
             .args(["show", &format!("systemd-nspawn@{}.service", name)])
-            .output()
+            .logged_output("systemctl")
             .await;
 
         if let Ok(out) = system_out {

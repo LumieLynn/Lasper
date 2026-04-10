@@ -1,5 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 use super::state::NvidiaState;
 use super::cdi::CdiSpec;
 use super::resolve::{get_ldconfig_cache, resolve_so_aliases};
@@ -39,7 +39,7 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     let tmp_path = format!("{}/cdi-{}.json", cache_dir, std::process::id());
     let out = new_command("nvidia-ctk")
         .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path)])
-        .output()
+        .logged_output("nvidia-ctk")
         .await
         .map_err(|e| {
             NspawnError::Runtime(format!("Failed to execute 'nvidia-ctk': {}. Please ensure nvidia-container-toolkit is installed.", e))

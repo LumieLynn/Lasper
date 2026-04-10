@@ -1,10 +1,8 @@
 use crate::nspawn::storage::StorageType;
 use crate::ui::core::{Component, EventResult, FocusTracker};
-use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
-use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{StorageState, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
@@ -16,24 +14,18 @@ use ratatui::{
     Frame,
 };
 
-macro_rules! active_comps {
-    ($self:ident) => {{
-        let is_disk = $self.is_disk_image_selected();
-        let creation_method_idx = $self.creation_method.selected_idx();
-        let luks_enabled = $self.luks_enabled.checked();
-
-        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
+    macro_rules! active_comps {
+        ($self:ident) => {{
+            let is_disk = $self.is_disk_image_selected();
+            let creation_method_idx = $self.creation_method.selected_idx();
+    
+            let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
         if is_disk {
             comps.push(&mut $self.creation_method);
             if creation_method_idx == 0 {
                 // Create New
-                comps.push(&mut $self.disk_format);
                 comps.push(&mut $self.disk_size);
                 comps.push(&mut $self.disk_fs);
-                comps.push(&mut $self.luks_enabled);
-                if luks_enabled {
-                    comps.push(&mut $self.passphrase);
-                }
             } else {
                 // Import
                 comps.push(&mut $self.import_path);
@@ -46,11 +38,8 @@ macro_rules! active_comps {
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
     creation_method: RadioGroup,
-    disk_format: RadioGroup,
     disk_size: TextBox,
     disk_fs: TextBox,
-    luks_enabled: Checkbox,
-    passphrase: PasswordBox,
     import_path: PathBox,
     focus: FocusTracker,
 }
@@ -87,11 +76,6 @@ impl StorageStepView {
                 vec!["Create New Image".into(), "Import Existing Image".into()],
                 initial_data.creation_method_idx,
             ),
-            disk_format: RadioGroup::new(
-                " Image Format ",
-                vec!["Raw".into(), "Qcow2".into(), "VDI".into(), "VMDK".into(), "VPC".into()],
-                initial_data.disk_format_idx,
-            ),
             disk_size: TextBox::new(" Disk Volume Size (e.g. 2G, 500M) ", initial_data.disk_size.clone())
                 .with_validator(|v| {
                     if v.trim().is_empty() {
@@ -109,8 +93,6 @@ impl StorageStepView {
                     }
                 },
             ),
-            luks_enabled: Checkbox::new(" Enable LUKS Encryption ", initial_data.encrypted),
-            passphrase: PasswordBox::new(" LUKS Passphrase ", initial_data.passphrase.clone()),
             import_path: PathBox::new(" Source Image Path ", initial_data.import_path.clone()),
             focus: FocusTracker::new(),
         };
@@ -150,7 +132,6 @@ impl Component for StorageStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let is_disk = self.is_disk_image_selected();
         let is_import = self.creation_method.selected_idx() == 1;
-        let is_encrypted = self.luks_enabled.checked();
 
         let mut constraints = vec![
             Constraint::Length(1), // Title
@@ -161,13 +142,8 @@ impl Component for StorageStepView {
             if is_import {
                 constraints.push(Constraint::Length(3)); // Import Path
             } else {
-                constraints.push(Constraint::Length(3)); // Format
                 constraints.push(Constraint::Length(3)); // Size
                 constraints.push(Constraint::Length(3)); // FS
-                constraints.push(Constraint::Length(3)); // LUKS
-                if is_encrypted {
-                    constraints.push(Constraint::Length(3)); // Passphrase
-                }
             }
         }
         constraints.push(Constraint::Length(1)); // Hint
@@ -195,17 +171,9 @@ impl Component for StorageStepView {
             if is_import {
                 self.import_path.render(f, chunks[current]);
             } else {
-                self.disk_format.render(f, chunks[current]);
-                current += 1;
                 self.disk_size.render(f, chunks[current]);
                 current += 1;
                 self.disk_fs.render(f, chunks[current]);
-                current += 1;
-                self.luks_enabled.render(f, chunks[current]);
-                current += 1;
-                if is_encrypted {
-                    self.passphrase.render(f, chunks[current]);
-                }
             }
         }
     }
@@ -255,11 +223,8 @@ impl Component for StorageStepView {
         } else {
             self.list.set_focus(false);
             self.creation_method.set_focus(false);
-            self.disk_format.set_focus(false);
             self.disk_size.set_focus(false);
             self.disk_fs.set_focus(false);
-            self.luks_enabled.set_focus(false);
-            self.passphrase.set_focus(false);
             self.import_path.set_focus(false);
         }
     }
@@ -279,9 +244,6 @@ impl Component for StorageStepView {
             if self.creation_method.selected_idx() == 0 {
                 self.disk_size.validate()?;
                 self.disk_fs.validate()?;
-                if self.luks_enabled.checked() {
-                    self.passphrase.validate()?;
-                }
             } else {
                 self.import_path.validate()?;
             }
@@ -296,11 +258,8 @@ impl StepComponent for StorageStepView {
             ctx.storage.type_idx = idx;
         }
         ctx.storage.creation_method_idx = self.creation_method.selected_idx();
-        ctx.storage.disk_format_idx = self.disk_format.selected_idx();
         ctx.storage.disk_size = self.disk_size.value().to_string();
         ctx.storage.disk_fs = self.disk_fs.value().to_string();
-        ctx.storage.encrypted = self.luks_enabled.checked();
-        ctx.storage.passphrase = self.passphrase.value().to_string();
         ctx.storage.import_path = self.import_path.value().to_string();
     }
 

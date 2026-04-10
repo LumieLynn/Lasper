@@ -54,35 +54,12 @@ pub struct CreateUser {
     pub shell: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum DiskImageFormat {
-    Raw,
-    Qcow2,
-    Vdi,
-    Vmdk,
-    Vpc,
-}
-
-impl DiskImageFormat {
-    pub fn extension(&self) -> &'static str {
-        match self {
-            Self::Raw => "raw",
-            Self::Qcow2 => "qcow2",
-            Self::Vdi => "vdi",
-            Self::Vmdk => "vmdk",
-            Self::Vpc => "vpc",
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DiskImageSource {
     CreateNew {
         size: String,
         fs_type: String,
-        format: DiskImageFormat,
-        encrypted: bool,
-        passphrase: Option<String>,
     },
     ImportExisting {
         path: String,
@@ -102,9 +79,6 @@ impl Default for DiskImageConfig {
             source: DiskImageSource::CreateNew {
                 size: "10G".to_string(),
                 fs_type: "ext4".to_string(),
-                format: DiskImageFormat::Raw,
-                encrypted: false,
-                passphrase: None,
             },
             use_partition_table: false,
         }

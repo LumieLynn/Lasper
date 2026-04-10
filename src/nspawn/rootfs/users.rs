@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::CreateUser;
-use crate::nspawn::utils::command::new_command;
+use crate::nspawn::utils::command::{new_command, log_output, CommandLogged};
 
 /// Create a user inside the container rootfs via `systemd-nspawn --directory … useradd`.
 pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Result<()> {
@@ -20,7 +20,7 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
             shell,
             &user.username,
         ])
-        .output()
+        .logged_output("useradd")
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("useradd"), e))?;
     if !out.status.success() {
@@ -41,7 +41,7 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
                     group,
                     &user.username,
                 ])
-                .output()
+                .logged_output("usermod")
                 .await;
             if r.map(|o| o.status.success()).unwrap_or(false) {
                 let sudoers_dir = rootfs.join("etc/sudoers.d");
@@ -87,6 +87,7 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
             .wait_with_output()
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
+        log_output("chpasswd", &res);
         if !res.status.success() {
             log::warn!(
                 "chpasswd in container failed, proceeding anyway: {}",
@@ -123,6 +124,7 @@ pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
         .wait_with_output()
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("chpasswd"), e))?;
+    log_output("chpasswd", &res);
     if !res.status.success() {
         log::warn!(
             "chpasswd for root in container failed, proceeding anyway: {}",

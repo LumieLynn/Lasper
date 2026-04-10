@@ -7,6 +7,7 @@ pub mod image;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
 use crate::nspawn::storage::StorageBackend;
+use crate::nspawn::utils::CommandLogged;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -124,7 +125,7 @@ async fn run_deploy_internal(
                 
                 let out = crate::nspawn::utils::new_command("systemd-dissect")
                     .args(["--mount", raw_path.to_str().unwrap(), mount_point.to_str().unwrap()])
-                    .output().await;
+                    .logged_output("systemd-dissect").await;
 
                 if let Ok(cmd) = out {
                     if cmd.status.success() {
@@ -245,7 +246,7 @@ async fn run_deploy_internal(
         push_log!("Unmounting raw image...".to_string());
         let _ = crate::nspawn::utils::new_command("systemd-dissect")
             .args(["--umount", mnt.to_str().unwrap()])
-            .output().await;
+            .logged_output("systemd-dissect").await;
         let _ = tokio::fs::remove_dir_all(&mnt).await;
     }
 
@@ -270,7 +271,7 @@ async fn run_deploy_internal(
             // Cleanup systemd-managed storage (downloaded/imported junk)
             let _ = crate::nspawn::utils::new_command("machinectl")
                 .args(["remove", &name])
-                .output().await;
+                .logged_output("machinectl").await;
         } else {
             // Cleanup Lasper-managed storage
             let _ = storage.delete(&name).await;

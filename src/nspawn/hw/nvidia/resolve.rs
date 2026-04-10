@@ -1,9 +1,9 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 use std::path::Path;
 
 pub(crate) async fn get_ldconfig_cache() -> Option<String> {
-    let out = new_command("ldconfig").arg("-p").output().await.ok()?;
+    let out = new_command("ldconfig").arg("-p").logged_output("ldconfig").await.ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     } else {

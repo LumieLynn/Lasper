@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 
 /// Enable systemd-networkd and systemd-resolved inside the container.
 pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
@@ -19,7 +19,7 @@ pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
     ]);
 
     let res = cmd
-        .output()
+        .logged_output("systemctl")
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("systemctl"), e))?;
     if !res.status.success() {

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -39,7 +39,7 @@ impl Deployer for CloneDeployer {
 
         let out = new_command("machinectl")
             .args(["clone", &self.source_name, name])
-            .output()
+            .logged_output("machinectl")
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 

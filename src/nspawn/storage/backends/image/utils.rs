@@ -1,7 +1,7 @@
 //! Utility functions for disk image backend (device discovery, UUIDs, etc.)
 
 use std::path::{Path, PathBuf};
-use crate::nspawn::utils::new_command;
+use crate::nspawn::utils::{new_command, CommandLogged};
 use crate::nspawn::errors::Result;
 
 /// Get the standard Discoverable Partition Specification UUID for the root partition
@@ -19,7 +19,7 @@ pub fn get_discoverable_root_uuid() -> &'static str {
 
 /// Find a loop device associated with a specific file path.
 pub async fn find_loop_device(file_path: &Path) -> Result<Option<PathBuf>> {
-    let out = new_command("losetup").args(["-j", &file_path.to_string_lossy()]).output().await?;
+    let out = new_command("losetup").args(["-j", &file_path.to_string_lossy()]).logged_output("losetup").await?;
     if !out.status.success() {
         return Ok(None);
     }
@@ -33,45 +33,5 @@ pub async fn find_loop_device(file_path: &Path) -> Result<Option<PathBuf>> {
     Ok(None)
 }
 
-/// Finds the first unattached NBD device by checking if it has an active PID.
-pub async fn find_free_nbd_device() -> Result<Option<String>> {
-    for i in 0..16 {
-        let pid_path = format!("/sys/class/block/nbd{}/pid", i);
-        if !Path::new(&pid_path).exists() {
-            return Ok(Some(format!("/dev/nbd{}", i)));
-        }
-    }
-    Ok(None)
-}
 
-/// Surgically finds which NBD device is backed by a specific image file 
-/// by cross-referencing the PID with the process cmdline.
-pub async fn find_nbd_device(file_path: &Path) -> Result<Option<PathBuf>> {
-    let target_str = file_path.to_string_lossy();
-    
-    for i in 0..16 {
-        let pid_path = format!("/sys/class/block/nbd{}/pid", i);
-        if let Ok(pid_str) = tokio::fs::read_to_string(&pid_path).await {
-            let pid = pid_str.trim();
-            let cmdline_path = format!("/proc/{}/cmdline", pid);
-            
-            // Check if this qemu-nbd process was launched with our file path
-            if let Ok(cmdline) = tokio::fs::read_to_string(&cmdline_path).await {
-                // cmdline arguments are null-separated in /proc
-                if cmdline.contains(target_str.as_ref()) {
-                    return Ok(Some(PathBuf::from(format!("/dev/nbd{}", i))));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
 
-/// Check if a block device is LUKS encrypted.
-pub async fn is_luks(device: &Path) -> bool {
-    let out = new_command("cryptsetup").args(["isLuks", &device.to_string_lossy()]).output().await;
-    match out {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
-}

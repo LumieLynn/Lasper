@@ -1,10 +1,10 @@
 //! OCI and Disk Image deployment implementations.
 
+use crate::nspawn::utils::{new_command, CommandLogged};
 use async_trait::async_trait;
+use std::os::unix::fs::PermissionsExt;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
-use std::os::unix::fs::PermissionsExt;
-use crate::nspawn::utils::new_command;
 
 use crate::nspawn::deploy::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -82,17 +82,21 @@ impl Deployer for NetworkImageDeployer {
         let cache_dir = "/var/cache/lasper/downloads";
         let _ = tokio::fs::create_dir_all(cache_dir).await;
         let _ = tokio::fs::create_dir_all("/var/lib/machines").await;
-        
-        let _ = logs.send(format!("Downloading container from {}...", clean_url)).await;
+
+        let _ = logs
+            .send(format!("Downloading container from {}...", clean_url))
+            .await;
         check_tool("curl")?;
 
         if self.is_raw {
             check_tool("bash")?;
-            let _ = logs.send("Streaming and provisioning RAW disk image to cache...".into()).await;
-            
+            let _ = logs
+                .send("Streaming and provisioning RAW disk image to cache...".into())
+                .await;
+
             let dest = format!("/var/lib/machines/{}.raw", name);
             let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
-            
+
             // Phase 1: Download and decompress into isolated cache
             let script = format!(
                 "set -o pipefail; case '{url}' in \
@@ -115,23 +119,31 @@ impl Deployer for NetworkImageDeployer {
 
             stream_curl_logs(&mut child, logs.clone());
 
-            let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
             if !status.success() {
                 let _ = tokio::fs::remove_file(&cache_dest).await;
-                return Err(NspawnError::DeployError(format!("Raw image download/extraction failed: {}", status)));
+                return Err(NspawnError::DeployError(format!(
+                    "Raw image download/extraction failed: {}",
+                    status
+                )));
             }
 
             // Phase 2: Post-download validation in the cache zone
             let _ = logs.send("Validating disk image integrity...".into()).await;
             let validate = new_command("systemd-dissect")
                 .args(["--validate", &cache_dest])
-                .output()
+                .logged_output("systemd-dissect")
                 .await
                 .map_err(|e| NspawnError::Io(std::path::PathBuf::from("systemd-dissect"), e))?;
 
             if !validate.status.success() {
                 let _ = tokio::fs::remove_file(&cache_dest).await;
-                return Err(NspawnError::DeployError("Downloaded file is not a valid disk image.".into()));
+                return Err(NspawnError::DeployError(
+                    "Downloaded file is not a valid disk image.".into(),
+                ));
             }
 
             // Phase 3: Finalize — move to hot zone protected by systemd-machined
@@ -139,16 +151,18 @@ impl Deployer for NetworkImageDeployer {
         } else {
             check_tool("tar")?;
             check_tool("bash")?;
-            
+
             let cache_tar = format!("{}/{}.tar.part", cache_dir, name);
-            let _ = logs.send("Downloading compressed tarball to cache...".into()).await;
-            
+            let _ = logs
+                .send("Downloading compressed tarball to cache...".into())
+                .await;
+
             // Phase 1: Download to isolated cache file
             let download_script = format!(
-                "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' '{}' -o '{}'", 
+                "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' '{}' -o '{}'",
                 clean_url, cache_tar
             );
-            
+
             let mut child = new_command("bash")
                 .args(["-c", &download_script])
                 .stdout(std::process::Stdio::piped())
@@ -158,14 +172,22 @@ impl Deployer for NetworkImageDeployer {
 
             stream_curl_logs(&mut child, logs.clone());
 
-            let status = child.wait().await.map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
             if !status.success() {
                 let _ = tokio::fs::remove_file(&cache_tar).await;
-                return Err(NspawnError::DeployError(format!("Network download failed: {}", status)));
+                return Err(NspawnError::DeployError(format!(
+                    "Network download failed: {}",
+                    status
+                )));
             }
 
             // Phase 2: Extract from local cache file directly into user-selected rootfs
-            let _ = logs.send("Extracting tarball to storage backend...".into()).await;
+            let _ = logs
+                .send("Extracting tarball to storage backend...".into())
+                .await;
             let extract_out = new_command("tar")
                 .args([
                     "--numeric-owner",
@@ -174,7 +196,7 @@ impl Deployer for NetworkImageDeployer {
                     "-C",
                     &rootfs.to_string_lossy(),
                 ])
-                .output()
+                .logged_output("tar")
                 .await
                 .map_err(|e| NspawnError::Io(rootfs.to_path_buf(), e))?;
 
@@ -187,7 +209,6 @@ impl Deployer for NetworkImageDeployer {
                 ));
             }
         }
-
 
         Ok(())
     }
@@ -202,7 +223,9 @@ fn stream_curl_logs(child: &mut tokio::process::Child, logs: tokio::sync::mpsc::
             let mut buf = Vec::new();
             // Split by \r (carriage return) instead of \n to capture curl's progress bar updates correctly
             while let Ok(bytes) = reader.read_until(b'\r', &mut buf).await {
-                if bytes == 0 { break; }
+                if bytes == 0 {
+                    break;
+                }
                 let line = String::from_utf8_lossy(&buf).trim().to_string();
                 if !line.is_empty() {
                     let _ = logs.send(line).await;
@@ -263,7 +286,12 @@ pub async fn import_oci_image(
     let _ = std::fs::set_permissions(tmp_parent, std::fs::Permissions::from_mode(0o700));
 
     let tmp_oci = format!("{}/oci-{}-{}", tmp_parent, local_name, std::process::id());
-    let bundle_dir = format!("{}/bundle-{}-{}", tmp_parent, local_name, std::process::id());
+    let bundle_dir = format!(
+        "{}/bundle-{}-{}",
+        tmp_parent,
+        local_name,
+        std::process::id()
+    );
 
     // Closure for cleanup
     let cleanup = || {
@@ -278,7 +306,7 @@ pub async fn import_oci_image(
     log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci);
     let skopeo = new_command("skopeo")
         .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci)])
-        .output()
+        .logged_output("skopeo")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
 
@@ -296,7 +324,11 @@ pub async fn import_oci_image(
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
-    log::info!("umoci raw-unpack --image {}:latest {}", tmp_oci, dest.display());
+    log::info!(
+        "umoci raw-unpack --image {}:latest {}",
+        tmp_oci,
+        dest.display()
+    );
     let umoci_raw = new_command("umoci")
         .args([
             "raw-unpack",
@@ -304,7 +336,7 @@ pub async fn import_oci_image(
             &format!("{}:latest", tmp_oci),
             &dest.to_string_lossy(),
         ])
-        .output()
+        .logged_output("umoci")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
 
@@ -315,7 +347,10 @@ pub async fn import_oci_image(
     }
 
     // Fallback to older `umoci unpack` if raw-unpack fails
-    log::warn!("umoci raw-unpack failed or missing, falling back to unpack: {:?}", String::from_utf8_lossy(&umoci_raw.stderr));
+    log::warn!(
+        "umoci raw-unpack failed or missing, falling back to unpack: {:?}",
+        String::from_utf8_lossy(&umoci_raw.stderr)
+    );
     let umoci = new_command("umoci")
         .args([
             "unpack",
@@ -323,7 +358,7 @@ pub async fn import_oci_image(
             &format!("{}:latest", tmp_oci),
             &bundle_dir,
         ])
-        .output()
+        .logged_output("umoci")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
 
@@ -358,7 +393,7 @@ pub async fn import_oci_image(
             &format!("{}/.", rootfs_source.to_string_lossy()),
             &dest.to_string_lossy(),
         ])
-        .output()
+        .logged_output("cp")
         .await
         .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
 
@@ -376,7 +411,7 @@ pub async fn import_oci_image(
     Ok(())
 }
 
-/// Import a local disk image (.raw/.tar/.tar.gz/.qcow2).
+/// Import a local disk image (.raw/.tar/.tar.gz).
 pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::Path) -> Result<()> {
     let p = path.to_lowercase();
     if p.ends_with(".tar")
@@ -392,7 +427,7 @@ pub async fn import_disk_image(path: &str, local_name: &str, dest: &std::path::P
     log::info!("importctl import-raw {} {}", path, local_name);
     let out = new_command("importctl")
         .args(["import-raw", path, local_name])
-        .output()
+        .logged_output("importctl")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("importctl"), e))?;
 
@@ -421,7 +456,7 @@ async fn import_disk_image_tar(path: &str, dest: &std::path::Path) -> Result<()>
             "-C",
             &dest.to_string_lossy(),
         ])
-        .output()
+        .logged_output("tar")
         .await
         .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
 

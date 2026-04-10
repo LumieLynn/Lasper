@@ -6,7 +6,7 @@ pub fn detect_available_storage_types() -> StorageInfo {
     let machines_dir = Path::new("/var/lib/machines");
     let mut types = vec![
         (StorageType::Directory, true),
-        // (StorageType::DiskImage, true), // Hidden for now as it's not fully finished
+        (StorageType::DiskImage, true),
         (StorageType::Subvolume, false),
     ];
 

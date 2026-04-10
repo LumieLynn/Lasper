@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use crate::nspawn::errors::{NspawnError, Result};
 use super::super::{StorageBackend, StorageType};
-use crate::nspawn::utils::{new_command, new_sync_command, get_filesystem_type};
+use crate::nspawn::utils::{new_command, new_sync_command, get_filesystem_type, CommandLogged};
 
 pub struct SubvolumeBackend;
 
@@ -63,7 +63,7 @@ impl StorageBackend for SubvolumeBackend {
             SubvolumeType::Btrfs => {
                 let out = new_command("btrfs")
                     .args(["subvolume", "create", &path.to_string_lossy()])
-                    .output()
+                    .logged_output("btrfs")
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
 
@@ -82,7 +82,7 @@ impl StorageBackend for SubvolumeBackend {
 
                 let out = new_command("zfs")
                     .args(["create", &dataset_name])
-                    .output()
+                    .logged_output("zfs")
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
 
@@ -112,7 +112,7 @@ impl StorageBackend for SubvolumeBackend {
             SubvolumeType::Btrfs => {
                 let out = new_command("btrfs")
                     .args(["subvolume", "delete", &path.to_string_lossy()])
-                    .output()
+                    .logged_output("btrfs")
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
 
@@ -139,7 +139,7 @@ impl StorageBackend for SubvolumeBackend {
 
                 let out = new_command("zfs")
                     .args(["destroy", &dataset_name])
-                    .output()
+                    .logged_output("zfs")
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
 

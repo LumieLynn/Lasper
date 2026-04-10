@@ -1,7 +1,6 @@
 //! Disk image storage backend.
 
 pub mod create;
-pub mod crypto;
 pub mod mount;
 pub mod utils;
 
@@ -28,8 +27,8 @@ impl StorageBackend for DiskImageBackend {
                 let ext = src_path.extension().and_then(|e| e.to_str()).unwrap_or("raw");
                 PathBuf::from(format!("/var/lib/machines/{}.{}", name, ext))
             }
-            DiskImageSource::CreateNew { format, .. } => {
-                PathBuf::from(format!("/var/lib/machines/{}.{}", name, format.extension()))
+            DiskImageSource::CreateNew { .. } => {
+                PathBuf::from(format!("/var/lib/machines/{}.raw", name))
             }
         }
     }
@@ -60,8 +59,8 @@ impl StorageBackend for DiskImageBackend {
 
     async fn exists(&self, name: &str) -> bool {
         let base = PathBuf::from("/var/lib/machines").join(name);
-        for ext in ["raw", "qcow2", "vdi", "vmdk", "vpc", "img"] {
-            if base.with_extension(ext).exists() {
+        for ext in ["raw", "img"] {
+            if tokio::fs::try_exists(base.with_extension(ext)).await.unwrap_or(false) {
                 return true;
             }
         }

@@ -3,14 +3,14 @@
 pub mod backends;
 pub mod detect;
 
-use std::path::PathBuf;
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{DiskImageConfig, DiskImageSource};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 pub use backends::directory::DirectoryBackend;
-pub use backends::subvolume::SubvolumeBackend;
 pub use backends::image::DiskImageBackend;
+pub use backends::subvolume::SubvolumeBackend;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -24,7 +24,7 @@ impl StorageType {
         match self {
             Self::Directory => "Directory",
             Self::Subvolume => "Subvolume (Btrfs/Generic)",
-            Self::DiskImage => "Disk Image (Raw/Qcow2/Block)",
+            Self::DiskImage => "Disk Image (Raw/Block)",
         }
     }
 
@@ -34,9 +34,9 @@ impl StorageType {
                 PathBuf::from(format!("/var/lib/machines/{}", name))
             }
             Self::DiskImage => {
-                // For DiskImage, we search for common extensions if we don't know it yet
+                // Only raw disk images are supported by systemd-nspawn
                 let base = PathBuf::from("/var/lib/machines").join(name);
-                for ext in ["raw", "qcow2", "vdi", "vmdk", "vpc", "img"] {
+                for ext in ["raw", "img"] {
                     let p = base.with_extension(ext);
                     if p.exists() {
                         return p;
@@ -74,9 +74,9 @@ pub trait StorageBackend: Send + Sync {
 /// Factory function to get the appropriate storage backend for an existing machine.
 pub fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     let base = PathBuf::from("/var/lib/machines").join(name);
-    
-    // 1. Check for well-known disk image extensions
-    let extensions = ["raw", "qcow2", "vdi", "vmdk", "vpc", "img", "iso"];
+
+    // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
+    let extensions = ["raw", "img", "iso"];
     for ext in extensions {
         let path = base.with_extension(ext);
         if path.exists() {
