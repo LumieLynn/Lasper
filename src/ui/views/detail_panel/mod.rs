@@ -9,7 +9,10 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
+    widgets::{
+        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
+        ScrollbarState,
+    },
     Frame,
 };
 
@@ -47,29 +50,59 @@ impl DetailPanel {
         self.focused = focused;
     }
 
-    fn sync_data_lengths(&mut self, data: &AppData) {
+    fn sync_data_lengths(&mut self, data: &AppData, width: usize) {
         let old_logs_len = self.logs_len;
         self.details_len = data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
-        self.logs_len = data.log_lines.len();
+
+        self.logs_len = data
+            .log_lines
+            .iter()
+            .map(|l| {
+                let count = l.chars().count();
+                if count == 0 {
+                    1
+                } else {
+                    (count + width - 1) / width
+                }
+            })
+            .sum();
+
         self.config_len = data
             .config_content
             .as_ref()
-            .map(|c| c.lines().count())
+            .map(|c| {
+                c.lines()
+                    .map(|l| {
+                        let count = l.chars().count();
+                        if count == 0 {
+                            1
+                        } else {
+                            (count + width - 1) / width
+                        }
+                    })
+                    .sum()
+            })
             .unwrap_or(0);
 
         // Sticky autoscroll for Logs
         if self.active_pane == DetailPane::Logs && self.logs_len > old_logs_len {
             let max_scroll_old = old_logs_len.saturating_sub(self.pane_height as usize) as u16;
             if self.log_scroll >= max_scroll_old {
-                let max_scroll_new =
-                    self.logs_len.saturating_sub(self.pane_height as usize);
+                let max_scroll_new = self.logs_len.saturating_sub(self.pane_height as usize);
                 self.log_scroll = max_scroll_new.min(u16::MAX as usize) as u16;
             }
         }
+
+        // Always clamp scroll to the current max so a width change never
+        // leaves us past the real bottom of the content.
+        let log_max = self.logs_len.saturating_sub(self.pane_height as usize);
+        self.log_scroll = self.log_scroll.min(log_max.min(u16::MAX as usize) as u16);
+
+        let cfg_max = self.config_len.saturating_sub(self.pane_height as usize);
+        self.config_scroll = self.config_scroll.min(cfg_max.min(u16::MAX as usize) as u16);
     }
 
     pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &AppData) {
-
         // Border
         let border_color = if self.focused {
             Color::Cyan
@@ -88,7 +121,8 @@ impl DetailPanel {
         // Get inner area
         let inner_area = block.inner(area);
         self.pane_height = inner_area.height;
-        self.sync_data_lengths(data);
+        let pane_width = inner_area.width as usize;
+        self.sync_data_lengths(data, pane_width.max(1));
 
         f.render_widget(Clear, area);
         f.render_widget(block, area);
@@ -108,18 +142,14 @@ impl DetailPanel {
 
     fn render_scrollbar(&mut self, f: &mut Frame, area: Rect) {
         let (max_scroll, position) = match self.active_pane {
-            DetailPane::Logs if self.logs_len > self.pane_height as usize => {
-                (
-                    self.logs_len.saturating_sub(self.pane_height as usize),
-                    self.log_scroll as usize,
-                )
-            }
-            DetailPane::Config if self.config_len > self.pane_height as usize => {
-                (
-                    self.config_len.saturating_sub(self.pane_height as usize),
-                    self.config_scroll as usize,
-                )
-            }
+            DetailPane::Logs if self.logs_len > self.pane_height as usize => (
+                self.logs_len.saturating_sub(self.pane_height as usize),
+                self.log_scroll as usize,
+            ),
+            DetailPane::Config if self.config_len > self.pane_height as usize => (
+                self.config_len.saturating_sub(self.pane_height as usize),
+                self.config_scroll as usize,
+            ),
             DetailPane::Details if self.details_len > 1 => (
                 self.details_len.saturating_sub(1),
                 self.details_state.selected().unwrap_or(0),
@@ -166,7 +196,13 @@ impl DetailPanel {
             " Logs "
         };
 
-        let labels = [" Properties ", " Details ", log_label, " Config ", " Metrics "];
+        let labels = [
+            " Properties ",
+            " Details ",
+            log_label,
+            " Config ",
+            " Metrics ",
+        ];
 
         let mut spans = Vec::new();
 

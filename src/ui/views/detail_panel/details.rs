@@ -6,15 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::AppData;
 use super::empty_block;
+use crate::app::AppData;
 
-pub fn render(
-    f: &mut Frame,
-    data: &AppData,
-    area: Rect,
-    state: &mut ratatui::widgets::TableState,
-) {
+pub fn render(f: &mut Frame, data: &AppData, area: Rect, state: &mut ratatui::widgets::TableState) {
     if data.entries.is_empty() {
         f.render_widget(empty_block(" All Details "), area);
         return;
@@ -33,11 +28,7 @@ pub fn render(
                     Span::styled(e.clone(), Style::default().fg(Color::Red)),
                 ]),
             ];
-            f.render_widget(
-                Paragraph::new(error_text)
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
+            f.render_widget(Paragraph::new(error_text).wrap(Wrap { trim: false }), area);
             return;
         }
     };
@@ -45,13 +36,47 @@ pub fn render(
     let mut pairs: Vec<(&String, &String)> = props.iter().collect();
     pairs.sort_by_key(|(k, _)| k.as_str());
 
+    let val_width = if area.width > 6 {
+        (area.width as f32 * 0.65) as usize
+    } else {
+        10
+    };
+    let val_width = val_width.saturating_sub(3).max(10); // buffer for table spacing
+
     let rows: Vec<Row> = pairs
         .iter()
         .map(|(k, v)| {
+            let mut wrapped_lines = Vec::new();
+            for line in v.split('\n') {
+                if line.is_empty() {
+                    wrapped_lines.push(Line::from(""));
+                    continue;
+                }
+                let mut current = String::new();
+                let mut width = 0;
+                for c in line.chars() {
+                    if width >= val_width {
+                        wrapped_lines.push(Line::from(current));
+                        current = String::new();
+                        width = 0;
+                    }
+                    current.push(c);
+                    width += 1;
+                }
+                if !current.is_empty() {
+                    wrapped_lines.push(Line::from(current));
+                }
+            }
+            if wrapped_lines.is_empty() {
+                wrapped_lines.push(Line::from(""));
+            }
+            let height = wrapped_lines.len() as u16;
+
             Row::new(vec![
                 Cell::from(k.as_str()).style(Style::default().fg(Color::Cyan)),
-                Cell::from(v.as_str()),
+                Cell::from(wrapped_lines),
             ])
+            .height(height)
         })
         .collect();
 

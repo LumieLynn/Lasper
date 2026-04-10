@@ -132,7 +132,7 @@ impl Component for SourceStepView {
             1 => vec![
                 Constraint::Min(0),
                 Constraint::Length(3),
-                Constraint::Length(4),
+                Constraint::Length(self.oci_tip.required_height(area.width)),
             ], // OCI
             2 => vec![
                 Constraint::Min(0),
@@ -236,21 +236,26 @@ impl Component for SourceStepView {
         let cursor = self.kind_list.selected_idx().unwrap_or(0);
         match cursor {
             1 => {
-                crate::nspawn::deploy::image::check_tool("skopeo").map_err(|_| "Missing dependency: skopeo".to_string())?;
-                crate::nspawn::deploy::image::check_tool("umoci").map_err(|_| "Missing dependency: umoci".to_string())?;
+                crate::nspawn::deploy::image::check_tool("skopeo")
+                    .map_err(|_| "Missing dependency: skopeo".to_string())?;
+                crate::nspawn::deploy::image::check_tool("umoci")
+                    .map_err(|_| "Missing dependency: umoci".to_string())?;
                 self.oci_url.validate()?
             }
             2 => {
-                crate::nspawn::deploy::image::check_tool("debootstrap").map_err(|_| "Missing dependency: debootstrap".to_string())?;
+                crate::nspawn::deploy::image::check_tool("debootstrap")
+                    .map_err(|_| "Missing dependency: debootstrap".to_string())?;
                 self.deboot_mirror.validate()?;
                 self.deboot_suite.validate()?;
             }
             3 => {
-                crate::nspawn::deploy::image::check_tool("pacstrap").map_err(|_| "Missing dependency: pacstrap".to_string())?;
+                crate::nspawn::deploy::image::check_tool("pacstrap")
+                    .map_err(|_| "Missing dependency: pacstrap".to_string())?;
                 self.pacstrap_pkgs.validate()?
             }
             4 => {
-                crate::nspawn::deploy::image::check_tool("curl").map_err(|_| "Missing dependency: curl".to_string())?;
+                crate::nspawn::deploy::image::check_tool("curl")
+                    .map_err(|_| "Missing dependency: curl".to_string())?;
                 self.pull_url.validate()?
             }
             5 => self.local_path.validate()?,
