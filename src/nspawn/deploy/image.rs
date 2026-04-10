@@ -98,20 +98,16 @@ impl Deployer for NetworkImageDeployer {
             let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
 
             // Phase 1: Download and decompress into isolated cache
-            let script = format!(
-                "set -o pipefail; case '{url}' in \
-                 *.xz)  curl -# -L -f -A 'Lasper/1.0' '{url}' | xz -d > '{cache_dest}' ;; \
-                 *.gz)  curl -# -L -f -A 'Lasper/1.0' '{url}' | gzip -d > '{cache_dest}' ;; \
-                 *.zst) curl -# -L -f -A 'Lasper/1.0' '{url}' | zstd -d > '{cache_dest}' ;; \
-                 *.bz2) curl -# -L -f -A 'Lasper/1.0' '{url}' | bzip2 -d > '{cache_dest}' ;; \
-                 *)     curl -# -L -f -A 'Lasper/1.0' '{url}' -o '{cache_dest}' ;; \
-                 esac",
-                url = clean_url,
-                cache_dest = cache_dest
-            );
+            let script = "set -o pipefail; case \"$1\" in \
+                 *.xz)  curl -# -L -f -A 'Lasper/1.0' \"$1\" | xz -d > \"$2\" ;; \
+                 *.gz)  curl -# -L -f -A 'Lasper/1.0' \"$1\" | gzip -d > \"$2\" ;; \
+                 *.zst) curl -# -L -f -A 'Lasper/1.0' \"$1\" | zstd -d > \"$2\" ;; \
+                 *.bz2) curl -# -L -f -A 'Lasper/1.0' \"$1\" | bzip2 -d > \"$2\" ;; \
+                 *)     curl -# -L -f -A 'Lasper/1.0' \"$1\" -o \"$2\" ;; \
+                 esac";
 
             let mut child = new_command("bash")
-                .args(["-c", &script])
+                .args(["-c", script, "--", clean_url, &cache_dest])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()
@@ -158,13 +154,10 @@ impl Deployer for NetworkImageDeployer {
                 .await;
 
             // Phase 1: Download to isolated cache file
-            let download_script = format!(
-                "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' '{}' -o '{}'",
-                clean_url, cache_tar
-            );
+            let download_script = "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' \"$1\" -o \"$2\"";
 
             let mut child = new_command("bash")
-                .args(["-c", &download_script])
+                .args(["-c", download_script, "--", clean_url, &cache_tar])
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .spawn()

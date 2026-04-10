@@ -67,8 +67,26 @@ impl SourceStepView {
         let mut view = Self {
             kind_list,
             oci_url: TextBox::new(" OCI URL (e.g. alpine, docker://ubuntu) ", initial_data.oci_url.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) }),
-            deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone()),
+                .with_validator(|v| {
+                    let v = v.trim();
+                    if v.is_empty() { return Err("URL required".into()); }
+                    if v.contains("://") {
+                        url::Url::parse(v).map(|_| ()).map_err(|e| format!("Invalid URL: {}", e))
+                    } else {
+                        // Allow basic OCI references: alphanumeric, ".", "-", "_", ":", "/"
+                        if v.chars().all(|c| c.is_alphanumeric() || ".-_:".contains(c) || c == '/') {
+                            Ok(())
+                        } else {
+                            Err("Invalid characters in image reference".into())
+                        }
+                    }
+                }),
+            deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone())
+                .with_validator(|v| {
+                    let v = v.trim();
+                    if v.is_empty() { return Ok(()); }
+                    url::Url::parse(v).map(|_| ()).map_err(|e| format!("Invalid URL: {}", e))
+                }),
             deboot_suite: TextBox::new(" Suite (example: bookworm) ", initial_data.deboot_suite.clone())
                 .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) }),
             pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone()),
@@ -85,7 +103,14 @@ impl SourceStepView {
                     }
                 }),
             pull_url: TextBox::new(" Download URL (tar/raw) ", initial_data.pull_url.clone())
-                .with_validator(|v| if v.trim().is_empty() { Err("URL required".into()) } else { Ok(()) }),
+                .with_validator(|v| {
+                    let v = v.trim();
+                    if v.is_empty() {
+                        Err("URL required".into())
+                    } else {
+                        url::Url::parse(v).map(|_| ()).map_err(|e| format!("Invalid URL: {}", e))
+                    }
+                }),
             pull_format: RadioGroup::new(
                 " Pull Format ",
                 vec!["Tarball (.tar)".to_string(), "Raw Image (.raw)".to_string()],
