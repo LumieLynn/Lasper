@@ -21,8 +21,9 @@ macro_rules! active_comps {
             2 => {
                 comps.push(&mut $self.deboot_mirror);
                 comps.push(&mut $self.deboot_suite);
+                comps.push(&mut $self.bootstrap_pkgs);
             }
-            3 => comps.push(&mut $self.pacstrap_pkgs),
+            3 => comps.push(&mut $self.bootstrap_pkgs),
             4 => {
                 comps.push(&mut $self.pull_url);
                 comps.push(&mut $self.pull_format);
@@ -39,7 +40,7 @@ pub struct SourceStepView {
     oci_url: TextBox,
     deboot_mirror: TextBox,
     deboot_suite: TextBox,
-    pacstrap_pkgs: TextBox,
+    bootstrap_pkgs: TextBox,
     local_path: TextBox,
     pull_url: TextBox,
     pull_format: RadioGroup,
@@ -89,7 +90,16 @@ impl SourceStepView {
                 }),
             deboot_suite: TextBox::new(" Suite (example: bookworm) ", initial_data.deboot_suite.clone())
                 .with_validator(|v| if v.trim().is_empty() { Err("Suite required".into()) } else { Ok(()) }),
-            pacstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.pacstrap_pkgs.clone()),
+            bootstrap_pkgs: TextBox::new(" Packages (space separated) ", initial_data.bootstrap_pkgs.clone())
+                .with_validator(|v| {
+                    let v = v.trim();
+                    if v.is_empty() { return Ok(()); }
+                    if v.chars().all(|c| c.is_alphanumeric() || c.is_whitespace() || "+-.@_".contains(c)) {
+                        Ok(())
+                    } else {
+                        Err("Invalid characters in package list".into())
+                    }
+                }),
             local_path: TextBox::new(" Local file path (.tar, .raw) ", initial_data.local_path.clone())
                 .with_validator(|v| {
                     if v.trim().is_empty() { return Err("Path required".into()); }
@@ -163,6 +173,7 @@ impl Component for SourceStepView {
                 Constraint::Min(0),
                 Constraint::Length(3),
                 Constraint::Length(3),
+                Constraint::Length(3),
             ], // Deboot
             3 => vec![Constraint::Min(0), Constraint::Length(3)], // Pacstrap
             4 => vec![
@@ -192,8 +203,9 @@ impl Component for SourceStepView {
             2 => {
                 self.deboot_mirror.render(f, chunks[1]);
                 self.deboot_suite.render(f, chunks[2]);
+                self.bootstrap_pkgs.render(f, chunks[3]);
             }
-            3 => self.pacstrap_pkgs.render(f, chunks[1]),
+            3 => self.bootstrap_pkgs.render(f, chunks[1]),
             4 => {
                 self.pull_url.render(f, chunks[1]);
                 self.pull_format.render(f, chunks[2]);
@@ -250,7 +262,7 @@ impl Component for SourceStepView {
             self.oci_url.set_focus(false);
             self.deboot_mirror.set_focus(false);
             self.deboot_suite.set_focus(false);
-            self.pacstrap_pkgs.set_focus(false);
+            self.bootstrap_pkgs.set_focus(false);
             self.local_path.set_focus(false);
             self.pull_url.set_focus(false);
             self.pull_format.set_focus(false);
@@ -272,11 +284,12 @@ impl Component for SourceStepView {
                     .map_err(|_| "Missing dependency: debootstrap".to_string())?;
                 self.deboot_mirror.validate()?;
                 self.deboot_suite.validate()?;
+                self.bootstrap_pkgs.validate()?;
             }
             3 => {
                 crate::nspawn::deploy::image::check_tool("pacstrap")
                     .map_err(|_| "Missing dependency: pacstrap".to_string())?;
-                self.pacstrap_pkgs.validate()?
+                self.bootstrap_pkgs.validate()?
             }
             4 => {
                 crate::nspawn::deploy::image::check_tool("curl")
@@ -304,7 +317,7 @@ impl StepComponent for SourceStepView {
         ctx.source.oci_url = self.oci_url.value().to_string();
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
-        ctx.source.pacstrap_pkgs = self.pacstrap_pkgs.value().to_string();
+        ctx.source.bootstrap_pkgs = self.bootstrap_pkgs.value().to_string();
         ctx.source.local_path = self.local_path.value().to_string();
         ctx.source.pull_url = self.pull_url.value().to_string();
         ctx.source.is_pull_raw = self.pull_format.selected_idx() == 1;

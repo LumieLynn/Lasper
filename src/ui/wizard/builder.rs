@@ -21,7 +21,7 @@ pub struct SourceConfig {
     pub oci_url: String,
     pub deboot_mirror: String,
     pub deboot_suite: String,
-    pub pacstrap_pkgs: String,
+    pub bootstrap_pkgs: String,
     pub local_path: String,
     pub clone_source: String,
     pub pull_url: String,
@@ -195,7 +195,7 @@ impl ContainerConfigBuilder {
             oci_url: String::new(),
             deboot_mirror: String::new(),
             deboot_suite: String::new(),
-            pacstrap_pkgs: String::new(),
+            bootstrap_pkgs: String::new(),
             local_path: String::new(),
             clone_source: String::new(),
             pull_url: String::new(),
@@ -223,9 +223,10 @@ impl ContainerConfigBuilder {
                 } else {
                     source.deboot_suite.clone()
                 },
+                packages: source.bootstrap_pkgs.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer {
-                packages: source.pacstrap_pkgs.clone(),
+                packages: source.bootstrap_pkgs.clone(),
             }) as Box<dyn Deployer>,
         };
 

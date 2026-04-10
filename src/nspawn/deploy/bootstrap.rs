@@ -14,6 +14,7 @@ use crate::nspawn::models::ContainerConfig;
 pub struct DebootstrapDeployer {
     pub mirror: String,
     pub suite: String,
+    pub packages: String,
 }
 
 #[async_trait]
@@ -28,6 +29,10 @@ impl Deployer for DebootstrapDeployer {
         let mut args = vec![];
         if cfg.users.iter().any(|u| u.sudoer) {
             args.push("--include=sudo".to_string());
+        }
+        if !self.packages.is_empty() {
+            let pkgs = self.packages.split_whitespace().collect::<Vec<_>>().join(",");
+            args.push(format!("--include={}", pkgs));
         }
         args.push(self.suite.clone());
         args.push(rootfs.to_string_lossy().to_string());
