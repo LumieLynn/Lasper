@@ -2,13 +2,14 @@
 
 use std::path::Path;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::utils::new_sync_command;
+use crate::nspawn::utils::command::{new_sync_command, CommandLogged};
 
 /// Detects the filesystem type of a given path using 'stat -f -c %T'.
-pub fn get_filesystem_type(path: &Path) -> Result<String> {
-    let out = new_sync_command("stat")
+pub async fn get_filesystem_type(path: &Path) -> Result<String> {
+    let out = crate::nspawn::utils::new_command("stat")
         .args(["-f", "-c", "%T", &path.to_string_lossy()])
-        .output()
+        .logged_output("stat")
+        .await
         .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
 
     if out.status.success() {

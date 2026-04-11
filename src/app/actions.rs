@@ -93,7 +93,7 @@ impl App {
             }
             DetailPane::Config => {
                 let new_content =
-                    crate::nspawn::config::NspawnConfig::load(&entry.name).map(|c| c.content);
+                    crate::nspawn::config::NspawnConfig::load(&entry.name).await.map(|c| c.content);
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
                 }

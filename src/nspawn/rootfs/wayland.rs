@@ -27,9 +27,13 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 
     let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
     if let Some(parent) = full_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
     }
-    std::fs::write(&full_path, script_content).map_err(|e| NspawnError::Io(full_path, e))?;
+    tokio::fs::write(&full_path, script_content)
+        .await
+        .map_err(|e| NspawnError::Io(full_path, e))?;
 
     let shell = user.shell.as_str();
     let rc_file = if shell.ends_with("zsh") {
@@ -39,7 +43,9 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
             "{}/.config/fish/conf.d",
             home_dir.trim_start_matches('/')
         ));
-        std::fs::create_dir_all(&fish_dir).map_err(|e| NspawnError::Io(fish_dir.clone(), e))?;
+        tokio::fs::create_dir_all(&fish_dir)
+            .await
+            .map_err(|e| NspawnError::Io(fish_dir.clone(), e))?;
         let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
         let fish_script = format!(
             r#"
@@ -52,20 +58,25 @@ ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
             host_display
         );
         let script_path = fish_dir.join("wayland-env.fish");
-        std::fs::write(&script_path, fish_script).map_err(|e| NspawnError::Io(script_path, e))?;
+        tokio::fs::write(&script_path, fish_script)
+            .await
+            .map_err(|e| NspawnError::Io(script_path, e))?;
         return Ok(());
     } else {
         ".bashrc"
     };
 
     let rc_full_path = rootfs.join(format!("{}/{}", home_dir.trim_start_matches('/'), rc_file));
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    if let Ok(mut f) = tokio::fs::OpenOptions::new()
         .append(true)
         .create(true)
         .open(&rc_full_path)
+        .await
     {
-        writeln!(f, "\n[ -f ~/.wayland-env ] && source ~/.wayland-env")
-            .map_err(|e| NspawnError::Io(rc_full_path, e))?;
+        use tokio::io::AsyncWriteExt;
+        let _ = f
+            .write_all(b"\n[ -f ~/.wayland-env ] && source ~/.wayland-env\n")
+            .await;
     }
 
     Ok(())

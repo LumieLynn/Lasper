@@ -41,7 +41,7 @@ pub(crate) fn get_state_dir() -> PathBuf {
 pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
     let dir = get_state_dir();
     let path = dir.join(format!("{}.json", name));
-    if !path.exists() {
+    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Ok(None);
     }
     let content = tokio::fs::read_to_string(&path)
@@ -52,11 +52,11 @@ pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
-    let backend = crate::nspawn::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name).await;
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 
-    let res = if path.exists() {
+    let res = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => serde_json::from_str(&content).ok(),
             Err(_) => None,
@@ -71,29 +71,24 @@ pub async fn get_internal_state(name: &str) -> Result<Option<NvidiaState>> {
 
 pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
     let dir = get_state_dir();
-    let _ = tokio::fs::create_dir_all(&dir).await;
     let path = dir.join(format!("{}.json", name));
     let content = serde_json::to_string_pretty(state)?;
-    tokio::fs::write(&path, content)
-        .await
-        .map_err(|e| NspawnError::Io(path, e))?;
+
+    crate::nspawn::utils::io::AsyncLockedWriter::write_locked(&path, |_| Ok(content)).await?;
     Ok(())
 }
 
 pub async fn save_internal_state(name: &str, state: &NvidiaState) -> Result<()> {
     let content = serde_json::to_string_pretty(state)?;
 
-    let backend = crate::nspawn::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name).await;
     let rootfs = backend.mount(name).await?;
     let path = rootfs.join("etc/.lasper-nvidia.json");
 
-    if let Err(e) = tokio::fs::write(&path, content).await {
-        let _ = backend.unmount(name).await;
-        return Err(NspawnError::Io(path, e));
-    }
+    let res = crate::nspawn::utils::io::AsyncLockedWriter::write_locked(&path, |_| Ok(content)).await;
 
     let _ = backend.unmount(name).await;
-    Ok(())
+    res
 }
 
 pub(crate) fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<String> {

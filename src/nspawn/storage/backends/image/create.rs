@@ -18,8 +18,7 @@ impl DiskImageBackend {
                     return Err(NspawnError::Validation(format!("Source image not found: {}", path)));
                 }
                 log::info!("Importing existing image from {} to {}", src_path.display(), dest_path.display());
-                tokio::fs::copy(&src_path, &dest_path).await
-                    .map_err(|e| NspawnError::Io(dest_path.clone(), e))?;
+                crate::nspawn::utils::io::AsyncLockedWriter::atomic_copy(&src_path, &dest_path).await?;
             }
             DiskImageSource::CreateNew { size, fs_type } => {
                 let out = new_command("truncate")

@@ -9,47 +9,45 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
 
 /// Scans the systemd-nspawn cgroup machine slice to discover active containers.
-fn discover_containers() -> Vec<(String, PathBuf)> {
+async fn discover_containers() -> Vec<(String, PathBuf)> {
     let machine_slice = "/sys/fs/cgroup/machine.slice";
-    let entries = match fs::read_dir(machine_slice) {
+    let mut entries = match tokio::fs::read_dir(machine_slice).await {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
 
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let name_str = entry.file_name().to_string_lossy().to_string();
-            if name_str.starts_with("systemd-nspawn@") && name_str.ends_with(".service") {
-                let container_name = name_str
-                    .strip_prefix("systemd-nspawn@")?
-                    .strip_suffix(".service")?
-                    .to_string();
-                Some((container_name, entry.path()))
-            } else {
-                None
+    let mut containers = Vec::new();
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let name_str = entry.file_name().to_string_lossy().to_string();
+        if name_str.starts_with("systemd-nspawn@") && name_str.ends_with(".service") {
+            if let Some(container_name) = name_str
+                .strip_prefix("systemd-nspawn@")
+                .and_then(|s| s.strip_suffix(".service"))
+            {
+                containers.push((container_name.to_string(), entry.path()));
             }
-        })
-        .collect()
+        }
+    }
+    containers
 }
 
 /// Read basic usage statistics from a container's cgroup path.
-fn read_container_stats(cgroup_path: &Path) -> (f64, Option<u64>) {
+async fn read_container_stats(cgroup_path: &Path) -> (f64, Option<u64>) {
     // RAM
-    let ram_mb = (|| -> Option<f64> {
-        let mem_str = fs::read_to_string(cgroup_path.join("memory.current")).ok()?;
-        let bytes = mem_str.trim().parse::<f64>().ok()?;
-        Some(bytes / 1024.0 / 1024.0)
-    })()
-    .unwrap_or(0.0);
+    let ram_mb = match tokio::fs::read_to_string(cgroup_path.join("memory.current")).await {
+        Ok(mem_str) => mem_str.trim().parse::<f64>().unwrap_or(0.0) / 1024.0 / 1024.0,
+        Err(_) => 0.0,
+    };
 
     // CPU
-    let cpu_usec = (|| -> Option<u64> {
-        let cpu_str = fs::read_to_string(cgroup_path.join("cpu.stat")).ok()?;
-        let line = cpu_str.lines().find(|l| l.starts_with("usage_usec"))?;
-        let usec_str = line.split_whitespace().nth(1)?;
-        usec_str.parse::<u64>().ok()
-    })();
+    let cpu_usec = match tokio::fs::read_to_string(cgroup_path.join("cpu.stat")).await {
+        Ok(cpu_str) => cpu_str
+            .lines()
+            .find(|l| l.starts_with("usage_usec"))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|usec_str| usec_str.parse::<u64>().ok()),
+        Err(_) => None,
+    };
 
     (ram_mb, cpu_usec)
 }
@@ -64,8 +62,8 @@ pub fn spawn_collector(tx: Sender<AppEvent>, cpu_cores: usize, cpu_rep: CpuRepre
         loop {
             interval.tick().await;
 
-            for (name, path) in discover_containers() {
-                let (ram_mb, cpu_usec) = read_container_stats(&path);
+            for (name, path) in discover_containers().await {
+                let (ram_mb, cpu_usec) = read_container_stats(&path).await;
 
                 // Core Calculation Logic
                 if let Some(current_usec) = cpu_usec {

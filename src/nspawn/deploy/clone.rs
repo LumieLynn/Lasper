@@ -54,12 +54,12 @@ impl Deployer for CloneDeployer {
         // machinectl clone creates the container in /var/lib/machines/NAME automatically.
 
         // Clone configs
-        if let Err(e) = crate::nspawn::config::nspawn_file::clone_nspawn_config(&self.source_name, name) {
+        if let Err(e) = crate::nspawn::config::nspawn_file::clone_nspawn_config(&self.source_name, name).await {
             let _ = logs
                 .send(format!("WARNING: Failed to clone .nspawn config: {}", e))
                 .await;
         }
-        if let Err(e) = crate::nspawn::config::systemd_unit::clone_systemd_override(&self.source_name, name) {
+        if let Err(e) = crate::nspawn::config::systemd_unit::clone_systemd_override(&self.source_name, name).await {
             let _ = logs
                 .send(format!("WARNING: Failed to clone systemd override: {}", e))
                 .await;

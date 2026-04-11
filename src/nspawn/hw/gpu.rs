@@ -16,15 +16,15 @@ pub struct GpuDevice {
 
 /// Discover all available GPU-like hardware nodes on the host.
 /// Uses Sysfs canonicalization to group cardX and renderDX nodes by physical device.
-pub fn discover_host_gpus() -> Vec<GpuDevice> {
+pub async fn discover_host_gpus() -> Vec<GpuDevice> {
     let mut gpu_map: HashMap<PathBuf, GpuDevice> = HashMap::new();
 
     // 1. Initialize PCI database (cached in memory after first read)
     let pci_db = PCI_DB.get_or_init(|| Database::read().ok());
 
     // 2. Standard DRM/KMS Devices
-    if let Ok(entries) = std::fs::read_dir("/sys/class/drm") {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir("/sys/class/drm").await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name().to_string_lossy().to_string();
 
             // We only care about cardX and renderDX nodes
@@ -34,7 +34,7 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
 
             // Find the "real physical parent" by resolving the 'device' symlink
             let device_link = entry.path().join("device");
-            let canonical_parent = match std::fs::canonicalize(&device_link) {
+            let canonical_parent = match tokio::fs::canonicalize(&device_link).await {
                 Ok(path) => path,
                 Err(_) => continue,
             };
@@ -49,7 +49,7 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
             }
 
             // New physical GPU discovered
-            let display_name = resolve_hardware_name(&canonical_parent, pci_db.as_ref());
+            let display_name = resolve_hardware_name(&canonical_parent, pci_db.as_ref()).await;
             gpu_map.insert(
                 canonical_parent,
                 GpuDevice {
@@ -64,7 +64,7 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
     let mut result: Vec<GpuDevice> = gpu_map.into_values().collect();
 
     // 3. WSL2 DirectX Virtual GPU (if not already handled via DRM)
-    if Path::new("/dev/dxg").exists() {
+    if tokio::fs::try_exists("/dev/dxg").await.unwrap_or(false) {
         result.push(GpuDevice {
             display_name: "WSL2 DirectX Virtual GPU".into(),
             driver_type: "WSL/DirectX".into(),
@@ -73,7 +73,7 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
     }
 
     // 4. Legacy ARM Mali (if not appearing in /sys/class/drm)
-    if Path::new("/dev/mali").exists() && !result.iter().any(|g| g.nodes.contains(&"/dev/mali".into())) {
+    if tokio::fs::try_exists("/dev/mali").await.unwrap_or(false) && !result.iter().any(|g| g.nodes.contains(&"/dev/mali".into())) {
         result.push(GpuDevice {
             display_name: "ARM Mali Graphics (Legacy)".into(),
             driver_type: "Mali/Proprietary".into(),
@@ -82,7 +82,7 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
     }
 
     // 5. Qualcomm Adreno (Legacy KGSL)
-    if Path::new("/dev/kgsl-3d0").exists() {
+    if tokio::fs::try_exists("/dev/kgsl-3d0").await.unwrap_or(false) {
         result.push(GpuDevice {
             display_name: "Qualcomm Adreno (Legacy KGSL)".into(),
             driver_type: "KGSL".into(),
@@ -95,11 +95,14 @@ pub fn discover_host_gpus() -> Vec<GpuDevice> {
 }
 
 /// Helper function to resolve the real hardware name from Sysfs
-fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) -> String {
+async fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) -> String {
     // Try reading Vendor ID and Device ID (Standard PCIe)
+    let vendor_file = device_path.join("vendor");
+    let device_file = device_path.join("device");
+    
     if let (Ok(vendor_str), Ok(device_str)) = (
-        std::fs::read_to_string(device_path.join("vendor")),
-        std::fs::read_to_string(device_path.join("device")),
+        tokio::fs::read_to_string(&vendor_file).await,
+        tokio::fs::read_to_string(&device_file).await,
     ) {
         let v_id = u16::from_str_radix(vendor_str.trim().trim_start_matches("0x"), 16).unwrap_or(0);
         let d_id = u16::from_str_radix(device_str.trim().trim_start_matches("0x"), 16).unwrap_or(0);
@@ -117,7 +120,7 @@ fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) -> Strin
 
     // ARM/Embedded Platform GPU (check compatible node)
     let compatible_path = device_path.join("of_node/compatible");
-    if let Ok(content) = std::fs::read_to_string(compatible_path) {
+    if let Ok(content) = tokio::fs::read_to_string(compatible_path).await {
         // e.g., "qcom,adreno-640.1\0qcom,adreno\0"
         let first_compatible = content.split('\0').next().unwrap_or("ARM Platform GPU");
         return first_compatible

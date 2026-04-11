@@ -20,13 +20,13 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
     );
 
     // 1. Mount rootfs
-    let backend = crate::nspawn::storage::get_storage_backend_for(name);
+    let backend = crate::nspawn::storage::get_storage_backend_for(name).await;
     let rootfs = backend.mount(name).await?;
 
     // 2. Precise cleanup: Iterate and remove 0-byte files
     for path in death_list {
         let target = rootfs.join(path.trim_start_matches('/'));
-        if target.exists() {
+        if tokio::fs::try_exists(&target).await.unwrap_or(false) {
             if let Ok(meta) = tokio::fs::metadata(&target).await {
                 if meta.len() == 0 {
                     log_step!(name, "Cleanup", "Deleting 0-byte junk: {}", path);
@@ -57,9 +57,7 @@ async fn inject_persistent_device_allow(name: &str, state: &NvidiaState) -> Resu
         content.push_str(&format!("DeviceAllow={} rw\n", dev));
     }
 
-    tokio::fs::write(&path, content)
-        .await
-        .map_err(|e| NspawnError::Io(path, e))?;
+    crate::nspawn::utils::io::AsyncLockedWriter::write_atomic(&path, &content).await?;
 
     // Cleanup old transient one if present
     let transient_path = format!(
@@ -76,7 +74,7 @@ pub async fn ensure_gpu_passthrough(
     dbus: &crate::nspawn::core::provider::dbus::DbusProvider,
 ) -> Result<()> {
     // 1. Semantic Marker Check
-    let config = match crate::nspawn::config::nspawn_file::NspawnConfig::load(name) {
+    let config = match crate::nspawn::config::nspawn_file::NspawnConfig::load(name).await {
         Some(c) => c,
         None => return Ok(()),
     };

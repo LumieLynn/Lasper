@@ -5,15 +5,15 @@ use crate::nspawn::utils::command::new_sync_command;
 
 /// Determines the host's runtime directory (XDG_RUNTIME_DIR).
 /// Returns an error if it cannot be determined reliably.
-pub fn get_xdg_runtime() -> Result<String> {
+pub async fn get_xdg_runtime() -> Result<String> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         return Ok(dir);
     }
-    
+
     // Fallback to /run/user/<SUDO_UID> if Lasper is run via sudo
     if let Ok(uid) = std::env::var("SUDO_UID") {
         let path = format!("/run/user/{}", uid);
-        if fs::metadata(&path).is_ok() {
+        if tokio::fs::metadata(&path).await.is_ok() {
             return Ok(path);
         }
     }
@@ -67,21 +67,21 @@ pub fn supports_idmap() -> bool {
 }
 
 /// Scans the host's runtime directory for available Wayland sockets.
-pub fn scan_available_wayland_sockets() -> Vec<String> {
-    let xdg_runtime = match get_xdg_runtime() {
+pub async fn scan_available_wayland_sockets() -> Vec<String> {
+    let xdg_runtime = match get_xdg_runtime().await {
         Ok(dir) => dir,
         Err(_) => return Vec::new(),
     };
 
     let mut sockets = Vec::new();
-    if let Ok(entries) = fs::read_dir(&xdg_runtime) {
-        for entry in entries.flatten() {
+    if let Ok(mut entries) = tokio::fs::read_dir(&xdg_runtime).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
 
             // Match wayland-* but exclude .lock files
             if name.starts_with("wayland-") && !name.ends_with(".lock") {
-                if let Ok(meta) = entry.metadata() {
+                if let Ok(meta) = entry.metadata().await {
                     if meta.file_type().is_socket() {
                         sockets.push(name.to_string());
                     }
@@ -89,7 +89,7 @@ pub fn scan_available_wayland_sockets() -> Vec<String> {
             }
         }
     }
-    
+
     sockets.sort();
     sockets
 }

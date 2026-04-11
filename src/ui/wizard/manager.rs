@@ -24,12 +24,12 @@ pub struct Wizard {
 }
 
 impl Wizard {
-    pub fn new(
+    pub async fn new(
         entries: Vec<ContainerEntry>,
         nvidia_toolkit_installed: bool,
         command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
     ) -> Self {
-        let mut context = WizardContext::new(entries);
+        let mut context = WizardContext::new(entries).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {

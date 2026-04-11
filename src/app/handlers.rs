@@ -105,7 +105,7 @@ impl App {
                             self.data.entries.clone(),
                             nvidia_installed,
                             tx.clone(),
-                        ));
+                        ).await);
                         self.ui.show_wizard = true;
                     }
                 } else {

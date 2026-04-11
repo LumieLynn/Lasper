@@ -116,29 +116,43 @@ async fn run_deploy_internal(
         // ---- systemd-dissect raw mounting ----
         let mut actual_rootfs = rootfs.clone();
 
-        if !actual_rootfs.exists() {
+        if !tokio::fs::try_exists(&actual_rootfs).await.unwrap_or(false) {
             let raw_path = std::path::PathBuf::from(format!("/var/lib/machines/{}.raw", name));
-            if raw_path.exists() && raw_path.is_file() {
-                let mount_point = std::path::PathBuf::from(format!("/var/cache/lasper/dissect-{}", name));
-                let _ = tokio::fs::create_dir_all(&mount_point).await;
-                push_log!("Mounting raw image for configuration...".to_string());
-                
-                let out = crate::nspawn::utils::new_command("systemd-dissect")
-                    .args(["--mount", raw_path.to_str().unwrap(), mount_point.to_str().unwrap()])
-                    .logged_output("systemd-dissect").await;
+            if let Ok(meta) = tokio::fs::metadata(&raw_path).await {
+                if meta.is_file() {
+                    let mount_point =
+                        std::path::PathBuf::from(format!("/var/cache/lasper/dissect-{}", name));
+                    let _ = tokio::fs::create_dir_all(&mount_point).await;
+                    push_log!("Mounting raw image for configuration...".to_string());
 
-                if let Ok(cmd) = out {
-                    if cmd.status.success() {
-                        actual_rootfs = mount_point.clone();
-                        dissect_mount_dir = Some(mount_point);
-                    } else {
-                        push_log!("WARNING: Failed to mount raw image with systemd-dissect.".into());
+                    let out = crate::nspawn::utils::new_command("systemd-dissect")
+                        .args([
+                            "--mount",
+                            raw_path.to_str().unwrap(),
+                            mount_point.to_str().unwrap(),
+                        ])
+                        .logged_output("systemd-dissect")
+                        .await;
+
+                    if let Ok(cmd) = out {
+                        if cmd.status.success() {
+                            actual_rootfs = mount_point.clone();
+                            dissect_mount_dir = Some(mount_point);
+                        } else {
+                            push_log!(
+                                "WARNING: Failed to mount raw image with systemd-dissect.".into()
+                            );
+                        }
                     }
                 }
             }
         }
 
-        let is_mounted_dir = actual_rootfs.exists() && actual_rootfs.is_dir();
+        let is_mounted_dir = if let Ok(meta) = tokio::fs::metadata(&actual_rootfs).await {
+            meta.is_dir()
+        } else {
+            false
+        };
 
         if is_mounted_dir {
             if let Some(pwd) = &cfg.root_password {
@@ -160,7 +174,8 @@ async fn run_deploy_internal(
             push_log!("WARNING: Target is unmounted. Skipping passwords and user creation.".to_string());
         }
 
-        let mut nspawn_content = crate::nspawn::config::nspawn_file::nspawn_config_content(&cfg)?;
+        let xdg_runtime = crate::nspawn::utils::discovery::get_xdg_runtime().await.ok();
+        let mut nspawn_content = crate::nspawn::config::nspawn_file::nspawn_config_content(&cfg, xdg_runtime.as_deref())?;
 
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
@@ -200,12 +215,8 @@ async fn run_deploy_internal(
 
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        if let Some(parent) = nspawn_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
-        }
-        std::fs::write(&nspawn_path, nspawn_content)
-            .map_err(|e| NspawnError::Io(nspawn_path, e))?;
+        
+        crate::nspawn::utils::io::AsyncLockedWriter::write_locked(&nspawn_path, |_| Ok(nspawn_content)).await?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             log::info!(
@@ -219,7 +230,7 @@ async fn run_deploy_internal(
                 cfg.nvidia_gpu,
                 cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
-            )?;
+            ).await?;
         }
 
         if is_mounted_dir {

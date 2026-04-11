@@ -11,9 +11,11 @@ pub struct NspawnConfig {
 
 impl NspawnConfig {
     /// Load the `.nspawn` config for a container by name.
-    pub fn load(name: &str) -> Option<NspawnConfig> {
+    pub async fn load(name: &str) -> Option<NspawnConfig> {
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        match std::fs::read_to_string(&path) {
+        match tokio::fs::read_to_string(&path)
+            .await
+        {
             Ok(content) => Some(NspawnConfig { path, content }),
             Err(e) => {
                 log::debug!("Could not read .nspawn config for {}: {}", name, e);
@@ -46,25 +48,18 @@ impl NspawnConfig {
         death_list: &[String],
     ) -> Result<()> {
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| NspawnError::Io(path.clone(), e))?;
 
-        let final_content = Self::apply_gpu_passthrough_to_content(content, new_state, death_list)?;
+        crate::nspawn::utils::io::AsyncLockedWriter::write_locked(&path, |existing| {
+            let content = existing.ok_or_else(|| {
+                NspawnError::Io(
+                    path.clone(),
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "Config file not found"),
+                )
+            })?;
 
-        // Atomic write
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
-        }
-        let tmp_path = path.with_extension("nspawn.tmp");
-        std::fs::write(&tmp_path, final_content)
-            .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-
-        tokio::fs::rename(&tmp_path, &path)
-            .await
-            .map_err(|e| NspawnError::Io(path, e))?;
-
-        Ok(())
+            Self::apply_gpu_passthrough_to_content(content, new_state, death_list)
+        })
+        .await
     }
 
     /// Scans the raw content for markers and removes the block.
@@ -205,7 +200,7 @@ impl NspawnConfig {
 // ── .nspawn file generation ───────────────────────────────────────────────────
 
 /// Generate the content of a `.nspawn` container config file using AST.
-pub fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
+pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
     let mut conf = Ini::new();
     let idmap_supported = crate::nspawn::utils::discovery::supports_idmap();
 
@@ -317,13 +312,11 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
         let suffix = if idmap_supported { ":idmap" } else { "" };
 
         if let Some(socket_name) = &cfg.wayland_socket {
-            let xdg_runtime = crate::nspawn::utils::discovery::get_xdg_runtime()?;
-            let host_wayland_sock = format!("{}/{}", xdg_runtime, socket_name);
+            if let Some(runtime) = xdg_runtime {
+                let socket_path = std::path::PathBuf::from(runtime).join(socket_name);
+                files.append("Bind", format!("{}:/run/wayland-0", socket_path.display()));
+            }
 
-            files.append(
-                "Bind",
-                format!("{}:/mnt/wayland-socket{}", host_wayland_sock, suffix),
-            );
             files.append("Bind", format!("/tmp/.X11-unix:/tmp/.X11-unix{}", suffix));
 
             if std::path::Path::new("/dev/dri").exists() {
@@ -342,13 +335,22 @@ pub fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
 }
 
 /// Clones an .nspawn configuration file from one container to another.
-pub fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<()> {
+pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<()> {
     let source_path = format!("/etc/systemd/nspawn/{}.nspawn", source_name);
-    if !Path::new(&source_path).exists() {
+    if !tokio::fs::try_exists(&source_path)
+        .await
+        .unwrap_or(false)
+    {
         return Ok(());
     }
     let dest_path = format!("/etc/systemd/nspawn/{}.nspawn", dest_name);
-    std::fs::copy(&source_path, &dest_path)
-        .map_err(|e| NspawnError::Io(PathBuf::from(&dest_path), e))?;
+
+    if let Some(parent) = Path::new(&dest_path).parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+    }
+
+    crate::nspawn::utils::io::AsyncLockedWriter::atomic_copy(Path::new(&source_path), Path::new(&dest_path)).await?;
     Ok(())
 }

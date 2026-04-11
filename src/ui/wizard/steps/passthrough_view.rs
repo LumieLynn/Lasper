@@ -58,6 +58,8 @@ impl PassthroughStepView {
         initial_data: &PassthroughConfig,
         nw_mode: Option<NetworkMode>,
         nvidia_toolkit_installed: bool,
+        wayland_sockets: Vec<String>,
+        discovered_gpus: Vec<GpuDevice>,
     ) -> Self {
         let nvidia_label = if nvidia_toolkit_installed {
             "NVIDIA Driver & GPU Passthrough (Scan host)"
@@ -79,7 +81,6 @@ impl PassthroughStepView {
             false
         };
 
-        let wayland_sockets = scan_available_wayland_sockets();
         let wayland_options = if wayland_sockets.is_empty() {
             vec!["No sockets found".to_string()]
         } else {
@@ -96,7 +97,6 @@ impl PassthroughStepView {
             0
         };
 
-        let discovered_gpus = discover_host_gpus();
         let mut gpu_list = Checklist::new("Select Host GPU(s)", discovered_gpus.clone(), |gpu| {
             format!("{} ({})", gpu.display_name, gpu.nodes.first().cloned().unwrap_or_default())
         });

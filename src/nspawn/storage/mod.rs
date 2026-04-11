@@ -72,14 +72,14 @@ pub trait StorageBackend: Send + Sync {
 }
 
 /// Factory function to get the appropriate storage backend for an existing machine.
-pub fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
+pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     let base = PathBuf::from("/var/lib/machines").join(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
     let extensions = ["raw", "img", "iso"];
     for ext in extensions {
         let path = base.with_extension(ext);
-        if path.exists() {
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
             return Box::new(DiskImageBackend {
                 config: DiskImageConfig {
                     source: DiskImageSource::ImportExisting {
@@ -93,24 +93,22 @@ pub fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
 
     // 2. Check if a block device exists with this name (e.g. /dev/name)
     let block_dev = PathBuf::from(format!("/dev/{}", name));
-    if block_dev.exists() {
-        if let Ok(meta) = std::fs::metadata(&block_dev) {
-            use std::os::unix::fs::FileTypeExt;
-            if meta.file_type().is_block_device() {
-                return Box::new(DiskImageBackend {
-                    config: DiskImageConfig {
-                        source: DiskImageSource::ImportExisting {
-                            path: block_dev.to_string_lossy().to_string(),
-                        },
-                        use_partition_table: false,
+    if let Ok(meta) = tokio::fs::metadata(&block_dev).await {
+        use std::os::unix::fs::FileTypeExt;
+        if meta.file_type().is_block_device() {
+            return Box::new(DiskImageBackend {
+                config: DiskImageConfig {
+                    source: DiskImageSource::ImportExisting {
+                        path: block_dev.to_string_lossy().to_string(),
                     },
-                });
-            }
+                    use_partition_table: false,
+                },
+            });
         }
     }
 
     // 3. Check if it's a subvolume (Btrfs subvolume or ZFS dataset)
-    if crate::nspawn::storage::detect::is_subvolume(&base) {
+    if crate::nspawn::storage::detect::is_subvolume(&base).await {
         return Box::new(SubvolumeBackend);
     }
 

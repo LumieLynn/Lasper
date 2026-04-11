@@ -5,7 +5,7 @@ use crate::nspawn::utils::{new_command, CommandLogged};
 /// Enable systemd-networkd and systemd-resolved inside the container.
 pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
     let systemctl_path = rootfs.join("usr/bin/systemctl");
-    if !systemctl_path.exists() {
+    if !tokio::fs::try_exists(&systemctl_path).await.unwrap_or(false) {
         return Ok(());
     }
 
@@ -34,8 +34,8 @@ pub async fn enable_container_networkd(rootfs: &Path) -> Result<()> {
     }
 
     let resolv_conf = rootfs.join("etc/resolv.conf");
-    let _ = std::fs::remove_file(&resolv_conf);
-    let _ = std::os::unix::fs::symlink("../run/systemd/resolve/stub-resolv.conf", &resolv_conf);
+    let _ = tokio::fs::remove_file(&resolv_conf).await;
+    let _ = tokio::fs::symlink("../run/systemd/resolve/stub-resolv.conf", &resolv_conf).await;
 
     Ok(())
 }

@@ -73,7 +73,7 @@ pub struct ContainerConfigBuilder {
 }
 
 impl ContainerConfigBuilder {
-    pub fn build_config(&self) -> ContainerConfigWithPreview {
+    pub fn build_config(&self, xdg_runtime: Option<&str>) -> ContainerConfigWithPreview {
         let passthrough = self
             .passthrough
             .as_ref()
@@ -148,7 +148,7 @@ impl ContainerConfigBuilder {
             storage.storage_type.get_path(&basic.name).display()
         ));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
-        content.push_str(&nspawn_config_content(&cfg).unwrap_or_else(|e| format!(" [ERROR: {}]", e)));
+        content.push_str(&nspawn_config_content(&cfg, xdg_runtime).unwrap_or_else(|e| format!(" [ERROR: {}]", e)));
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
             content.push_str(&systemd_override_content(

@@ -251,14 +251,10 @@ fn normalize_oci_image_ref(image_ref: &str) -> String {
 
 async fn ensure_container_policy() -> Result<()> {
     let policy_path = std::path::Path::new("/etc/containers/policy.json");
-    if !policy_path.exists() {
-        let default_policy = r#"{"default":[{"type":"insecureAcceptAnything"}]}"#;
-        if let Some(parent) = policy_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
-        tokio::fs::write(policy_path, default_policy)
-            .await
-            .map_err(|e| NspawnError::Io(policy_path.to_path_buf(), e))?;
+    if !tokio::fs::try_exists(policy_path).await.unwrap_or(false) {
+        log::info!("Initializing default OCI policy in /etc/containers/policy.json");
+        let default_policy = r#"{ "default": [ { "type": "insecureAcceptAnything" } ] }"#;
+        crate::nspawn::utils::io::AsyncLockedWriter::write_atomic(policy_path, default_policy).await?;
     }
     Ok(())
 }
@@ -276,7 +272,7 @@ pub async fn import_oci_image(
     let normalized_ref = normalize_oci_image_ref(image_ref);
     let tmp_parent = "/var/cache/lasper/oci-staging";
     let _ = tokio::fs::create_dir_all(tmp_parent).await;
-    let _ = std::fs::set_permissions(tmp_parent, std::fs::Permissions::from_mode(0o700));
+    let _ = tokio::fs::set_permissions(tmp_parent, std::fs::Permissions::from_mode(0o700)).await;
 
     let tmp_oci = format!("{}/oci-{}-{}", tmp_parent, local_name, std::process::id());
     let bundle_dir = format!(
@@ -366,7 +362,7 @@ pub async fn import_oci_image(
 
     // Move rootfs content to dest
     let rootfs_source = std::path::Path::new(&bundle_dir).join("rootfs");
-    if !rootfs_source.exists() {
+    if !tokio::fs::try_exists(&rootfs_source).await.unwrap_or(false) {
         cleanup().await;
         return Err(NspawnError::DeployError(
             "umoci unpack did not create rootfs directory".into(),

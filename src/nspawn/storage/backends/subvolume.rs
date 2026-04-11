@@ -14,9 +14,9 @@ enum SubvolumeType {
 }
 
 impl SubvolumeBackend {
-    fn detect_type(&self) -> Result<SubvolumeType> {
+    async fn detect_type(&self) -> Result<SubvolumeType> {
         let machines_dir = Path::new("/var/lib/machines");
-        let fs_type = get_filesystem_type(machines_dir)?;
+        let fs_type = get_filesystem_type(machines_dir).await?;
         
         match fs_type.as_str() {
             "btrfs" => Ok(SubvolumeType::Btrfs),
@@ -29,10 +29,11 @@ impl SubvolumeBackend {
     }
 
     /// Gets the ZFS dataset name for a given path.
-    fn get_zfs_dataset(&self, path: &Path) -> Result<String> {
-        let out = new_sync_command("zfs")
+    async fn get_zfs_dataset(&self, path: &Path) -> Result<String> {
+        let out = crate::nspawn::utils::new_command("zfs")
             .args(["list", "-H", "-o", "name", &path.to_string_lossy()])
-            .output()
+            .logged_output("zfs")
+            .await
             .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
 
         if out.status.success() {
@@ -59,7 +60,7 @@ impl StorageBackend for SubvolumeBackend {
 
     async fn create(&self, name: &str) -> Result<PathBuf> {
         let path = self.get_path(name);
-        match self.detect_type()? {
+        match self.detect_type().await? {
             SubvolumeType::Btrfs => {
                 let out = new_command("btrfs")
                     .args(["subvolume", "create", &path.to_string_lossy()])
@@ -77,7 +78,7 @@ impl StorageBackend for SubvolumeBackend {
             }
             SubvolumeType::Zfs => {
                 let machines_dir = Path::new("/var/lib/machines");
-                let parent_dataset = self.get_zfs_dataset(machines_dir)?;
+                let parent_dataset = self.get_zfs_dataset(machines_dir).await?;
                 let dataset_name = format!("{}/{}", parent_dataset, name);
 
                 let out = new_command("zfs")
@@ -108,7 +109,7 @@ impl StorageBackend for SubvolumeBackend {
 
     async fn delete(&self, name: &str) -> Result<()> {
         let path = self.get_path(name);
-        match self.detect_type()? {
+        match self.detect_type().await? {
             SubvolumeType::Btrfs => {
                 let out = new_command("btrfs")
                     .args(["subvolume", "delete", &path.to_string_lossy()])
@@ -131,7 +132,7 @@ impl StorageBackend for SubvolumeBackend {
             }
             SubvolumeType::Zfs => {
                 let machines_dir = Path::new("/var/lib/machines");
-                let parent_dataset = match self.get_zfs_dataset(machines_dir) {
+                let parent_dataset = match self.get_zfs_dataset(machines_dir).await {
                     Ok(ds) => ds,
                     Err(_) => return Ok(()), // Machines dir not a ZFS dataset, nothing to destroy
                 };
@@ -161,6 +162,6 @@ impl StorageBackend for SubvolumeBackend {
     }
 
     async fn exists(&self, name: &str) -> bool {
-        self.get_path(name).exists()
+        tokio::fs::try_exists(self.get_path(name)).await.unwrap_or(false)
     }
 }

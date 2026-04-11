@@ -45,20 +45,17 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
                 .await;
             if r.map(|o| o.status.success()).unwrap_or(false) {
                 let sudoers_dir = rootfs.join("etc/sudoers.d");
-                std::fs::create_dir_all(&sudoers_dir)
-                    .map_err(|e| NspawnError::Io(sudoers_dir.clone(), e))?;
                 let sudoers_file = sudoers_dir.join(group);
                 let content = format!("%{} ALL=(ALL:ALL) ALL\n", group);
-                std::fs::write(&sudoers_file, content)
-                    .map_err(|e| NspawnError::Io(sudoers_file.clone(), e))?;
+                crate::nspawn::utils::io::AsyncLockedWriter::write_atomic(&sudoers_file, &content).await?;
 
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    if let Ok(mut perms) = std::fs::metadata(&sudoers_file).map(|m| m.permissions())
-                    {
+                    if let Ok(meta) = tokio::fs::metadata(&sudoers_file).await {
+                        let mut perms = meta.permissions();
                         perms.set_mode(0o440);
-                        let _ = std::fs::set_permissions(&sudoers_file, perms);
+                        let _ = tokio::fs::set_permissions(&sudoers_file, perms).await;
                     }
                 }
                 break;
