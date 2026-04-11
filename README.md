@@ -12,14 +12,15 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
   - Pull and extract OCI (Docker/Podman) images via `skopeo` and `umoci`.
   - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
 - **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
-- **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images / block device (unfinished).
+- **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
 
 ## Prerequisites
 
 - `systemd-container` (provides `machinectl` and `systemd-nspawn`)
 - Root privileges (run via `sudo`)
 - *Optional*: `skopeo` and `umoci` (for OCI image support)
-- `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
+- *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
+- *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
 ## ⚠️ Before You Begin – Must Read
 
@@ -49,6 +50,10 @@ Start the UI:
 sudo lasper
 ```
 
+You can adds a container via the creation wizard. Tap `a` or `n` to open the wizard.
+
+It's recommended to use `machinectl` to connect to the container after creation and starting. For example: `sudo machinectl shell <user_name>@<container_name>`. Ensures that you installed systembus and an init program inside your container.
+
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
 - `Enter` / `x` : Open Action Power Menu (Start, Poweroff, Reboot, Terminate, Kill, Enable, Disable)
@@ -67,10 +72,8 @@ sudo lasper
 - [x] Component-based TUI architecture & Responsive layout.
 - [x] DBus integration via `zbus` (with automatic CLI fallback for legacy systems).
 - [x] Asynchronous background task scheduling for long-running deployments.
-- [x] Resource monitoring (CPU/Memory/I/O usage).
+- [x] Resource monitoring (CPU/Memory usage).
 - [ ] Interactive .nspawn configuration editor.
-- [ ] `.raw` file custom partition support.
-- [ ] Advanced networking config (`macvlan`, `ipvlan`, static IP customizing, etc.).
 - [ ] Global `config.toml` for overriding default settings.
 - [ ] Better OCI import support.
 - [ ] Customizable post-deployment hooks and scripts.
