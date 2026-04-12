@@ -34,11 +34,13 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     };
 
     // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp file
-    let cache_dir = "/var/cache/lasper";
-    let _ = tokio::fs::create_dir_all(cache_dir).await;
-    let tmp_path = format!("{}/cdi-{}.json", cache_dir, std::process::id());
+    let tmp_file = tempfile::NamedTempFile::new()
+        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary file for CDI discovery: {}", e)))?;
+    let tmp_path = tmp_file.path().to_path_buf();
+    let tmp_path_str = tmp_path.to_string_lossy();
+
     let out = new_command("nvidia-ctk")
-        .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path)])
+        .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path_str)])
         .logged_output("nvidia-ctk")
         .await
         .map_err(|e| {
@@ -46,50 +48,44 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
         })?;
 
     if !out.status.success() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(NspawnError::cmd_failed(
             "NVIDIA CDI Discovery",
             format!(
                 "nvidia-ctk cdi generate --format=json --output={}",
-                tmp_path
+                tmp_path_str
             ),
             &out,
         ));
     }
 
     // Check if the file was actually created and has content
-    let path = std::path::Path::new(&tmp_path);
-    if !path.exists() {
+    if !tmp_path.exists() {
         return Err(NspawnError::Runtime(format!(
             "nvidia-ctk reported success but no CDI file was created at {}",
-            tmp_path
+            tmp_path_str
         )));
     }
 
     let content = tokio::fs::read(&tmp_path)
         .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from(&tmp_path), e))?;
+        .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
 
     if content.is_empty() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
         log::warn!("nvidia-ctk generated an empty CDI file. Assuming no NVIDIA devices are present or driver is inactive.");
         return Ok(state);
     }
 
     let spec: CdiSpec = match serde_json::from_slice(&content) {
-        Ok(s) => {
-            let _ = tokio::fs::remove_file(&tmp_path).await;
-            s
-        }
+        Ok(s) => s,
         Err(e) => {
             log::error!(
                 "CDI Raw Output (saved at {}): {}",
-                tmp_path,
+                tmp_path_str,
                 String::from_utf8_lossy(&content)
             );
             return Err(NspawnError::Runtime(format!(
-                "Failed to parse CDI JSON (check {}): {}",
-                tmp_path, e
+                "Failed to parse CDI JSON: {}",
+                e
             )));
         }
     };

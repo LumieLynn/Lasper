@@ -109,6 +109,7 @@ async fn run_deploy_internal(
 
     // 2. Deployment & Configuration scoping
     let mut dissect_mount_dir: Option<std::path::PathBuf> = None;
+    let mut _dissect_guard: Option<tempfile::TempDir> = None;
 
     let result = async {
         // 2. Mount storage (returns rootfs path)
@@ -144,9 +145,15 @@ async fn run_deploy_internal(
             let raw_path = std::path::PathBuf::from(format!("/var/lib/machines/{}.raw", name));
             if let Ok(meta) = tokio::fs::metadata(&raw_path).await {
                 if meta.is_file() {
-                    let mount_point =
-                        std::path::PathBuf::from(format!("/var/cache/lasper/dissect-{}", name));
-                    let _ = tokio::fs::create_dir_all(&mount_point).await;
+                    let dissect_parent = "/var/cache/lasper/mounts";
+                    let _ = tokio::fs::create_dir_all(dissect_parent).await;
+
+                    let tmp_mnt = tempfile::Builder::new()
+                        .prefix(&format!("lasper-dissect-{}-", name))
+                        .tempdir_in(dissect_parent)
+                        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary mount point: {}", e)))?;
+                    
+                    let mount_point = tmp_mnt.path().to_path_buf();
                     push_log!("Mounting raw image for configuration...".to_string());
 
                     let out = crate::nspawn::utils::new_command("systemd-dissect")
@@ -162,6 +169,7 @@ async fn run_deploy_internal(
                         if cmd.status.success() {
                             actual_rootfs = mount_point.clone();
                             dissect_mount_dir = Some(mount_point);
+                            _dissect_guard = Some(tmp_mnt);
                         } else {
                             push_log!(
                                 "WARNING: Failed to mount raw image with systemd-dissect.".into()
@@ -282,7 +290,7 @@ async fn run_deploy_internal(
         let _ = crate::nspawn::utils::new_command("systemd-dissect")
             .args(["--umount", mnt.to_str().unwrap()])
             .logged_output("systemd-dissect").await;
-        let _ = tokio::fs::remove_dir_all(&mnt).await;
+        // _dissect_guard will automatically clean up the directory when it drops
     }
 
     // 2. Unmount Lasper storage

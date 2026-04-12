@@ -272,38 +272,28 @@ pub async fn import_oci_image(
     let normalized_ref = normalize_oci_image_ref(image_ref);
     let tmp_parent = "/var/cache/lasper/oci-staging";
     let _ = tokio::fs::create_dir_all(tmp_parent).await;
-    let _ = tokio::fs::set_permissions(tmp_parent, std::fs::Permissions::from_mode(0o700)).await;
 
-    let tmp_oci = format!("{}/oci-{}-{}", tmp_parent, local_name, std::process::id());
-    let bundle_dir = format!(
-        "{}/bundle-{}-{}",
-        tmp_parent,
-        local_name,
-        std::process::id()
-    );
+    // Create a secure, randomized temporary directory for this OCI operation on disk
+    let tmp_dir = tempfile::Builder::new()
+        .prefix(&format!("oci-deploy-{}-", local_name))
+        .tempdir_in(tmp_parent)
+        .map_err(|e| NspawnError::Runtime(format!("Failed to create OCI staging directory: {}", e)))?;
 
-    // Closure for cleanup
-    let cleanup = || {
-        let t = tmp_oci.clone();
-        let b = bundle_dir.clone();
-        async move {
-            let _ = tokio::fs::remove_dir_all(&t).await;
-            let _ = tokio::fs::remove_dir_all(&b).await;
-        }
-    };
+    let staging_root = tmp_dir.path();
+    let tmp_oci = staging_root.join("oci-repo");
+    let bundle_dir = staging_root.join("bundle");
 
-    log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci);
+    log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci.display());
     let skopeo = new_command("skopeo")
-        .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci)])
+        .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci.display())])
         .logged_output("skopeo")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
 
     if !skopeo.status.success() {
-        cleanup().await;
         return Err(NspawnError::cmd_failed(
             "skopeo copy",
-            format!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci),
+            format!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci.display()),
             &skopeo,
         ));
     }
@@ -315,14 +305,14 @@ pub async fn import_oci_image(
 
     log::info!(
         "umoci raw-unpack --image {}:latest {}",
-        tmp_oci,
+        tmp_oci.display(),
         dest.display()
     );
     let umoci_raw = new_command("umoci")
         .args([
             "raw-unpack",
             "--image",
-            &format!("{}:latest", tmp_oci),
+            &format!("{}:latest", tmp_oci.display()),
             &dest.to_string_lossy(),
         ])
         .logged_output("umoci")
@@ -330,7 +320,6 @@ pub async fn import_oci_image(
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
 
     if umoci_raw.status.success() {
-        cleanup().await;
         log::info!("OCI image imported to {} via raw-unpack", dest.display());
         return Ok(());
     }
@@ -344,26 +333,24 @@ pub async fn import_oci_image(
         .args([
             "unpack",
             "--image",
-            &format!("{}:latest", tmp_oci),
-            &bundle_dir,
+            &format!("{}:latest", tmp_oci.display()),
+            &bundle_dir.to_string_lossy(),
         ])
         .logged_output("umoci")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
 
     if !umoci.status.success() {
-        cleanup().await;
         return Err(NspawnError::cmd_failed(
             "umoci unpack",
-            format!("umoci unpack --image {}:latest {}", tmp_oci, bundle_dir),
+            format!("umoci unpack --image {}:latest {}", tmp_oci.display(), bundle_dir.display()),
             &umoci,
         ));
     }
 
     // Move rootfs content to dest
-    let rootfs_source = std::path::Path::new(&bundle_dir).join("rootfs");
+    let rootfs_source = bundle_dir.join("rootfs");
     if !tokio::fs::try_exists(&rootfs_source).await.unwrap_or(false) {
-        cleanup().await;
         return Err(NspawnError::DeployError(
             "umoci unpack did not create rootfs directory".into(),
         ));
@@ -387,7 +374,6 @@ pub async fn import_oci_image(
         .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
 
     if !copy_out.status.success() {
-        cleanup().await;
         return Err(NspawnError::cmd_failed(
             "cp rootfs content",
             format!("cp -a {}/. {}", rootfs_source.display(), dest.display()),
@@ -395,7 +381,6 @@ pub async fn import_oci_image(
         ));
     }
 
-    cleanup().await;
     log::info!("OCI image imported to {}", dest.display());
     Ok(())
 }
