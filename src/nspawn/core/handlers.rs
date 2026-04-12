@@ -27,7 +27,8 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 let success = ctx.deploy.success.clone();
 
                 // Run the real deployment
-                tokio::spawn(async move {
+                let tx_panic = tx.clone();
+                let deploy_handle = tokio::spawn(async move {
                     crate::nspawn::deploy::run_deploy_task(
                         deployer,
                         storage,
@@ -38,6 +39,18 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                         success,
                     )
                     .await;
+                });
+
+                // Monitor for panics
+                tokio::spawn(async move {
+                    if let Err(join_err) = deploy_handle.await {
+                        if join_err.is_panic() {
+                            let _ = tx_panic.send(AppEvent::ActionDone(
+                                "CRITICAL: Deployment pipeline panicked.".into(),
+                                crate::nspawn::StatusLevel::Error
+                            )).await;
+                        }
+                    }
                 });
 
                 let _ = tx

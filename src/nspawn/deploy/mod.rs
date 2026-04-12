@@ -11,6 +11,17 @@ use crate::nspawn::utils::CommandLogged;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// RAII guard to ensure the 'done' flag is always set, even on panic or early return.
+struct DoneGuard {
+    done: Arc<AtomicBool>,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::SeqCst);
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Deployer: Send + Sync {
     /// Performs the actual deployment (bootstrapping / cloning) of the container.
@@ -44,13 +55,26 @@ pub async fn run_deploy_task(
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
 ) {
-    if let Err(e) = run_deploy_internal(deployer, storage, name, cfg, logs.clone()).await {
-        let _ = logs.send(format!("FATAL ERROR: {}", e)).await;
+    // 1. Initialize the guard. When this is dropped (at end of function or on panic),
+    // it will unconditionally set done = true, unblocking the UI spinner.
+    let _guard = DoneGuard { done };
+
+    // 2. Perform deployment
+    if let Err(e) = run_deploy_internal(deployer, storage, name.clone(), cfg, logs.clone()).await {
+        // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
+        // if the log channel happens to be full.
+        let err_msg = format!("FATAL ERROR: {}", e);
+        match logs.try_send(err_msg.clone()) {
+            Ok(_) => {}
+            Err(_) => {
+                // If channel is full, we log to stdout as fallback
+                log::error!("[DEPLOY] [Container: {}] Channel full, cannot send log: {}", name, err_msg);
+            }
+        }
         success.store(false, Ordering::SeqCst);
     } else {
         success.store(true, Ordering::SeqCst);
     }
-    done.store(true, Ordering::SeqCst);
 }
 
 async fn run_deploy_internal(
