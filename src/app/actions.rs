@@ -1,5 +1,5 @@
 use super::{App, DetailPane};
-use crate::nspawn::{models::ContainerEntry, StatusLevel};
+use crate::nspawn::{models::ContainerEntry, models::ContainerState, StatusLevel};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -136,21 +136,37 @@ impl App {
         true
     }
 
-    pub fn action_start(&mut self) {
+    /// Generic helper for container actions to reduce boilerplate.
+    fn perform_container_action<F, Fut>(
+        &mut self,
+        action_label: &'static str,
+        transition: Option<ContainerState>,
+        validate: impl FnOnce(&ContainerEntry) -> bool,
+        action: F,
+    ) where
+        F: FnOnce(String, std::sync::Arc<dyn crate::nspawn::core::NspawnManager>) -> Fut
+            + Send
+            + 'static,
+        Fut: std::future::Future<Output = crate::nspawn::errors::Result<()>> + Send + 'static,
+    {
         if !self.check_action_cooldown() {
             return;
         }
+
         let (name, manager, tx) = {
             let e = match self.data.entries.get_mut(self.data.selected) {
                 Some(e) => e,
                 None => return,
             };
-            if e.state.is_running() {
+
+            if !validate(e) {
                 return;
             }
 
-            // State Latching: Optimistic UI update via transitions map
-            self.data.transitions.insert(e.name.clone(), (crate::nspawn::models::ContainerState::Starting, Instant::now()));
+            if let Some(state) = transition {
+                self.data.transitions
+                    .insert(e.name.clone(), (state, Instant::now()));
+            }
 
             let tx = match &self.ui.app_tx {
                 Some(tx) => tx.clone(),
@@ -160,302 +176,87 @@ impl App {
         };
 
         tokio::spawn(async move {
-            match manager.start(&name).await {
-                Ok(_) => {
-                    let suffix = if manager.did_fallback() {
-                        " (via CLI fallback)"
-                    } else {
-                        ""
-                    };
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Started {}{}", name, suffix),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
+            let res = action(name.clone(), manager.clone()).await;
+            let suffix = if manager.did_fallback() {
+                " (via CLI fallback)"
+            } else {
+                ""
+            };
+
+            let (msg, level) = match res {
+                Ok(_) => (
+                    format!("{} {}{}", action_label, name, suffix),
+                    StatusLevel::Success,
+                ),
+                Err(err) => (format!("Error: {err}"), StatusLevel::Error),
+            };
+
+            let _ = tx
+                .send(crate::events::AppEvent::ActionDone(msg, level))
+                .await;
         });
+    }
+
+    pub fn action_start(&mut self) {
+        self.perform_container_action(
+            "Started",
+            Some(ContainerState::Starting),
+            |e| !e.state.is_running(),
+            |name, manager| async move { manager.start(&name).await },
+        );
     }
 
     pub fn action_poweroff(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get_mut(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            if !e.state.is_running() {
-                return;
-            }
-
-            // State Latching: Optimistic UI update via transitions map
-            self.data.transitions.insert(e.name.clone(), (crate::nspawn::models::ContainerState::Exiting, Instant::now()));
-
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.poweroff(&name).await {
-                Ok(_) => {
-                    let suffix = if manager.did_fallback() {
-                        " (via CLI fallback)"
-                    } else {
-                        ""
-                    };
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Powered off {}{}", name, suffix),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Powered off",
+            Some(ContainerState::Exiting),
+            |e| e.state.is_running(),
+            |name, manager| async move { manager.poweroff(&name).await },
+        );
     }
 
     pub fn action_terminate(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get_mut(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            if !e.state.is_running() {
-                return;
-            }
-
-            // State Latching: Optimistic UI update via transitions map
-            self.data.transitions.insert(e.name.clone(), (crate::nspawn::models::ContainerState::Exiting, Instant::now()));
-
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.terminate(&name).await {
-                Ok(_) => {
-                    let suffix = if manager.did_fallback() {
-                        " (via CLI fallback)"
-                    } else {
-                        ""
-                    };
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Terminated {}{}", name, suffix),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Terminated",
+            Some(ContainerState::Exiting),
+            |e| e.state.is_running(),
+            |name, manager| async move { manager.terminate(&name).await },
+        );
     }
 
     pub fn action_reboot(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get_mut(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            if !e.state.is_running() {
-                return;
-            }
-
-            // State Latching: Optimistic UI update: it will stop first
-            self.data.transitions.insert(e.name.clone(), (crate::nspawn::models::ContainerState::Exiting, Instant::now()));
-
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.reboot(&name).await {
-                Ok(_) => {
-                    let suffix = if manager.did_fallback() {
-                        " (via CLI fallback)"
-                    } else {
-                        ""
-                    };
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Rebooting {}{}", name, suffix),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Rebooting",
+            Some(ContainerState::Exiting),
+            |e| e.state.is_running(),
+            |name, manager| async move { manager.reboot(&name).await },
+        );
     }
 
     pub fn action_kill(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            if !e.state.is_running() {
-                return;
-            }
-
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.kill(&name, "SIGTERM").await {
-                Ok(_) => {
-                    let suffix = if manager.did_fallback() {
-                        " (via CLI fallback)"
-                    } else {
-                        ""
-                    };
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Sent SIGTERM to {}{}", name, suffix),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Sent SIGTERM to",
+            None,
+            |e| e.state.is_running(),
+            |name, manager| async move { manager.kill(&name, "SIGTERM").await },
+        );
     }
 
     pub fn action_enable(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.enable(&name).await {
-                Ok(_) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Enabled {}", name),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Enabled",
+            None,
+            |_| true,
+            |name, manager| async move { manager.enable(&name).await },
+        );
     }
 
     pub fn action_disable(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
-        let (name, manager, tx) = {
-            let e = match self.data.entries.get(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (e.name.clone(), self.data.manager.clone(), tx)
-        };
-
-        tokio::spawn(async move {
-            match manager.disable(&name).await {
-                Ok(_) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Disabled {}", name),
-                            StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(err) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("Error: {err}"),
-                            StatusLevel::Error,
-                        ))
-                        .await;
-                }
-            }
-        });
+        self.perform_container_action(
+            "Disabled",
+            None,
+            |_| true,
+            |name, manager| async move { manager.disable(&name).await },
+        );
     }
 }
