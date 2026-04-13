@@ -5,7 +5,7 @@ pub mod handlers;
 
 use anyhow::Result;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Stdout;
 use std::time::Instant;
 
@@ -113,7 +113,8 @@ pub struct AppData {
     pub entries: Vec<ContainerEntry>,
     pub selected: usize,
     pub properties: Result<HashMap<String, String>, String>,
-    pub log_lines: Vec<String>,
+    pub log_lines: VecDeque<String>,
+    pub log_stream: Option<(String, tokio::task::JoinHandle<()>)>,
     pub config_content: Option<String>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
@@ -142,7 +143,8 @@ impl App {
                 entries: Vec::new(),
                 selected: 0,
                 properties: Ok(HashMap::new()),
-                log_lines: Vec::new(),
+                log_lines: VecDeque::with_capacity(5000),
+                log_stream: None,
                 config_content: None,
                 dbus_active: true,
                 manager: std::sync::Arc::new(DefaultManager::new(is_root)),
@@ -249,6 +251,28 @@ impl App {
         }
     }
 
+    /// Processes a single application event.
+    async fn handle_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Key(key) => self.handle_key(key).await,
+            AppEvent::Tick => self.tick().await,
+            AppEvent::BackendResult(res) => self.handle_backend_result(res),
+            AppEvent::ActionDone(msg, level) => {
+                self.set_status(msg, level);
+                self.refresh().await;
+            }
+            AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
+                self.update_metrics(name, time_x, cpu, ram)
+            }
+            AppEvent::LogLine(line) => {
+                self.data.log_lines.push_back(line);
+                if self.data.log_lines.len() > 5000 {
+                    self.data.log_lines.pop_front();
+                }
+            }
+        }
+    }
+
     /// Starts the main application loop.
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         let mut events = EventHandler::new(100);
@@ -293,15 +317,10 @@ impl App {
 
             tokio::select! {
                 Some(event) = events.rx.recv() => {
-                    match event {
-                        AppEvent::Key(key) => self.handle_key(key).await,
-                        AppEvent::Tick => self.tick().await,
-                        AppEvent::BackendResult(res) => self.handle_backend_result(res),
-                        AppEvent::ActionDone(msg, level) => {
-                            self.set_status(msg, level);
-                            self.refresh().await;
-                        }
-                        AppEvent::MetricsUpdate(name, time_x, cpu, ram) => self.update_metrics(name, time_x, cpu, ram),
+                    self.handle_event(event).await;
+                    // Drain all pending events to batch UI updates
+                    while let Ok(event) = events.rx.try_recv() {
+                        self.handle_event(event).await;
                     }
                 }
                 Some(cmd) = backend_rx.recv() => {

@@ -1,7 +1,9 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
-use std::collections::HashMap;
 use crate::nspawn::utils::{new_command, CommandLogged};
+use std::collections::HashMap;
+use std::process::Stdio;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[derive(Clone)]
 pub struct CliProvider {
@@ -229,6 +231,48 @@ impl CliProvider {
             .collect())
     }
 
+    pub fn spawn_log_stream(
+        &self,
+        name: &str,
+        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let res: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+                let mut child = tokio::process::Command::new("journalctl")
+                    .args(["-M", &name, "-n", "1000", "-f", "--no-pager", "--output=short"])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+
+                let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+
+                loop {
+                    tokio::select! {
+                        line_res = lines.next_line() => {
+                            if let Ok(Some(line)) = line_res {
+                                tx.send(crate::events::AppEvent::LogLine(line)).await.map_err(|_| "Channel closed")?;
+                            } else {
+                                break;
+                            }
+                        }
+                        _ = child.wait() => break,
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = res {
+                tx.send(crate::events::AppEvent::LogLine(format!(
+                    "Log stream stopped: {e}"
+                )))
+                .await
+                .ok();
+            }
+        })
+    }
+
     pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let mut map = HashMap::new();
 
@@ -270,7 +314,8 @@ impl CliProvider {
             return Err(NspawnError::CommandFailed(
                 format!("machinectl/systemctl show {}", name),
                 "No properties found".to_string(),
-                "The target machine might not exist or systemd-nspawn is not managing it.".to_string(),
+                "The target machine might not exist or systemd-nspawn is not managing it."
+                    .to_string(),
             ));
         }
 

@@ -12,6 +12,11 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn start(&self, name: &str) -> Result<()>;
     async fn terminate(&self, name: &str) -> Result<()>;
     async fn get_logs(&self, name: &str, lines: usize) -> Result<Vec<String>>;
+    fn spawn_log_stream(
+        &self,
+        name: &str,
+        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    ) -> tokio::task::JoinHandle<()>;
     async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
@@ -202,6 +207,14 @@ impl NspawnManager for DefaultManager {
             log::error!("CLI get_logs failed for {}: {}", name, e);
             e
         })
+    }
+
+    fn spawn_log_stream(
+        &self,
+        name: &str,
+        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    ) -> tokio::task::JoinHandle<()> {
+        self.cli.spawn_log_stream(name, tx)
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {

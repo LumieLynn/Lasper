@@ -42,9 +42,20 @@ impl App {
                 self.data.properties = Ok(HashMap::new());
                 self.data.log_lines.clear();
                 self.data.config_content = Option::None;
+                if let Some((_, handle)) = self.data.log_stream.take() {
+                    handle.abort();
+                }
                 return;
             }
         };
+
+        // Stop log stream if we are not in the Logs pane
+        if self.ui.detail_panel.active_pane != DetailPane::Logs {
+            if let Some((_, handle)) = self.data.log_stream.take() {
+                handle.abort();
+            }
+        }
+
         match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
                 match self.data.manager.get_properties(&entry.name).await {
@@ -83,12 +94,28 @@ impl App {
             }
             DetailPane::Logs => {
                 if entry.state.is_running() {
-                    match self.data.manager.get_logs(&entry.name, 100).await {
-                        Ok(l) => self.data.log_lines = l,
-                        Err(e) => self.data.log_lines = vec![format!("Error: {e}")],
+                    let needs_new_stream = match &self.data.log_stream {
+                        Some((name, _)) if name == &entry.name => false,
+                        _ => true,
+                    };
+
+                    if needs_new_stream {
+                        // Stop old stream
+                        if let Some((_, handle)) = self.data.log_stream.take() {
+                            handle.abort();
+                        }
+                        self.data.log_lines.clear();
+                        if let Some(tx) = &self.ui.app_tx {
+                            let handle = self.data.manager.spawn_log_stream(&entry.name, tx.clone());
+                            self.data.log_stream = Some((entry.name.clone(), handle));
+                        }
                     }
                 } else {
-                    self.data.log_lines = vec!["Container is not running.".into()];
+                    if let Some((_, handle)) = self.data.log_stream.take() {
+                        handle.abort();
+                    }
+                    self.data.log_lines.clear();
+                    self.data.log_lines.push_back("Container is not running.".into());
                 }
             }
             DetailPane::Config => {

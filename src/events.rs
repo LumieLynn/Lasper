@@ -14,6 +14,8 @@ pub enum AppEvent {
     ActionDone(String, crate::nspawn::StatusLevel),
     /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
     MetricsUpdate(String, f64, f64, f64),
+    /// Real-time log line from a container.
+    LogLine(String),
 }
 
 /// Merges keyboard input and periodic ticks into one channel.
