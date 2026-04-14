@@ -33,14 +33,14 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
         ..Default::default()
     };
 
-    // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp file
-    let tmp_file = tempfile::NamedTempFile::new()
-        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary file for CDI discovery: {}", e)))?;
-    let tmp_path = tmp_file.path().to_path_buf();
+    // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp dir
+    let tmp_dir = tempfile::tempdir()
+        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary directory for CDI discovery: {}", e)))?;
+    let tmp_path = tmp_dir.path().join("nvidia-cdi.json");
     let tmp_path_str = tmp_path.to_string_lossy();
 
     let out = new_command("nvidia-ctk")
-        .args(["cdi", "generate", "--format=json", &format!("--output={}", tmp_path_str)])
+        .args(["cdi", "generate", "--format=json", "--output", &tmp_path_str])
         .logged_output("nvidia-ctk")
         .await
         .map_err(|e| {
@@ -59,7 +59,7 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     }
 
     // Check if the file was actually created and has content
-    if !tmp_path.exists() {
+    if !tokio::fs::try_exists(&tmp_path).await.unwrap_or(false) {
         return Err(NspawnError::Runtime(format!(
             "nvidia-ctk reported success but no CDI file was created at {}",
             tmp_path_str
