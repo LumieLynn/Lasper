@@ -23,18 +23,36 @@ const IMPORTANT_KEYS: &[&str] = &[
     "Usage",
 ];
 
-fn property_style(key: &str, value: &str) -> Style {
+pub fn property_style(key: &str, value: &str) -> Style {
+    // 1) Global Semantic Matching (matches our unified formatting)
+    if value == "yes" && key != "ReadOnly" {
+        return Style::default().fg(Color::Green);
+    }
+    if value == "no" {
+        return Style::default().fg(Color::DarkGray);
+    }
+
     match key {
         "Enabled" => match value {
-            "enabled" | "enabled-runtime" => Style::default().fg(Color::Green),
-            "disabled" => Style::default().fg(Color::Red),
+            "enabled" | "enabled-runtime" | "yes" => Style::default().fg(Color::Green),
+            "disabled" | "no" => Style::default().fg(Color::Red),
             _ => Style::default().fg(Color::Yellow),
         },
         "State" => match value {
-            "running" => Style::default().fg(Color::Green),
-            "poweroff" => Style::default().fg(Color::DarkGray),
+            "running" | "yes" => Style::default().fg(Color::Green),
+            "starting" | "exiting" => Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+            "poweroff" | "no" => Style::default().fg(Color::DarkGray),
             _ => Style::default().fg(Color::Yellow),
         },
+        "ReadOnly" => {
+            if value == "yes" {
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            }
+        }
+        "MainPID" | "Leader" => Style::default().fg(Color::Magenta),
+        "MemoryCurrent" | "Usage" => Style::default().fg(Color::Blue),
         _ => Style::default().fg(Color::White),
     }
 }
@@ -67,10 +85,18 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         }
     };
 
-    let mut pairs: Vec<(&String, &String)> = props
-        .iter()
-        .filter(|(k, _)| IMPORTANT_KEYS.contains(&k.as_str()))
-        .collect();
+    let mut pairs = Vec::new();
+    for group in &props.groups {
+        for (k, v) in &group.properties {
+            if IMPORTANT_KEYS.contains(&k.as_str()) {
+                pairs.push((k, v));
+            }
+        }
+    }
+
+    // Deduplicate keys (keeping whichever one appeared first)
+    let mut seen = std::collections::HashSet::new();
+    pairs.retain(|(k, _)| seen.insert(k.as_str()));
 
     pairs.sort_by_key(|(k, _)| {
         IMPORTANT_KEYS

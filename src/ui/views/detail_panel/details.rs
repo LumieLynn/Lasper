@@ -7,6 +7,7 @@ use ratatui::{
 };
 
 use super::empty_block;
+use super::properties::property_style;
 use crate::app::AppData;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, state: &mut ratatui::widgets::TableState) {
@@ -33,9 +34,6 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, state: &mut ratatui::wi
         }
     };
 
-    let mut pairs: Vec<(&String, &String)> = props.iter().collect();
-    pairs.sort_by_key(|(k, _)| k.as_str());
-
     let val_width = if area.width > 6 {
         (area.width as f32 * 0.65) as usize
     } else {
@@ -43,9 +41,32 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, state: &mut ratatui::wi
     };
     let val_width = val_width.saturating_sub(3).max(10); // buffer for table spacing
 
-    let rows: Vec<Row> = pairs
-        .iter()
-        .map(|(k, v)| {
+    let mut rows = Vec::new();
+
+    // Sort groups for consistent display order
+    let mut sorted_groups = props.groups.clone();
+    sorted_groups.sort_by_key(|g| g.display_priority());
+
+    for group in &sorted_groups {
+        if group.properties.is_empty() {
+            continue;
+        }
+
+        // Add Header Row
+        rows.push(
+            Row::new(vec![
+                Cell::from(format!("[ {} ]", group.name.to_uppercase()))
+                    .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Cell::from(""),
+            ])
+            .height(1),
+        );
+
+        let mut pairs: Vec<(&String, &String)> = group.properties.iter().collect();
+        pairs.sort_by_key(|(k, _)| k.as_str());
+
+        for (k, v) in pairs {
+            let val_style = property_style(k, v);
             let mut wrapped_lines = Vec::new();
             for line in v.split('\n') {
                 if line.is_empty() {
@@ -72,13 +93,18 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, state: &mut ratatui::wi
             }
             let height = wrapped_lines.len() as u16;
 
-            Row::new(vec![
-                Cell::from(k.as_str()).style(Style::default().fg(Color::Cyan)),
-                Cell::from(wrapped_lines),
-            ])
-            .height(height)
-        })
-        .collect();
+            rows.push(
+                Row::new(vec![
+                    Cell::from(k.as_str()).style(Style::default().fg(Color::Cyan)),
+                    Cell::from(wrapped_lines).style(val_style),
+                ])
+                .height(height),
+            );
+        }
+
+        // Add Spacer
+        rows.push(Row::new(vec![Cell::from(""), Cell::from("")]).height(1));
+    }
 
     let widths = [Constraint::Percentage(35), Constraint::Percentage(65)];
     let table = Table::new(rows, widths)

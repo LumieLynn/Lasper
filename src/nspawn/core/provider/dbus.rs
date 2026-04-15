@@ -84,7 +84,7 @@ impl DbusProvider {
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
             let formatted: Vec<String> = addrs
                 .into_iter()
-                .map(|(family, data)| format_address(family, &data))
+                .map(|(family, data)| crate::nspawn::utils::format_ip_address(family, &data))
                 .collect();
             running_names.insert(name, formatted);
         }
@@ -108,7 +108,7 @@ impl DbusProvider {
                 usage: if usage == u64::MAX {
                     None
                 } else {
-                    Some(format_size(usage))
+                    Some(crate::nspawn::utils::format_size(usage))
                 },
                 address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
                 all_addresses: addrs,
@@ -132,11 +132,7 @@ impl DbusProvider {
             }
         }
 
-        entries.sort_by(|a, b| {
-            let a_run = a.state.is_running();
-            let b_run = b.state.is_running();
-            b_run.cmp(&a_run).then(a.name.cmp(&b.name))
-        });
+        entries.sort();
 
         Ok(entries)
     }
@@ -214,29 +210,46 @@ impl DbusProvider {
             .connection()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let mut map = HashMap::new();
+
+        let mut props = MachineProperties::default();
 
         // 1) Try machine1 properties (only works for running/registered machines)
         if let Ok(m1_props) = get_machine1_properties(&conn, name).await {
-            map.extend(m1_props);
+            let group = props.get_group_mut("Machine");
+            for (k, v) in m1_props {
+                group.insert(k, v);
+            }
         }
 
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
         if let Ok(sd_props) = get_systemd1_properties(&conn, name).await {
             for (k, v) in sd_props {
-                map.entry(k).or_insert(v);
+                if matches!(
+                    k.as_str(),
+                    "After"
+                        | "Before"
+                        | "Wants"
+                        | "WantedBy"
+                        | "Requires"
+                        | "RequiredBy"
+                        | "Conflicts"
+                        | "ConflictedBy"
+                ) {
+                    if !v.is_empty() && v != "[]" {
+                        props.insert("Dependencies", k, v);
+                    }
+                } else {
+                    props.insert("Systemd Unit", k, v);
+                }
             }
         }
 
-        if map.is_empty() {
+        if props.groups.is_empty() {
             Err(NspawnError::Dbus(zbus::Error::Failure(
                 "No properties found".into(),
             )))
         } else {
-            Ok(MachineProperties {
-                properties: map,
-                ..Default::default()
-            })
+            Ok(props)
         }
     }
 
@@ -302,7 +315,8 @@ async fn get_machine1_properties(
     let all_props = props_proxy.get_all(Some(interface).into()).await?;
     let mut map = HashMap::new();
     for (k, v) in all_props {
-        map.insert(k, value_to_string(v.into()));
+        let val = crate::nspawn::utils::format_property(&k, &v.into());
+        map.insert(k, val);
     }
     Ok(map)
 }
@@ -332,71 +346,8 @@ async fn get_systemd1_properties(
     let all_props = props_proxy.get_all(Some(interface).into()).await?;
     let mut map = HashMap::new();
     for (k, v) in all_props {
-        map.insert(k, value_to_string(v.into()));
+        let val = crate::nspawn::utils::format_property(&k, &v.into());
+        map.insert(k, val);
     }
     Ok(map)
-}
-
-fn format_address(family: i32, data: &[u8]) -> String {
-    match family {
-        libc::AF_INET => {
-            if data.len() == 4 {
-                format!("{}.{}.{}.{}", data[0], data[1], data[2], data[3])
-            } else {
-                String::new()
-            }
-        }
-        libc::AF_INET6 => {
-            if data.len() == 16 {
-                let mut s = String::new();
-                for i in 0..8 {
-                    if i > 0 {
-                        s.push(':');
-                    }
-                    s.push_str(&format!(
-                        "{:x}",
-                        u16::from_be_bytes([data[i * 2], data[i * 2 + 1]])
-                    ));
-                }
-                s
-            } else {
-                String::new()
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-fn format_size(bytes: u64) -> String {
-    const KI_B: u64 = 1024;
-    const MI_B: u64 = KI_B * 1024;
-    const GI_B: u64 = MI_B * 1024;
-    const TI_B: u64 = GI_B * 1024;
-
-    if bytes >= TI_B {
-        format!("{:.1}T", bytes as f64 / TI_B as f64)
-    } else if bytes >= GI_B {
-        format!("{:.1}G", bytes as f64 / GI_B as f64)
-    } else if bytes >= MI_B {
-        format!("{:.1}M", bytes as f64 / MI_B as f64)
-    } else if bytes >= KI_B {
-        format!("{:.1}K", bytes as f64 / KI_B as f64)
-    } else {
-        format!("{}B", bytes)
-    }
-}
-
-fn value_to_string(v: zbus::zvariant::Value<'_>) -> String {
-    use zbus::zvariant::Value;
-    match v {
-        Value::Str(s) => s.as_str().to_string(),
-        Value::U32(n) => n.to_string(),
-        Value::U64(n) => n.to_string(),
-        Value::I32(n) => n.to_string(),
-        Value::I64(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::ObjectPath(p) => p.as_str().to_string(),
-        Value::Signature(s) => s.as_str().to_string(),
-        _ => format!("{:?}", v),
-    }
 }

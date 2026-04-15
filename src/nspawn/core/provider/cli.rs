@@ -166,11 +166,7 @@ impl CliProvider {
             }
         }
 
-        entries.sort_by(|a, b| {
-            let a_run = a.state.is_running();
-            let b_run = b.state.is_running();
-            b_run.cmp(&a_run).then(a.name.cmp(&b.name))
-        });
+        entries.sort();
 
         Ok(entries)
     }
@@ -274,7 +270,7 @@ impl CliProvider {
     }
 
     pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        let mut map = HashMap::new();
+        let mut props = MachineProperties::default();
 
         let machine_out = new_command("machinectl")
             .args(["show", name])
@@ -285,8 +281,13 @@ impl CliProvider {
             if out.status.success() {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     if let Some((k, v)) = line.split_once('=') {
-                        map.entry(k.trim().to_string())
-                            .or_insert_with(|| v.trim().to_string());
+                        let key = k.trim();
+                        let val = v.trim();
+                        let formatted = crate::nspawn::utils::format_property(
+                            key,
+                            &zbus::zvariant::Value::Str(val.into()),
+                        );
+                        props.insert("Machine", key.to_string(), formatted);
                     }
                 }
             }
@@ -302,15 +303,34 @@ impl CliProvider {
                 for line in String::from_utf8_lossy(&out.stdout).lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         let key = k.trim();
-                        if key == "UnitFileState" || !map.contains_key(key) {
-                            map.insert(key.to_string(), v.trim().to_string());
+                        let val = v.trim();
+                        let formatted = crate::nspawn::utils::format_property(
+                            key,
+                            &zbus::zvariant::Value::Str(val.into()),
+                        );
+                        if matches!(
+                            key,
+                            "After"
+                                | "Before"
+                                | "Wants"
+                                | "WantedBy"
+                                | "Requires"
+                                | "RequiredBy"
+                                | "Conflicts"
+                                | "ConflictedBy"
+                        ) {
+                            if !formatted.is_empty() && formatted != "[]" {
+                                props.insert("Dependencies", key.to_string(), formatted);
+                            }
+                        } else {
+                            props.insert("Systemd Unit", key.to_string(), formatted);
                         }
                     }
                 }
             }
         }
 
-        if map.is_empty() {
+        if props.groups.is_empty() {
             return Err(NspawnError::CommandFailed(
                 format!("machinectl/systemctl show {}", name),
                 "No properties found".to_string(),
@@ -319,9 +339,6 @@ impl CliProvider {
             ));
         }
 
-        Ok(MachineProperties {
-            properties: map,
-            ..Default::default()
-        })
+        Ok(props)
     }
 }

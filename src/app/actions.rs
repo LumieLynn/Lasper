@@ -39,7 +39,7 @@ impl App {
         let entry: ContainerEntry = match self.data.entries.get(self.data.selected) {
             Some(e) => e.clone(),
             Option::None => {
-                self.data.properties = Ok(HashMap::new());
+                self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
                 self.data.log_lines.clear();
                 self.data.config_content = Option::None;
                 if let Some((_, handle)) = self.data.log_stream.take() {
@@ -59,29 +59,29 @@ impl App {
         match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
                 match self.data.manager.get_properties(&entry.name).await {
-                    Ok(machine_props) => {
-                        let mut p = machine_props.properties;
+                    Ok(mut p) => {
                         if !entry.all_addresses.is_empty() {
-                            p.insert("IPAddresses".into(), entry.all_addresses.join(", "));
+                            p.insert("Machine", "IPAddresses".into(), entry.all_addresses.join(", "));
                         }
-                        if let Some(ufs) = p.get("UnitFileState") {
-                            p.insert("Enabled".into(), ufs.clone());
+                        if let Some(ufs) = p.get_group_mut("Systemd Unit").get("UnitFileState") {
+                            let ufs = ufs.clone();
+                            p.insert("Systemd Unit", "Enabled".into(), ufs);
                         }
                         // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
                         if let Some(image_type) = &entry.image_type {
-                            if let Some(machine_type) = p.remove("Type") {
-                                p.insert("Class".into(), machine_type);
+                            if let Some(machine_type) = p.get_group_mut("Machine").remove("Type") {
+                                p.insert("Machine", "Class".into(), machine_type);
                             }
-                            p.insert("Type".into(), image_type.clone());
+                            p.insert("Machine", "Type".into(), image_type.clone());
                         }
 
                         // For stopped containers, manually ensure expected static fields
                         if !entry.state.is_running() {
-                            p.insert("ReadOnly".into(), entry.readonly.to_string());
+                            p.insert("Machine", "ReadOnly".into(), entry.readonly.to_string());
                             if let Some(u) = &entry.usage {
-                                p.insert("Usage".into(), u.clone());
+                                p.insert("Machine", "Usage".into(), u.clone());
                             }
-                            p.insert("State".into(), entry.state.label().into());
+                            p.insert("Machine", "State".into(), entry.state.label().into());
                         }
 
                         self.data.properties = Ok(p);

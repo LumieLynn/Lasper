@@ -52,7 +52,7 @@ impl DetailPanel {
 
     fn sync_data_lengths(&mut self, data: &AppData, width: usize) {
         let old_logs_len = self.logs_len;
-        self.details_len = data.properties.as_ref().map(|p| p.len()).unwrap_or(0);
+        self.details_len = data.properties.as_ref().map(|p| p.total_rows()).unwrap_or(0);
 
         self.logs_len = data
             .log_lines

@@ -112,7 +112,7 @@ impl AppUi {
 pub struct AppData {
     pub entries: Vec<ContainerEntry>,
     pub selected: usize,
-    pub properties: Result<HashMap<String, String>, String>,
+    pub properties: Result<crate::nspawn::models::MachineProperties, String>,
     pub log_lines: VecDeque<String>,
     pub log_stream: Option<(String, tokio::task::JoinHandle<()>)>,
     pub config_content: Option<String>,
@@ -142,7 +142,7 @@ impl App {
             data: AppData {
                 entries: Vec::new(),
                 selected: 0,
-                properties: Ok(HashMap::new()),
+                properties: Ok(crate::nspawn::models::MachineProperties::default()),
                 log_lines: VecDeque::with_capacity(5000),
                 log_stream: None,
                 config_content: None,

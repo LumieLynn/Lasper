@@ -1,8 +1,10 @@
 use crate::nspawn::{ContainerEntry, ContainerState};
+use crate::ui::views::detail_panel::properties::property_style;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState},
     Frame,
 };
@@ -54,14 +56,29 @@ impl SharedContainerList {
         let items: Vec<ListItem> = entries
             .iter()
             .map(|e| {
-                let (icon, color) = match &e.state {
-                    ContainerState::Running => ("● ", Color::Green),
-                    ContainerState::Starting => ("◑ ", Color::Yellow),
-                    ContainerState::Exiting => ("◐ ", Color::Yellow),
-                    ContainerState::Off => ("○ ", Color::DarkGray),
+                let state_label = e.state.label();
+                let style = property_style("State", state_label);
+                let icon = match &e.state {
+                    ContainerState::Running => "● ",
+                    ContainerState::Starting => "◑ ",
+                    ContainerState::Exiting => "◐ ",
+                    ContainerState::Off => "○ ",
                 };
-                ListItem::new(format!("{} {} ({})", icon, e.name, e.state.label()))
-                    .style(Style::default().fg(color))
+
+                let mut spans = vec![
+                    Span::styled(icon.to_string(), style),
+                    Span::styled(e.name.clone(), style),
+                    Span::styled(format!(" ({})", state_label), style),
+                ];
+
+                if let Some(addr) = &e.address {
+                    spans.push(Span::styled(
+                        format!(" - {}", addr),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    ));
+                }
+
+                ListItem::new(Line::from(spans))
             })
             .collect();
 
