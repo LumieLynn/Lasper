@@ -1,5 +1,5 @@
 use crate::nspawn::{ContainerEntry, ContainerState};
-use crate::ui::views::detail_panel::properties::property_style;
+use crate::ui::views::detail_panel::property_style;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,

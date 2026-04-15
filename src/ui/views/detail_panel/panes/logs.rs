@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::AppData;
-use super::empty_block;
+use super::super::core::utils::empty_block;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {

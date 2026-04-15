@@ -1,8 +1,8 @@
-pub mod configs;
-pub mod details;
-pub mod logs;
-pub mod metrics;
-pub mod properties;
+pub mod core;
+pub mod panes;
+
+pub use core::style::property_style;
+pub use core::utils::{detail_block, empty_block};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -10,37 +10,41 @@ use ratatui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation,
-        ScrollbarState,
+        Block, BorderType, Borders, Clear,
     },
     Frame,
 };
 
 use crate::app::{AppData, DetailPane};
 use crate::ui::core::{AppMessage, ContainerMessage, EventResult};
+use crate::{handle_nav};
 
 pub struct DetailPanel {
     pub active_pane: DetailPane,
-    pub details_state: ratatui::widgets::TableState,
+    pub details_scroll: u16,
+    pub properties_scroll: u16,
     pub log_scroll: u16,
     pub config_scroll: u16,
     pub pane_height: u16,
     pub focused: bool,
-    details_len: usize,
-    logs_len: usize,
-    config_len: usize,
+    pub(crate) details_len: usize,
+    pub(crate) properties_len: usize,
+    pub(crate) logs_len: usize,
+    pub(crate) config_len: usize,
 }
 
 impl DetailPanel {
     pub fn new() -> Self {
         Self {
             active_pane: DetailPane::Properties,
-            details_state: ratatui::widgets::TableState::default(),
+            details_scroll: 0,
+            properties_scroll: 0,
             log_scroll: 0,
             config_scroll: 0,
             pane_height: 10,
             focused: false,
             details_len: 0,
+            properties_len: 0,
             logs_len: 0,
             config_len: 0,
         }
@@ -48,58 +52,6 @@ impl DetailPanel {
 
     pub fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
-    }
-
-    fn sync_data_lengths(&mut self, data: &AppData, width: usize) {
-        let old_logs_len = self.logs_len;
-        self.details_len = data.properties.as_ref().map(|p| p.total_rows()).unwrap_or(0);
-
-        self.logs_len = data
-            .log_lines
-            .iter()
-            .map(|l| {
-                let count = l.chars().count();
-                if count == 0 {
-                    1
-                } else {
-                    (count + width - 1) / width
-                }
-            })
-            .sum();
-
-        self.config_len = data
-            .config_content
-            .as_ref()
-            .map(|c| {
-                c.lines()
-                    .map(|l| {
-                        let count = l.chars().count();
-                        if count == 0 {
-                            1
-                        } else {
-                            (count + width - 1) / width
-                        }
-                    })
-                    .sum()
-            })
-            .unwrap_or(0);
-
-        // Sticky autoscroll for Logs
-        if self.active_pane == DetailPane::Logs && self.logs_len > old_logs_len {
-            let max_scroll_old = old_logs_len.saturating_sub(self.pane_height as usize) as u16;
-            if self.log_scroll >= max_scroll_old {
-                let max_scroll_new = self.logs_len.saturating_sub(self.pane_height as usize);
-                self.log_scroll = max_scroll_new.min(u16::MAX as usize) as u16;
-            }
-        }
-
-        // Always clamp scroll to the current max so a width change never
-        // leaves us past the real bottom of the content.
-        let log_max = self.logs_len.saturating_sub(self.pane_height as usize);
-        self.log_scroll = self.log_scroll.min(log_max.min(u16::MAX as usize) as u16);
-
-        let cfg_max = self.config_len.saturating_sub(self.pane_height as usize);
-        self.config_scroll = self.config_scroll.min(cfg_max.min(u16::MAX as usize) as u16);
     }
 
     pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &AppData) {
@@ -122,56 +74,26 @@ impl DetailPanel {
         let inner_area = block.inner(area);
         self.pane_height = inner_area.height;
         let pane_width = inner_area.width as usize;
-        self.sync_data_lengths(data, pane_width.max(1));
+        
+        // Use extracted scroll logic
+        core::scrolling::sync_data_lengths(self, data, pane_width.max(1));
 
         f.render_widget(Clear, area);
         f.render_widget(block, area);
 
         // Render content area directly in inner_area
         match self.active_pane {
-            DetailPane::Properties => properties::render(f, data, inner_area),
-            DetailPane::Details => details::render(f, data, inner_area, &mut self.details_state),
-            DetailPane::Logs => logs::render(f, data, inner_area, self.log_scroll),
-            DetailPane::Config => configs::render(f, data, inner_area, self.config_scroll),
-            DetailPane::Metrics => metrics::render(f, data, inner_area),
+            DetailPane::Properties => {
+                panes::properties::render(f, data, inner_area, self.properties_scroll)
+            }
+            DetailPane::Details => panes::details::render(f, data, inner_area, self.details_scroll),
+            DetailPane::Logs => panes::logs::render(f, data, inner_area, self.log_scroll),
+            DetailPane::Config => panes::configs::render(f, data, inner_area, self.config_scroll),
+            DetailPane::Metrics => panes::metrics::render(f, data, inner_area),
         }
 
-        // Render scrollbar
-        self.render_scrollbar(f, area);
-    }
-
-    fn render_scrollbar(&mut self, f: &mut Frame, area: Rect) {
-        let (max_scroll, position) = match self.active_pane {
-            DetailPane::Logs if self.logs_len > self.pane_height as usize => (
-                self.logs_len.saturating_sub(self.pane_height as usize),
-                self.log_scroll as usize,
-            ),
-            DetailPane::Config if self.config_len > self.pane_height as usize => (
-                self.config_len.saturating_sub(self.pane_height as usize),
-                self.config_scroll as usize,
-            ),
-            DetailPane::Details if self.details_len > 1 => (
-                self.details_len.saturating_sub(1),
-                self.details_state.selected().unwrap_or(0),
-            ),
-            _ => return,
-        };
-
-        let mut state = ScrollbarState::new(max_scroll).position(position);
-
-        let scrollbar = Scrollbar::default()
-            .orientation(ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("↑"))
-            .end_symbol(Some("↓"));
-
-        let scrollbar_area = Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
-            height: area.height.saturating_sub(2),
-        };
-
-        f.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+        // Render scrollbar via extracted logic
+        core::scrolling::render_scrollbar(self, f, area);
     }
 
     fn get_tabs_line(&self, data: &AppData) -> Line<'static> {
@@ -239,13 +161,14 @@ impl DetailPanel {
             // ─── Pane switching ────────────────────────────────────────────
             KeyCode::Char('p') => {
                 self.active_pane = DetailPane::Properties;
+                self.properties_scroll = 0;
                 return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
                     DetailPane::Properties,
                 )));
             }
             KeyCode::Char('d') => {
                 self.active_pane = DetailPane::Details;
-                self.details_state.select(Some(0));
+                self.details_scroll = 0;
                 return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
                     DetailPane::Details,
                 )));
@@ -272,109 +195,22 @@ impl DetailPanel {
                 )));
             }
 
-            // ─── Logs scrolling ────────────────────────────────────────────
-            KeyCode::Up if self.active_pane == DetailPane::Logs => {
-                self.log_scroll = self.log_scroll.saturating_sub(1);
-                return EventResult::Consumed;
+            // ─── Detail scrolling ──────────────────────────────────────────
+            _ if self.active_pane == DetailPane::Logs => {
+                handle_nav!(self, log_scroll, self.logs_len, step, self.pane_height, key);
             }
-            KeyCode::Down if self.active_pane == DetailPane::Logs => {
-                let max = self.logs_len.saturating_sub(self.pane_height as usize);
-                let safe_max = max.min(u16::MAX as usize) as u16;
-                self.log_scroll = (self.log_scroll + 1).min(safe_max);
-                return EventResult::Consumed;
+            _ if self.active_pane == DetailPane::Config => {
+                handle_nav!(self, config_scroll, self.config_len, step, self.pane_height, key);
             }
-            KeyCode::PageUp if self.active_pane == DetailPane::Logs => {
-                self.log_scroll = self.log_scroll.saturating_sub(step);
-                return EventResult::Consumed;
+            _ if self.active_pane == DetailPane::Details => {
+                handle_nav!(self, details_scroll, self.details_len, step, self.pane_height, key);
             }
-            KeyCode::PageDown if self.active_pane == DetailPane::Logs => {
-                let max = self.logs_len.saturating_sub(self.pane_height as usize);
-                let safe_max = max.min(u16::MAX as usize) as u16;
-                self.log_scroll = (self.log_scroll + step).min(safe_max);
-                return EventResult::Consumed;
-            }
-
-            // ─── Config scrolling ──────────────────────────────────────────
-            KeyCode::Up if self.active_pane == DetailPane::Config => {
-                self.config_scroll = self.config_scroll.saturating_sub(1);
-                return EventResult::Consumed;
-            }
-            KeyCode::Down if self.active_pane == DetailPane::Config => {
-                let max = self.config_len.saturating_sub(self.pane_height as usize);
-                let safe_max = max.min(u16::MAX as usize) as u16;
-                self.config_scroll = (self.config_scroll + 1).min(safe_max);
-                return EventResult::Consumed;
-            }
-            KeyCode::PageUp if self.active_pane == DetailPane::Config => {
-                self.config_scroll = self.config_scroll.saturating_sub(step);
-                return EventResult::Consumed;
-            }
-            KeyCode::PageDown if self.active_pane == DetailPane::Config => {
-                let max = self.config_len.saturating_sub(self.pane_height as usize);
-                let safe_max = max.min(u16::MAX as usize) as u16;
-                self.config_scroll = (self.config_scroll + step).min(safe_max);
-                return EventResult::Consumed;
-            }
-
-            // ─── Details table navigation (clamped by cached details_len) ──
-            KeyCode::Up if self.active_pane == DetailPane::Details => {
-                let i = self
-                    .details_state
-                    .selected()
-                    .map(|i| i.saturating_sub(1))
-                    .unwrap_or(0);
-                self.details_state.select(Some(i));
-                return EventResult::Consumed;
-            }
-            KeyCode::Down if self.active_pane == DetailPane::Details => {
-                let max = self.details_len.saturating_sub(1);
-                let i = self
-                    .details_state
-                    .selected()
-                    .map(|i| (i + 1).min(max))
-                    .unwrap_or(0);
-                self.details_state.select(Some(i));
-                return EventResult::Consumed;
-            }
-            KeyCode::PageUp if self.active_pane == DetailPane::Details => {
-                let i = self
-                    .details_state
-                    .selected()
-                    .map(|i| i.saturating_sub(step as usize))
-                    .unwrap_or(0);
-                self.details_state.select(Some(i));
-                return EventResult::Consumed;
-            }
-            KeyCode::PageDown if self.active_pane == DetailPane::Details => {
-                let max = self.details_len.saturating_sub(1);
-                let i = self
-                    .details_state
-                    .selected()
-                    .map(|i| (i + step as usize).min(max))
-                    .unwrap_or(0);
-                self.details_state.select(Some(i));
-                return EventResult::Consumed;
+            _ if self.active_pane == DetailPane::Properties => {
+                handle_nav!(self, properties_scroll, self.properties_len, step, self.pane_height, key);
             }
 
             _ => {}
         }
         EventResult::Ignored
     }
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-pub(crate) fn detail_block(_title: &str) -> Block<'_> {
-    Block::default().style(Style::default().fg(Color::White))
-}
-
-pub(crate) fn empty_block(title: &str) -> Paragraph<'_> {
-    Paragraph::new(vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  No container selected.",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ])
-    .block(detail_block(title))
 }

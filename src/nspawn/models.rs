@@ -212,6 +212,20 @@ impl PropertyGroup {
     }
 }
 
+pub const IMPORTANT_KEYS: &[&str] = &[
+    "Name",
+    "State",
+    "Class",
+    "Enabled",
+    "IPAddresses",
+    "MainPID",
+    "Leader",
+    "Timestamp",
+    "Type",
+    "ReadOnly",
+    "Usage",
+];
+
 /// Strongly-typed properties for a machine/container.
 #[derive(Debug, Clone, Default)]
 pub struct MachineProperties {
@@ -247,5 +261,27 @@ impl MachineProperties {
             .filter(|g| !g.properties.is_empty())
             .map(|g| g.properties.len() + 2) // 1 header + N props + 1 spacer
             .sum()
+    }
+
+    /// Returns a filtered and ordered list of 'primary' properties for summary views.
+    pub fn get_summary(&self) -> Vec<(&String, &String)> {
+        let mut pairs = Vec::new();
+        for group in &self.groups {
+            for (k, v) in &group.properties {
+                if IMPORTANT_KEYS.contains(&k.as_str()) {
+                    pairs.push((k, v));
+                }
+            }
+        }
+
+        // Sort by the order defined in IMPORTANT_KEYS
+        pairs.sort_by_key(|(k, _)| {
+            IMPORTANT_KEYS
+                .iter()
+                .position(|&ik| ik == k.as_str())
+                .unwrap_or(usize::MAX)
+        });
+
+        pairs
     }
 }
