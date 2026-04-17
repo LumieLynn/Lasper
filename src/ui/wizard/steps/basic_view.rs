@@ -2,16 +2,19 @@ use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::wizard::context::{BasicConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
-use crossterm::event::{KeyCode, KeyEvent};
+
+use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
         comps
     }};
 }
+
+impl_wizard_nav!(BasicStepView, active_comps);
 
 pub struct BasicStepView {
     name: TextBox,
@@ -62,22 +65,6 @@ impl BasicStepView {
         view
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.next(&mut comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.prev(&mut comps);
-        self.update_focus();
-    }
 }
 
 impl Component for BasicStepView {
@@ -92,31 +79,7 @@ impl Component for BasicStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            _ => {}
-        }
-
-        let mut comps = active_comps!(self);
-        let res = comps[self.focus.active_idx].handle_key(key);
-        match res {
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
-        }
+        delegate_wizard_navigation!(self, key, active_comps)
     }
 
     fn set_focus(&mut self, focused: bool) {

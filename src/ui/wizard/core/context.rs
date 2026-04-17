@@ -2,7 +2,7 @@ use crate::nspawn::deploy::Deployer;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::storage::{StorageBackend, StorageInfo, StorageType};
 use crate::nspawn::ContainerEntry;
-pub use crate::ui::wizard::builder::{
+pub use crate::nspawn::config::builder::{
     BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };

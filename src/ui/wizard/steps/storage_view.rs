@@ -7,19 +7,19 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{StorageState, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::Paragraph,
     Frame,
 };
 
-    macro_rules! active_comps {
-        ($self:ident) => {{
-            let is_disk = $self.is_disk_image_selected();
-            let creation_method_idx = $self.creation_method.selected_idx();
-    
-            let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
+macro_rules! active_comps {
+    ($self:ident) => {{
+        let is_disk = $self.is_disk_image_selected();
+        let creation_method_idx = $self.creation_method.selected_idx();
+
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.list];
         if is_disk {
             comps.push(&mut $self.creation_method);
             if creation_method_idx == 0 {
@@ -34,6 +34,8 @@ use ratatui::{
         comps
     }};
 }
+
+impl_wizard_nav!(StorageStepView, active_comps);
 
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
@@ -107,25 +109,6 @@ impl StorageStepView {
         false
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        if self.focus.active_idx >= comps.len() {
-            self.focus.active_idx = comps.len().saturating_sub(1);
-        }
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.next(&mut comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.prev(&mut comps);
-        self.update_focus();
-    }
 }
 
 impl Component for StorageStepView {
@@ -179,42 +162,14 @@ impl Component for StorageStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            _ => {}
-        }
-
-        let mut comps = active_comps!(self);
-
-        if self.focus.active_idx >= comps.len() {
-            self.focus.active_idx = comps.len().saturating_sub(1);
-        }
-
-        let res = comps[self.focus.active_idx].handle_key(key);
+        let res = delegate_wizard_navigation!(self, key, active_comps);
 
         if let EventResult::Consumed = res {
             if self.focus.active_idx == 0 {
                 self.update_focus();
             }
         }
-        match res {
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
-        }
+        res
     }
 
     fn set_focus(&mut self, focused: bool) {

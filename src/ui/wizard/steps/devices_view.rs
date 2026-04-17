@@ -4,6 +4,7 @@ use crate::ui::widgets::composites::bind_mount::BindMountBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::ui::wizard::core::render_editor_overlay;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -45,14 +46,7 @@ impl DevicesStepView {
 impl Component for DevicesStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.bind_editor {
-            let inner_area = crate::ui::centered_rect(60, 60, f.area());
-            f.render_widget(ratatui::widgets::Clear, inner_area);
-            let block = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Add Bind Mount ");
-            let editor_area = block.inner(inner_area);
-            f.render_widget(block, inner_area);
-            editor.render(f, editor_area);
+            render_editor_overlay(f, "Add Bind Mount", 60, 60, editor);
             return;
         }
 

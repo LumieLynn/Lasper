@@ -5,6 +5,7 @@ use crate::ui::widgets::composites::user_editor::UserEditor;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::wizard::context::{UserConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::ui::wizard::core::render_editor_overlay;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -16,10 +17,12 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let comps: Vec<&mut dyn Component> = vec![&mut $self.root_password, &mut $self.user_list];
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.root_password, &mut $self.user_list];
         comps
     }};
 }
+
+impl_wizard_nav!(UserStepView, active_comps);
 
 pub struct UserStepView {
     root_password: PasswordBox,
@@ -52,35 +55,12 @@ impl UserStepView {
         view
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.next(&mut comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.prev(&mut comps);
-        self.update_focus();
-    }
 }
 
 impl Component for UserStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.editor {
-            let inner_area = crate::ui::centered_rect(60, 85, f.area());
-            f.render_widget(ratatui::widgets::Clear, inner_area);
-            let block = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Add/Edit User ");
-            let editor_area = block.inner(inner_area);
-            f.render_widget(block, inner_area);
-            editor.render(f, editor_area);
+            render_editor_overlay(f, "Add/Edit User", 60, 85, editor);
             return;
         }
 
@@ -128,16 +108,8 @@ impl Component for UserStepView {
             return res;
         }
 
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') if self.user_list.is_focused() => {
+        if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+            if self.user_list.is_focused() {
                 self.editor = Some(UserEditor::new(|u| {
                     AppMessage::Wizard(WizardMessage::UserAdded(u))
                 }));
@@ -145,26 +117,13 @@ impl Component for UserStepView {
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
-            _ => {}
         }
 
-        let mut comps = active_comps!(self);
-        let res = comps[self.focus.active_idx].handle_key(key);
-        match res {
-            EventResult::Message(AppMessage::Wizard(WizardMessage::UserRemoved(_))) => {
-                self.update_focus();
-                res
-            }
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
+        let res = delegate_wizard_navigation!(self, key, active_comps);
+        if let EventResult::Message(AppMessage::Wizard(WizardMessage::UserRemoved(_))) = res {
+            self.update_focus();
         }
+        res
     }
 
     fn set_focus(&mut self, focused: bool) {

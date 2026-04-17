@@ -1,6 +1,7 @@
-pub mod builder;
-pub mod context;
-pub mod manager;
+#[macro_use]
+pub mod core;
+pub use self::core::context;
+pub use self::core::manager;
 pub mod steps;
 
 pub use self::manager::Wizard;

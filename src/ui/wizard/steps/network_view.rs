@@ -7,9 +7,9 @@ use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
-
+use crate::ui::wizard::core::render_editor_overlay;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
 
 macro_rules! active_comps {
@@ -35,6 +35,8 @@ macro_rules! active_comps {
         visible
     }};
 }
+
+impl_wizard_nav!(NetworkStepView, active_comps);
 
 pub struct NetworkStepView {
     mode_selector: RadioGroup,
@@ -183,69 +185,43 @@ impl NetworkStepView {
         self.interface_list.selected_idx() == Some(self.interface_options_len - 1)
     }
 
-    fn update_focus(&mut self) {
-        let mut visible = active_comps!(self);
-        if self.focus.active_idx >= visible.len() {
-            self.focus.active_idx = visible.len().saturating_sub(1);
-        }
-        self.focus.update_focus(&mut visible, true);
-    }
-
-    fn next(&mut self) {
-        let mut visible = active_comps!(self);
-        self.focus.next(&mut visible);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let mut visible = active_comps!(self);
-        self.focus.prev(&mut visible);
-        self.update_focus();
-    }
 }
 
 impl Component for NetworkStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         if let Some(editor) = &mut self.port_editor {
-            let inner_area = crate::ui::centered_rect(60, 60, f.area());
-            f.render_widget(ratatui::widgets::Clear, inner_area);
-            let block = ratatui::widgets::Block::default()
-                .borders(ratatui::widgets::Borders::ALL)
-                .title(" Add Port Forward ");
-            let editor_area = block.inner(inner_area);
-            f.render_widget(block, inner_area);
-            editor.render(f, editor_area);
+            render_editor_overlay(f, "Add Port Forward", 60, 60, editor);
             return;
         }
 
         let mode = self.mode_selector.selected_idx();
-        let chunks = ratatui::layout::Layout::default()
-            .direction(ratatui::layout::Direction::Vertical)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
             .margin(1)
             .constraints([
-                ratatui::layout::Constraint::Length(3), // Mode
-                ratatui::layout::Constraint::Min(5),    // Bridge/Ports
-                ratatui::layout::Constraint::Length(1), // Hint
+                Constraint::Length(3), // Mode
+                Constraint::Min(5),    // Bridge/Ports
+                Constraint::Length(1), // Hint
             ])
             .split(area);
 
         self.mode_selector.render(f, chunks[0]);
 
         if mode == 3 {
-            let mid_chunks = ratatui::layout::Layout::default()
+            let mid_chunks = Layout::default()
                 .constraints([
-                    ratatui::layout::Constraint::Percentage(50),
-                    ratatui::layout::Constraint::Percentage(50),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(50),
                 ])
-                .direction(ratatui::layout::Direction::Horizontal)
+                .direction(Direction::Horizontal)
                 .split(chunks[1]);
             self.bridge_list.render(f, mid_chunks[0]);
             if self.is_custom_bridge() {
-                let right_chunks = ratatui::layout::Layout::default()
-                    .direction(ratatui::layout::Direction::Vertical)
+                let right_chunks = Layout::default()
+                    .direction(Direction::Vertical)
                     .constraints([
-                        ratatui::layout::Constraint::Length(3),
-                        ratatui::layout::Constraint::Min(0),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
                     ])
                     .split(mid_chunks[1]);
                 self.custom_bridge.render(f, right_chunks[0]);
@@ -254,20 +230,20 @@ impl Component for NetworkStepView {
                 self.port_list.render(f, mid_chunks[1]);
             }
         } else if mode >= 4 {
-            let mid_chunks = ratatui::layout::Layout::default()
+            let mid_chunks = Layout::default()
                 .constraints([
-                    ratatui::layout::Constraint::Percentage(50),
-                    ratatui::layout::Constraint::Percentage(50),
+                    Constraint::Percentage(50),
+                    Constraint::Percentage(50),
                 ])
-                .direction(ratatui::layout::Direction::Horizontal)
+                .direction(Direction::Horizontal)
                 .split(chunks[1]);
             self.interface_list.render(f, mid_chunks[0]);
             if self.is_custom_interface() {
-                let right_chunks = ratatui::layout::Layout::default()
-                    .direction(ratatui::layout::Direction::Vertical)
+                let right_chunks = Layout::default()
+                    .direction(Direction::Vertical)
                     .constraints([
-                        ratatui::layout::Constraint::Length(3),
-                        ratatui::layout::Constraint::Min(0),
+                        Constraint::Length(3),
+                        Constraint::Min(0),
                     ])
                     .split(mid_chunks[1]);
                 self.custom_interface.render(f, right_chunks[0]);
@@ -300,16 +276,8 @@ impl Component for NetworkStepView {
             return res;
         }
 
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') if self.port_list.is_focused() => {
+        if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
+            if self.port_list.is_focused() {
                 self.port_editor = Some(PortMappingBox::new(|p| {
                     AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
                 }));
@@ -317,41 +285,23 @@ impl Component for NetworkStepView {
                 self.port_editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
-            _ => {}
         }
 
         let mode = self.mode_selector.selected_idx();
-        let mut visible = active_comps!(self);
+        let res = delegate_wizard_navigation!(self, key, active_comps);
 
-        if self.focus.active_idx < visible.len() {
-            let res = visible[self.focus.active_idx].handle_key(key);
-            if let EventResult::Consumed = res {
-                if self.focus.active_idx == 0
-                    || (mode == 3 && self.focus.active_idx == 1)
-                    || (mode >= 4 && self.focus.active_idx == 1)
-                {
-                    self.update_focus();
-                }
+        if let EventResult::Consumed = res {
+            if self.focus.active_idx == 0
+                || (mode == 3 && self.focus.active_idx == 1)
+                || (mode >= 4 && self.focus.active_idx == 1)
+            {
+                self.update_focus();
             }
-            match &res {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardRemoved(_))) => {
-                    self.update_focus();
-                }
-
-                EventResult::FocusNext => {
-                    self.next();
-                    return EventResult::Consumed;
-                }
-                EventResult::FocusPrev => {
-                    self.prev();
-                    return EventResult::Consumed;
-                }
-                _ => {}
-            }
-            res
-        } else {
-            EventResult::Ignored
         }
+        if let EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardRemoved(_))) = res {
+            self.update_focus();
+        }
+        res
     }
 
     fn set_focus(&mut self, focused: bool) {

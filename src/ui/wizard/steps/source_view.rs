@@ -6,7 +6,7 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
@@ -34,6 +34,8 @@ macro_rules! active_comps {
         comps
     }};
 }
+
+impl_wizard_nav!(SourceStepView, active_comps);
 
 pub struct SourceStepView {
     kind_list: SelectableList<String>,
@@ -138,25 +140,6 @@ impl SourceStepView {
         view
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        if self.focus.active_idx >= comps.len() {
-            self.focus.active_idx = comps.len().saturating_sub(1);
-        }
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.next(&mut comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.prev(&mut comps);
-        self.update_focus();
-    }
 }
 
 impl Component for SourceStepView {
@@ -216,42 +199,14 @@ impl Component for SourceStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            _ => {}
-        }
-
-        let mut comps = active_comps!(self);
-
-        if self.focus.active_idx >= comps.len() {
-            self.focus.active_idx = comps.len().saturating_sub(1);
-        }
-
-        let res = comps[self.focus.active_idx].handle_key(key);
+        let res = delegate_wizard_navigation!(self, key, active_comps);
         if let EventResult::Consumed = res {
             // If the kind list changed, we need to update focus since visible inputs change
             if self.focus.active_idx == 0 {
                 self.update_focus();
             }
         }
-        match res {
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
-        }
+        res
     }
 
     fn set_focus(&mut self, focused: bool) {
