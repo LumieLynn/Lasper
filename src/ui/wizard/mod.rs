@@ -28,7 +28,7 @@ pub enum StepAction {
     Close,
     CloseRefresh,
     /// Display a status message in the application status bar.
-    Status(String, crate::nspawn::StatusLevel),
+    Status(String, crate::ui::StatusLevel),
 }
 
 impl WizardStep {

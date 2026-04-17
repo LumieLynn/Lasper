@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::nspawn::StatusLevel;
+use crate::ui::StatusLevel;
 use crate::ui::{centered_rect, core::Component};
 
 pub fn render(f: &mut Frame, app: &mut App) {

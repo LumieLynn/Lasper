@@ -1,5 +1,5 @@
 use super::{ActivePanel, App};
-use crate::nspawn::StatusLevel;
+use crate::ui::StatusLevel;
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 
 use crate::ui::wizard::StepAction as WizardAction;

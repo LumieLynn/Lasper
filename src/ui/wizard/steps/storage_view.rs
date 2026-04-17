@@ -1,4 +1,4 @@
-use crate::nspawn::storage::StorageType;
+use crate::nspawn::adapters::storage::StorageType;
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::inputs::text_box::TextBox;

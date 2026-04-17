@@ -11,7 +11,7 @@ pub enum AppEvent {
     Tick,
     BackendResult(crate::ui::core::BackendResponse),
     /// Background action execution finished.
-    ActionDone(String, crate::nspawn::StatusLevel),
+    ActionDone(String, crate::ui::StatusLevel),
     /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
     MetricsUpdate(String, f64, f64, f64),
     /// Real-time log line from a container.

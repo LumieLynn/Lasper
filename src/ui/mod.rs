@@ -1,5 +1,14 @@
 //! UI module containing layout and widget rendering logic.
 
+/// Severity level for status messages shown in the UI.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatusLevel {
+    Info,
+    Success,
+    Warn,
+    Error,
+}
+
 pub mod core;
 pub mod layout;
 pub mod views;

@@ -1,8 +1,8 @@
-use crate::nspawn::deploy::Deployer;
+use crate::nspawn::ops::provision::Deployer;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::storage::{StorageBackend, StorageInfo, StorageType};
-use crate::nspawn::ContainerEntry;
-pub use crate::nspawn::config::builder::{
+use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
+use crate::nspawn::models::ContainerEntry;
+pub use crate::nspawn::adapters::config::builder::{
     BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };
@@ -164,7 +164,7 @@ pub struct PassthroughState {
     pub privileged: bool,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
-    pub discovered_gpus: Vec<crate::nspawn::hw::gpu::GpuDevice>,
+    pub discovered_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
     pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
     pub selected_gpu_nodes: Vec<String>,
@@ -234,12 +234,12 @@ pub struct WizardContext {
 
 impl WizardContext {
     pub async fn new(entries: Vec<ContainerEntry>) -> Self {
-        let xdg_runtime = crate::nspawn::utils::discovery::get_xdg_runtime().await.ok();
+        let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime().await.ok();
         let nvidia_toolkit_installed = tokio::fs::try_exists("/usr/bin/nvidia-ctk")
             .await
             .unwrap_or(false);
-        let wayland_sockets = crate::nspawn::utils::scan_available_wayland_sockets().await;
-        let discovered_gpus = crate::nspawn::hw::gpu::discover_host_gpus().await;
+        let wayland_sockets = crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
+        let discovered_gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
         Self {
             source: SourceState {
                 kind: SourceKind::Copy,
@@ -259,7 +259,7 @@ impl WizardContext {
             },
             storage: StorageState {
                 type_idx: 0,
-                info: crate::nspawn::storage::detect::detect_available_storage_types().await,
+                info: crate::nspawn::adapters::storage::detect::detect_available_storage_types().await,
                 creation_method_idx: 0,
                 disk_size: "2G".to_string(),
                 disk_fs: "ext4".to_string(),
@@ -271,13 +271,13 @@ impl WizardContext {
                 users: vec![],
             },
             network: {
-                let bridges = crate::nspawn::hw::network::detect_bridges().await;
+                let bridges = crate::nspawn::platform::network::detect_bridges().await;
                 let default_bridge = bridges
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "br0".to_string());
 
-                let physical_interfaces = crate::nspawn::hw::network::detect_physical_interfaces().await;
+                let physical_interfaces = crate::nspawn::platform::network::detect_physical_interfaces().await;
                 let default_interface = physical_interfaces
                     .first()
                     .cloned()

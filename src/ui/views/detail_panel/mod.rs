@@ -2,7 +2,6 @@ pub mod core;
 pub mod panes;
 
 pub use core::style::property_style;
-pub use core::utils::{detail_block, empty_block};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{

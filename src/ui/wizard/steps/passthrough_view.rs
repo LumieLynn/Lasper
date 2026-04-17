@@ -4,7 +4,7 @@ use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::widgets::lists::checklist::Checklist;
-use crate::nspawn::hw::gpu::GpuDevice;
+use crate::nspawn::platform::gpu::GpuDevice;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};

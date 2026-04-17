@@ -11,9 +11,8 @@ use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    core::{DefaultManager, NspawnManager},
     models::ContainerEntry,
-    StatusLevel,
+    ops::{DefaultManager, NspawnManager},
 };
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
@@ -75,7 +74,7 @@ pub struct AppUi {
 
     pub wizard: Option<Wizard>,
 
-    pub status_message: Option<(String, StatusLevel)>,
+    pub status_message: Option<(String, crate::ui::StatusLevel)>,
     pub status_expiry: Option<Instant>,
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
@@ -223,7 +222,7 @@ impl App {
         if self.data.dbus_active && self.data.manager.did_fallback() {
             self.set_status(
                 "DBus call failed — used CLI fallback".into(),
-                crate::nspawn::StatusLevel::Warn,
+                crate::ui::StatusLevel::Warn,
             );
         }
     }
@@ -284,7 +283,7 @@ impl App {
         self.ui.app_tx = Some(events.tx.clone());
 
         // Start nspawn metrics collection engine
-        crate::nspawn::hw::metrics::spawn_collector(
+        crate::nspawn::ops::inspect::metrics::spawn_collector(
             events.tx.clone(),
             self.data.cpu_cores,
             self.data.cpu_representation,
@@ -324,7 +323,7 @@ impl App {
                     }
                 }
                 Some(cmd) = backend_rx.recv() => {
-                    crate::nspawn::core::handlers::handle_command(cmd, events.tx.clone());
+                    crate::nspawn::ops::handlers::handle_command(cmd, events.tx.clone());
                 }
                 else => break,
             }

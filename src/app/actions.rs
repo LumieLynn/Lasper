@@ -1,6 +1,5 @@
 use super::{App, DetailPane};
-use crate::nspawn::{models::ContainerEntry, models::ContainerState, StatusLevel};
-use std::collections::HashMap;
+use crate::nspawn::{models::ContainerEntry, models::ContainerState};
 use std::time::{Duration, Instant};
 
 impl App {
@@ -30,7 +29,7 @@ impl App {
         if self.data.dbus_active && self.data.manager.did_fallback() {
             self.set_status(
                 "⚡ DBus call failed — used CLI fallback".into(),
-                StatusLevel::Warn,
+                crate::ui::StatusLevel::Warn,
             );
         }
     }
@@ -120,7 +119,7 @@ impl App {
             }
             DetailPane::Config => {
                 let new_content =
-                    crate::nspawn::config::NspawnConfig::load(&entry.name).await.map(|c| c.content);
+                    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name).await.map(|c| c.content);
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
                 }
@@ -132,7 +131,7 @@ impl App {
         }
     }
 
-    pub fn set_status(&mut self, msg: String, level: StatusLevel) {
+    pub fn set_status(&mut self, msg: String, level: crate::ui::StatusLevel) {
         self.ui.status_message = Some((msg, level));
         self.ui.status_expiry = Some(Instant::now() + Duration::from_secs(4));
     }
@@ -171,7 +170,7 @@ impl App {
         validate: impl FnOnce(&ContainerEntry) -> bool,
         action: F,
     ) where
-        F: FnOnce(String, std::sync::Arc<dyn crate::nspawn::core::NspawnManager>) -> Fut
+        F: FnOnce(String, std::sync::Arc<dyn crate::nspawn::ops::NspawnManager>) -> Fut
             + Send
             + 'static,
         Fut: std::future::Future<Output = crate::nspawn::errors::Result<()>> + Send + 'static,
@@ -213,9 +212,9 @@ impl App {
             let (msg, level) = match res {
                 Ok(_) => (
                     format!("{} {}{}", action_label, name, suffix),
-                    StatusLevel::Success,
+                    crate::ui::StatusLevel::Success,
                 ),
-                Err(err) => (format!("Error: {err}"), StatusLevel::Error),
+                Err(err) => (format!("Error: {err}"), crate::ui::StatusLevel::Error),
             };
 
             let _ = tx

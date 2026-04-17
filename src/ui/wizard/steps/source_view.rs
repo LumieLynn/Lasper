@@ -228,26 +228,26 @@ impl Component for SourceStepView {
         let cursor = self.kind_list.selected_idx().unwrap_or(0);
         match cursor {
             1 => {
-                crate::nspawn::deploy::image::check_tool("skopeo")
+                crate::nspawn::ops::provision::builders::image::check_tool("skopeo")
                     .map_err(|_| "Missing dependency: skopeo".to_string())?;
-                crate::nspawn::deploy::image::check_tool("umoci")
+                crate::nspawn::ops::provision::builders::image::check_tool("umoci")
                     .map_err(|_| "Missing dependency: umoci".to_string())?;
                 self.oci_url.validate()?
             }
             2 => {
-                crate::nspawn::deploy::image::check_tool("debootstrap")
+                crate::nspawn::ops::provision::builders::image::check_tool("debootstrap")
                     .map_err(|_| "Missing dependency: debootstrap".to_string())?;
                 self.deboot_mirror.validate()?;
                 self.deboot_suite.validate()?;
                 self.bootstrap_pkgs.validate()?;
             }
             3 => {
-                crate::nspawn::deploy::image::check_tool("pacstrap")
+                crate::nspawn::ops::provision::builders::image::check_tool("pacstrap")
                     .map_err(|_| "Missing dependency: pacstrap".to_string())?;
                 self.bootstrap_pkgs.validate()?
             }
             4 => {
-                crate::nspawn::deploy::image::check_tool("curl")
+                crate::nspawn::ops::provision::builders::image::check_tool("curl")
                     .map_err(|_| "Missing dependency: curl".to_string())?;
                 self.pull_url.validate()?
             }

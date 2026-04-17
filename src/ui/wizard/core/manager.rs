@@ -192,7 +192,7 @@ impl Wizard {
                                     "Validation Error: Source container '{}' no longer exists",
                                     source_cfg
                                 ),
-                                crate::nspawn::StatusLevel::Error,
+                                crate::ui::StatusLevel::Error,
                             );
                         }
                     }
@@ -203,7 +203,7 @@ impl Wizard {
                                 "Validation Error: Container '{}' already exists",
                                 target_name
                             ),
-                            crate::nspawn::StatusLevel::Error,
+                            crate::ui::StatusLevel::Error,
                         );
                     }
 
@@ -216,7 +216,7 @@ impl Wizard {
                         self.loading = false;
                         return StepAction::Status(
                             "Internal error: Backend channel busy or closed".into(),
-                            crate::nspawn::StatusLevel::Error,
+                            crate::ui::StatusLevel::Error,
                         );
                     }
                     StepAction::None
@@ -232,14 +232,14 @@ impl Wizard {
                     }
                     crate::ui::core::BackendResponse::ValidationError(e) => StepAction::Status(
                         format!("Error: {}", e),
-                        crate::nspawn::StatusLevel::Error,
+                        crate::ui::StatusLevel::Error,
                     ),
                     crate::ui::core::BackendResponse::DeployStarted => {
                         self.handle_action(StepAction::Next)
                     }
                     crate::ui::core::BackendResponse::DeployFailed(e) => StepAction::Status(
                         format!("Deploy Failed: {}", e),
-                        crate::nspawn::StatusLevel::Error,
+                        crate::ui::StatusLevel::Error,
                     ),
                 }
             }
@@ -252,7 +252,7 @@ impl Wizard {
             StepAction::Next => {
                 if let Some(view) = &mut self.active_view {
                     if let Err(e) = view.validate() {
-                        return StepAction::Status(e, crate::nspawn::StatusLevel::Error);
+                        return StepAction::Status(e, crate::ui::StatusLevel::Error);
                     }
                     view.commit_to_context(&mut self.context);
                 }
