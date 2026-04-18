@@ -9,9 +9,30 @@ pub struct NspawnConfig {
     pub content: String,
 }
 
+/// Validates a container name matches systemd machine name constraints.
+/// Defense-in-depth: the wizard UI already validates this, but backend
+/// must not trust inputs blindly in case of restricted-sudo environments.
+pub fn validate_machine_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 64
+        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        || name.starts_with('.')
+        || name.contains("..")
+    {
+        return Err(NspawnError::Validation(format!(
+            "Invalid machine name: '{}'. Must be 1-64 chars, [a-zA-Z0-9_.-], no leading dot or '..'",
+            name
+        )));
+    }
+    Ok(())
+}
+
 impl NspawnConfig {
     /// Load the `.nspawn` config for a container by name.
     pub async fn load(name: &str) -> Option<NspawnConfig> {
+        if validate_machine_name(name).is_err() {
+            return None;
+        }
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
         match tokio::fs::read_to_string(&path)
             .await
@@ -47,6 +68,7 @@ impl NspawnConfig {
         new_state: &crate::nspawn::platform::nvidia::NvidiaState,
         death_list: &[String],
     ) -> Result<()> {
+        validate_machine_name(name)?;
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
 
         crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |existing| {
@@ -124,76 +146,74 @@ impl NspawnConfig {
         new_state: &crate::nspawn::platform::nvidia::NvidiaState,
         _death_list: &[String], // No longer strictly needed for config update if using markers
     ) -> Result<String> {
-        // 1. Purge existing block using markers
+        // 1. Purge existing block using markers (preserves everything else)
         let (clean_content, _extracted_deaths) = Self::purge_nvidia_block(&content)?;
 
-        let original_conf = Ini::load_from_str(&clean_content)
-            .map_err(|e| NspawnError::Runtime(format!("Failed to parse .nspawn as INI: {}", e)))?;
-
-        // 2. Rebuild Ini to ensure clean section structure
-        let mut new_conf = Ini::new();
-        for (section_name, props) in original_conf.iter() {
-            let section_str = section_name.as_deref();
-            for (key, value) in props.iter() {
-                // FALLBACK DE-DUPLICATION:
-                // If this is a Bind entry that is ALREADY in our new managed state,
-                // skip it here so it doesn't get written twice (it will be added in markers later).
-                // This handles the transition from unmarked legacy files to marked ones.
-                if section_str == Some("Files") {
+        // 2. Read-only INI parse for legacy dedup detection
+        let mut lines_to_remove: Vec<String> = Vec::new();
+        if let Ok(conf) = Ini::load_from_str(&clean_content) {
+            if let Some(files_section) = conf.section(Some("Files")) {
+                for (key, value) in files_section.iter() {
                     if key == "Bind" && new_state.device_binds.iter().any(|v| v == value) {
-                        continue;
+                        lines_to_remove.push(format!("Bind={}", value));
                     }
-                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value)
-                    {
-                        continue;
+                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value) {
+                        lines_to_remove.push(format!("BindReadOnly={}", value));
                     }
-                }
-
-                if new_conf.section(section_str).is_none() {
-                    new_conf
-                        .with_section(section_str)
-                        .set(key.to_string(), value.to_string());
-                } else {
-                    new_conf
-                        .section_mut(section_str)
-                        .unwrap()
-                        .append(key.to_string(), value.to_string());
                 }
             }
         }
 
-        // 3. Add New Managed Block to [Files]
-        if !new_state.device_binds.is_empty() || !new_state.readonly_binds.is_empty() {
-            // Ensure [Files] section exists
-            if new_conf.section(Some("Files")).is_none() {
-                new_conf
-                    .with_section(Some("Files"))
-                    .set("__placeholder", "");
-                new_conf
-                    .section_mut(Some("Files"))
-                    .unwrap()
-                    .remove("__placeholder");
-            }
-            let s = new_conf.section_mut(Some("Files")).unwrap();
+        // 3. Line-level dedup (preserves everything else including comments)
+        let mut result_lines: Vec<String> = clean_content.lines().map(|l| l.to_string()).collect();
+        if !lines_to_remove.is_empty() {
+            result_lines.retain(|line| {
+                let trimmed = line.trim();
+                !lines_to_remove.iter().any(|dup| trimmed == dup)
+            });
+        }
 
-            // Markers (Phase 3: Static semantic tagging)
-            s.append("X-Lasper-Nvidia-Begin", "managed-by-lasper");
+        // 4. Build the new managed block
+        if !new_state.device_binds.is_empty() || !new_state.readonly_binds.is_empty() {
+            let mut block = Vec::new();
+            block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
             for dev in &new_state.device_binds {
-                s.append("Bind", dev.clone());
+                block.push(format!("Bind={}", dev));
             }
             for ro in &new_state.readonly_binds {
-                s.append("BindReadOnly", ro.clone());
+                block.push(format!("BindReadOnly={}", ro));
             }
-            s.append("X-Lasper-Nvidia-End", "true");
+            block.push("X-Lasper-Nvidia-End=true".to_string());
+
+            // 5. Find [Files] section and insert block at its end
+            let files_idx = result_lines.iter().position(|l| {
+                l.trim().eq_ignore_ascii_case("[files]")
+            });
+
+            match files_idx {
+                Some(idx) => {
+                    // Find end of [Files] section: next section header or EOF
+                    let insert_at = result_lines.iter()
+                        .enumerate()
+                        .skip(idx + 1)
+                        .find(|(_, l)| l.trim().starts_with('[') && l.trim().ends_with(']'))
+                        .map(|(i, _)| i)
+                        .unwrap_or(result_lines.len());
+
+                    for (i, line) in block.into_iter().enumerate() {
+                        result_lines.insert(insert_at + i, line);
+                    }
+                }
+                None => {
+                    // No [Files] section exists — append one
+                    result_lines.push(String::new());
+                    result_lines.push("[Files]".to_string());
+                    result_lines.extend(block);
+                }
+            }
         }
 
-        // 4. Serialize back to buffer
-        let mut buffer = Vec::new();
-        new_conf
-            .write_to(&mut buffer)
-            .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
-
-        Ok(String::from_utf8_lossy(&buffer).into_owned())
+        Ok(result_lines.join("\n"))
     }
 }
 
@@ -201,6 +221,7 @@ impl NspawnConfig {
 
 /// Generate the content of a `.nspawn` container config file using AST.
 pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
+    validate_machine_name(&cfg.name)?;
     let mut conf = Ini::new();
     let idmap_supported = crate::nspawn::platform::capabilities::supports_idmap();
 
@@ -336,6 +357,8 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
 
 /// Clones an .nspawn configuration file from one container to another.
 pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<()> {
+    validate_machine_name(source_name)?;
+    validate_machine_name(dest_name)?;
     let source_path = format!("/etc/systemd/nspawn/{}.nspawn", source_name);
     if !tokio::fs::try_exists(&source_path)
         .await

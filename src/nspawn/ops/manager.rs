@@ -4,7 +4,6 @@ use crate::nspawn::adapters::comm::{cli::CliProvider, dbus::DbusProvider};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {
@@ -24,7 +23,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
-    fn did_fallback(&self) -> bool;
+    fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>);
     fn get_watch_paths(&self) -> Vec<PathBuf>;
 }
@@ -33,7 +32,7 @@ pub struct DefaultManager {
     is_root: bool,
     dbus: DbusProvider,
     cli: CliProvider,
-    last_fallback: AtomicBool,
+    last_fallback_reason: std::sync::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
 }
 
@@ -43,7 +42,7 @@ impl DefaultManager {
             is_root,
             dbus: DbusProvider::new(),
             cli: CliProvider::new(is_root),
-            last_fallback: AtomicBool::new(false),
+            last_fallback_reason: std::sync::Mutex::new(None),
             watch_paths: vec![PathBuf::from("/var/lib/machines")],
         }
     }
@@ -56,8 +55,8 @@ impl DefaultManager {
         }
     }
 
-    fn mark_fallback(&self) {
-        self.last_fallback.store(true, Ordering::Relaxed);
+    fn mark_fallback(&self, reason: &str) {
+        *self.last_fallback_reason.lock().unwrap() = Some(reason.to_string());
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
@@ -76,12 +75,12 @@ impl NspawnManager for DefaultManager {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
                     log::warn!("DBus list_all failed, falling back to CLI: {}", e);
-                    self.mark_fallback();
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::debug!("DBus not available for list_all, using CLI");
-            self.mark_fallback();
+            self.mark_fallback("DBus not available");
         }
         self.cli.list_all().await.map_err(|e| {
             log::error!("CLI list_all failed: {}", e);
@@ -98,12 +97,13 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("DBus start failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::warn!("DBus not available for start, falling back to CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.start(name).await.map_err(|e| {
             log::error!("CLI start failed for {}: {}", name, e);
             e
@@ -117,12 +117,13 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("DBus terminate failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::warn!("DBus not available for terminate, falling back to CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.terminate(name).await.map_err(|e| {
             log::error!("CLI terminate failed for {}: {}", name, e);
             e
@@ -136,12 +137,13 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("DBus poweroff failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::warn!("DBus not available for poweroff, falling back to CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.poweroff(name).await.map_err(|e| {
             log::error!("CLI poweroff failed for {}: {}", name, e);
             e
@@ -155,12 +157,13 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("DBus reboot failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::warn!("DBus not available for reboot, falling back to CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.reboot(name).await.map_err(|e| {
             log::error!("CLI reboot failed for {}: {}", name, e);
             e
@@ -190,12 +193,13 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!("DBus kill failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::warn!("DBus not available for kill, falling back to CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.kill(name, signal).await.map_err(|e| {
             log::error!("CLI kill failed for {} (signal {}): {}", name, signal, e);
             e
@@ -223,12 +227,13 @@ impl NspawnManager for DefaultManager {
                 Ok(p) => return Ok(p),
                 Err(e) => {
                     log::warn!("DBus get_properties failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
                 }
             }
         } else {
             log::debug!("DBus not available for get_properties, using CLI");
+            self.mark_fallback("DBus not available");
         }
-        self.mark_fallback();
         self.cli.get_properties(name).await.map_err(|e| {
             log::error!("CLI get_properties failed for {}: {}", name, e);
             e
@@ -239,8 +244,8 @@ impl NspawnManager for DefaultManager {
         self.dbus.is_available().await
     }
 
-    fn did_fallback(&self) -> bool {
-        self.last_fallback.swap(false, Ordering::Relaxed)
+    fn did_fallback(&self) -> Option<String> {
+        self.last_fallback_reason.lock().unwrap().take()
     }
 
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {

@@ -26,11 +26,13 @@ impl App {
         self.refresh_detail().await;
 
         // Check if any DBus call fell back to CLI during this refresh
-        if self.data.dbus_active && self.data.manager.did_fallback() {
-            self.set_status(
-                "⚡ DBus call failed — used CLI fallback".into(),
-                crate::ui::StatusLevel::Warn,
-            );
+        if self.data.dbus_active {
+            if let Some(reason) = self.data.manager.did_fallback() {
+                self.set_status(
+                    format!("⚡ DBus fallback: {}", reason),
+                    crate::ui::StatusLevel::Warn,
+                );
+            }
         }
     }
 
@@ -203,10 +205,9 @@ impl App {
 
         tokio::spawn(async move {
             let res = action(name.clone(), manager.clone()).await;
-            let suffix = if manager.did_fallback() {
-                " (via CLI fallback)"
-            } else {
-                ""
+            let suffix = match manager.did_fallback() {
+                Some(reason) => format!(" (CLI fallback: {})", reason),
+                None => String::new(),
             };
 
             let (msg, level) = match res {

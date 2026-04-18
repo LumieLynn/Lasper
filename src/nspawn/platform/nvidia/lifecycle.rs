@@ -36,8 +36,22 @@ pub async fn cleanup_container_garbage(name: &str, death_list: &[String]) -> Res
         }
     }
 
-    // 3. Unmount
-    let _ = backend.unmount(name).await;
+    // 3. Unmount (with retry to prevent loop device leaks)
+    if let Err(e) = backend.unmount(name).await {
+        log::warn!(
+            "[AUDIT] [Container: {}] [Step: Cleanup] Unmount failed: {}. Retrying...",
+            name,
+            e
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        if let Err(e2) = backend.unmount(name).await {
+            log::error!(
+                "[AUDIT] [Container: {}] [Step: Cleanup] Unmount retry failed: {}. Loopback device may be leaked.",
+                name,
+                e2
+            );
+        }
+    }
 
     Ok(())
 }

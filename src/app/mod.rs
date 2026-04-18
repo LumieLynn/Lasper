@@ -208,6 +208,9 @@ impl App {
             .get(self.data.selected)
             .map(|e| e.name.clone());
         self.data.entries = self.merge_transitional_states(entries);
+        let active_names: std::collections::HashSet<&String> =
+            self.data.entries.iter().map(|e| &e.name).collect();
+        self.data.metrics.retain(|name, _| active_names.contains(name));
         self.data.selected = prev_name
             .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
             .unwrap_or(0)
@@ -219,11 +222,13 @@ impl App {
         }
 
         // Check if any DBus call fell back to CLI during this background refresh
-        if self.data.dbus_active && self.data.manager.did_fallback() {
-            self.set_status(
-                "DBus call failed — used CLI fallback".into(),
-                crate::ui::StatusLevel::Warn,
-            );
+        if self.data.dbus_active {
+            if let Some(reason) = self.data.manager.did_fallback() {
+                self.set_status(
+                    format!("DBus fallback: {}", reason),
+                    crate::ui::StatusLevel::Warn,
+                );
+            }
         }
     }
 
