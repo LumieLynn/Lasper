@@ -99,3 +99,113 @@ pub(crate) fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<
         .filter(|p| !new_paths.contains(p))
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_paths_combines_both() {
+        let state = NvidiaState {
+            driver_version: "1.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        let paths = state.all_paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"/ro1".to_string()));
+        assert!(paths.contains(&"/dev1".to_string()));
+    }
+
+    #[test]
+    fn test_all_paths_empty_state() {
+        let state = NvidiaState::default();
+        assert!(state.all_paths().is_empty());
+    }
+
+    #[test]
+    fn test_calculate_death_list_removed_paths() {
+        let old = NvidiaState {
+            driver_version: "1.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string(), "/ro2".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        let new = NvidiaState {
+            driver_version: "2.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        let death_list = calculate_death_list(&old, &new);
+        assert_eq!(death_list, vec!["/ro2".to_string()]);
+    }
+
+    #[test]
+    fn test_calculate_death_list_no_change() {
+        let state = NvidiaState {
+            driver_version: "1.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        assert!(calculate_death_list(&state, &state).is_empty());
+    }
+
+    #[test]
+    fn test_calculate_death_list_completely_new() {
+        let old = NvidiaState::default();
+        let new = NvidiaState {
+            driver_version: "1.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        // Nothing in old → nothing to kill
+        assert!(calculate_death_list(&old, &new).is_empty());
+    }
+
+    #[test]
+    fn test_calculate_death_list_everything_removed() {
+        let old = NvidiaState {
+            driver_version: "1.0".to_string(),
+            readonly_binds: vec!["/ro1".to_string()],
+            device_binds: vec!["/dev1".to_string()],
+        };
+        let new = NvidiaState::default();
+        let death_list = calculate_death_list(&old, &new);
+        assert_eq!(death_list.len(), 2);
+        assert!(death_list.contains(&"/ro1".to_string()));
+        assert!(death_list.contains(&"/dev1".to_string()));
+    }
+
+    #[test]
+    fn test_nvidia_state_serde_roundtrip() {
+        let state = NvidiaState {
+            driver_version: "550.1".to_string(),
+            readonly_binds: vec!["/usr/lib/libcuda.so".to_string()],
+            device_binds: vec!["/dev/nvidia0".to_string()],
+        };
+        let serialized = serde_json::to_string(&state).unwrap();
+        let deserialized: NvidiaState = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn test_nvidia_state_serde_empty_state() {
+        let state = NvidiaState::default();
+        let json = serde_json::to_string(&state).unwrap();
+        let back: NvidiaState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.driver_version, "");
+        assert!(back.readonly_binds.is_empty());
+        assert!(back.device_binds.is_empty());
+    }
+
+    #[test]
+    fn test_get_state_dir_respects_env() {
+        let original = std::env::var("LASPER_STATE_DIR").ok();
+        std::env::set_var("LASPER_STATE_DIR", "/custom/path");
+        assert_eq!(get_state_dir(), PathBuf::from("/custom/path"));
+        // Restore
+        match original {
+            Some(v) => std::env::set_var("LASPER_STATE_DIR", v),
+            None => std::env::remove_var("LASPER_STATE_DIR"),
+        }
+    }
+}

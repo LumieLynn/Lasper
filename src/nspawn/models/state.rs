@@ -142,3 +142,128 @@ impl MachineProperties {
         pairs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_container_state_labels() {
+        assert_eq!(ContainerState::Running.label(), "running");
+        assert_eq!(ContainerState::Off.label(), "poweroff");
+        assert_eq!(ContainerState::Starting.label(), "starting");
+        assert_eq!(ContainerState::Exiting.label(), "exiting");
+    }
+
+    #[test]
+    fn test_container_state_is_running() {
+        assert!(ContainerState::Running.is_running());
+        assert!(ContainerState::Starting.is_running());
+        assert!(ContainerState::Exiting.is_running());
+        assert!(!ContainerState::Off.is_running());
+    }
+
+    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
+        ContainerEntry {
+            name: name.to_string(),
+            state,
+            image_type: None,
+            readonly: false,
+            usage: None,
+            address: None,
+            all_addresses: vec![],
+        }
+    }
+
+    #[test]
+    fn test_container_entry_ordering() {
+        let mut entries = vec![
+            make_entry("z", ContainerState::Running),
+            make_entry("a", ContainerState::Running),
+            make_entry("b", ContainerState::Off),
+        ];
+        entries.sort();
+        assert_eq!(entries[0].name, "a");
+        assert_eq!(entries[1].name, "z");
+        assert_eq!(entries[2].name, "b");
+    }
+
+    #[test]
+    fn test_container_entry_ordering_all_states() {
+        let mut entries = vec![
+            make_entry("d", ContainerState::Off),
+            make_entry("c", ContainerState::Exiting),
+            make_entry("a", ContainerState::Running),
+            make_entry("b", ContainerState::Starting),
+        ];
+        entries.sort();
+        // Ord is derived enum order: Running(0) < Starting(1) < Exiting(2) < Off(3)
+        assert_eq!(entries[0].name, "a"); // Running
+        assert_eq!(entries[1].name, "b"); // Starting
+        assert_eq!(entries[2].name, "c"); // Exiting
+        assert_eq!(entries[3].name, "d"); // Off
+    }
+
+    #[test]
+    fn test_container_entry_ordering_empty() {
+        let mut entries: Vec<ContainerEntry> = vec![];
+        entries.sort();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_property_group_priority() {
+        assert_eq!(PropertyGroup { name: "Machine".into(), properties: Default::default() }.display_priority(), 0);
+        assert_eq!(PropertyGroup { name: "Systemd Unit".into(), properties: Default::default() }.display_priority(), 1);
+        assert_eq!(PropertyGroup { name: "Dependencies".into(), properties: Default::default() }.display_priority(), 10);
+        assert_eq!(PropertyGroup { name: "Other".into(), properties: Default::default() }.display_priority(), 5);
+        assert_eq!(PropertyGroup { name: "SomethingNew".into(), properties: Default::default() }.display_priority(), 5);
+    }
+
+    #[test]
+    fn test_machine_properties_summary() {
+        let mut props = MachineProperties::default();
+        props.insert("Machine", "Name".to_string(), "test".to_string());
+        props.insert("Machine", "State".to_string(), "running".to_string());
+        props.insert("Machine", "Unknown".to_string(), "val".to_string());
+
+        let summary = props.get_summary();
+        assert_eq!(summary.len(), 2);
+        assert_eq!(summary[0].0, "Name");
+        assert_eq!(summary[1].0, "State");
+    }
+
+    #[test]
+    fn test_machine_properties_summary_no_important_keys() {
+        let mut props = MachineProperties::default();
+        props.insert("Machine", "SomeRandom".to_string(), "val".to_string());
+        props.insert("Machine", "AnotherRandom".to_string(), "val2".to_string());
+
+        let summary = props.get_summary();
+        assert!(summary.is_empty());
+    }
+
+    #[test]
+    fn test_total_rows_empty() {
+        let props = MachineProperties::default();
+        assert_eq!(props.total_rows(), 0);
+    }
+
+    #[test]
+    fn test_total_rows_with_data() {
+        let mut props = MachineProperties::default();
+        props.insert("Machine", "Name".to_string(), "test".to_string());
+        props.insert("Machine", "State".to_string(), "running".to_string());
+        // 1 group with 2 props = 1 header + 2 props + 1 spacer = 4
+        assert_eq!(props.total_rows(), 4);
+    }
+
+    #[test]
+    fn test_get_group_mut_creates_once() {
+        let mut props = MachineProperties::default();
+        props.get_group_mut("Machine");
+        props.get_group_mut("Machine");
+        // Should only create the group once
+        assert_eq!(props.groups.len(), 1);
+    }
+}

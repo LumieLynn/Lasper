@@ -377,3 +377,287 @@ pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<(
     crate::nspawn::sys::io::AsyncLockedWriter::atomic_copy(Path::new(&source_path), Path::new(&dest_path)).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::models::{NetworkMode, PortForward};
+
+    // ── Validation ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validate_machine_name_valid() {
+        assert!(validate_machine_name("my-container").is_ok());
+        assert!(validate_machine_name("test_01").is_ok());
+        assert!(validate_machine_name("a.b").is_ok());
+    }
+
+    #[test]
+    fn test_validate_machine_name_empty() {
+        assert!(validate_machine_name("").is_err());
+    }
+
+    #[test]
+    fn test_validate_machine_name_boundary_length() {
+        assert!(validate_machine_name("a").is_ok());
+        assert!(validate_machine_name(&"a".repeat(64)).is_ok());
+        assert!(validate_machine_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn test_validate_machine_name_invalid_chars() {
+        assert!(validate_machine_name("foo/bar").is_err());
+        assert!(validate_machine_name("a b").is_err());
+        assert!(validate_machine_name("rm -rf").is_err());
+    }
+
+    #[test]
+    fn test_validate_machine_name_path_traversal() {
+        assert!(validate_machine_name(".hidden").is_err());
+        assert!(validate_machine_name("foo..bar").is_err());
+        assert!(validate_machine_name("../../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_machine_name_injection_attacks() {
+        assert!(validate_machine_name("foo\0bar").is_err());
+        assert!(validate_machine_name("foo\nbar").is_err());
+        assert!(validate_machine_name("foo;rm -rf /").is_err());
+        assert!(validate_machine_name("$(whoami)").is_err());
+    }
+
+    // ── GPU enabled detection ─────────────────────────────────────────────
+
+    #[test]
+    fn test_is_gpu_enabled_true() {
+        let config = NspawnConfig {
+            path: PathBuf::from("test.nspawn"),
+            content: "[General]\nX-Lasper-Nvidia-Enabled=true".to_string(),
+        };
+        assert!(config.is_gpu_enabled());
+    }
+
+    #[test]
+    fn test_is_gpu_enabled_false_value() {
+        let config = NspawnConfig {
+            path: PathBuf::from("test.nspawn"),
+            content: "[General]\nX-Lasper-Nvidia-Enabled=false".to_string(),
+        };
+        assert!(!config.is_gpu_enabled());
+    }
+
+    #[test]
+    fn test_is_gpu_enabled_missing_key() {
+        let config = NspawnConfig {
+            path: PathBuf::from("test.nspawn"),
+            content: "[General]\nSomeOther=value".to_string(),
+        };
+        assert!(!config.is_gpu_enabled());
+    }
+
+    #[test]
+    fn test_is_gpu_enabled_empty_content() {
+        let config = NspawnConfig {
+            path: PathBuf::from("test.nspawn"),
+            content: "".to_string(),
+        };
+        assert!(!config.is_gpu_enabled());
+    }
+
+    #[test]
+    fn test_is_gpu_enabled_malformed_ini() {
+        let config = NspawnConfig {
+            path: PathBuf::from("test.nspawn"),
+            content: "not valid ini [[[[".to_string(),
+        };
+        assert!(!config.is_gpu_enabled());
+    }
+
+    // ── Purge nvidia block ────────────────────────────────────────────────
+
+    #[test]
+    fn test_purge_nvidia_block_present() {
+        let content = "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nBindReadOnly=/usr/lib/libcuda.so\nX-Lasper-Nvidia-End=true\nLine 2";
+        let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
+        assert_eq!(new_content, "Line 1\nLine 2");
+        assert_eq!(death_list, vec!["/dev/nvidia0", "/usr/lib/libcuda.so"]);
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_absent() {
+        let content = "Line 1\nLine 2";
+        let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
+        assert_eq!(new_content, content);
+        assert!(death_list.is_empty());
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_begin_only() {
+        let content = "X-Lasper-Nvidia-Begin=managed-by-lasper\nLine 1";
+        assert!(NspawnConfig::purge_nvidia_block(content).is_err());
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_end_only() {
+        let content = "Line 1\nX-Lasper-Nvidia-End=true\nLine 2";
+        assert!(NspawnConfig::purge_nvidia_block(content).is_err());
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_duplicate_begin() {
+        let content = "X-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true";
+        assert!(NspawnConfig::purge_nvidia_block(content).is_err());
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_reversed_markers() {
+        let content = "X-Lasper-Nvidia-End=true\nBind=/dev/nvidia0\nX-Lasper-Nvidia-Begin=managed-by-lasper";
+        assert!(NspawnConfig::purge_nvidia_block(content).is_err());
+    }
+
+    #[test]
+    fn test_purge_nvidia_block_empty_block() {
+        let content = "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\nLine 2";
+        let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
+        assert_eq!(new_content, "Line 1\nLine 2");
+        assert!(death_list.is_empty());
+    }
+
+    // ── Config content generation ─────────────────────────────────────────
+
+    #[test]
+    fn test_nspawn_config_content_minimal() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.boot = true;
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("[Exec]"));
+        assert!(content.contains("Boot=yes"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_boot_disabled() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.boot = false;
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("Boot=no"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_host_network() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.network = Some(NetworkMode::Host);
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("VirtualEthernet=no"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_network_veth_with_ports() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.network = Some(NetworkMode::Veth);
+        cfg.port_forwards = vec![
+            PortForward { host: 8080, container: 80, proto: "tcp".to_string() },
+            PortForward { host: 4443, container: 443, proto: "tcp".to_string() },
+        ];
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("VirtualEthernet=yes"));
+        assert!(content.contains("Port=tcp:8080:80"));
+        assert!(content.contains("Port=tcp:4443:443"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_bridge_mode() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.network = Some(NetworkMode::Bridge("br0".into()));
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("Bridge=br0"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_privileged() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.privileged = true;
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("Capability=all"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_nvidia_marker() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".to_string();
+        cfg.nvidia_gpu = true;
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("X-Lasper-Nvidia-Enabled=true"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_rejects_invalid_name() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "../escape".to_string();
+        assert!(nspawn_config_content(&cfg, None).is_err());
+    }
+
+    // ── GPU passthrough surgery ───────────────────────────────────────────
+
+    #[test]
+    fn test_apply_gpu_passthrough_to_content() {
+        let content = "[Exec]\nBoot=yes\n".to_string();
+        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
+        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+        new_state.readonly_binds = vec!["/usr/lib/libcuda.so".to_string()];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("[Files]"));
+        assert!(updated.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
+        assert!(updated.contains("Bind=/dev/nvidia0"));
+        assert!(updated.contains("BindReadOnly=/usr/lib/libcuda.so"));
+        assert!(updated.contains("X-Lasper-Nvidia-End=true"));
+    }
+
+    #[test]
+    fn test_apply_gpu_appends_to_existing_files_section() {
+        let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/home/user:/home/user\n".to_string();
+        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
+        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("Bind=/home/user:/home/user"), "User bind should survive");
+        assert!(updated.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
+    }
+
+    #[test]
+    fn test_apply_gpu_preserves_comments() {
+        let content = "[Exec]\nBoot=yes\n# My custom comment\n".to_string();
+        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
+        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("# My custom comment"));
+    }
+
+    #[test]
+    fn test_apply_gpu_dedup_legacy_binds() {
+        let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/dev/nvidia0\n".to_string();
+        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
+        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        let count = updated.matches("Bind=/dev/nvidia0").count();
+        assert_eq!(count, 1, "Legacy duplicate should be removed, got:\n{}", updated);
+    }
+
+    #[test]
+    fn test_apply_gpu_empty_state_is_noop() {
+        let content = "[Exec]\nBoot=yes\n".to_string();
+        let empty_state = crate::nspawn::platform::nvidia::NvidiaState::default();
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content.clone(), &empty_state, &[]).unwrap();
+        assert!(!updated.contains("[Files]"));
+        assert!(!updated.contains("X-Lasper-Nvidia-Begin"));
+    }
+}

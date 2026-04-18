@@ -136,3 +136,26 @@ impl Default for ContainerConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_container_config_defaults() {
+        let cfg = ContainerConfig::default();
+        assert!(cfg.boot);
+        assert_eq!(cfg.network, None);
+    }
+
+    #[test]
+    fn test_container_config_serde_roundtrip() {
+        let mut cfg = ContainerConfig::default();
+        cfg.name = "test".into();
+        cfg.nvidia_gpu = true;
+        
+        let json = serde_json::to_string(&cfg).unwrap();
+        let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, cfg2);
+    }
+}

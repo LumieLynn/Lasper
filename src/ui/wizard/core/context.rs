@@ -342,3 +342,79 @@ impl WizardContext {
         self.builder().get_deployer_and_storage()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_network_state_mode_mapping() {
+        let mut state = NetworkState {
+            mode: 0,
+            bridge_name: "br0".into(),
+            bridge_list: vec![],
+            interface_name: "eth0".into(),
+            physical_interfaces: vec![],
+            port_list: vec![],
+        };
+        assert_eq!(state.network_mode(), Some(NetworkMode::Host));
+        state.mode = 1;
+        assert_eq!(state.network_mode(), Some(NetworkMode::None));
+        state.mode = 2;
+        assert_eq!(state.network_mode(), Some(NetworkMode::Veth));
+        state.mode = 3;
+        assert_eq!(state.network_mode(), Some(NetworkMode::Bridge("br0".into())));
+    }
+
+    #[test]
+    fn test_source_state_externally_managed() {
+        let mut state = SourceState {
+            kind: SourceKind::Pull,
+            oci_url: "".into(),
+            deboot_mirror: "".into(),
+            deboot_suite: "".into(),
+            bootstrap_pkgs: "".into(),
+            local_path: "".into(),
+            clone_source: "".into(),
+            pull_url: "".into(),
+            is_pull_raw: true,
+            copy_idx: 0,
+        };
+        assert!(state.is_storage_managed_externally());
+        
+        state.kind = SourceKind::LocalFile;
+        state.local_path = "test.raw".into();
+        assert!(state.is_storage_managed_externally());
+
+        state.local_path = "test.tar.gz".into();
+        assert!(!state.is_storage_managed_externally());
+    }
+
+    #[test]
+    fn test_passthrough_config_logic() {
+        let state = PassthroughState {
+            privileged: true,
+            graphics_acceleration: true,
+            wayland_socket: Some("wayland-0".into()),
+            discovered_gpus: vec![],
+            nvidia_gpu: true,
+            nvidia_toolkit_installed: true,
+            selected_gpu_nodes: vec![],
+            wayland_sockets: vec![],
+            bind_mounts: vec![],
+        };
+        
+        // Wayland only if Host network
+        let cfg = state.extract_config(Some(NetworkMode::Host));
+        assert!(cfg.wayland_socket.is_some());
+        
+        let cfg = state.extract_config(Some(NetworkMode::Veth));
+        assert!(cfg.wayland_socket.is_none());
+
+        // Nvidia GPU only if toolkit installed
+        let mut state_no_toolkit = state.clone();
+        state_no_toolkit.nvidia_toolkit_installed = false;
+        let cfg = state_no_toolkit.extract_config(Some(NetworkMode::Host));
+        assert!(!cfg.nvidia_gpu);
+    }
+}

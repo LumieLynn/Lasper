@@ -134,3 +134,34 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
 
     Ok(state)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dedup_sorts_and_removes() {
+        let input = vec![
+            "c".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+            "a".to_string(),
+        ];
+        let result = dedup(input);
+        assert_eq!(result, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+    }
+
+    #[test]
+    fn test_dedup_empty() {
+        let input: Vec<String> = vec![];
+        let result = dedup(input);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_dedup_already_unique() {
+        let input = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let result = dedup(input.clone());
+        assert_eq!(result, input);
+    }
+}

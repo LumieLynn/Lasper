@@ -288,3 +288,153 @@ fn format_timestamp(v: &Value<'_>) -> String {
 
     format!("{}s (unix epoch)", us / 1_000_000)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Size formatting ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(0), "0B");
+        assert_eq!(format_size(512), "512B");
+        assert_eq!(format_size(1024), "1.0K");
+        assert_eq!(format_size(1024 * 1024), "1.0M");
+        assert_eq!(format_size(1024 * 1024 * 1024), "1.0G");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024 * 1024), "2.0T");
+        assert_eq!(format_size(u64::MAX), "infinity");
+    }
+
+    #[test]
+    fn test_format_size_value_u32_fallback() {
+        let val = Value::U32(2048);
+        assert_eq!(format_size_value(&val), "2.0K");
+    }
+
+    #[test]
+    fn test_format_size_value_non_numeric_fallback() {
+        let val = Value::Str("not a number".into());
+        assert_eq!(format_size_value(&val), "not a number");
+    }
+
+    // ── IP formatting ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_format_ip_v4() {
+        assert_eq!(format_ip_address(2, &[192, 168, 1, 1]), "192.168.1.1");
+        assert_eq!(format_ip_address(2, &[0, 0, 0, 0]), "0.0.0.0");
+        assert_eq!(format_ip_address(2, &[255, 255, 255, 255]), "255.255.255.255");
+    }
+
+    #[test]
+    fn test_format_ip_v4_wrong_length() {
+        assert_eq!(format_ip_address(2, &[192, 168, 1]), "");
+        assert_eq!(format_ip_address(2, &[192, 168, 1, 1, 5]), "");
+        assert_eq!(format_ip_address(2, &[]), "");
+    }
+
+    #[test]
+    fn test_format_ip_v6() {
+        let data = vec![
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+        ];
+        assert_eq!(format_ip_address(10, &data), "2001:db8:0:0:0:0:0:1");
+    }
+
+    #[test]
+    fn test_format_ip_v6_wrong_length() {
+        assert_eq!(format_ip_address(10, &[0x20, 0x01]), "");
+        assert_eq!(format_ip_address(10, &[]), "");
+    }
+
+    #[test]
+    fn test_format_ip_unknown_family() {
+        assert_eq!(format_ip_address(99, &[1, 2, 3]), "[3 bytes]");
+        assert_eq!(format_ip_address(0, &[]), "[0 bytes]");
+    }
+
+    // ── Duration formatting ───────────────────────────────────────────────
+
+    #[test]
+    fn test_format_duration_ns() {
+        assert_eq!(format_duration_ns(&Value::U64(1_500_000_000)), "1s");
+        assert_eq!(format_duration_ns(&Value::U64(3661_000_000_000)), "1h 1m 1s");
+        assert_eq!(format_duration_ns(&Value::U64(500_000_000)), "500ms");
+    }
+
+    #[test]
+    fn test_format_duration_ns_zero() {
+        assert_eq!(format_duration_ns(&Value::U64(0)), "0ms");
+    }
+
+    #[test]
+    fn test_format_duration_ns_exact_minutes() {
+        assert_eq!(format_duration_ns(&Value::U64(120_000_000_000)), "2m 0s");
+    }
+
+    #[test]
+    fn test_format_duration_ns_u32_fallback() {
+        assert_eq!(format_duration_ns(&Value::U32(2_000_000_000)), "2s");
+    }
+
+    #[test]
+    fn test_format_duration_ns_non_numeric() {
+        assert_eq!(format_duration_ns(&Value::Str("garbage".into())), "garbage");
+    }
+
+    // ── Timestamp formatting ──────────────────────────────────────────────
+
+    #[test]
+    fn test_format_timestamp_zero() {
+        assert_eq!(format_timestamp(&Value::U64(0)), "n/a");
+    }
+
+    #[test]
+    fn test_format_timestamp_nonzero() {
+        assert_eq!(format_timestamp(&Value::U64(1713415975000000)), "1713415975s (unix epoch)");
+    }
+
+    #[test]
+    fn test_format_timestamp_u32_fallback() {
+        assert_eq!(format_timestamp(&Value::U32(0)), "n/a");
+        assert_eq!(format_timestamp(&Value::U32(5_000_000)), "5s (unix epoch)");
+    }
+
+    #[test]
+    fn test_format_timestamp_non_numeric() {
+        assert_eq!(format_timestamp(&Value::Str("garbage".into())), "garbage");
+    }
+
+    // ── Dependency filtering ──────────────────────────────────────────────
+
+    #[test]
+    fn test_format_dependencies_filtration() {
+        let val = Value::Str("basic.target my-app.service systemd-journald.socket".into());
+        let result = format_dependencies(&val);
+        assert!(result.contains("my-app.service"));
+        assert!(result.contains("(+ 2 system units)"));
+    }
+
+    #[test]
+    fn test_format_dependencies_all_blocklisted() {
+        let val = Value::Str("basic.target sysinit.target".into());
+        let result = format_dependencies(&val);
+        assert_eq!(result, "(system default)");
+    }
+
+    #[test]
+    fn test_format_dependencies_empty() {
+        let val = Value::Str("".into());
+        let result = format_dependencies(&val);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_format_dependencies_no_blocklisted() {
+        let val = Value::Str("my-app.service my-db.service".into());
+        let result = format_dependencies(&val);
+        assert_eq!(result, "my-app.service my-db.service");
+    }
+}

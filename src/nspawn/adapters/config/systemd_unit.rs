@@ -122,3 +122,49 @@ pub async fn clone_systemd_override(source_name: &str, dest_name: &str) -> Resul
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_systemd_override_content_devices() {
+        let binds = vec!["/dev/nvidia0".to_string(), "/dev/nvidiactl".to_string()];
+        let content = systemd_override_content(&binds, false, false, false);
+        assert!(content.contains("[Service]"));
+        assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
+        assert!(content.contains("DeviceAllow=/dev/nvidiactl rw"));
+    }
+
+    #[test]
+    fn test_systemd_override_content_wayland() {
+        let content = systemd_override_content(&[], false, false, true);
+        assert!(content.contains("DeviceAllow=/dev/dri rw"));
+    }
+
+    #[test]
+    fn test_systemd_override_content_empty_devices_no_wayland() {
+        let content = systemd_override_content(&[], false, false, false);
+        assert!(content.contains("[Service]"));
+        assert!(!content.contains("DeviceAllow"));
+    }
+
+    #[test]
+    fn test_systemd_override_content_combined() {
+        let binds = vec!["/dev/nvidia0".to_string()];
+        let content = systemd_override_content(&binds, true, true, true);
+        assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
+        assert!(content.contains("DeviceAllow=/dev/dri rw"));
+        // nvidia_gpu and graphics_acceleration params are currently unused/commented out
+        // They should NOT produce any additional output
+        assert!(!content.contains("Delegate"));
+    }
+
+    #[test]
+    fn test_systemd_override_content_is_valid_ini() {
+        let binds = vec!["/dev/nvidia0".to_string()];
+        let content = systemd_override_content(&binds, false, false, true);
+        // Should be parseable as valid INI
+        assert!(Ini::load_from_str(&content).is_ok());
+    }
+}

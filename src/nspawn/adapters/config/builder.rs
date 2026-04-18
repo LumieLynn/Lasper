@@ -239,3 +239,55 @@ pub struct ContainerConfigWithPreview {
     pub cfg: ContainerConfig,
     pub preview: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::models::NetworkMode;
+
+    #[test]
+    fn test_build_config_defaults() {
+        let builder = ContainerConfigBuilder::default();
+        let result = builder.build_config(None);
+        assert_eq!(result.cfg.name, "unknown");
+        assert_eq!(result.cfg.hostname, "unknown");
+        assert_eq!(result.cfg.network, Some(NetworkMode::Host));
+    }
+
+    #[test]
+    fn test_build_config_oci_disables_boot() {
+        let mut builder = ContainerConfigBuilder::default();
+        builder.source = Some(SourceConfig {
+            kind: SourceKind::Oci,
+            oci_url: "ubuntu".to_string(),
+            deboot_mirror: "".to_string(),
+            deboot_suite: "".to_string(),
+            bootstrap_pkgs: "".to_string(),
+            local_path: "".to_string(),
+            clone_source: "".to_string(),
+            pull_url: "".to_string(),
+            is_pull_raw: false,
+        });
+        let result = builder.build_config(None);
+        assert!(!result.cfg.boot);
+    }
+
+    #[test]
+    fn test_build_config_passthrough_fields() {
+        let mut builder = ContainerConfigBuilder::default();
+        builder.passthrough = Some(PassthroughConfig {
+            bind_mounts: vec![],
+            device_binds: vec!["/dev/dri/card0".to_string()],
+            privileged: true,
+            graphics_acceleration: true,
+            wayland_socket: Some("wayland-0".to_string()),
+            nvidia_gpu: true,
+        });
+        let result = builder.build_config(None);
+        assert!(result.cfg.privileged);
+        assert!(result.cfg.graphics_acceleration);
+        assert_eq!(result.cfg.device_binds, vec!["/dev/dri/card0"]);
+        assert_eq!(result.cfg.wayland_socket, Some("wayland-0".to_string()));
+        assert!(result.cfg.nvidia_gpu);
+    }
+}
