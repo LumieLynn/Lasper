@@ -31,7 +31,7 @@ impl TerminalPanel {
             let mut style = Style::default().fg(Color::DarkGray);
             if i == active_idx {
                 style = style
-                    .fg(if is_focused { Color::Cyan } else { Color::White })
+                    .fg(if is_focused { Color::Yellow } else { Color::White })
                     .add_modifier(Modifier::BOLD);
             }
             spans.push(Span::styled(format!(" {} ", s.container_name), style));
@@ -42,7 +42,7 @@ impl TerminalPanel {
         let tabs_line = Line::from(spans);
 
         let border_color = if is_focused {
-            if session.insert_mode { Color::Green } else { Color::Yellow }
+            if session.insert_mode { Color::Green } else { Color::Cyan }
         } else {
             Color::DarkGray
         };
@@ -112,7 +112,7 @@ impl TerminalPanel {
         if is_focused && session.insert_mode && session.scroll_offset == 0 {
             let (row, col) = screen.cursor_position();
             if row < term_area.height && col < term_area.width {
-                f.set_cursor(term_area.x + col, term_area.y + row);
+                f.set_cursor_position((term_area.x + col, term_area.y + row));
             }
         }
     }

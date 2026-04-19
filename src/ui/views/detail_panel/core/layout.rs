@@ -49,8 +49,8 @@ macro_rules! handle_nav {
         let max = ($len).saturating_sub($height as usize);
         let safe_max = max.min(u16::MAX as usize) as u16;
         match $key.code {
-            crossterm::event::KeyCode::Up => $self.$field = $self.$field.saturating_sub(1),
-            crossterm::event::KeyCode::Down => $self.$field = ($self.$field + 1).min(safe_max),
+            crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => $self.$field = $self.$field.saturating_sub(1),
+            crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => $self.$field = ($self.$field + 1).min(safe_max),
             crossterm::event::KeyCode::PageUp => $self.$field = $self.$field.saturating_sub($step),
             crossterm::event::KeyCode::PageDown => $self.$field = ($self.$field + $step).min(safe_max),
             _ => return crate::ui::core::EventResult::Ignored,

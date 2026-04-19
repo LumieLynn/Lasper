@@ -181,17 +181,11 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" quit"),
             ]),
             crate::app::ActivePanel::DetailPanel => Line::from(vec![
-                kspan("[p]"),
-                hspan(" prop "),
-                kspan("[d]"),
-                hspan(" det "),
-                kspan("[l]"),
-                hspan(" logs "),
-                kspan("[c]"),
-                hspan(" config "),
-                kspan("[m]"),
-                hspan(" metrics "),
-                kspan("[↑/↓]"),
+                kspan("[Alt+1..5]"),
+                hspan(" panes "),
+                kspan("[[/]]"),
+                hspan(" cycle "),
+                kspan("[↑/↓ | j/k]"),
                 hspan(" scroll "),
                 kspan("[PgUp/Dn]"),
                 hspan(" page "),
@@ -214,14 +208,14 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     Line::from(vec![
                         kspan("[Alt+x]"),
                         hspan(" exit insert mode "),
-                        kspan("[Alt+1..9]"),
+                        kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs"),
                     ])
                 } else {
                     Line::from(vec![
                         kspan("[i/⏎/Alt+x]"),
                         hspan(" insert mode "),
-                        kspan("[1..9 / Alt+1..9]"),
+                        kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs "),
                         kspan("[t]"),
                         hspan(" hide "),
@@ -261,12 +255,12 @@ fn render_help(f: &mut Frame) {
         hrow("j / ↓", "Select next container"),
         hrow("k / ↑", "Select previous container"),
         Line::from(""),
-        hrow("p    ", "Properties pane"),
-        hrow("d    ", "Full details pane"),
-        hrow("l    ", "Logs pane (running only)"),
-        hrow("c    ", "Config pane (.nspawn file)"),
-        hrow("m    ", "Metrics pane (CPU/RAM charts)"),
-        hrow("↑/↓  ", "Scroll / navigate in detail pane"),
+        hrow("Alt+1..5", "Switch detail pane"),
+        hrow("[ / ]  ", "Cycle detail panes"),
+        hrow("↑/↓ | j/k", "Scroll / navigate in detail pane"),
+        Line::from(""),
+        hrow("Alt+1..9", "Switch terminal tab"),
+        hrow("[ / ]  ", "Cycle terminal tabs"),
         Line::from(""),
         hrow("s    ", "Start container  [root]"),
         hrow("S    ", "Poweroff container [root]"),
@@ -304,5 +298,3 @@ fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
         Span::raw(d),
     ])
 }
-
-// ── Utility ───────────────────────────────────────────────────────────────────

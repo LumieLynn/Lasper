@@ -1,5 +1,4 @@
 use crate::nspawn::{ContainerEntry, ContainerState};
-use crate::ui::views::detail_panel::property_style;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
@@ -53,11 +52,44 @@ impl SharedContainerList {
             }
         }
 
+        let selected_idx = self.state.selected();
         let items: Vec<ListItem> = entries
             .iter()
-            .map(|e| {
+            .enumerate()
+            .map(|(i, e)| {
+                let is_selected = Some(i) == selected_idx;
                 let state_label = e.state.label();
-                let style = property_style("State", state_label);
+
+                // Icon style (Yellow for alive, Gray for dead)
+                let icon_style = match &e.state {
+                    ContainerState::Running | ContainerState::Starting => {
+                        Style::default().fg(Color::Yellow)
+                    }
+                    _ => Style::default().fg(Color::DarkGray),
+                };
+
+                // Text style (Yellow for selected, Gray for others)
+                let text_style = if is_selected {
+                    let s = Style::default().fg(Color::Yellow);
+                    if self.focused {
+                        s.add_modifier(Modifier::BOLD)
+                    } else {
+                        s
+                    }
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
+                // Cursor logic (Yellow if focused, DarkGray if unfocused)
+                let cursor_symbol = if is_selected { ">> " } else { "   " };
+                let cursor_style = if self.focused {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+
                 let icon = match &e.state {
                     ContainerState::Running => "● ",
                     ContainerState::Starting => "◑ ",
@@ -66,9 +98,10 @@ impl SharedContainerList {
                 };
 
                 let mut spans = vec![
-                    Span::styled(icon.to_string(), style),
-                    Span::styled(e.name.clone(), style),
-                    Span::styled(format!(" ({})", state_label), style),
+                    Span::styled(cursor_symbol.to_string(), cursor_style),
+                    Span::styled(icon.to_string(), icon_style),
+                    Span::styled(e.name.clone(), text_style),
+                    Span::styled(format!(" ({})", state_label), text_style),
                 ];
 
                 if let Some(addr) = &e.address {
@@ -96,17 +129,7 @@ impl SharedContainerList {
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(border_color)),
             )
-            .highlight_symbol(">> ");
-
-        if self.focused {
-            list = list.highlight_style(
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            );
-        } else {
-            list = list.highlight_style(Style::default().fg(Color::DarkGray));
-        }
+            .highlight_style(Style::default());
 
         f.render_stateful_widget(list, area, &mut self.state);
     }

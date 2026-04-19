@@ -151,6 +151,21 @@ impl DetailPanel {
         (self.pane_height / 2).max(1)
     }
 
+    fn switch_pane(&mut self, pane: DetailPane) -> EventResult {
+        self.active_pane = pane.clone();
+        match self.active_pane {
+            DetailPane::Properties => self.properties_scroll = 0,
+            DetailPane::Details => self.details_scroll = 0,
+            DetailPane::Logs => {
+                let max = self.logs_len.saturating_sub(self.pane_height as usize);
+                self.log_scroll = max.min(u16::MAX as usize) as u16;
+            }
+            DetailPane::Config => self.config_scroll = 0,
+            DetailPane::Metrics => {}
+        }
+        EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(pane)))
+    }
+
     /// Handles all keyboard input for the detail panel.
     /// Returns Consumed for scroll/navigation, Message for pane switches.
     pub fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -158,40 +173,28 @@ impl DetailPanel {
 
         match key.code {
             // ─── Pane switching ────────────────────────────────────────────
-            KeyCode::Char('p') => {
-                self.active_pane = DetailPane::Properties;
-                self.properties_scroll = 0;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
-                    DetailPane::Properties,
-                )));
+            KeyCode::Char('[') => {
+                let next = self.active_pane.prev();
+                return self.switch_pane(next);
             }
-            KeyCode::Char('d') => {
-                self.active_pane = DetailPane::Details;
-                self.details_scroll = 0;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
-                    DetailPane::Details,
-                )));
+            KeyCode::Char(']') => {
+                let next = self.active_pane.next();
+                return self.switch_pane(next);
             }
-            KeyCode::Char('l') => {
-                self.active_pane = DetailPane::Logs;
-                let max = self.logs_len.saturating_sub(self.pane_height as usize);
-                self.log_scroll = max.min(u16::MAX as usize) as u16;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
-                    DetailPane::Logs,
-                )));
+            KeyCode::Char('1') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                return self.switch_pane(DetailPane::Properties);
             }
-            KeyCode::Char('c') => {
-                self.active_pane = DetailPane::Config;
-                self.config_scroll = 0;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
-                    DetailPane::Config,
-                )));
+            KeyCode::Char('2') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                return self.switch_pane(DetailPane::Details);
             }
-            KeyCode::Char('m') => {
-                self.active_pane = DetailPane::Metrics;
-                return EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
-                    DetailPane::Metrics,
-                )));
+            KeyCode::Char('3') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                return self.switch_pane(DetailPane::Logs);
+            }
+            KeyCode::Char('4') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                return self.switch_pane(DetailPane::Config);
+            }
+            KeyCode::Char('5') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                return self.switch_pane(DetailPane::Metrics);
             }
 
             // ─── Detail scrolling ──────────────────────────────────────────

@@ -30,6 +30,39 @@ pub enum DetailPane {
     Metrics,
 }
 
+impl DetailPane {
+    pub fn next(&self) -> Self {
+        match self {
+            DetailPane::Properties => DetailPane::Details,
+            DetailPane::Details => DetailPane::Logs,
+            DetailPane::Logs => DetailPane::Config,
+            DetailPane::Config => DetailPane::Metrics,
+            DetailPane::Metrics => DetailPane::Properties,
+        }
+    }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            DetailPane::Properties => DetailPane::Metrics,
+            DetailPane::Details => DetailPane::Properties,
+            DetailPane::Logs => DetailPane::Details,
+            DetailPane::Config => DetailPane::Logs,
+            DetailPane::Metrics => DetailPane::Config,
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Option<Self> {
+        match idx {
+            0 => Some(DetailPane::Properties),
+            1 => Some(DetailPane::Details),
+            2 => Some(DetailPane::Logs),
+            3 => Some(DetailPane::Config),
+            4 => Some(DetailPane::Metrics),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CpuRepresentation {
     /// Aggregate usage across all cores (e.g., 230% for 2.3 cores)

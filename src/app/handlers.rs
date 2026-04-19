@@ -25,8 +25,9 @@ impl App {
 
         // ── Terminal Panel (Priority) ─────────────────────────────────────────
         if self.ui.active_panel == ActivePanel::TerminalPanel {
-            if let Some(session) = self.data.terminal_sessions.get_mut(self.data.active_terminal_idx) {
-                // Tab switching: Ctrl+Number, Alt+Number, or just Number (in Normal mode)
+            let session_count = self.data.terminal_sessions.len();
+            if session_count > 0 {
+                // Tab switching: Alt+Number or [ ] brackets
                 let new_idx = match key.code {
                     KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => Some(0),
                     KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => Some(1),
@@ -37,11 +38,19 @@ impl App {
                     KeyCode::Char('7') if key.modifiers.contains(KeyModifiers::ALT) => Some(6),
                     KeyCode::Char('8') if key.modifiers.contains(KeyModifiers::ALT) => Some(7),
                     KeyCode::Char('9') if key.modifiers.contains(KeyModifiers::ALT) => Some(8),
+                    KeyCode::Char('[') => {
+                        let cur = self.data.active_terminal_idx;
+                        Some(if cur == 0 { session_count - 1 } else { cur - 1 })
+                    }
+                    KeyCode::Char(']') => {
+                        let cur = self.data.active_terminal_idx;
+                        Some((cur + 1) % session_count)
+                    }
                     _ => None,
                 };
 
                 if let Some(idx) = new_idx {
-                    if idx < self.data.terminal_sessions.len() {
+                    if idx < session_count {
                         self.data.active_terminal_idx = idx;
                         let name = self.data.terminal_sessions[idx].container_name.clone();
                         if let Some(pos) = self.data.entries.iter().position(|e| e.name == name) {
@@ -52,80 +61,65 @@ impl App {
                     return;
                 }
 
-                if session.insert_mode {
-                    let is_toggle = key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::ALT);
-                    
-                    if is_toggle {
-                        session.insert_mode = false;
+                // Now borrow session for input handling
+                if let Some(session) = self.data.terminal_sessions.get_mut(self.data.active_terminal_idx) {
+                    if session.insert_mode {
+                        let is_toggle = key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::ALT);
+                        
+                        if is_toggle {
+                            session.insert_mode = false;
+                            return;
+                        }
+                        
+                        // Forward other keys to PTY
+                        let bytes = crate::ui::views::terminal_panel::encode_key(key);
+                        let _ = session.pty_tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
                         return;
-                    }
-                    
-                    // Forward other keys to PTY
-                    let bytes = crate::ui::views::terminal_panel::encode_key(key);
-                    let _ = session.pty_tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
-                    return;
-                } else {
-                    // Normal Mode keys - Handle locally and RETURN to prevent pollution
-                    let normal_idx = match key.code {
-                        KeyCode::Enter | KeyCode::Char('i') => {
-                            session.insert_mode = true;
-                            session.scroll_offset = 0;
-                            return;
-                        }
-                        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
-                            session.insert_mode = true;
-                            session.scroll_offset = 0;
-                            return;
-                        }
-                        KeyCode::Char('x') => {
-                            self.close_active_terminal();
-                            return;
-                        }
-                        KeyCode::PageUp => {
-                            let mut screen = session.terminal.lock().screen().clone();
-                            screen.set_scrollback(usize::MAX);
-                            let max_scroll = screen.scrollback();
-                            session.scroll_offset = session.scroll_offset.saturating_add(10).min(max_scroll);
-                            return;
-                        }
-                        KeyCode::PageDown => {
-                            session.scroll_offset = session.scroll_offset.saturating_sub(10);
-                            return;
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            let mut screen = session.terminal.lock().screen().clone();
-                            screen.set_scrollback(usize::MAX);
-                            let max_scroll = screen.scrollback();
-                            session.scroll_offset = session.scroll_offset.saturating_add(1).min(max_scroll);
-                            return;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            session.scroll_offset = session.scroll_offset.saturating_sub(1);
-                            return;
-                        }
-                        KeyCode::Char('1') => Some(0),
-                        KeyCode::Char('2') => Some(1),
-                        KeyCode::Char('3') => Some(2),
-                        KeyCode::Char('4') => Some(3),
-                        KeyCode::Char('5') => Some(4),
-                        KeyCode::Char('6') => Some(5),
-                        KeyCode::Char('7') => Some(6),
-                        KeyCode::Char('8') => Some(7),
-                        KeyCode::Char('9') => Some(8),
-                        KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('t') => None,
-                        _ => return, // Consume other keys in Normal Mode
-                    };
-
-                    if let Some(idx) = normal_idx {
-                        if idx < self.data.terminal_sessions.len() {
-                            self.data.active_terminal_idx = idx;
-                            let name = self.data.terminal_sessions[idx].container_name.clone();
-                            if let Some(pos) = self.data.entries.iter().position(|e| e.name == name) {
-                                self.data.selected = pos;
-                                self.refresh_detail().await;
+                    } else {
+                        // Normal Mode keys - Handle locally and RETURN to prevent pollution
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Char('i') => {
+                                session.insert_mode = true;
+                                session.scroll_offset = 0;
+                                return;
                             }
-                        }
-                        return;
+                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                session.insert_mode = true;
+                                session.scroll_offset = 0;
+                                return;
+                            }
+                            KeyCode::Char('x') => {
+                                self.close_active_terminal();
+                                return;
+                            }
+                            KeyCode::PageUp => {
+                                let mut screen = session.terminal.lock().screen().clone();
+                                screen.set_scrollback(usize::MAX);
+                                let max_scroll = screen.scrollback();
+                                session.scroll_offset = session.scroll_offset.saturating_add(10).min(max_scroll);
+                                return;
+                            }
+                            KeyCode::PageDown => {
+                                session.scroll_offset = session.scroll_offset.saturating_sub(10);
+                                return;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                let mut screen = session.terminal.lock().screen().clone();
+                                screen.set_scrollback(usize::MAX);
+                                let max_scroll = screen.scrollback();
+                                session.scroll_offset = session.scroll_offset.saturating_add(1).min(max_scroll);
+                                return;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                session.scroll_offset = session.scroll_offset.saturating_sub(1);
+                                return;
+                            }
+                            KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3') | KeyCode::Char('4') | 
+                            KeyCode::Char('5') | KeyCode::Char('6') | KeyCode::Char('7') | KeyCode::Char('8') | 
+                            KeyCode::Char('9') => return,
+                            KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('t') => {}
+                            _ => return, // Consume other keys in Normal Mode
+                        };
                     }
                 }
             }
