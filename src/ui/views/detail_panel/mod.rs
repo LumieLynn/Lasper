@@ -26,6 +26,7 @@ pub struct DetailPanel {
     pub config_scroll: u16,
     pub pane_height: u16,
     pub focused: bool,
+    pub(crate) old_pane_height: u16,
     pub(crate) details_len: usize,
     pub(crate) properties_len: usize,
     pub(crate) logs_len: usize,
@@ -41,6 +42,7 @@ impl DetailPanel {
             log_scroll: 0,
             config_scroll: 0,
             pane_height: 10,
+            old_pane_height: 10,
             focused: false,
             details_len: 0,
             properties_len: 0,
@@ -76,6 +78,7 @@ impl DetailPanel {
         
         // Use extracted scroll logic
         core::scrolling::sync_data_lengths(self, data, pane_width.max(1));
+        self.old_pane_height = self.pane_height;
 
         f.render_widget(Clear, area);
         f.render_widget(block, area);

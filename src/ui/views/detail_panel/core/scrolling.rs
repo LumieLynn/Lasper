@@ -73,11 +73,19 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
         .log_lines
         .iter()
         .map(|l| {
-            let count = l.chars().count();
-            if count == 0 {
+            // Very simple tab expansion for width calculation
+            let mut visual_width = 0;
+            for c in l.chars() {
+                if c == '\t' {
+                    visual_width += 8 - (visual_width % 8);
+                } else {
+                    visual_width += 1;
+                }
+            }
+            if visual_width == 0 {
                 1
             } else {
-                (count + width - 1) / width
+                (visual_width + width - 1) / width
             }
         })
         .sum();
@@ -100,9 +108,14 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
         .unwrap_or(0);
 
     // Sticky autoscroll for Logs
-    if panel.active_pane == DetailPane::Logs && panel.logs_len > old_logs_len {
-        let max_scroll_old = old_logs_len.saturating_sub(panel.pane_height as usize) as u16;
-        if panel.log_scroll >= max_scroll_old {
+    // We scroll to bottom if:
+    // 1. New logs arrived while we were at the old bottom
+    // 2. The viewport shrunk while we were at the old bottom
+    if panel.active_pane == DetailPane::Logs {
+        let max_scroll_old = old_logs_len.saturating_sub(panel.old_pane_height as usize) as u16;
+        let at_bottom = panel.log_scroll >= max_scroll_old;
+
+        if at_bottom && (panel.logs_len > old_logs_len || panel.pane_height < panel.old_pane_height) {
             let max_scroll_new = panel.logs_len.saturating_sub(panel.pane_height as usize);
             panel.log_scroll = max_scroll_new.min(u16::MAX as usize) as u16;
         }

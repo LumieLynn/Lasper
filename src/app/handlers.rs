@@ -181,8 +181,6 @@ impl App {
             return;
         }
 
-        // Update pane_height into the detail panel before processing keys.
-        self.ui.detail_panel.pane_height = self.ui.pane_height;
 
         // ── Global keys ───────────────────────────────────────────────────────
         match key.code {
