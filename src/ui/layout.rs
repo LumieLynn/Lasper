@@ -38,6 +38,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if app.ui.show_help {
         render_help(f);
     }
+    if let Some(dialog) = &mut app.ui.quit_dialog {
+        dialog.render(f, area);
+    }
 }
 
 // ── Title ─────────────────────────────────────────────────────────────────────
@@ -88,11 +91,10 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 // ── Content ───────────────────────────────────────────────────────────────────
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
-    app.ui.pane_height = area.height.saturating_sub(2);
-    app.ui.detail_panel.pane_height = app.ui.pane_height;
-
     let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
     let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
+    let terminal_focused = app.ui.active_panel == crate::app::ActivePanel::TerminalPanel;
+
     app.ui.detail_panel.set_focus(detail_focused);
 
     let cols = Layout::default()
@@ -100,15 +102,44 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
+    let list_area = cols[0];
+    let right_area = cols[1];
+
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if app.ui.show_terminal {
+            vec![Constraint::Percentage(60), Constraint::Percentage(40)]
+        } else {
+            vec![Constraint::Percentage(100)]
+        })
+        .split(right_area);
+
+    let detail_area = right_chunks[0];
+
+    app.ui.pane_height = list_area.height.saturating_sub(2);
+    app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
+
+    if app.ui.show_terminal {
+        let terminal_area = right_chunks[1];
+        let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
+        terminal_panel.render(
+            f,
+            terminal_area,
+            &app.data.terminal_sessions,
+            app.data.active_terminal_idx,
+            terminal_focused,
+        );
+    }
+
     app.ui.container_list.render_with_data(
         f,
-        cols[0],
+        list_area,
         &app.data.entries,
         app.data.selected,
         app.is_root,
         list_focused,
     );
-    app.ui.detail_panel.render_with_data(f, cols[1], &app.data);
+    app.ui.detail_panel.render_with_data(f, detail_area, &app.data);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -142,6 +173,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" new "),
                 kspan("[r]"),
                 hspan(" refresh "),
+                kspan("[t]"),
+                hspan(" terminal "),
                 kspan("[?]"),
                 hspan(" help "),
                 kspan("[q]"),
@@ -164,11 +197,41 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" page "),
                 kspan("[Tab]"),
                 hspan(" → list "),
+                kspan("[t]"),
+                hspan(" terminal "),
                 kspan("[?]"),
                 hspan(" help "),
                 kspan("[q]"),
                 hspan(" quit"),
             ]),
+            crate::app::ActivePanel::TerminalPanel => {
+                let insert_mode = if let Some(session) = app.data.terminal_sessions.get(app.data.active_terminal_idx) {
+                    session.insert_mode
+                } else {
+                    false
+                };
+                if insert_mode {
+                    Line::from(vec![
+                        kspan("[Alt+x]"),
+                        hspan(" exit insert mode "),
+                        kspan("[Alt+1..9]"),
+                        hspan(" switch tabs"),
+                    ])
+                } else {
+                    Line::from(vec![
+                        kspan("[i/⏎/Alt+x]"),
+                        hspan(" insert mode "),
+                        kspan("[1..9 / Alt+1..9]"),
+                        hspan(" switch tabs "),
+                        kspan("[t]"),
+                        hspan(" hide "),
+                        kspan("[x]"),
+                        hspan(" close tab "),
+                        kspan("[q]"),
+                        hspan(" quit"),
+                    ])
+                }
+            }
         }
     };
 

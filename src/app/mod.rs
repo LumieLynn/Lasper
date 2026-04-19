@@ -4,9 +4,7 @@ pub mod actions;
 pub mod handlers;
 
 use anyhow::Result;
-use ratatui::{backend::CrosstermBackend, Terminal};
 use std::collections::{HashMap, VecDeque};
-use std::io::Stdout;
 use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
@@ -14,6 +12,8 @@ use crate::nspawn::{
     models::ContainerEntry,
     ops::{DefaultManager, NspawnManager},
 };
+use ratatui::{backend::CrosstermBackend, Terminal};
+use std::io::Stdout;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
@@ -60,6 +60,7 @@ impl Default for ContainerMetrics {
 pub enum ActivePanel {
     ContainerList,
     DetailPanel,
+    TerminalPanel,
 }
 
 pub struct AppUi {
@@ -67,6 +68,7 @@ pub struct AppUi {
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
+    pub show_terminal: bool,
     pub show_wizard: bool,
     pub show_help: bool,
     pub power_menu: Option<crate::ui::widgets::power_menu::PowerMenu>,
@@ -78,6 +80,7 @@ pub struct AppUi {
     pub status_expiry: Option<Instant>,
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
 }
 
 impl AppUi {
@@ -86,6 +89,7 @@ impl AppUi {
             active_panel: ActivePanel::ContainerList,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
+            show_terminal: false,
             show_wizard: false,
             show_help: false,
             power_menu: None,
@@ -95,15 +99,36 @@ impl AppUi {
             status_expiry: None,
             backend_tx: None,
             app_tx: None,
+            quit_dialog: None,
         }
     }
 
     pub fn toggle_focus(&mut self) {
         self.active_panel = match self.active_panel {
             ActivePanel::ContainerList => ActivePanel::DetailPanel,
-            ActivePanel::DetailPanel => ActivePanel::ContainerList,
+            ActivePanel::DetailPanel => {
+                if self.show_terminal {
+                    ActivePanel::TerminalPanel
+                } else {
+                    ActivePanel::ContainerList
+                }
+            }
+            ActivePanel::TerminalPanel => ActivePanel::ContainerList,
         };
     }
+}
+
+pub struct TerminalSession {
+    pub container_name: String,
+    pub terminal: std::sync::Arc<
+        parking_lot::Mutex<
+            vt100::Parser<crate::nspawn::adapters::comm::pty::PtyReply>,
+        >,
+    >,
+    pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
+    pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
+    pub scroll_offset: usize,
+    pub insert_mode: bool,
 }
 
 // ── App ───────────────────────────────────────────────────────────────────────
@@ -123,6 +148,10 @@ pub struct AppData {
     pub metrics: HashMap<String, ContainerMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
+
+    // Terminal state
+    pub terminal_sessions: Vec<TerminalSession>,
+    pub active_terminal_idx: usize,
 }
 
 /// Global application state.
@@ -154,6 +183,8 @@ impl App {
                     .map(|n| n.get())
                     .unwrap_or(1),
                 cpu_representation: CpuRepresentation::Aggregate,
+                terminal_sessions: Vec::new(),
+                active_terminal_idx: 0,
             },
             ui: AppUi::new(is_root),
         }
@@ -274,6 +305,7 @@ impl App {
                     self.data.log_lines.pop_front();
                 }
             }
+            AppEvent::TerminalRedraw => {}
         }
     }
 
@@ -337,6 +369,7 @@ impl App {
                 break;
             }
         }
+        self.cleanup_all_terminals();
         Ok(())
     }
 

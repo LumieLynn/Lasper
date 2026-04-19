@@ -286,4 +286,109 @@ impl App {
             |name, manager| async move { manager.disable(&name).await },
         );
     }
+
+    pub fn spawn_terminal(&mut self) {
+        // Use current UI height for initial rows, default columns
+        let rows = self.ui.pane_height.max(10);
+        let cols = 80; // Standard fallback
+
+        // Get the selected container
+        let entry = match self.data.entries.get(self.data.selected) {
+            Some(e) => e,
+            None => return,
+        };
+
+        // Only for running containers.
+        if !entry.state.is_running() {
+            self.set_status(
+                format!("Container {} is not running", entry.name),
+                crate::ui::StatusLevel::Error,
+            );
+            return;
+        }
+
+        // Check if session already exists
+        if let Some(idx) = self.data.terminal_sessions.iter().position(|s| s.container_name == entry.name) {
+            self.data.active_terminal_idx = idx;
+            self.ui.show_terminal = true;
+            self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
+            return;
+        }
+
+        let cmd = "machinectl";
+        let args = vec!["login".to_string(), entry.name.clone()];
+        let container_name = entry.name.clone();
+
+        if let Some(tx) = &self.ui.app_tx {
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            match crate::nspawn::adapters::comm::pty::spawn_terminal(
+                cmd,
+                &arg_refs,
+                cols,
+                rows,
+                tx.clone(),
+            ) {
+                Ok((term, pty_tx, handle)) => {
+                    let session = super::TerminalSession {
+                        container_name,
+                        terminal: term,
+                        pty_tx,
+                        handle,
+                        scroll_offset: 0,
+                        insert_mode: true, // Default to insert mode on spawn
+                    };
+                    self.data.terminal_sessions.push(session);
+                    self.data.active_terminal_idx = self.data.terminal_sessions.len() - 1;
+                    self.ui.show_terminal = true;
+                    self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
+                    self.set_status(format!("Logged into {}", args[1]), crate::ui::StatusLevel::Info);
+                }
+                Err(e) => {
+                    self.set_status(
+                        format!("Failed to spawn terminal: {}", e),
+                        crate::ui::StatusLevel::Error,
+                    );
+                }
+            }
+        }
+    }
+
+    pub fn close_active_terminal(&mut self) {
+        if self.data.terminal_sessions.is_empty() {
+            self.ui.show_terminal = false;
+            return;
+        }
+
+        let mut session = self.data.terminal_sessions.remove(self.data.active_terminal_idx);
+        session.handle.abort();
+        
+        if self.data.active_terminal_idx >= self.data.terminal_sessions.len() && !self.data.terminal_sessions.is_empty() {
+            self.data.active_terminal_idx = self.data.terminal_sessions.len() - 1;
+        }
+
+        if self.data.terminal_sessions.is_empty() {
+            self.ui.show_terminal = false;
+            self.ui.active_panel = crate::app::ActivePanel::DetailPanel;
+        }
+    }
+
+    pub fn sync_terminal_to_selected(&mut self) {
+        let entry = match self.data.entries.get(self.data.selected) {
+            Some(e) => e,
+            None => return,
+        };
+
+        if let Some(idx) = self.data.terminal_sessions.iter().position(|s| s.container_name == entry.name) {
+            self.data.active_terminal_idx = idx;
+        } else {
+            // Hide terminal if no session for the selected container
+            self.ui.show_terminal = false;
+        }
+    }
+
+    pub fn cleanup_all_terminals(&mut self) {
+        for mut session in self.data.terminal_sessions.drain(..) {
+            session.handle.abort();
+        }
+    }
 }

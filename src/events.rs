@@ -16,6 +16,8 @@ pub enum AppEvent {
     MetricsUpdate(String, f64, f64, f64),
     /// Real-time log line from a container.
     LogLine(String),
+    /// Request a UI redraw for the terminal.
+    TerminalRedraw,
 }
 
 /// Merges keyboard input and periodic ticks into one channel.

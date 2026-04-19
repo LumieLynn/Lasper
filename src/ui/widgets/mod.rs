@@ -1,3 +1,4 @@
+pub mod confirmation;
 pub mod power_menu;
 
 pub mod composites;
