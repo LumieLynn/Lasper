@@ -12,7 +12,7 @@ use crate::nspawn::{
     models::ContainerEntry,
     ops::{DefaultManager, NspawnManager},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
 use std::io::Stdout;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
@@ -170,7 +170,9 @@ pub struct AppData {
     pub entries: Vec<ContainerEntry>,
     pub selected: usize,
     pub properties: Result<crate::nspawn::models::MachineProperties, String>,
-    pub log_lines: VecDeque<String>,
+    pub log_lines: VecDeque<Line<'static>>,
+    pub log_offset_index: Vec<usize>,
+    pub log_wrapped_height: usize,
     pub log_stream: Option<(String, tokio::task::JoinHandle<()>)>,
     pub config_content: Option<String>,
     pub dbus_active: bool,
@@ -181,6 +183,12 @@ pub struct AppData {
     pub metrics: HashMap<String, ContainerMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
+
+    // Dirty flags to avoid redundant O(N) calculations
+    pub properties_dirty: bool,
+    pub config_dirty: bool,
+    pub details_dirty: bool,
+    pub logs_dirty: bool,
 
     // Terminal state
     pub terminal_sessions: Vec<TerminalSession>,
@@ -205,6 +213,8 @@ impl App {
                 selected: 0,
                 properties: Ok(crate::nspawn::models::MachineProperties::default()),
                 log_lines: VecDeque::with_capacity(5000),
+                log_offset_index: Vec::with_capacity(5000),
+                log_wrapped_height: 0,
                 log_stream: None,
                 config_content: None,
                 dbus_active: true,
@@ -216,6 +226,10 @@ impl App {
                     .map(|n| n.get())
                     .unwrap_or(1),
                 cpu_representation: CpuRepresentation::Aggregate,
+                properties_dirty: true,
+                config_dirty: true,
+                details_dirty: true,
+                logs_dirty: true,
                 terminal_sessions: Vec::new(),
                 active_terminal_idx: 0,
             },
@@ -333,10 +347,11 @@ impl App {
                 self.update_metrics(name, time_x, cpu, ram)
             }
             AppEvent::LogLine(line) => {
-                self.data.log_lines.push_back(line);
+                self.data.log_lines.push_back(Line::from(line));
                 if self.data.log_lines.len() > 5000 {
                     self.data.log_lines.pop_front();
                 }
+                self.data.logs_dirty = true;
             }
             AppEvent::TerminalRedraw => {}
         }

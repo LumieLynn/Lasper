@@ -139,7 +139,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         app.is_root,
         list_focused,
     );
-    app.ui.detail_panel.render_with_data(f, detail_area, &app.data);
+    app.ui.detail_panel.render_with_data(f, detail_area, &mut app.data);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────

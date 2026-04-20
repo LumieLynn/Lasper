@@ -1,7 +1,6 @@
 pub mod core;
 pub mod panes;
 
-pub use core::style::property_style;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -31,6 +30,7 @@ pub struct DetailPanel {
     pub(crate) properties_len: usize,
     pub(crate) logs_len: usize,
     pub(crate) config_len: usize,
+    pub(crate) last_rendered_width: u16,
 }
 
 impl DetailPanel {
@@ -48,6 +48,7 @@ impl DetailPanel {
             properties_len: 0,
             logs_len: 0,
             config_len: 0,
+            last_rendered_width: 0,
         }
     }
 
@@ -55,7 +56,7 @@ impl DetailPanel {
         self.focused = focused;
     }
 
-    pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &AppData) {
+    pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &mut AppData) {
         // Border
         let border_color = if self.focused {
             Color::Cyan
@@ -74,10 +75,12 @@ impl DetailPanel {
         // Get inner area
         let inner_area = block.inner(area);
         self.pane_height = inner_area.height;
-        let pane_width = inner_area.width as usize;
+        
+        // Reserve 1 column for the scrollbar to avoid text overlap and wrapping issues
+        let pane_width = (inner_area.width as usize).saturating_sub(1).max(1);
         
         // Use extracted scroll logic
-        core::scrolling::sync_data_lengths(self, data, pane_width.max(1));
+        core::scrolling::sync_data_lengths(self, data, pane_width);
         self.old_pane_height = self.pane_height;
 
         f.render_widget(Clear, area);

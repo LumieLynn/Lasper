@@ -1,5 +1,6 @@
 use ratatui::{
     layout::Rect,
+    text::Line,
     widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
@@ -7,8 +8,10 @@ use ratatui::{
 use crate::app::{AppData, DetailPane};
 use super::super::DetailPanel;
 
-pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) {
+pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usize) {
     let old_logs_len = panel.logs_len;
+    let width_changed = panel.last_rendered_width != width as u16;
+    panel.last_rendered_width = width as u16;
 
     let val_width = if width > 6 {
         (width as f32 * 0.65) as usize
@@ -17,18 +20,16 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
     };
     let val_width = val_width.saturating_sub(3).max(10);
 
-    panel.details_len = data
-        .properties
-        .as_ref()
-        .map(|p| {
-            p.groups
-                .iter()
-                .filter(|g| !g.properties.is_empty())
-                .map(|g| {
-                    let mut group_lines = 2; // Header + Spacer
-                    for (_, v) in &g.properties {
-                        group_lines += v
-                            .lines()
+    // 1. Properties
+    if data.properties_dirty || width_changed {
+        panel.properties_len = data
+            .properties
+            .as_ref()
+            .map(|p| {
+                p.get_summary()
+                    .iter()
+                    .map(|(_, v)| {
+                        v.lines()
                             .map(|l| {
                                 let count = l.chars().count();
                                 if count == 0 {
@@ -38,79 +39,94 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
                                 }
                             })
                             .sum::<usize>()
-                            .max(1);
-                    }
-                    group_lines
-                })
-                .sum()
-        })
-        .unwrap_or(0);
+                            .max(1)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        data.properties_dirty = false;
+    }
 
-    panel.properties_len = data
-        .properties
-        .as_ref()
-        .map(|p| {
-            p.get_summary()
-                .iter()
-                .map(|(_, v)| {
-                    v.lines()
-                        .map(|l| {
-                            let count = l.chars().count();
-                            if count == 0 {
-                                1
-                            } else {
-                                (count + val_width - 1) / val_width
-                            }
-                        })
-                        .sum::<usize>()
-                        .max(1)
-                })
-                .sum()
-        })
-        .unwrap_or(0);
+    // 2. Details
+    if data.details_dirty || width_changed {
+        panel.details_len = data
+            .properties
+            .as_ref()
+            .map(|p| {
+                p.groups
+                    .iter()
+                    .filter(|g| !g.properties.is_empty())
+                    .map(|g| {
+                        let mut group_lines = 2; // Header + Spacer
+                        for (_, v) in &g.properties {
+                            group_lines += v
+                                .lines()
+                                .map(|l| {
+                                    let count = l.chars().count();
+                                    if count == 0 {
+                                        1
+                                    } else {
+                                        (count + val_width - 1) / val_width
+                                    }
+                                })
+                                .sum::<usize>()
+                                .max(1);
+                        }
+                        group_lines
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        data.details_dirty = false;
+    }
 
-    panel.logs_len = data
-        .log_lines
-        .iter()
-        .map(|l| {
-            // Very simple tab expansion for width calculation
-            let mut visual_width = 0;
-            for c in l.chars() {
-                if c == '\t' {
-                    visual_width += 8 - (visual_width % 8);
-                } else {
-                    visual_width += 1;
-                }
+    // 3. Config
+    if data.config_dirty || width_changed {
+        panel.config_len = data
+            .config_content
+            .as_ref()
+            .map(|c| {
+                c.lines()
+                    .map(|l| {
+                        let count = l.chars().count();
+                        if count == 0 {
+                            1
+                        } else {
+                            (count + width - 1) / width
+                        }
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        data.config_dirty = false;
+    }
+
+    // 4. Logs (The hot path)
+    if data.logs_dirty || width_changed {
+        if width_changed || data.log_lines.len() < data.log_offset_index.len() {
+            // Full re-calculate index
+            data.log_offset_index.clear();
+            let mut current_y = 0;
+            for line in &data.log_lines {
+                data.log_offset_index.push(current_y);
+                current_y += calculate_line_wrapped_height(line, width);
             }
-            if visual_width == 0 {
-                1
-            } else {
-                (visual_width + width - 1) / width
+            data.log_wrapped_height = current_y;
+        } else {
+            // Incremental append
+            let mut current_y = data.log_wrapped_height;
+            let start_idx = data.log_offset_index.len();
+            for i in start_idx..data.log_lines.len() {
+                data.log_offset_index.push(current_y);
+                current_y += calculate_line_wrapped_height(&data.log_lines[i], width);
             }
-        })
-        .sum();
-
-    panel.config_len = data
-        .config_content
-        .as_ref()
-        .map(|c| {
-            c.lines()
-                .map(|l| {
-                    let count = l.chars().count();
-                    if count == 0 {
-                        1
-                    } else {
-                        (count + width - 1) / width
-                    }
-                })
-                .sum()
-        })
-        .unwrap_or(0);
+            data.log_wrapped_height = current_y;
+        }
+        panel.logs_len = data.log_wrapped_height;
+        data.logs_dirty = false;
+    }
 
     // Sticky autoscroll for Logs
-    // We scroll to bottom if:
-    // 1. New logs arrived while we were at the old bottom
-    // 2. The viewport shrunk while we were at the old bottom
     if panel.active_pane == DetailPane::Logs {
         let max_scroll_old = old_logs_len.saturating_sub(panel.old_pane_height as usize) as u16;
         let at_bottom = panel.log_scroll >= max_scroll_old;
@@ -121,8 +137,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
         }
     }
 
-    // Always clamp scroll to the current max so a width change never
-    // leaves us past the real bottom of the content.
+    // Always clamp scroll to current max
     let log_max = panel.logs_len.saturating_sub(panel.pane_height as usize);
     panel.log_scroll = panel.log_scroll.min(log_max.min(u16::MAX as usize) as u16);
 
@@ -135,6 +150,49 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &AppData, width: usize) 
     let prop_max = panel.properties_len.saturating_sub(panel.pane_height as usize);
     panel.properties_scroll =
         panel.properties_scroll.min(prop_max.min(u16::MAX as usize) as u16);
+}
+
+fn calculate_line_wrapped_height(line: &Line, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let mut lines = 0;
+    let mut current_line_width = 0;
+
+    for span in &line.spans {
+        // Split by whitespace to simulate word wrapping
+        for word in span.content.split_inclusive(' ') {
+            let mut word_width = 0;
+            for c in word.chars() {
+                if c == '\t' {
+                    word_width += 8 - (word_width % 8);
+                } else {
+                    word_width += 1;
+                }
+            }
+
+            if current_line_width + word_width > width {
+                if word_width > width {
+                    // Single long word wraps multiple times
+                    if current_line_width > 0 {
+                        lines += 1;
+                    }
+                    lines += (word_width - 1) / width;
+                    current_line_width = word_width % width;
+                } else {
+                    // Word moves to new line
+                    lines += 1;
+                    current_line_width = word_width;
+                }
+            } else {
+                current_line_width += word_width;
+            }
+        }
+    }
+    if current_line_width > 0 || lines == 0 {
+        lines += 1;
+    }
+    lines
 }
 
 pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {

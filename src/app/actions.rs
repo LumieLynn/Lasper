@@ -1,5 +1,6 @@
 use super::{App, DetailPane};
 use crate::nspawn::{models::ContainerEntry, models::ContainerState};
+use ratatui::text::Line;
 use std::time::{Duration, Instant};
 
 impl App {
@@ -16,6 +17,8 @@ impl App {
                     .get(self.data.selected)
                     .map(|e| e.name.clone());
                 self.data.entries = self.merge_transitional_states(entries);
+                self.data.properties_dirty = true;
+                self.data.details_dirty = true;
                 self.data.selected = prev_name
                     .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
                     .unwrap_or(0)
@@ -41,8 +44,11 @@ impl App {
             Some(e) => e.clone(),
             Option::None => {
                 self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
+                self.data.properties_dirty = true;
                 self.data.log_lines.clear();
+                self.data.logs_dirty = true;
                 self.data.config_content = Option::None;
+                self.data.config_dirty = true;
                 if let Some((_, handle)) = self.data.log_stream.take() {
                     handle.abort();
                 }
@@ -86,10 +92,14 @@ impl App {
                         }
 
                         self.data.properties = Ok(p);
+                        self.data.properties_dirty = true;
+                        self.data.details_dirty = true;
                     }
                     Err(e) => {
                         log::debug!("{e}");
                         self.data.properties = Err(e.to_string());
+                        self.data.properties_dirty = true;
+                        self.data.details_dirty = true;
                     }
                 }
             }
@@ -106,6 +116,7 @@ impl App {
                             handle.abort();
                         }
                         self.data.log_lines.clear();
+                        self.data.logs_dirty = true;
                         if let Some(tx) = &self.ui.app_tx {
                             let handle = self.data.manager.spawn_log_stream(&entry.name, tx.clone());
                             self.data.log_stream = Some((entry.name.clone(), handle));
@@ -116,7 +127,8 @@ impl App {
                         handle.abort();
                     }
                     self.data.log_lines.clear();
-                    self.data.log_lines.push_back("Container is not running.".into());
+                    self.data.log_lines.push_back(Line::from("Container is not running."));
+                    self.data.logs_dirty = true;
                 }
             }
             DetailPane::Config => {
@@ -124,6 +136,7 @@ impl App {
                     crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name).await.map(|c| c.content);
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
+                    self.data.config_dirty = true;
                 }
                 self.data.config_content = new_content;
             }
