@@ -7,6 +7,7 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 ## Features
 
 - **Container Management**: Start, stop, restart, enable/disable, and terminate systemd-nspawn containers. View properties, full details, and journal logs directly in the terminal via a unified dashboard.
+- **Integrated Terminal**: Seamlessly jump into container shells via `machinectl login`. Features a modal interface (Normal/Insert modes) for easy scrolling and multi-session management without leaving the dashboard.
 - **Creation Wizard**: Interactively generate `.nspawn` configurations with background task execution for image provisioning and deployment.
 - **Image Provisioning**:
   - Pull and extract OCI (Docker/Podman) images via `skopeo` and `umoci`.
@@ -50,18 +51,19 @@ Start the UI:
 sudo lasper
 ```
 
-You can adds a container via the creation wizard. Tap `a` or `n` to open the wizard.
+You can add a container via the creation wizard. Tap `a` or `n` to open the wizard.
 
-It's recommended to use `machinectl` to connect to the container after creation and starting. For example: `sudo machinectl shell <user_name>@<container_name>`. Ensures that you installed systembus and an init program inside your container.
+It's recommended to use `machinectl` to connect to the container after creation and starting. For example: `sudo machinectl shell <user_name>@<container_name>`. Ensure that you installed systembus and an init program inside your container.
 
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
 - `Enter` / `x` : Open Action Power Menu (Start, Poweroff, Reboot, Terminate, Kill, Enable, Disable)
-- `Tab` : Toggle Focus (Container List ↔ Detail Panel)
+- `Tab` : Toggle Focus (Container List ↔ Detail Panel ↔ Terminal)
 - `n` / `a` : Create a new container (Creation Wizard)
 - `s` : Start selected container
 - `S` : Poweroff selected container
-- `p` / `d` / `l` / `c` / `m` : Switch view panes (Properties / All Details / Logs / Config / Monitoring)
+- `[` / `]` or `Alt + 1-5` : Switch view panes (Properties / Details / Logs / Config / Metrics)
+- `t` : Open shell terminal (machinectl login)
 - `r` : Manual refresh data
 - `?` : Show help
 - `q` : Quit
