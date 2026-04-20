@@ -27,6 +27,7 @@ impl<T> EditableList<T> {
         self.list.add_item(item);
     }
 
+    #[allow(dead_code)]
     pub fn remove_item(&mut self, idx: usize) {
         self.list.remove_item(idx);
     }

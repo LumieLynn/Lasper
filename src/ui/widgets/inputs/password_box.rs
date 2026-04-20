@@ -25,10 +25,7 @@ impl PasswordBox {
         self.base.input.value()
     }
 
-    pub fn set_value(&mut self, value: String) {
-        self.base.input = tui_input::Input::from(value);
-    }
-
+    #[allow(dead_code)]
     pub fn with_validator<F>(mut self, f: F) -> Self
     where
         F: Fn(&str) -> Result<(), String> + 'static,

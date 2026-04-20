@@ -26,6 +26,7 @@ impl RadioGroup {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self

@@ -29,10 +29,12 @@ impl Checkbox {
         self
     }
 
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
+    #[allow(dead_code)]
     pub fn set_checked(&mut self, checked: bool) {
         self.checked = checked;
     }

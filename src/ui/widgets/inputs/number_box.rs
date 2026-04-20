@@ -19,15 +19,18 @@ impl NumberBox {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.base.enabled = enabled;
         self
     }
 
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.base.enabled = enabled;
     }
 
+    #[allow(dead_code)]
     pub fn set_value(&mut self, value: u32) {
         self.base.input = tui_input::Input::from(value.to_string());
     }

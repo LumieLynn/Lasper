@@ -39,15 +39,18 @@ impl<T> Checklist<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
 
+    #[allow(dead_code)]
     pub fn items(&self) -> &[T] {
         &self.items
     }
@@ -56,6 +59,7 @@ impl<T> Checklist<T> {
         &self.checked_indices
     }
 
+    #[allow(dead_code)]
     pub fn checked_items(&self) -> Vec<&T> {
         self.checked_indices
             .iter()

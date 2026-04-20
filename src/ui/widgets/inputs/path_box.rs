@@ -16,6 +16,7 @@ impl PathBox {
         }
     }
 
+    #[allow(dead_code)]
     pub fn set_value(&mut self, value: String) {
         self.base.input = tui_input::Input::from(value);
     }

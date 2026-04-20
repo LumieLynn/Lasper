@@ -43,11 +43,13 @@ impl<T> SelectableList<T> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.enabled = enabled;
         self
     }
 
+    #[allow(dead_code)]
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
     }
