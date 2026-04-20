@@ -1,23 +1,14 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMessage {
-    Global(GlobalMessage),
     Wizard(WizardMessage),
     Container(ContainerMessage),
     List(ListMessage),
-    Backend(BackendResponse),
+    Backend(crate::nspawn::ops::BackendResponse),
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum GlobalMessage {
-    Exit,
-    Refresh,
-    Help,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardMessage {
-    NextStep,
-    PrevStep,
     Submit,
     Close,
     DialogSubmit,
@@ -34,9 +25,6 @@ pub enum WizardMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerMessage {
-    Start,
-    Stop,
-    Remove,
     PaneChanged(crate::app::DetailPane),
 }
 
@@ -46,19 +34,6 @@ pub enum ListMessage {
     Prev,
 }
 
-#[derive(Debug, Clone)]
-pub enum BackendCommand {
-    SubmitConfig(Box<crate::ui::wizard::context::WizardContext>),
-    ValidateBridge(String),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum BackendResponse {
-    ValidationSuccess,
-    ValidationError(String),
-    DeployStarted,
-    DeployFailed(String),
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventResult {

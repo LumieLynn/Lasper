@@ -20,7 +20,6 @@ pub async fn detect_bridges() -> Vec<String> {
 }
 
 /// Autodetect physical (non-virtual) network interfaces on the host.
-#[allow(dead_code)]
 pub async fn detect_physical_interfaces() -> Vec<String> {
     let mut interfaces = Vec::new();
     if let Ok(mut entries) = tokio::fs::read_dir("/sys/class/net").await {
@@ -41,4 +40,21 @@ pub async fn detect_physical_interfaces() -> Vec<String> {
     }
     interfaces.sort();
     interfaces
+}
+
+/// Identify the type of a network interface for diagnostic purposes.
+pub async fn identify_interface(name: &str) -> String {
+    if name == "lo" {
+        return "loopback interface".into();
+    }
+    let path = std::path::PathBuf::from(format!("/sys/class/net/{}", name));
+    if tokio::fs::metadata(path.join("bridge")).await.is_ok() {
+        return "bridge".into();
+    }
+    if let Ok(real_path) = tokio::fs::canonicalize(&path).await {
+        if !real_path.to_string_lossy().contains("/devices/virtual/") {
+            return "physical interface".into();
+        }
+    }
+    "virtual interface".into()
 }

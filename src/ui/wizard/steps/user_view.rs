@@ -17,8 +17,7 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let mut comps: Vec<&mut dyn Component> =
-            vec![&mut $self.root_password, &mut $self.user_list];
+        let comps: Vec<&mut dyn Component> = vec![&mut $self.root_password, &mut $self.user_list];
         comps
     }};
 }

@@ -111,7 +111,7 @@ pub struct AppUi {
 
     pub status_message: Option<(String, crate::ui::StatusLevel)>,
     pub status_expiry: Option<Instant>,
-    pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>>,
+    pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
 }
@@ -311,7 +311,7 @@ impl App {
     }
 
     /// Forward backend response to the active wizard/context.
-    fn handle_backend_result(&mut self, res: crate::ui::core::BackendResponse) {
+    fn handle_backend_result(&mut self, res: crate::nspawn::ops::BackendResponse) {
         if let Some(wizard) = &mut self.ui.wizard {
             let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
             if let crate::ui::wizard::StepAction::Status(msg, level) = action {
@@ -362,7 +362,7 @@ impl App {
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
         let (backend_tx, mut backend_rx) =
-            tokio::sync::mpsc::channel::<crate::ui::core::BackendCommand>(100);
+            tokio::sync::mpsc::channel::<crate::nspawn::ops::BackendCommand>(100);
 
         self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());

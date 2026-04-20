@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
+        let comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
         comps
     }};
 }

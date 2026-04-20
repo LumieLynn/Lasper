@@ -1,7 +1,7 @@
 //! nspawn-specific backend command handlers.
 
 use crate::events::AppEvent;
-use crate::ui::core::{BackendCommand, BackendResponse};
+use super::{BackendCommand, BackendResponse};
 use tokio::sync::mpsc::Sender;
 
 /// Handle backend asynchronous tasks (deployments, validations, etc.)
@@ -28,6 +28,7 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 
                 // Run the real deployment
                 let tx_panic = tx.clone();
+                let tx_deploy = tx.clone();
                 let deploy_handle = tokio::spawn(async move {
                     crate::nspawn::ops::provision::run_deploy_task(
                         deployer,
@@ -37,6 +38,7 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                         log_mpsc_tx,
                         done,
                         success,
+                        tx_deploy,
                     )
                     .await;
                 });
@@ -59,11 +61,25 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     .send(AppEvent::BackendResult(BackendResponse::DeployStarted))
                     .await;
             }
-            BackendCommand::ValidateBridge(_) => {
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                let _ = tx
-                    .send(AppEvent::BackendResult(BackendResponse::ValidationSuccess))
-                    .await;
+            BackendCommand::ValidateInterface { name, is_bridge_mode } => {
+                let net_path = format!("/sys/class/net/{}", name);
+                let bridge_path = format!("/sys/class/net/{}/bridge", name);
+
+                let exists = tokio::fs::metadata(&net_path).await.is_ok();
+                let is_bridge = tokio::fs::metadata(&bridge_path).await.is_ok();
+
+                let resp = if !exists {
+                    BackendResponse::ValidationWarning(format!("Interface '{}' not found. It must exist before starting the container.", name))
+                } else if is_bridge_mode && !is_bridge {
+                    let actual_type = crate::nspawn::platform::network::identify_interface(&name).await;
+                    BackendResponse::ValidationWarning(format!("'{}' is a {}, not a bridge", name, actual_type))
+                } else if !is_bridge_mode && is_bridge {
+                    BackendResponse::ValidationWarning(format!("'{}' is a bridge, but you selected a physical/virtual mode", name))
+                } else {
+                    BackendResponse::ValidationSuccess
+                };
+
+                let _ = tx.send(AppEvent::BackendResult(resp)).await;
             }
         }
     });

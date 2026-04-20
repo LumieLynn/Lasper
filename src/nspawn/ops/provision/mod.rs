@@ -3,6 +3,7 @@
 pub mod builders;
 
 use crate::nspawn::adapters::storage::StorageBackend;
+use crate::events::AppEvent;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
 use crate::nspawn::sys::CommandLogged;
@@ -52,6 +53,7 @@ pub async fn run_deploy_task(
     logs: tokio::sync::mpsc::Sender<String>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
+    tx: tokio::sync::mpsc::Sender<AppEvent>,
 ) {
     // 1. Initialize the guard. When this is dropped (at end of function or on panic),
     // it will unconditionally set done = true, unblocking the UI spinner.
@@ -74,6 +76,11 @@ pub async fn run_deploy_task(
             }
         }
         success.store(false, Ordering::SeqCst);
+        let _ = tx
+            .send(AppEvent::BackendResult(
+                crate::nspawn::ops::BackendResponse::DeployFailed(e.to_string()),
+            ))
+            .await;
     } else {
         success.store(true, Ordering::SeqCst);
     }

@@ -1,6 +1,6 @@
 use crate::nspawn::ContainerEntry;
 use crate::ui::core::{AppMessage, EventResult, WizardMessage};
-use crate::ui::wizard::context::{SourceKind, WizardContext};
+use crate::ui::wizard::core::context::{SourceKind, WizardContext};
 use crate::ui::wizard::steps::{self, StepComponent};
 use crate::ui::wizard::{StepAction, WizardStep};
 
@@ -19,7 +19,7 @@ pub struct Wizard {
     /// Recreated on step transitions to ensure fresh data from context.
     pub active_view: Option<Box<dyn StepComponent>>,
 
-    pub command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
+    pub command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
     pub loading: bool,
 }
 
@@ -27,7 +27,7 @@ impl Wizard {
     pub async fn new(
         entries: Vec<ContainerEntry>,
         nvidia_toolkit_installed: bool,
-        command_tx: tokio::sync::mpsc::Sender<crate::ui::core::BackendCommand>,
+        command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
     ) -> Self {
         let mut context = WizardContext::new(entries).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
@@ -180,8 +180,6 @@ impl Wizard {
     pub fn process_message(&mut self, msg: AppMessage) -> StepAction {
         match msg {
             AppMessage::Wizard(wiz_msg) => match wiz_msg {
-                WizardMessage::NextStep => self.handle_action(StepAction::Next),
-                WizardMessage::PrevStep => self.handle_action(StepAction::Prev),
                 WizardMessage::Close => StepAction::Close,
                 WizardMessage::Submit => {
                     if self.context.source.kind == SourceKind::Copy {
@@ -209,7 +207,7 @@ impl Wizard {
 
                     self.loading = true;
                     let tx = self.command_tx.clone();
-                    let cmd = crate::ui::core::BackendCommand::SubmitConfig(Box::new(
+                    let cmd = crate::nspawn::ops::BackendCommand::SubmitConfig(Box::new(
                         self.context.clone(),
                     ));
                     if tx.try_send(cmd).is_err() {
@@ -227,16 +225,22 @@ impl Wizard {
             AppMessage::Backend(res) => {
                 self.loading = false;
                 match res {
-                    crate::ui::core::BackendResponse::ValidationSuccess => {
-                        self.handle_action(StepAction::Next)
+                    crate::nspawn::ops::BackendResponse::ValidationSuccess => {
+                        self.move_next();
+                        StepAction::None
                     }
-                    crate::ui::core::BackendResponse::ValidationError(e) => {
+                    crate::nspawn::ops::BackendResponse::ValidationWarning(w) => {
+                        self.move_next();
+                        StepAction::Status(format!("Warning: {}", w), crate::ui::StatusLevel::Warn)
+                    }
+                    crate::nspawn::ops::BackendResponse::ValidationError(e) => {
                         StepAction::Status(format!("Error: {}", e), crate::ui::StatusLevel::Error)
                     }
-                    crate::ui::core::BackendResponse::DeployStarted => {
-                        self.handle_action(StepAction::Next)
+                    crate::nspawn::ops::BackendResponse::DeployStarted => {
+                        self.move_next();
+                        StepAction::None
                     }
-                    crate::ui::core::BackendResponse::DeployFailed(e) => StepAction::Status(
+                    crate::nspawn::ops::BackendResponse::DeployFailed(e) => StepAction::Status(
                         format!("Deploy Failed: {}", e),
                         crate::ui::StatusLevel::Error,
                     ),
@@ -256,11 +260,29 @@ impl Wizard {
                     view.commit_to_context(&mut self.context);
                 }
 
-                if let Some(next_step) = self.resolve_next_step(self.step) {
-                    self.step = next_step;
-                    // Evict view so it's recreated with fresh context
-                    self.active_view = None;
+                // Trigger backend validation for network modes with interfaces
+                if self.step == WizardStep::Network {
+                    let mode = self.context.network.network_mode();
+                    let (name, is_bridge) = match mode {
+                        Some(crate::nspawn::models::NetworkMode::Bridge(n)) => (Some(n), true),
+                        Some(crate::nspawn::models::NetworkMode::MacVlan(n))
+                        | Some(crate::nspawn::models::NetworkMode::IpVlan(n))
+                        | Some(crate::nspawn::models::NetworkMode::Interface(n)) => (Some(n), false),
+                        _ => (None, false),
+                    };
+
+                    if let Some(name) = name {
+                        self.loading = true;
+                        let tx = self.command_tx.clone();
+                        let _ = tx.try_send(crate::nspawn::ops::BackendCommand::ValidateInterface {
+                            name,
+                            is_bridge_mode: is_bridge,
+                        });
+                        return StepAction::None;
+                    }
                 }
+
+                self.move_next();
                 StepAction::None
             }
             StepAction::Prev => {
@@ -270,13 +292,25 @@ impl Wizard {
                         view.commit_to_context(&mut self.context);
                     }
                 }
-                if let Some(prev_step) = self.resolve_prev_step(self.step) {
-                    self.step = prev_step;
-                    self.active_view = None;
-                }
+                self.move_prev();
                 StepAction::None
             }
             _ => action,
+        }
+    }
+
+    fn move_next(&mut self) {
+        if let Some(next_step) = self.resolve_next_step(self.step) {
+            self.step = next_step;
+            // Evict view so it's recreated with fresh context
+            self.active_view = None;
+        }
+    }
+
+    fn move_prev(&mut self) {
+        if let Some(prev_step) = self.resolve_prev_step(self.step) {
+            self.step = prev_step;
+            self.active_view = None;
         }
     }
 }

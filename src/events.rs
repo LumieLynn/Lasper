@@ -9,7 +9,7 @@ use tokio_stream::StreamExt;
 pub enum AppEvent {
     Key(KeyEvent),
     Tick,
-    BackendResult(crate::ui::core::BackendResponse),
+    BackendResult(crate::nspawn::ops::BackendResponse),
     /// Background action execution finished.
     ActionDone(String, crate::ui::StatusLevel),
     /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)

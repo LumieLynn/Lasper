@@ -123,7 +123,7 @@ impl SharedContainerList {
             Color::White
         };
 
-        let mut list = List::new(items)
+        let list = List::new(items)
             .block(
                 Block::default()
                     .title(self.label.as_str())
