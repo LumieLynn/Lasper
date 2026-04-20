@@ -15,7 +15,7 @@ use crate::handle_nav;
 use crate::ui::core::{AppMessage, ContainerMessage, EventResult};
 
 /// The currently active detail pane in the main UI.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DetailPane {
     Properties,
     Details,
@@ -25,35 +25,26 @@ pub enum DetailPane {
 }
 
 impl DetailPane {
+    pub const ALL: &[DetailPane] = &[
+        DetailPane::Properties,
+        DetailPane::Details,
+        DetailPane::Logs,
+        DetailPane::Config,
+        DetailPane::Metrics,
+    ];
+
     pub fn next(&self) -> Self {
-        match self {
-            DetailPane::Properties => DetailPane::Details,
-            DetailPane::Details => DetailPane::Logs,
-            DetailPane::Logs => DetailPane::Config,
-            DetailPane::Config => DetailPane::Metrics,
-            DetailPane::Metrics => DetailPane::Properties,
-        }
+        let idx = Self::ALL.iter().position(|p| p == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
     }
 
     pub fn prev(&self) -> Self {
-        match self {
-            DetailPane::Properties => DetailPane::Metrics,
-            DetailPane::Details => DetailPane::Properties,
-            DetailPane::Logs => DetailPane::Details,
-            DetailPane::Config => DetailPane::Logs,
-            DetailPane::Metrics => DetailPane::Config,
-        }
+        let idx = Self::ALL.iter().position(|p| p == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
     }
 
     pub fn from_index(idx: usize) -> Option<Self> {
-        match idx {
-            0 => Some(DetailPane::Properties),
-            1 => Some(DetailPane::Details),
-            2 => Some(DetailPane::Logs),
-            3 => Some(DetailPane::Config),
-            4 => Some(DetailPane::Metrics),
-            _ => None,
-        }
+        Self::ALL.get(idx).copied()
     }
 }
 
@@ -227,20 +218,11 @@ impl DetailPanel {
                 let next = self.active_pane.next();
                 return self.switch_pane(next);
             }
-            KeyCode::Char('1') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
-                return self.switch_pane(DetailPane::Properties);
-            }
-            KeyCode::Char('2') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
-                return self.switch_pane(DetailPane::Details);
-            }
-            KeyCode::Char('3') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
-                return self.switch_pane(DetailPane::Logs);
-            }
-            KeyCode::Char('4') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
-                return self.switch_pane(DetailPane::Config);
-            }
-            KeyCode::Char('5') if key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
-                return self.switch_pane(DetailPane::Metrics);
+            KeyCode::Char(c) if c.is_digit(10) && key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+                let idx = (c.to_digit(10).unwrap() as usize).saturating_sub(1);
+                if let Some(pane) = DetailPane::from_index(idx) {
+                    return self.switch_pane(pane);
+                }
             }
 
             // ─── Detail scrolling ──────────────────────────────────────────

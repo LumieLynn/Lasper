@@ -100,6 +100,12 @@ impl<T> SelectableList<T> {
         }
     }
 
+    pub fn update_item(&mut self, idx: usize, item: T) {
+        if idx < self.items.len() {
+            self.items[idx] = item;
+        }
+    }
+
     pub fn remove_item(&mut self, idx: usize) {
         if idx < self.items.len() {
             self.items.remove(idx);

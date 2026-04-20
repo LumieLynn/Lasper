@@ -16,6 +16,7 @@ pub enum WizardMessage {
 
     // Macro-events for atomic data changes
     UserAdded(crate::nspawn::models::CreateUser),
+    UserUpdated(usize, crate::nspawn::models::CreateUser),
     UserRemoved(usize),
     PortForwardAdded(crate::nspawn::models::PortForward),
     PortForwardRemoved(usize),

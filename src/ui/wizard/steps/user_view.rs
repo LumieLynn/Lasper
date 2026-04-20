@@ -76,8 +76,8 @@ impl Component for UserStepView {
 
         self.root_password.render(f, chunks[0]);
         self.user_list.render(f, chunks[2]);
-
-        let hint = " [Tab] switch, [A]dd user, [D]elete user, [Enter] next ";
+ 
+        let hint = " [Tab] switch, [A]dd user, [E]dit user, [D]elete user, [Enter] next ";
         f.render_widget(
             Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
             chunks[3],
@@ -97,6 +97,11 @@ impl Component for UserStepView {
                     self.editor = None;
                     self.update_focus();
                 }
+                EventResult::Message(AppMessage::Wizard(WizardMessage::UserUpdated(idx, user))) => {
+                    self.user_list.update_item(*idx, user.clone());
+                    self.editor = None;
+                    self.update_focus();
+                }
                 EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
                     self.editor = None;
                     self.update_focus();
@@ -112,9 +117,27 @@ impl Component for UserStepView {
                 self.editor = Some(UserEditor::new(|u| {
                     AppMessage::Wizard(WizardMessage::UserAdded(u))
                 }));
-
+ 
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
+            }
+        }
+ 
+        if key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E') {
+            if self.user_list.is_focused() {
+                if let Some(user) = self.user_list.selected_item() {
+                    let idx = self.user_list.selected();
+                    let user = user.clone();
+                    self.editor = Some(
+                        UserEditor::new(move |u| {
+                            AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
+                        })
+                        .with_user(&user),
+                    );
+ 
+                    self.editor.as_mut().unwrap().set_focus(true);
+                    return EventResult::Consumed;
+                }
             }
         }
 

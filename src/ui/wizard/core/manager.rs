@@ -267,17 +267,20 @@ impl Wizard {
                         Some(crate::nspawn::models::NetworkMode::Bridge(n)) => (Some(n), true),
                         Some(crate::nspawn::models::NetworkMode::MacVlan(n))
                         | Some(crate::nspawn::models::NetworkMode::IpVlan(n))
-                        | Some(crate::nspawn::models::NetworkMode::Interface(n)) => (Some(n), false),
+                        | Some(crate::nspawn::models::NetworkMode::Interface(n)) => {
+                            (Some(n), false)
+                        }
                         _ => (None, false),
                     };
 
                     if let Some(name) = name {
                         self.loading = true;
                         let tx = self.command_tx.clone();
-                        let _ = tx.try_send(crate::nspawn::ops::BackendCommand::ValidateInterface {
-                            name,
-                            is_bridge_mode: is_bridge,
-                        });
+                        let _ =
+                            tx.try_send(crate::nspawn::ops::BackendCommand::ValidateInterface {
+                                name,
+                                is_bridge_mode: is_bridge,
+                            });
                         return StepAction::None;
                     }
                 }

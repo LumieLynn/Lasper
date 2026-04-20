@@ -152,11 +152,6 @@ impl App {
                         self.ui.show_wizard = false;
                         self.ui.wizard = None;
                     }
-                    WizardAction::CloseRefresh => {
-                        self.ui.show_wizard = false;
-                        self.ui.wizard = None;
-                        self.refresh().await;
-                    }
                     WizardAction::Status(msg, level) => {
                         self.set_status(msg, level);
                     }

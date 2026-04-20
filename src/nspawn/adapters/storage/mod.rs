@@ -68,6 +68,7 @@ pub trait StorageBackend: Send + Sync {
     async fn unmount(&self, name: &str) -> Result<()>;
 
     async fn delete(&self, name: &str) -> Result<()>;
+    #[allow(dead_code)]
     async fn exists(&self, name: &str) -> bool;
 }
 

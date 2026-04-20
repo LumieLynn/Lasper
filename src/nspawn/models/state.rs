@@ -114,13 +114,6 @@ impl MachineProperties {
         self.get_group_mut(group).insert(key, value);
     }
 
-    pub fn total_rows(&self) -> usize {
-        self.groups
-            .iter()
-            .filter(|g| !g.properties.is_empty())
-            .map(|g| g.properties.len() + 2) // 1 header + N props + 1 spacer
-            .sum()
-    }
 
     /// Returns a filtered and ordered list of 'primary' properties for summary views.
     pub fn get_summary(&self) -> Vec<(&String, &String)> {
@@ -145,7 +138,7 @@ impl MachineProperties {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum CpuRepresentation {
     /// Aggregate usage across all cores (e.g., 230% for 2.3 cores)
@@ -306,20 +299,6 @@ mod tests {
         assert!(summary.is_empty());
     }
 
-    #[test]
-    fn test_total_rows_empty() {
-        let props = MachineProperties::default();
-        assert_eq!(props.total_rows(), 0);
-    }
-
-    #[test]
-    fn test_total_rows_with_data() {
-        let mut props = MachineProperties::default();
-        props.insert("Machine", "Name".to_string(), "test".to_string());
-        props.insert("Machine", "State".to_string(), "running".to_string());
-        // 1 group with 2 props = 1 header + 2 props + 1 spacer = 4
-        assert_eq!(props.total_rows(), 4);
-    }
 
     #[test]
     fn test_get_group_mut_creates_once() {

@@ -26,7 +26,6 @@ pub enum StepAction {
     Next,
     Prev,
     Close,
-    CloseRefresh,
     /// Display a status message in the application status bar.
     Status(String, crate::ui::StatusLevel),
 }
@@ -46,17 +45,4 @@ impl WizardStep {
             WizardStep::Deploy => "Deployment Progress",
         }
     }
-}
-
-pub fn render_hint(f: &mut ratatui::Frame, area: ratatui::layout::Rect, hints: &[&str]) {
-    use ratatui::{
-        layout::Alignment,
-        style::{Color, Style},
-        widgets::Paragraph,
-    };
-    let text = hints.join(" | ");
-    let p = Paragraph::new(text)
-        .style(Style::default().fg(Color::DarkGray))
-        .alignment(Alignment::Center);
-    f.render_widget(p, area);
 }

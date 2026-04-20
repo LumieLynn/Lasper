@@ -27,9 +27,21 @@ impl<T> EditableList<T> {
         self.list.add_item(item);
     }
 
+    pub fn update_item(&mut self, idx: usize, item: T) {
+        self.list.update_item(idx, item);
+    }
+
     #[allow(dead_code)]
     pub fn remove_item(&mut self, idx: usize) {
         self.list.remove_item(idx);
+    }
+
+    pub fn selected(&self) -> usize {
+        self.list.selected_idx().unwrap_or(0)
+    }
+
+    pub fn selected_item(&self) -> Option<&T> {
+        self.list.selected_item()
     }
 
     pub fn items(&self) -> &[T] {
