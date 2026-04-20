@@ -54,13 +54,8 @@ pub struct CreateUser {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DiskImageSource {
-    CreateNew {
-        size: String,
-        fs_type: String,
-    },
-    ImportExisting {
-        path: String,
-    },
+    CreateNew { size: String, fs_type: String },
+    ImportExisting { path: String },
 }
 
 /// Configuration for disk image storage.
@@ -153,7 +148,7 @@ mod tests {
         let mut cfg = ContainerConfig::default();
         cfg.name = "test".into();
         cfg.nvidia_gpu = true;
-        
+
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, cfg2);

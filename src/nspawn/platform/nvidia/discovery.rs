@@ -1,8 +1,8 @@
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::{new_command, CommandLogged};
-use super::state::NvidiaState;
 use super::cdi::CdiSpec;
 use super::resolve::{get_ldconfig_cache, resolve_so_aliases};
+use super::state::NvidiaState;
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::sys::{new_command, CommandLogged};
 
 /// Get the current NVIDIA driver version on the host.
 /// Gracefully handles WSL and missing sysfs nodes.
@@ -34,8 +34,12 @@ pub async fn get_nvidia_state() -> Result<NvidiaState> {
     };
 
     // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON via a temp dir
-    let tmp_dir = tempfile::tempdir()
-        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary directory for CDI discovery: {}", e)))?;
+    let tmp_dir = tempfile::tempdir().map_err(|e| {
+        NspawnError::Runtime(format!(
+            "Failed to create temporary directory for CDI discovery: {}",
+            e
+        ))
+    })?;
     let tmp_path = tmp_dir.path().join("nvidia-cdi.json");
     let tmp_path_str = tmp_path.to_string_lossy();
 
@@ -148,7 +152,10 @@ mod tests {
             "a".to_string(),
         ];
         let result = dedup(input);
-        assert_eq!(result, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            result,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]

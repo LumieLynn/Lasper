@@ -1,7 +1,7 @@
-use std::path::{Path, PathBuf};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::CreateUser;
-use crate::nspawn::sys::command::{new_command, log_output, CommandLogged};
+use crate::nspawn::sys::command::{log_output, new_command, CommandLogged};
+use std::path::{Path, PathBuf};
 
 /// Create a user inside the container rootfs via `systemd-nspawn --directory … useradd`.
 pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Result<()> {
@@ -47,7 +47,8 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
                 let sudoers_dir = rootfs.join("etc/sudoers.d");
                 let sudoers_file = sudoers_dir.join(group);
                 let content = format!("%{} ALL=(ALL:ALL) ALL\n", group);
-                crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(&sudoers_file, &content).await?;
+                crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(&sudoers_file, &content)
+                    .await?;
 
                 #[cfg(unix)]
                 {

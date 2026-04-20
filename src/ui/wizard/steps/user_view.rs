@@ -1,11 +1,11 @@
 use crate::nspawn::models::CreateUser;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::composites::user_editor::UserEditor;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
+use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{UserConfig, WizardContext};
-use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::core::render_editor_overlay;
+use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -17,7 +17,8 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.root_password, &mut $self.user_list];
+        let mut comps: Vec<&mut dyn Component> =
+            vec![&mut $self.root_password, &mut $self.user_list];
         comps
     }};
 }
@@ -54,7 +55,6 @@ impl UserStepView {
         view.update_focus();
         view
     }
-
 }
 
 impl Component for UserStepView {

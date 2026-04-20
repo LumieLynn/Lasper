@@ -1,8 +1,8 @@
 //! Filesystem type detection utilities.
 
-use std::path::Path;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::sys::command::CommandLogged;
+use std::path::Path;
 
 /// Detects the filesystem type of a given path using 'stat -f -c %T'.
 pub async fn get_filesystem_type(path: &Path) -> Result<String> {

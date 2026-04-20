@@ -1,21 +1,18 @@
 pub mod core;
 pub mod panes;
 
-
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, BorderType, Borders, Clear,
-    },
+    widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
 
 use crate::app::{AppData, DetailPane};
+use crate::handle_nav;
 use crate::ui::core::{AppMessage, ContainerMessage, EventResult};
-use crate::{handle_nav};
 
 pub struct DetailPanel {
     pub active_pane: DetailPane,
@@ -75,10 +72,10 @@ impl DetailPanel {
         // Get inner area
         let inner_area = block.inner(area);
         self.pane_height = inner_area.height;
-        
+
         // Reserve 1 column for the scrollbar to avoid text overlap and wrapping issues
         let pane_width = (inner_area.width as usize).saturating_sub(1).max(1);
-        
+
         // Use extracted scroll logic
         core::scrolling::sync_data_lengths(self, data, pane_width);
         self.old_pane_height = self.pane_height;
@@ -208,13 +205,34 @@ impl DetailPanel {
                 handle_nav!(self, log_scroll, self.logs_len, step, self.pane_height, key);
             }
             _ if self.active_pane == DetailPane::Config => {
-                handle_nav!(self, config_scroll, self.config_len, step, self.pane_height, key);
+                handle_nav!(
+                    self,
+                    config_scroll,
+                    self.config_len,
+                    step,
+                    self.pane_height,
+                    key
+                );
             }
             _ if self.active_pane == DetailPane::Details => {
-                handle_nav!(self, details_scroll, self.details_len, step, self.pane_height, key);
+                handle_nav!(
+                    self,
+                    details_scroll,
+                    self.details_len,
+                    step,
+                    self.pane_height,
+                    key
+                );
             }
             _ if self.active_pane == DetailPane::Properties => {
-                handle_nav!(self, properties_scroll, self.properties_len, step, self.pane_height, key);
+                handle_nav!(
+                    self,
+                    properties_scroll,
+                    self.properties_len,
+                    step,
+                    self.pane_height,
+                    key
+                );
             }
 
             _ => {}

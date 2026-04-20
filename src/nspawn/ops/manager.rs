@@ -1,6 +1,6 @@
+use crate::nspawn::adapters::comm::{cli::CliProvider, dbus::DbusProvider};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
-use crate::nspawn::adapters::comm::{cli::CliProvider, dbus::DbusProvider};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;

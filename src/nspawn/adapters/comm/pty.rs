@@ -1,10 +1,10 @@
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-use vt100::Parser;
-use std::sync::Arc;
-use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use anyhow::Result;
+use parking_lot::Mutex;
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
+use std::sync::Arc;
+use tokio::sync::mpsc;
+use vt100::Parser;
 
 pub enum PtyMessage {
     Data(Vec<u8>),
@@ -59,31 +59,35 @@ pub fn spawn_terminal(
 
     let mut cmd = CommandBuilder::new(cmd_name);
     cmd.args(args);
-    
+
     let child = pair.slave.spawn_command(cmd)?;
-    
+
     // Master handles
     let mut reader = pair.master.try_clone_reader()?;
     let mut writer = pair.master.take_writer()?;
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
-    
+
     // 10,000 lines of scrollback
     let parser = Arc::new(Mutex::new(Parser::new(
-        rows, 
-        cols, 
-        10000, 
-        PtyReply { tx: pty_tx.downgrade() }
+        rows,
+        cols,
+        10000,
+        PtyReply {
+            tx: pty_tx.downgrade(),
+        },
     )));
 
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
-    
+
     // Reading thread
     let reader_handle = tokio::task::spawn_blocking(move || {
         let mut buf = [0u8; 4096];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             {
                 let mut p = parser_clone.lock();
                 p.process(&buf[..n]);
@@ -94,7 +98,7 @@ pub fn spawn_terminal(
 
     let parser_for_write = parser.clone();
     let master_for_write = pair.master;
-    
+
     // Writing/Resize thread
     let writer_handle = tokio::task::spawn_blocking(move || {
         while let Some(msg) = pty_rx.blocking_recv() {
@@ -118,13 +122,12 @@ pub fn spawn_terminal(
     });
 
     Ok((
-        parser, 
-        pty_tx, 
+        parser,
+        pty_tx,
         TerminalHandle {
             reader: reader_handle,
             writer: writer_handle,
             child,
-        }
+        },
     ))
 }
-

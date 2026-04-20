@@ -78,23 +78,28 @@ impl StorageStepView {
                 vec!["Create New Image".into(), "Import Existing Image".into()],
                 initial_data.creation_method_idx,
             ),
-            disk_size: TextBox::new(" Disk Volume Size (e.g. 2G, 500M) ", initial_data.disk_size.clone())
-                .with_validator(|v| {
-                    if v.trim().is_empty() {
-                        Err("Size required".into())
-                    } else {
-                        Ok(())
-                    }
-                }),
-            disk_fs: TextBox::new(" Filesystem Type (ext4, xfs) ", initial_data.disk_fs.clone()).with_validator(
-                |v| {
-                    if v.trim().is_empty() {
-                        Err("Filesystem required".into())
-                    } else {
-                        Ok(())
-                    }
-                },
-            ),
+            disk_size: TextBox::new(
+                " Disk Volume Size (e.g. 2G, 500M) ",
+                initial_data.disk_size.clone(),
+            )
+            .with_validator(|v| {
+                if v.trim().is_empty() {
+                    Err("Size required".into())
+                } else {
+                    Ok(())
+                }
+            }),
+            disk_fs: TextBox::new(
+                " Filesystem Type (ext4, xfs) ",
+                initial_data.disk_fs.clone(),
+            )
+            .with_validator(|v| {
+                if v.trim().is_empty() {
+                    Err("Filesystem required".into())
+                } else {
+                    Ok(())
+                }
+            }),
             import_path: PathBox::new(" Source Image Path ", initial_data.import_path.clone()),
             focus: FocusTracker::new(),
         };
@@ -108,7 +113,6 @@ impl StorageStepView {
         }
         false
     }
-
 }
 
 impl Component for StorageStepView {

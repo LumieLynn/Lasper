@@ -15,7 +15,9 @@ pub struct NspawnConfig {
 pub fn validate_machine_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name.len() > 64
-        || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
         || name.starts_with('.')
         || name.contains("..")
     {
@@ -34,9 +36,7 @@ impl NspawnConfig {
             return None;
         }
         let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        match tokio::fs::read_to_string(&path)
-            .await
-        {
+        match tokio::fs::read_to_string(&path).await {
             Ok(content) => Some(NspawnConfig { path, content }),
             Err(e) => {
                 log::debug!("Could not read .nspawn config for {}: {}", name, e);
@@ -157,7 +157,8 @@ impl NspawnConfig {
                     if key == "Bind" && new_state.device_binds.iter().any(|v| v == value) {
                         lines_to_remove.push(format!("Bind={}", value));
                     }
-                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value) {
+                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value)
+                    {
                         lines_to_remove.push(format!("BindReadOnly={}", value));
                     }
                 }
@@ -186,14 +187,15 @@ impl NspawnConfig {
             block.push("X-Lasper-Nvidia-End=true".to_string());
 
             // 5. Find [Files] section and insert block at its end
-            let files_idx = result_lines.iter().position(|l| {
-                l.trim().eq_ignore_ascii_case("[files]")
-            });
+            let files_idx = result_lines
+                .iter()
+                .position(|l| l.trim().eq_ignore_ascii_case("[files]"));
 
             match files_idx {
                 Some(idx) => {
                     // Find end of [Files] section: next section header or EOF
-                    let insert_at = result_lines.iter()
+                    let insert_at = result_lines
+                        .iter()
                         .enumerate()
                         .skip(idx + 1)
                         .find(|(_, l)| l.trim().starts_with('[') && l.trim().ends_with(']'))
@@ -360,10 +362,7 @@ pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<(
     validate_machine_name(source_name)?;
     validate_machine_name(dest_name)?;
     let source_path = format!("/etc/systemd/nspawn/{}.nspawn", source_name);
-    if !tokio::fs::try_exists(&source_path)
-        .await
-        .unwrap_or(false)
-    {
+    if !tokio::fs::try_exists(&source_path).await.unwrap_or(false) {
         return Ok(());
     }
     let dest_path = format!("/etc/systemd/nspawn/{}.nspawn", dest_name);
@@ -374,7 +373,11 @@ pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<(
             .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
     }
 
-    crate::nspawn::sys::io::AsyncLockedWriter::atomic_copy(Path::new(&source_path), Path::new(&dest_path)).await?;
+    crate::nspawn::sys::io::AsyncLockedWriter::atomic_copy(
+        Path::new(&source_path),
+        Path::new(&dest_path),
+    )
+    .await?;
     Ok(())
 }
 
@@ -511,13 +514,15 @@ mod tests {
 
     #[test]
     fn test_purge_nvidia_block_reversed_markers() {
-        let content = "X-Lasper-Nvidia-End=true\nBind=/dev/nvidia0\nX-Lasper-Nvidia-Begin=managed-by-lasper";
+        let content =
+            "X-Lasper-Nvidia-End=true\nBind=/dev/nvidia0\nX-Lasper-Nvidia-Begin=managed-by-lasper";
         assert!(NspawnConfig::purge_nvidia_block(content).is_err());
     }
 
     #[test]
     fn test_purge_nvidia_block_empty_block() {
-        let content = "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\nLine 2";
+        let content =
+            "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\nLine 2";
         let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
         assert_eq!(new_content, "Line 1\nLine 2");
         assert!(death_list.is_empty());
@@ -559,8 +564,16 @@ mod tests {
         cfg.name = "test".to_string();
         cfg.network = Some(NetworkMode::Veth);
         cfg.port_forwards = vec![
-            PortForward { host: 8080, container: 80, proto: "tcp".to_string() },
-            PortForward { host: 4443, container: 443, proto: "tcp".to_string() },
+            PortForward {
+                host: 8080,
+                container: 80,
+                proto: "tcp".to_string(),
+            },
+            PortForward {
+                host: 4443,
+                container: 443,
+                proto: "tcp".to_string(),
+            },
         ];
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=yes"));
@@ -611,7 +624,8 @@ mod tests {
         new_state.device_binds = vec!["/dev/nvidia0".to_string()];
         new_state.readonly_binds = vec!["/usr/lib/libcuda.so".to_string()];
 
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
         assert!(updated.contains("[Files]"));
         assert!(updated.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
         assert!(updated.contains("Bind=/dev/nvidia0"));
@@ -625,8 +639,12 @@ mod tests {
         let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
         new_state.device_binds = vec!["/dev/nvidia0".to_string()];
 
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
-        assert!(updated.contains("Bind=/home/user:/home/user"), "User bind should survive");
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(
+            updated.contains("Bind=/home/user:/home/user"),
+            "User bind should survive"
+        );
         assert!(updated.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
     }
 
@@ -636,7 +654,8 @@ mod tests {
         let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
         new_state.device_binds = vec!["/dev/nvidia0".to_string()];
 
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
         assert!(updated.contains("# My custom comment"));
     }
 
@@ -646,9 +665,14 @@ mod tests {
         let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
         new_state.device_binds = vec!["/dev/nvidia0".to_string()];
 
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
         let count = updated.matches("Bind=/dev/nvidia0").count();
-        assert_eq!(count, 1, "Legacy duplicate should be removed, got:\n{}", updated);
+        assert_eq!(
+            count, 1,
+            "Legacy duplicate should be removed, got:\n{}",
+            updated
+        );
     }
 
     #[test]
@@ -656,7 +680,9 @@ mod tests {
         let content = "[Exec]\nBoot=yes\n".to_string();
         let empty_state = crate::nspawn::platform::nvidia::NvidiaState::default();
 
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content.clone(), &empty_state, &[]).unwrap();
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content.clone(), &empty_state, &[])
+                .unwrap();
         assert!(!updated.contains("[Files]"));
         assert!(!updated.contains("X-Lasper-Nvidia-Begin"));
     }

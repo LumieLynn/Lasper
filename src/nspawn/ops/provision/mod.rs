@@ -2,9 +2,9 @@
 
 pub mod builders;
 
+use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
-use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::sys::CommandLogged;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -66,7 +66,11 @@ pub async fn run_deploy_task(
             Ok(_) => {}
             Err(_) => {
                 // If channel is full, we log to stdout as fallback
-                log::error!("[DEPLOY] [Container: {}] Channel full, cannot send log: {}", name, err_msg);
+                log::error!(
+                    "[DEPLOY] [Container: {}] Channel full, cannot send log: {}",
+                    name,
+                    err_msg
+                );
             }
         }
         success.store(false, Ordering::SeqCst);
@@ -150,7 +154,7 @@ async fn run_deploy_internal(
                         .prefix(&format!("lasper-dissect-{}-", name))
                         .tempdir_in(dissect_parent)
                         .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary mount point: {}", e)))?;
-                    
+
                     let mount_point = tmp_mnt.path().to_path_buf();
                     push_log!("Mounting raw image for configuration...".to_string());
 
@@ -245,7 +249,7 @@ async fn run_deploy_internal(
 
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
-        
+
         crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&nspawn_path, |_| Ok(nspawn_content)).await?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
@@ -287,7 +291,8 @@ async fn run_deploy_internal(
         push_log!("Unmounting raw image...".to_string());
         let _ = crate::nspawn::sys::new_command("systemd-dissect")
             .args(["--umount", mnt.to_str().unwrap()])
-            .logged_output("systemd-dissect").await;
+            .logged_output("systemd-dissect")
+            .await;
         // _dissect_guard will automatically clean up the directory when it drops
     }
 
@@ -301,7 +306,7 @@ async fn run_deploy_internal(
     if let Err(e) = result {
         push_log!(format!("Deployment failed: {}", e));
         push_log!("Rolling back broken container...".to_string());
-        
+
         // Clean up host-side configurations to prevent "ghost configs"
         let nspawn_path = format!("/etc/systemd/nspawn/{}.nspawn", name);
         let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
@@ -312,7 +317,8 @@ async fn run_deploy_internal(
             // Cleanup systemd-managed storage (downloaded/imported junk)
             let _ = crate::nspawn::sys::new_command("machinectl")
                 .args(["remove", &name])
-                .logged_output("machinectl").await;
+                .logged_output("machinectl")
+                .await;
         } else {
             // Cleanup Lasper-managed storage
             let _ = storage.delete(&name).await;

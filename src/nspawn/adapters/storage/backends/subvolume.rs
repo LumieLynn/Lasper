@@ -1,9 +1,9 @@
 //! Subvolume-based storage backend supporting Btrfs and ZFS.
 
-use std::path::{Path, PathBuf};
-use crate::nspawn::errors::{NspawnError, Result};
 use super::super::{StorageBackend, StorageType};
-use crate::nspawn::sys::{new_command, get_filesystem_type, CommandLogged};
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::sys::{get_filesystem_type, new_command, CommandLogged};
+use std::path::{Path, PathBuf};
 
 pub struct SubvolumeBackend;
 
@@ -17,7 +17,7 @@ impl SubvolumeBackend {
     async fn detect_type(&self) -> Result<SubvolumeType> {
         let machines_dir = Path::new("/var/lib/machines");
         let fs_type = get_filesystem_type(machines_dir).await?;
-        
+
         match fs_type.as_str() {
             "btrfs" => Ok(SubvolumeType::Btrfs),
             "zfs" => Ok(SubvolumeType::Zfs),
@@ -119,8 +119,12 @@ impl StorageBackend for SubvolumeBackend {
 
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
-                    if err.contains("no such file or directory") || err.contains("not a subvolume") {
-                        log::warn!("Btrfs subvolume already missing for deletion: {}", path.display());
+                    if err.contains("no such file or directory") || err.contains("not a subvolume")
+                    {
+                        log::warn!(
+                            "Btrfs subvolume already missing for deletion: {}",
+                            path.display()
+                        );
                     } else {
                         return Err(NspawnError::cmd_failed(
                             "btrfs subvolume delete",
@@ -162,6 +166,8 @@ impl StorageBackend for SubvolumeBackend {
     }
 
     async fn exists(&self, name: &str) -> bool {
-        tokio::fs::try_exists(self.get_path(name)).await.unwrap_or(false)
+        tokio::fs::try_exists(self.get_path(name))
+            .await
+            .unwrap_or(false)
     }
 }

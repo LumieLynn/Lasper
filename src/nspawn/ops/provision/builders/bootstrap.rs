@@ -1,15 +1,15 @@
 //! Debootstrap and Pacstrap deployment implementations.
 
+use crate::nspawn::sys::new_command;
 use async_trait::async_trait;
 use std::process::Stdio;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
-use crate::nspawn::sys::new_command;
 
-use crate::nspawn::ops::provision::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::ops::provision::Deployer;
 
 pub struct DebootstrapDeployer {
     pub mirror: String,
@@ -31,7 +31,11 @@ impl Deployer for DebootstrapDeployer {
             args.push("--include=sudo".to_string());
         }
         if !self.packages.is_empty() {
-            let pkgs = self.packages.split_whitespace().collect::<Vec<_>>().join(",");
+            let pkgs = self
+                .packages
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(",");
             args.push(format!("--include={}", pkgs));
         }
         args.push(self.suite.clone());

@@ -3,8 +3,8 @@ use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::composites::bind_mount::BindMountBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
-use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::core::render_editor_overlay;
+use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{

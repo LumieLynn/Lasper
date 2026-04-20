@@ -73,7 +73,9 @@ pub async fn discover_host_gpus() -> Vec<GpuDevice> {
     }
 
     // 4. Legacy ARM Mali (if not appearing in /sys/class/drm)
-    if tokio::fs::try_exists("/dev/mali").await.unwrap_or(false) && !result.iter().any(|g| g.nodes.contains(&"/dev/mali".into())) {
+    if tokio::fs::try_exists("/dev/mali").await.unwrap_or(false)
+        && !result.iter().any(|g| g.nodes.contains(&"/dev/mali".into()))
+    {
         result.push(GpuDevice {
             display_name: "ARM Mali Graphics (Legacy)".into(),
             driver_type: "Mali/Proprietary".into(),
@@ -82,7 +84,10 @@ pub async fn discover_host_gpus() -> Vec<GpuDevice> {
     }
 
     // 5. Qualcomm Adreno (Legacy KGSL)
-    if tokio::fs::try_exists("/dev/kgsl-3d0").await.unwrap_or(false) {
+    if tokio::fs::try_exists("/dev/kgsl-3d0")
+        .await
+        .unwrap_or(false)
+    {
         result.push(GpuDevice {
             display_name: "Qualcomm Adreno (Legacy KGSL)".into(),
             driver_type: "KGSL".into(),
@@ -99,7 +104,7 @@ async fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) ->
     // Try reading Vendor ID and Device ID (Standard PCIe)
     let vendor_file = device_path.join("vendor");
     let device_file = device_path.join("device");
-    
+
     if let (Ok(vendor_str), Ok(device_str)) = (
         tokio::fs::read_to_string(&vendor_file).await,
         tokio::fs::read_to_string(&device_file).await,

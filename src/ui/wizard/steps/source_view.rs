@@ -139,7 +139,6 @@ impl SourceStepView {
         view.update_focus();
         view
     }
-
 }
 
 impl Component for SourceStepView {

@@ -1,11 +1,11 @@
+use crate::app::TerminalSession;
 use ratatui::{
-    layout::{Rect, Alignment},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
-use crate::app::TerminalSession;
 
 pub struct TerminalPanel;
 
@@ -24,14 +24,18 @@ impl TerminalPanel {
 
         let session = &sessions[active_idx];
         let mut term = session.terminal.lock();
-        
+
         // Tab generation in DetailPanel style
         let mut spans = Vec::new();
         for (i, s) in sessions.iter().enumerate() {
             let mut style = Style::default().fg(Color::DarkGray);
             if i == active_idx {
                 style = style
-                    .fg(if is_focused { Color::Yellow } else { Color::White })
+                    .fg(if is_focused {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    })
                     .add_modifier(Modifier::BOLD);
             }
             spans.push(Span::styled(format!(" {} ", s.container_name), style));
@@ -42,18 +46,26 @@ impl TerminalPanel {
         let tabs_line = Line::from(spans);
 
         let border_color = if is_focused {
-            if session.insert_mode { Color::Green } else { Color::Cyan }
+            if session.insert_mode {
+                Color::Green
+            } else {
+                Color::Cyan
+            }
         } else {
             Color::DarkGray
         };
 
-        let title_suffix = if session.insert_mode { 
+        let title_suffix = if session.insert_mode {
             " [INSERT] ".to_string()
         } else if session.scroll_offset > 0 {
             let mut screen_probe = term.screen().clone();
             screen_probe.set_scrollback(usize::MAX);
             let max_scroll = screen_probe.scrollback();
-            format!(" [NORMAL] (Scroll: {}/{}) ", session.scroll_offset.min(max_scroll), max_scroll)
+            format!(
+                " [NORMAL] (Scroll: {}/{}) ",
+                session.scroll_offset.min(max_scroll),
+                max_scroll
+            )
         } else {
             " [NORMAL] ".to_string()
         };
@@ -74,33 +86,39 @@ impl TerminalPanel {
             let (rows, cols) = term.screen().size();
             if term_area.width != cols || term_area.height != rows {
                 term.set_size(term_area.height, term_area.width);
-                let _ = session.pty_tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Resize { 
-                    cols: term_area.width, 
-                    rows: term_area.height 
-                });
+                let _ = session.pty_tx.try_send(
+                    crate::nspawn::adapters::comm::pty::PtyMessage::Resize {
+                        cols: term_area.width,
+                        rows: term_area.height,
+                    },
+                );
             }
         }
 
         // Clone the screen so we don't mutate the live parser state, then shift the viewport
         let mut screen = term.screen().clone();
-        
+
         // Use the probe hack to find the actual history limit for clamping
         let mut screen_probe = screen.clone();
         screen_probe.set_scrollback(usize::MAX);
         let max_scroll = screen_probe.scrollback();
-        
+
         screen.set_scrollback(session.scroll_offset.min(max_scroll));
         let (rows, cols) = screen.size();
 
         for row in 0..rows {
-            if row >= term_area.height { break; }
+            if row >= term_area.height {
+                break;
+            }
             for col in 0..cols {
-                if col >= term_area.width { break; }
-                
+                if col >= term_area.width {
+                    break;
+                }
+
                 if let Some(cell) = screen.cell(row, col) {
                     let x = term_area.x + col;
                     let y = term_area.y + row;
-                    
+
                     let style = self.get_cell_style(cell);
                     let c = cell.contents().chars().next().unwrap_or(' ');
                     f.buffer_mut()[(x, y)].set_char(c).set_style(style);
@@ -119,7 +137,7 @@ impl TerminalPanel {
 
     fn get_cell_style(&self, cell: &vt100::Cell) -> Style {
         let mut style = Style::default();
-        
+
         style = style.fg(self.map_color(cell.fgcolor()));
         style = style.bg(self.map_color(cell.bgcolor()));
 

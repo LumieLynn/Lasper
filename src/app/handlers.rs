@@ -1,6 +1,6 @@
 use super::{ActivePanel, App};
-use crate::ui::StatusLevel;
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
+use crate::ui::StatusLevel;
 
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::wizard::Wizard;
@@ -62,18 +62,25 @@ impl App {
                 }
 
                 // Now borrow session for input handling
-                if let Some(session) = self.data.terminal_sessions.get_mut(self.data.active_terminal_idx) {
+                if let Some(session) = self
+                    .data
+                    .terminal_sessions
+                    .get_mut(self.data.active_terminal_idx)
+                {
                     if session.insert_mode {
-                        let is_toggle = key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::ALT);
-                        
+                        let is_toggle = key.code == KeyCode::Char('x')
+                            && key.modifiers.contains(KeyModifiers::ALT);
+
                         if is_toggle {
                             session.insert_mode = false;
                             return;
                         }
-                        
+
                         // Forward other keys to PTY
                         let bytes = crate::ui::views::terminal_panel::encode_key(key);
-                        let _ = session.pty_tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
+                        let _ = session
+                            .pty_tx
+                            .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
                         return;
                     } else {
                         // Normal Mode keys - Handle locally and RETURN to prevent pollution
@@ -96,7 +103,8 @@ impl App {
                                 let mut screen = session.terminal.lock().screen().clone();
                                 screen.set_scrollback(usize::MAX);
                                 let max_scroll = screen.scrollback();
-                                session.scroll_offset = session.scroll_offset.saturating_add(10).min(max_scroll);
+                                session.scroll_offset =
+                                    session.scroll_offset.saturating_add(10).min(max_scroll);
                                 return;
                             }
                             KeyCode::PageDown => {
@@ -107,17 +115,27 @@ impl App {
                                 let mut screen = session.terminal.lock().screen().clone();
                                 screen.set_scrollback(usize::MAX);
                                 let max_scroll = screen.scrollback();
-                                session.scroll_offset = session.scroll_offset.saturating_add(1).min(max_scroll);
+                                session.scroll_offset =
+                                    session.scroll_offset.saturating_add(1).min(max_scroll);
                                 return;
                             }
                             KeyCode::Down | KeyCode::Char('j') => {
                                 session.scroll_offset = session.scroll_offset.saturating_sub(1);
                                 return;
                             }
-                            KeyCode::Char('1') | KeyCode::Char('2') | KeyCode::Char('3') | KeyCode::Char('4') | 
-                            KeyCode::Char('5') | KeyCode::Char('6') | KeyCode::Char('7') | KeyCode::Char('8') | 
-                            KeyCode::Char('9') => return,
-                            KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('t') => {}
+                            KeyCode::Char('1')
+                            | KeyCode::Char('2')
+                            | KeyCode::Char('3')
+                            | KeyCode::Char('4')
+                            | KeyCode::Char('5')
+                            | KeyCode::Char('6')
+                            | KeyCode::Char('7')
+                            | KeyCode::Char('8')
+                            | KeyCode::Char('9') => return,
+                            KeyCode::Tab
+                            | KeyCode::Char('q')
+                            | KeyCode::Char('?')
+                            | KeyCode::Char('t') => {}
                             _ => return, // Consume other keys in Normal Mode
                         };
                     }
@@ -181,7 +199,6 @@ impl App {
             return;
         }
 
-
         // ── Global keys ───────────────────────────────────────────────────────
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -213,7 +230,9 @@ impl App {
                 self.action_poweroff();
                 return;
             }
-            KeyCode::Char('x') | KeyCode::Enter if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('x') | KeyCode::Enter
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 if !self.data.entries.is_empty() {
                     self.ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
                 }
@@ -223,11 +242,10 @@ impl App {
                 if self.is_root {
                     let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
                     if let Some(tx) = &self.ui.backend_tx {
-                        self.ui.wizard = Some(Wizard::new(
-                            self.data.entries.clone(),
-                            nvidia_installed,
-                            tx.clone(),
-                        ).await);
+                        self.ui.wizard = Some(
+                            Wizard::new(self.data.entries.clone(), nvidia_installed, tx.clone())
+                                .await,
+                        );
                         self.ui.show_wizard = true;
                     }
                 } else {

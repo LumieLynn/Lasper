@@ -5,9 +5,9 @@ use async_trait::async_trait;
 #[allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 
-use crate::nspawn::ops::provision::Deployer;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::ops::provision::Deployer;
 
 pub struct OciDeployer {
     pub url: String,
@@ -253,7 +253,8 @@ async fn ensure_container_policy() -> Result<()> {
     if !tokio::fs::try_exists(policy_path).await.unwrap_or(false) {
         log::info!("Initializing default OCI policy in /etc/containers/policy.json");
         let default_policy = r#"{ "default": [ { "type": "insecureAcceptAnything" } ] }"#;
-        crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(policy_path, default_policy).await?;
+        crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(policy_path, default_policy)
+            .await?;
     }
     Ok(())
 }
@@ -276,15 +277,25 @@ pub async fn import_oci_image(
     let tmp_dir = tempfile::Builder::new()
         .prefix(&format!("oci-deploy-{}-", local_name))
         .tempdir_in(tmp_parent)
-        .map_err(|e| NspawnError::Runtime(format!("Failed to create OCI staging directory: {}", e)))?;
+        .map_err(|e| {
+            NspawnError::Runtime(format!("Failed to create OCI staging directory: {}", e))
+        })?;
 
     let staging_root = tmp_dir.path();
     let tmp_oci = staging_root.join("oci-repo");
     let bundle_dir = staging_root.join("bundle");
 
-    log::info!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci.display());
+    log::info!(
+        "skopeo copy {} oci:{}:latest",
+        normalized_ref,
+        tmp_oci.display()
+    );
     let skopeo = new_command("skopeo")
-        .args(["copy", &normalized_ref, &format!("oci:{}:latest", tmp_oci.display())])
+        .args([
+            "copy",
+            &normalized_ref,
+            &format!("oci:{}:latest", tmp_oci.display()),
+        ])
         .logged_output("skopeo")
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
@@ -292,7 +303,11 @@ pub async fn import_oci_image(
     if !skopeo.status.success() {
         return Err(NspawnError::cmd_failed(
             "skopeo copy",
-            format!("skopeo copy {} oci:{}:latest", normalized_ref, tmp_oci.display()),
+            format!(
+                "skopeo copy {} oci:{}:latest",
+                normalized_ref,
+                tmp_oci.display()
+            ),
             &skopeo,
         ));
     }
@@ -342,7 +357,11 @@ pub async fn import_oci_image(
     if !umoci.status.success() {
         return Err(NspawnError::cmd_failed(
             "umoci unpack",
-            format!("umoci unpack --image {}:latest {}", tmp_oci.display(), bundle_dir.display()),
+            format!(
+                "umoci unpack --image {}:latest {}",
+                tmp_oci.display(),
+                bundle_dir.display()
+            ),
             &umoci,
         ));
     }

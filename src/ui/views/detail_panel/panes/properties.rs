@@ -4,9 +4,9 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::AppData;
-use super::super::core::utils::empty_block;
 use super::super::core::style::property_style;
+use super::super::core::utils::empty_block;
+use crate::app::AppData;
 use crate::render_column_layout;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
@@ -27,14 +27,13 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                             .fg(ratatui::style::Color::Red)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
-                    ratatui::text::Span::styled(e.clone(), ratatui::style::Style::default().fg(ratatui::style::Color::Red)),
+                    ratatui::text::Span::styled(
+                        e.clone(),
+                        ratatui::style::Style::default().fg(ratatui::style::Color::Red),
+                    ),
                 ]),
             ];
-            f.render_widget(
-                Paragraph::new(error_text)
-                    .wrap(Wrap { trim: false }),
-                area,
-            );
+            f.render_widget(Paragraph::new(error_text).wrap(Wrap { trim: false }), area);
             return;
         }
     };
@@ -56,9 +55,5 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         render_column_layout!(lines, k, v, key_width, val_width, style);
     }
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll, 0)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }

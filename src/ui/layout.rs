@@ -139,7 +139,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         app.is_root,
         list_focused,
     );
-    app.ui.detail_panel.render_with_data(f, detail_area, &mut app.data);
+    app.ui
+        .detail_panel
+        .render_with_data(f, detail_area, &mut app.data);
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────
@@ -199,7 +201,9 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" quit"),
             ]),
             crate::app::ActivePanel::TerminalPanel => {
-                let insert_mode = if let Some(session) = app.data.terminal_sessions.get(app.data.active_terminal_idx) {
+                let insert_mode = if let Some(session) =
+                    app.data.terminal_sessions.get(app.data.active_terminal_idx)
+                {
                     session.insert_mode
                 } else {
                     false

@@ -1,10 +1,10 @@
 use crate::nspawn::models::NetworkMode;
+use crate::nspawn::platform::gpu::GpuDevice;
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
+use crate::ui::widgets::lists::checklist::Checklist;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::widgets::lists::checklist::Checklist;
-use crate::nspawn::platform::gpu::GpuDevice;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -97,13 +97,21 @@ impl PassthroughStepView {
         };
 
         let mut gpu_list = Checklist::new("Select Host GPU(s)", discovered_gpus.clone(), |gpu| {
-            format!("{} ({})", gpu.display_name, gpu.nodes.first().cloned().unwrap_or_default())
+            format!(
+                "{} ({})",
+                gpu.display_name,
+                gpu.nodes.first().cloned().unwrap_or_default()
+            )
         });
 
         // Pre-check previously selected GPUs
         let mut checked_indices = Vec::new();
         for (i, gpu) in discovered_gpus.iter().enumerate() {
-            if gpu.nodes.iter().any(|node| initial_data.device_binds.contains(node)) {
+            if gpu
+                .nodes
+                .iter()
+                .any(|node| initial_data.device_binds.contains(node))
+            {
                 checked_indices.push(i);
             }
         }
@@ -137,7 +145,6 @@ impl PassthroughStepView {
         let enabled = self.wayland_socket.checked() && !self.wayland_sockets.is_empty();
         self.wayland_selector.set_enabled(enabled);
     }
-
 }
 
 impl Component for PassthroughStepView {
@@ -147,7 +154,7 @@ impl Component for PassthroughStepView {
         ];
 
         if self.graphics_acceleration.checked() && !self.discovered_gpus.is_empty() {
-             // Checklist needs +2 lines for borders, limited to a reasonable height
+            // Checklist needs +2 lines for borders, limited to a reasonable height
             let height = (self.discovered_gpus.len() as u16 + 2).min(10);
             constraints.push(Constraint::Length(height));
         }
@@ -160,11 +167,11 @@ impl Component for PassthroughStepView {
 
         constraints.push(Constraint::Length(3)); // NVIDIA
         constraints.push(Constraint::Length(3)); // Privileged
-        
+
         if self.privileged.checked() {
             constraints.push(Constraint::Length(5)); // Warning + Borders
         }
-        
+
         constraints.push(Constraint::Min(0));
 
         let chunks = Layout::default()
@@ -233,8 +240,11 @@ impl StepComponent for PassthroughStepView {
         }
         ctx.passthrough.selected_gpu_nodes = selected_nodes;
 
-        let is_host_nw = matches!(ctx.network.network_mode(), Some(crate::nspawn::models::NetworkMode::Host));
-        
+        let is_host_nw = matches!(
+            ctx.network.network_mode(),
+            Some(crate::nspawn::models::NetworkMode::Host)
+        );
+
         if self.wayland_socket.checked() && is_host_nw && !self.wayland_sockets.is_empty() {
             let idx = self.wayland_selector.selected_idx();
             ctx.passthrough.wayland_socket = Some(self.wayland_sockets[idx].clone());

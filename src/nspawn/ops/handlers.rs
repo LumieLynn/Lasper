@@ -45,10 +45,12 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 tokio::spawn(async move {
                     if let Err(join_err) = deploy_handle.await {
                         if join_err.is_panic() {
-                            let _ = tx_panic.send(AppEvent::ActionDone(
-                                "CRITICAL: Deployment pipeline panicked.".into(),
-                                crate::ui::StatusLevel::Error
-                            )).await;
+                            let _ = tx_panic
+                                .send(AppEvent::ActionDone(
+                                    "CRITICAL: Deployment pipeline panicked.".into(),
+                                    crate::ui::StatusLevel::Error,
+                                ))
+                                .await;
                         }
                     }
                 });

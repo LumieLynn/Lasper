@@ -6,10 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use super::super::core::utils::empty_block;
 use super::super::core::style::property_style;
-use crate::render_column_layout;
+use super::super::core::utils::empty_block;
 use crate::app::AppData;
+use crate::render_column_layout;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {
@@ -55,12 +55,12 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         }
 
         // Add Header Row
-        lines.push(Line::from(vec![
-            ratatui::text::Span::styled(
-                format!("[ {} ]", group.name.to_uppercase()),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            ),
-        ]));
+        lines.push(Line::from(vec![ratatui::text::Span::styled(
+            format!("[ {} ]", group.name.to_uppercase()),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
 
         let mut pairs: Vec<(&String, &String)> = group.properties.iter().collect();
         pairs.sort_by_key(|(k, _)| k.as_str());
@@ -74,9 +74,5 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         lines.push(Line::from(""));
     }
 
-    f.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll, 0)),
-        area,
-    );
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
 }

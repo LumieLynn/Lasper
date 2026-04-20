@@ -35,15 +35,8 @@ pub fn format_property(key: &str, value: &Value<'_>) -> String {
         k if k.contains("Timestamp") || k.ends_with("Time") => format_timestamp(value),
 
         // Sizes (Bytes)
-        "MemoryCurrent"
-        | "MemoryMax"
-        | "MemoryLimit"
-        | "MemoryAvailable"
-        | "MemoryHigh"
-        | "MemoryLow"
-        | "IOWriteBytes"
-        | "IOReadBytes"
-        | "Usage" => format_size_value(value),
+        "MemoryCurrent" | "MemoryMax" | "MemoryLimit" | "MemoryAvailable" | "MemoryHigh"
+        | "MemoryLow" | "IOWriteBytes" | "IOReadBytes" | "Usage" => format_size_value(value),
 
         // Durations (Nanoseconds)
         "CPUUsageNS" => format_duration_ns(value),
@@ -98,12 +91,11 @@ pub fn format_dbus_value(v: &Value<'_>) -> String {
                 .join(" ")
         }
 
-        Value::Dict(d) => {
-            d.iter()
-                .map(|(k, v)| format!("{}={}", format_dbus_value(&k), format_dbus_value(&v)))
-                .collect::<Vec<String>>()
-                .join(", ")
-        }
+        Value::Dict(d) => d
+            .iter()
+            .map(|(k, v)| format!("{}={}", format_dbus_value(&k), format_dbus_value(&v)))
+            .collect::<Vec<String>>()
+            .join(", "),
 
         Value::Structure(s) => {
             let fields = s.fields();
@@ -324,7 +316,10 @@ mod tests {
     fn test_format_ip_v4() {
         assert_eq!(format_ip_address(2, &[192, 168, 1, 1]), "192.168.1.1");
         assert_eq!(format_ip_address(2, &[0, 0, 0, 0]), "0.0.0.0");
-        assert_eq!(format_ip_address(2, &[255, 255, 255, 255]), "255.255.255.255");
+        assert_eq!(
+            format_ip_address(2, &[255, 255, 255, 255]),
+            "255.255.255.255"
+        );
     }
 
     #[test]
@@ -337,8 +332,8 @@ mod tests {
     #[test]
     fn test_format_ip_v6() {
         let data = vec![
-            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
         ];
         assert_eq!(format_ip_address(10, &data), "2001:db8:0:0:0:0:0:1");
     }
@@ -360,7 +355,10 @@ mod tests {
     #[test]
     fn test_format_duration_ns() {
         assert_eq!(format_duration_ns(&Value::U64(1_500_000_000)), "1s");
-        assert_eq!(format_duration_ns(&Value::U64(3661_000_000_000)), "1h 1m 1s");
+        assert_eq!(
+            format_duration_ns(&Value::U64(3661_000_000_000)),
+            "1h 1m 1s"
+        );
         assert_eq!(format_duration_ns(&Value::U64(500_000_000)), "500ms");
     }
 
@@ -393,7 +391,10 @@ mod tests {
 
     #[test]
     fn test_format_timestamp_nonzero() {
-        assert_eq!(format_timestamp(&Value::U64(1713415975000000)), "1713415975s (unix epoch)");
+        assert_eq!(
+            format_timestamp(&Value::U64(1713415975000000)),
+            "1713415975s (unix epoch)"
+        );
     }
 
     #[test]

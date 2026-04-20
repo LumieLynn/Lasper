@@ -27,7 +27,7 @@ pub fn systemd_override_content(
     if wayland_socket {
         s.append("DeviceAllow", "/dev/dri rw");
     }
-    // Note: Individual device allows (/dev/dri, /dev/mali, etc.) are now 
+    // Note: Individual device allows (/dev/dri, /dev/mali, etc.) are now
     // dynamically discovered and passed via device_binds.
 
     let mut buffer = Vec::new();
@@ -87,10 +87,7 @@ pub async fn clone_systemd_override(source_name: &str, dest_name: &str) -> Resul
         source_name
     );
 
-    if !tokio::fs::try_exists(&source_path)
-        .await
-        .unwrap_or(false)
-    {
+    if !tokio::fs::try_exists(&source_path).await.unwrap_or(false) {
         return Ok(());
     }
 

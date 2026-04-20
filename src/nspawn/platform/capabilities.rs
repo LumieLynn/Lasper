@@ -1,6 +1,6 @@
-use std::os::unix::fs::FileTypeExt;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::sys::command::new_sync_command;
+use std::os::unix::fs::FileTypeExt;
 
 /// Determines the host's runtime directory (XDG_RUNTIME_DIR).
 /// Returns an error if it cannot be determined reliably.
@@ -18,7 +18,8 @@ pub async fn get_xdg_runtime() -> Result<String> {
     }
 
     Err(NspawnError::Runtime(
-        "Could not determine host Wayland socket directory (XDG_RUNTIME_DIR or SUDO_UID missing)".into()
+        "Could not determine host Wayland socket directory (XDG_RUNTIME_DIR or SUDO_UID missing)"
+            .into(),
     ))
 }
 
@@ -56,7 +57,11 @@ pub fn supports_idmap() -> bool {
             let parts: Vec<&str> = s.split('.').collect();
             if parts.len() >= 2 {
                 let major = parts[0].parse::<u32>().unwrap_or(0);
-                let minor = parts[1].split('-').next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+                let minor = parts[1]
+                    .split('-')
+                    .next()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(0);
                 Some(major > 5 || (major == 5 && minor >= 12))
             } else {
                 None

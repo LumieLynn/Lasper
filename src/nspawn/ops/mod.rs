@@ -1,6 +1,6 @@
-pub mod manager;
 pub mod handlers;
-pub mod provision;
 pub mod inspect;
+pub mod manager;
+pub mod provision;
 
 pub use manager::{DefaultManager, NspawnManager};

@@ -5,8 +5,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{AppData, DetailPane};
 use super::super::DetailPanel;
+use crate::app::{AppData, DetailPane};
 
 pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usize) {
     let old_logs_len = panel.logs_len;
@@ -131,7 +131,8 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         let max_scroll_old = old_logs_len.saturating_sub(panel.old_pane_height as usize) as u16;
         let at_bottom = panel.log_scroll >= max_scroll_old;
 
-        if at_bottom && (panel.logs_len > old_logs_len || panel.pane_height < panel.old_pane_height) {
+        if at_bottom && (panel.logs_len > old_logs_len || panel.pane_height < panel.old_pane_height)
+        {
             let max_scroll_new = panel.logs_len.saturating_sub(panel.pane_height as usize);
             panel.log_scroll = max_scroll_new.min(u16::MAX as usize) as u16;
         }
@@ -142,14 +143,21 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
     panel.log_scroll = panel.log_scroll.min(log_max.min(u16::MAX as usize) as u16);
 
     let cfg_max = panel.config_len.saturating_sub(panel.pane_height as usize);
-    panel.config_scroll = panel.config_scroll.min(cfg_max.min(u16::MAX as usize) as u16);
+    panel.config_scroll = panel
+        .config_scroll
+        .min(cfg_max.min(u16::MAX as usize) as u16);
 
     let det_max = panel.details_len.saturating_sub(panel.pane_height as usize);
-    panel.details_scroll = panel.details_scroll.min(det_max.min(u16::MAX as usize) as u16);
+    panel.details_scroll = panel
+        .details_scroll
+        .min(det_max.min(u16::MAX as usize) as u16);
 
-    let prop_max = panel.properties_len.saturating_sub(panel.pane_height as usize);
-    panel.properties_scroll =
-        panel.properties_scroll.min(prop_max.min(u16::MAX as usize) as u16);
+    let prop_max = panel
+        .properties_len
+        .saturating_sub(panel.pane_height as usize);
+    panel.properties_scroll = panel
+        .properties_scroll
+        .min(prop_max.min(u16::MAX as usize) as u16);
 }
 
 fn calculate_line_wrapped_height(line: &Line, width: usize) -> usize {
@@ -210,7 +218,9 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
             panel.details_scroll as usize,
         ),
         DetailPane::Properties if panel.properties_len > panel.pane_height as usize => (
-            panel.properties_len.saturating_sub(panel.pane_height as usize),
+            panel
+                .properties_len
+                .saturating_sub(panel.pane_height as usize),
             panel.properties_scroll as usize,
         ),
         _ => return,

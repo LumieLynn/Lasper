@@ -230,10 +230,9 @@ impl Wizard {
                     crate::ui::core::BackendResponse::ValidationSuccess => {
                         self.handle_action(StepAction::Next)
                     }
-                    crate::ui::core::BackendResponse::ValidationError(e) => StepAction::Status(
-                        format!("Error: {}", e),
-                        crate::ui::StatusLevel::Error,
-                    ),
+                    crate::ui::core::BackendResponse::ValidationError(e) => {
+                        StepAction::Status(format!("Error: {}", e), crate::ui::StatusLevel::Error)
+                    }
                     crate::ui::core::BackendResponse::DeployStarted => {
                         self.handle_action(StepAction::Next)
                     }

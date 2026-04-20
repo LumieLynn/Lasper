@@ -1,6 +1,6 @@
-use std::path::Path;
-use crate::nspawn::adapters::storage::{StorageType, StorageInfo};
+use crate::nspawn::adapters::storage::{StorageInfo, StorageType};
 use crate::nspawn::sys::{get_filesystem_type, CommandLogged};
+use std::path::Path;
 
 pub async fn detect_available_storage_types() -> StorageInfo {
     let machines_dir = Path::new("/var/lib/machines");

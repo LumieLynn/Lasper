@@ -3,7 +3,11 @@ use crate::nspawn::sys::{new_command, CommandLogged};
 use std::path::Path;
 
 pub(crate) async fn get_ldconfig_cache() -> Option<String> {
-    let out = new_command("ldconfig").arg("-p").logged_output("ldconfig").await.ok()?;
+    let out = new_command("ldconfig")
+        .arg("-p")
+        .logged_output("ldconfig")
+        .await
+        .ok()?;
     if out.status.success() {
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     } else {
@@ -13,7 +17,10 @@ pub(crate) async fn get_ldconfig_cache() -> Option<String> {
 
 /// For a given .so path (which might be a versioned file), find it and all its aliases.
 /// We first try `ldconfig -p`, then fallback to directory scanning.
-pub(crate) async fn resolve_so_aliases(path: &str, ldconfig_cache: Option<&str>) -> Result<Vec<String>> {
+pub(crate) async fn resolve_so_aliases(
+    path: &str,
+    ldconfig_cache: Option<&str>,
+) -> Result<Vec<String>> {
     let p = Path::new(path);
     let dir = p
         .parent()
@@ -75,8 +82,10 @@ mod tests {
     async fn test_resolve_ldconfig_extracts_paths() {
         let cache = "libcuda.so.1 (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so.1\n\
                      libcuda.so (libc6,x86-64) => /usr/lib/x86_64-linux-gnu/libcuda.so";
-        
-        let result = resolve_so_aliases("/some/path/libcuda.so.550.1", Some(cache)).await.unwrap();
+
+        let result = resolve_so_aliases("/some/path/libcuda.so.550.1", Some(cache))
+            .await
+            .unwrap();
         assert!(result.contains(&"/usr/lib/x86_64-linux-gnu/libcuda.so.1".to_string()));
         assert!(result.contains(&"/usr/lib/x86_64-linux-gnu/libcuda.so".to_string()));
     }
@@ -86,7 +95,9 @@ mod tests {
         let cache = "libother.so => /usr/lib/libother.so";
         // Use a parent directory that exists but a filename that doesn't match anything in cache.
         // We use /usr/bin as a likely existing directory.
-        let result = resolve_so_aliases("/usr/bin/libnonexistent.so", Some(cache)).await.unwrap();
+        let result = resolve_so_aliases("/usr/bin/libnonexistent.so", Some(cache))
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 }

@@ -41,7 +41,9 @@ pub struct ContainerEntry {
 
 impl Ord for ContainerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.state.cmp(&other.state).then(self.name.cmp(&other.name))
+        self.state
+            .cmp(&other.state)
+            .then(self.name.cmp(&other.name))
     }
 }
 
@@ -213,11 +215,46 @@ mod tests {
 
     #[test]
     fn test_property_group_priority() {
-        assert_eq!(PropertyGroup { name: "Machine".into(), properties: Default::default() }.display_priority(), 0);
-        assert_eq!(PropertyGroup { name: "Systemd Unit".into(), properties: Default::default() }.display_priority(), 1);
-        assert_eq!(PropertyGroup { name: "Dependencies".into(), properties: Default::default() }.display_priority(), 10);
-        assert_eq!(PropertyGroup { name: "Other".into(), properties: Default::default() }.display_priority(), 5);
-        assert_eq!(PropertyGroup { name: "SomethingNew".into(), properties: Default::default() }.display_priority(), 5);
+        assert_eq!(
+            PropertyGroup {
+                name: "Machine".into(),
+                properties: Default::default()
+            }
+            .display_priority(),
+            0
+        );
+        assert_eq!(
+            PropertyGroup {
+                name: "Systemd Unit".into(),
+                properties: Default::default()
+            }
+            .display_priority(),
+            1
+        );
+        assert_eq!(
+            PropertyGroup {
+                name: "Dependencies".into(),
+                properties: Default::default()
+            }
+            .display_priority(),
+            10
+        );
+        assert_eq!(
+            PropertyGroup {
+                name: "Other".into(),
+                properties: Default::default()
+            }
+            .display_priority(),
+            5
+        );
+        assert_eq!(
+            PropertyGroup {
+                name: "SomethingNew".into(),
+                properties: Default::default()
+            }
+            .display_priority(),
+            5
+        );
     }
 
     #[test]

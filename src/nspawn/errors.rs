@@ -57,7 +57,11 @@ pub enum NspawnError {
 }
 
 impl NspawnError {
-    pub fn cmd_failed(context: impl Into<String>, cmd: impl Into<String>, output: &std::process::Output) -> Self {
+    pub fn cmd_failed(
+        context: impl Into<String>,
+        cmd: impl Into<String>,
+        output: &std::process::Output,
+    ) -> Self {
         Self::CommandFailed(
             context.into(),
             cmd.into(),

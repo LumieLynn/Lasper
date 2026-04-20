@@ -1,9 +1,9 @@
 pub mod context;
 pub mod manager;
 
+use crate::ui::core::Component;
 use ratatui::widgets::{Block, Borders, Clear};
 use ratatui::Frame;
-use crate::ui::core::Component;
 
 /// Renders an editor overlay centered on the screen.
 pub fn render_editor_overlay(

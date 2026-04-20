@@ -1,8 +1,8 @@
 //! Simple directory-based storage backend.
 
-use std::path::PathBuf;
-use crate::nspawn::errors::{NspawnError, Result};
 use super::super::{StorageBackend, StorageType};
+use crate::nspawn::errors::{NspawnError, Result};
+use std::path::PathBuf;
 
 pub struct DirectoryBackend;
 

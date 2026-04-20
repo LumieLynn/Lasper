@@ -16,13 +16,17 @@ pub fn property_style(key: &str, value: &str) -> Style {
         },
         "State" => match value {
             "running" | "yes" => Style::default().fg(Color::Green),
-            "starting" | "exiting" => Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+            "starting" | "exiting" => Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC),
             "poweroff" | "no" => Style::default().fg(Color::DarkGray),
             _ => Style::default().fg(Color::Yellow),
         },
         "ReadOnly" => {
             if value == "yes" {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             }

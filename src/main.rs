@@ -73,10 +73,7 @@ fn try_chown_to_sudo_user(path: &Path) {
         // Refuse to chown if the path is a symlink (prevents symlink-following attacks)
         match std::fs::symlink_metadata(path) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!(
-                    "Warning: Refusing to chown {:?} — it is a symlink",
-                    path
-                );
+                eprintln!("Warning: Refusing to chown {:?} — it is a symlink", path);
                 return;
             }
             Err(e) => {

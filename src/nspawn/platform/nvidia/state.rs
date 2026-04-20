@@ -1,6 +1,6 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Hardware and driver information detected on the host for mounting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

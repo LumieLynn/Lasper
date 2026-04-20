@@ -1,11 +1,11 @@
-use crate::nspawn::ops::provision::Deployer;
-use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
-use crate::nspawn::models::ContainerEntry;
 pub use crate::nspawn::adapters::config::builder::{
     BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };
+use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
+use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::ops::provision::Deployer;
 use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
@@ -234,11 +234,14 @@ pub struct WizardContext {
 
 impl WizardContext {
     pub async fn new(entries: Vec<ContainerEntry>) -> Self {
-        let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime().await.ok();
+        let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
+            .await
+            .ok();
         let nvidia_toolkit_installed = tokio::fs::try_exists("/usr/bin/nvidia-ctk")
             .await
             .unwrap_or(false);
-        let wayland_sockets = crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
+        let wayland_sockets =
+            crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
         let discovered_gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
         Self {
             source: SourceState {
@@ -259,7 +262,8 @@ impl WizardContext {
             },
             storage: StorageState {
                 type_idx: 0,
-                info: crate::nspawn::adapters::storage::detect::detect_available_storage_types().await,
+                info: crate::nspawn::adapters::storage::detect::detect_available_storage_types()
+                    .await,
                 creation_method_idx: 0,
                 disk_size: "2G".to_string(),
                 disk_fs: "ext4".to_string(),
@@ -277,7 +281,8 @@ impl WizardContext {
                     .cloned()
                     .unwrap_or_else(|| "br0".to_string());
 
-                let physical_interfaces = crate::nspawn::platform::network::detect_physical_interfaces().await;
+                let physical_interfaces =
+                    crate::nspawn::platform::network::detect_physical_interfaces().await;
                 let default_interface = physical_interfaces
                     .first()
                     .cloned()
@@ -363,7 +368,10 @@ mod tests {
         state.mode = 2;
         assert_eq!(state.network_mode(), Some(NetworkMode::Veth));
         state.mode = 3;
-        assert_eq!(state.network_mode(), Some(NetworkMode::Bridge("br0".into())));
+        assert_eq!(
+            state.network_mode(),
+            Some(NetworkMode::Bridge("br0".into()))
+        );
     }
 
     #[test]
@@ -381,7 +389,7 @@ mod tests {
             copy_idx: 0,
         };
         assert!(state.is_storage_managed_externally());
-        
+
         state.kind = SourceKind::LocalFile;
         state.local_path = "test.raw".into();
         assert!(state.is_storage_managed_externally());
@@ -403,11 +411,11 @@ mod tests {
             wayland_sockets: vec![],
             bind_mounts: vec![],
         };
-        
+
         // Wayland only if Host network
         let cfg = state.extract_config(Some(NetworkMode::Host));
         assert!(cfg.wayland_socket.is_some());
-        
+
         let cfg = state.extract_config(Some(NetworkMode::Veth));
         assert!(cfg.wayland_socket.is_none());
 

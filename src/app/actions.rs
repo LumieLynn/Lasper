@@ -68,7 +68,11 @@ impl App {
                 match self.data.manager.get_properties(&entry.name).await {
                     Ok(mut p) => {
                         if !entry.all_addresses.is_empty() {
-                            p.insert("Machine", "IPAddresses".into(), entry.all_addresses.join(", "));
+                            p.insert(
+                                "Machine",
+                                "IPAddresses".into(),
+                                entry.all_addresses.join(", "),
+                            );
                         }
                         if let Some(ufs) = p.get_group_mut("Systemd Unit").get("UnitFileState") {
                             let ufs = ufs.clone();
@@ -118,7 +122,8 @@ impl App {
                         self.data.log_lines.clear();
                         self.data.logs_dirty = true;
                         if let Some(tx) = &self.ui.app_tx {
-                            let handle = self.data.manager.spawn_log_stream(&entry.name, tx.clone());
+                            let handle =
+                                self.data.manager.spawn_log_stream(&entry.name, tx.clone());
                             self.data.log_stream = Some((entry.name.clone(), handle));
                         }
                     }
@@ -127,13 +132,17 @@ impl App {
                         handle.abort();
                     }
                     self.data.log_lines.clear();
-                    self.data.log_lines.push_back(Line::from("Container is not running."));
+                    self.data
+                        .log_lines
+                        .push_back(Line::from("Container is not running."));
                     self.data.logs_dirty = true;
                 }
             }
             DetailPane::Config => {
                 let new_content =
-                    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name).await.map(|c| c.content);
+                    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name)
+                        .await
+                        .map(|c| c.content);
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
                     self.data.config_dirty = true;
@@ -205,7 +214,8 @@ impl App {
             }
 
             if let Some(state) = transition {
-                self.data.transitions
+                self.data
+                    .transitions
                     .insert(e.name.clone(), (state, Instant::now()));
             }
 
@@ -321,7 +331,12 @@ impl App {
         }
 
         // Check if session already exists
-        if let Some(idx) = self.data.terminal_sessions.iter().position(|s| s.container_name == entry.name) {
+        if let Some(idx) = self
+            .data
+            .terminal_sessions
+            .iter()
+            .position(|s| s.container_name == entry.name)
+        {
             self.data.active_terminal_idx = idx;
             self.ui.show_terminal = true;
             self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
@@ -354,7 +369,10 @@ impl App {
                     self.data.active_terminal_idx = self.data.terminal_sessions.len() - 1;
                     self.ui.show_terminal = true;
                     self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
-                    self.set_status(format!("Logged into {}", args[1]), crate::ui::StatusLevel::Info);
+                    self.set_status(
+                        format!("Logged into {}", args[1]),
+                        crate::ui::StatusLevel::Info,
+                    );
                 }
                 Err(e) => {
                     self.set_status(
@@ -372,10 +390,15 @@ impl App {
             return;
         }
 
-        let mut session = self.data.terminal_sessions.remove(self.data.active_terminal_idx);
+        let mut session = self
+            .data
+            .terminal_sessions
+            .remove(self.data.active_terminal_idx);
         session.handle.abort();
-        
-        if self.data.active_terminal_idx >= self.data.terminal_sessions.len() && !self.data.terminal_sessions.is_empty() {
+
+        if self.data.active_terminal_idx >= self.data.terminal_sessions.len()
+            && !self.data.terminal_sessions.is_empty()
+        {
             self.data.active_terminal_idx = self.data.terminal_sessions.len() - 1;
         }
 
@@ -391,7 +414,12 @@ impl App {
             None => return,
         };
 
-        if let Some(idx) = self.data.terminal_sessions.iter().position(|s| s.container_name == entry.name) {
+        if let Some(idx) = self
+            .data
+            .terminal_sessions
+            .iter()
+            .position(|s| s.container_name == entry.name)
+        {
             self.data.active_terminal_idx = idx;
         } else {
             // Hide terminal if no session for the selected container

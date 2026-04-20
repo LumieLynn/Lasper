@@ -107,7 +107,9 @@ impl SharedContainerList {
                 if let Some(addr) = &e.address {
                     spans.push(Span::styled(
                         format!(" - {}", addr),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
                     ));
                 }
 

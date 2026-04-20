@@ -6,8 +6,8 @@ use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
-use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::core::render_editor_overlay;
+use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
@@ -184,7 +184,6 @@ impl NetworkStepView {
     fn is_custom_interface(&self) -> bool {
         self.interface_list.selected_idx() == Some(self.interface_options_len - 1)
     }
-
 }
 
 impl Component for NetworkStepView {
@@ -209,20 +208,14 @@ impl Component for NetworkStepView {
 
         if mode == 3 {
             let mid_chunks = Layout::default()
-                .constraints([
-                    Constraint::Percentage(50),
-                    Constraint::Percentage(50),
-                ])
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .direction(Direction::Horizontal)
                 .split(chunks[1]);
             self.bridge_list.render(f, mid_chunks[0]);
             if self.is_custom_bridge() {
                 let right_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(0),
-                    ])
+                    .constraints([Constraint::Length(3), Constraint::Min(0)])
                     .split(mid_chunks[1]);
                 self.custom_bridge.render(f, right_chunks[0]);
                 self.port_list.render(f, right_chunks[1]);
@@ -231,20 +224,14 @@ impl Component for NetworkStepView {
             }
         } else if mode >= 4 {
             let mid_chunks = Layout::default()
-                .constraints([
-                    Constraint::Percentage(50),
-                    Constraint::Percentage(50),
-                ])
+                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
                 .direction(Direction::Horizontal)
                 .split(chunks[1]);
             self.interface_list.render(f, mid_chunks[0]);
             if self.is_custom_interface() {
                 let right_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(3),
-                        Constraint::Min(0),
-                    ])
+                    .constraints([Constraint::Length(3), Constraint::Min(0)])
                     .split(mid_chunks[1]);
                 self.custom_interface.render(f, right_chunks[0]);
             }
@@ -298,7 +285,8 @@ impl Component for NetworkStepView {
                 self.update_focus();
             }
         }
-        if let EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardRemoved(_))) = res {
+        if let EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardRemoved(_))) = res
+        {
             self.update_focus();
         }
         res

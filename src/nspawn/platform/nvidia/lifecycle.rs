@@ -1,7 +1,10 @@
+use super::discovery::get_nvidia_state;
+use super::state::{
+    calculate_death_list, get_external_state, get_internal_state, save_external_state,
+    save_internal_state, NvidiaState,
+};
 use crate::nspawn::errors::{NspawnError, Result};
 use std::path::PathBuf;
-use super::state::{NvidiaState, get_external_state, get_internal_state, save_external_state, save_internal_state, calculate_death_list};
-use super::discovery::get_nvidia_state;
 
 macro_rules! log_step {
     ($name:expr, $step:expr, $msg:expr) => {
@@ -88,7 +91,8 @@ pub async fn ensure_gpu_passthrough(
     dbus: &crate::nspawn::adapters::comm::dbus::DbusProvider,
 ) -> Result<()> {
     // 1. Semantic Marker Check
-    let config = match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(name).await {
+    let config = match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(name).await
+    {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -156,7 +160,12 @@ pub async fn ensure_gpu_passthrough(
 
     // 4. AST mutation
     log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
-    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::update_gpu_passthrough(name, &host_state, &death_list).await?;
+    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::update_gpu_passthrough(
+        name,
+        &host_state,
+        &death_list,
+    )
+    .await?;
 
     // 5. Persistent Injection & Dual-Track Sync
     log_step!(

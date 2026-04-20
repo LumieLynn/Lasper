@@ -84,7 +84,9 @@ impl DbusProvider {
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
             let formatted: Vec<String> = addrs
                 .into_iter()
-                .map(|(family, data)| crate::nspawn::adapters::comm::formatting::format_ip_address(family, &data))
+                .map(|(family, data)| {
+                    crate::nspawn::adapters::comm::formatting::format_ip_address(family, &data)
+                })
                 .collect();
             running_names.insert(name, formatted);
         }
@@ -108,7 +110,9 @@ impl DbusProvider {
                 usage: if usage == u64::MAX {
                     None
                 } else {
-                    Some(crate::nspawn::adapters::comm::formatting::format_size(usage))
+                    Some(crate::nspawn::adapters::comm::formatting::format_size(
+                        usage,
+                    ))
                 },
                 address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
                 all_addresses: addrs,

@@ -6,8 +6,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::AppData;
 use super::super::core::utils::empty_block;
+use crate::app::AppData;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {
@@ -34,7 +34,11 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     };
 
     // Calculate how many visual lines into the first visible logical line we are
-    let first_line_start_y = data.log_offset_index.get(first_line_idx).copied().unwrap_or(0);
+    let first_line_start_y = data
+        .log_offset_index
+        .get(first_line_idx)
+        .copied()
+        .unwrap_or(0);
     let skip_visual_lines = scroll_y.saturating_sub(first_line_start_y);
 
     // Collect only enough lines to fill the viewport plus a small buffer
@@ -44,7 +48,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     for i in first_line_idx..data.log_lines.len() {
         let line = &data.log_lines[i];
         visible_lines.push(line.clone());
-        
+
         // Use a loose limit for performance, but 500 lines is safe
         if visible_lines.len() > 500 {
             break;

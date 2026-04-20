@@ -64,7 +64,6 @@ impl BasicStepView {
         view.update_focus();
         view
     }
-
 }
 
 impl Component for BasicStepView {

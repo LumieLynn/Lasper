@@ -12,11 +12,11 @@ use crate::nspawn::{
     models::ContainerEntry,
     ops::{DefaultManager, NspawnManager},
 };
-use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
-use std::io::Stdout;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
+use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
+use std::io::Stdout;
 
 // ── Simple enums ──────────────────────────────────────────────────────────────
 
@@ -154,9 +154,7 @@ impl AppUi {
 pub struct TerminalSession {
     pub container_name: String,
     pub terminal: std::sync::Arc<
-        parking_lot::Mutex<
-            vt100::Parser<crate::nspawn::adapters::comm::pty::PtyReply>,
-        >,
+        parking_lot::Mutex<vt100::Parser<crate::nspawn::adapters::comm::pty::PtyReply>>,
     >,
     pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
     pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
@@ -288,7 +286,9 @@ impl App {
         self.data.entries = self.merge_transitional_states(entries);
         let active_names: std::collections::HashSet<&String> =
             self.data.entries.iter().map(|e| &e.name).collect();
-        self.data.metrics.retain(|name, _| active_names.contains(name));
+        self.data
+            .metrics
+            .retain(|name, _| active_names.contains(name));
         self.data.selected = prev_name
             .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
             .unwrap_or(0)
