@@ -145,6 +145,32 @@ impl MachineProperties {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+pub enum CpuRepresentation {
+    /// Aggregate usage across all cores (e.g., 230% for 2.3 cores)
+    Aggregate,
+    /// Normalized to total system capacity (e.g., 28% for 230% on an 8-core system)
+    Normalized,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerMetrics {
+    /// Time-series for CPU usage: (timestamp_offset_secs, percentage)
+    pub cpu_history: Vec<(f64, f64)>,
+    /// Time-series for RAM usage: (timestamp_offset_secs, megabytes)
+    pub ram_history: Vec<(f64, f64)>,
+}
+
+impl Default for ContainerMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_history: Vec::with_capacity(61),
+            ram_history: Vec::with_capacity(61),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

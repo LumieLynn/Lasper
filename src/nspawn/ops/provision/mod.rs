@@ -255,7 +255,7 @@ async fn run_deploy_internal(
         }
 
         push_log!("Writing .nspawn config...".to_string());
-        let nspawn_path = std::path::PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
+        let nspawn_path = crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
 
         crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&nspawn_path, |_| Ok(nspawn_content)).await?;
 
@@ -315,7 +315,7 @@ async fn run_deploy_internal(
         push_log!("Rolling back broken container...".to_string());
 
         // Clean up host-side configurations to prevent "ghost configs"
-        let nspawn_path = format!("/etc/systemd/nspawn/{}.nspawn", name);
+        let nspawn_path = crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
         let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
         let _ = tokio::fs::remove_file(&nspawn_path).await;
         let _ = tokio::fs::remove_dir_all(&override_dir).await;

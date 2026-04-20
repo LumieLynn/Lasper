@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
 pub struct NspawnConfig {
+    #[allow(dead_code)]
     pub path: PathBuf,
     pub content: String,
 }
@@ -30,12 +31,16 @@ pub fn validate_machine_name(name: &str) -> Result<()> {
 }
 
 impl NspawnConfig {
+    pub fn default_path(name: &str) -> PathBuf {
+        PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
+    }
+
     /// Load the `.nspawn` config for a container by name.
     pub async fn load(name: &str) -> Option<NspawnConfig> {
         if validate_machine_name(name).is_err() {
             return None;
         }
-        let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
+        let path = Self::default_path(name);
         match tokio::fs::read_to_string(&path).await {
             Ok(content) => Some(NspawnConfig { path, content }),
             Err(e) => {
@@ -69,7 +74,7 @@ impl NspawnConfig {
         death_list: &[String],
     ) -> Result<()> {
         validate_machine_name(name)?;
-        let path = PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name));
+        let path = Self::default_path(name);
 
         crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |existing| {
             let content = existing.ok_or_else(|| {
@@ -361,11 +366,11 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
 pub async fn clone_nspawn_config(source_name: &str, dest_name: &str) -> Result<()> {
     validate_machine_name(source_name)?;
     validate_machine_name(dest_name)?;
-    let source_path = format!("/etc/systemd/nspawn/{}.nspawn", source_name);
+    let source_path = NspawnConfig::default_path(source_name);
     if !tokio::fs::try_exists(&source_path).await.unwrap_or(false) {
         return Ok(());
     }
-    let dest_path = format!("/etc/systemd/nspawn/{}.nspawn", dest_name);
+    let dest_path = NspawnConfig::default_path(dest_name);
 
     if let Some(parent) = Path::new(&dest_path).parent() {
         tokio::fs::create_dir_all(parent)

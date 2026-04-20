@@ -24,7 +24,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                 .map(|e| e.name.as_str())
                 .unwrap_or("?");
             format!(
-                "No config file found at /etc/systemd/nspawn/{}.nspawn",
+                "No .nspawn config file found for machine '{}'.",
                 name
             )
         }

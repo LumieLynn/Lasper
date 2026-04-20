@@ -1,6 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::CreateUser;
-use std::io::Write;
 use std::path::Path;
 
 /// Sets up the target user's shell environments with exported Wayland variables.

@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    models::ContainerEntry,
+    models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
 };
 use crate::ui::views::container_list::ContainerListComponent;
@@ -17,76 +17,6 @@ use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
 use std::io::Stdout;
-
-// ── Simple enums ──────────────────────────────────────────────────────────────
-
-/// The currently active detail pane in the main UI.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DetailPane {
-    Properties,
-    Details,
-    Logs,
-    Config,
-    Metrics,
-}
-
-impl DetailPane {
-    pub fn next(&self) -> Self {
-        match self {
-            DetailPane::Properties => DetailPane::Details,
-            DetailPane::Details => DetailPane::Logs,
-            DetailPane::Logs => DetailPane::Config,
-            DetailPane::Config => DetailPane::Metrics,
-            DetailPane::Metrics => DetailPane::Properties,
-        }
-    }
-
-    pub fn prev(&self) -> Self {
-        match self {
-            DetailPane::Properties => DetailPane::Metrics,
-            DetailPane::Details => DetailPane::Properties,
-            DetailPane::Logs => DetailPane::Details,
-            DetailPane::Config => DetailPane::Logs,
-            DetailPane::Metrics => DetailPane::Config,
-        }
-    }
-
-    pub fn from_index(idx: usize) -> Option<Self> {
-        match idx {
-            0 => Some(DetailPane::Properties),
-            1 => Some(DetailPane::Details),
-            2 => Some(DetailPane::Logs),
-            3 => Some(DetailPane::Config),
-            4 => Some(DetailPane::Metrics),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CpuRepresentation {
-    /// Aggregate usage across all cores (e.g., 230% for 2.3 cores)
-    Aggregate,
-    /// Normalized to total system capacity (e.g., 28% for 230% on an 8-core system)
-    Normalized,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContainerMetrics {
-    /// Time-series for CPU usage: (timestamp_offset_secs, percentage)
-    pub cpu_history: Vec<(f64, f64)>,
-    /// Time-series for RAM usage: (timestamp_offset_secs, megabytes)
-    pub ram_history: Vec<(f64, f64)>,
-}
-
-impl Default for ContainerMetrics {
-    fn default() -> Self {
-        Self {
-            cpu_history: Vec::with_capacity(61),
-            ram_history: Vec::with_capacity(61),
-        }
-    }
-}
 
 /// Which top-level panel has keyboard focus.
 #[derive(Debug, Clone, PartialEq)]
@@ -223,7 +153,7 @@ impl App {
                 cpu_cores: std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1),
-                cpu_representation: CpuRepresentation::Aggregate,
+                cpu_representation: CpuRepresentation::Normalized,
                 properties_dirty: true,
                 config_dirty: true,
                 details_dirty: true,

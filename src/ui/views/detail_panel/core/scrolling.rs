@@ -6,7 +6,8 @@ use ratatui::{
 };
 
 use super::super::DetailPanel;
-use crate::app::{AppData, DetailPane};
+use crate::app::AppData;
+use super::super::DetailPane;
 
 pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usize) {
     let old_logs_len = panel.logs_len;

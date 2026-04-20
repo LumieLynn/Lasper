@@ -25,7 +25,7 @@ pub enum WizardMessage {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ContainerMessage {
-    PaneChanged(crate::app::DetailPane),
+    PaneChanged(crate::ui::views::detail_panel::DetailPane),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1,6 +1,6 @@
 //! nspawn-specific metrics collection logic.
 
-use crate::app::CpuRepresentation;
+use crate::nspawn::models::CpuRepresentation;
 use crate::events::AppEvent;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

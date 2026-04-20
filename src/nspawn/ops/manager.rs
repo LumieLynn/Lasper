@@ -10,7 +10,6 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
     async fn start(&self, name: &str) -> Result<()>;
     async fn terminate(&self, name: &str) -> Result<()>;
-    async fn get_logs(&self, name: &str, lines: usize) -> Result<Vec<String>>;
     fn spawn_log_stream(
         &self,
         name: &str,
@@ -202,13 +201,6 @@ impl NspawnManager for DefaultManager {
         }
         self.cli.kill(name, signal).await.map_err(|e| {
             log::error!("CLI kill failed for {} (signal {}): {}", name, signal, e);
-            e
-        })
-    }
-
-    async fn get_logs(&self, name: &str, lines: usize) -> Result<Vec<String>> {
-        self.cli.get_logs(name, lines).await.map_err(|e| {
-            log::error!("CLI get_logs failed for {}: {}", name, e);
             e
         })
     }

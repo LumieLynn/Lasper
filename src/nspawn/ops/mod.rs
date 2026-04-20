@@ -12,6 +12,7 @@ pub enum BackendCommand {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum BackendResponse {
     ValidationSuccess,
     ValidationError(String),

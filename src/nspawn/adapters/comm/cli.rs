@@ -199,34 +199,6 @@ impl CliProvider {
         self.run_machinectl(&["kill", "-s", signal, name]).await
     }
 
-    pub async fn get_logs(&self, name: &str, lines: usize) -> Result<Vec<String>> {
-        let out = new_command("journalctl")
-            .args([
-                "-M",
-                name,
-                "-n",
-                &lines.to_string(),
-                "--no-pager",
-                "--output=short",
-            ])
-            .logged_output("journalctl")
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("journalctl"), e))?;
-
-        if !out.status.success() {
-            log::warn!(
-                "journalctl -M {} failed: {}",
-                name,
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect())
-    }
-
     pub fn spawn_log_stream(
         &self,
         name: &str,
