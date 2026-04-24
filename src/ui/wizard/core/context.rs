@@ -178,6 +178,7 @@ pub struct PassthroughState {
     pub nvidia_inject_env: bool,
     pub nvidia_available_devices: Vec<String>,
     pub active_nvidia_categories: Vec<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
+    pub hardware_scanning: bool,
 }
 
 impl PassthroughState {
@@ -260,12 +261,11 @@ impl WizardContext {
             .unwrap_or(false);
         let wayland_sockets =
             crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
-        let discovered_gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
-        let nvidia_available_devices = crate::nspawn::platform::nvidia::discovery::list_devices()
-            .await
-            .unwrap_or_else(|_| vec!["all".to_string()]);
-        let nvidia_state = crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await.unwrap_or_default();
-        let active_nvidia_categories = crate::nspawn::platform::nvidia::classify::detect_active_categories(&nvidia_state.classified_entries);
+        
+        // NVIDIA and GPU discovery is now offloaded to a background task
+        let discovered_gpus = vec![];
+        let nvidia_available_devices = vec!["all".to_string()];
+        let active_nvidia_categories = vec![];
         Self {
             source: SourceState {
                 kind: SourceKind::Copy,
@@ -336,6 +336,7 @@ impl WizardContext {
                 nvidia_inject_env: true,
                 nvidia_available_devices,
                 active_nvidia_categories,
+                hardware_scanning: true,
             },
             review: ReviewState {
                 preview: "".to_string(),
@@ -374,6 +375,21 @@ impl WizardContext {
 
     pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder().get_deployer_and_storage()
+    }
+
+    pub fn update_hardware_data(
+        &mut self,
+        state: crate::nspawn::platform::nvidia::state::NvidiaState,
+        devices: Vec<String>,
+        gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
+    ) {
+        self.passthrough.hardware_scanning = false;
+        self.passthrough.discovered_gpus = gpus;
+        self.passthrough.nvidia_available_devices = devices;
+        self.passthrough.active_nvidia_categories =
+            crate::nspawn::platform::nvidia::classify::detect_active_categories(
+                &state.classified_entries,
+            );
     }
 }
 
@@ -445,6 +461,7 @@ mod tests {
             nvidia_inject_env: true,
             nvidia_available_devices: vec!["all".to_string()],
             active_nvidia_categories: vec![],
+            hardware_scanning: false,
         };
 
         // Wayland only if Host network

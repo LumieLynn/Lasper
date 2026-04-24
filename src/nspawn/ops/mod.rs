@@ -9,6 +9,7 @@ pub use manager::{DefaultManager, NspawnManager};
 pub enum BackendCommand {
     SubmitConfig(Box<crate::ui::wizard::context::WizardContext>),
     ValidateInterface { name: String, is_bridge_mode: bool },
+    DiscoverHardware,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -19,4 +20,11 @@ pub enum BackendResponse {
     ValidationWarning(String),
     DeployStarted,
     DeployFailed(String),
+    HardwareDiscovered {
+        nvidia_state: crate::nspawn::platform::nvidia::state::NvidiaState,
+        nvidia_devices: Vec<String>,
+        host_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
+    },
+    DiscoveryStarted,
+    DiscoveryFailed(String),
 }

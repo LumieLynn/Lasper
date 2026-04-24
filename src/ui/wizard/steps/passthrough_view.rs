@@ -12,7 +12,7 @@ use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     Frame,
 };
 use std::collections::HashMap;
@@ -74,8 +74,10 @@ pub struct PassthroughStepView {
 
     privileged: Checkbox,
     privilege_warning: TextBlock,
+    scanning_indicator: TextBlock,
     focus: FocusTracker,
     scroll_offset: u16,
+    hardware_scanning: bool,
 }
 
 impl PassthroughStepView {
@@ -87,6 +89,7 @@ impl PassthroughStepView {
         discovered_gpus: Vec<GpuDevice>,
         nvidia_available_devices: Vec<String>,
         active_nvidia_categories: Vec<NvidiaFileCategory>,
+        hardware_scanning: bool,
     ) -> Self {
         let nvidia_label = if nvidia_toolkit_installed {
             "NVIDIA Driver & GPU Passthrough (Scan host)"
@@ -227,8 +230,13 @@ impl PassthroughStepView {
 
             privileged: Checkbox::new("Privileged Mode (NOT RECOMMENDED)", initial_data.privileged),
             privilege_warning: TextBlock::new("SECURITY RISK", warning_text),
+            scanning_indicator: TextBlock::new(
+                " SCANNING ",
+                " [~] Hardware discovery is running in the background. GPU and NVIDIA lists will populate automatically when finished...",
+            ),
             focus: FocusTracker::new(),
             scroll_offset: 0,
+            hardware_scanning,
         };
 
         view.update_wayland_state();
@@ -280,6 +288,10 @@ impl Component for PassthroughStepView {
         visual_items.push((&mut self.privileged, 3));
         if is_privileged {
             visual_items.push((&mut self.privilege_warning, 5));
+        }
+
+        if self.hardware_scanning {
+            visual_items.insert(0, (&mut self.scanning_indicator, 4));
         }
 
         let mut total_height = 0;

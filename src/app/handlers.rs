@@ -242,6 +242,8 @@ impl App {
                                 .await,
                         );
                         self.ui.show_wizard = true;
+                        // Trigger hardware discovery in background
+                        let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
                     }
                 } else {
                     self.set_status(

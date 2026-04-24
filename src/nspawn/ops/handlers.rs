@@ -83,6 +83,35 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 
                 let _ = tx.send(AppEvent::BackendResult(resp)).await;
             }
+            BackendCommand::DiscoverHardware => {
+                let _ = tx
+                    .send(AppEvent::BackendResult(BackendResponse::DiscoveryStarted))
+                    .await;
+
+                let devices_res = crate::nspawn::platform::nvidia::discovery::list_devices().await;
+                let state_res = crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await;
+                let gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
+
+                match (devices_res, state_res) {
+                    (Ok(nvidia_devices), Ok(nvidia_state)) => {
+                        let _ = tx
+                            .send(AppEvent::BackendResult(BackendResponse::HardwareDiscovered {
+                                nvidia_state,
+                                nvidia_devices,
+                                host_gpus: gpus,
+                            }))
+                            .await;
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        log::error!("Hardware discovery failed: {}", e);
+                        let _ = tx
+                            .send(AppEvent::BackendResult(BackendResponse::DiscoveryFailed(
+                                e.to_string(),
+                            )))
+                            .await;
+                    }
+                }
+            }
         }
     });
 }

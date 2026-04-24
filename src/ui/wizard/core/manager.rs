@@ -244,6 +244,37 @@ impl Wizard {
                         format!("Deploy Failed: {}", e),
                         crate::ui::StatusLevel::Error,
                     ),
+                    crate::nspawn::ops::BackendResponse::HardwareDiscovered {
+                        nvidia_state,
+                        nvidia_devices,
+                        host_gpus,
+                    } => {
+                        self.context
+                            .update_hardware_data(nvidia_state, nvidia_devices, host_gpus);
+                        // Force a view rebuild if we are on Passthrough or Devices steps
+                        if self.step == crate::ui::wizard::WizardStep::Passthrough
+                            || self.step == crate::ui::wizard::WizardStep::Devices
+                        {
+                            self.active_view = None;
+                        }
+                        StepAction::Status(
+                            "Hardware discovery complete".into(),
+                            crate::ui::StatusLevel::Info,
+                        )
+                    }
+                    crate::nspawn::ops::BackendResponse::DiscoveryStarted => {
+                        StepAction::Status(
+                            "Scanning host hardware...".into(),
+                            crate::ui::StatusLevel::Info,
+                        )
+                    }
+                    crate::nspawn::ops::BackendResponse::DiscoveryFailed(e) => {
+                        self.context.passthrough.hardware_scanning = false;
+                        StepAction::Status(
+                            format!("Hardware discovery failed: {}", e),
+                            crate::ui::StatusLevel::Error,
+                        )
+                    }
                 }
             }
             _ => StepAction::None,

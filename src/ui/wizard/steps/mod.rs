@@ -58,6 +58,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
             context.passthrough.discovered_gpus.clone(),
             context.passthrough.nvidia_available_devices.clone(),
             context.passthrough.active_nvidia_categories.clone(),
+            context.passthrough.hardware_scanning,
         )),
 
         WizardStep::Devices => Box::new(devices_view::DevicesStepView::new(
