@@ -339,7 +339,8 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         || !cfg.readonly_binds.is_empty()
         || !cfg.bind_mounts.is_empty()
         || cfg.wayland_socket.is_some()
-        || cfg.graphics_acceleration;
+        || cfg.graphics_acceleration
+        || matches!(cfg.network, Some(crate::nspawn::models::NetworkMode::Host));
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
@@ -361,6 +362,13 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
 
         let suffix = if idmap_supported { ":idmap" } else { "" };
+
+        if matches!(cfg.network, Some(crate::nspawn::models::NetworkMode::Host)) {
+            files.append(
+                "BindReadOnly",
+                format!("/etc/resolv.conf:/etc/resolv.conf{}", suffix),
+            );
+        }
 
         if let Some(socket_name) = &cfg.wayland_socket {
             if let Some(runtime) = xdg_runtime {
@@ -587,6 +595,7 @@ mod tests {
         cfg.network = Some(NetworkMode::Host);
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=no"));
+        assert!(content.contains("BindReadOnly=/etc/resolv.conf:/etc/resolv.conf"));
     }
 
     #[test]

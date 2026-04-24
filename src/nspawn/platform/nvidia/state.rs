@@ -1,8 +1,8 @@
-use std::collections::HashSet;
 use crate::nspawn::errors::{NspawnError, Result};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// Hardware and driver information detected on the host for mounting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -77,14 +77,7 @@ pub(crate) fn get_state_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
         return PathBuf::from(xdg).join("lasper").join("states");
     }
-    if let Some(home) = dirs::home_dir() {
-        home.join(".local")
-            .join("state")
-            .join("lasper")
-            .join("states")
-    } else {
-        PathBuf::from("/var/lib/lasper/states")
-    }
+    PathBuf::from("/var/lib/lasper/states")
 }
 
 pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
