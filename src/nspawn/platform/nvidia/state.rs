@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 
 /// Hardware and driver information detected on the host for mounting.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -8,16 +10,63 @@ pub struct NvidiaState {
     /// Host driver version when this state was captured.
     pub driver_version: String,
     /// Host paths to bind-mount into the container (read-only).
+    /// Format: "host:container" or just "path" (if mirror).
     pub readonly_binds: Vec<String>,
     /// Device files to bind-mount (read-write).
+    /// Format: "host:container" or just "path" (if mirror).
     pub device_binds: Vec<String>,
+
+    // Enriched data for advanced remapping and hooks
+    #[serde(default)]
+    pub classified_entries: Vec<ClassifiedEntry>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub symlinks: Vec<SymlinkEntry>,
+    #[serde(default)]
+    pub ldcache_folders: Vec<String>,
+    #[serde(default)]
+    pub env_vars: Vec<(String, String)>,
 }
 
 impl NvidiaState {
+    /// Returns all host paths involved in this state.
+    #[allow(dead_code)]
+    pub fn all_host_paths(&self) -> Vec<String> {
+        let mut paths = HashSet::new();
+        for b in &self.readonly_binds {
+            paths.insert(b.split(':').next().unwrap_or(b).to_string());
+        }
+        for b in &self.device_binds {
+            paths.insert(b.split(':').next().unwrap_or(b).to_string());
+        }
+        for e in &self.classified_entries {
+            paths.insert(e.host_path.clone());
+        }
+        paths.into_iter().collect()
+    }
+
+    /// Returns all container paths that were created/mounted.
+    /// Used for precise cleanup of 0-byte placeholders.
+    pub fn all_container_paths(&self) -> Vec<String> {
+        let mut paths = HashSet::new();
+        for b in &self.readonly_binds {
+            paths.insert(b.split(':').last().unwrap_or(b).to_string());
+        }
+        for b in &self.device_binds {
+            paths.insert(b.split(':').last().unwrap_or(b).to_string());
+        }
+        for e in &self.classified_entries {
+            paths.insert(e.default_container_path.clone());
+        }
+        for s in &self.symlinks {
+            paths.insert(s.link_path.clone());
+        }
+        paths.into_iter().collect()
+    }
+
+    /// Backward compatibility for legacy code that expects flattened paths.
     pub fn all_paths(&self) -> Vec<String> {
-        let mut paths = self.readonly_binds.clone();
-        paths.extend(self.device_binds.clone());
-        paths
+        self.all_container_paths()
     }
 }
 
@@ -110,6 +159,7 @@ mod tests {
             driver_version: "1.0".to_string(),
             readonly_binds: vec!["/ro1".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         let paths = state.all_paths();
         assert_eq!(paths.len(), 2);
@@ -129,11 +179,13 @@ mod tests {
             driver_version: "1.0".to_string(),
             readonly_binds: vec!["/ro1".to_string(), "/ro2".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         let new = NvidiaState {
             driver_version: "2.0".to_string(),
             readonly_binds: vec!["/ro1".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         let death_list = calculate_death_list(&old, &new);
         assert_eq!(death_list, vec!["/ro2".to_string()]);
@@ -145,6 +197,7 @@ mod tests {
             driver_version: "1.0".to_string(),
             readonly_binds: vec!["/ro1".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         assert!(calculate_death_list(&state, &state).is_empty());
     }
@@ -156,6 +209,7 @@ mod tests {
             driver_version: "1.0".to_string(),
             readonly_binds: vec!["/ro1".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         // Nothing in old → nothing to kill
         assert!(calculate_death_list(&old, &new).is_empty());
@@ -167,6 +221,7 @@ mod tests {
             driver_version: "1.0".to_string(),
             readonly_binds: vec!["/ro1".to_string()],
             device_binds: vec!["/dev1".to_string()],
+            ..Default::default()
         };
         let new = NvidiaState::default();
         let death_list = calculate_death_list(&old, &new);
@@ -181,6 +236,7 @@ mod tests {
             driver_version: "550.1".to_string(),
             readonly_binds: vec!["/usr/lib/libcuda.so".to_string()],
             device_binds: vec!["/dev/nvidia0".to_string()],
+            ..Default::default()
         };
         let serialized = serde_json::to_string(&state).unwrap();
         let deserialized: NvidiaState = serde_json::from_str(&serialized).unwrap();

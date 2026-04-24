@@ -50,6 +50,7 @@ pub async fn run_deploy_task(
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
+    nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     logs: tokio::sync::mpsc::Sender<String>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
@@ -60,7 +61,7 @@ pub async fn run_deploy_task(
     let _guard = DoneGuard { done };
 
     // 2. Perform deployment
-    if let Err(e) = run_deploy_internal(deployer, storage, name.clone(), cfg, logs.clone()).await {
+    if let Err(e) = run_deploy_internal(deployer, storage, name.clone(), cfg, nvidia_profile, logs.clone()).await {
         // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
         // if the log channel happens to be full.
         let err_msg = format!("FATAL ERROR: {}", e);
@@ -91,6 +92,7 @@ async fn run_deploy_internal(
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
+    nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     macro_rules! push_log {
@@ -220,7 +222,16 @@ async fn run_deploy_internal(
 
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
-            if let Ok(state) = crate::nspawn::platform::nvidia::get_nvidia_state().await {
+            
+            // Save profile if we have one so it's persisted for lifecycle later
+            if let Some(prof) = &nvidia_profile {
+                let _ = prof.save(&name).await;
+            }
+
+            if let Ok(mut state) = crate::nspawn::platform::nvidia::get_nvidia_state(nvidia_profile.as_ref()).await {
+                if let Some(prof) = &nvidia_profile {
+                    crate::nspawn::platform::nvidia::lifecycle::apply_category_remapping(&mut state, prof);
+                }
                 match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::apply_gpu_passthrough_to_content(
                     nspawn_content.clone(),
                     &state,

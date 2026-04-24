@@ -61,6 +61,7 @@ pub struct PassthroughConfig {
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
+    pub nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
 }
 
 #[derive(Default, Clone)]
@@ -86,6 +87,7 @@ impl ContainerConfigBuilder {
                 graphics_acceleration: false,
                 wayland_socket: None,
                 nvidia_gpu: false,
+                nvidia_profile: None,
             });
 
         let basic = self.basic.as_ref().cloned().unwrap_or(BasicConfig {
@@ -142,6 +144,7 @@ impl ContainerConfigBuilder {
                 return ContainerConfigWithPreview {
                     cfg,
                     preview: content,
+                    nvidia_profile: passthrough.nvidia_profile.clone(),
                 };
             }
         }
@@ -174,6 +177,7 @@ impl ContainerConfigBuilder {
         ContainerConfigWithPreview {
             cfg,
             preview: content,
+            nvidia_profile: passthrough.nvidia_profile.clone(),
         }
     }
 
@@ -249,6 +253,7 @@ impl ContainerConfigBuilder {
 pub struct ContainerConfigWithPreview {
     pub cfg: ContainerConfig,
     pub preview: String,
+    pub nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
 }
 
 #[cfg(test)]
@@ -293,6 +298,7 @@ mod tests {
             graphics_acceleration: true,
             wayland_socket: Some("wayland-0".to_string()),
             nvidia_gpu: true,
+            nvidia_profile: None,
         });
         let result = builder.build_config(None);
         assert!(result.cfg.privileged);

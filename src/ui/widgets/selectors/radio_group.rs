@@ -45,6 +45,10 @@ impl RadioGroup {
     pub fn selected_idx(&self) -> usize {
         self.selected_idx
     }
+
+    pub fn options(&self) -> &[String] {
+        &self.options
+    }
 }
 
 impl Component for RadioGroup {

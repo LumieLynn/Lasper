@@ -170,6 +170,14 @@ pub struct PassthroughState {
     pub selected_gpu_nodes: Vec<String>,
     pub wayland_sockets: Vec<String>,
     pub bind_mounts: Vec<BindMount>,
+
+    // Advanced NVIDIA passthrough
+    pub nvidia_passthrough_mode: crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode,
+    pub nvidia_gpu_device: String,
+    pub nvidia_category_destinations: std::collections::HashMap<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory, String>,
+    pub nvidia_inject_env: bool,
+    pub nvidia_available_devices: Vec<String>,
+    pub active_nvidia_categories: Vec<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
 }
 
 impl PassthroughState {
@@ -186,6 +194,16 @@ impl PassthroughState {
                 None
             },
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
+            nvidia_profile: if self.nvidia_gpu {
+                Some(crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile {
+                    gpu_device: self.nvidia_gpu_device.clone(),
+                    mode: self.nvidia_passthrough_mode.clone(),
+                    category_destinations: self.nvidia_category_destinations.clone(),
+                    inject_env: self.nvidia_inject_env,
+                })
+            } else {
+                None
+            },
         }
     }
 }
@@ -243,6 +261,11 @@ impl WizardContext {
         let wayland_sockets =
             crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
         let discovered_gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
+        let nvidia_available_devices = crate::nspawn::platform::nvidia::discovery::list_devices()
+            .await
+            .unwrap_or_else(|_| vec!["all".to_string()]);
+        let nvidia_state = crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await.unwrap_or_default();
+        let active_nvidia_categories = crate::nspawn::platform::nvidia::classify::detect_active_categories(&nvidia_state.classified_entries);
         Self {
             source: SourceState {
                 kind: SourceKind::Copy,
@@ -307,6 +330,12 @@ impl WizardContext {
                 selected_gpu_nodes: vec![],
                 wayland_sockets,
                 bind_mounts: vec![],
+                nvidia_passthrough_mode: crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode::Mirror,
+                nvidia_gpu_device: "all".to_string(),
+                nvidia_category_destinations: std::collections::HashMap::new(),
+                nvidia_inject_env: true,
+                nvidia_available_devices,
+                active_nvidia_categories,
             },
             review: ReviewState {
                 preview: "".to_string(),
@@ -410,6 +439,12 @@ mod tests {
             selected_gpu_nodes: vec![],
             wayland_sockets: vec![],
             bind_mounts: vec![],
+            nvidia_passthrough_mode: crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode::Mirror,
+            nvidia_gpu_device: "all".to_string(),
+            nvidia_category_destinations: std::collections::HashMap::new(),
+            nvidia_inject_env: true,
+            nvidia_available_devices: vec!["all".to_string()],
+            active_nvidia_categories: vec![],
         };
 
         // Wayland only if Host network

@@ -21,18 +21,35 @@ pub(crate) struct CdiDevice {
 pub(crate) struct CdiEdits {
     pub(crate) device_nodes: Option<Vec<CdiDeviceNode>>,
     pub(crate) mounts: Option<Vec<CdiMount>>,
+    pub(crate) hooks: Option<Vec<CdiHook>>,
+    pub(crate) env: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CdiHook {
+    pub(crate) hook_name: String,
+    pub(crate) path: String,
+    pub(crate) args: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiDeviceNode {
     pub(crate) path: String,
+    pub(crate) host_path: Option<String>,
+    pub(crate) major: Option<u32>,
+    pub(crate) minor: Option<u32>,
+    pub(crate) permissions: Option<String>,
+    pub(crate) gid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiMount {
     pub(crate) host_path: String,
+    pub(crate) container_path: String,
+    pub(crate) options: Option<Vec<String>>,
 }
 
 #[cfg(test)]

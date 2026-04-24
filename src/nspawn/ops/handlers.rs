@@ -13,6 +13,7 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 let (deployer, storage) = ctx.get_deployer_and_storage();
                 let name = built.cfg.name.clone();
                 let cfg = built.cfg;
+                let nvidia_profile = built.nvidia_profile;
 
                 // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
                 let (log_mpsc_tx, mut log_mpsc_rx) = tokio::sync::mpsc::channel::<String>(100);
@@ -35,6 +36,7 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                         storage,
                         name,
                         cfg,
+                        nvidia_profile,
                         log_mpsc_tx,
                         done,
                         success,

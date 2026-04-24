@@ -162,9 +162,19 @@ impl NspawnConfig {
                     if key == "Bind" && new_state.device_binds.iter().any(|v| v == value) {
                         lines_to_remove.push(format!("Bind={}", value));
                     }
-                    if key == "BindReadOnly" && new_state.readonly_binds.iter().any(|v| v == value)
-                    {
-                        lines_to_remove.push(format!("BindReadOnly={}", value));
+                    if key == "BindReadOnly" {
+                        let host_path = value.split(':').next().unwrap_or(value);
+                        let is_in_ro = new_state
+                            .readonly_binds
+                            .iter()
+                            .any(|v| v.split(':').next().unwrap_or(v) == host_path);
+                        let is_in_ce = new_state
+                            .classified_entries
+                            .iter()
+                            .any(|ce| ce.host_path == host_path);
+                        if is_in_ro || is_in_ce {
+                            lines_to_remove.push(format!("BindReadOnly={}", value));
+                        }
                     }
                 }
             }
@@ -180,7 +190,10 @@ impl NspawnConfig {
         }
 
         // 4. Build the new managed block
-        if !new_state.device_binds.is_empty() || !new_state.readonly_binds.is_empty() {
+        if !new_state.device_binds.is_empty()
+            || !new_state.readonly_binds.is_empty()
+            || !new_state.classified_entries.is_empty()
+        {
             let mut block = Vec::new();
             block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
             for dev in &new_state.device_binds {
@@ -188,6 +201,16 @@ impl NspawnConfig {
             }
             for ro in &new_state.readonly_binds {
                 block.push(format!("BindReadOnly={}", ro));
+            }
+            for ce in &new_state.classified_entries {
+                if ce.host_path == ce.default_container_path {
+                    block.push(format!("BindReadOnly={}", ce.host_path));
+                } else {
+                    block.push(format!(
+                        "BindReadOnly={}:{}",
+                        ce.host_path, ce.default_container_path
+                    ));
+                }
             }
             block.push("X-Lasper-Nvidia-End=true".to_string());
 
@@ -342,7 +365,10 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         if let Some(socket_name) = &cfg.wayland_socket {
             if let Some(runtime) = xdg_runtime {
                 let socket_path = std::path::PathBuf::from(runtime).join(socket_name);
-                files.append("Bind", format!("{}:/run/wayland-0", socket_path.display()));
+                files.append(
+                    "Bind",
+                    format!("{}:/mnt/wayland-socket{}", socket_path.display(), suffix),
+                );
             }
 
             files.append("Bind", format!("/tmp/.X11-unix:/tmp/.X11-unix{}", suffix));
