@@ -186,7 +186,10 @@ pub async fn ensure_gpu_passthrough(
 
     // 2. State Diff Engine (Declarative)
     log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
-    let profile = NvidiaPassthroughProfile::load(name).await.unwrap_or_default();
+    
+    let external_cache = get_external_state(name).await?.unwrap_or_default();
+    let profile = external_cache.profile.clone().unwrap_or_default();
+
     let mut host_state = get_nvidia_state(Some(&profile)).await?;
 
     // Apply remapping if in Categorized mode
@@ -194,6 +197,7 @@ pub async fn ensure_gpu_passthrough(
         log_step!(name, "Remapping", "Applying custom destination remapping...");
         apply_category_remapping(&mut host_state, &profile);
     }
+    host_state.profile = Some(profile.clone());
 
     log_step!(
         name,
@@ -203,8 +207,6 @@ pub async fn ensure_gpu_passthrough(
         host_state.readonly_binds.len(),
         host_state.device_binds.len()
     );
-
-    let external_cache = get_external_state(name).await?.unwrap_or_default();
 
     // Full-payload comparison for perfect state sync
     let mut old_state = external_cache.clone();

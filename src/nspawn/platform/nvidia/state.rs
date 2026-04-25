@@ -26,6 +26,8 @@ pub struct NvidiaState {
     pub ldcache_folders: Vec<String>,
     #[serde(default)]
     pub env_vars: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
 }
 
 impl NvidiaState {

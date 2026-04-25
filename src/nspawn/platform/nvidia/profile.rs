@@ -1,6 +1,6 @@
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NvidiaPassthroughMode {
@@ -39,27 +39,12 @@ impl Default for NvidiaPassthroughProfile {
 }
 
 impl NvidiaPassthroughProfile {
-    pub fn get_profile_path(name: &str) -> std::path::PathBuf {
-        super::state::get_state_dir().join(format!("{}.nvidia-profile.json", name))
-    }
-
-    pub async fn load(name: &str) -> crate::nspawn::errors::Result<Self> {
-        let path = Self::get_profile_path(name);
-        if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return Ok(Self::default());
-        }
-        let content = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.clone(), e))?;
-        let profile: Self = serde_json::from_str(&content)?;
-        Ok(profile)
-    }
-
     pub async fn save(&self, name: &str) -> crate::nspawn::errors::Result<()> {
-        let path = Self::get_profile_path(name);
-        let content = serde_json::to_string_pretty(self)?;
-        crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |_| Ok(content)).await?;
-        Ok(())
+        let mut state = super::state::get_external_state(name)
+            .await?
+            .unwrap_or_default();
+        state.profile = Some(self.clone());
+        super::state::save_external_state(name, &state).await
     }
 }
 
@@ -78,7 +63,9 @@ pub fn builtin_templates() -> Vec<ProfileTemplate> {
                 (NvidiaFileCategory::Bin, "/usr/bin".into()),
                 (NvidiaFileCategory::Firmware, "/lib/firmware/nvidia".into()),
                 (NvidiaFileCategory::Config, "/etc/vulkan/icd.d".into()),
-            ].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect(),
         },
         ProfileTemplate {
             name: "Isolated Prefix".into(),
@@ -91,7 +78,9 @@ pub fn builtin_templates() -> Vec<ProfileTemplate> {
                 (NvidiaFileCategory::Xorg, "/opt/nvidia/xorg".into()),
                 (NvidiaFileCategory::Vdpau, "/opt/nvidia/vdpau".into()),
                 (NvidiaFileCategory::Gbm, "/opt/nvidia/gbm".into()),
-            ].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect(),
         },
     ]
 }
