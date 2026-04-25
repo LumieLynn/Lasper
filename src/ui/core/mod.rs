@@ -6,7 +6,6 @@ pub enum AppMessage {
     Backend(crate::nspawn::ops::BackendResponse),
 }
 
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum WizardMessage {
     Submit,
@@ -34,7 +33,6 @@ pub enum ListMessage {
     Next,
     Prev,
 }
-
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventResult {

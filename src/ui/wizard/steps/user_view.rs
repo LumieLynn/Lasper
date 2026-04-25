@@ -76,7 +76,7 @@ impl Component for UserStepView {
 
         self.root_password.render(f, chunks[0]);
         self.user_list.render(f, chunks[2]);
- 
+
         let hint = " [Tab] switch, [A]dd user, [E]dit user, [D]elete user, [Enter] next ";
         f.render_widget(
             Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
@@ -117,12 +117,12 @@ impl Component for UserStepView {
                 self.editor = Some(UserEditor::new(|u| {
                     AppMessage::Wizard(WizardMessage::UserAdded(u))
                 }));
- 
+
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
             }
         }
- 
+
         if key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E') {
             if self.user_list.is_focused() {
                 if let Some(user) = self.user_list.selected_item() {
@@ -134,7 +134,7 @@ impl Component for UserStepView {
                         })
                         .with_user(&user),
                     );
- 
+
                     self.editor.as_mut().unwrap().set_focus(true);
                     return EventResult::Consumed;
                 }

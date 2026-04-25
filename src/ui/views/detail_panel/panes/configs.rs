@@ -23,10 +23,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                 .get(data.selected)
                 .map(|e| e.name.as_str())
                 .unwrap_or("?");
-            format!(
-                "No .nspawn config file found for machine '{}'.",
-                name
-            )
+            format!("No .nspawn config file found for machine '{}'.", name)
         }
     };
 

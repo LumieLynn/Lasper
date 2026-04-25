@@ -1,6 +1,6 @@
 use super::App;
-use crate::ui::views::detail_panel::DetailPane;
 use crate::nspawn::models::{ContainerEntry, ContainerState};
+use crate::ui::views::detail_panel::DetailPane;
 use ratatui::text::Line;
 use std::time::{Duration, Instant};
 

@@ -48,11 +48,13 @@ impl NvidiaPassthroughProfile {
     }
 }
 
+#[allow(dead_code)]
 pub struct ProfileTemplate {
     pub name: String,
     pub destinations: HashMap<NvidiaFileCategory, String>,
 }
 
+#[allow(dead_code)]
 pub fn builtin_templates() -> Vec<ProfileTemplate> {
     vec![
         ProfileTemplate {

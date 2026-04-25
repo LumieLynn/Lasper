@@ -1,7 +1,7 @@
 //! nspawn-specific backend command handlers.
 
-use crate::events::AppEvent;
 use super::{BackendCommand, BackendResponse};
+use crate::events::AppEvent;
 use tokio::sync::mpsc::Sender;
 
 /// Handle backend asynchronous tasks (deployments, validations, etc.)
@@ -63,7 +63,10 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     .send(AppEvent::BackendResult(BackendResponse::DeployStarted))
                     .await;
             }
-            BackendCommand::ValidateInterface { name, is_bridge_mode } => {
+            BackendCommand::ValidateInterface {
+                name,
+                is_bridge_mode,
+            } => {
                 let net_path = format!("/sys/class/net/{}", name);
                 let bridge_path = format!("/sys/class/net/{}/bridge", name);
 
@@ -71,12 +74,22 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 let is_bridge = tokio::fs::metadata(&bridge_path).await.is_ok();
 
                 let resp = if !exists {
-                    BackendResponse::ValidationWarning(format!("Interface '{}' not found. It must exist before starting the container.", name))
+                    BackendResponse::ValidationWarning(format!(
+                        "Interface '{}' not found. It must exist before starting the container.",
+                        name
+                    ))
                 } else if is_bridge_mode && !is_bridge {
-                    let actual_type = crate::nspawn::platform::network::identify_interface(&name).await;
-                    BackendResponse::ValidationWarning(format!("'{}' is a {}, not a bridge", name, actual_type))
+                    let actual_type =
+                        crate::nspawn::platform::network::identify_interface(&name).await;
+                    BackendResponse::ValidationWarning(format!(
+                        "'{}' is a {}, not a bridge",
+                        name, actual_type
+                    ))
                 } else if !is_bridge_mode && is_bridge {
-                    BackendResponse::ValidationWarning(format!("'{}' is a bridge, but you selected a physical/virtual mode", name))
+                    BackendResponse::ValidationWarning(format!(
+                        "'{}' is a bridge, but you selected a physical/virtual mode",
+                        name
+                    ))
                 } else {
                     BackendResponse::ValidationSuccess
                 };
@@ -89,17 +102,20 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     .await;
 
                 let devices_res = crate::nspawn::platform::nvidia::discovery::list_devices().await;
-                let state_res = crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await;
+                let state_res =
+                    crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await;
                 let gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
 
                 match (devices_res, state_res) {
                     (Ok(nvidia_devices), Ok(nvidia_state)) => {
                         let _ = tx
-                            .send(AppEvent::BackendResult(BackendResponse::HardwareDiscovered {
-                                nvidia_state,
-                                nvidia_devices,
-                                host_gpus: gpus,
-                            }))
+                            .send(AppEvent::BackendResult(
+                                BackendResponse::HardwareDiscovered {
+                                    nvidia_state,
+                                    nvidia_devices,
+                                    host_gpus: gpus,
+                                },
+                            ))
                             .await;
                     }
                     (Err(e), _) | (_, Err(e)) => {

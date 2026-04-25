@@ -11,10 +11,7 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{
-    layout::Rect,
-    Frame,
-};
+use ratatui::{layout::Rect, Frame};
 use std::collections::HashMap;
 
 macro_rules! active_comps {
@@ -302,7 +299,10 @@ impl Component for PassthroughStepView {
         }
 
         // Auto-scroll logic: ensure the active focusable component is completely visible
-        let active_vis_idx = self.focus.active_idx.min(visual_items.len().saturating_sub(1));
+        let active_vis_idx = self
+            .focus
+            .active_idx
+            .min(visual_items.len().saturating_sub(1));
         let active_y = item_ys[active_vis_idx];
         let active_h = visual_items[active_vis_idx].1;
 
@@ -310,7 +310,11 @@ impl Component for PassthroughStepView {
             self.scroll_offset = active_y;
         } else if active_y + active_h > self.scroll_offset + area.height {
             let target_scroll = (active_y + active_h).saturating_sub(area.height);
-            let new_scroll = item_ys.iter().copied().find(|&y| y >= target_scroll).unwrap_or(target_scroll);
+            let new_scroll = item_ys
+                .iter()
+                .copied()
+                .find(|&y| y >= target_scroll)
+                .unwrap_or(target_scroll);
             self.scroll_offset = new_scroll;
         }
 
@@ -318,11 +322,15 @@ impl Component for PassthroughStepView {
         self.scroll_offset = self.scroll_offset.min(max_scroll);
 
         // Rendering logic
-        let inner_width = if total_height > area.height { area.width.saturating_sub(1) } else { area.width };
+        let inner_width = if total_height > area.height {
+            area.width.saturating_sub(1)
+        } else {
+            area.width
+        };
 
         for (i, (comp, height)) in visual_items.into_iter().enumerate() {
             let y = item_ys[i];
-            
+
             if y + height <= self.scroll_offset {
                 continue; // completely above view
             }
@@ -332,26 +340,32 @@ impl Component for PassthroughStepView {
             if y < self.scroll_offset {
                 continue; // partially above view, skip to prevent bad rect bounds
             }
-            
+
             let screen_y = area.y + y - self.scroll_offset;
             let draw_height = height.min(area.y + area.height - screen_y);
-            
+
             let draw_rect = Rect::new(area.x, screen_y, inner_width, draw_height);
             comp.render(f, draw_rect);
         }
 
         if total_height > area.height {
             use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-            let mut state = ScrollbarState::new(max_scroll as usize).position(self.scroll_offset as usize);
+            let mut state =
+                ScrollbarState::new(max_scroll as usize).position(self.scroll_offset as usize);
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
                 .end_symbol(Some("▼"));
-            
+
             f.render_stateful_widget(
                 scrollbar,
-                Rect { x: area.x + area.width - 1, y: area.y, width: 1, height: area.height },
-                &mut state
+                Rect {
+                    x: area.x + area.width - 1,
+                    y: area.y,
+                    width: 1,
+                    height: area.height,
+                },
+                &mut state,
             );
         }
     }

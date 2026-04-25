@@ -27,6 +27,7 @@ pub(crate) struct CdiEdits {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct CdiHook {
     pub(crate) hook_name: String,
     pub(crate) path: String,
@@ -35,6 +36,7 @@ pub(crate) struct CdiHook {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct CdiDeviceNode {
     pub(crate) path: String,
     pub(crate) host_path: Option<String>,
@@ -46,6 +48,7 @@ pub(crate) struct CdiDeviceNode {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub(crate) struct CdiMount {
     pub(crate) host_path: String,
     pub(crate) container_path: String,

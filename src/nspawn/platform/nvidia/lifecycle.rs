@@ -112,29 +112,34 @@ pub fn apply_category_remapping(host_state: &mut NvidiaState, profile: &NvidiaPa
             } else if root.is_empty() {
                 // No canonical root (Config) — keep CDI's original container path
             } else {
-                let filename = entry.default_container_path.split('/').last().unwrap_or_default();
+                let filename = entry
+                    .default_container_path
+                    .split('/')
+                    .last()
+                    .unwrap_or_default();
                 entry.default_container_path = format!("{}/{}", dest, filename);
             }
         }
     }
 
     // Helper: remap a path using prefix matching against dir_remap
-    let remap_path = |path: &str, dir_remap: &std::collections::HashMap<String, String>| -> Option<String> {
-        let mut best_root = "";
-        let mut best_dest = "";
-        for (root, dest) in dir_remap {
-            if path.starts_with(root.as_str()) && root.len() > best_root.len() {
-                best_root = root;
-                best_dest = dest;
+    let remap_path =
+        |path: &str, dir_remap: &std::collections::HashMap<String, String>| -> Option<String> {
+            let mut best_root = "";
+            let mut best_dest = "";
+            for (root, dest) in dir_remap {
+                if path.starts_with(root.as_str()) && root.len() > best_root.len() {
+                    best_root = root;
+                    best_dest = dest;
+                }
             }
-        }
-        if !best_root.is_empty() {
-            let relative = &path[best_root.len()..];
-            Some(format!("{}{}", best_dest, relative))
-        } else {
-            None
-        }
-    };
+            if !best_root.is_empty() {
+                let relative = &path[best_root.len()..];
+                Some(format!("{}{}", best_dest, relative))
+            } else {
+                None
+            }
+        };
 
     // Remap symlinks
     for sym in &mut host_state.symlinks {
@@ -186,7 +191,7 @@ pub async fn ensure_gpu_passthrough(
 
     // 2. State Diff Engine (Declarative)
     log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
-    
+
     let external_cache = get_external_state(name).await?.unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
 
@@ -194,7 +199,11 @@ pub async fn ensure_gpu_passthrough(
 
     // Apply remapping if in Categorized mode
     if profile.mode == NvidiaPassthroughMode::Categorized {
-        log_step!(name, "Remapping", "Applying custom destination remapping...");
+        log_step!(
+            name,
+            "Remapping",
+            "Applying custom destination remapping..."
+        );
         apply_category_remapping(&mut host_state, &profile);
     }
     host_state.profile = Some(profile.clone());
@@ -266,7 +275,11 @@ pub async fn ensure_gpu_passthrough(
     inject_persistent_device_allow(name, &host_state).await?;
 
     // 6. Hook execution (Symlinks, Env)
-    log_step!(name, "Surgery", "Creating symlinks and injecting environment...");
+    log_step!(
+        name,
+        "Surgery",
+        "Creating symlinks and injecting environment..."
+    );
     let backend = crate::nspawn::adapters::storage::get_storage_backend_for(name).await;
     let rootfs = backend.mount(name).await?;
 
@@ -278,7 +291,12 @@ pub async fn ensure_gpu_passthrough(
         }
         let _ = tokio::fs::remove_file(&target).await;
         if let Err(e) = std::os::unix::fs::symlink(&sym.target, &target) {
-            log::warn!("Failed to create symlink {} -> {}: {}", target.display(), sym.target, e);
+            log::warn!(
+                "Failed to create symlink {} -> {}: {}",
+                target.display(),
+                sym.target,
+                e
+            );
         }
     }
 
@@ -294,7 +312,7 @@ pub async fn ensure_gpu_passthrough(
             }
             let _ = tokio::fs::write(&env_path, lines.join("\n") + "\n").await;
         }
-        
+
         // ldconfig
         let ld_conf_dir = rootfs.join("etc/ld.so.conf.d");
         let _ = tokio::fs::create_dir_all(&ld_conf_dir).await;

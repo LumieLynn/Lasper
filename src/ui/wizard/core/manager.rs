@@ -262,12 +262,10 @@ impl Wizard {
                             crate::ui::StatusLevel::Info,
                         )
                     }
-                    crate::nspawn::ops::BackendResponse::DiscoveryStarted => {
-                        StepAction::Status(
-                            "Scanning host hardware...".into(),
-                            crate::ui::StatusLevel::Info,
-                        )
-                    }
+                    crate::nspawn::ops::BackendResponse::DiscoveryStarted => StepAction::Status(
+                        "Scanning host hardware...".into(),
+                        crate::ui::StatusLevel::Info,
+                    ),
                     crate::nspawn::ops::BackendResponse::DiscoveryFailed(e) => {
                         self.context.passthrough.hardware_scanning = false;
                         StepAction::Status(

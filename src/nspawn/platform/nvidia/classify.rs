@@ -17,12 +17,7 @@ pub enum NvidiaFileCategory {
 
 impl NvidiaFileCategory {
     pub fn all_static() -> Vec<Self> {
-        vec![
-            Self::Lib64,
-            Self::Lib32,
-            Self::Bin,
-            Self::Firmware,
-        ]
+        vec![Self::Lib64, Self::Lib32, Self::Bin, Self::Firmware]
     }
 
     pub fn label(&self) -> &str {
@@ -81,19 +76,16 @@ pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<Bind
         let path = m.host_path.clone();
         let lower = path.to_lowercase();
 
-        let category = if lower.contains("xorg") || lower.contains("modules/drivers") {
-            Some(NvidiaFileCategory::Xorg)
-        } else if lower.contains("vdpau") {
-            Some(NvidiaFileCategory::Vdpau)
-        } else if lower.contains("gbm") {
-            Some(NvidiaFileCategory::Gbm)
-        } else if lower.ends_with(".json")
-            && (lower.contains("vulkan") || lower.contains("egl") || lower.contains("glvnd"))
-        {
+        let category = if lower.ends_with(".json") {
             Some(NvidiaFileCategory::Config)
         } else if lower.ends_with(".so") || lower.contains(".so.") {
-            // 32-bit vs 64-bit detection
-            if lower.contains("/lib32/")
+            if lower.contains("xorg") || lower.contains("modules/drivers") {
+                Some(NvidiaFileCategory::Xorg)
+            } else if lower.contains("vdpau") {
+                Some(NvidiaFileCategory::Vdpau)
+            } else if lower.contains("gbm") {
+                Some(NvidiaFileCategory::Gbm)
+            } else if lower.contains("/lib32/")
                 || lower.contains("/i386-linux-gnu/")
                 || lower.contains("/i686/")
             {

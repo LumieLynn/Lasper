@@ -2,8 +2,8 @@
 
 pub mod builders;
 
-use crate::nspawn::adapters::storage::StorageBackend;
 use crate::events::AppEvent;
+use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
 use crate::nspawn::sys::CommandLogged;
@@ -61,7 +61,16 @@ pub async fn run_deploy_task(
     let _guard = DoneGuard { done };
 
     // 2. Perform deployment
-    if let Err(e) = run_deploy_internal(deployer, storage, name.clone(), cfg, nvidia_profile, logs.clone()).await {
+    if let Err(e) = run_deploy_internal(
+        deployer,
+        storage,
+        name.clone(),
+        cfg,
+        nvidia_profile,
+        logs.clone(),
+    )
+    .await
+    {
         // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
         // if the log channel happens to be full.
         let err_msg = format!("FATAL ERROR: {}", e);
@@ -222,7 +231,7 @@ async fn run_deploy_internal(
 
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
-            
+
             // Save profile if we have one so it's persisted for lifecycle later
             if let Some(prof) = &nvidia_profile {
                 let _ = prof.save(&name).await;
@@ -326,7 +335,8 @@ async fn run_deploy_internal(
         push_log!("Rolling back broken container...".to_string());
 
         // Clean up host-side configurations to prevent "ghost configs"
-        let nspawn_path = crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
+        let nspawn_path =
+            crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
         let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
         let _ = tokio::fs::remove_file(&nspawn_path).await;
         let _ = tokio::fs::remove_dir_all(&override_dir).await;

@@ -114,7 +114,6 @@ impl MachineProperties {
         self.get_group_mut(group).insert(key, value);
     }
 
-
     /// Returns a filtered and ordered list of 'primary' properties for summary views.
     pub fn get_summary(&self) -> Vec<(&String, &String)> {
         let mut pairs = Vec::new();
@@ -298,7 +297,6 @@ mod tests {
         let summary = props.get_summary();
         assert!(summary.is_empty());
     }
-
 
     #[test]
     fn test_get_group_mut_creates_once() {

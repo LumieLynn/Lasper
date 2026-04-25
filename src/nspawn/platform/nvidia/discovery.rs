@@ -72,8 +72,14 @@ pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Res
     let tmp_path_str = tmp_path.to_string_lossy();
 
     let mut cmd = new_command("nvidia-ctk");
-    cmd.args(["cdi", "generate", "--format=json", "--output", &tmp_path_str]);
-    
+    cmd.args([
+        "cdi",
+        "generate",
+        "--format=json",
+        "--output",
+        &tmp_path_str,
+    ]);
+
     // Per-GPU selection
     if gpu_device != "all" {
         cmd.args(["--device-id", gpu_device]);
@@ -134,22 +140,38 @@ pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Res
     let mut all_env = Vec::new();
 
     if let Some(edits) = spec.container_edits {
-        if let Some(m) = edits.mounts { all_mounts.extend(m); }
-        if let Some(h) = edits.hooks { all_hooks.extend(h); }
-        if let Some(e) = edits.env { all_env.extend(e); }
+        if let Some(m) = edits.mounts {
+            all_mounts.extend(m);
+        }
+        if let Some(h) = edits.hooks {
+            all_hooks.extend(h);
+        }
+        if let Some(e) = edits.env {
+            all_env.extend(e);
+        }
         if let Some(nodes) = edits.device_nodes {
-            for node in nodes { state.device_binds.push(node.path); }
+            for node in nodes {
+                state.device_binds.push(node.path);
+            }
         }
     }
 
     if let Some(devices) = spec.devices {
         for dev in devices {
             if let Some(edits) = dev.container_edits {
-                if let Some(m) = edits.mounts { all_mounts.extend(m); }
-                if let Some(h) = edits.hooks { all_hooks.extend(h); }
-                if let Some(e) = edits.env { all_env.extend(e); }
+                if let Some(m) = edits.mounts {
+                    all_mounts.extend(m);
+                }
+                if let Some(h) = edits.hooks {
+                    all_hooks.extend(h);
+                }
+                if let Some(e) = edits.env {
+                    all_env.extend(e);
+                }
                 if let Some(nodes) = edits.device_nodes {
-                    for node in nodes { state.device_binds.push(node.path); }
+                    for node in nodes {
+                        state.device_binds.push(node.path);
+                    }
                 }
             }
         }
@@ -171,7 +193,7 @@ pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Res
     // 3. Symlink Magic: Resolve aliases for .so files via ldconfig (Double Check)
     let ldconfig_cache = get_ldconfig_cache().await;
     let mut resolved_libs = Vec::new();
-    
+
     // We check both raw unclassified and classified libs
     let mut check_paths = state.readonly_binds.clone();
     for entry in &state.classified_entries {
@@ -188,7 +210,11 @@ pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Res
 
     // Merge resolved libs if they aren't already covered by classified_entries
     for lib_path in resolved_libs {
-        if !state.classified_entries.iter().any(|ce| ce.host_path == lib_path) {
+        if !state
+            .classified_entries
+            .iter()
+            .any(|ce| ce.host_path == lib_path)
+        {
             state.readonly_binds.push(lib_path);
         }
     }

@@ -218,7 +218,10 @@ impl DetailPanel {
                 let next = self.active_pane.next();
                 return self.switch_pane(next);
             }
-            KeyCode::Char(c) if c.is_digit(10) && key.modifiers.contains(crossterm::event::KeyModifiers::ALT) => {
+            KeyCode::Char(c)
+                if c.is_digit(10)
+                    && key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
+            {
                 let idx = (c.to_digit(10).unwrap() as usize).saturating_sub(1);
                 if let Some(pane) = DetailPane::from_index(idx) {
                     return self.switch_pane(pane);
