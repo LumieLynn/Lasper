@@ -2,6 +2,7 @@
 
 pub mod actions;
 pub mod handlers;
+pub mod terminal;
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
@@ -18,6 +19,8 @@ use crate::ui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
 use std::io::Stdout;
 
+pub use terminal::TerminalManager;
+
 /// Which top-level panel has keyboard focus.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActivePanel {
@@ -31,7 +34,6 @@ pub struct AppUi {
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
-    pub show_terminal: bool,
     pub show_wizard: bool,
     pub show_help: bool,
     pub power_menu: Option<crate::ui::widgets::power_menu::PowerMenu>,
@@ -52,7 +54,6 @@ impl AppUi {
             active_panel: ActivePanel::ContainerList,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
-            show_terminal: false,
             show_wizard: false,
             show_help: false,
             power_menu: None,
@@ -66,11 +67,11 @@ impl AppUi {
         }
     }
 
-    pub fn toggle_focus(&mut self) {
+    pub fn toggle_focus(&mut self, terminal_showing: bool) {
         self.active_panel = match self.active_panel {
             ActivePanel::ContainerList => ActivePanel::DetailPanel,
             ActivePanel::DetailPanel => {
-                if self.show_terminal {
+                if terminal_showing {
                     ActivePanel::TerminalPanel
                 } else {
                     ActivePanel::ContainerList
@@ -81,18 +82,7 @@ impl AppUi {
     }
 }
 
-pub struct TerminalSession {
-    pub container_name: String,
-    pub terminal: std::sync::Arc<
-        parking_lot::Mutex<vt100::Parser<crate::nspawn::adapters::comm::pty::PtyReply>>,
-    >,
-    pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
-    pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
-    pub scroll_offset: usize,
-    pub insert_mode: bool,
-}
-
-// ── App ───────────────────────────────────────────────────────────────────────
+// App
 
 pub struct AppData {
     pub entries: Vec<ContainerEntry>,
@@ -119,8 +109,7 @@ pub struct AppData {
     pub logs_dirty: bool,
 
     // Terminal state
-    pub terminal_sessions: Vec<TerminalSession>,
-    pub active_terminal_idx: usize,
+    pub terminal: TerminalManager,
 }
 
 /// Global application state.
@@ -158,8 +147,7 @@ impl App {
                 config_dirty: true,
                 details_dirty: true,
                 logs_dirty: true,
-                terminal_sessions: Vec::new(),
-                active_terminal_idx: 0,
+                terminal: TerminalManager::new(),
             },
             ui: AppUi::new(is_root),
         }
@@ -347,11 +335,11 @@ impl App {
                 break;
             }
         }
-        self.cleanup_all_terminals();
+        self.data.terminal.cleanup_all();
         Ok(())
     }
 
-    // ── Tick (auto-refresh + status expiry) ───────────────────────────────────
+    // Tick (auto-refresh + status expiry)
 
     async fn tick(&mut self) {
         // Expire status message

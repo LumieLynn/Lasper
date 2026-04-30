@@ -379,7 +379,10 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
                 );
             }
 
-            files.append("Bind", format!("/tmp/.X11-unix:/tmp/.X11-unix{}", suffix));
+            files.append(
+                "BindReadOnly",
+                format!("/tmp/.X11-unix:/mnt/host-x11{}", suffix),
+            );
 
             if std::path::Path::new("/dev/dri").exists() {
                 files.append("Bind", "/dev/dri");

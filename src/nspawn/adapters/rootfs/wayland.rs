@@ -20,6 +20,13 @@ export WAYLAND_DISPLAY=wayland-socket
 export DISPLAY={}
 mkdir -p "$XDG_RUNTIME_DIR"
 ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
+if [ -d /mnt/host-x11 ] && [ -d /tmp/.X11-unix ]; then
+    for sock in /mnt/host-x11/*; do
+        if [ -S "$sock" ]; then
+            ln -sf "$sock" "/tmp/.X11-unix/$(basename "$sock")" 2>/dev/null
+        fi
+    done
+fi
 "#,
         host_display
     );
@@ -51,8 +58,15 @@ ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 set -gx XDG_RUNTIME_DIR /run/user/(id -u)
 set -gx WAYLAND_DISPLAY wayland-socket
 set -gx DISPLAY {}
-mkdir -p $XDG_RUNTIME_DIR
-ln -sf /mnt/wayland-socket $XDG_RUNTIME_DIR/wayland-socket
+mkdir -p "$XDG_RUNTIME_DIR"
+ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
+if test -d /mnt/host-x11; and test -d /tmp/.X11-unix
+    for sock in /mnt/host-x11/*
+        if test -S "$sock"
+            ln -sf "$sock" "/tmp/.X11-unix/"(basename "$sock") 2>/dev/null
+        end
+    end
+end
 "#,
             host_display
         );
