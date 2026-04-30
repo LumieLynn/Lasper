@@ -20,9 +20,9 @@ impl Deployer for OciDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<String>,
     ) -> Result<()> {
-        import_oci_image(&self.url, name, rootfs).await
+        import_oci_image(&self.url, name, rootfs, &logs).await
     }
 }
 
@@ -264,6 +264,7 @@ pub async fn import_oci_image(
     image_ref: &str,
     local_name: &str,
     dest: &std::path::Path,
+    logs: &tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     check_tool("skopeo")?;
     check_tool("umoci")?;
@@ -285,31 +286,58 @@ pub async fn import_oci_image(
     let tmp_oci = staging_root.join("oci-repo");
     let bundle_dir = staging_root.join("bundle");
 
+    let _ = logs
+        .send(format!(
+            "Pulling OCI image '{}' via skopeo...",
+            normalized_ref
+        ))
+        .await;
     log::info!(
         "skopeo copy {} oci:{}:latest",
         normalized_ref,
         tmp_oci.display()
     );
-    let skopeo = new_command("skopeo")
+
+    // Spawn manually so skopeo's stderr progress is streamed to the UI in real-time.
+    let mut child = new_command("skopeo")
         .args([
             "copy",
             &normalized_ref,
             &format!("oci:{}:latest", tmp_oci.display()),
         ])
-        .logged_output("skopeo")
+        .spawn()
+        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
+
+    // skopeo writes progress updates to stderr, delimited by \r (carriage return).
+    if let Some(stderr) = child.stderr.take() {
+        let logs = logs.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncBufReadExt;
+            let mut reader = tokio::io::BufReader::new(stderr);
+            let mut buf = Vec::new();
+            while let Ok(bytes) = reader.read_until(b'\r', &mut buf).await {
+                if bytes == 0 {
+                    break;
+                }
+                let line = String::from_utf8_lossy(&buf).trim().to_string();
+                if !line.is_empty() {
+                    let _ = logs.send(line).await;
+                }
+                buf.clear();
+            }
+        });
+    }
+
+    let status = child
+        .wait()
         .await
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("skopeo"), e))?;
 
-    if !skopeo.status.success() {
-        return Err(NspawnError::cmd_failed(
-            "skopeo copy",
-            format!(
-                "skopeo copy {} oci:{}:latest",
-                normalized_ref,
-                tmp_oci.display()
-            ),
-            &skopeo,
-        ));
+    if !status.success() {
+        return Err(NspawnError::DeployError(format!(
+            "skopeo copy failed (exit code: {}). Check the deploy log above for details.",
+            status
+        )));
     }
 
     // Ensure dest directory exists (or at least its parent)
@@ -317,6 +345,7 @@ pub async fn import_oci_image(
         let _ = tokio::fs::create_dir_all(parent).await;
     }
 
+    let _ = logs.send("Extracting rootfs with umoci...".into()).await;
     log::info!(
         "umoci raw-unpack --image {}:latest {}",
         tmp_oci.display(),
@@ -334,11 +363,15 @@ pub async fn import_oci_image(
         .map_err(|e| NspawnError::Io(std::path::PathBuf::from("umoci"), e))?;
 
     if umoci_raw.status.success() {
+        let _ = logs.send("OCI image imported via raw-unpack.".into()).await;
         log::info!("OCI image imported to {} via raw-unpack", dest.display());
         return Ok(());
     }
 
     // Fallback to older `umoci unpack` if raw-unpack fails
+    let _ = logs
+        .send("umoci raw-unpack failed, falling back to unpack...".into())
+        .await;
     log::warn!(
         "umoci raw-unpack failed or missing, falling back to unpack: {:?}",
         String::from_utf8_lossy(&umoci_raw.stderr)
@@ -374,6 +407,7 @@ pub async fn import_oci_image(
         ));
     }
 
+    let _ = logs.send("Copying rootfs to destination...".into()).await;
     log::info!(
         "Moving rootfs from {} to {}",
         rootfs_source.display(),
@@ -399,6 +433,7 @@ pub async fn import_oci_image(
         ));
     }
 
+    let _ = logs.send("OCI image imported successfully.".into()).await;
     log::info!("OCI image imported to {}", dest.display());
     Ok(())
 }

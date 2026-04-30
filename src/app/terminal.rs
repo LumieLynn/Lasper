@@ -165,14 +165,6 @@ impl TerminalManager {
             KeyCode::Char('7') if key.modifiers.contains(KeyModifiers::ALT) => Some(6),
             KeyCode::Char('8') if key.modifiers.contains(KeyModifiers::ALT) => Some(7),
             KeyCode::Char('9') if key.modifiers.contains(KeyModifiers::ALT) => Some(8),
-            KeyCode::Char('[') => {
-                let cur = self.active_idx;
-                Some(if cur == 0 { session_count - 1 } else { cur - 1 })
-            }
-            KeyCode::Char(']') => {
-                let cur = self.active_idx;
-                Some((cur + 1) % session_count)
-            }
             _ => None,
         };
 
@@ -266,6 +258,25 @@ impl TerminalManager {
                 | KeyCode::Char('7')
                 | KeyCode::Char('8')
                 | KeyCode::Char('9') => TerminalKeyOutcome::Consumed,
+
+                KeyCode::Char('[') => {
+                    let cur = self.active_idx;
+                    self.active_idx = if cur == 0 { session_count - 1 } else { cur - 1 };
+                    let name = self.sessions[self.active_idx].container_name.clone();
+                    if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                        *selected = pos;
+                    }
+                    TerminalKeyOutcome::ConsumedAndRefreshDetail
+                }
+                KeyCode::Char(']') => {
+                    let cur = self.active_idx;
+                    self.active_idx = (cur + 1) % session_count;
+                    let name = self.sessions[self.active_idx].container_name.clone();
+                    if let Some(pos) = entries.iter().position(|e| e.name == name) {
+                        *selected = pos;
+                    }
+                    TerminalKeyOutcome::ConsumedAndRefreshDetail
+                }
 
                 KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('t') => {
                     TerminalKeyOutcome::PassThrough
