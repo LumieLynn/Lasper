@@ -211,7 +211,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     Line::from(vec![
                         kspan("[Alt+x]"),
                         hspan(" exit insert mode "),
-                        kspan("[Alt+1..9 / [/]]"),
+                        kspan("[Alt+1..9]"),
                         hspan(" switch tabs"),
                     ])
                 } else {

@@ -27,13 +27,12 @@ pub struct DeployStepView {
 
 impl DeployStepView {
     pub fn new(
-        log_tx: broadcast::Sender<String>,
+        log_rx: broadcast::Receiver<String>,
         done: Arc<AtomicBool>,
         success: Arc<AtomicBool>,
     ) -> Self {
-        let rx = log_tx.subscribe();
         Self {
-            log_rx: Some(rx),
+            log_rx: Some(log_rx),
             done,
             success,
             status_block: TextBlock::new(" Status ", "Deploying...".to_string()),

@@ -71,10 +71,18 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
             context.build_preview_nspawn(),
         )),
 
-        WizardStep::Deploy => Box::new(deploy_view::DeployStepView::new(
-            context.deploy.log_tx.clone(),
-            context.deploy.done.clone(),
-            context.deploy.success.clone(),
-        )),
+        WizardStep::Deploy => {
+            let rx = context
+                .deploy
+                .log_rx
+                .borrow_mut()
+                .take()
+                .unwrap_or_else(|| context.deploy.log_tx.subscribe());
+            Box::new(deploy_view::DeployStepView::new(
+                rx,
+                context.deploy.done.clone(),
+                context.deploy.success.clone(),
+            ))
+        }
     }
 }
