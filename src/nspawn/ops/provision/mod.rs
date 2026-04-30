@@ -209,12 +209,12 @@ async fn run_deploy_internal(
         if is_mounted_dir {
             if let Some(pwd) = &cfg.root_password {
                 push_log!("Setting root password...".to_string());
-                crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd).await?;
+                crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd, &logs).await?;
             }
 
             for user in &cfg.users {
                 push_log!(format!("Creating user {}...", user.username));
-                crate::nspawn::adapters::rootfs::users::create_user_in_container(&actual_rootfs, user).await?;
+                crate::nspawn::adapters::rootfs::users::create_user_in_container(&actual_rootfs, user, &logs).await?;
 
                 if cfg.wayland_socket.is_some() {
                     push_log!(format!("Setting up wayland env for {}...", user.username));

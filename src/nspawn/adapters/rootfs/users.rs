@@ -4,7 +4,12 @@ use crate::nspawn::sys::command::{log_output, new_command, CommandLogged};
 use std::path::{Path, PathBuf};
 
 /// Create a user inside the container rootfs via `systemd-nspawn --directory … useradd`.
-pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Result<()> {
+/// Warnings (e.g. chpasswd failure) are pushed through `logs` so the UI can surface them.
+pub async fn create_user_in_container(
+    rootfs: &Path,
+    user: &CreateUser,
+    logs: &tokio::sync::mpsc::Sender<String>,
+) -> Result<()> {
     let shell = if user.shell.is_empty() {
         "/bin/bash"
     } else {
@@ -102,10 +107,13 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
             .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
         log_output("chpasswd", &res);
         if !res.status.success() {
-            log::warn!(
-                "chpasswd in container failed, proceeding anyway: {}",
-                String::from_utf8_lossy(&res.stderr)
+            let msg = format!(
+                "WARNING: chpasswd failed for user '{}': {}",
+                user.username,
+                String::from_utf8_lossy(&res.stderr).trim()
             );
+            log::warn!("{}", msg);
+            let _ = logs.send(msg).await;
         }
     }
 
@@ -113,7 +121,12 @@ pub async fn create_user_in_container(rootfs: &Path, user: &CreateUser) -> Resul
 }
 
 /// Set the root password via `chpasswd` inside the container.
-pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
+/// Warnings (e.g. chpasswd failure) are pushed through `logs` so the UI can surface them.
+pub async fn set_root_password(
+    rootfs: &Path,
+    password: &str,
+    logs: &tokio::sync::mpsc::Sender<String>,
+) -> Result<()> {
     if password.is_empty() {
         return Ok(());
     }
@@ -146,10 +159,12 @@ pub async fn set_root_password(rootfs: &Path, password: &str) -> Result<()> {
         .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
     log_output("chpasswd", &res);
     if !res.status.success() {
-        log::warn!(
-            "chpasswd for root in container failed, proceeding anyway: {}",
-            String::from_utf8_lossy(&res.stderr)
+        let msg = format!(
+            "WARNING: chpasswd for root failed: {}",
+            String::from_utf8_lossy(&res.stderr).trim()
         );
+        log::warn!("{}", msg);
+        let _ = logs.send(msg).await;
     }
     Ok(())
 }
