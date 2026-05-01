@@ -351,3 +351,173 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::models::{ContainerEntry, ContainerState};
+    use std::time::{Duration, Instant};
+
+    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
+        ContainerEntry {
+            name: name.to_string(),
+            state,
+            image_type: None,
+            readonly: false,
+            usage: None,
+            address: None,
+            all_addresses: vec![],
+        }
+    }
+
+    fn make_app(is_root: bool) -> App {
+        App::new(is_root)
+    }
+
+    mod merge_transitional_states {
+        use super::*;
+
+        #[test]
+        fn adds_starting_overlay() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Off)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Starting);
+        }
+
+        #[test]
+        fn adds_exiting_overlay() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Exiting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Running)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Exiting);
+        }
+
+        #[test]
+        fn expires_stale() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (
+                    ContainerState::Starting,
+                    Instant::now() - Duration::from_secs(11),
+                ),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Off)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Off);
+            assert!(app.data.transitions.is_empty());
+        }
+
+        #[test]
+        fn removes_when_backend_resolved() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Running)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Running);
+            assert!(app.data.transitions.is_empty());
+        }
+    }
+
+    mod select_next_prev {
+        use super::*;
+
+        #[test]
+        fn next_wraps() {
+            let mut app = make_app(true);
+            app.data.entries = vec![
+                make_entry("a", ContainerState::Off),
+                make_entry("b", ContainerState::Off),
+                make_entry("c", ContainerState::Off),
+            ];
+            app.data.selected = 2;
+
+            app.select_next();
+            assert_eq!(app.data.selected, 0);
+        }
+
+        #[test]
+        fn prev_wraps() {
+            let mut app = make_app(true);
+            app.data.entries = vec![
+                make_entry("a", ContainerState::Off),
+                make_entry("b", ContainerState::Off),
+                make_entry("c", ContainerState::Off),
+            ];
+            app.data.selected = 0;
+
+            app.select_prev();
+            assert_eq!(app.data.selected, 2);
+        }
+
+        #[test]
+        fn next_empty_no_panic() {
+            let mut app = make_app(true);
+            app.data.entries = vec![];
+            app.data.selected = 0;
+
+            app.select_next();
+        }
+
+        #[test]
+        fn prev_empty_no_panic() {
+            let mut app = make_app(true);
+            app.data.entries = vec![];
+            app.data.selected = 0;
+
+            app.select_prev();
+        }
+    }
+
+    mod action_cooldown {
+        use super::*;
+
+        #[test]
+        fn allows_first() {
+            let mut app = make_app(true);
+            assert!(app.check_action_cooldown());
+        }
+
+        #[test]
+        fn blocks_within_2s() {
+            let mut app = make_app(true);
+            assert!(app.check_action_cooldown());
+            assert!(!app.check_action_cooldown());
+        }
+    }
+
+    mod set_status {
+        use super::*;
+
+        #[test]
+        fn sets_message_and_expiry() {
+            let mut app = make_app(true);
+            app.set_status("hello".into(), crate::ui::StatusLevel::Info);
+
+            let (msg, level) = app.ui.status_message.as_ref().unwrap();
+            assert_eq!(msg, "hello");
+            assert_eq!(*level, crate::ui::StatusLevel::Info);
+            assert!(app.ui.status_expiry.is_some());
+        }
+    }
+}
