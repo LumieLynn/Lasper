@@ -339,5 +339,4 @@ impl App {
         };
         self.data.terminal.sync_to_entry(&entry.name);
     }
-
 }
