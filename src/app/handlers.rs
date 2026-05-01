@@ -1,149 +1,93 @@
 use super::{ActivePanel, App};
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
-use crate::ui::StatusLevel;
-
 use crate::ui::wizard::StepAction as WizardAction;
-use crate::ui::wizard::Wizard;
+use crate::ui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+// ── Top-level dispatch ────────────────────────────────────────────────────────
+//
+// handle_key is now a thin chain of mode-specific handlers.  Each handler
+// returns `true` when it consumed the key — the remaining handlers are
+// skipped.  This replaces the previous 300-line nested match.
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
-        // ── Overlay: Quit Confirmation ────────────────────────────────────────
-        if self.ui.quit_dialog.is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Enter => {
-                    self.cleanup_all_terminals();
-                    self.should_quit = true;
-                }
-                KeyCode::Char('n') | KeyCode::Esc => {
-                    self.ui.quit_dialog = None;
-                }
-                _ => {}
-            }
+        // Layer 1 – quit confirmation dialog (modal)
+        if self.handle_quit_confirm_key(key) {
             return;
         }
 
-        // ── Terminal Panel (Priority) ─────────────────────────────────────────
-        if self.ui.active_panel == ActivePanel::TerminalPanel {
-            let session_count = self.data.terminal_sessions.len();
-            if session_count > 0 {
-                // Tab switching: Alt+Number or [ ] brackets
-                let new_idx = match key.code {
-                    KeyCode::Char('1') if key.modifiers.contains(KeyModifiers::ALT) => Some(0),
-                    KeyCode::Char('2') if key.modifiers.contains(KeyModifiers::ALT) => Some(1),
-                    KeyCode::Char('3') if key.modifiers.contains(KeyModifiers::ALT) => Some(2),
-                    KeyCode::Char('4') if key.modifiers.contains(KeyModifiers::ALT) => Some(3),
-                    KeyCode::Char('5') if key.modifiers.contains(KeyModifiers::ALT) => Some(4),
-                    KeyCode::Char('6') if key.modifiers.contains(KeyModifiers::ALT) => Some(5),
-                    KeyCode::Char('7') if key.modifiers.contains(KeyModifiers::ALT) => Some(6),
-                    KeyCode::Char('8') if key.modifiers.contains(KeyModifiers::ALT) => Some(7),
-                    KeyCode::Char('9') if key.modifiers.contains(KeyModifiers::ALT) => Some(8),
-                    KeyCode::Char('[') => {
-                        let cur = self.data.active_terminal_idx;
-                        Some(if cur == 0 { session_count - 1 } else { cur - 1 })
-                    }
-                    KeyCode::Char(']') => {
-                        let cur = self.data.active_terminal_idx;
-                        Some((cur + 1) % session_count)
-                    }
-                    _ => None,
-                };
-
-                if let Some(idx) = new_idx {
-                    if idx < session_count {
-                        self.data.active_terminal_idx = idx;
-                        let name = self.data.terminal_sessions[idx].container_name.clone();
-                        if let Some(pos) = self.data.entries.iter().position(|e| e.name == name) {
-                            self.data.selected = pos;
-                            self.refresh_detail().await;
-                        }
-                    }
-                    return;
-                }
-
-                // Now borrow session for input handling
-                if let Some(session) = self
-                    .data
-                    .terminal_sessions
-                    .get_mut(self.data.active_terminal_idx)
-                {
-                    if session.insert_mode {
-                        let is_toggle = key.code == KeyCode::Char('x')
-                            && key.modifiers.contains(KeyModifiers::ALT);
-
-                        if is_toggle {
-                            session.insert_mode = false;
-                            return;
-                        }
-
-                        // Forward other keys to PTY
-                        let bytes = crate::ui::views::terminal_panel::encode_key(key);
-                        let _ = session
-                            .pty_tx
-                            .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
-                        return;
-                    } else {
-                        // Normal Mode keys - Handle locally and RETURN to prevent pollution
-                        match key.code {
-                            KeyCode::Enter | KeyCode::Char('i') => {
-                                session.insert_mode = true;
-                                session.scroll_offset = 0;
-                                return;
-                            }
-                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::ALT) => {
-                                session.insert_mode = true;
-                                session.scroll_offset = 0;
-                                return;
-                            }
-                            KeyCode::Char('x') => {
-                                self.close_active_terminal();
-                                return;
-                            }
-                            KeyCode::PageUp => {
-                                let mut screen = session.terminal.lock().screen().clone();
-                                screen.set_scrollback(usize::MAX);
-                                let max_scroll = screen.scrollback();
-                                session.scroll_offset =
-                                    session.scroll_offset.saturating_add(10).min(max_scroll);
-                                return;
-                            }
-                            KeyCode::PageDown => {
-                                session.scroll_offset = session.scroll_offset.saturating_sub(10);
-                                return;
-                            }
-                            KeyCode::Up | KeyCode::Char('k') => {
-                                let mut screen = session.terminal.lock().screen().clone();
-                                screen.set_scrollback(usize::MAX);
-                                let max_scroll = screen.scrollback();
-                                session.scroll_offset =
-                                    session.scroll_offset.saturating_add(1).min(max_scroll);
-                                return;
-                            }
-                            KeyCode::Down | KeyCode::Char('j') => {
-                                session.scroll_offset = session.scroll_offset.saturating_sub(1);
-                                return;
-                            }
-                            KeyCode::Char('1')
-                            | KeyCode::Char('2')
-                            | KeyCode::Char('3')
-                            | KeyCode::Char('4')
-                            | KeyCode::Char('5')
-                            | KeyCode::Char('6')
-                            | KeyCode::Char('7')
-                            | KeyCode::Char('8')
-                            | KeyCode::Char('9') => return,
-                            KeyCode::Tab
-                            | KeyCode::Char('q')
-                            | KeyCode::Char('?')
-                            | KeyCode::Char('t') => {}
-                            _ => return, // Consume other keys in Normal Mode
-                        };
-                    }
-                }
-            }
+        // Layer 2 – terminal panel when it owns focus
+        if self.ui.active_panel == ActivePanel::TerminalPanel
+            && self.handle_terminal_focused_key(key).await
+        {
+            return;
         }
 
-        // ── Overlay: wizard ───────────────────────────────────────────────────
+        // Layer 3 – overlays (wizard / help / power menu)
+        if self.handle_overlay_key(key).await {
+            return;
+        }
+
+        // Layer 4 – global shortcuts
+        if self.handle_global_key(key).await {
+            return;
+        }
+
+        // Layer 5 – route to the focused panel
+        self.route_to_focused_panel(key).await;
+    }
+}
+
+// ── Layer 1: quit confirmation ────────────────────────────────────────────────
+
+impl App {
+    fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
+        if self.ui.quit_dialog.is_none() {
+            return false;
+        }
+
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.data.terminal.cleanup_all();
+                self.should_quit = true;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.ui.quit_dialog = None;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+// ── Layer 2: terminal panel (insert / normal mode + tab switching) ────────────
+
+impl App {
+    async fn handle_terminal_focused_key(&mut self, key: KeyEvent) -> bool {
+        use crate::app::terminal::TerminalKeyOutcome;
+
+        let outcome =
+            self.data
+                .terminal
+                .handle_key(key, &self.data.entries, &mut self.data.selected);
+
+        match outcome {
+            TerminalKeyOutcome::Consumed => true,
+            TerminalKeyOutcome::PassThrough => false,
+            TerminalKeyOutcome::ConsumedAndRefreshDetail => {
+                self.refresh_detail().await;
+                true
+            }
+        }
+    }
+}
+
+// ── Layer 3: overlays (wizard, help, power menu) ──────────────────────────────
+
+impl App {
+    async fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
+        // 3a – wizard
         if self.ui.show_wizard {
             if let Some(wizard) = &mut self.ui.wizard {
                 match wizard.handle_key(key) {
@@ -160,16 +104,16 @@ impl App {
             } else {
                 self.ui.show_wizard = false;
             }
-            return;
+            return true;
         }
 
-        // ── Overlay: help ─────────────────────────────────────────────────────
+        // 3b – help (any key dismisses)
         if self.ui.show_help {
             self.ui.show_help = false;
-            return;
+            return true;
         }
 
-        // ── Overlay: power menu ───────────────────────────────────────────────
+        // 3c – power menu
         if let Some(pm) = &mut self.ui.power_menu {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.ui.power_menu = None,
@@ -191,39 +135,46 @@ impl App {
                     let _ = pm.handle_key(key);
                 }
             }
-            return;
+            return true;
         }
 
-        // ── Global keys ───────────────────────────────────────────────────────
+        false
+    }
+}
+
+// ── Layer 4: global shortcuts ─────────────────────────────────────────────────
+
+impl App {
+    async fn handle_global_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.data.terminal_sessions.is_empty() {
-                    self.ui.quit_dialog = Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
-                        "Quit Lasper?",
-                        "Active terminal sessions are still running.\nQuit and terminate all logins?",
-                    ));
+                if !self.data.terminal.sessions.is_empty() {
+                    self.ui.quit_dialog =
+                        Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+                            "Quit Lasper?",
+                            "Active terminal sessions are still running.\nQuit and terminate all logins?",
+                        ));
                 } else {
                     self.should_quit = true;
                 }
-                return;
+                true
             }
             KeyCode::Char('?') => {
                 self.ui.show_help = true;
-                return;
+                true
             }
-            // Focus toggle
             KeyCode::Tab => {
-                self.ui.toggle_focus();
-                return;
+                let terminal_showing = self.data.terminal.is_showing();
+                self.ui.toggle_focus(terminal_showing);
+                true
             }
-            // Container actions (always global regardless of focus)
             KeyCode::Char('s') => {
                 self.action_start();
-                return;
+                true
             }
             KeyCode::Char('S') => {
                 self.action_poweroff();
-                return;
+                true
             }
             KeyCode::Char('x') | KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -231,45 +182,29 @@ impl App {
                 if !self.data.entries.is_empty() {
                     self.ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
                 }
-                return;
+                true
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
-                if self.is_root {
-                    let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
-                    if let Some(tx) = &self.ui.backend_tx {
-                        self.ui.wizard = Some(
-                            Wizard::new(self.data.entries.clone(), nvidia_installed, tx.clone())
-                                .await,
-                        );
-                        self.ui.show_wizard = true;
-                        // Trigger hardware discovery in background
-                        let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
-                    }
-                } else {
-                    self.set_status(
-                        "Root required — run: sudo lasper".into(),
-                        StatusLevel::Error,
-                    );
-                }
-                return;
+                self.begin_wizard().await;
+                true
             }
             KeyCode::Char('r') => {
                 self.refresh().await;
-                return;
+                true
             }
             KeyCode::Char('t') => {
-                if self.ui.show_terminal {
-                    self.ui.show_terminal = false;
-                    self.ui.active_panel = ActivePanel::ContainerList;
-                } else {
-                    self.spawn_terminal();
-                }
-                return;
+                self.toggle_terminal();
+                true
             }
-            _ => {}
+            _ => false,
         }
+    }
+}
 
-        // ── Route to focused panel ────────────────────────────────────────────
+// ── Layer 5: route to focused panel ───────────────────────────────────────────
+
+impl App {
+    async fn route_to_focused_panel(&mut self, key: KeyEvent) {
         match self.ui.active_panel {
             ActivePanel::ContainerList => {
                 let result = self.ui.container_list.handle_key(key);
@@ -279,7 +214,10 @@ impl App {
                 let result = self.ui.detail_panel.handle_key(key);
                 self.handle_detail_panel_result(result).await;
             }
-            ActivePanel::TerminalPanel => {}
+            ActivePanel::TerminalPanel => {
+                // Already handled in layer 2; only reached when there are
+                // no active sessions (empty terminal panel).
+            }
         }
     }
 
@@ -299,16 +237,50 @@ impl App {
         }
     }
 
-    /// Processes an `EventResult` produced by the detail panel.
     async fn handle_detail_panel_result(&mut self, result: EventResult) {
         match result {
             EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(_pane))) => {
-                // The active_pane is already updated inside the component.
-                // Just trigger a data refresh for the new pane.
                 self.refresh_detail().await;
             }
             EventResult::Consumed | EventResult::Ignored => {}
             _ => {}
+        }
+    }
+}
+
+// Composite actions
+
+impl App {
+    async fn begin_wizard(&mut self) {
+        if !self.is_root {
+            self.set_status(
+                "Root required — run: sudo lasper".into(),
+                StatusLevel::Error,
+            );
+            return;
+        }
+
+        let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
+        if let Some(tx) = &self.ui.backend_tx {
+            self.ui.wizard = Some(
+                crate::ui::wizard::Wizard::new(
+                    self.data.entries.clone(),
+                    nvidia_installed,
+                    tx.clone(),
+                )
+                .await,
+            );
+            self.ui.show_wizard = true;
+            let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
+        }
+    }
+
+    fn toggle_terminal(&mut self) {
+        if self.data.terminal.is_showing() {
+            self.data.terminal.show = false;
+            self.ui.active_panel = ActivePanel::ContainerList;
+        } else {
+            self.spawn_terminal();
         }
     }
 }

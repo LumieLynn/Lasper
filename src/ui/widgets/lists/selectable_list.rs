@@ -7,6 +7,7 @@ use ratatui::{
     Frame,
 };
 
+#[allow(clippy::type_complexity)]
 pub struct SelectableList<T> {
     items: Vec<T>,
     state: ListState,

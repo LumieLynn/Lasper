@@ -115,7 +115,7 @@ pub fn apply_category_remapping(host_state: &mut NvidiaState, profile: &NvidiaPa
                 let filename = entry
                     .default_container_path
                     .split('/')
-                    .last()
+                    .next_back()
                     .unwrap_or_default();
                 entry.default_container_path = format!("{}/{}", dest, filename);
             }
@@ -171,7 +171,7 @@ pub fn apply_category_remapping(host_state: &mut NvidiaState, profile: &NvidiaPa
 
 pub async fn ensure_gpu_passthrough(
     name: &str,
-    dbus: &crate::nspawn::adapters::comm::dbus::DbusProvider,
+    dbus: &dyn crate::nspawn::adapters::comm::dbus::DbusProvider,
 ) -> Result<()> {
     // 1. Semantic Marker Check
     let config = match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(name).await

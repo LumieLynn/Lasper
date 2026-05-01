@@ -189,7 +189,7 @@ impl DetailPanel {
     }
 
     fn switch_pane(&mut self, pane: DetailPane) -> EventResult {
-        self.active_pane = pane.clone();
+        self.active_pane = pane;
         match self.active_pane {
             DetailPane::Properties => self.properties_scroll = 0,
             DetailPane::Details => self.details_scroll = 0,
@@ -219,7 +219,7 @@ impl DetailPanel {
                 return self.switch_pane(next);
             }
             KeyCode::Char(c)
-                if c.is_digit(10)
+                if c.is_ascii_digit()
                     && key.modifiers.contains(crossterm::event::KeyModifiers::ALT) =>
             {
                 let idx = (c.to_digit(10).unwrap() as usize).saturating_sub(1);

@@ -57,14 +57,14 @@ impl PortMappingBox {
     }
 
     fn next(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.next(&mut comps);
+        let comps = active_comps!(self);
+        self.focus.next(&comps);
         self.update_focus();
     }
 
     fn prev(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.prev(&mut comps);
+        let comps = active_comps!(self);
+        self.focus.prev(&comps);
         self.update_focus();
     }
 }

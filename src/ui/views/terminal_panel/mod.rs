@@ -1,4 +1,4 @@
-use crate::app::TerminalSession;
+use crate::app::terminal::TerminalSession;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},

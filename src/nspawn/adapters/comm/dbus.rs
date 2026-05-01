@@ -1,8 +1,25 @@
+#![allow(clippy::type_complexity)]
+
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{proxy, Connection};
+
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
+pub trait DbusProvider: Send + Sync + 'static {
+    async fn is_available(&self) -> bool;
+    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
+    async fn start(&self, name: &str) -> Result<()>;
+    async fn terminate(&self, name: &str) -> Result<()>;
+    async fn poweroff(&self, name: &str) -> Result<()>;
+    async fn reboot(&self, name: &str) -> Result<()>;
+    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
+    async fn reload_daemon(&self) -> Result<()>;
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()>;
+}
 
 #[proxy(
     interface = "org.freedesktop.machine1.Manager",
@@ -38,11 +55,11 @@ trait Machine {
 }
 
 #[derive(Clone)]
-pub struct DbusProvider {
+pub struct DefaultDbusProvider {
     conn: std::sync::Arc<tokio::sync::OnceCell<Option<Connection>>>,
 }
 
-impl DbusProvider {
+impl DefaultDbusProvider {
     pub fn new() -> Self {
         Self {
             conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
@@ -61,12 +78,15 @@ impl DbusProvider {
         let conn = self.connection().await?;
         ManagerProxy::new(&conn).await.ok()
     }
+}
 
-    pub async fn is_available(&self) -> bool {
+#[async_trait::async_trait]
+impl DbusProvider for DefaultDbusProvider {
+    async fn is_available(&self) -> bool {
         self.connection().await.is_some()
     }
 
-    pub async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
         let proxy = self
             .manager_proxy()
             .await
@@ -141,7 +161,7 @@ impl DbusProvider {
         Ok(entries)
     }
 
-    pub async fn start(&self, name: &str) -> Result<()> {
+    async fn start(&self, name: &str) -> Result<()> {
         let conn = self
             .connection()
             .await
@@ -159,7 +179,7 @@ impl DbusProvider {
         Ok(())
     }
 
-    pub async fn terminate(&self, name: &str) -> Result<()> {
+    async fn terminate(&self, name: &str) -> Result<()> {
         let proxy = self
             .manager_proxy()
             .await
@@ -171,7 +191,7 @@ impl DbusProvider {
         Ok(())
     }
 
-    pub async fn poweroff(&self, name: &str) -> Result<()> {
+    async fn poweroff(&self, name: &str) -> Result<()> {
         let proxy = self
             .manager_proxy()
             .await
@@ -184,7 +204,7 @@ impl DbusProvider {
         Ok(())
     }
 
-    pub async fn reboot(&self, name: &str) -> Result<()> {
+    async fn reboot(&self, name: &str) -> Result<()> {
         let proxy = self
             .manager_proxy()
             .await
@@ -196,7 +216,7 @@ impl DbusProvider {
         Ok(())
     }
 
-    pub async fn kill(&self, name: &str, signal: &str) -> Result<()> {
+    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
         let proxy = self
             .manager_proxy()
             .await
@@ -209,7 +229,7 @@ impl DbusProvider {
         Ok(())
     }
 
-    pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let conn = self
             .connection()
             .await
@@ -257,7 +277,7 @@ impl DbusProvider {
         }
     }
 
-    pub async fn reload_daemon(&self) -> Result<()> {
+    async fn reload_daemon(&self) -> Result<()> {
         let conn = self
             .connection()
             .await
@@ -275,7 +295,7 @@ impl DbusProvider {
     }
 
     /// Block and watch for machine start/stop events. Sends a signal to tx whenever a change occurs.
-    pub async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
         use futures_util::StreamExt;
         let proxy = self
             .manager_proxy()

@@ -121,10 +121,10 @@ impl NspawnConfig {
                     return Err(NspawnError::Runtime("Markers out of order".into()));
                 }
                 // Extract paths from common entries in this block
-                for i in s + 1..e {
-                    let line = lines[i].trim();
+                for line in &lines[s + 1..e] {
+                    let line = line.trim();
                     if line.starts_with("Bind=") || line.starts_with("BindReadOnly=") {
-                        if let Some(val) = line.splitn(2, '=').nth(1) {
+                        if let Some(val) = line.split_once('=').map(|x| x.1) {
                             death_list.push(val.to_string());
                         }
                     }
@@ -379,7 +379,10 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
                 );
             }
 
-            files.append("Bind", format!("/tmp/.X11-unix:/tmp/.X11-unix{}", suffix));
+            files.append(
+                "BindReadOnly",
+                format!("/tmp/.X11-unix:/mnt/host-x11{}", suffix),
+            );
 
             if std::path::Path::new("/dev/dri").exists() {
                 files.append("Bind", "/dev/dri");
@@ -571,9 +574,11 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_minimal() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.boot = true;
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            boot: true,
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("[Exec]"));
         assert!(content.contains("Boot=yes"));
@@ -581,18 +586,22 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_boot_disabled() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.boot = false;
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            boot: false,
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("Boot=no"));
     }
 
     #[test]
     fn test_nspawn_config_content_host_network() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.network = Some(NetworkMode::Host);
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            network: Some(NetworkMode::Host),
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=no"));
         assert!(content.contains("BindReadOnly=/etc/resolv.conf:/etc/resolv.conf"));
@@ -600,21 +609,23 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_network_veth_with_ports() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.network = Some(NetworkMode::Veth);
-        cfg.port_forwards = vec![
-            PortForward {
-                host: 8080,
-                container: 80,
-                proto: "tcp".to_string(),
-            },
-            PortForward {
-                host: 4443,
-                container: 443,
-                proto: "tcp".to_string(),
-            },
-        ];
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            network: Some(NetworkMode::Veth),
+            port_forwards: vec![
+                PortForward {
+                    host: 8080,
+                    container: 80,
+                    proto: "tcp".to_string(),
+                },
+                PortForward {
+                    host: 4443,
+                    container: 443,
+                    proto: "tcp".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=yes"));
         assert!(content.contains("Port=tcp:8080:80"));
@@ -623,35 +634,43 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_bridge_mode() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.network = Some(NetworkMode::Bridge("br0".into()));
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            network: Some(NetworkMode::Bridge("br0".into())),
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("Bridge=br0"));
     }
 
     #[test]
     fn test_nspawn_config_content_privileged() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.privileged = true;
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            privileged: true,
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("Capability=all"));
     }
 
     #[test]
     fn test_nspawn_config_content_nvidia_marker() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".to_string();
-        cfg.nvidia_gpu = true;
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            nvidia_gpu: true,
+            ..Default::default()
+        };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("X-Lasper-Nvidia-Enabled=true"));
     }
 
     #[test]
     fn test_nspawn_config_content_rejects_invalid_name() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "../escape".to_string();
+        let cfg = ContainerConfig {
+            name: "../escape".to_string(),
+            ..Default::default()
+        };
         assert!(nspawn_config_content(&cfg, None).is_err());
     }
 
@@ -660,9 +679,11 @@ mod tests {
     #[test]
     fn test_apply_gpu_passthrough_to_content() {
         let content = "[Exec]\nBoot=yes\n".to_string();
-        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
-        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
-        new_state.readonly_binds = vec!["/usr/lib/libcuda.so".to_string()];
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            device_binds: vec!["/dev/nvidia0".to_string()],
+            readonly_binds: vec!["/usr/lib/libcuda.so".to_string()],
+            ..Default::default()
+        };
 
         let updated =
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
@@ -676,8 +697,10 @@ mod tests {
     #[test]
     fn test_apply_gpu_appends_to_existing_files_section() {
         let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/home/user:/home/user\n".to_string();
-        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
-        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            device_binds: vec!["/dev/nvidia0".to_string()],
+            ..Default::default()
+        };
 
         let updated =
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
@@ -691,8 +714,10 @@ mod tests {
     #[test]
     fn test_apply_gpu_preserves_comments() {
         let content = "[Exec]\nBoot=yes\n# My custom comment\n".to_string();
-        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
-        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            device_binds: vec!["/dev/nvidia0".to_string()],
+            ..Default::default()
+        };
 
         let updated =
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
@@ -702,8 +727,10 @@ mod tests {
     #[test]
     fn test_apply_gpu_dedup_legacy_binds() {
         let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/dev/nvidia0\n".to_string();
-        let mut new_state = crate::nspawn::platform::nvidia::NvidiaState::default();
-        new_state.device_binds = vec!["/dev/nvidia0".to_string()];
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            device_binds: vec!["/dev/nvidia0".to_string()],
+            ..Default::default()
+        };
 
         let updated =
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();

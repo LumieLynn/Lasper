@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_container_entry_ordering() {
-        let mut entries = vec![
+        let mut entries = [
             make_entry("z", ContainerState::Running),
             make_entry("a", ContainerState::Running),
             make_entry("b", ContainerState::Off),
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn test_container_entry_ordering_all_states() {
-        let mut entries = vec![
+        let mut entries = [
             make_entry("d", ContainerState::Off),
             make_entry("c", ContainerState::Exiting),
             make_entry("a", ContainerState::Running),

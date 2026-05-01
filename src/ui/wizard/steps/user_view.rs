@@ -112,32 +112,32 @@ impl Component for UserStepView {
             return res;
         }
 
-        if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
-            if self.user_list.is_focused() {
-                self.editor = Some(UserEditor::new(|u| {
-                    AppMessage::Wizard(WizardMessage::UserAdded(u))
-                }));
+        if (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
+            && self.user_list.is_focused()
+        {
+            self.editor = Some(UserEditor::new(|u| {
+                AppMessage::Wizard(WizardMessage::UserAdded(u))
+            }));
+
+            self.editor.as_mut().unwrap().set_focus(true);
+            return EventResult::Consumed;
+        }
+
+        if (key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E'))
+            && self.user_list.is_focused()
+        {
+            if let Some(user) = self.user_list.selected_item() {
+                let idx = self.user_list.selected();
+                let user = user.clone();
+                self.editor = Some(
+                    UserEditor::new(move |u| {
+                        AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
+                    })
+                    .with_user(&user),
+                );
 
                 self.editor.as_mut().unwrap().set_focus(true);
                 return EventResult::Consumed;
-            }
-        }
-
-        if key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E') {
-            if self.user_list.is_focused() {
-                if let Some(user) = self.user_list.selected_item() {
-                    let idx = self.user_list.selected();
-                    let user = user.clone();
-                    self.editor = Some(
-                        UserEditor::new(move |u| {
-                            AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
-                        })
-                        .with_user(&user),
-                    );
-
-                    self.editor.as_mut().unwrap().set_focus(true);
-                    return EventResult::Consumed;
-                }
             }
         }
 

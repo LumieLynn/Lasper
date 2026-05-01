@@ -1,3 +1,4 @@
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMessage {
     Wizard(WizardMessage),
@@ -34,6 +35,7 @@ pub enum ListMessage {
     Prev,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventResult {
     Ignored,             // Not handled, bubble up

@@ -6,6 +6,24 @@
 
 use std::process::{Output, Stdio};
 
+/// Trait abstracting over command execution — enables mocking in tests.
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
+pub trait CommandRunner: Send + Sync {
+    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output>;
+}
+
+/// Default production implementation that shells out via tokio::process::Command.
+pub struct DefaultCommandRunner;
+
+#[async_trait::async_trait]
+impl CommandRunner for DefaultCommandRunner {
+    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        new_command(program).args(&args_refs).output().await
+    }
+}
+
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set
 /// and stdout/stderr piped by default to prevent leaking output
 /// into the TUI's raw-mode terminal.

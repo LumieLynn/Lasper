@@ -5,6 +5,7 @@ use tokio::time::interval;
 use tokio_stream::StreamExt;
 
 /// Events the main loop handles.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
@@ -36,10 +37,10 @@ impl EventHandler {
             let mut reader = EventStream::new();
             while let Some(Ok(event)) = reader.next().await {
                 if let CrosstermEvent::Key(key) = event {
-                    if key.kind == KeyEventKind::Press {
-                        if tx_key.send(AppEvent::Key(key)).await.is_err() {
-                            break;
-                        }
+                    if key.kind == KeyEventKind::Press
+                        && tx_key.send(AppEvent::Key(key)).await.is_err()
+                    {
+                        break;
                     }
                 }
             }

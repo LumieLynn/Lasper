@@ -82,7 +82,7 @@ pub struct StorageState {
 
 impl StorageState {
     pub fn extract_config(&self) -> StorageConfig {
-        let (st, _) = self.info.types[self.type_idx].clone();
+        let (st, _) = self.info.types[self.type_idx];
         StorageConfig {
             storage_type: st,
             disk_config: if st == StorageType::DiskImage {
@@ -220,11 +220,24 @@ pub struct ReviewState {
     pub preview: String,
 }
 
-#[derive(Clone)]
+use std::cell::RefCell;
+
 pub struct DeployState {
     pub log_tx: broadcast::Sender<String>,
+    pub log_rx: RefCell<Option<broadcast::Receiver<String>>>,
     pub done: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
+}
+
+impl Clone for DeployState {
+    fn clone(&self) -> Self {
+        Self {
+            log_tx: self.log_tx.clone(),
+            log_rx: RefCell::new(Some(self.log_tx.subscribe())),
+            done: self.done.clone(),
+            success: self.success.clone(),
+        }
+    }
 }
 
 impl PartialEq for DeployState {
@@ -349,9 +362,10 @@ impl WizardContext {
                 preview: "".to_string(),
             },
             deploy: {
-                let (log_tx, _) = broadcast::channel(1000);
+                let (log_tx, log_rx) = broadcast::channel(1000);
                 DeployState {
                     log_tx,
+                    log_rx: RefCell::new(Some(log_rx)),
                     done: Arc::new(AtomicBool::new(false)),
                     success: Arc::new(AtomicBool::new(false)),
                 }

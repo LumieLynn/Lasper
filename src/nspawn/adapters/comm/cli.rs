@@ -1,26 +1,60 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
-use crate::nspawn::sys::{new_command, CommandLogged};
+use crate::nspawn::sys::{CommandRunner, DefaultCommandRunner};
 use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-#[derive(Clone)]
-pub struct CliProvider {
-    is_root: bool,
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
+pub trait CliProvider: Send + Sync + 'static {
+    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
+    async fn running_map(&self) -> Result<HashMap<String, Vec<String>>>;
+    async fn start(&self, name: &str) -> Result<()>;
+    async fn terminate(&self, name: &str) -> Result<()>;
+    async fn poweroff(&self, name: &str) -> Result<()>;
+    async fn reboot(&self, name: &str) -> Result<()>;
+    async fn enable(&self, name: &str) -> Result<()>;
+    async fn disable(&self, name: &str) -> Result<()>;
+    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    fn spawn_log_stream(
+        &self,
+        name: &str,
+        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    ) -> tokio::task::JoinHandle<()>;
+    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
 }
 
-impl CliProvider {
+#[derive(Clone)]
+pub struct DefaultCliProvider {
+    is_root: bool,
+    cmd_runner: std::sync::Arc<dyn CommandRunner>,
+}
+
+impl DefaultCliProvider {
     pub fn new(is_root: bool) -> Self {
-        Self { is_root }
+        Self {
+            is_root,
+            cmd_runner: std::sync::Arc::new(DefaultCommandRunner),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runner(is_root: bool, runner: std::sync::Arc<dyn CommandRunner>) -> Self {
+        Self {
+            is_root,
+            cmd_runner: runner,
+        }
     }
 
     async fn run_machinectl(&self, args: &[&str]) -> Result<()> {
-        let out = new_command("machinectl")
-            .args(args)
-            .logged_output("machinectl")
+        let out = self
+            .cmd_runner
+            .run("machinectl", args.iter().map(|s| s.to_string()).collect())
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
+
+        crate::nspawn::sys::log_output("machinectl", &out);
 
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
@@ -31,62 +65,11 @@ impl CliProvider {
         }
         Ok(())
     }
+}
 
-    pub async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
-        let out = new_command("machinectl")
-            .args(["list", "-l", "--no-legend", "--no-pager"])
-            .logged_output("machinectl")
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() && !stderr.contains("No machines") {
-                return Err(NspawnError::cmd_failed(
-                    "machinectl list",
-                    "machinectl list -l --no-legend --no-pager",
-                    &out,
-                ));
-            }
-            return Ok(HashMap::new());
-        }
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut current_machine = String::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line.starts_with(|c: char| c.is_whitespace()) {
-                let ip = line.trim();
-                if !current_machine.is_empty() && !ip.is_empty() {
-                    if let Some(ips) = map.get_mut(&current_machine) {
-                        ips.push(ip.to_string());
-                    }
-                }
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-            current_machine = parts[0].to_string();
-            if current_machine == ".host" {
-                continue;
-            }
-            let mut ips = Vec::new();
-            if let Some(addr) = parts.get(5).copied() {
-                if !addr.is_empty() && addr != "-" {
-                    ips.push(addr.to_string());
-                }
-            }
-            map.insert(current_machine.clone(), ips);
-        }
-        Ok(map)
-    }
-
-    pub async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+#[async_trait::async_trait]
+impl CliProvider for DefaultCliProvider {
+    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
         let running = self.running_map().await?;
 
         if !self.is_root {
@@ -105,9 +88,17 @@ impl CliProvider {
                 .collect());
         }
 
-        let out = new_command("machinectl")
-            .args(["list-images", "-l", "--no-legend", "--no-pager"])
-            .logged_output("machinectl")
+        let out = self
+            .cmd_runner
+            .run(
+                "machinectl",
+                vec![
+                    "list-images".to_string(),
+                    "-l".to_string(),
+                    "--no-legend".to_string(),
+                    "--no-pager".to_string(),
+                ],
+            )
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
 
@@ -171,35 +162,97 @@ impl CliProvider {
         Ok(entries)
     }
 
-    pub async fn start(&self, name: &str) -> Result<()> {
+    async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
+        let out = self
+            .cmd_runner
+            .run(
+                "machinectl",
+                vec![
+                    "list".to_string(),
+                    "-l".to_string(),
+                    "--no-legend".to_string(),
+                    "--no-pager".to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.is_empty() && !stderr.contains("No machines") {
+                return Err(NspawnError::cmd_failed(
+                    "machinectl list",
+                    "machinectl list -l --no-legend --no-pager",
+                    &out,
+                ));
+            }
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut current_machine = String::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.starts_with(|c: char| c.is_whitespace()) {
+                let ip = line.trim();
+                if !current_machine.is_empty() && !ip.is_empty() {
+                    if let Some(ips) = map.get_mut(&current_machine) {
+                        ips.push(ip.to_string());
+                    }
+                }
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            current_machine = parts[0].to_string();
+            if current_machine == ".host" {
+                continue;
+            }
+            let mut ips = Vec::new();
+            if let Some(addr) = parts.get(5).copied() {
+                if !addr.is_empty() && addr != "-" {
+                    ips.push(addr.to_string());
+                }
+            }
+            map.insert(current_machine.clone(), ips);
+        }
+        Ok(map)
+    }
+
+    async fn start(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["start", name]).await
     }
 
-    pub async fn terminate(&self, name: &str) -> Result<()> {
+    async fn terminate(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["terminate", name]).await
     }
 
-    pub async fn poweroff(&self, name: &str) -> Result<()> {
+    async fn poweroff(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["poweroff", name]).await
     }
 
-    pub async fn reboot(&self, name: &str) -> Result<()> {
+    async fn reboot(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["reboot", name]).await
     }
 
-    pub async fn enable(&self, name: &str) -> Result<()> {
+    async fn enable(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["enable", name]).await
     }
 
-    pub async fn disable(&self, name: &str) -> Result<()> {
+    async fn disable(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["disable", name]).await
     }
 
-    pub async fn kill(&self, name: &str, signal: &str) -> Result<()> {
+    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
         self.run_machinectl(&["kill", "-s", signal, name]).await
     }
 
-    pub fn spawn_log_stream(
+    fn spawn_log_stream(
         &self,
         name: &str,
         tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
@@ -241,12 +294,12 @@ impl CliProvider {
         })
     }
 
-    pub async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let mut props = MachineProperties::default();
 
-        let machine_out = new_command("machinectl")
-            .args(["show", name])
-            .logged_output("machinectl")
+        let machine_out = self
+            .cmd_runner
+            .run("machinectl", vec!["show".to_string(), name.to_string()])
             .await;
 
         if let Ok(out) = machine_out {
@@ -265,9 +318,15 @@ impl CliProvider {
             }
         }
 
-        let system_out = new_command("systemctl")
-            .args(["show", &format!("systemd-nspawn@{}.service", name)])
-            .logged_output("systemctl")
+        let system_out = self
+            .cmd_runner
+            .run(
+                "systemctl",
+                vec![
+                    "show".to_string(),
+                    format!("systemd-nspawn@{}.service", name),
+                ],
+            )
             .await;
 
         if let Ok(out) = system_out {
@@ -312,5 +371,208 @@ impl CliProvider {
         }
 
         Ok(props)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::sys::command::MockCommandRunner;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+
+    fn mock_output(status: bool, stdout: &str, stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(if status { 0 } else { 256 }),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
+    // ── running_map ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_running_map_parses_list_output() {
+        let stdout = "machine1  container systemd-nspawn running -  1.2.3.4\n\
+                       machine2  container systemd-nspawn running -  10.0.0.1\n";
+        let out = mock_output(true, stdout, "");
+
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r
+        });
+
+        let provider = DefaultCliProvider::with_runner(true, runner);
+        let map = provider.running_map().await.unwrap();
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("machine1").unwrap(), &vec!["1.2.3.4"]);
+        assert_eq!(map.get("machine2").unwrap(), &vec!["10.0.0.1"]);
+    }
+
+    #[tokio::test]
+    async fn test_running_map_no_machines_returns_empty() {
+        let out = mock_output(false, "", "No machines.");
+
+        let runner = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r
+        });
+
+        let provider = DefaultCliProvider::with_runner(true, runner);
+        let map = provider.running_map().await.unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_running_map_skips_host() {
+        let stdout = ".host       container systemd-nspawn running -  -\n\
+                       my-ctr      container systemd-nspawn running -  192.168.1.1\n";
+        let out = mock_output(true, stdout, "");
+
+        let runner = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r
+        });
+
+        let provider = DefaultCliProvider::with_runner(true, runner);
+        let map = provider.running_map().await.unwrap();
+
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("my-ctr"));
+        assert!(!map.contains_key(".host"));
+    }
+
+    // ── list_all ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_all_merges_images_and_running() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().returning(|_, args| {
+                if args.iter().any(|a| a == "list-images") {
+                    Ok(mock_output(
+                        true,
+                        "my-ctr directory no 123456 -\n\
+                             other   directory no 789012 -\n",
+                        "",
+                    ))
+                } else {
+                    Ok(mock_output(
+                        true,
+                        "my-ctr container systemd-nspawn running - 10.0.0.1\n",
+                        "",
+                    ))
+                }
+            });
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(true, runner);
+
+        let entries = provider.list_all().await.unwrap();
+
+        assert_eq!(entries.len(), 2);
+        let my_ctr = entries.iter().find(|e| e.name == "my-ctr").unwrap();
+        assert_eq!(my_ctr.state, ContainerState::Running);
+        assert_eq!(my_ctr.address.as_deref(), Some("10.0.0.1"));
+
+        let other = entries.iter().find(|e| e.name == "other").unwrap();
+        assert_eq!(other.state, ContainerState::Off);
+        assert!(other.address.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_non_root_only_running() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            let out_list = mock_output(
+                true,
+                "ctr1 container systemd-nspawn running - 10.0.0.1\n",
+                "",
+            );
+            r.expect_run().returning(move |_, _| Ok(out_list.clone()));
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(false, runner);
+
+        let entries = provider.list_all().await.unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, ContainerState::Running);
+        assert_eq!(entries[0].image_type, None);
+    }
+
+    // ── get_properties ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_get_properties_parses_machinectl_and_systemctl_output() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().returning(|program, _args| {
+                if program == "systemctl" {
+                    Ok(mock_output(
+                        true,
+                        "ActiveState=active\nLoadState=loaded\n",
+                        "",
+                    ))
+                } else {
+                    Ok(mock_output(true, "State=running\nLeader=12345\n", ""))
+                }
+            });
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(true, runner);
+
+        let props = provider.get_properties("test-ctr").await.unwrap();
+
+        assert!(props.groups.iter().any(|g| g.name == "Machine"));
+        assert!(props.groups.iter().any(|g| g.name == "Systemd Unit"));
+    }
+
+    #[tokio::test]
+    async fn test_get_properties_empty_when_no_output() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            let out1 = mock_output(false, "", "");
+            let out2 = mock_output(false, "", "");
+            r.expect_run().returning(move |_, _| Ok(out1.clone()));
+            r.expect_run().returning(move |_, _| Ok(out2.clone()));
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(true, runner);
+
+        let result = provider.get_properties("missing-ctr").await;
+        assert!(result.is_err());
+    }
+
+    // ── action methods ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_start_calls_machinectl_start() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            let out = mock_output(true, "", "");
+            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(true, runner);
+
+        provider.start("my-ctr").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_kill_calls_machinectl_kill_with_signal() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            let out = mock_output(true, "", "");
+            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r
+        });
+        let provider = DefaultCliProvider::with_runner(true, runner);
+
+        provider.kill("my-ctr", "SIGTERM").await.unwrap();
     }
 }

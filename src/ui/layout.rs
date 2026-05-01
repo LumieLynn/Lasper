@@ -107,7 +107,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if app.ui.show_terminal {
+        .constraints(if app.data.terminal.is_showing() {
             vec![Constraint::Percentage(60), Constraint::Percentage(40)]
         } else {
             vec![Constraint::Percentage(100)]
@@ -119,14 +119,14 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.pane_height = list_area.height.saturating_sub(2);
     app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
 
-    if app.ui.show_terminal {
+    if app.data.terminal.is_showing() {
         let terminal_area = right_chunks[1];
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
         terminal_panel.render(
             f,
             terminal_area,
-            &app.data.terminal_sessions,
-            app.data.active_terminal_idx,
+            &app.data.terminal.sessions,
+            app.data.terminal.active_idx,
             terminal_focused,
         );
     }
@@ -201,18 +201,17 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" quit"),
             ]),
             crate::app::ActivePanel::TerminalPanel => {
-                let insert_mode = if let Some(session) =
-                    app.data.terminal_sessions.get(app.data.active_terminal_idx)
-                {
-                    session.insert_mode
-                } else {
-                    false
-                };
+                let insert_mode = app
+                    .data
+                    .terminal
+                    .active_session()
+                    .map(|s| s.insert_mode)
+                    .unwrap_or(false);
                 if insert_mode {
                     Line::from(vec![
                         kspan("[Alt+x]"),
                         hspan(" exit insert mode "),
-                        kspan("[Alt+1..9 / [/]]"),
+                        kspan("[Alt+1..9]"),
                         hspan(" switch tabs"),
                     ])
                 } else {

@@ -38,6 +38,7 @@ impl TerminalHandle {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn spawn_terminal(
     cmd_name: &str,
     args: &[&str],

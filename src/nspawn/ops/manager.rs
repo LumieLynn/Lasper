@@ -1,10 +1,12 @@
-use crate::nspawn::adapters::comm::{cli::CliProvider, dbus::DbusProvider};
+use crate::nspawn::adapters::comm::cli::{CliProvider, DefaultCliProvider};
+use crate::nspawn::adapters::comm::dbus::{DbusProvider, DefaultDbusProvider};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
 
+#[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
@@ -29,8 +31,8 @@ pub trait NspawnManager: Send + Sync + 'static {
 
 pub struct DefaultManager {
     is_root: bool,
-    dbus: DbusProvider,
-    cli: CliProvider,
+    dbus: std::sync::Arc<dyn DbusProvider>,
+    cli: std::sync::Arc<dyn CliProvider>,
     last_fallback_reason: std::sync::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
 }
@@ -39,8 +41,8 @@ impl DefaultManager {
     pub fn new(is_root: bool) -> Self {
         Self {
             is_root,
-            dbus: DbusProvider::new(),
-            cli: CliProvider::new(is_root),
+            dbus: std::sync::Arc::new(DefaultDbusProvider::new()),
+            cli: std::sync::Arc::new(DefaultCliProvider::new(is_root)),
             last_fallback_reason: std::sync::Mutex::new(None),
             watch_paths: vec![PathBuf::from("/var/lib/machines")],
         }
@@ -59,7 +61,7 @@ impl DefaultManager {
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &self.dbus).await
+        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &*self.dbus).await
     }
 }
 
@@ -283,7 +285,7 @@ impl NspawnManager for DefaultManager {
                 if notify_rx.recv().await.is_some() {
                     // Wait 200ms to consolidate burst events
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    while let Ok(_) = notify_rx.try_recv() {}
+                    while notify_rx.try_recv().is_ok() {}
                     let _ = tx_fs.send(()).await;
                 }
             }
@@ -302,5 +304,235 @@ impl NspawnManager for DefaultManager {
 
     fn get_watch_paths(&self) -> Vec<PathBuf> {
         self.watch_paths.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::adapters::comm::cli::MockCliProvider;
+    use crate::nspawn::adapters::comm::dbus::MockDbusProvider;
+    use crate::nspawn::errors::NspawnError;
+    use crate::nspawn::models::ContainerState;
+
+    fn dummy_entry(name: &str) -> ContainerEntry {
+        ContainerEntry {
+            name: name.to_string(),
+            state: ContainerState::Off,
+            image_type: None,
+            readonly: false,
+            usage: None,
+            address: None,
+            all_addresses: vec![],
+        }
+    }
+
+    fn mock_dbus_available() -> MockDbusProvider {
+        let mut dbus = MockDbusProvider::new();
+        dbus.expect_is_available().returning(|| true);
+        dbus
+    }
+
+    fn mock_dbus_unavailable() -> MockDbusProvider {
+        let mut dbus = MockDbusProvider::new();
+        dbus.expect_is_available().returning(|| false);
+        dbus
+    }
+
+    // ── list_all ────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_list_all_uses_dbus_when_available() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_all()
+            .returning(|| Ok(vec![dummy_entry("dbus-entry")]));
+
+        let cli = MockCliProvider::new(); // cli should never be called
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let entries = mgr.list_all().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "dbus-entry");
+        assert!(mgr.did_fallback().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_falls_back_to_cli_when_dbus_fails() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_all()
+            .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("dbus down".into()))));
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_list_all()
+            .returning(|| Ok(vec![dummy_entry("cli-entry")]));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let entries = mgr.list_all().await.unwrap();
+        assert_eq!(entries[0].name, "cli-entry");
+        assert!(mgr.did_fallback().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_uses_cli_when_dbus_unavailable() {
+        let dbus = mock_dbus_unavailable();
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_list_all()
+            .returning(|| Ok(vec![dummy_entry("cli-only")]));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let entries = mgr.list_all().await.unwrap();
+        assert_eq!(entries[0].name, "cli-only");
+        assert!(mgr.did_fallback().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_list_all_non_root_uses_cli_only() {
+        let dbus = MockDbusProvider::new(); // never called for non-root
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_list_all()
+            .returning(|| Ok(vec![dummy_entry("non-root")]));
+
+        let mgr = DefaultManager {
+            is_root: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let entries = mgr.list_all().await.unwrap();
+        assert_eq!(entries[0].name, "non-root");
+    }
+
+    // ── permission guard ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_start_requires_root() {
+        let dbus = mock_dbus_available();
+        let cli = MockCliProvider::new();
+
+        let mgr = DefaultManager {
+            is_root: false, // not root
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let err = mgr.start("test").await.unwrap_err();
+        assert!(matches!(err, NspawnError::PermissionDenied));
+    }
+
+    // ── fallback paths ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_start_falls_back_to_cli_when_dbus_fails() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_start()
+            .returning(|_| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_start().returning(|_| Ok(()));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        mgr.start("test").await.unwrap();
+        assert!(mgr.did_fallback().is_some());
+    }
+
+    // ── enable/disable bypass DBus ──────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_enable_calls_cli_directly() {
+        let dbus = MockDbusProvider::new(); // should never be called for enable
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_enable()
+            .with(mockall::predicate::eq("test-ctr"))
+            .returning(|_| Ok(()));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        mgr.enable("test-ctr").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_disable_calls_cli_directly() {
+        let dbus = MockDbusProvider::new();
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_disable()
+            .with(mockall::predicate::eq("test-ctr"))
+            .returning(|_| Ok(()));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        mgr.disable("test-ctr").await.unwrap();
+    }
+
+    // ── did_fallback state ──────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_did_fallback_clears_after_read() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_all()
+            .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
+
+        let mut cli = MockCliProvider::new();
+        cli.expect_list_all()
+            .returning(|| Ok(vec![dummy_entry("test")]));
+
+        let mgr = DefaultManager {
+            is_root: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        mgr.list_all().await.unwrap();
+        assert!(mgr.did_fallback().is_some()); // first read returns reason
+        assert!(mgr.did_fallback().is_none()); // second returns None (taken)
     }
 }

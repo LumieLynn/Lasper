@@ -52,10 +52,10 @@ impl NvidiaState {
     pub fn all_container_paths(&self) -> Vec<String> {
         let mut paths = HashSet::new();
         for b in &self.readonly_binds {
-            paths.insert(b.split(':').last().unwrap_or(b).to_string());
+            paths.insert(b.split(':').next_back().unwrap_or(b).to_string());
         }
         for b in &self.device_binds {
-            paths.insert(b.split(':').last().unwrap_or(b).to_string());
+            paths.insert(b.split(':').next_back().unwrap_or(b).to_string());
         }
         for e in &self.classified_entries {
             paths.insert(e.default_container_path.clone());

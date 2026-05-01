@@ -86,14 +86,14 @@ pub fn format_dbus_value(v: &Value<'_>) -> String {
             }
 
             arr.iter()
-                .map(|v| format_dbus_value(&v))
+                .map(|v| format_dbus_value(v))
                 .collect::<Vec<String>>()
                 .join(" ")
         }
 
         Value::Dict(d) => d
             .iter()
-            .map(|(k, v)| format!("{}={}", format_dbus_value(&k), format_dbus_value(&v)))
+            .map(|(k, v)| format!("{}={}", format_dbus_value(k), format_dbus_value(v)))
             .collect::<Vec<String>>()
             .join(", "),
 
@@ -195,7 +195,7 @@ fn format_dependencies(v: &Value<'_>) -> String {
     let mut result = filtered.join(" ");
     if hidden_count > 0 {
         if !result.is_empty() {
-            result.push_str(" ");
+            result.push(' ');
         }
         result.push_str(&format!("(+ {} system units)", hidden_count));
     }
@@ -223,7 +223,7 @@ fn format_ip_addresses(v: &Value<'_>) -> String {
                         }
                     }
                 }
-                format_dbus_value(&item)
+                format_dbus_value(item)
             })
             .collect::<Vec<String>>()
             .join(" ")
@@ -356,7 +356,7 @@ mod tests {
     fn test_format_duration_ns() {
         assert_eq!(format_duration_ns(&Value::U64(1_500_000_000)), "1s");
         assert_eq!(
-            format_duration_ns(&Value::U64(3661_000_000_000)),
+            format_duration_ns(&Value::U64(3_661_000_000_000)),
             "1h 1m 1s"
         );
         assert_eq!(format_duration_ns(&Value::U64(500_000_000)), "500ms");

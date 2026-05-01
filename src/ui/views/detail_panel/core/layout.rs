@@ -59,8 +59,8 @@ macro_rules! handle_nav {
             crossterm::event::KeyCode::PageDown => {
                 $self.$field = ($self.$field + $step).min(safe_max)
             }
-            _ => return crate::ui::core::EventResult::Ignored,
+            _ => return $crate::ui::core::EventResult::Ignored,
         }
-        return crate::ui::core::EventResult::Consumed;
+        return $crate::ui::core::EventResult::Consumed;
     }};
 }

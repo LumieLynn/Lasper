@@ -63,7 +63,10 @@ impl Component for NumberBox {
             return res;
         }
 
-        if let Some(_) = temp_input.handle_event(&crossterm::event::Event::Key(key)) {
+        if temp_input
+            .handle_event(&crossterm::event::Event::Key(key))
+            .is_some()
+        {
             let val_str = temp_input.value();
 
             if val_str.is_empty() {

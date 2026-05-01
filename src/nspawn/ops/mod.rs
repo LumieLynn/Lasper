@@ -13,7 +13,7 @@ pub enum BackendCommand {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
+#[allow(dead_code, clippy::large_enum_variant)]
 pub enum BackendResponse {
     ValidationSuccess,
     ValidationError(String),

@@ -73,15 +73,30 @@ impl SourceStepView {
                 .with_validator(|v| {
                     let v = v.trim();
                     if v.is_empty() { return Err("URL required".into()); }
-                    if v.contains("://") {
-                        url::Url::parse(v).map(|_| ()).map_err(|e| format!("Invalid URL: {}", e))
-                    } else {
-                        // Allow basic OCI references: alphanumeric, ".", "-", "_", ":", "/"
-                        if v.chars().all(|c| c.is_alphanumeric() || ".-_:".contains(c) || c == '/') {
+                    // Block injection characters on the whole input first
+                    if v.chars().any(|c| c.is_control() || "$`!\\\"'".contains(c)) {
+                        return Err("Invalid characters in image reference".into());
+                    }
+                    // If there's a transport prefix, validate it separately
+                    if let Some(pos) = v.find("://") {
+                        let prefix = &v[..pos];
+                        if !matches!(prefix, "docker" | "docker-archive" | "docker-daemon") {
+                            return Err(format!("Unknown transport prefix: {}://", prefix));
+                        }
+                        if prefix.chars().any(|c| c.is_control() || "$`!\\\"'".contains(c)) {
+                            return Err("Invalid characters in image reference".into());
+                        }
+                        let remainder = &v[pos + 3..];
+                        if remainder.is_empty() { return Err("URL required".into()); }
+                        if remainder.chars().all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/') {
                             Ok(())
                         } else {
                             Err("Invalid characters in image reference".into())
                         }
+                    } else if v.chars().all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/') {
+                        Ok(())
+                    } else {
+                        Err("Invalid characters in image reference".into())
                     }
                 }),
             deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone())

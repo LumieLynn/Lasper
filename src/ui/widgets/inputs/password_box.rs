@@ -8,6 +8,7 @@ use ratatui::{
     Frame,
 };
 
+#[allow(clippy::type_complexity)]
 pub struct PasswordBox {
     base: TextInputBase,
     validator: Option<Box<dyn Fn(&str) -> Result<(), String>>>,
