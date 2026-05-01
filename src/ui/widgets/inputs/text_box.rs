@@ -3,6 +3,7 @@ use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
+#[allow(clippy::type_complexity)]
 pub struct TextBox {
     base: TextInputBase,
     validator: Option<Box<dyn Fn(&str) -> Result<(), String>>>,

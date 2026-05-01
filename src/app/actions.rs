@@ -110,10 +110,8 @@ impl App {
             }
             DetailPane::Logs => {
                 if entry.state.is_running() {
-                    let needs_new_stream = match &self.data.log_stream {
-                        Some((name, _)) if name == &entry.name => false,
-                        _ => true,
-                    };
+                    let needs_new_stream =
+                        !matches!(&self.data.log_stream, Some((name, _)) if name == &entry.name);
 
                     if needs_new_stream {
                         // Stop old stream

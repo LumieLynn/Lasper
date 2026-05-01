@@ -40,7 +40,7 @@ impl TextBlock {
                 if count == 0 {
                     1
                 } else {
-                    (count + inner_width - 1) / inner_width
+                    count.div_ceil(inner_width)
                 }
             })
             .sum();
@@ -75,7 +75,7 @@ impl Component for TextBlock {
                 if count == 0 {
                     1
                 } else {
-                    (count + safe_width - 1) / safe_width
+                    count.div_ceil(safe_width)
                 }
             })
             .sum();

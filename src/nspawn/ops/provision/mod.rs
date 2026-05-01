@@ -45,6 +45,7 @@ pub trait Deployer: Send + Sync {
 }
 
 /// Orchestrates the asynchronous deployment of a new container.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_deploy_task(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,

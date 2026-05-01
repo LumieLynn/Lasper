@@ -82,7 +82,7 @@ pub struct StorageState {
 
 impl StorageState {
     pub fn extract_config(&self) -> StorageConfig {
-        let (st, _) = self.info.types[self.type_idx].clone();
+        let (st, _) = self.info.types[self.type_idx];
         StorageConfig {
             storage_type: st,
             disk_config: if st == StorageType::DiskImage {

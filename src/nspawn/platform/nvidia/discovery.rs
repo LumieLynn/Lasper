@@ -39,7 +39,7 @@ pub async fn list_devices() -> Result<Vec<String>> {
     for line in stdout.lines() {
         if let Some(id) = line.split_whitespace().last() {
             // Strip vendor prefix if present (e.g. nvidia.com/gpu=0 -> 0)
-            let clean_id = id.split('=').last().unwrap_or(id);
+            let clean_id = id.split('=').next_back().unwrap_or(id);
             devices.push(clean_id.to_string());
         }
     }

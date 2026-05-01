@@ -1,3 +1,5 @@
+#![allow(clippy::type_complexity)]
+
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;

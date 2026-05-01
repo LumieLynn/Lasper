@@ -2,16 +2,11 @@ use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub enum NvidiaPassthroughMode {
-    Mirror,      // Use CDI containerPath as-is
+    #[default]
+    Mirror, // Use CDI containerPath as-is
     Categorized, // Use category_destinations for remapping
-}
-
-impl Default for NvidiaPassthroughMode {
-    fn default() -> Self {
-        Self::Mirror
-    }
 }
 
 /// User-configured destination directories for each file category.

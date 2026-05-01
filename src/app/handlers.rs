@@ -18,10 +18,10 @@ impl App {
         }
 
         // Layer 2 – terminal panel when it owns focus
-        if self.ui.active_panel == ActivePanel::TerminalPanel {
-            if self.handle_terminal_focused_key(key).await {
-                return;
-            }
+        if self.ui.active_panel == ActivePanel::TerminalPanel
+            && self.handle_terminal_focused_key(key).await
+        {
+            return;
         }
 
         // Layer 3 – overlays (wizard / help / power menu)
@@ -157,24 +157,24 @@ impl App {
                 } else {
                     self.should_quit = true;
                 }
-                return true;
+                true
             }
             KeyCode::Char('?') => {
                 self.ui.show_help = true;
-                return true;
+                true
             }
             KeyCode::Tab => {
                 let terminal_showing = self.data.terminal.is_showing();
                 self.ui.toggle_focus(terminal_showing);
-                return true;
+                true
             }
             KeyCode::Char('s') => {
                 self.action_start();
-                return true;
+                true
             }
             KeyCode::Char('S') => {
                 self.action_poweroff();
-                return true;
+                true
             }
             KeyCode::Char('x') | KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -182,19 +182,19 @@ impl App {
                 if !self.data.entries.is_empty() {
                     self.ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
                 }
-                return true;
+                true
             }
             KeyCode::Char('n') | KeyCode::Char('a') => {
                 self.begin_wizard().await;
-                return true;
+                true
             }
             KeyCode::Char('r') => {
                 self.refresh().await;
-                return true;
+                true
             }
             KeyCode::Char('t') => {
                 self.toggle_terminal();
-                return true;
+                true
             }
             _ => false,
         }

@@ -25,11 +25,8 @@ impl Component for ReviewStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Enter => {
-                return EventResult::Message(AppMessage::Wizard(WizardMessage::Submit))
-            }
-            _ => {}
+        if key.code == KeyCode::Enter {
+            return EventResult::Message(AppMessage::Wizard(WizardMessage::Submit));
         }
 
         self.preview.handle_key(key)

@@ -271,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_build_config_oci_disables_boot() {
         let mut builder = ContainerConfigBuilder::default();
         builder.source = Some(SourceConfig {
@@ -289,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_build_config_passthrough_fields() {
         let mut builder = ContainerConfigBuilder::default();
         builder.passthrough = Some(PassthroughConfig {

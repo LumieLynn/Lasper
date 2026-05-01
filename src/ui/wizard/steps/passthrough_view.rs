@@ -78,6 +78,7 @@ pub struct PassthroughStepView {
 }
 
 impl PassthroughStepView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_data: &PassthroughConfig,
         nw_mode: Option<NetworkMode>,

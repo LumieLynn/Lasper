@@ -36,7 +36,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                                 if count == 0 {
                                     1
                                 } else {
-                                    (count + val_width - 1) / val_width
+                                    count.div_ceil(val_width)
                                 }
                             })
                             .sum::<usize>()
@@ -59,7 +59,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                     .filter(|g| !g.properties.is_empty())
                     .map(|g| {
                         let mut group_lines = 2; // Header + Spacer
-                        for (_, v) in &g.properties {
+                        for v in g.properties.values() {
                             group_lines += v
                                 .lines()
                                 .map(|l| {
@@ -67,7 +67,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                                     if count == 0 {
                                         1
                                     } else {
-                                        (count + val_width - 1) / val_width
+                                        count.div_ceil(val_width)
                                     }
                                 })
                                 .sum::<usize>()
@@ -93,7 +93,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                         if count == 0 {
                             1
                         } else {
-                            (count + width - 1) / width
+                            count.div_ceil(width)
                         }
                     })
                     .sum()

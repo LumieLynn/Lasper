@@ -40,7 +40,7 @@ impl DiskImageBackend {
         // 1. Try systemd-dissect
         let out = new_command("systemd-dissect")
             .arg("--umount")
-            .arg(&mount_point.to_string_lossy().to_string())
+            .arg(mount_point.to_string_lossy().to_string())
             .logged_output("systemd-dissect")
             .await?;
 
@@ -49,7 +49,7 @@ impl DiskImageBackend {
             if !err.contains("not mounted") && !err.contains("no such file") {
                 log::warn!("systemd-dissect umount failed. Forcing standard umount.");
                 let _ = new_command("umount")
-                    .arg(&mount_point.to_string_lossy().to_string())
+                    .arg(mount_point.to_string_lossy().to_string())
                     .logged_output("umount")
                     .await;
             }
@@ -106,7 +106,7 @@ impl DiskImageBackend {
         }
         let out = new_command("mount")
             .arg(&dev)
-            .arg(&mount_point.to_string_lossy().to_string())
+            .arg(mount_point.to_string_lossy().to_string())
             .logged_output("mount")
             .await?;
 

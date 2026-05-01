@@ -93,12 +93,10 @@ impl SourceStepView {
                         } else {
                             Err("Invalid characters in image reference".into())
                         }
+                    } else if v.chars().all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/') {
+                        Ok(())
                     } else {
-                        if v.chars().all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/') {
-                            Ok(())
-                        } else {
-                            Err("Invalid characters in image reference".into())
-                        }
+                        Err("Invalid characters in image reference".into())
                     }
                 }),
             deboot_mirror: TextBox::new(" Mirror (leave blank for default) ", initial_data.deboot_mirror.clone())

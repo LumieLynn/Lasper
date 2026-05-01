@@ -285,7 +285,7 @@ impl NspawnManager for DefaultManager {
                 if notify_rx.recv().await.is_some() {
                     // Wait 200ms to consolidate burst events
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                    while let Ok(_) = notify_rx.try_recv() {}
+                    while notify_rx.try_recv().is_ok() {}
                     let _ = tx_fs.send(()).await;
                 }
             }

@@ -115,7 +115,7 @@ pub fn apply_category_remapping(host_state: &mut NvidiaState, profile: &NvidiaPa
                 let filename = entry
                     .default_container_path
                     .split('/')
-                    .last()
+                    .next_back()
                     .unwrap_or_default();
                 entry.default_container_path = format!("{}/{}", dest, filename);
             }

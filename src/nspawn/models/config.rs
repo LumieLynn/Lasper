@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 /// Represents the network configuration for a container.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub enum NetworkMode {
     /// Share the host's network namespace.
     Host,
     /// Private network namespace with no connectivity (unless manually configured).
     None,
     /// Virtual Ethernet pair (veth).
+    #[default]
     Veth,
     /// Connect to a specific host bridge.
     Bridge(String),
@@ -17,12 +18,6 @@ pub enum NetworkMode {
     IpVlan(String),
     /// Physical interface passthrough.
     Interface(String),
-}
-
-impl Default for NetworkMode {
-    fn default() -> Self {
-        NetworkMode::Veth
-    }
 }
 
 /// A port forwarding rule (host -> container).
@@ -145,9 +140,11 @@ mod tests {
 
     #[test]
     fn test_container_config_serde_roundtrip() {
-        let mut cfg = ContainerConfig::default();
-        cfg.name = "test".into();
-        cfg.nvidia_gpu = true;
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            nvidia_gpu: true,
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();

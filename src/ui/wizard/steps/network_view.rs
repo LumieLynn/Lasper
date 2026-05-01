@@ -263,15 +263,15 @@ impl Component for NetworkStepView {
             return res;
         }
 
-        if key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A') {
-            if self.port_list.is_focused() {
-                self.port_editor = Some(PortMappingBox::new(|p| {
-                    AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
-                }));
+        if (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
+            && self.port_list.is_focused()
+        {
+            self.port_editor = Some(PortMappingBox::new(|p| {
+                AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
+            }));
 
-                self.port_editor.as_mut().unwrap().set_focus(true);
-                return EventResult::Consumed;
-            }
+            self.port_editor.as_mut().unwrap().set_focus(true);
+            return EventResult::Consumed;
         }
 
         let mode = self.mode_selector.selected_idx();
