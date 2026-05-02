@@ -34,7 +34,7 @@ pub struct DefaultManager {
     is_root: bool,
     dbus: std::sync::Arc<dyn DbusProvider>,
     cli: std::sync::Arc<dyn CliProvider>,
-    last_fallback_reason: std::sync::Mutex<Option<String>>,
+    last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
 }
 
@@ -44,7 +44,7 @@ impl DefaultManager {
             is_root,
             dbus: std::sync::Arc::new(DefaultDbusProvider::new()),
             cli: std::sync::Arc::new(DefaultCliProvider::new(is_root)),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![PathBuf::from("/var/lib/machines")],
         }
     }
@@ -58,7 +58,7 @@ impl DefaultManager {
     }
 
     fn mark_fallback(&self, reason: &str) {
-        *self.last_fallback_reason.lock().unwrap() = Some(reason.to_string());
+        *self.last_fallback_reason.lock() = Some(reason.to_string());
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
@@ -281,7 +281,7 @@ impl NspawnManager for DefaultManager {
     }
 
     fn did_fallback(&self) -> Option<String> {
-        self.last_fallback_reason.lock().unwrap().take()
+        self.last_fallback_reason.lock().take()
     }
 
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {
@@ -302,15 +302,20 @@ impl NspawnManager for DefaultManager {
         tokio::spawn(async move {
             let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            let mut watcher = RecommendedWatcher::new(
+            let mut watcher = match RecommendedWatcher::new(
                 move |res: std::result::Result<Event, notify::Error>| {
                     if res.is_ok() {
                         let _ = notify_tx.send(());
                     }
                 },
                 Config::default(),
-            )
-            .expect("Failed to create FS watcher");
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    log::error!("Failed to create FS watcher: {}. Inotify-based refresh disabled; relying on heartbeat.", e);
+                    return;
+                }
+            };
 
             for path in paths {
                 if path.exists() {
@@ -395,7 +400,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -419,7 +424,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -440,7 +445,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -461,7 +466,7 @@ mod tests {
             is_root: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -480,7 +485,7 @@ mod tests {
             is_root: false, // not root
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -503,7 +508,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -526,7 +531,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -546,7 +551,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -569,7 +574,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -589,7 +594,7 @@ mod tests {
             is_root: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
