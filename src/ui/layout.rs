@@ -41,9 +41,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(dialog) = &mut app.ui.quit_dialog {
         dialog.render(f, area);
     }
+    if let Some(dialog) = &mut app.ui.delete_dialog {
+        dialog.render(f, area);
+    }
 }
 
-// ── Title ─────────────────────────────────────────────────────────────────────
+// Title
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let badge = if app.is_root {
@@ -88,7 +91,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line).style(Style::default()), area);
 }
 
-// ── Content ───────────────────────────────────────────────────────────────────
+// Content
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
@@ -144,7 +147,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         .render_with_data(f, detail_area, &mut app.data);
 }
 
-// ── Status bar ────────────────────────────────────────────────────────────────
+// Status bar
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let line = if let Some((msg, level)) = &app.ui.status_message {
@@ -177,6 +180,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" refresh "),
                 kspan("[t]"),
                 hspan(" terminal "),
+                kspan("[D]"),
+                hspan(" delete "),
                 kspan("[?]"),
                 hspan(" help "),
                 kspan("[q]"),
@@ -242,7 +247,7 @@ fn hspan(s: &'static str) -> Span<'static> {
     Span::styled(s, Style::default().fg(Color::DarkGray))
 }
 
-// ── Help overlay ──────────────────────────────────────────────────────────────
+// Help overlay
 
 fn render_help(f: &mut Frame) {
     let area = centered_rect(50, 85, f.area());
@@ -267,6 +272,7 @@ fn render_help(f: &mut Frame) {
         Line::from(""),
         hrow("s    ", "Start container  [root]"),
         hrow("S    ", "Poweroff container [root]"),
+        hrow("D    ", "Delete container [root]"),
         hrow("x / ⏎", "Actions / Power menu  [root]"),
         Line::from(""),
         hrow("n    ", "New container / Import wizard  [root]"),

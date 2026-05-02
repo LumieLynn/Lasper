@@ -291,6 +291,16 @@ impl App {
         );
     }
 
+    pub fn action_remove(&mut self) {
+        self.ui.delete_dialog = None;
+        self.perform_container_action(
+            "Removed",
+            None,
+            |e| !e.state.is_running(),
+            |name, manager| async move { manager.remove(&name).await },
+        );
+    }
+
     pub fn action_enable(&mut self) {
         self.perform_container_action(
             "Enabled",

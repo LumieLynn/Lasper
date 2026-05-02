@@ -46,6 +46,7 @@ pub struct AppUi {
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
+    pub delete_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
 }
 
 impl AppUi {
@@ -64,6 +65,7 @@ impl AppUi {
             backend_tx: None,
             app_tx: None,
             quit_dialog: None,
+            delete_dialog: None,
         }
     }
 

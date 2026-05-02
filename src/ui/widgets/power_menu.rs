@@ -16,6 +16,7 @@ impl PowerMenu {
             "  ☠  Kill (SIGKILL)".to_string(),
             "  ⬆  Enable at Boot".to_string(),
             "  ⬇  Disable at Boot".to_string(),
+            "  ✕  Delete Container".to_string(),
         ];
 
         let mut list = SelectableList::new(" [ Power Actions ] ", items, |s| s.clone());
@@ -32,7 +33,7 @@ impl PowerMenu {
 impl Component for PowerMenu {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         // Use fixed height for 7 items + borders + title
-        let menu_height = 9;
+        let menu_height = 10;
         let menu_width = 32;
 
         // Manual centering

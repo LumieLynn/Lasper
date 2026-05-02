@@ -4,7 +4,7 @@ use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-// ── Top-level dispatch ────────────────────────────────────────────────────────
+// Top-level dispatch
 //
 // handle_key is now a thin chain of mode-specific handlers.  Each handler
 // returns `true` when it consumed the key — the remaining handlers are
@@ -12,6 +12,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
+        // Layer 0 – delete confirmation (modal)
+        if self.handle_delete_confirm_key(key) {
+            return;
+        }
+
         // Layer 1 – quit confirmation dialog (modal)
         if self.handle_quit_confirm_key(key) {
             return;
@@ -39,7 +44,27 @@ impl App {
     }
 }
 
-// ── Layer 1: quit confirmation ────────────────────────────────────────────────
+// Layer 0: delete confirmation
+
+impl App {
+    fn handle_delete_confirm_key(&mut self, key: KeyEvent) -> bool {
+        if self.ui.delete_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.action_remove();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.ui.delete_dialog = None;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+// Layer 1: quit confirmation
 
 impl App {
     fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
@@ -61,7 +86,7 @@ impl App {
     }
 }
 
-// ── Layer 2: terminal panel (insert / normal mode + tab switching) ────────────
+// Layer 2: terminal panel (insert / normal mode + tab switching)
 
 impl App {
     async fn handle_terminal_focused_key(&mut self, key: KeyEvent) -> bool {
@@ -83,7 +108,7 @@ impl App {
     }
 }
 
-// ── Layer 3: overlays (wizard, help, power menu) ──────────────────────────────
+// Layer 3: overlays (wizard, help, power menu)
 
 impl App {
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -128,6 +153,7 @@ impl App {
                         4 => self.action_kill(),
                         5 => self.action_enable(),
                         6 => self.action_disable(),
+                        7 => self.show_delete_dialog(),
                         _ => {}
                     }
                 }
@@ -142,7 +168,7 @@ impl App {
     }
 }
 
-// ── Layer 4: global shortcuts ─────────────────────────────────────────────────
+// Layer 4: global shortcuts
 
 impl App {
     async fn handle_global_key(&mut self, key: KeyEvent) -> bool {
@@ -196,12 +222,16 @@ impl App {
                 self.toggle_terminal();
                 true
             }
+            KeyCode::Char('D') => {
+                self.show_delete_dialog();
+                true
+            }
             _ => false,
         }
     }
 }
 
-// ── Layer 5: route to focused panel ───────────────────────────────────────────
+// Layer 5: route to focused panel
 
 impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
@@ -282,5 +312,27 @@ impl App {
         } else {
             self.spawn_terminal();
         }
+    }
+
+    fn show_delete_dialog(&mut self) {
+        let entry = match self.data.entries.get(self.data.selected) {
+            Some(e) => e,
+            None => return,
+        };
+        if entry.state.is_running() {
+            self.set_status(
+                format!("Stop '{}' before deleting it.", entry.name),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
+        self.ui.delete_dialog =
+            Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+                "Delete Container",
+                format!(
+                    "Delete '{}' and all its data?\nThis cannot be undone.",
+                    entry.name
+                ),
+            ));
     }
 }

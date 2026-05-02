@@ -16,6 +16,7 @@ pub trait DbusProvider: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn remove(&self, name: &str) -> Result<()>;
     async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
     async fn reload_daemon(&self) -> Result<()>;
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()>;
@@ -36,6 +37,7 @@ trait Manager {
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
     fn get_machine_addresses(&self, name: &str) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
+    fn remove_image(&self, name: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn machine_new(&self, machine: String, path: OwnedObjectPath) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -224,6 +226,18 @@ impl DbusProvider for DefaultDbusProvider {
         let sig = signal.parse::<i32>().unwrap_or(15);
         proxy
             .kill_machine(name, "all", sig)
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    async fn remove(&self, name: &str) -> Result<()> {
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .remove_image(name)
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())

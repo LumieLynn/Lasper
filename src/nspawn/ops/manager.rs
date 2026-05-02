@@ -23,6 +23,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn remove(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>);
@@ -207,6 +208,47 @@ impl NspawnManager for DefaultManager {
         })
     }
 
+    async fn remove(&self, name: &str) -> Result<()> {
+        self.require_root()?;
+
+        let result = if self.dbus.is_available().await {
+            match self.dbus.remove(name).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    log::warn!("DBus remove failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
+                    self.cli.remove(name).await.map_err(|e| {
+                        log::error!("CLI remove failed for {}: {}", name, e);
+                        e
+                    })
+                }
+            }
+        } else {
+            self.cli.remove(name).await.map_err(|e| {
+                log::error!("CLI remove failed for {}: {}", name, e);
+                e
+            })
+        };
+
+        // systemd may or may not clean these up — an extra unlink is harmless
+        let _ = tokio::fs::remove_file(
+            crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
+        )
+        .await;
+        let _ = tokio::fs::remove_dir_all(format!(
+            "/etc/systemd/system/systemd-nspawn@{}.service.d",
+            name
+        ))
+        .await;
+        let _ =
+            tokio::fs::remove_file(crate::nspawn::platform::nvidia::state::get_state_dir().join(
+                format!("{}.json", name),
+            ))
+            .await;
+
+        result
+    }
+
     fn spawn_log_stream(
         &self,
         name: &str,
@@ -339,7 +381,7 @@ mod tests {
         dbus
     }
 
-    // ── list_all ────────────────────────────────────────────────────────────────
+    // list_all
 
     #[tokio::test]
     async fn test_list_all_uses_dbus_when_available() {
@@ -427,7 +469,7 @@ mod tests {
         assert_eq!(entries[0].name, "non-root");
     }
 
-    // ── permission guard ────────────────────────────────────────────────────────
+    // permission guard
 
     #[tokio::test]
     async fn test_start_requires_root() {
@@ -446,7 +488,7 @@ mod tests {
         assert!(matches!(err, NspawnError::PermissionDenied));
     }
 
-    // ── fallback paths ──────────────────────────────────────────────────────────
+    // fallback paths
 
     #[tokio::test]
     async fn test_start_falls_back_to_cli_when_dbus_fails() {
@@ -469,7 +511,7 @@ mod tests {
         assert!(mgr.did_fallback().is_some());
     }
 
-    // ── enable/disable bypass DBus ──────────────────────────────────────────────
+    // enable/disable bypass DBus
 
     #[tokio::test]
     async fn test_enable_calls_cli_directly() {
@@ -511,7 +553,7 @@ mod tests {
         mgr.disable("test-ctr").await.unwrap();
     }
 
-    // ── did_fallback state ──────────────────────────────────────────────────────
+    // did_fallback state
 
     #[tokio::test]
     async fn test_did_fallback_clears_after_read() {
@@ -534,5 +576,24 @@ mod tests {
         mgr.list_all().await.unwrap();
         assert!(mgr.did_fallback().is_some()); // first read returns reason
         assert!(mgr.did_fallback().is_none()); // second returns None (taken)
+    }
+
+    // remove
+
+    #[tokio::test]
+    async fn test_remove_requires_root() {
+        let dbus = mock_dbus_available();
+        let cli = MockCliProvider::new();
+
+        let mgr = DefaultManager {
+            is_root: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: std::sync::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let err = mgr.remove("test").await.unwrap_err();
+        assert!(matches!(err, NspawnError::PermissionDenied));
     }
 }

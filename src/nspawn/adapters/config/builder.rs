@@ -165,7 +165,7 @@ impl ContainerConfigBuilder {
             || cfg.wayland_socket.is_some()
             || cfg.graphics_acceleration
         {
-            content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
+            content.push_str("\n#[systemd override.conf]\n");
             content.push_str(&systemd_override_content(
                 &cfg.device_binds,
                 cfg.nvidia_gpu,

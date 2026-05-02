@@ -247,7 +247,7 @@ impl NspawnConfig {
     }
 }
 
-// ── .nspawn file generation ───────────────────────────────────────────────────
+//.nspawn file generation
 
 /// Generate the content of a `.nspawn` container config file using AST.
 pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
@@ -260,7 +260,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
             .set("X-Lasper-Nvidia-Enabled", "true");
     }
 
-    // ── [Exec] ────────────────────────────────────────────────────────────────
+    //[Exec]
     {
         let mut exec = conf.with_section(Some("Exec"));
         if cfg.boot {
@@ -285,7 +285,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
     }
 
-    // ── [Network] ─────────────────────────────────────────────────────────────
+    //[Network]
     if let Some(mode) = &cfg.network {
         use crate::nspawn::models::NetworkMode;
         match mode {
@@ -334,7 +334,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
     }
 
-    // ── [Files] ───────────────────────────────────────────────────────────────
+    //[Files]
     let has_files = !cfg.device_binds.is_empty()
         || !cfg.readonly_binds.is_empty()
         || !cfg.bind_mounts.is_empty()
@@ -428,7 +428,7 @@ mod tests {
     use super::*;
     use crate::nspawn::models::{NetworkMode, PortForward};
 
-    // ── Validation ────────────────────────────────────────────────────────
+    // Validation
 
     #[test]
     fn test_validate_machine_name_valid() {
@@ -471,7 +471,7 @@ mod tests {
         assert!(validate_machine_name("$(whoami)").is_err());
     }
 
-    // ── GPU enabled detection ─────────────────────────────────────────────
+    // GPU enabled detection
 
     #[test]
     fn test_is_gpu_enabled_true() {
@@ -518,7 +518,7 @@ mod tests {
         assert!(!config.is_gpu_enabled());
     }
 
-    // ── Purge nvidia block ────────────────────────────────────────────────
+    // Purge nvidia block
 
     #[test]
     fn test_purge_nvidia_block_present() {
@@ -570,7 +570,7 @@ mod tests {
         assert!(death_list.is_empty());
     }
 
-    // ── Config content generation ─────────────────────────────────────────
+    // Config content generation
 
     #[test]
     fn test_nspawn_config_content_minimal() {
@@ -674,7 +674,7 @@ mod tests {
         assert!(nspawn_config_content(&cfg, None).is_err());
     }
 
-    // ── GPU passthrough surgery ───────────────────────────────────────────
+    // GPU passthrough surgery
 
     #[test]
     fn test_apply_gpu_passthrough_to_content() {
