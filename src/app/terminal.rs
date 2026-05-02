@@ -278,9 +278,11 @@ impl TerminalManager {
                     TerminalKeyOutcome::ConsumedAndRefreshDetail
                 }
 
-                KeyCode::Tab | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('t') => {
-                    TerminalKeyOutcome::PassThrough
-                }
+                KeyCode::Tab
+                | KeyCode::Char('q')
+                | KeyCode::Char('?')
+                | KeyCode::Char('t')
+                | KeyCode::Char('R') => TerminalKeyOutcome::PassThrough,
 
                 _ => TerminalKeyOutcome::Consumed,
             }

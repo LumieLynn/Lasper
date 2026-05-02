@@ -358,7 +358,9 @@ pub async fn ensure_gpu_passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, NvidiaFileCategory, SymlinkEntry};
+    use crate::nspawn::platform::nvidia::classify::{
+        ClassifiedEntry, NvidiaFileCategory, SymlinkEntry,
+    };
     use crate::nspawn::platform::nvidia::state::NvidiaState;
     use std::collections::HashMap;
 

@@ -317,7 +317,11 @@ impl CliProvider for DefaultCliProvider {
                             key,
                             &zbus::zvariant::Value::Str(val.into()),
                         );
-                        props.insert(crate::nspawn::models::GROUP_MACHINE, key.to_string(), formatted);
+                        props.insert(
+                            crate::nspawn::models::GROUP_MACHINE,
+                            key.to_string(),
+                            formatted,
+                        );
                     }
                 }
             }
@@ -356,10 +360,18 @@ impl CliProvider for DefaultCliProvider {
                                 | "ConflictedBy"
                         ) {
                             if !formatted.is_empty() && formatted != "[]" {
-                                props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, key.to_string(), formatted);
+                                props.insert(
+                                    crate::nspawn::models::GROUP_DEPENDENCIES,
+                                    key.to_string(),
+                                    formatted,
+                                );
                             }
                         } else {
-                            props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, key.to_string(), formatted);
+                            props.insert(
+                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                                key.to_string(),
+                                formatted,
+                            );
                         }
                     }
                 }

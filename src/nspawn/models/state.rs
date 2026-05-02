@@ -296,7 +296,11 @@ mod tests {
     fn test_machine_properties_summary_no_important_keys() {
         let mut props = MachineProperties::default();
         props.insert(GROUP_MACHINE, "SomeRandom".to_string(), "val".to_string());
-        props.insert(GROUP_MACHINE, "AnotherRandom".to_string(), "val2".to_string());
+        props.insert(
+            GROUP_MACHINE,
+            "AnotherRandom".to_string(),
+            "val2".to_string(),
+        );
 
         let summary = props.get_summary();
         assert!(summary.is_empty());

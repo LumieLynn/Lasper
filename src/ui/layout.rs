@@ -100,18 +100,26 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.ui.detail_panel.set_focus(detail_focused);
 
+    let list_pct = app.ui.container_list_pct;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([
+            Constraint::Percentage(list_pct),
+            Constraint::Percentage(100u16.saturating_sub(list_pct)),
+        ])
         .split(area);
 
     let list_area = cols[0];
     let right_area = cols[1];
 
+    let detail_pct = app.ui.detail_pct;
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(if app.data.terminal.is_showing() {
-            vec![Constraint::Percentage(60), Constraint::Percentage(40)]
+            vec![
+                Constraint::Percentage(detail_pct),
+                Constraint::Percentage(100u16.saturating_sub(detail_pct)),
+            ]
         } else {
             vec![Constraint::Percentage(100)]
         })
@@ -160,6 +168,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::raw("  "),
             Span::styled(msg.as_str(), Style::default().fg(color)),
+        ])
+    } else if app.ui.resize_mode == crate::app::ResizeMode::Active {
+        Line::from(vec![
+            kspan("[Esc/R/q]"),
+            hspan(" exit resize "),
+            kspan("[←/h →/l]"),
+            hspan(" list width "),
+            kspan("[↓/j ↑/k]"),
+            hspan(" detail/terminal height"),
         ])
     } else {
         match app.ui.active_panel {
@@ -279,6 +296,7 @@ fn render_help(f: &mut Frame) {
         Line::from(""),
         hrow("Tab  ", "Toggle focus: list ↔ detail panel"),
         hrow("r    ", "Refresh list"),
+        hrow("R    ", "Enter resize mode"),
         hrow("?    ", "Toggle help"),
         hrow("q    ", "Quit"),
         Line::from(""),

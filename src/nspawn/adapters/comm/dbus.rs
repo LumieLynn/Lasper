@@ -236,10 +236,7 @@ impl DbusProvider for DefaultDbusProvider {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .remove_image(name)
-            .await
-            .map_err(NspawnError::Dbus)?;
+        proxy.remove_image(name).await.map_err(NspawnError::Dbus)?;
         Ok(())
     }
 

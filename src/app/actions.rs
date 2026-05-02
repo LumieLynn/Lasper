@@ -75,25 +75,55 @@ impl App {
                                 entry.all_addresses.join(", "),
                             );
                         }
-                        if let Some(ufs) = p.get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT).get("UnitFileState") {
+                        if let Some(ufs) = p
+                            .get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+                            .get("UnitFileState")
+                        {
                             let ufs = ufs.clone();
-                            p.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, "Enabled".into(), ufs);
+                            p.insert(
+                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                                "Enabled".into(),
+                                ufs,
+                            );
                         }
                         // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
                         if let Some(image_type) = &entry.image_type {
-                            if let Some(machine_type) = p.get_group_mut(crate::nspawn::models::GROUP_MACHINE).remove("Type") {
-                                p.insert(crate::nspawn::models::GROUP_MACHINE, "Class".into(), machine_type);
+                            if let Some(machine_type) = p
+                                .get_group_mut(crate::nspawn::models::GROUP_MACHINE)
+                                .remove("Type")
+                            {
+                                p.insert(
+                                    crate::nspawn::models::GROUP_MACHINE,
+                                    "Class".into(),
+                                    machine_type,
+                                );
                             }
-                            p.insert(crate::nspawn::models::GROUP_MACHINE, "Type".into(), image_type.clone());
+                            p.insert(
+                                crate::nspawn::models::GROUP_MACHINE,
+                                "Type".into(),
+                                image_type.clone(),
+                            );
                         }
 
                         // For stopped containers, manually ensure expected static fields
                         if !entry.state.is_running() {
-                            p.insert(crate::nspawn::models::GROUP_MACHINE, "ReadOnly".into(), entry.readonly.to_string());
+                            p.insert(
+                                crate::nspawn::models::GROUP_MACHINE,
+                                "ReadOnly".into(),
+                                entry.readonly.to_string(),
+                            );
                             if let Some(u) = &entry.usage {
-                                p.insert(crate::nspawn::models::GROUP_MACHINE, "Usage".into(), u.clone());
+                                p.insert(
+                                    crate::nspawn::models::GROUP_MACHINE,
+                                    "Usage".into(),
+                                    u.clone(),
+                                );
                             }
-                            p.insert(crate::nspawn::models::GROUP_MACHINE, "State".into(), entry.state.label().into());
+                            p.insert(
+                                crate::nspawn::models::GROUP_MACHINE,
+                                "State".into(),
+                                entry.state.label().into(),
+                            );
                         }
 
                         self.data.properties = Ok(p);
@@ -320,6 +350,7 @@ impl App {
     }
 
     pub fn spawn_terminal(&mut self) {
+        self.ui.prev_active_panel = self.ui.active_panel.clone();
         let rows = self.ui.pane_height.max(10);
         let entry = match self.data.entries.get(self.data.selected) {
             Some(e) => e.clone(),

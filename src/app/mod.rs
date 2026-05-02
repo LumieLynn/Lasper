@@ -29,8 +29,21 @@ pub enum ActivePanel {
     TerminalPanel,
 }
 
+/// Whether the user is in panel resize mode (toggled by `R`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResizeMode {
+    Inactive,
+    Active,
+}
+
+pub const CONTAINER_LIST_PCT_MIN: u16 = 15;
+pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
+pub const DETAIL_PCT_MIN: u16 = 30;
+pub const DETAIL_PCT_MAX: u16 = 85;
+
 pub struct AppUi {
     pub active_panel: ActivePanel,
+    pub prev_active_panel: ActivePanel,
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
@@ -47,12 +60,17 @@ pub struct AppUi {
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
     pub delete_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
+
+    pub resize_mode: ResizeMode,
+    pub container_list_pct: u16,
+    pub detail_pct: u16,
 }
 
 impl AppUi {
     pub fn new(_is_root: bool) -> Self {
         Self {
             active_panel: ActivePanel::ContainerList,
+            prev_active_panel: ActivePanel::ContainerList,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
@@ -66,6 +84,9 @@ impl AppUi {
             app_tx: None,
             quit_dialog: None,
             delete_dialog: None,
+            resize_mode: ResizeMode::Inactive,
+            container_list_pct: 30,
+            detail_pct: 60,
         }
     }
 
@@ -74,6 +95,7 @@ impl AppUi {
             ActivePanel::ContainerList => ActivePanel::DetailPanel,
             ActivePanel::DetailPanel => {
                 if terminal_showing {
+                    self.prev_active_panel = self.active_panel.clone();
                     ActivePanel::TerminalPanel
                 } else {
                     ActivePanel::ContainerList

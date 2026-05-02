@@ -22,6 +22,14 @@ impl App {
             return;
         }
 
+        // Layer 1.5 – resize mode (skip when terminal is in insert mode)
+        if self.ui.resize_mode == super::ResizeMode::Active
+            && !self.is_terminal_insert_mode()
+            && self.handle_resize_key(key)
+        {
+            return;
+        }
+
         // Layer 2 – terminal panel when it owns focus
         if self.ui.active_panel == ActivePanel::TerminalPanel
             && self.handle_terminal_focused_key(key).await
@@ -96,6 +104,15 @@ impl App {
             self.data
                 .terminal
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
+
+        // If closing a tab emptied the terminal panel, restore focus to a valid panel.
+        if self.ui.active_panel == ActivePanel::TerminalPanel && !self.data.terminal.is_showing() {
+            self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
+                ActivePanel::ContainerList
+            } else {
+                self.ui.prev_active_panel.clone()
+            };
+        }
 
         match outcome {
             TerminalKeyOutcome::Consumed => true,
@@ -218,6 +235,14 @@ impl App {
                 self.refresh().await;
                 true
             }
+            KeyCode::Char('R') => {
+                self.ui.resize_mode = if self.ui.resize_mode == super::ResizeMode::Active {
+                    super::ResizeMode::Inactive
+                } else {
+                    super::ResizeMode::Active
+                };
+                true
+            }
             KeyCode::Char('t') => {
                 self.toggle_terminal();
                 true
@@ -308,7 +333,13 @@ impl App {
     fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            self.ui.active_panel = ActivePanel::ContainerList;
+            if self.ui.active_panel == ActivePanel::TerminalPanel {
+                self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
+                    ActivePanel::ContainerList
+                } else {
+                    self.ui.prev_active_panel.clone()
+                };
+            }
         } else {
             self.spawn_terminal();
         }
@@ -326,13 +357,71 @@ impl App {
             );
             return;
         }
-        self.ui.delete_dialog =
-            Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
-                "Delete Container",
-                format!(
-                    "Delete '{}' and all its data?\nThis cannot be undone.",
-                    entry.name
-                ),
-            ));
+        self.ui.delete_dialog = Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+            "Delete Container",
+            format!(
+                "Delete '{}' and all its data?\nThis cannot be undone.",
+                entry.name
+            ),
+        ));
+    }
+}
+
+// Resize mode
+
+impl App {
+    fn is_terminal_insert_mode(&self) -> bool {
+        self.ui.active_panel == ActivePanel::TerminalPanel
+            && self
+                .data
+                .terminal
+                .active_session()
+                .map(|s| s.insert_mode)
+                .unwrap_or(false)
+    }
+
+    fn handle_resize_key(&mut self, key: KeyEvent) -> bool {
+        let step = 5u16;
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('R') | KeyCode::Char('q') => {
+                self.ui.resize_mode = super::ResizeMode::Inactive;
+                true
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.ui.container_list_pct = self
+                    .ui
+                    .container_list_pct
+                    .saturating_sub(step)
+                    .max(super::CONTAINER_LIST_PCT_MIN);
+                true
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.ui.container_list_pct = self
+                    .ui
+                    .container_list_pct
+                    .saturating_add(step)
+                    .min(super::CONTAINER_LIST_PCT_MAX);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.data.terminal.is_showing() => {
+                self.ui.detail_pct = self
+                    .ui
+                    .detail_pct
+                    .saturating_add(step)
+                    .min(super::DETAIL_PCT_MAX);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.data.terminal.is_showing() => {
+                self.ui.detail_pct = self
+                    .ui
+                    .detail_pct
+                    .saturating_sub(step)
+                    .max(super::DETAIL_PCT_MIN);
+                true
+            }
+            KeyCode::Tab => false,
+            _ => true,
+        }
     }
 }

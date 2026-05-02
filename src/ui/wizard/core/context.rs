@@ -275,8 +275,7 @@ impl WizardContext {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
             .await
             .ok();
-        let nvidia_toolkit_installed =
-            crate::nspawn::platform::nvidia::nvidia_ctk_available();
+        let nvidia_toolkit_installed = crate::nspawn::platform::nvidia::nvidia_ctk_available();
         let wayland_sockets =
             crate::nspawn::platform::capabilities::scan_available_wayland_sockets().await;
 

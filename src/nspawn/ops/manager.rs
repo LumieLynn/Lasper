@@ -186,11 +186,10 @@ impl NspawnManager for DefaultManager {
             name
         ))
         .await;
-        let _ =
-            tokio::fs::remove_file(crate::nspawn::platform::nvidia::state::get_state_dir().join(
-                format!("{}.json", name),
-            ))
-            .await;
+        let _ = tokio::fs::remove_file(
+            crate::nspawn::platform::nvidia::state::get_state_dir().join(format!("{}.json", name)),
+        )
+        .await;
 
         result
     }
