@@ -231,8 +231,8 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
 
     let scrollbar = Scrollbar::default()
         .orientation(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(Some("↑"))
-        .end_symbol(Some("↓"));
+        .begin_symbol(Some("▲"))
+        .end_symbol(Some("▼"));
 
     let scrollbar_area = Rect {
         x: area.x,

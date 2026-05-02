@@ -66,6 +66,28 @@ impl DefaultManager {
     }
 }
 
+/// Try DBus first, then fall back to CLI with consistent logging and error reporting.
+macro_rules! fallback_to_cli {
+    ($self:ident, $method:ident, $name:expr $(, $arg:expr)*) => {{
+        if $self.dbus.is_available().await {
+            match $self.dbus.$method($name, $($arg),*).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    log::warn!("DBus {} failed, falling back to CLI: {}", stringify!($method), e);
+                    $self.mark_fallback(&format!("{}", e));
+                }
+            }
+        } else {
+            log::warn!("DBus not available for {}, falling back to CLI", stringify!($method));
+            $self.mark_fallback("DBus not available");
+        }
+        $self.cli.$method($name, $($arg),*).await.map_err(|e| {
+            log::error!("CLI {} failed for {}: {}", stringify!($method), $name, e);
+            e
+        })
+    }};
+}
+
 #[async_trait]
 impl NspawnManager for DefaultManager {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
@@ -93,83 +115,22 @@ impl NspawnManager for DefaultManager {
     async fn start(&self, name: &str) -> Result<()> {
         self.require_root()?;
         self._ensure_gpu_passthrough(name).await?;
-
-        if self.dbus.is_available().await {
-            match self.dbus.start(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus start failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for start, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.start(name).await.map_err(|e| {
-            log::error!("CLI start failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, start, name)
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.terminate(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus terminate failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for terminate, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.terminate(name).await.map_err(|e| {
-            log::error!("CLI terminate failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, terminate, name)
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.poweroff(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus poweroff failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for poweroff, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.poweroff(name).await.map_err(|e| {
-            log::error!("CLI poweroff failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, poweroff, name)
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.reboot(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus reboot failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for reboot, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.reboot(name).await.map_err(|e| {
-            log::error!("CLI reboot failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, reboot, name)
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
@@ -190,22 +151,7 @@ impl NspawnManager for DefaultManager {
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.kill(name, signal).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus kill failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for kill, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.kill(name, signal).await.map_err(|e| {
-            log::error!("CLI kill failed for {} (signal {}): {}", name, signal, e);
-            e
-        })
+        fallback_to_cli!(self, kill, name, signal)
     }
 
     async fn remove(&self, name: &str) -> Result<()> {

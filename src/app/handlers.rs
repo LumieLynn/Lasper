@@ -290,7 +290,7 @@ impl App {
             return;
         }
 
-        let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
+        let nvidia_installed = crate::nspawn::platform::nvidia::nvidia_ctk_available();
         if let Some(tx) = &self.ui.backend_tx {
             self.ui.wizard = Some(
                 crate::ui::wizard::Wizard::new(

@@ -253,7 +253,7 @@ impl DbusProvider for DefaultDbusProvider {
 
         // 1) Try machine1 properties (only works for running/registered machines)
         if let Ok(m1_props) = get_machine1_properties(&conn, name).await {
-            let group = props.get_group_mut("Machine");
+            let group = props.get_group_mut(crate::nspawn::models::GROUP_MACHINE);
             for (k, v) in m1_props {
                 group.insert(k, v);
             }
@@ -274,10 +274,10 @@ impl DbusProvider for DefaultDbusProvider {
                         | "ConflictedBy"
                 ) {
                     if !v.is_empty() && v != "[]" {
-                        props.insert("Dependencies", k, v);
+                        props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, k, v);
                     }
                 } else {
-                    props.insert("Systemd Unit", k, v);
+                    props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, k, v);
                 }
             }
         }

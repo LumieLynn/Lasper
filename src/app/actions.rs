@@ -70,30 +70,30 @@ impl App {
                     Ok(mut p) => {
                         if !entry.all_addresses.is_empty() {
                             p.insert(
-                                "Machine",
+                                crate::nspawn::models::GROUP_MACHINE,
                                 "IPAddresses".into(),
                                 entry.all_addresses.join(", "),
                             );
                         }
-                        if let Some(ufs) = p.get_group_mut("Systemd Unit").get("UnitFileState") {
+                        if let Some(ufs) = p.get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT).get("UnitFileState") {
                             let ufs = ufs.clone();
-                            p.insert("Systemd Unit", "Enabled".into(), ufs);
+                            p.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, "Enabled".into(), ufs);
                         }
                         // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
                         if let Some(image_type) = &entry.image_type {
-                            if let Some(machine_type) = p.get_group_mut("Machine").remove("Type") {
-                                p.insert("Machine", "Class".into(), machine_type);
+                            if let Some(machine_type) = p.get_group_mut(crate::nspawn::models::GROUP_MACHINE).remove("Type") {
+                                p.insert(crate::nspawn::models::GROUP_MACHINE, "Class".into(), machine_type);
                             }
-                            p.insert("Machine", "Type".into(), image_type.clone());
+                            p.insert(crate::nspawn::models::GROUP_MACHINE, "Type".into(), image_type.clone());
                         }
 
                         // For stopped containers, manually ensure expected static fields
                         if !entry.state.is_running() {
-                            p.insert("Machine", "ReadOnly".into(), entry.readonly.to_string());
+                            p.insert(crate::nspawn::models::GROUP_MACHINE, "ReadOnly".into(), entry.readonly.to_string());
                             if let Some(u) = &entry.usage {
-                                p.insert("Machine", "Usage".into(), u.clone());
+                                p.insert(crate::nspawn::models::GROUP_MACHINE, "Usage".into(), u.clone());
                             }
-                            p.insert("Machine", "State".into(), entry.state.label().into());
+                            p.insert(crate::nspawn::models::GROUP_MACHINE, "State".into(), entry.state.label().into());
                         }
 
                         self.data.properties = Ok(p);
