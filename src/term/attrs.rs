@@ -11,71 +11,71 @@ const TEXT_MODE_INVERSE: u8 = 0b0000_1000;
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Attrs {
-  pub fgcolor: Color,
-  pub bgcolor: Color,
-  pub mode: u8,
+    pub fgcolor: Color,
+    pub bgcolor: Color,
+    pub mode: u8,
 }
 
 impl Attrs {
-  pub fn fg(&mut self, color: Color) -> Self {
-    self.fgcolor = color;
-    *self
-  }
-
-  pub fn bg(&mut self, color: Color) -> Self {
-    self.bgcolor = color;
-    *self
-  }
-
-  pub fn bold(&self) -> bool {
-    self.mode & TEXT_MODE_BOLD != 0
-  }
-
-  pub fn set_bold(&mut self, bold: bool) -> Self {
-    if bold {
-      self.mode |= TEXT_MODE_BOLD;
-    } else {
-      self.mode &= !TEXT_MODE_BOLD;
+    pub fn fg(&mut self, color: Color) -> Self {
+        self.fgcolor = color;
+        *self
     }
-    *self
-  }
 
-  pub fn italic(&self) -> bool {
-    self.mode & TEXT_MODE_ITALIC != 0
-  }
-
-  pub fn set_italic(&mut self, italic: bool) -> Self {
-    if italic {
-      self.mode |= TEXT_MODE_ITALIC;
-    } else {
-      self.mode &= !TEXT_MODE_ITALIC;
+    pub fn bg(&mut self, color: Color) -> Self {
+        self.bgcolor = color;
+        *self
     }
-    *self
-  }
 
-  pub fn underline(&self) -> bool {
-    self.mode & TEXT_MODE_UNDERLINE != 0
-  }
-
-  pub fn set_underline(&mut self, underline: bool) -> Self {
-    if underline {
-      self.mode |= TEXT_MODE_UNDERLINE;
-    } else {
-      self.mode &= !TEXT_MODE_UNDERLINE;
+    pub fn bold(&self) -> bool {
+        self.mode & TEXT_MODE_BOLD != 0
     }
-    *self
-  }
 
-  pub fn inverse(&self) -> bool {
-    self.mode & TEXT_MODE_INVERSE != 0
-  }
-
-  pub fn set_inverse(&mut self, inverse: bool) -> Self {
-    if inverse {
-      self.mode |= TEXT_MODE_INVERSE;
-    } else {
-      self.mode &= !TEXT_MODE_INVERSE;
+    pub fn set_bold(&mut self, bold: bool) -> Self {
+        if bold {
+            self.mode |= TEXT_MODE_BOLD;
+        } else {
+            self.mode &= !TEXT_MODE_BOLD;
+        }
+        *self
     }
-    *self
-  }
+
+    pub fn italic(&self) -> bool {
+        self.mode & TEXT_MODE_ITALIC != 0
+    }
+
+    pub fn set_italic(&mut self, italic: bool) -> Self {
+        if italic {
+            self.mode |= TEXT_MODE_ITALIC;
+        } else {
+            self.mode &= !TEXT_MODE_ITALIC;
+        }
+        *self
+    }
+
+    pub fn underline(&self) -> bool {
+        self.mode & TEXT_MODE_UNDERLINE != 0
+    }
+
+    pub fn set_underline(&mut self, underline: bool) -> Self {
+        if underline {
+            self.mode |= TEXT_MODE_UNDERLINE;
+        } else {
+            self.mode &= !TEXT_MODE_UNDERLINE;
+        }
+        *self
+    }
+
+    pub fn inverse(&self) -> bool {
+        self.mode & TEXT_MODE_INVERSE != 0
+    }
+
+    pub fn set_inverse(&mut self, inverse: bool) -> Self {
+        if inverse {
+            self.mode |= TEXT_MODE_INVERSE;
+        } else {
+            self.mode &= !TEXT_MODE_INVERSE;
+        }
+        *self
+    }
 }

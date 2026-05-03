@@ -112,10 +112,13 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     let list_area = cols[0];
     let right_area = cols[1];
 
+    let maximized = app.data.terminal.is_showing() && app.data.terminal.maximized;
     let detail_pct = app.ui.detail_pct;
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if app.data.terminal.is_showing() {
+        .constraints(if maximized {
+            vec![Constraint::Percentage(100)]
+        } else if app.data.terminal.is_showing() {
             vec![
                 Constraint::Percentage(detail_pct),
                 Constraint::Percentage(100u16.saturating_sub(detail_pct)),
@@ -131,7 +134,11 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
 
     if app.data.terminal.is_showing() {
-        let terminal_area = right_chunks[1];
+        let terminal_area = if maximized {
+            right_chunks[0]
+        } else {
+            right_chunks[1]
+        };
         let active_idx = app.data.terminal.active_idx;
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
         terminal_panel.render(
@@ -151,9 +158,11 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         app.is_root,
         list_focused,
     );
-    app.ui
-        .detail_panel
-        .render_with_data(f, detail_area, &mut app.data);
+    if !maximized {
+        app.ui
+            .detail_panel
+            .render_with_data(f, detail_area, &mut app.data);
+    }
 }
 
 // Status bar
@@ -238,11 +247,18 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         hspan(" switch tabs"),
                     ])
                 } else {
+                    let t_label = if app.data.terminal.maximized {
+                        " restore split "
+                    } else {
+                        " maximize "
+                    };
                     Line::from(vec![
                         kspan("[i/⏎/Alt+x]"),
                         hspan(" insert mode "),
                         kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs "),
+                        kspan("[T]"),
+                        hspan(t_label),
                         kspan("[t]"),
                         hspan(" hide "),
                         kspan("[x]"),

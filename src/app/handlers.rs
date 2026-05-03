@@ -247,6 +247,12 @@ impl App {
                 self.toggle_terminal();
                 true
             }
+            KeyCode::Char('T') => {
+                if self.data.terminal.is_showing() {
+                    self.data.terminal.maximized = !self.data.terminal.maximized;
+                }
+                true
+            }
             KeyCode::Char('D') => {
                 self.show_delete_dialog();
                 true

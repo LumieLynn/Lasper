@@ -7,8 +7,7 @@ use std::sync::Arc;
 
 pub struct TerminalSession {
     pub container_name: String,
-    pub terminal:
-        Arc<parking_lot::Mutex<crate::term::Parser>>,
+    pub terminal: Arc<parking_lot::Mutex<crate::term::Parser>>,
     pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
     pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
     pub scroll_offset: usize,
@@ -20,6 +19,7 @@ pub struct TerminalManager {
     pub sessions: Vec<TerminalSession>,
     pub active_idx: usize,
     pub show: bool,
+    pub maximized: bool,
 }
 
 impl TerminalManager {
@@ -28,6 +28,7 @@ impl TerminalManager {
             sessions: Vec::new(),
             active_idx: 0,
             show: false,
+            maximized: false,
         }
     }
 
@@ -100,6 +101,7 @@ impl TerminalManager {
     pub fn close_active(&mut self) {
         if self.sessions.is_empty() {
             self.show = false;
+            self.maximized = false;
             return;
         }
 
@@ -112,6 +114,7 @@ impl TerminalManager {
 
         if self.sessions.is_empty() {
             self.show = false;
+            self.maximized = false;
         }
     }
 
@@ -126,6 +129,7 @@ impl TerminalManager {
             self.active_idx = idx;
         } else {
             self.show = false;
+            self.maximized = false;
         }
     }
 
@@ -135,6 +139,7 @@ impl TerminalManager {
             session.handle.abort();
         }
         self.show = false;
+        self.maximized = false;
     }
 
     // key dispatch
@@ -282,6 +287,7 @@ impl TerminalManager {
                 | KeyCode::Char('q')
                 | KeyCode::Char('?')
                 | KeyCode::Char('t')
+                | KeyCode::Char('T')
                 | KeyCode::Char('R') => TerminalKeyOutcome::PassThrough,
 
                 _ => TerminalKeyOutcome::Consumed,
