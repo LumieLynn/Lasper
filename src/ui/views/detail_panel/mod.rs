@@ -87,13 +87,16 @@ impl DetailPanel {
         self.focused = focused;
     }
 
-    pub fn render_with_data(&mut self, f: &mut Frame, area: Rect, data: &mut AppData) {
+    pub fn render_with_data(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        data: &mut AppData,
+        resize_mode: bool,
+    ) {
         // Border
-        let border_color = if self.focused {
-            Color::Cyan
-        } else {
-            Color::DarkGray
-        };
+        let border_color =
+            crate::ui::panel_border_color(resize_mode, self.focused, Color::DarkGray);
 
         let tabs_line = self.get_tabs_line(data);
 
@@ -209,7 +212,7 @@ impl DetailPanel {
         let step = self.page_step();
 
         match key.code {
-            // ─── Pane switching ────────────────────────────────────────────
+            // Pane switching
             KeyCode::Char('[') => {
                 let next = self.active_pane.prev();
                 return self.switch_pane(next);
@@ -228,7 +231,7 @@ impl DetailPanel {
                 }
             }
 
-            // ─── Detail scrolling ──────────────────────────────────────────
+            // Detail scrolling
             _ if self.active_pane == DetailPane::Logs => {
                 handle_nav!(self, log_scroll, self.logs_len, step, self.pane_height, key);
             }

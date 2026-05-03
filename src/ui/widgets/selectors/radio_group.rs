@@ -2,7 +2,7 @@ use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
@@ -53,13 +53,7 @@ impl RadioGroup {
 
 impl Component for RadioGroup {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        let style = if !self.enabled {
-            Style::default().fg(Color::DarkGray)
-        } else if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = Style::default().fg(crate::ui::widget_border_color(self.focused, self.enabled));
 
         let mut spans = vec![];
         for (i, opt) in self.options.iter().enumerate() {

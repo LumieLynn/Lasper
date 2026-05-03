@@ -1,5 +1,7 @@
 //! UI module containing layout and widget rendering logic.
 
+use ratatui::style::Color;
+
 /// Severity level for status messages shown in the UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StatusLevel {
@@ -7,6 +9,24 @@ pub enum StatusLevel {
     Success,
     Warn,
     Error,
+}
+
+/// Border color for top-level panels (container list, detail, terminal).
+pub fn panel_border_color(resize_mode: bool, focused: bool, unfocused: Color) -> Color {
+    if resize_mode {
+        if focused { Color::Yellow } else { Color::Rgb(180, 140, 0) }
+    } else if focused {
+        Color::Cyan
+    } else {
+        unfocused
+    }
+}
+
+/// Border color for inner widgets (selectable lists, checklists, inputs).
+pub fn widget_border_color(focused: bool, enabled: bool) -> Color {
+    if !enabled { Color::DarkGray }
+    else if focused { Color::Cyan }
+    else { Color::White }
 }
 
 pub mod core;

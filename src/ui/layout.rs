@@ -97,6 +97,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
     let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
     let terminal_focused = app.ui.active_panel == crate::app::ActivePanel::TerminalPanel;
+    let resize_mode = app.ui.resize_mode == crate::app::ResizeMode::Active;
 
     app.ui.detail_panel.set_focus(detail_focused);
 
@@ -147,6 +148,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
             &mut app.data.terminal.sessions,
             active_idx,
             terminal_focused,
+            resize_mode,
         );
     }
 
@@ -157,11 +159,12 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         app.data.selected,
         app.is_root,
         list_focused,
+        resize_mode,
     );
     if !maximized {
         app.ui
             .detail_panel
-            .render_with_data(f, detail_area, &mut app.data);
+            .render_with_data(f, detail_area, &mut app.data, resize_mode);
     }
 }
 

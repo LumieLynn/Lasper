@@ -28,15 +28,16 @@ impl ContainerListComponent {
         area: Rect,
         entries: &[ContainerEntry],
         selected: usize,
-        _is_root: bool, // is_root was used for hint, keeping it in signature for now
+        _is_root: bool,
         focused: bool,
+        resize_mode: bool,
     ) {
         // Sync state from background data
         self.list.select(selected);
         self.list.set_focus(focused);
 
         // Zero-copy rendering
-        self.list.render(f, area, entries);
+        self.list.render(f, area, entries, resize_mode);
 
         if entries.is_empty() {
             // Hint logic (simplified for now but preserving the spirit)

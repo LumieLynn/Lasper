@@ -38,14 +38,10 @@ impl PasswordBox {
 
 impl Component for PasswordBox {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        let style = if !self.base.enabled {
-            Style::default().fg(Color::DarkGray)
-        } else if self.base.error_msg.is_some() {
+        let style = if self.base.error_msg.is_some() {
             Style::default().fg(Color::Red)
-        } else if self.base.focused {
-            Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::ui::widget_border_color(self.base.focused, self.base.enabled))
         };
 
         let title = if let Some(err) = &self.base.error_msg {

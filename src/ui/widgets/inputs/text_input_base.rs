@@ -29,14 +29,10 @@ impl TextInputBase {
     }
 
     pub fn render_base(&mut self, f: &mut Frame, area: Rect) {
-        let style = if !self.enabled {
-            Style::default().fg(Color::DarkGray)
-        } else if self.error_msg.is_some() {
+        let style = if self.error_msg.is_some() {
             Style::default().fg(Color::Red)
-        } else if self.focused {
-            Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(crate::ui::widget_border_color(self.focused, self.enabled))
         };
 
         let mut title = self.label.clone();
