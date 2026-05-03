@@ -44,6 +44,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(dialog) = &mut app.ui.delete_dialog {
         dialog.render(f, area);
     }
+    if let Some(dialog) = &mut app.ui.active_dialog {
+        dialog.render(f, area);
+    }
 }
 
 // Title

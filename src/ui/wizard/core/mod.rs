@@ -1,28 +1,6 @@
 pub mod context;
 pub mod manager;
 
-use crate::ui::core::Component;
-use ratatui::widgets::{Block, Borders, Clear};
-use ratatui::Frame;
-
-/// Renders an editor overlay centered on the screen.
-pub fn render_editor_overlay(
-    f: &mut Frame,
-    title: &str,
-    width_pct: u16,
-    height_pct: u16,
-    editor: &mut dyn Component,
-) {
-    let area = crate::ui::centered_rect(width_pct, height_pct, f.area());
-    f.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" {} ", title));
-    let inner_area = block.inner(area);
-    f.render_widget(block, area);
-    editor.render(f, inner_area);
-}
-
 #[macro_export]
 macro_rules! impl_wizard_nav {
     ($name:ident, $comps_macro:ident) => {

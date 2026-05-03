@@ -7,6 +7,8 @@ use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
 
@@ -85,10 +87,73 @@ impl BindMountBox {
         self.focus.prev(&comps);
         self.update_focus();
     }
+
+    pub fn with_mount(mut self, bm: &BindMount) -> Self {
+        self.source_path = PathBox::new("Source Path", bm.source.clone()).with_validator(|v| {
+            let path = std::path::Path::new(v.trim());
+            if v.trim().is_empty() {
+                return Err("Path required".into());
+            }
+            if !path.is_absolute() {
+                return Err("Must be absolute path".into());
+            }
+            if !path.exists() {
+                return Err("Path does not exist".into());
+            }
+            Ok(())
+        });
+        self.target_path = PathBox::new("Target Path (optional)", bm.target.clone())
+            .with_validator(|v| {
+                let trimmed = v.trim();
+                if trimmed.is_empty() {
+                    return Ok(());
+                }
+                if !std::path::Path::new(trimmed).is_absolute() {
+                    return Err("Must be absolute path".into());
+                }
+                Ok(())
+            });
+        self.readonly = Checkbox::new("Read Only", bm.readonly);
+        self.update_focus();
+        self
+    }
+
+    fn try_submit(&mut self) -> Option<AppMessage> {
+        let mut valid = true;
+        if self.source_path.validate().is_err() {
+            valid = false;
+        }
+        if self.target_path.validate().is_err() {
+            valid = false;
+        }
+        if !valid {
+            return None;
+        }
+        let source = self.source_path.value().trim().to_string();
+        let mut target = self.target_path.value().trim().to_string();
+        if target.is_empty() {
+            target = source.clone();
+        }
+        Some((self.on_submit)(BindMount {
+            source,
+            target,
+            readonly: self.readonly.checked(),
+        }))
+    }
 }
 
 impl Component for BindMountBox {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let dialog_area = crate::ui::centered_rect(45, 45, area);
+        f.render_widget(Clear, dialog_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Add Bind Mount ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(dialog_area);
+        f.render_widget(block, dialog_area);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -98,7 +163,7 @@ impl Component for BindMountBox {
                 Constraint::Min(0),
                 Constraint::Length(3),
             ])
-            .split(area);
+            .split(inner);
 
         self.source_path.render(f, chunks[0]);
         self.target_path.render(f, chunks[1]);
@@ -126,66 +191,26 @@ impl Component for BindMountBox {
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
-                let mut valid = true;
-                if self.source_path.validate().is_err() {
-                    valid = false;
-                }
-                if self.target_path.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let source = self.source_path.value().trim().to_string();
-                let mut target = self.target_path.value().trim().to_string();
-                if target.is_empty() {
-                    target = source.clone();
-                }
-                let readonly = self.readonly.checked();
-
-                return EventResult::Message((self.on_submit)(BindMount {
-                    source,
-                    target,
-                    readonly,
-                }));
+                return if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
+                };
             }
             _ => {}
         }
 
         let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
-
         match res {
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
-                let mut valid = true;
-                if self.source_path.validate().is_err() {
-                    valid = false;
+                if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
                 }
-                if self.target_path.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let source = self.source_path.value().trim().to_string();
-                let mut target = self.target_path.value().trim().to_string();
-                if target.is_empty() {
-                    target = source.clone();
-                }
-                let readonly = self.readonly.checked();
-
-                EventResult::Message((self.on_submit)(BindMount {
-                    source,
-                    target,
-                    readonly,
-                }))
             }
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
-            }
-
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => res,
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed

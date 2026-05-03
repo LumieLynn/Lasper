@@ -30,6 +30,11 @@ impl App {
             return;
         }
 
+        // Layer 2.5 – active dialog (modal, blocks everything below)
+        if self.handle_dialog_key(key).await {
+            return;
+        }
+
         // Layer 2 – terminal panel when it owns focus
         if self.ui.active_panel == ActivePanel::TerminalPanel
             && self.handle_terminal_focused_key(key).await
@@ -142,6 +147,12 @@ impl App {
                         self.set_status(msg, level);
                     }
                     WizardAction::Next | WizardAction::Prev => {}
+                    WizardAction::OpenDialog(dialog) => {
+                        self.ui.active_dialog = Some(dialog);
+                    }
+                    WizardAction::CloseDialog => {
+                        self.ui.active_dialog = None;
+                    }
                 }
             } else {
                 self.ui.show_wizard = false;
@@ -428,6 +439,41 @@ impl App {
             }
             KeyCode::Tab => false,
             _ => true,
+        }
+    }
+
+    async fn handle_dialog_key(&mut self, key: KeyEvent) -> bool {
+        if self.ui.active_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.ui.active_dialog = None;
+                true
+            }
+            _ => {
+                let mut dialog = self.ui.active_dialog.take().unwrap();
+                let result = dialog.handle_key(key);
+                match result {
+                    EventResult::Message(msg) => {
+                        let mut close = false;
+                        if let Some(wizard) = &mut self.ui.wizard {
+                            let action = wizard.process_message(msg);
+                            if matches!(action, crate::ui::wizard::StepAction::CloseDialog) {
+                                close = true;
+                            }
+                        }
+                        if close {
+                            self.ui.active_dialog = None;
+                        }
+                        true
+                    }
+                    _ => {
+                        self.ui.active_dialog = Some(dialog);
+                        true
+                    }
+                }
+            }
         }
     }
 }

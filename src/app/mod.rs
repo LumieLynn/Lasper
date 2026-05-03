@@ -13,6 +13,7 @@ use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
 };
+use crate::ui::core::Component;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
@@ -60,6 +61,7 @@ pub struct AppUi {
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
     pub delete_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
+    pub active_dialog: Option<Box<dyn Component>>,
 
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
@@ -84,6 +86,7 @@ impl AppUi {
             app_tx: None,
             quit_dialog: None,
             delete_dialog: None,
+            active_dialog: None,
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
             detail_pct: 60,

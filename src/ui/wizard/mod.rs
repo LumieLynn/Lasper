@@ -20,14 +20,14 @@ pub enum WizardStep {
     Deploy,
 }
 
-#[derive(Debug, Clone, PartialEq)]
 pub enum StepAction {
     None,
     Next,
     Prev,
     Close,
-    /// Display a status message in the application status bar.
     Status(String, crate::ui::StatusLevel),
+    OpenDialog(Box<dyn crate::ui::core::Component>),
+    CloseDialog,
 }
 
 impl WizardStep {

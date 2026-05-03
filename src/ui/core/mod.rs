@@ -14,13 +14,23 @@ pub enum WizardMessage {
     DialogSubmit,
     DialogCancel,
 
+    // Dialog open requests (add = blank, edit = pre-filled)
+    OpenUserDialog,
+    OpenUserEditDialog(usize, crate::nspawn::models::CreateUser),
+    OpenPortDialog,
+    OpenPortEditDialog(usize, crate::nspawn::models::PortForward),
+    OpenBindDialog,
+    OpenBindEditDialog(usize, crate::nspawn::models::BindMount),
+
     // Macro-events for atomic data changes
     UserAdded(crate::nspawn::models::CreateUser),
     UserUpdated(usize, crate::nspawn::models::CreateUser),
     UserRemoved(usize),
     PortForwardAdded(crate::nspawn::models::PortForward),
+    PortForwardUpdated(usize, crate::nspawn::models::PortForward),
     PortForwardRemoved(usize),
     BindMountAdded(crate::nspawn::models::BindMount),
+    BindMountUpdated(usize, crate::nspawn::models::BindMount),
     BindMountRemoved(usize),
 }
 
