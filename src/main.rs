@@ -10,6 +10,7 @@ use std::io;
 mod app;
 mod events;
 mod nspawn;
+mod term;
 mod ui;
 
 use std::env;

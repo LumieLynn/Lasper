@@ -81,6 +81,10 @@ It's recommended to use `machinectl` to connect to the container after creation 
 - [ ] Customizable post-deployment hooks and scripts.
 - [ ] Customizable deployment scripts.
 
+## Credits
+
+The terminal emulator in `src/term/` is ported from [mprocs](https://github.com/pvolok/mprocs) by Pavel Volokitin (MIT license).
+
 ## License
 
 GPL V2

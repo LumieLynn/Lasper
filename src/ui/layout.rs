@@ -132,12 +132,13 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     if app.data.terminal.is_showing() {
         let terminal_area = right_chunks[1];
+        let active_idx = app.data.terminal.active_idx;
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
         terminal_panel.render(
             f,
             terminal_area,
-            &app.data.terminal.sessions,
-            app.data.terminal.active_idx,
+            &mut app.data.terminal.sessions,
+            active_idx,
             terminal_focused,
         );
     }

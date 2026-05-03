@@ -8,7 +8,7 @@ use std::sync::Arc;
 pub struct TerminalSession {
     pub container_name: String,
     pub terminal:
-        Arc<parking_lot::Mutex<vt100::Parser<crate::nspawn::adapters::comm::pty::PtyReply>>>,
+        Arc<parking_lot::Mutex<crate::term::Parser>>,
     pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
     pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
     pub scroll_offset: usize,
