@@ -59,8 +59,8 @@ pub struct AppUi {
     pub status_expiry: Option<Instant>,
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
-    pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
-    pub delete_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
+    pub quit_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
+    pub delete_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
     pub active_dialog: Option<Box<dyn Component>>,
 
     pub resize_mode: ResizeMode,

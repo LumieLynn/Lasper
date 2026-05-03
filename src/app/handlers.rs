@@ -204,7 +204,7 @@ impl App {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.data.terminal.sessions.is_empty() {
                     self.ui.quit_dialog =
-                        Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+                        Some(crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
                             "Quit Lasper?",
                             "Active terminal sessions are still running.\nQuit and terminate all logins?",
                         ));
@@ -374,7 +374,7 @@ impl App {
             );
             return;
         }
-        self.ui.delete_dialog = Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+        self.ui.delete_dialog = Some(crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
             "Delete Container",
             format!(
                 "Delete '{}' and all its data?\nThis cannot be undone.",

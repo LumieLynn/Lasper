@@ -1,7 +1,6 @@
-pub mod confirmation;
 pub mod power_menu;
 
-pub mod composites;
+pub mod dialogs;
 pub mod display;
 pub mod inputs;
 pub mod lists;
