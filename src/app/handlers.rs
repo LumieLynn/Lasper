@@ -334,16 +334,21 @@ impl App {
 
         let nvidia_installed = crate::nspawn::platform::nvidia::nvidia_ctk_available();
         if let Some(tx) = &self.ui.backend_tx {
-            self.ui.wizard = Some(
-                crate::ui::wizard::Wizard::new(
-                    self.data.entries.clone(),
-                    nvidia_installed,
-                    tx.clone(),
-                )
-                .await,
-            );
+            let mut wizard = crate::ui::wizard::Wizard::new(
+                self.data.entries.clone(),
+                nvidia_installed,
+                tx.clone(),
+            )
+            .await;
+
+            if nvidia_installed {
+                let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
+            } else {
+                wizard.context.passthrough.hardware_scanning = false;
+            }
+
+            self.ui.wizard = Some(wizard);
             self.ui.show_wizard = true;
-            let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
         }
     }
 
