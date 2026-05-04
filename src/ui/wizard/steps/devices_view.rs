@@ -1,10 +1,9 @@
-use crate::nspawn::models::BindMount;
+use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
-use crate::ui::widgets::composites::bind_mount::BindMountBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
-use crate::ui::wizard::core::render_editor_overlay;
 use crate::ui::wizard::steps::StepComponent;
+use crate::ui::wizard::StepAction;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -16,7 +15,6 @@ use ratatui::{
 
 pub struct DevicesStepView {
     bind_list: EditableList<BindMount>,
-    bind_editor: Option<BindMountBox>,
     nvidia_enabled: bool,
 }
 
@@ -27,17 +25,22 @@ impl DevicesStepView {
                 " Configured Bind Mounts ",
                 initial_data.bind_mounts.clone(),
                 |bm| {
+                    let suffix_display = if bm.suffix == IdmapSuffix::None {
+                        String::new()
+                    } else {
+                        format!(" [{}]", bm.suffix.label())
+                    };
                     format!(
-                        "  {}:{} ({})",
+                        "  {}:{} ({}){}",
                         bm.source,
                         bm.target,
-                        if bm.readonly { "ro" } else { "rw" }
+                        if bm.readonly { "ro" } else { "rw" },
+                        suffix_display
                     )
                 },
                 |idx| AppMessage::Wizard(WizardMessage::BindMountRemoved(idx)),
             ),
 
-            bind_editor: None,
             nvidia_enabled: initial_data.nvidia_gpu,
         }
     }
@@ -45,11 +48,6 @@ impl DevicesStepView {
 
 impl Component for DevicesStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        if let Some(editor) = &mut self.bind_editor {
-            render_editor_overlay(f, "Add Bind Mount", 60, 60, editor);
-            return;
-        }
-
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
@@ -70,7 +68,7 @@ impl Component for DevicesStepView {
         self.bind_list.set_focus(true);
         self.bind_list.render(f, chunks[1]);
 
-        let footer = " [A]dd mount, [D]elete mount, [Enter] next ";
+        let footer = " [A]dd mount, [E]dit mount, [D]elete mount, [Enter] next ";
         f.render_widget(
             Paragraph::new(footer).style(Style::default().fg(Color::Yellow)),
             chunks[2],
@@ -78,34 +76,17 @@ impl Component for DevicesStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if let Some(editor) = &mut self.bind_editor {
-            if key.code == KeyCode::Esc {
-                self.bind_editor = None;
-                return EventResult::Consumed;
-            }
-            let res = editor.handle_key(key);
-            match &res {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::BindMountAdded(bm))) => {
-                    self.bind_list.add_item(bm.clone());
-                    self.bind_editor = None;
-                }
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                    self.bind_editor = None;
-                    return EventResult::Consumed;
-                }
-                _ => {}
-            }
-            return res;
-        }
-
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.bind_editor = Some(BindMountBox::new(|bm| {
-                    AppMessage::Wizard(WizardMessage::BindMountAdded(bm))
-                }));
-
-                self.bind_editor.as_mut().unwrap().set_focus(true);
-                return EventResult::Consumed;
+                return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenBindDialog));
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                if let Some(bm) = self.bind_list.selected_item() {
+                    let idx = self.bind_list.selected();
+                    return EventResult::Message(AppMessage::Wizard(
+                        WizardMessage::OpenBindEditDialog(idx, bm.clone()),
+                    ));
+                }
             }
             _ => {}
         }
@@ -127,6 +108,21 @@ impl Component for DevicesStepView {
 }
 
 impl StepComponent for DevicesStepView {
+    fn handle_message(&mut self, msg: &AppMessage) -> StepAction {
+        match msg {
+            AppMessage::Wizard(WizardMessage::BindMountAdded(bm)) => {
+                self.bind_list.add_item(bm.clone());
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::BindMountUpdated(idx, bm)) => {
+                self.bind_list.update_item(*idx, bm.clone());
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::DialogCancel) => StepAction::CloseDialog,
+            _ => StepAction::None,
+        }
+    }
+
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.passthrough.bind_mounts = self.bind_list.items().to_vec();
     }

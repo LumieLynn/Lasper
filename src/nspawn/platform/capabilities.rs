@@ -1,5 +1,4 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::command::new_sync_command;
 use std::os::unix::fs::FileTypeExt;
 
 /// Determines the host's runtime directory (XDG_RUNTIME_DIR).
@@ -21,53 +20,6 @@ pub async fn get_xdg_runtime() -> Result<String> {
         "Could not determine host Wayland socket directory (XDG_RUNTIME_DIR or SUDO_UID missing)"
             .into(),
     ))
-}
-
-/// Checks if the host system (Kernel >= 5.12 and systemd >= 248) supports :idmap mounts.
-pub fn supports_idmap() -> bool {
-    // 1. Check systemd version
-    let systemd_ok = new_sync_command("systemd-nspawn")
-        .arg("--version")
-        .output()
-        .ok()
-        .and_then(|out| {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // Example: systemd 255 (255.4-1.fc40)
-            s.lines().next().and_then(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .and_then(|v| v.parse::<u32>().ok())
-            })
-        })
-        .map(|v| v >= 248)
-        .unwrap_or(false);
-
-    if !systemd_ok {
-        return false;
-    }
-
-    // 2. Check kernel version (uname -r)
-    new_sync_command("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .and_then(|out| {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // Example: 6.8.1-1.fc40.x86_64
-            let parts: Vec<&str> = s.split('.').collect();
-            if parts.len() >= 2 {
-                let major = parts[0].parse::<u32>().unwrap_or(0);
-                let minor = parts[1]
-                    .split('-')
-                    .next()
-                    .and_then(|v| v.parse::<u32>().ok())
-                    .unwrap_or(0);
-                Some(major > 5 || (major == 5 && minor >= 12))
-            } else {
-                None
-            }
-        })
-        .unwrap_or(false)
 }
 
 /// Scans the host's runtime directory for available Wayland sockets.

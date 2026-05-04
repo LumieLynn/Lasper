@@ -38,6 +38,7 @@ pub fn new_command(program: &str) -> tokio::process::Command {
 /// Creates a new `std::process::Command` with `LC_ALL=C` set
 /// and stdout/stderr piped by default to prevent leaking output
 /// into the TUI's raw-mode terminal.
+#[allow(dead_code)]
 pub fn new_sync_command(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     cmd.env("LC_ALL", "C");

@@ -14,19 +14,18 @@ impl TerminalPanel {
         &self,
         f: &mut Frame,
         area: Rect,
-        sessions: &[TerminalSession],
+        sessions: &mut [TerminalSession],
         active_idx: usize,
         is_focused: bool,
+        resize_mode: bool,
     ) {
         if sessions.is_empty() {
             return;
         }
 
-        let session = &sessions[active_idx];
-        let mut term = session.terminal.lock();
-
-        // Tab generation in DetailPanel style
-        let mut spans = Vec::new();
+        // Collect tab labels and session metadata before any mutable borrow.
+        let mut tab_spans = Vec::new();
+        let session_count = sessions.len();
         for (i, s) in sessions.iter().enumerate() {
             let mut style = Style::default().fg(Color::DarkGray);
             if i == active_idx {
@@ -38,14 +37,19 @@ impl TerminalPanel {
                     })
                     .add_modifier(Modifier::BOLD);
             }
-            spans.push(Span::styled(format!(" {} ", s.container_name), style));
-            if i < sessions.len() - 1 {
-                spans.push(Span::raw("-"));
+            tab_spans.push(Span::styled(format!(" {} ", s.container_name), style));
+            if i < session_count - 1 {
+                tab_spans.push(Span::raw("-"));
             }
         }
-        let tabs_line = Line::from(spans);
+        let tabs_line = Line::from(tab_spans);
 
-        let border_color = if is_focused {
+        let session = &mut sessions[active_idx];
+        let mut term = session.terminal.lock();
+
+        let border_color = if resize_mode {
+            crate::ui::panel_border_color(true, is_focused, Color::DarkGray)
+        } else if is_focused {
             if session.insert_mode {
                 Color::Green
             } else {
@@ -81,10 +85,10 @@ impl TerminalPanel {
         f.render_widget(Clear, area);
         f.render_widget(block, area);
 
-        // Dynamic resizing
+        // Resize: the new Grid handles reflow internally, so no debounce needed.
         if term_area.width > 0 && term_area.height > 0 {
-            let (rows, cols) = term.screen().size();
-            if term_area.width != cols || term_area.height != rows {
+            let size = term.screen().size();
+            if term_area.width != size.width || term_area.height != size.height {
                 term.set_size(term_area.height, term_area.width);
                 let _ = session.pty_tx.try_send(
                     crate::nspawn::adapters::comm::pty::PtyMessage::Resize {
@@ -104,13 +108,13 @@ impl TerminalPanel {
         let max_scroll = screen_probe.scrollback();
 
         screen.set_scrollback(session.scroll_offset.min(max_scroll));
-        let (rows, cols) = screen.size();
+        let size = screen.size();
 
-        for row in 0..rows {
+        for row in 0..size.height {
             if row >= term_area.height {
                 break;
             }
-            for col in 0..cols {
+            for col in 0..size.width {
                 if col >= term_area.width {
                     break;
                 }
@@ -135,33 +139,34 @@ impl TerminalPanel {
         }
     }
 
-    fn get_cell_style(&self, cell: &vt100::Cell) -> Style {
+    fn get_cell_style(&self, cell: &crate::term::Cell) -> Style {
         let mut style = Style::default();
+        let attrs = cell.attrs();
 
-        style = style.fg(self.map_color(cell.fgcolor()));
-        style = style.bg(self.map_color(cell.bgcolor()));
+        style = style.fg(self.map_color(attrs.fgcolor));
+        style = style.bg(self.map_color(attrs.bgcolor));
 
-        if cell.bold() {
+        if attrs.bold() {
             style = style.add_modifier(Modifier::BOLD);
         }
-        if cell.italic() {
+        if attrs.italic() {
             style = style.add_modifier(Modifier::ITALIC);
         }
-        if cell.underline() {
+        if attrs.underline() {
             style = style.add_modifier(Modifier::UNDERLINED);
         }
-        if cell.inverse() {
+        if attrs.inverse() {
             style = style.add_modifier(Modifier::REVERSED);
         }
 
         style
     }
 
-    fn map_color(&self, color: vt100::Color) -> Color {
+    fn map_color(&self, color: crate::term::Color) -> Color {
         match color {
-            vt100::Color::Default => Color::Reset,
-            vt100::Color::Idx(i) => Color::Indexed(i),
-            vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+            crate::term::Color::Default => Color::Reset,
+            crate::term::Color::Idx(i) => Color::Indexed(i),
+            crate::term::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
         }
     }
 }

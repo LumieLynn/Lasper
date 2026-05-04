@@ -58,6 +58,7 @@ pub struct PassthroughConfig {
     pub bind_mounts: Vec<BindMount>,
     pub device_binds: Vec<String>,
     pub privileged: bool,
+    pub private_users: Option<String>,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
@@ -84,6 +85,7 @@ impl ContainerConfigBuilder {
                 bind_mounts: vec![],
                 device_binds: vec![],
                 privileged: false,
+                private_users: None,
                 graphics_acceleration: false,
                 wayland_socket: None,
                 nvidia_gpu: false,
@@ -121,6 +123,7 @@ impl ContainerConfigBuilder {
             device_binds,
             readonly_binds: vec![],
             privileged: passthrough.privileged,
+            private_users: passthrough.private_users,
             graphics_acceleration: passthrough.graphics_acceleration,
             root_password: user.root_password.clone(),
             users: user.users.clone(),
@@ -165,7 +168,7 @@ impl ContainerConfigBuilder {
             || cfg.wayland_socket.is_some()
             || cfg.graphics_acceleration
         {
-            content.push_str("\n# ── [systemd override.conf] ───────────────────────────\n");
+            content.push_str("\n#[systemd override.conf]\n");
             content.push_str(&systemd_override_content(
                 &cfg.device_binds,
                 cfg.nvidia_gpu,
@@ -297,6 +300,7 @@ mod tests {
             bind_mounts: vec![],
             device_binds: vec!["/dev/dri/card0".to_string()],
             privileged: true,
+            private_users: None,
             graphics_acceleration: true,
             wayland_socket: Some("wayland-0".to_string()),
             nvidia_gpu: true,

@@ -13,6 +13,7 @@ use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
 };
+use crate::ui::core::Component;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
@@ -29,8 +30,21 @@ pub enum ActivePanel {
     TerminalPanel,
 }
 
+/// Whether the user is in panel resize mode (toggled by `R`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ResizeMode {
+    Inactive,
+    Active,
+}
+
+pub const CONTAINER_LIST_PCT_MIN: u16 = 15;
+pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
+pub const DETAIL_PCT_MIN: u16 = 30;
+pub const DETAIL_PCT_MAX: u16 = 85;
+
 pub struct AppUi {
     pub active_panel: ActivePanel,
+    pub prev_active_panel: ActivePanel,
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
@@ -45,13 +59,20 @@ pub struct AppUi {
     pub status_expiry: Option<Instant>,
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
-    pub quit_dialog: Option<crate::ui::widgets::confirmation::ConfirmationDialog>,
+    pub quit_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
+    pub delete_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
+    pub active_dialog: Option<Box<dyn Component>>,
+
+    pub resize_mode: ResizeMode,
+    pub container_list_pct: u16,
+    pub detail_pct: u16,
 }
 
 impl AppUi {
     pub fn new(_is_root: bool) -> Self {
         Self {
             active_panel: ActivePanel::ContainerList,
+            prev_active_panel: ActivePanel::ContainerList,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
@@ -64,6 +85,11 @@ impl AppUi {
             backend_tx: None,
             app_tx: None,
             quit_dialog: None,
+            delete_dialog: None,
+            active_dialog: None,
+            resize_mode: ResizeMode::Inactive,
+            container_list_pct: 30,
+            detail_pct: 60,
         }
     }
 
@@ -72,6 +98,7 @@ impl AppUi {
             ActivePanel::ContainerList => ActivePanel::DetailPanel,
             ActivePanel::DetailPanel => {
                 if terminal_showing {
+                    self.prev_active_panel = self.active_panel.clone();
                     ActivePanel::TerminalPanel
                 } else {
                     ActivePanel::ContainerList
@@ -348,6 +375,176 @@ impl App {
                 self.ui.status_message = None;
                 self.ui.status_expiry = None;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::models::{ContainerEntry, ContainerState};
+    use std::time::{Duration, Instant};
+
+    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
+        ContainerEntry {
+            name: name.to_string(),
+            state,
+            image_type: None,
+            readonly: false,
+            usage: None,
+            address: None,
+            all_addresses: vec![],
+        }
+    }
+
+    fn make_app(is_root: bool) -> App {
+        App::new(is_root)
+    }
+
+    mod merge_transitional_states {
+        use super::*;
+
+        #[test]
+        fn adds_starting_overlay() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Off)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Starting);
+        }
+
+        #[test]
+        fn adds_exiting_overlay() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Exiting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Running)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Exiting);
+        }
+
+        #[test]
+        fn expires_stale() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (
+                    ContainerState::Starting,
+                    Instant::now() - Duration::from_secs(11),
+                ),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Off)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Off);
+            assert!(app.data.transitions.is_empty());
+        }
+
+        #[test]
+        fn removes_when_backend_resolved() {
+            let mut app = make_app(true);
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            let entries = vec![make_entry("test", ContainerState::Running)];
+            let result = app.merge_transitional_states(entries);
+
+            assert_eq!(result[0].state, ContainerState::Running);
+            assert!(app.data.transitions.is_empty());
+        }
+    }
+
+    mod select_next_prev {
+        use super::*;
+
+        #[test]
+        fn next_wraps() {
+            let mut app = make_app(true);
+            app.data.entries = vec![
+                make_entry("a", ContainerState::Off),
+                make_entry("b", ContainerState::Off),
+                make_entry("c", ContainerState::Off),
+            ];
+            app.data.selected = 2;
+
+            app.select_next();
+            assert_eq!(app.data.selected, 0);
+        }
+
+        #[test]
+        fn prev_wraps() {
+            let mut app = make_app(true);
+            app.data.entries = vec![
+                make_entry("a", ContainerState::Off),
+                make_entry("b", ContainerState::Off),
+                make_entry("c", ContainerState::Off),
+            ];
+            app.data.selected = 0;
+
+            app.select_prev();
+            assert_eq!(app.data.selected, 2);
+        }
+
+        #[test]
+        fn next_empty_no_panic() {
+            let mut app = make_app(true);
+            app.data.entries = vec![];
+            app.data.selected = 0;
+
+            app.select_next();
+        }
+
+        #[test]
+        fn prev_empty_no_panic() {
+            let mut app = make_app(true);
+            app.data.entries = vec![];
+            app.data.selected = 0;
+
+            app.select_prev();
+        }
+    }
+
+    mod action_cooldown {
+        use super::*;
+
+        #[test]
+        fn allows_first() {
+            let mut app = make_app(true);
+            assert!(app.check_action_cooldown());
+        }
+
+        #[test]
+        fn blocks_within_2s() {
+            let mut app = make_app(true);
+            assert!(app.check_action_cooldown());
+            assert!(!app.check_action_cooldown());
+        }
+    }
+
+    mod set_status {
+        use super::*;
+
+        #[test]
+        fn sets_message_and_expiry() {
+            let mut app = make_app(true);
+            app.set_status("hello".into(), crate::ui::StatusLevel::Info);
+
+            let (msg, level) = app.ui.status_message.as_ref().unwrap();
+            assert_eq!(msg, "hello");
+            assert_eq!(*level, crate::ui::StatusLevel::Info);
+            assert!(app.ui.status_expiry.is_some());
         }
     }
 }

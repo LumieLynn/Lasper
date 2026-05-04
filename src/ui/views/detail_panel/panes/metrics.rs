@@ -34,8 +34,13 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         }
     };
 
+    let horizontal = area.height < 35;
     let chunks = Layout::default()
-        .direction(Direction::Vertical)
+        .direction(if horizontal {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 

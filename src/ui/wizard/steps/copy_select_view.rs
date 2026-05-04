@@ -76,6 +76,6 @@ impl StepComponent for CopySelectStepView {
             .split(area);
 
         // Zero-copy rendering!
-        self.list.render(f, chunks[0], &context.entries);
+        self.list.render(f, chunks[0], &context.entries, false);
     }
 }

@@ -285,7 +285,7 @@ fn format_timestamp(v: &Value<'_>) -> String {
 mod tests {
     use super::*;
 
-    // ── Size formatting ───────────────────────────────────────────────────
+    // Size formatting
 
     #[test]
     fn test_format_size() {
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(format_size_value(&val), "not a number");
     }
 
-    // ── IP formatting ─────────────────────────────────────────────────────
+    // IP formatting
 
     #[test]
     fn test_format_ip_v4() {
@@ -350,7 +350,7 @@ mod tests {
         assert_eq!(format_ip_address(0, &[]), "[0 bytes]");
     }
 
-    // ── Duration formatting ───────────────────────────────────────────────
+    // Duration formatting
 
     #[test]
     fn test_format_duration_ns() {
@@ -382,7 +382,7 @@ mod tests {
         assert_eq!(format_duration_ns(&Value::Str("garbage".into())), "garbage");
     }
 
-    // ── Timestamp formatting ──────────────────────────────────────────────
+    // Timestamp formatting
 
     #[test]
     fn test_format_timestamp_zero() {
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(format_timestamp(&Value::Str("garbage".into())), "garbage");
     }
 
-    // ── Dependency filtering ──────────────────────────────────────────────
+    // Dependency filtering
 
     #[test]
     fn test_format_dependencies_filtration() {

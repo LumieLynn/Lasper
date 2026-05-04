@@ -51,6 +51,8 @@ Start the UI:
 sudo lasper
 ```
 
+Pass `--version` or `--help` for version info and usage.
+
 You can add a container via the creation wizard. Tap `a` or `n` to open the wizard.
 
 It's recommended to use `machinectl` to connect to the container after creation and starting. For example: `sudo machinectl shell <user_name>@<container_name>`. Ensure that you installed systembus and an init program inside your container.
@@ -62,9 +64,12 @@ It's recommended to use `machinectl` to connect to the container after creation 
 - `n` / `a` : Create a new container (Creation Wizard)
 - `s` : Start selected container
 - `S` : Poweroff selected container
-- `[` / `]` or `Alt + 1-5` : Switch view panes (Properties / Details / Logs / Config / Metrics)
+- `D` : Delete selected container
 - `t` : Open shell terminal (machinectl login)
-- `r` : Manual refresh data
+- `T` : Maximize terminal (when terminal is focused)
+- `r` : Manual refresh
+- `R` : Toggle panel resize mode
+- `[` / `]` or `Alt + 1-5` : Switch view panes (Properties / Details / Logs / Config / Metrics)
 - `?` : Show help
 - `q` : Quit
 - `Esc` : Back / Close Overlays
@@ -80,6 +85,10 @@ It's recommended to use `machinectl` to connect to the container after creation 
 - [ ] Better OCI import support.
 - [ ] Customizable post-deployment hooks and scripts.
 - [ ] Customizable deployment scripts.
+
+## Credits
+
+The terminal emulator in `src/term/` is ported from [mprocs](https://github.com/pvolok/mprocs) by Pavel Volokitin (MIT license).
 
 ## License
 

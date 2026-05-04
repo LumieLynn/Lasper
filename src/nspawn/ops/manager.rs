@@ -23,6 +23,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn remove(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>);
@@ -33,7 +34,7 @@ pub struct DefaultManager {
     is_root: bool,
     dbus: std::sync::Arc<dyn DbusProvider>,
     cli: std::sync::Arc<dyn CliProvider>,
-    last_fallback_reason: std::sync::Mutex<Option<String>>,
+    last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
 }
 
@@ -43,7 +44,7 @@ impl DefaultManager {
             is_root,
             dbus: std::sync::Arc::new(DefaultDbusProvider::new()),
             cli: std::sync::Arc::new(DefaultCliProvider::new(is_root)),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![PathBuf::from("/var/lib/machines")],
         }
     }
@@ -57,12 +58,34 @@ impl DefaultManager {
     }
 
     fn mark_fallback(&self, reason: &str) {
-        *self.last_fallback_reason.lock().unwrap() = Some(reason.to_string());
+        *self.last_fallback_reason.lock() = Some(reason.to_string());
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &*self.dbus).await
     }
+}
+
+/// Try DBus first, then fall back to CLI with consistent logging and error reporting.
+macro_rules! fallback_to_cli {
+    ($self:ident, $method:ident, $name:expr $(, $arg:expr)*) => {{
+        if $self.dbus.is_available().await {
+            match $self.dbus.$method($name, $($arg),*).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    log::warn!("DBus {} failed, falling back to CLI: {}", stringify!($method), e);
+                    $self.mark_fallback(&format!("{}", e));
+                }
+            }
+        } else {
+            log::warn!("DBus not available for {}, falling back to CLI", stringify!($method));
+            $self.mark_fallback("DBus not available");
+        }
+        $self.cli.$method($name, $($arg),*).await.map_err(|e| {
+            log::error!("CLI {} failed for {}: {}", stringify!($method), $name, e);
+            e
+        })
+    }};
 }
 
 #[async_trait]
@@ -92,83 +115,22 @@ impl NspawnManager for DefaultManager {
     async fn start(&self, name: &str) -> Result<()> {
         self.require_root()?;
         self._ensure_gpu_passthrough(name).await?;
-
-        if self.dbus.is_available().await {
-            match self.dbus.start(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus start failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for start, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.start(name).await.map_err(|e| {
-            log::error!("CLI start failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, start, name)
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.terminate(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus terminate failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for terminate, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.terminate(name).await.map_err(|e| {
-            log::error!("CLI terminate failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, terminate, name)
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.poweroff(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus poweroff failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for poweroff, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.poweroff(name).await.map_err(|e| {
-            log::error!("CLI poweroff failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, poweroff, name)
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.reboot(name).await {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    log::warn!("DBus reboot failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
-                }
-            }
-        } else {
-            log::warn!("DBus not available for reboot, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.reboot(name).await.map_err(|e| {
-            log::error!("CLI reboot failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, reboot, name)
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
@@ -189,22 +151,47 @@ impl NspawnManager for DefaultManager {
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
         self.require_root()?;
-        if self.dbus.is_available().await {
-            match self.dbus.kill(name, signal).await {
-                Ok(()) => return Ok(()),
+        fallback_to_cli!(self, kill, name, signal)
+    }
+
+    async fn remove(&self, name: &str) -> Result<()> {
+        self.require_root()?;
+
+        let result = if self.dbus.is_available().await {
+            match self.dbus.remove(name).await {
+                Ok(()) => Ok(()),
                 Err(e) => {
-                    log::warn!("DBus kill failed, falling back to CLI: {}", e);
+                    log::warn!("DBus remove failed, falling back to CLI: {}", e);
                     self.mark_fallback(&format!("{}", e));
+                    self.cli.remove(name).await.map_err(|e| {
+                        log::error!("CLI remove failed for {}: {}", name, e);
+                        e
+                    })
                 }
             }
         } else {
-            log::warn!("DBus not available for kill, falling back to CLI");
-            self.mark_fallback("DBus not available");
-        }
-        self.cli.kill(name, signal).await.map_err(|e| {
-            log::error!("CLI kill failed for {} (signal {}): {}", name, signal, e);
-            e
-        })
+            self.cli.remove(name).await.map_err(|e| {
+                log::error!("CLI remove failed for {}: {}", name, e);
+                e
+            })
+        };
+
+        // systemd may or may not clean these up — an extra unlink is harmless
+        let _ = tokio::fs::remove_file(
+            crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
+        )
+        .await;
+        let _ = tokio::fs::remove_dir_all(format!(
+            "/etc/systemd/system/systemd-nspawn@{}.service.d",
+            name
+        ))
+        .await;
+        let _ = tokio::fs::remove_file(
+            crate::nspawn::platform::nvidia::state::get_state_dir().join(format!("{}.json", name)),
+        )
+        .await;
+
+        result
     }
 
     fn spawn_log_stream(
@@ -239,7 +226,7 @@ impl NspawnManager for DefaultManager {
     }
 
     fn did_fallback(&self) -> Option<String> {
-        self.last_fallback_reason.lock().unwrap().take()
+        self.last_fallback_reason.lock().take()
     }
 
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {
@@ -260,15 +247,20 @@ impl NspawnManager for DefaultManager {
         tokio::spawn(async move {
             let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
-            let mut watcher = RecommendedWatcher::new(
+            let mut watcher = match RecommendedWatcher::new(
                 move |res: std::result::Result<Event, notify::Error>| {
                     if res.is_ok() {
                         let _ = notify_tx.send(());
                     }
                 },
                 Config::default(),
-            )
-            .expect("Failed to create FS watcher");
+            ) {
+                Ok(w) => w,
+                Err(e) => {
+                    log::error!("Failed to create FS watcher: {}. Inotify-based refresh disabled; relying on heartbeat.", e);
+                    return;
+                }
+            };
 
             for path in paths {
                 if path.exists() {
@@ -339,7 +331,7 @@ mod tests {
         dbus
     }
 
-    // ── list_all ────────────────────────────────────────────────────────────────
+    // list_all
 
     #[tokio::test]
     async fn test_list_all_uses_dbus_when_available() {
@@ -353,7 +345,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -377,7 +369,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -398,7 +390,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -419,7 +411,7 @@ mod tests {
             is_root: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -427,7 +419,7 @@ mod tests {
         assert_eq!(entries[0].name, "non-root");
     }
 
-    // ── permission guard ────────────────────────────────────────────────────────
+    // permission guard
 
     #[tokio::test]
     async fn test_start_requires_root() {
@@ -438,7 +430,7 @@ mod tests {
             is_root: false, // not root
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -446,7 +438,7 @@ mod tests {
         assert!(matches!(err, NspawnError::PermissionDenied));
     }
 
-    // ── fallback paths ──────────────────────────────────────────────────────────
+    // fallback paths
 
     #[tokio::test]
     async fn test_start_falls_back_to_cli_when_dbus_fails() {
@@ -461,7 +453,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -469,7 +461,7 @@ mod tests {
         assert!(mgr.did_fallback().is_some());
     }
 
-    // ── enable/disable bypass DBus ──────────────────────────────────────────────
+    // enable/disable bypass DBus
 
     #[tokio::test]
     async fn test_enable_calls_cli_directly() {
@@ -484,7 +476,7 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
@@ -504,14 +496,14 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
         mgr.disable("test-ctr").await.unwrap();
     }
 
-    // ── did_fallback state ──────────────────────────────────────────────────────
+    // did_fallback state
 
     #[tokio::test]
     async fn test_did_fallback_clears_after_read() {
@@ -527,12 +519,31 @@ mod tests {
             is_root: true,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            last_fallback_reason: std::sync::Mutex::new(None),
+            last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
         };
 
         mgr.list_all().await.unwrap();
         assert!(mgr.did_fallback().is_some()); // first read returns reason
         assert!(mgr.did_fallback().is_none()); // second returns None (taken)
+    }
+
+    // remove
+
+    #[tokio::test]
+    async fn test_remove_requires_root() {
+        let dbus = mock_dbus_available();
+        let cli = MockCliProvider::new();
+
+        let mgr = DefaultManager {
+            is_root: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+        };
+
+        let err = mgr.remove("test").await.unwrap_err();
+        assert!(matches!(err, NspawnError::PermissionDenied));
     }
 }

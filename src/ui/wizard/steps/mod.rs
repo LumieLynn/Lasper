@@ -21,6 +21,12 @@ pub trait StepComponent: Component {
         area: ratatui::layout::Rect,
         context: &WizardContext,
     );
+    fn handle_message(
+        &mut self,
+        _msg: &crate::ui::core::AppMessage,
+    ) -> crate::ui::wizard::StepAction {
+        crate::ui::wizard::StepAction::None
+    }
 }
 
 pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComponent> {

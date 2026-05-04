@@ -7,6 +7,8 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
 
@@ -51,6 +53,19 @@ impl PortMappingBox {
         }
     }
 
+    pub fn with_port(mut self, pf: &PortForward) -> Self {
+        self.host_port = NumberBox::new("Host Port", pf.host as u32)
+            .with_max_value(65535)
+            .with_min_value(1);
+        self.container_port = NumberBox::new("Container Port", pf.container as u32)
+            .with_max_value(65535)
+            .with_min_value(1);
+        let proto_idx = if pf.proto == "udp" { 1 } else { 0 };
+        self.protocol.set_selected_idx(proto_idx);
+        self.update_focus();
+        self
+    }
+
     fn update_focus(&mut self) {
         let mut comps = active_comps!(self);
         self.focus.update_focus(&mut comps, true);
@@ -67,10 +82,43 @@ impl PortMappingBox {
         self.focus.prev(&comps);
         self.update_focus();
     }
+
+    fn try_submit(&mut self) -> Option<AppMessage> {
+        let mut valid = true;
+        if self.host_port.validate().is_err() {
+            valid = false;
+        }
+        if self.container_port.validate().is_err() {
+            valid = false;
+        }
+        if !valid {
+            return None;
+        }
+        let proto = match self.protocol.selected_idx() {
+            0 => "tcp".to_string(),
+            1 => "udp".to_string(),
+            _ => "tcp".to_string(),
+        };
+        Some((self.on_submit)(PortForward {
+            host: self.host_port.value() as u16,
+            container: self.container_port.value() as u16,
+            proto,
+        }))
+    }
 }
 
 impl Component for PortMappingBox {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let dialog_area = crate::ui::centered_rect(30, 40, area);
+        f.render_widget(Clear, dialog_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Add Port Forward ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(dialog_area);
+        f.render_widget(block, dialog_area);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -80,7 +128,7 @@ impl Component for PortMappingBox {
                 Constraint::Min(0),
                 Constraint::Length(3),
             ])
-            .split(area);
+            .split(inner);
 
         self.host_port.render(f, chunks[0]);
         self.container_port.render(f, chunks[1]);
@@ -108,68 +156,26 @@ impl Component for PortMappingBox {
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
-                let mut valid = true;
-                if self.host_port.validate().is_err() {
-                    valid = false;
-                }
-                if self.container_port.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let host = self.host_port.value() as u16;
-                let container = self.container_port.value() as u16;
-                let proto = match self.protocol.selected_idx() {
-                    0 => "tcp".to_string(),
-                    1 => "udp".to_string(),
-                    _ => "tcp".to_string(),
+                return if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
                 };
-
-                return EventResult::Message((self.on_submit)(PortForward {
-                    host,
-                    container,
-                    proto,
-                }));
             }
             _ => {}
         }
 
         let mut comps = active_comps!(self);
         let res = comps[self.focus.active_idx].handle_key(key);
-
         match res {
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
-                let mut valid = true;
-                if self.host_port.validate().is_err() {
-                    valid = false;
+                if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
                 }
-                if self.container_port.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let host = self.host_port.value() as u16;
-                let container = self.container_port.value() as u16;
-                let proto = match self.protocol.selected_idx() {
-                    0 => "tcp".to_string(),
-                    1 => "udp".to_string(),
-                    _ => "tcp".to_string(),
-                };
-
-                EventResult::Message((self.on_submit)(PortForward {
-                    host,
-                    container,
-                    proto,
-                }))
             }
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
-            }
-
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => res,
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed

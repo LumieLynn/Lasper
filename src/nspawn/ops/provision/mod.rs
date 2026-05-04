@@ -260,14 +260,9 @@ async fn run_deploy_internal(
             }
         }
 
-        // Audit the security posture
-        let idmap_supported = crate::nspawn::platform::capabilities::supports_idmap();
-        if idmap_supported {
-            log::info!("[AUDIT] [Container: {}] [Security: High] Using secure idmap for hardware passthrough.", name);
-            push_log!("Using secure idmap for hardware passthrough.".to_string());
-        } else if cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged {
-            log::warn!("[AUDIT] [Container: {}] [Security: Compromised] Disabling User Namespaces due to missing host idmap support.", name);
-            push_log!("WARNING: Legacy security mode (PrivateUsers=no) due to missing host idmap support.".to_string());
+        if cfg.private_users.as_deref() == Some("no") {
+            log::warn!("[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled.", name);
+            push_log!("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
         }
 
         if cfg.privileged {

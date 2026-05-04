@@ -2,7 +2,7 @@ use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
     Frame,
 };
@@ -50,11 +50,7 @@ impl TextBlock {
 
 impl Component for TextBlock {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        let style = if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = Style::default().fg(crate::ui::widget_border_color(self.focused, true));
 
         let block = Block::default()
             .borders(Borders::ALL)

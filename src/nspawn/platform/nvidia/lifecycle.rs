@@ -354,3 +354,215 @@ pub async fn ensure_gpu_passthrough(
     log_step!(name, "Lifecycle", "GPU surgery successful.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::platform::nvidia::classify::{
+        ClassifiedEntry, NvidiaFileCategory, SymlinkEntry,
+    };
+    use crate::nspawn::platform::nvidia::state::NvidiaState;
+    use std::collections::HashMap;
+
+    fn make_profile(
+        mode: NvidiaPassthroughMode,
+        destinations: HashMap<NvidiaFileCategory, String>,
+    ) -> NvidiaPassthroughProfile {
+        NvidiaPassthroughProfile {
+            gpu_device: "all".into(),
+            mode,
+            category_destinations: destinations,
+            inject_env: false,
+        }
+    }
+
+    mod mirror_mode {
+        use super::*;
+
+        #[test]
+        fn is_noop() {
+            let mut state = NvidiaState {
+                readonly_binds: vec!["/usr/lib/libcuda.so:/usr/lib/libcuda.so".to_string()],
+                ..Default::default()
+            };
+            let profile = make_profile(NvidiaPassthroughMode::Mirror, HashMap::new());
+            let before = state.clone();
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(state.readonly_binds, before.readonly_binds);
+        }
+    }
+
+    mod classified_entries {
+        use super::*;
+
+        #[test]
+        fn entry_under_root_preserves_subdir() {
+            let mut state = NvidiaState {
+                classified_entries: vec![ClassifiedEntry {
+                    host_path: "/host/nvidia/libcuda.so".into(),
+                    default_container_path: "/usr/lib/x86_64-linux-gnu/libcuda.so".into(),
+                    category: NvidiaFileCategory::Lib64,
+                }],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(
+                state.classified_entries[0].default_container_path,
+                "/opt/nvidia/lib64/x86_64-linux-gnu/libcuda.so"
+            );
+        }
+
+        #[test]
+        fn config_keeps_cdi_path() {
+            let mut state = NvidiaState {
+                classified_entries: vec![ClassifiedEntry {
+                    host_path: "/host/nvidia/config.json".into(),
+                    default_container_path: "/etc/some-vendor/config.json".into(),
+                    category: NvidiaFileCategory::Config,
+                }],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [(NvidiaFileCategory::Config, "/opt/nvidia/config".into())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(
+                state.classified_entries[0].default_container_path,
+                "/etc/some-vendor/config.json"
+            );
+        }
+
+        #[test]
+        fn path_not_under_root_uses_filename() {
+            let mut state = NvidiaState {
+                classified_entries: vec![ClassifiedEntry {
+                    host_path: "/host/nvidia/bin/nvidia-smi".into(),
+                    default_container_path: "/usr/local/bin/nvidia-smi".into(),
+                    category: NvidiaFileCategory::Bin,
+                }],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [(NvidiaFileCategory::Bin, "/opt/nvidia/bin".into())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(
+                state.classified_entries[0].default_container_path,
+                "/opt/nvidia/bin/nvidia-smi"
+            );
+        }
+    }
+
+    mod symlinks {
+        use super::*;
+
+        #[test]
+        fn remapped_by_longest_prefix() {
+            let mut state = NvidiaState {
+                symlinks: vec![
+                    SymlinkEntry {
+                        target: "/usr/lib/libcuda.so.1".into(),
+                        link_path: "/usr/lib/libcuda.so".into(),
+                    },
+                    SymlinkEntry {
+                        target: "/some/other/path".into(),
+                        link_path: "/usr/lib/nvidia/libfoo.so".into(),
+                    },
+                ],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(state.symlinks[0].link_path, "/opt/nvidia/lib64/libcuda.so");
+            assert_eq!(state.symlinks[0].target, "/opt/nvidia/lib64/libcuda.so.1");
+            assert_eq!(
+                state.symlinks[1].link_path,
+                "/opt/nvidia/lib64/nvidia/libfoo.so"
+            );
+            assert_eq!(state.symlinks[1].target, "/some/other/path");
+        }
+    }
+
+    mod readonly_binds {
+        use super::*;
+
+        #[test]
+        fn container_part_remapped() {
+            let mut state = NvidiaState {
+                readonly_binds: vec![
+                    "/host/lib/libcuda.so:/usr/lib/libcuda.so".to_string(),
+                    "/host/lib32/libcuda.so:/usr/lib32/libcuda.so".to_string(),
+                ],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [
+                    (NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into()),
+                    (NvidiaFileCategory::Lib32, "/opt/nvidia/lib32".into()),
+                ]
+                .into_iter()
+                .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(
+                state.readonly_binds[0],
+                "/host/lib/libcuda.so:/opt/nvidia/lib64/libcuda.so"
+            );
+            assert_eq!(
+                state.readonly_binds[1],
+                "/host/lib32/libcuda.so:/opt/nvidia/lib32/libcuda.so"
+            );
+        }
+
+        #[test]
+        fn no_colon_treats_as_identity() {
+            let mut state = NvidiaState {
+                readonly_binds: vec!["/usr/lib/libcuda.so".to_string()],
+                ..Default::default()
+            };
+            let profile = make_profile(
+                NvidiaPassthroughMode::Categorized,
+                [(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into())]
+                    .into_iter()
+                    .collect(),
+            );
+
+            apply_category_remapping(&mut state, &profile);
+
+            assert_eq!(
+                state.readonly_binds[0],
+                "/usr/lib/libcuda.so:/opt/nvidia/lib64/libcuda.so"
+            );
+        }
+    }
+}

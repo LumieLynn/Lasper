@@ -96,21 +96,14 @@ pub async fn clone_systemd_override(source_name: &str, dest_name: &str) -> Resul
         dest_name
     ));
 
-    // Transactional write for destination
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&dest_path, |_existing| {
-        // Read source content inside the generator is slightly inefficient but safe.
-        // Better: Read source first, THEN call write_locked.
-        Ok(String::new()) // Placeholder
-    })
-    .await?;
-
-    // Refactored for better efficiency
     let source_content = tokio::fs::read_to_string(&source_path)
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from(&source_path), e))?;
 
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&dest_path, |_| Ok(source_content))
-        .await?;
+    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&dest_path, |_| {
+        Ok(source_content.clone())
+    })
+    .await?;
 
     let _ = crate::nspawn::sys::new_command("systemctl")
         .arg("daemon-reload")

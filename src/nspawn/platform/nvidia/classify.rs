@@ -115,6 +115,7 @@ pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<Bind
                 source: m.host_path,
                 target: m.container_path,
                 readonly: true,
+                suffix: Default::default(),
             });
         }
     }
@@ -123,10 +124,17 @@ pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<Bind
 }
 
 /// Parses CDI hooks for symlink creation.
+/// Real nvidia-ctk output uses hookName "createContainer" with the
+/// actual operation in args[1] (e.g. "create-symlinks").
 pub fn parse_symlink_hooks(hooks: &[CdiHook]) -> Vec<SymlinkEntry> {
     let mut symlinks = Vec::new();
     for hook in hooks {
-        if hook.hook_name == "create-symlinks" {
+        if hook
+            .args
+            .as_ref()
+            .and_then(|a| a.get(1))
+            .is_some_and(|op| op == "create-symlinks")
+        {
             if let Some(args) = &hook.args {
                 let mut i = 0;
                 while i < args.len() {
@@ -150,10 +158,17 @@ pub fn parse_symlink_hooks(hooks: &[CdiHook]) -> Vec<SymlinkEntry> {
 }
 
 /// Parses CDI hooks for ldcache folders.
+/// Real nvidia-ctk output uses hookName "createContainer" with the
+/// actual operation in args[1] (e.g. "update-ldcache").
 pub fn parse_ldcache_folders(hooks: &[CdiHook]) -> Vec<String> {
     let mut folders = Vec::new();
     for hook in hooks {
-        if hook.hook_name == "update-ldcache" {
+        if hook
+            .args
+            .as_ref()
+            .and_then(|a| a.get(1))
+            .is_some_and(|op| op == "update-ldcache")
+        {
             if let Some(args) = &hook.args {
                 let mut i = 0;
                 while i < args.len() {
@@ -273,7 +288,7 @@ mod tests {
     #[test]
     fn test_parse_symlink_hooks() {
         let hooks = vec![CdiHook {
-            hook_name: "create-symlinks".into(),
+            hook_name: "createContainer".into(),
             path: "/usr/bin/nvidia-cdi-hook".into(),
             args: Some(vec![
                 "nvidia-cdi-hook".into(),
@@ -294,9 +309,51 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_symlink_hooks_ignores_other_subcommands() {
+        let hooks = vec![
+            CdiHook {
+                hook_name: "createContainer".into(),
+                path: "/usr/bin/nvidia-cdi-hook".into(),
+                args: Some(vec![
+                    "nvidia-cdi-hook".into(),
+                    "enable-cuda-compat".into(),
+                    "--host-driver-version=595.58.03".into(),
+                ]),
+            },
+            CdiHook {
+                hook_name: "createContainer".into(),
+                path: "/usr/bin/nvidia-cdi-hook".into(),
+                args: Some(vec![
+                    "nvidia-cdi-hook".into(),
+                    "create-symlinks".into(),
+                    "--link".into(),
+                    "target::link".into(),
+                ]),
+            },
+        ];
+
+        let symlinks = parse_symlink_hooks(&hooks);
+        assert_eq!(symlinks.len(), 1);
+        assert_eq!(symlinks[0].target, "target");
+        assert_eq!(symlinks[0].link_path, "link");
+    }
+
+    #[test]
+    fn test_parse_symlink_hooks_no_args() {
+        let hooks = vec![CdiHook {
+            hook_name: "createContainer".into(),
+            path: "/usr/bin/nvidia-cdi-hook".into(),
+            args: None,
+        }];
+
+        let symlinks = parse_symlink_hooks(&hooks);
+        assert!(symlinks.is_empty());
+    }
+
+    #[test]
     fn test_parse_ldcache_folders() {
         let hooks = vec![CdiHook {
-            hook_name: "update-ldcache".into(),
+            hook_name: "createContainer".into(),
             path: "/usr/bin/nvidia-cdi-hook".into(),
             args: Some(vec![
                 "nvidia-cdi-hook".into(),
@@ -321,6 +378,34 @@ mod tests {
         assert_eq!(folders[2], "/usr/lib/i386-linux-gnu");
         assert_eq!(folders[3], "/usr/lib/x86_64-linux-gnu");
         assert_eq!(folders[4], "/usr/lib/vdpau");
+    }
+
+    #[test]
+    fn test_parse_ldcache_folders_ignores_other_subcommands() {
+        let hooks = vec![
+            CdiHook {
+                hook_name: "createContainer".into(),
+                path: "/usr/bin/nvidia-cdi-hook".into(),
+                args: Some(vec![
+                    "nvidia-cdi-hook".into(),
+                    "disable-device-node-modification".into(),
+                ]),
+            },
+            CdiHook {
+                hook_name: "createContainer".into(),
+                path: "/usr/bin/nvidia-cdi-hook".into(),
+                args: Some(vec![
+                    "nvidia-cdi-hook".into(),
+                    "update-ldcache".into(),
+                    "--folder".into(),
+                    "/usr/lib".into(),
+                ]),
+            },
+        ];
+
+        let folders = parse_ldcache_folders(&hooks);
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0], "/usr/lib");
     }
 
     #[test]

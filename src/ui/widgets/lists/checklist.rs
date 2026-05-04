@@ -114,13 +114,7 @@ impl<T> Checklist<T> {
     }
 
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
-        let style = if !self.enabled {
-            Style::default().fg(Color::DarkGray)
-        } else if self.focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::White)
-        };
+        let style = Style::default().fg(crate::ui::widget_border_color(self.focused, self.enabled));
 
         let items: Vec<ListItem> = self
             .items

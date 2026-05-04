@@ -4,24 +4,10 @@ use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use vt100::Parser;
 
 pub enum PtyMessage {
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
-}
-
-#[derive(Clone)]
-pub struct PtyReply {
-    pub tx: mpsc::WeakSender<PtyMessage>,
-}
-
-impl vt100::TermReplySender for PtyReply {
-    fn reply(&self, s: compact_str::CompactString) {
-        if let Some(tx) = self.tx.upgrade() {
-            let _ = tx.try_send(PtyMessage::Data(s.as_bytes().to_vec()));
-        }
-    }
 }
 
 pub struct TerminalHandle {
@@ -46,7 +32,7 @@ pub fn spawn_terminal(
     rows: u16,
     app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
 ) -> Result<(
-    Arc<Mutex<Parser<PtyReply>>>,
+    Arc<Mutex<crate::term::Parser>>,
     mpsc::Sender<PtyMessage>,
     TerminalHandle,
 )> {
@@ -70,14 +56,7 @@ pub fn spawn_terminal(
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
 
     // 10,000 lines of scrollback
-    let parser = Arc::new(Mutex::new(Parser::new(
-        rows,
-        cols,
-        10000,
-        PtyReply {
-            tx: pty_tx.downgrade(),
-        },
-    )));
+    let parser = Arc::new(Mutex::new(crate::term::Parser::new(rows, cols, 10000)));
 
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
@@ -91,7 +70,8 @@ pub fn spawn_terminal(
             }
             {
                 let mut p = parser_clone.lock();
-                p.process(&buf[..n]);
+                let mut events = Vec::new();
+                p.screen.process(&buf[..n], &mut events);
             }
             let _ = app_tx_clone.try_send(crate::events::AppEvent::TerminalRedraw);
         }

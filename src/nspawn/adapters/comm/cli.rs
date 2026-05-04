@@ -17,6 +17,7 @@ pub trait CliProvider: Send + Sync + 'static {
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn remove(&self, name: &str) -> Result<()>;
     fn spawn_log_stream(
         &self,
         name: &str,
@@ -252,6 +253,10 @@ impl CliProvider for DefaultCliProvider {
         self.run_machinectl(&["kill", "-s", signal, name]).await
     }
 
+    async fn remove(&self, name: &str) -> Result<()> {
+        self.run_machinectl(&["remove", name]).await
+    }
+
     fn spawn_log_stream(
         &self,
         name: &str,
@@ -312,7 +317,11 @@ impl CliProvider for DefaultCliProvider {
                             key,
                             &zbus::zvariant::Value::Str(val.into()),
                         );
-                        props.insert("Machine", key.to_string(), formatted);
+                        props.insert(
+                            crate::nspawn::models::GROUP_MACHINE,
+                            key.to_string(),
+                            formatted,
+                        );
                     }
                 }
             }
@@ -351,10 +360,18 @@ impl CliProvider for DefaultCliProvider {
                                 | "ConflictedBy"
                         ) {
                             if !formatted.is_empty() && formatted != "[]" {
-                                props.insert("Dependencies", key.to_string(), formatted);
+                                props.insert(
+                                    crate::nspawn::models::GROUP_DEPENDENCIES,
+                                    key.to_string(),
+                                    formatted,
+                                );
                             }
                         } else {
-                            props.insert("Systemd Unit", key.to_string(), formatted);
+                            props.insert(
+                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                                key.to_string(),
+                                formatted,
+                            );
                         }
                     }
                 }
@@ -389,7 +406,7 @@ mod tests {
         }
     }
 
-    // ── running_map ─────────────────────────────────────────────────────────────
+    // running_map
 
     #[tokio::test]
     async fn test_running_map_parses_list_output() {
@@ -446,7 +463,7 @@ mod tests {
         assert!(!map.contains_key(".host"));
     }
 
-    // ── list_all ────────────────────────────────────────────────────────────────
+    // list_all
 
     #[tokio::test]
     async fn test_list_all_merges_images_and_running() {
@@ -505,7 +522,7 @@ mod tests {
         assert_eq!(entries[0].image_type, None);
     }
 
-    // ── get_properties ──────────────────────────────────────────────────────────
+    // get_properties
 
     #[tokio::test]
     async fn test_get_properties_parses_machinectl_and_systemctl_output() {
@@ -548,7 +565,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── action methods ──────────────────────────────────────────────────────────
+    // action methods
 
     #[tokio::test]
     async fn test_start_calls_machinectl_start() {

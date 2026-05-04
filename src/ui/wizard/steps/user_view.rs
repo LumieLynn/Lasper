@@ -1,11 +1,10 @@
 use crate::nspawn::models::CreateUser;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::composites::user_editor::UserEditor;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{UserConfig, WizardContext};
-use crate::ui::wizard::core::render_editor_overlay;
 use crate::ui::wizard::steps::StepComponent;
+use crate::ui::wizard::StepAction;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -28,7 +27,6 @@ pub struct UserStepView {
     root_password: PasswordBox,
     user_list: EditableList<CreateUser>,
 
-    editor: Option<UserEditor>,
     focus: FocusTracker,
 }
 
@@ -48,7 +46,6 @@ impl UserStepView {
                 |idx| AppMessage::Wizard(WizardMessage::UserRemoved(idx)),
             ),
 
-            editor: None,
             focus: FocusTracker::new(),
         };
         view.update_focus();
@@ -58,11 +55,6 @@ impl UserStepView {
 
 impl Component for UserStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        if let Some(editor) = &mut self.editor {
-            render_editor_overlay(f, "Add/Edit User", 60, 85, editor);
-            return;
-        }
-
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(2)
@@ -85,59 +77,20 @@ impl Component for UserStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if let Some(editor) = &mut self.editor {
-            if key.code == KeyCode::Esc {
-                self.editor = None;
-                return EventResult::Consumed;
-            }
-            let res = editor.handle_key(key);
-            match &res {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::UserAdded(user))) => {
-                    self.user_list.add_item(user.clone());
-                    self.editor = None;
-                    self.update_focus();
+        if self.user_list.is_focused() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenUserDialog));
                 }
-                EventResult::Message(AppMessage::Wizard(WizardMessage::UserUpdated(idx, user))) => {
-                    self.user_list.update_item(*idx, user.clone());
-                    self.editor = None;
-                    self.update_focus();
-                }
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                    self.editor = None;
-                    self.update_focus();
-                    return EventResult::Consumed;
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if let Some(user) = self.user_list.selected_item() {
+                        let idx = self.user_list.selected();
+                        return EventResult::Message(AppMessage::Wizard(
+                            WizardMessage::OpenUserEditDialog(idx, user.clone()),
+                        ));
+                    }
                 }
                 _ => {}
-            }
-            return res;
-        }
-
-        if (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
-            && self.user_list.is_focused()
-        {
-            self.editor = Some(UserEditor::new(|u| {
-                AppMessage::Wizard(WizardMessage::UserAdded(u))
-            }));
-
-            self.editor.as_mut().unwrap().set_focus(true);
-            return EventResult::Consumed;
-        }
-
-        if (key.code == KeyCode::Char('e') || key.code == KeyCode::Char('E'))
-            && self.user_list.is_focused()
-        {
-            if let Some(user) = self.user_list.selected_item() {
-                let idx = self.user_list.selected();
-                let user = user.clone();
-                self.editor = Some(
-                    UserEditor::new(move |u| {
-                        AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
-                    })
-                    .with_user(&user),
-                );
-
-                self.editor.as_mut().unwrap().set_focus(true);
-                return EventResult::Consumed;
             }
         }
 
@@ -175,5 +128,22 @@ impl StepComponent for UserStepView {
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
         self.render(f, area);
+    }
+
+    fn handle_message(&mut self, msg: &AppMessage) -> StepAction {
+        match msg {
+            AppMessage::Wizard(WizardMessage::UserAdded(user)) => {
+                self.user_list.add_item(user.clone());
+                self.update_focus();
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::UserUpdated(idx, user)) => {
+                self.user_list.update_item(*idx, user.clone());
+                self.update_focus();
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::DialogCancel) => StepAction::CloseDialog,
+            _ => StepAction::None,
+        }
     }
 }

@@ -4,7 +4,7 @@ use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-// ── Top-level dispatch ────────────────────────────────────────────────────────
+// Top-level dispatch
 //
 // handle_key is now a thin chain of mode-specific handlers.  Each handler
 // returns `true` when it consumed the key — the remaining handlers are
@@ -12,8 +12,26 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
+        // Layer 0 – delete confirmation (modal)
+        if self.handle_delete_confirm_key(key) {
+            return;
+        }
+
         // Layer 1 – quit confirmation dialog (modal)
         if self.handle_quit_confirm_key(key) {
+            return;
+        }
+
+        // Layer 1.5 – resize mode (skip when terminal is in insert mode)
+        if self.ui.resize_mode == super::ResizeMode::Active
+            && !self.is_terminal_insert_mode()
+            && self.handle_resize_key(key)
+        {
+            return;
+        }
+
+        // Layer 2.5 – active dialog (modal, blocks everything below)
+        if self.handle_dialog_key(key).await {
             return;
         }
 
@@ -39,7 +57,27 @@ impl App {
     }
 }
 
-// ── Layer 1: quit confirmation ────────────────────────────────────────────────
+// Layer 0: delete confirmation
+
+impl App {
+    fn handle_delete_confirm_key(&mut self, key: KeyEvent) -> bool {
+        if self.ui.delete_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.action_remove();
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.ui.delete_dialog = None;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
+// Layer 1: quit confirmation
 
 impl App {
     fn handle_quit_confirm_key(&mut self, key: KeyEvent) -> bool {
@@ -61,7 +99,7 @@ impl App {
     }
 }
 
-// ── Layer 2: terminal panel (insert / normal mode + tab switching) ────────────
+// Layer 2: terminal panel (insert / normal mode + tab switching)
 
 impl App {
     async fn handle_terminal_focused_key(&mut self, key: KeyEvent) -> bool {
@@ -71,6 +109,15 @@ impl App {
             self.data
                 .terminal
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
+
+        // If closing a tab emptied the terminal panel, restore focus to a valid panel.
+        if self.ui.active_panel == ActivePanel::TerminalPanel && !self.data.terminal.is_showing() {
+            self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
+                ActivePanel::ContainerList
+            } else {
+                self.ui.prev_active_panel.clone()
+            };
+        }
 
         match outcome {
             TerminalKeyOutcome::Consumed => true,
@@ -83,7 +130,7 @@ impl App {
     }
 }
 
-// ── Layer 3: overlays (wizard, help, power menu) ──────────────────────────────
+// Layer 3: overlays (wizard, help, power menu)
 
 impl App {
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -100,6 +147,12 @@ impl App {
                         self.set_status(msg, level);
                     }
                     WizardAction::Next | WizardAction::Prev => {}
+                    WizardAction::OpenDialog(dialog) => {
+                        self.ui.active_dialog = Some(dialog);
+                    }
+                    WizardAction::CloseDialog => {
+                        self.ui.active_dialog = None;
+                    }
                 }
             } else {
                 self.ui.show_wizard = false;
@@ -128,6 +181,7 @@ impl App {
                         4 => self.action_kill(),
                         5 => self.action_enable(),
                         6 => self.action_disable(),
+                        7 => self.show_delete_dialog(),
                         _ => {}
                     }
                 }
@@ -142,7 +196,7 @@ impl App {
     }
 }
 
-// ── Layer 4: global shortcuts ─────────────────────────────────────────────────
+// Layer 4: global shortcuts
 
 impl App {
     async fn handle_global_key(&mut self, key: KeyEvent) -> bool {
@@ -150,7 +204,7 @@ impl App {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 if !self.data.terminal.sessions.is_empty() {
                     self.ui.quit_dialog =
-                        Some(crate::ui::widgets::confirmation::ConfirmationDialog::new(
+                        Some(crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
                             "Quit Lasper?",
                             "Active terminal sessions are still running.\nQuit and terminate all logins?",
                         ));
@@ -192,8 +246,26 @@ impl App {
                 self.refresh().await;
                 true
             }
+            KeyCode::Char('R') => {
+                self.ui.resize_mode = if self.ui.resize_mode == super::ResizeMode::Active {
+                    super::ResizeMode::Inactive
+                } else {
+                    super::ResizeMode::Active
+                };
+                true
+            }
             KeyCode::Char('t') => {
                 self.toggle_terminal();
+                true
+            }
+            KeyCode::Char('T') => {
+                if self.data.terminal.is_showing() {
+                    self.data.terminal.maximized = !self.data.terminal.maximized;
+                }
+                true
+            }
+            KeyCode::Char('D') => {
+                self.show_delete_dialog();
                 true
             }
             _ => false,
@@ -201,7 +273,7 @@ impl App {
     }
 }
 
-// ── Layer 5: route to focused panel ───────────────────────────────────────────
+// Layer 5: route to focused panel
 
 impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
@@ -260,27 +332,155 @@ impl App {
             return;
         }
 
-        let nvidia_installed = std::path::Path::new("/usr/bin/nvidia-ctk").exists();
+        let nvidia_installed = crate::nspawn::platform::nvidia::nvidia_ctk_available();
         if let Some(tx) = &self.ui.backend_tx {
-            self.ui.wizard = Some(
-                crate::ui::wizard::Wizard::new(
-                    self.data.entries.clone(),
-                    nvidia_installed,
-                    tx.clone(),
-                )
-                .await,
-            );
+            let mut wizard = crate::ui::wizard::Wizard::new(
+                self.data.entries.clone(),
+                nvidia_installed,
+                tx.clone(),
+            )
+            .await;
+
+            if nvidia_installed {
+                let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
+            } else {
+                wizard.context.passthrough.hardware_scanning = false;
+            }
+
+            self.ui.wizard = Some(wizard);
             self.ui.show_wizard = true;
-            let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
         }
     }
 
     fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            self.ui.active_panel = ActivePanel::ContainerList;
+            if self.ui.active_panel == ActivePanel::TerminalPanel {
+                self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
+                    ActivePanel::ContainerList
+                } else {
+                    self.ui.prev_active_panel.clone()
+                };
+            }
         } else {
             self.spawn_terminal();
+        }
+    }
+
+    fn show_delete_dialog(&mut self) {
+        let entry = match self.data.entries.get(self.data.selected) {
+            Some(e) => e,
+            None => return,
+        };
+        if entry.state.is_running() {
+            self.set_status(
+                format!("Stop '{}' before deleting it.", entry.name),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
+        self.ui.delete_dialog = Some(
+            crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                "Delete Container",
+                format!(
+                    "Delete '{}' and all its data?\nThis cannot be undone.",
+                    entry.name
+                ),
+            ),
+        );
+    }
+}
+
+// Resize mode
+
+impl App {
+    fn is_terminal_insert_mode(&self) -> bool {
+        self.ui.active_panel == ActivePanel::TerminalPanel
+            && self
+                .data
+                .terminal
+                .active_session()
+                .map(|s| s.insert_mode)
+                .unwrap_or(false)
+    }
+
+    fn handle_resize_key(&mut self, key: KeyEvent) -> bool {
+        let step = 5u16;
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('R') | KeyCode::Char('q') => {
+                self.ui.resize_mode = super::ResizeMode::Inactive;
+                true
+            }
+            KeyCode::Char('h') | KeyCode::Left => {
+                self.ui.container_list_pct = self
+                    .ui
+                    .container_list_pct
+                    .saturating_sub(step)
+                    .max(super::CONTAINER_LIST_PCT_MIN);
+                true
+            }
+            KeyCode::Char('l') | KeyCode::Right => {
+                self.ui.container_list_pct = self
+                    .ui
+                    .container_list_pct
+                    .saturating_add(step)
+                    .min(super::CONTAINER_LIST_PCT_MAX);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.data.terminal.is_showing() => {
+                self.ui.detail_pct = self
+                    .ui
+                    .detail_pct
+                    .saturating_add(step)
+                    .min(super::DETAIL_PCT_MAX);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.data.terminal.is_showing() => {
+                self.ui.detail_pct = self
+                    .ui
+                    .detail_pct
+                    .saturating_sub(step)
+                    .max(super::DETAIL_PCT_MIN);
+                true
+            }
+            KeyCode::Tab => false,
+            _ => true,
+        }
+    }
+
+    async fn handle_dialog_key(&mut self, key: KeyEvent) -> bool {
+        if self.ui.active_dialog.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.ui.active_dialog = None;
+                true
+            }
+            _ => {
+                let mut dialog = self.ui.active_dialog.take().unwrap();
+                let result = dialog.handle_key(key);
+                match result {
+                    EventResult::Message(msg) => {
+                        let mut close = false;
+                        if let Some(wizard) = &mut self.ui.wizard {
+                            let action = wizard.process_message(msg);
+                            if matches!(action, crate::ui::wizard::StepAction::CloseDialog) {
+                                close = true;
+                            }
+                        }
+                        if close {
+                            self.ui.active_dialog = None;
+                        }
+                        true
+                    }
+                    _ => {
+                        self.ui.active_dialog = Some(dialog);
+                        true
+                    }
+                }
+            }
         }
     }
 }

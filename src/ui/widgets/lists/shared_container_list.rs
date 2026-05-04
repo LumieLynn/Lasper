@@ -39,7 +39,13 @@ impl SharedContainerList {
 
     /// Renders the container list without taking ownership of data.
     /// Uses ContainerEntry references to build the UI list.
-    pub fn render(&mut self, f: &mut Frame, area: Rect, entries: &[ContainerEntry]) {
+    pub fn render(
+        &mut self,
+        f: &mut Frame,
+        area: Rect,
+        entries: &[ContainerEntry],
+        resize_mode: bool,
+    ) {
         // If background data changes and current selection is out of bounds, clamp it.
         if let Some(current) = self.state.selected() {
             if entries.is_empty() {
@@ -117,11 +123,7 @@ impl SharedContainerList {
             })
             .collect();
 
-        let border_color = if self.focused {
-            Color::Cyan
-        } else {
-            Color::White
-        };
+        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, Color::White);
 
         let list = List::new(items)
             .block(

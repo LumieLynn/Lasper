@@ -8,6 +8,8 @@ use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
 
@@ -105,10 +107,43 @@ impl UserEditor {
         self.focus.prev(&comps);
         self.update_focus();
     }
+
+    fn try_submit(&mut self) -> Option<AppMessage> {
+        let mut valid = true;
+        if self.username.validate().is_err() {
+            valid = false;
+        }
+        if self.password.validate().is_err() {
+            valid = false;
+        }
+        if self.shell.validate().is_err() {
+            valid = false;
+        }
+        if !valid {
+            return None;
+        }
+        let user = CreateUser {
+            username: self.username.value().to_string(),
+            password: self.password.value().to_string(),
+            shell: self.shell.value().to_string(),
+            sudoer: self.sudoer.checked(),
+        };
+        Some((self.on_submit)(user))
+    }
 }
 
 impl Component for UserEditor {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let dialog_area = crate::ui::centered_rect(40, 60, area);
+        f.render_widget(Clear, dialog_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" Add/Edit User ")
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(dialog_area);
+        f.render_widget(block, dialog_area);
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -119,7 +154,7 @@ impl Component for UserEditor {
                 Constraint::Min(0),
                 Constraint::Length(3),
             ])
-            .split(area);
+            .split(inner);
 
         self.username.render(f, chunks[0]);
         self.password.render(f, chunks[1]);
@@ -148,27 +183,11 @@ impl Component for UserEditor {
                 return EventResult::Consumed;
             }
             KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
-                let mut valid = true;
-                if self.username.validate().is_err() {
-                    valid = false;
-                }
-                if self.password.validate().is_err() {
-                    valid = false;
-                }
-                if self.shell.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let user = CreateUser {
-                    username: self.username.value().to_string(),
-                    password: self.password.value().to_string(),
-                    shell: self.shell.value().to_string(),
-                    sudoer: self.sudoer.checked(),
+                return if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
                 };
-                return EventResult::Message((self.on_submit)(user));
             }
             _ => {}
         }
@@ -177,32 +196,13 @@ impl Component for UserEditor {
         let res = comps[self.focus.active_idx].handle_key(key);
         match res {
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
-                let mut valid = true;
-                if self.username.validate().is_err() {
-                    valid = false;
+                if let Some(msg) = self.try_submit() {
+                    EventResult::Message(msg)
+                } else {
+                    EventResult::Consumed
                 }
-                if self.password.validate().is_err() {
-                    valid = false;
-                }
-                if self.shell.validate().is_err() {
-                    valid = false;
-                }
-                if !valid {
-                    return EventResult::Consumed;
-                }
-
-                let user = CreateUser {
-                    username: self.username.value().to_string(),
-                    password: self.password.value().to_string(),
-                    shell: self.shell.value().to_string(),
-                    sudoer: self.sudoer.checked(),
-                };
-                EventResult::Message((self.on_submit)(user))
             }
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel))
-            }
-
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => res,
             EventResult::FocusNext => {
                 self.next();
                 EventResult::Consumed

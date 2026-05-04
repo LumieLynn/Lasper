@@ -10,6 +10,7 @@ use std::io;
 mod app;
 mod events;
 mod nspawn;
+mod term;
 mod ui;
 
 use std::env;
@@ -94,6 +95,22 @@ fn try_chown_to_sudo_user(path: &Path) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle CLI flags before terminal takeover
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "--version" || arg == "-v" {
+            println!("lasper {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        if arg == "--help" || arg == "-h" {
+            println!(
+                "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
+                 USAGE:\n    lasper\n\n\
+                 FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message",
+                env!("CARGO_PKG_VERSION")
+            );
+            return Ok(());
+        }
+    }
     // Detect privilege level (uid 0 = root)
     let is_root = uzers::get_current_uid() == 0;
 

@@ -6,6 +6,11 @@ use super::state::NvidiaState;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::sys::{new_command, CommandLogged};
 
+/// Check whether `nvidia-ctk` is available on PATH.
+pub fn nvidia_ctk_available() -> bool {
+    which::which("nvidia-ctk").is_ok()
+}
+
 /// Get the current NVIDIA driver version on the host.
 /// Gracefully handles WSL and missing sysfs nodes.
 pub async fn get_host_driver_version() -> Result<String> {

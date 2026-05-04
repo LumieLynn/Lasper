@@ -1,16 +1,19 @@
 use crate::nspawn::models::{NetworkMode, PortForward};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::ui::widgets::composites::port_mapping::PortMappingBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
-use crate::ui::wizard::core::render_editor_overlay;
 use crate::ui::wizard::steps::StepComponent;
+use crate::ui::wizard::StepAction;
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::Frame;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Style},
+    widgets::Paragraph,
+    Frame,
+};
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -45,7 +48,6 @@ pub struct NetworkStepView {
     interface_list: SelectableList<String>,
     custom_interface: TextBox,
     port_list: EditableList<PortForward>,
-    port_editor: Option<PortMappingBox>,
     focus: FocusTracker,
     bridge_options_len: usize,
     interface_options_len: usize,
@@ -153,7 +155,6 @@ impl NetworkStepView {
                 |idx| AppMessage::Wizard(WizardMessage::PortForwardRemoved(idx)),
             ),
 
-            port_editor: None,
             focus: FocusTracker::new(),
             bridge_options_len,
             interface_options_len,
@@ -188,11 +189,6 @@ impl NetworkStepView {
 
 impl Component for NetworkStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        if let Some(editor) = &mut self.port_editor {
-            render_editor_overlay(f, "Add Port Forward", 60, 60, editor);
-            return;
-        }
-
         let mode = self.mode_selector.selected_idx();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -238,40 +234,36 @@ impl Component for NetworkStepView {
         } else if mode == 2 {
             self.port_list.render(f, chunks[1]);
         }
+
+        let hint = if mode == 2 || mode == 3 {
+            " [A]dd port, [E]dit port, [D]elete port "
+        } else {
+            ""
+        };
+        if !hint.is_empty() {
+            f.render_widget(
+                Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+                chunks[2],
+            );
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if let Some(editor) = &mut self.port_editor {
-            if key.code == KeyCode::Esc {
-                self.port_editor = None;
-                return EventResult::Consumed;
-            }
-            let res = editor.handle_key(key);
-            match &res {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::PortForwardAdded(map))) => {
-                    self.port_list.add_item(map.clone());
-                    self.port_editor = None;
-                    self.update_focus();
+        if self.port_list.is_focused() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenPortDialog));
                 }
-                EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => {
-                    self.port_editor = None;
-                    self.update_focus();
-                    return EventResult::Consumed;
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if let Some(pf) = self.port_list.selected_item() {
+                        let idx = self.port_list.selected();
+                        return EventResult::Message(AppMessage::Wizard(
+                            WizardMessage::OpenPortEditDialog(idx, pf.clone()),
+                        ));
+                    }
                 }
                 _ => {}
             }
-            return res;
-        }
-
-        if (key.code == KeyCode::Char('a') || key.code == KeyCode::Char('A'))
-            && self.port_list.is_focused()
-        {
-            self.port_editor = Some(PortMappingBox::new(|p| {
-                AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
-            }));
-
-            self.port_editor.as_mut().unwrap().set_focus(true);
-            return EventResult::Consumed;
         }
 
         let mode = self.mode_selector.selected_idx();
@@ -326,6 +318,23 @@ impl Component for NetworkStepView {
 }
 
 impl StepComponent for NetworkStepView {
+    fn handle_message(&mut self, msg: &AppMessage) -> StepAction {
+        match msg {
+            AppMessage::Wizard(WizardMessage::PortForwardAdded(pf)) => {
+                self.port_list.add_item(pf.clone());
+                self.update_focus();
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::PortForwardUpdated(idx, pf)) => {
+                self.port_list.update_item(*idx, pf.clone());
+                self.update_focus();
+                StepAction::CloseDialog
+            }
+            AppMessage::Wizard(WizardMessage::DialogCancel) => StepAction::CloseDialog,
+            _ => StepAction::None,
+        }
+    }
+
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.network.mode = self.mode_selector.selected_idx();
         if self.mode_selector.selected_idx() == 3 {

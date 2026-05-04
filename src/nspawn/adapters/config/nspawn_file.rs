@@ -247,20 +247,19 @@ impl NspawnConfig {
     }
 }
 
-// ── .nspawn file generation ───────────────────────────────────────────────────
+//.nspawn file generation
 
 /// Generate the content of a `.nspawn` container config file using AST.
 pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
     validate_machine_name(&cfg.name)?;
     let mut conf = Ini::new();
-    let idmap_supported = crate::nspawn::platform::capabilities::supports_idmap();
 
     if cfg.nvidia_gpu {
         conf.with_section(Some("General"))
             .set("X-Lasper-Nvidia-Enabled", "true");
     }
 
-    // ── [Exec] ────────────────────────────────────────────────────────────────
+    //[Exec]
     {
         let mut exec = conf.with_section(Some("Exec"));
         if cfg.boot {
@@ -269,12 +268,8 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
             exec.set("Boot", "no");
         }
 
-        // If idmap is NOT supported, we MUST disable PrivateUsers (the security compromise)
-        // DRI and Wayland sockets typically don't work in a namespaced environment without it.
-        if !idmap_supported
-            && (cfg.wayland_socket.is_some() || cfg.graphics_acceleration || cfg.privileged)
-        {
-            exec.set("PrivateUsers", "no");
+        if let Some(v) = &cfg.private_users {
+            exec.set("PrivateUsers", v.as_str());
         }
 
         if cfg.privileged {
@@ -285,7 +280,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
     }
 
-    // ── [Network] ─────────────────────────────────────────────────────────────
+    //[Network]
     if let Some(mode) = &cfg.network {
         use crate::nspawn::models::NetworkMode;
         match mode {
@@ -334,7 +329,7 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
     }
 
-    // ── [Files] ───────────────────────────────────────────────────────────────
+    //[Files]
     let has_files = !cfg.device_binds.is_empty()
         || !cfg.readonly_binds.is_empty()
         || !cfg.bind_mounts.is_empty()
@@ -355,13 +350,20 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
         for bm in &cfg.bind_mounts {
             if bm.readonly {
-                files.append("BindReadOnly", format!("{}:{}", bm.source, bm.target));
+                files.append(
+                    "BindReadOnly",
+                    format!("{}:{}{}", bm.source, bm.target, bm.suffix),
+                );
             } else {
-                files.append("Bind", format!("{}:{}", bm.source, bm.target));
+                files.append("Bind", format!("{}:{}{}", bm.source, bm.target, bm.suffix));
             }
         }
 
-        let suffix = if idmap_supported { ":idmap" } else { "" };
+        let suffix = if cfg.private_users.as_deref() == Some("no") {
+            ":noidmap"
+        } else {
+            ":idmap"
+        };
 
         if matches!(cfg.network, Some(crate::nspawn::models::NetworkMode::Host)) {
             files.append(
@@ -428,7 +430,7 @@ mod tests {
     use super::*;
     use crate::nspawn::models::{NetworkMode, PortForward};
 
-    // ── Validation ────────────────────────────────────────────────────────
+    // Validation
 
     #[test]
     fn test_validate_machine_name_valid() {
@@ -471,7 +473,7 @@ mod tests {
         assert!(validate_machine_name("$(whoami)").is_err());
     }
 
-    // ── GPU enabled detection ─────────────────────────────────────────────
+    // GPU enabled detection
 
     #[test]
     fn test_is_gpu_enabled_true() {
@@ -518,7 +520,7 @@ mod tests {
         assert!(!config.is_gpu_enabled());
     }
 
-    // ── Purge nvidia block ────────────────────────────────────────────────
+    // Purge nvidia block
 
     #[test]
     fn test_purge_nvidia_block_present() {
@@ -570,7 +572,7 @@ mod tests {
         assert!(death_list.is_empty());
     }
 
-    // ── Config content generation ─────────────────────────────────────────
+    // Config content generation
 
     #[test]
     fn test_nspawn_config_content_minimal() {
@@ -655,6 +657,39 @@ mod tests {
     }
 
     #[test]
+    fn test_nspawn_config_content_private_users_explicit_no() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            private_users: Some("no".into()),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=no"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_explicit_yes() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            private_users: Some("yes".into()),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=yes"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_pick() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            private_users: Some("pick".into()),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=pick"));
+    }
+
+    #[test]
     fn test_nspawn_config_content_nvidia_marker() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
@@ -674,7 +709,7 @@ mod tests {
         assert!(nspawn_config_content(&cfg, None).is_err());
     }
 
-    // ── GPU passthrough surgery ───────────────────────────────────────────
+    // GPU passthrough surgery
 
     #[test]
     fn test_apply_gpu_passthrough_to_content() {

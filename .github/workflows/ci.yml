@@ -37,21 +37,113 @@ jobs:
       - run: cargo test
 
   build:
-    name: build (release)
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            zig: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            zig: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
+        with:
+          key: ${{ matrix.target }}
 
-  e2e:
-    name: end-to-end (manual)
-    if: github.event_name == 'workflow_dispatch'
+      - name: Setup zig
+        if: ${{ matrix.zig }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.zig }}
+        run: cargo install cargo-zigbuild
+
+      - name: Build (glibc)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release
+
+      - name: Install target
+        if: ${{ matrix.zig }}
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (musl)
+        if: ${{ matrix.zig }}
+        run: cargo zigbuild --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/lasper" "lasper-${{ matrix.target }}"
+          else
+            cp target/release/lasper "lasper-${{ matrix.target }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lasper-${{ matrix.target }}
+          path: lasper-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    name: release
+    needs: [build]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release
-      - run: sudo ./target/release/lasper --help
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: lasper-*
+          merge-multiple: true
+          path: dist
+
+      - name: Extract version
+        id: meta
+        run: |
+          V=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "tag=v$V" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        id: changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --current --strip header
+
+      - name: Create tag
+        run: |
+          TAG="${{ steps.meta.outputs.tag }}"
+          if ! git rev-parse "$TAG" >/dev/null 2>&1; then
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.tag }}
+          body_path: "${{ steps.changelog.outputs.changelog }}"
+          files: dist/lasper-*
+          make_latest: true

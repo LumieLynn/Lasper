@@ -41,9 +41,15 @@ pub fn render(f: &mut Frame, app: &mut App) {
     if let Some(dialog) = &mut app.ui.quit_dialog {
         dialog.render(f, area);
     }
+    if let Some(dialog) = &mut app.ui.delete_dialog {
+        dialog.render(f, area);
+    }
+    if let Some(dialog) = &mut app.ui.active_dialog {
+        dialog.render(f, area);
+    }
 }
 
-// ── Title ─────────────────────────────────────────────────────────────────────
+// Title
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let badge = if app.is_root {
@@ -88,27 +94,39 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(line).style(Style::default()), area);
 }
 
-// ── Content ───────────────────────────────────────────────────────────────────
+// Content
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
     let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
     let terminal_focused = app.ui.active_panel == crate::app::ActivePanel::TerminalPanel;
+    let resize_mode = app.ui.resize_mode == crate::app::ResizeMode::Active;
 
     app.ui.detail_panel.set_focus(detail_focused);
 
+    let list_pct = app.ui.container_list_pct;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints([
+            Constraint::Percentage(list_pct),
+            Constraint::Percentage(100u16.saturating_sub(list_pct)),
+        ])
         .split(area);
 
     let list_area = cols[0];
     let right_area = cols[1];
 
+    let maximized = app.data.terminal.is_showing() && app.data.terminal.maximized;
+    let detail_pct = app.ui.detail_pct;
     let right_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if app.data.terminal.is_showing() {
-            vec![Constraint::Percentage(60), Constraint::Percentage(40)]
+        .constraints(if maximized {
+            vec![Constraint::Percentage(100)]
+        } else if app.data.terminal.is_showing() {
+            vec![
+                Constraint::Percentage(detail_pct),
+                Constraint::Percentage(100u16.saturating_sub(detail_pct)),
+            ]
         } else {
             vec![Constraint::Percentage(100)]
         })
@@ -120,14 +138,20 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
 
     if app.data.terminal.is_showing() {
-        let terminal_area = right_chunks[1];
+        let terminal_area = if maximized {
+            right_chunks[0]
+        } else {
+            right_chunks[1]
+        };
+        let active_idx = app.data.terminal.active_idx;
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
         terminal_panel.render(
             f,
             terminal_area,
-            &app.data.terminal.sessions,
-            app.data.terminal.active_idx,
+            &mut app.data.terminal.sessions,
+            active_idx,
             terminal_focused,
+            resize_mode,
         );
     }
 
@@ -138,13 +162,16 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         app.data.selected,
         app.is_root,
         list_focused,
+        resize_mode,
     );
-    app.ui
-        .detail_panel
-        .render_with_data(f, detail_area, &mut app.data);
+    if !maximized {
+        app.ui
+            .detail_panel
+            .render_with_data(f, detail_area, &mut app.data, resize_mode);
+    }
 }
 
-// ── Status bar ────────────────────────────────────────────────────────────────
+// Status bar
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let line = if let Some((msg, level)) = &app.ui.status_message {
@@ -157,6 +184,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::raw("  "),
             Span::styled(msg.as_str(), Style::default().fg(color)),
+        ])
+    } else if app.ui.resize_mode == crate::app::ResizeMode::Active {
+        Line::from(vec![
+            kspan("[Esc/R/q]"),
+            hspan(" exit resize "),
+            kspan("[←/h →/l]"),
+            hspan(" list width "),
+            kspan("[↓/j ↑/k]"),
+            hspan(" detail/terminal height"),
         ])
     } else {
         match app.ui.active_panel {
@@ -177,6 +213,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" refresh "),
                 kspan("[t]"),
                 hspan(" terminal "),
+                kspan("[D]"),
+                hspan(" delete "),
                 kspan("[?]"),
                 hspan(" help "),
                 kspan("[q]"),
@@ -215,11 +253,18 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         hspan(" switch tabs"),
                     ])
                 } else {
+                    let t_label = if app.data.terminal.maximized {
+                        " restore split "
+                    } else {
+                        " maximize "
+                    };
                     Line::from(vec![
                         kspan("[i/⏎/Alt+x]"),
                         hspan(" insert mode "),
                         kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs "),
+                        kspan("[T]"),
+                        hspan(t_label),
                         kspan("[t]"),
                         hspan(" hide "),
                         kspan("[x]"),
@@ -242,7 +287,7 @@ fn hspan(s: &'static str) -> Span<'static> {
     Span::styled(s, Style::default().fg(Color::DarkGray))
 }
 
-// ── Help overlay ──────────────────────────────────────────────────────────────
+// Help overlay
 
 fn render_help(f: &mut Frame) {
     let area = centered_rect(50, 85, f.area());
@@ -267,12 +312,14 @@ fn render_help(f: &mut Frame) {
         Line::from(""),
         hrow("s    ", "Start container  [root]"),
         hrow("S    ", "Poweroff container [root]"),
+        hrow("D    ", "Delete container [root]"),
         hrow("x / ⏎", "Actions / Power menu  [root]"),
         Line::from(""),
         hrow("n    ", "New container / Import wizard  [root]"),
         Line::from(""),
         hrow("Tab  ", "Toggle focus: list ↔ detail panel"),
         hrow("r    ", "Refresh list"),
+        hrow("R    ", "Enter resize mode"),
         hrow("?    ", "Toggle help"),
         hrow("q    ", "Quit"),
         Line::from(""),

@@ -60,12 +60,16 @@ pub struct PropertyGroup {
     pub properties: std::collections::HashMap<String, String>,
 }
 
+pub const GROUP_MACHINE: &str = "Machine";
+pub const GROUP_SYSTEMD_UNIT: &str = "Systemd Unit";
+pub const GROUP_DEPENDENCIES: &str = "Dependencies";
+
 impl PropertyGroup {
     pub fn display_priority(&self) -> u8 {
         match self.name.as_str() {
-            "Machine" => 0,
-            "Systemd Unit" => 1,
-            "Dependencies" => 10,
+            GROUP_MACHINE => 0,
+            GROUP_SYSTEMD_UNIT => 1,
+            GROUP_DEPENDENCIES => 10,
             _ => 5,
         }
     }
@@ -88,7 +92,7 @@ pub const IMPORTANT_KEYS: &[&str] = &[
 /// Strongly-typed properties for a machine/container.
 #[derive(Debug, Clone, Default)]
 pub struct MachineProperties {
-    /// Grouped properties (e.g., "Machine", "Systemd Unit", "Dependencies").
+    /// Grouped properties (e.g., GROUP_MACHINE, GROUP_SYSTEMD_UNIT, GROUP_DEPENDENCIES).
     pub groups: Vec<PropertyGroup>,
     // Placeholders for future metrics
     #[allow(dead_code)]
@@ -235,7 +239,7 @@ mod tests {
     fn test_property_group_priority() {
         assert_eq!(
             PropertyGroup {
-                name: "Machine".into(),
+                name: GROUP_MACHINE.into(),
                 properties: Default::default()
             }
             .display_priority(),
@@ -243,7 +247,7 @@ mod tests {
         );
         assert_eq!(
             PropertyGroup {
-                name: "Systemd Unit".into(),
+                name: GROUP_SYSTEMD_UNIT.into(),
                 properties: Default::default()
             }
             .display_priority(),
@@ -251,7 +255,7 @@ mod tests {
         );
         assert_eq!(
             PropertyGroup {
-                name: "Dependencies".into(),
+                name: GROUP_DEPENDENCIES.into(),
                 properties: Default::default()
             }
             .display_priority(),
@@ -278,9 +282,9 @@ mod tests {
     #[test]
     fn test_machine_properties_summary() {
         let mut props = MachineProperties::default();
-        props.insert("Machine", "Name".to_string(), "test".to_string());
-        props.insert("Machine", "State".to_string(), "running".to_string());
-        props.insert("Machine", "Unknown".to_string(), "val".to_string());
+        props.insert(GROUP_MACHINE, "Name".to_string(), "test".to_string());
+        props.insert(GROUP_MACHINE, "State".to_string(), "running".to_string());
+        props.insert(GROUP_MACHINE, "Unknown".to_string(), "val".to_string());
 
         let summary = props.get_summary();
         assert_eq!(summary.len(), 2);
@@ -291,8 +295,12 @@ mod tests {
     #[test]
     fn test_machine_properties_summary_no_important_keys() {
         let mut props = MachineProperties::default();
-        props.insert("Machine", "SomeRandom".to_string(), "val".to_string());
-        props.insert("Machine", "AnotherRandom".to_string(), "val2".to_string());
+        props.insert(GROUP_MACHINE, "SomeRandom".to_string(), "val".to_string());
+        props.insert(
+            GROUP_MACHINE,
+            "AnotherRandom".to_string(),
+            "val2".to_string(),
+        );
 
         let summary = props.get_summary();
         assert!(summary.is_empty());
@@ -301,8 +309,8 @@ mod tests {
     #[test]
     fn test_get_group_mut_creates_once() {
         let mut props = MachineProperties::default();
-        props.get_group_mut("Machine");
-        props.get_group_mut("Machine");
+        props.get_group_mut(GROUP_MACHINE);
+        props.get_group_mut(GROUP_MACHINE);
         // Should only create the group once
         assert_eq!(props.groups.len(), 1);
     }
