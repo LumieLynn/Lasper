@@ -22,6 +22,7 @@ impl ContainerListComponent {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render_with_data(
         &mut self,
         f: &mut Frame,

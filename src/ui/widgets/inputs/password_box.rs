@@ -41,7 +41,10 @@ impl Component for PasswordBox {
         let style = if self.base.error_msg.is_some() {
             Style::default().fg(Color::Red)
         } else {
-            Style::default().fg(crate::ui::widget_border_color(self.base.focused, self.base.enabled))
+            Style::default().fg(crate::ui::widget_border_color(
+                self.base.focused,
+                self.base.enabled,
+            ))
         };
 
         let title = if let Some(err) = &self.base.error_msg {

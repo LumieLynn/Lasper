@@ -50,7 +50,11 @@ impl TerminalPanel {
         let border_color = if resize_mode {
             crate::ui::panel_border_color(true, is_focused, Color::DarkGray)
         } else if is_focused {
-            if session.insert_mode { Color::Green } else { Color::Cyan }
+            if session.insert_mode {
+                Color::Green
+            } else {
+                Color::Cyan
+            }
         } else {
             Color::DarkGray
         };

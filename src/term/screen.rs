@@ -26,9 +26,10 @@ pub enum CharSet {
 }
 
 /// The xterm mouse handling mode currently in use.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 pub enum MouseProtocolMode {
     /// Mouse handling is disabled.
+    #[default]
     None,
 
     /// Mouse button events should be reported on button press. Also known as
@@ -56,12 +57,6 @@ pub enum MouseProtocolMode {
     /// On/off: `CSI ? 1003 h` / `CSI ? 1003 l`
     AnyMotion,
     // DecLocator,
-}
-
-impl Default for MouseProtocolMode {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// The encoding to use for the enabled `MouseProtocolMode`.
@@ -1028,11 +1023,7 @@ impl Screen {
             }
             ("", _, "", b'm') => {
                 let mut params = params.split(';');
-                loop {
-                    let p = match params.next() {
-                        Some(p) => p,
-                        None => break,
-                    };
+                while let Some(p) = params.next() {
                     match p.parse().unwrap_or(0) {
                         0 => {
                             // Reset

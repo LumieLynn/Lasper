@@ -252,9 +252,7 @@ impl Component for NetworkStepView {
         if self.port_list.is_focused() {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    return EventResult::Message(AppMessage::Wizard(
-                        WizardMessage::OpenPortDialog,
-                    ));
+                    return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenPortDialog));
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     if let Some(pf) = self.port_list.selected_item() {

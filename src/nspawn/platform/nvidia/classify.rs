@@ -133,7 +133,7 @@ pub fn parse_symlink_hooks(hooks: &[CdiHook]) -> Vec<SymlinkEntry> {
             .args
             .as_ref()
             .and_then(|a| a.get(1))
-            .map_or(false, |op| op == "create-symlinks")
+            .is_some_and(|op| op == "create-symlinks")
         {
             if let Some(args) = &hook.args {
                 let mut i = 0;
@@ -167,7 +167,7 @@ pub fn parse_ldcache_folders(hooks: &[CdiHook]) -> Vec<String> {
             .args
             .as_ref()
             .and_then(|a| a.get(1))
-            .map_or(false, |op| op == "update-ldcache")
+            .is_some_and(|op| op == "update-ldcache")
         {
             if let Some(args) = &hook.args {
                 let mut i = 0;

@@ -76,6 +76,10 @@ jobs:
         if: ${{ !matrix.zig }}
         run: cargo build --release
 
+      - name: Install target
+        if: ${{ matrix.zig }}
+        run: rustup target add ${{ matrix.target }}
+
       - name: Build (musl)
         if: ${{ matrix.zig }}
         run: cargo zigbuild --release --target ${{ matrix.target }}

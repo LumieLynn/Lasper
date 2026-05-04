@@ -220,50 +220,56 @@ impl Wizard {
                     StepAction::None
                 }
                 WizardMessage::OpenUserDialog => {
-                    let mut editor = crate::ui::widgets::dialogs::user_editor::UserEditor::new(
-                        |u| AppMessage::Wizard(WizardMessage::UserAdded(u)),
-                    );
+                    let mut editor =
+                        crate::ui::widgets::dialogs::user_editor::UserEditor::new(|u| {
+                            AppMessage::Wizard(WizardMessage::UserAdded(u))
+                        });
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenUserEditDialog(idx, ref user) => {
                     let idx = *idx;
-                    let mut editor = crate::ui::widgets::dialogs::user_editor::UserEditor::new(
-                        move |u| AppMessage::Wizard(WizardMessage::UserUpdated(idx, u)),
-                    )
-                    .with_user(user);
+                    let mut editor =
+                        crate::ui::widgets::dialogs::user_editor::UserEditor::new(move |u| {
+                            AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
+                        })
+                        .with_user(user);
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenPortDialog => {
-                    let mut editor = crate::ui::widgets::dialogs::port_mapping::PortMappingBox::new(
-                        |p| AppMessage::Wizard(WizardMessage::PortForwardAdded(p)),
-                    );
+                    let mut editor =
+                        crate::ui::widgets::dialogs::port_mapping::PortMappingBox::new(|p| {
+                            AppMessage::Wizard(WizardMessage::PortForwardAdded(p))
+                        });
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenPortEditDialog(idx, ref pf) => {
                     let idx = *idx;
-                    let mut editor = crate::ui::widgets::dialogs::port_mapping::PortMappingBox::new(
-                        move |p| AppMessage::Wizard(WizardMessage::PortForwardUpdated(idx, p)),
-                    )
-                    .with_port(pf);
+                    let mut editor =
+                        crate::ui::widgets::dialogs::port_mapping::PortMappingBox::new(move |p| {
+                            AppMessage::Wizard(WizardMessage::PortForwardUpdated(idx, p))
+                        })
+                        .with_port(pf);
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenBindDialog => {
-                    let mut editor = crate::ui::widgets::dialogs::bind_mount::BindMountBox::new(
-                        |b| AppMessage::Wizard(WizardMessage::BindMountAdded(b)),
-                    );
+                    let mut editor =
+                        crate::ui::widgets::dialogs::bind_mount::BindMountBox::new(|b| {
+                            AppMessage::Wizard(WizardMessage::BindMountAdded(b))
+                        });
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenBindEditDialog(idx, ref bm) => {
                     let idx = *idx;
-                    let mut editor = crate::ui::widgets::dialogs::bind_mount::BindMountBox::new(
-                        move |b| AppMessage::Wizard(WizardMessage::BindMountUpdated(idx, b)),
-                    )
-                    .with_mount(bm);
+                    let mut editor =
+                        crate::ui::widgets::dialogs::bind_mount::BindMountBox::new(move |b| {
+                            AppMessage::Wizard(WizardMessage::BindMountUpdated(idx, b))
+                        })
+                        .with_mount(bm);
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }

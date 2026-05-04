@@ -379,13 +379,15 @@ impl App {
             );
             return;
         }
-        self.ui.delete_dialog = Some(crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
-            "Delete Container",
-            format!(
-                "Delete '{}' and all its data?\nThis cannot be undone.",
-                entry.name
+        self.ui.delete_dialog = Some(
+            crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                "Delete Container",
+                format!(
+                    "Delete '{}' and all its data?\nThis cannot be undone.",
+                    entry.name
+                ),
             ),
-        ));
+        );
     }
 }
 

@@ -80,9 +80,7 @@ impl Component for UserStepView {
         if self.user_list.is_focused() {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    return EventResult::Message(AppMessage::Wizard(
-                        WizardMessage::OpenUserDialog,
-                    ));
+                    return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenUserDialog));
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     if let Some(user) = self.user_list.selected_item() {

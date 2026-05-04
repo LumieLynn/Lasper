@@ -78,9 +78,7 @@ impl Component for DevicesStepView {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => {
-                return EventResult::Message(AppMessage::Wizard(
-                    WizardMessage::OpenBindDialog,
-                ));
+                return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenBindDialog));
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
                 if let Some(bm) = self.bind_list.selected_item() {

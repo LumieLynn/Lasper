@@ -350,7 +350,10 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
         }
         for bm in &cfg.bind_mounts {
             if bm.readonly {
-                files.append("BindReadOnly", format!("{}:{}{}", bm.source, bm.target, bm.suffix));
+                files.append(
+                    "BindReadOnly",
+                    format!("{}:{}{}", bm.source, bm.target, bm.suffix),
+                );
             } else {
                 files.append("Bind", format!("{}:{}{}", bm.source, bm.target, bm.suffix));
             }
