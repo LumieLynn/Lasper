@@ -1,9 +1,10 @@
-use crate::nspawn::models::BindMount;
+use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
+use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -18,6 +19,7 @@ macro_rules! active_comps {
             &mut $self.source_path,
             &mut $self.target_path,
             &mut $self.readonly,
+            &mut $self.suffix,
             &mut $self.btn_ok,
             &mut $self.btn_cancel,
         ];
@@ -29,6 +31,7 @@ pub struct BindMountBox {
     source_path: PathBox,
     target_path: PathBox,
     readonly: Checkbox,
+    suffix: RadioGroup,
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
@@ -63,6 +66,17 @@ impl BindMountBox {
                     Ok(())
                 }),
             readonly: Checkbox::new("Read Only", false),
+            suffix: RadioGroup::new(
+                "ID Mapping",
+                vec![
+                    "None".to_string(),
+                    "noidmap".to_string(),
+                    "idmap".to_string(),
+                    "rootidmap".to_string(),
+                    "owneridmap".to_string(),
+                ],
+                0,
+            ),
             btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
             btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
 
@@ -114,6 +128,17 @@ impl BindMountBox {
                 Ok(())
             });
         self.readonly = Checkbox::new("Read Only", bm.readonly);
+        self.suffix = RadioGroup::new(
+            "ID Mapping",
+            vec![
+                "None".to_string(),
+                "noidmap".to_string(),
+                "idmap".to_string(),
+                "rootidmap".to_string(),
+                "owneridmap".to_string(),
+            ],
+            bm.suffix.to_index(),
+        );
         self.update_focus();
         self
     }
@@ -138,13 +163,14 @@ impl BindMountBox {
             source,
             target,
             readonly: self.readonly.checked(),
+            suffix: IdmapSuffix::from_index(self.suffix.selected_idx()),
         }))
     }
 }
 
 impl Component for BindMountBox {
     fn render(&mut self, f: &mut Frame, area: Rect) {
-        let dialog_area = crate::ui::centered_rect(45, 45, area);
+        let dialog_area = crate::ui::centered_rect(45, 55, area);
         f.render_widget(Clear, dialog_area);
         let block = Block::default()
             .borders(Borders::ALL)
@@ -160,6 +186,7 @@ impl Component for BindMountBox {
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
+                Constraint::Length(3),
                 Constraint::Min(0),
                 Constraint::Length(3),
             ])
@@ -168,11 +195,12 @@ impl Component for BindMountBox {
         self.source_path.render(f, chunks[0]);
         self.target_path.render(f, chunks[1]);
         self.readonly.render(f, chunks[2]);
+        self.suffix.render(f, chunks[3]);
 
         let btn_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[4]);
+            .split(chunks[5]);
 
         let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
         let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
@@ -230,12 +258,16 @@ impl Component for BindMountBox {
             self.source_path.set_focus(false);
             self.target_path.set_focus(false);
             self.readonly.set_focus(false);
+            self.suffix.set_focus(false);
             self.btn_ok.set_focus(false);
             self.btn_cancel.set_focus(false);
         }
     }
 
     fn is_focused(&self) -> bool {
-        self.source_path.is_focused() || self.target_path.is_focused() || self.readonly.is_focused()
+        self.source_path.is_focused()
+            || self.target_path.is_focused()
+            || self.readonly.is_focused()
+            || self.suffix.is_focused()
     }
 }

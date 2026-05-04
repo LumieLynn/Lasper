@@ -28,12 +28,68 @@ pub struct PortForward {
     pub proto: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum IdmapSuffix {
+    #[default]
+    None,
+    Noidmap,
+    Idmap,
+    Rootidmap,
+    Owneridmap,
+}
+
+impl IdmapSuffix {
+    pub fn to_index(&self) -> usize {
+        match self {
+            IdmapSuffix::None => 0,
+            IdmapSuffix::Noidmap => 1,
+            IdmapSuffix::Idmap => 2,
+            IdmapSuffix::Rootidmap => 3,
+            IdmapSuffix::Owneridmap => 4,
+        }
+    }
+
+    pub fn from_index(idx: usize) -> Self {
+        match idx {
+            1 => IdmapSuffix::Noidmap,
+            2 => IdmapSuffix::Idmap,
+            3 => IdmapSuffix::Rootidmap,
+            4 => IdmapSuffix::Owneridmap,
+            _ => IdmapSuffix::None,
+        }
+    }
+
+    pub fn label(&self) -> &str {
+        match self {
+            IdmapSuffix::None => "None",
+            IdmapSuffix::Noidmap => "noidmap",
+            IdmapSuffix::Idmap => "idmap",
+            IdmapSuffix::Rootidmap => "rootidmap",
+            IdmapSuffix::Owneridmap => "owneridmap",
+        }
+    }
+}
+
+impl std::fmt::Display for IdmapSuffix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IdmapSuffix::None => write!(f, ""),
+            IdmapSuffix::Noidmap => write!(f, ":noidmap"),
+            IdmapSuffix::Idmap => write!(f, ":idmap"),
+            IdmapSuffix::Rootidmap => write!(f, ":rootidmap"),
+            IdmapSuffix::Owneridmap => write!(f, ":owneridmap"),
+        }
+    }
+}
+
 /// A host path to bind-mount into the container.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BindMount {
     pub source: String,
     pub target: String,
     pub readonly: bool,
+    #[serde(default)]
+    pub suffix: IdmapSuffix,
 }
 
 /// User configuration to be applied after the container is bootstrapped.
@@ -86,6 +142,8 @@ pub struct ContainerConfig {
     pub readonly_binds: Vec<String>,
     /// Whether to grant all capabilities (privileged mode).
     pub privileged: bool,
+    /// Explicit PrivateUsers setting. None = auto-detect, Some(true) = yes, Some(false) = no.
+    pub private_users: Option<String>,
     /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
     pub graphics_acceleration: bool,
     pub root_password: Option<String>,
@@ -116,6 +174,7 @@ impl Default for ContainerConfig {
             device_binds: Default::default(),
             readonly_binds: Default::default(),
             privileged: Default::default(),
+            private_users: None,
             graphics_acceleration: Default::default(),
             root_password: Default::default(),
             users: Default::default(),
@@ -136,6 +195,26 @@ mod tests {
         let cfg = ContainerConfig::default();
         assert!(cfg.boot);
         assert_eq!(cfg.network, None);
+        assert_eq!(cfg.private_users, None);
+    }
+
+    #[test]
+    fn test_idmap_suffix_display() {
+        assert_eq!(IdmapSuffix::None.to_string(), "");
+        assert_eq!(IdmapSuffix::Idmap.to_string(), ":idmap");
+        assert_eq!(IdmapSuffix::Noidmap.to_string(), ":noidmap");
+        assert_eq!(IdmapSuffix::Rootidmap.to_string(), ":rootidmap");
+        assert_eq!(IdmapSuffix::Owneridmap.to_string(), ":owneridmap");
+    }
+
+    #[test]
+    fn test_idmap_suffix_from_index() {
+        assert_eq!(IdmapSuffix::from_index(0), IdmapSuffix::None);
+        assert_eq!(IdmapSuffix::from_index(1), IdmapSuffix::Noidmap);
+        assert_eq!(IdmapSuffix::from_index(2), IdmapSuffix::Idmap);
+        assert_eq!(IdmapSuffix::from_index(3), IdmapSuffix::Rootidmap);
+        assert_eq!(IdmapSuffix::from_index(4), IdmapSuffix::Owneridmap);
+        assert_eq!(IdmapSuffix::from_index(99), IdmapSuffix::None);
     }
 
     #[test]

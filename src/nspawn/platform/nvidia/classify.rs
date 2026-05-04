@@ -115,6 +115,7 @@ pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<Bind
                 source: m.host_path,
                 target: m.container_path,
                 readonly: true,
+                suffix: Default::default(),
             });
         }
     }

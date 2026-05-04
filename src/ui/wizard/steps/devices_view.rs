@@ -1,4 +1,4 @@
-use crate::nspawn::models::BindMount;
+use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
@@ -25,11 +25,17 @@ impl DevicesStepView {
                 " Configured Bind Mounts ",
                 initial_data.bind_mounts.clone(),
                 |bm| {
+                    let suffix_display = if bm.suffix == IdmapSuffix::None {
+                        String::new()
+                    } else {
+                        format!(" [{}]", bm.suffix.label())
+                    };
                     format!(
-                        "  {}:{} ({})",
+                        "  {}:{} ({}){}",
                         bm.source,
                         bm.target,
-                        if bm.readonly { "ro" } else { "rw" }
+                        if bm.readonly { "ro" } else { "rw" },
+                        suffix_display
                     )
                 },
                 |idx| AppMessage::Wizard(WizardMessage::BindMountRemoved(idx)),

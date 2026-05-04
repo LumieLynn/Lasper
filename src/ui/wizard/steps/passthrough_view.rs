@@ -48,6 +48,7 @@ macro_rules! active_comps {
         }
 
         comps.push(&mut $self.privileged);
+        comps.push(&mut $self.private_users);
         comps
     }};
 }
@@ -70,6 +71,7 @@ pub struct PassthroughStepView {
     nvidia_inject_env: Checkbox,
 
     privileged: Checkbox,
+    private_users: RadioGroup,
     privilege_warning: TextBlock,
     scanning_indicator: TextBlock,
     focus: FocusTracker,
@@ -227,6 +229,22 @@ impl PassthroughStepView {
             ),
 
             privileged: Checkbox::new("Privileged Mode (NOT RECOMMENDED)", initial_data.privileged),
+            private_users: RadioGroup::new(
+                "PrivateUsers (User Namespace)",
+                vec![
+                    "Default (systemd)".to_string(),
+                    "pick".to_string(),
+                    "Enabled (yes)".to_string(),
+                    "Disabled (no)".to_string(),
+                ],
+                match &initial_data.private_users {
+                    None => 0,
+                    Some(v) if v == "pick" => 1,
+                    Some(v) if v == "yes" => 2,
+                    Some(v) if v == "no" => 3,
+                    _ => 0,
+                },
+            ),
             privilege_warning: TextBlock::new("SECURITY RISK", warning_text),
             scanning_indicator: TextBlock::new(
                 " SCANNING ",
@@ -284,6 +302,7 @@ impl Component for PassthroughStepView {
         }
 
         visual_items.push((&mut self.privileged, 3));
+        visual_items.push((&mut self.private_users, 3));
         if is_privileged {
             visual_items.push((&mut self.privilege_warning, 5));
         }
@@ -422,6 +441,13 @@ impl StepComponent for PassthroughStepView {
         ctx.passthrough.graphics_acceleration = self.graphics_acceleration.checked();
         ctx.passthrough.nvidia_gpu = self.nvidia_gpu.checked();
         ctx.passthrough.privileged = self.privileged.checked();
+        ctx.passthrough.private_users = match self.private_users.selected_idx() {
+            0 => None,
+            1 => Some("pick".into()),
+            2 => Some("yes".into()),
+            3 => Some("no".into()),
+            _ => None,
+        };
 
         let mut selected_nodes = Vec::new();
         if self.graphics_acceleration.checked() {

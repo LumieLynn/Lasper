@@ -162,6 +162,7 @@ impl NetworkState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
     pub privileged: bool,
+    pub private_users: Option<String>,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub discovered_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
@@ -192,6 +193,7 @@ impl PassthroughState {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: self.selected_gpu_nodes.clone(),
             privileged: self.privileged,
+            private_users: self.private_users.clone(),
             graphics_acceleration: self.graphics_acceleration,
             wayland_socket: if is_host_nw {
                 self.wayland_socket.clone()
@@ -339,6 +341,7 @@ impl WizardContext {
             },
             passthrough: PassthroughState {
                 privileged: false,
+                private_users: None,
                 graphics_acceleration: false,
                 wayland_socket: None,
                 discovered_gpus,
@@ -466,6 +469,7 @@ mod tests {
     fn test_passthrough_config_logic() {
         let state = PassthroughState {
             privileged: true,
+            private_users: None,
             graphics_acceleration: true,
             wayland_socket: Some("wayland-0".into()),
             discovered_gpus: vec![],
