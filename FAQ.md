@@ -6,8 +6,8 @@ A: `systemd-nspawn` is a lightweight container engine that uses Linux namespaces
 **Q: Why I can't creat containers via bootstraps?** 
 A: Ensure that you've installed the correct keyring for your distribution. For example, creating an Arch Linux container needs to install `archlinux-keyring` package. It's the same as creating a container via `debootstrap` on Debian/Ubuntu.
 
-**Q: How should I remove the container?** 
-A: You can use `sudo machinectl remove <container_name>` to remove a container. Due to some permission settngs, lasper creates some systemd configuration files in `/etc/systemd/system/` to ensure the correct `rw` mount for GPU passthrough. You may need to remove them manually. Future updates will add options for configurating the configuration files' path (continuously in `/etc/systemd/system` or temporarily in `/run/systemd/system`) and a better delete method. 
+**Q: How should I remove the container?**
+A: Press `D` in the container list to delete a stopped container via the confirmation dialog. You can also use `sudo machinectl remove <container_name>`. Lasper creates systemd configuration files in `/etc/systemd/system/` for GPU passthrough (`10-lasper-nvidia.conf`); these are not automatically cleaned up and may need manual removal. 
 
 **Q: Why can't the container created from an OCI image start?**  
 A: See [CAVEATS.md](CAVEATS.md) for details. In containers created by lasper via OCI images, it defaultly sets `boot=no` due to the lack of init program and systembus in OCI images. Setting passwords and users may fail when deploying due to some permission error. You can try to start the container manually with `sudo systemd-nspawn -D /var/lib/machines/<container_name>` and install a proper init program like systemd, and a systembus daemon like dbus. After doing these, don't forget to set `boot=yes` in your `.nspawn` config if you want to use the container with `machinectl`.
@@ -30,3 +30,6 @@ A: Not yet. In current version, the container directory is hardcoded to `/var/li
 
 **Q: Can I specify a bootstrap installer other than `pacstrap` or `debootstrap`?**  
 A: Not yet. Future plans include supporting more bootstrap tools and custom installation scripts.
+
+**Q: Why can I start a program on Wayland, but not on X11?**
+A: Lasper passes both Wayland and X11 sockets directly into the container. By default, socket bind mounts use an `:idmap` suffix and `PrivateUsers` is left at systemd's default (`pick`). This remaps UIDs inside the container's user namespace, but the X server on the host checks the real UID — causing an authorization mismatch. Setting `PrivateUsers=no` resolves this (remember to change the suffix to `:noidmap` or just delete it). Be aware that disabling PrivateUsers weakens container isolation; make sure you understand the security trade-off. Alternatively, running a nested Wayland desktop inside the container sidesteps the X11 auth problem entirely.

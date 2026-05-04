@@ -13,9 +13,13 @@ Lasper primarily communicates with `systemd` via DBus for state detection and ma
 - **CLI Fallback**: Lasper maintains a fallback mechanism that parses `machinectl` and `journalctl` stdout if DBus is unavailable (e.g., non-root access or environment issues). CLI parsing remains fragile to upstream format changes.
 
 ## 3. NVIDIA GPU Passthrough
-Currently, Lasper uses `nvidia-container-toolkit` to generate CDI spec files for NVIDIA GPU passthrough. Defaultly, the NVIDIA passthrough passes all the NVIDIA GPU to the containers, a flexible multi-GPU passthrough method is still needs to be considered.
+Lasper uses `nvidia-container-toolkit` to generate CDI spec files for NVIDIA GPU passthrough. CDI provides the official mapping of devices, mounts, symlinks, and ldconfig folders for the host's driver installation.
 
-In the current version, Lasper passes GPU libraries and devices directly to containers without remapping their directory structure. This can cause compatibility issues if the host and container have different library paths. Future updates will add support for choosing a customised passthrough path for NVIDIA drivers.
+**Passthrough modes:**
+- **Mirror**: Driver files are bind-mounted into the container at their original host paths. Simplest option, works when host and container share the same library layout.
+- **Categorized**: Driver files are remapped to user-configured destination directories per category (libraries, binaries, firmware, etc.). Use this when host and container have incompatible directory structures.
+
+**GPU selection:** By default, all GPUs are passed through. A specific GPU can be selected via the wizard by its device ID (e.g. `GPU-<uuid>` or numeric index).
 
 ## 4. Wayland Socket Passthrough
 When wayland socket passthrough is enabled, lasper will let user to choose which socket to passthrough. What you need to notice is that the socket is passed to the `/mnt ` directory inside the container with the name of `wayland-socket`. A script called `.wayland-env` will write into the home directory of the user you created. Based on the login shell you configured for each user, it adds "source" for the `.wayland-env` file (supports bash, zsh, fish). This script links the wayland socket to `$XDG_RUNTIME_DIR/wayland-socket` and sets the variable `WAYLAND_DISPLAY` and `DISPLAY`. You can run Firefox to ensure the socket is successfully passed.
