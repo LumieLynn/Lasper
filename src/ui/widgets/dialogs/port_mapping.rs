@@ -1,16 +1,9 @@
 use crate::nspawn::models::PortForward;
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+use crate::ui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::number_box::NumberBox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, BorderType, Borders, Clear},
-    Frame,
-};
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -66,23 +59,6 @@ impl PortMappingBox {
         self
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let comps = active_comps!(self);
-        self.focus.next(&comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let comps = active_comps!(self);
-        self.focus.prev(&comps);
-        self.update_focus();
-    }
-
     fn try_submit(&mut self) -> Option<AppMessage> {
         let mut valid = true;
         if self.host_port.validate().is_err() {
@@ -107,96 +83,4 @@ impl PortMappingBox {
     }
 }
 
-impl Component for PortMappingBox {
-    fn render(&mut self, f: &mut Frame, area: Rect) {
-        let dialog_area = crate::ui::centered_rect(30, 40, area);
-        f.render_widget(Clear, dialog_area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Add Port Forward ")
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner = block.inner(dialog_area);
-        f.render_widget(block, dialog_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(inner);
-
-        self.host_port.render(f, chunks[0]);
-        self.container_port.render(f, chunks[1]);
-        self.protocol.render(f, chunks[2]);
-
-        let btn_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[4]);
-
-        let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
-        let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
-        self.btn_ok.render(f, ok_area);
-        self.btn_cancel.render(f, cancel_area);
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
-                return if let Some(msg) = self.try_submit() {
-                    EventResult::Message(msg)
-                } else {
-                    EventResult::Consumed
-                };
-            }
-            _ => {}
-        }
-
-        let mut comps = active_comps!(self);
-        let res = comps[self.focus.active_idx].handle_key(key);
-        match res {
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
-                if let Some(msg) = self.try_submit() {
-                    EventResult::Message(msg)
-                } else {
-                    EventResult::Consumed
-                }
-            }
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => res,
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
-        }
-    }
-
-    fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.host_port.set_focus(false);
-            self.container_port.set_focus(false);
-            self.protocol.set_focus(false);
-            self.btn_ok.set_focus(false);
-            self.btn_cancel.set_focus(false);
-        }
-    }
-}
+form_dialog!(PortMappingBox, " Add Port Forward ", (30, 40), [host_port, container_port, protocol]);
