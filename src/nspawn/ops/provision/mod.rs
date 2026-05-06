@@ -233,15 +233,19 @@ async fn run_deploy_internal(
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
 
-            // Save profile if we have one so it's persisted for lifecycle later
+            // Save profile so lifecycle.rs can reload it on container start
             if let Some(prof) = &nvidia_profile {
                 let _ = prof.save(&name).await;
             }
 
-            if let Ok(mut state) = crate::nspawn::platform::nvidia::get_nvidia_state(nvidia_profile.as_ref()).await {
-                if let Some(prof) = &nvidia_profile {
-                    crate::nspawn::platform::nvidia::lifecycle::apply_category_remapping(&mut state, prof);
-                }
+            // Run initial CDI discovery to seed the .nspawn config and state.
+            // Remapping is applied inside get_nvidia_state after CDI + ldconfig collection.
+            if let Ok(state) = crate::nspawn::platform::nvidia::get_nvidia_state(
+                nvidia_profile.as_ref(),
+            )
+            .await
+            {
+                // Write .nspawn markers from initial state
                 match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::apply_gpu_passthrough_to_content(
                     nspawn_content.clone(),
                     &state,
@@ -257,6 +261,24 @@ async fn run_deploy_internal(
                         ));
                     }
                 }
+
+                // Persist initial state for lifecycle diffing
+                if let Err(e) =
+                    crate::nspawn::platform::nvidia::state::save_external_state(&name, &state).await
+                {
+                    push_log!(format!("WARNING: Failed to save NVIDIA state: {}", e));
+                }
+
+                // Write ld.so.conf.d and env vars into rootfs (one-time setup)
+                if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
+                    &name, &state,
+                )
+                .await
+                {
+                    push_log!(format!("WARNING: Failed to inject NVIDIA env/ldconfig: {}", e));
+                }
+            } else {
+                push_log!("WARNING: NVIDIA CDI discovery failed. GPU passthrough will be retried on container start.".to_string());
             }
         }
 

@@ -25,7 +25,7 @@ pub(crate) struct CdiEdits {
     pub(crate) env: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub(crate) struct CdiHook {
@@ -34,7 +34,7 @@ pub(crate) struct CdiHook {
     pub(crate) args: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub(crate) struct CdiDeviceNode {
@@ -46,7 +46,7 @@ pub(crate) struct CdiDeviceNode {
     pub(crate) gid: Option<u32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub(crate) struct CdiMount {

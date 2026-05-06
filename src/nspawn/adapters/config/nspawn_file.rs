@@ -149,7 +149,7 @@ impl NspawnConfig {
     pub fn apply_gpu_passthrough_to_content(
         content: String,
         new_state: &crate::nspawn::platform::nvidia::NvidiaState,
-        _death_list: &[String], // No longer strictly needed for config update if using markers
+        _death_list: &[String],
     ) -> Result<String> {
         // 1. Purge existing block using markers (preserves everything else)
         let (clean_content, _extracted_deaths) = Self::purge_nvidia_block(&content)?;
@@ -159,20 +159,18 @@ impl NspawnConfig {
         if let Ok(conf) = Ini::load_from_str(&clean_content) {
             if let Some(files_section) = conf.section(Some("Files")) {
                 for (key, value) in files_section.iter() {
-                    if key == "Bind" && new_state.device_binds.iter().any(|v| v == value) {
-                        lines_to_remove.push(format!("Bind={}", value));
-                    }
-                    if key == "BindReadOnly" {
-                        let host_path = value.split(':').next().unwrap_or(value);
-                        let is_in_ro = new_state
-                            .readonly_binds
-                            .iter()
-                            .any(|v| v.split(':').next().unwrap_or(v) == host_path);
-                        let is_in_ce = new_state
-                            .classified_entries
-                            .iter()
-                            .any(|ce| ce.host_path == host_path);
-                        if is_in_ro || is_in_ce {
+                    let host_path = value.split(':').next().unwrap_or(value);
+                    let container_path = value.split(':').nth(1).unwrap_or(value);
+
+                    let is_in_binds = new_state
+                        .binds
+                        .iter()
+                        .any(|b| b.host_path == host_path || b.container_path == container_path);
+
+                    if (key == "Bind" || key == "BindReadOnly") && is_in_binds {
+                        if key == "Bind" {
+                            lines_to_remove.push(format!("Bind={}", value));
+                        } else {
                             lines_to_remove.push(format!("BindReadOnly={}", value));
                         }
                     }
@@ -189,27 +187,22 @@ impl NspawnConfig {
             });
         }
 
-        // 4. Build the new managed block
-        if !new_state.device_binds.is_empty()
-            || !new_state.readonly_binds.is_empty()
-            || !new_state.classified_entries.is_empty()
-        {
+        // 4. Build the new managed block from unified PassthroughBind list
+        if !new_state.binds.is_empty() {
             let mut block = Vec::new();
             block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
-            for dev in &new_state.device_binds {
-                block.push(format!("Bind={}", dev));
-            }
-            for ro in &new_state.readonly_binds {
-                block.push(format!("BindReadOnly={}", ro));
-            }
-            for ce in &new_state.classified_entries {
-                if ce.host_path == ce.default_container_path {
-                    block.push(format!("BindReadOnly={}", ce.host_path));
+            for bind in &new_state.binds {
+                if bind.readonly {
+                    if bind.host_path == bind.container_path {
+                        block.push(format!("BindReadOnly={}", bind.host_path));
+                    } else {
+                        block.push(format!(
+                            "BindReadOnly={}:{}",
+                            bind.host_path, bind.container_path
+                        ));
+                    }
                 } else {
-                    block.push(format!(
-                        "BindReadOnly={}:{}",
-                        ce.host_path, ce.default_container_path
-                    ));
+                    block.push(format!("Bind={}", bind.host_path));
                 }
             }
             block.push("X-Lasper-Nvidia-End=true".to_string());
@@ -221,7 +214,6 @@ impl NspawnConfig {
 
             match files_idx {
                 Some(idx) => {
-                    // Find end of [Files] section: next section header or EOF
                     let insert_at = result_lines
                         .iter()
                         .enumerate()
@@ -235,7 +227,6 @@ impl NspawnConfig {
                     }
                 }
                 None => {
-                    // No [Files] section exists — append one
                     result_lines.push(String::new());
                     result_lines.push("[Files]".to_string());
                     result_lines.extend(block);
@@ -713,10 +704,22 @@ mod tests {
 
     #[test]
     fn test_apply_gpu_passthrough_to_content() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
         let content = "[Exec]\nBoot=yes\n".to_string();
         let new_state = crate::nspawn::platform::nvidia::NvidiaState {
-            device_binds: vec!["/dev/nvidia0".to_string()],
-            readonly_binds: vec!["/usr/lib/libcuda.so".to_string()],
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/nvidia0".into(),
+                    readonly: false,
+                },
+                PassthroughBind {
+                    host_path: "/usr/lib/libcuda.so".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+            ],
             ..Default::default()
         };
 
@@ -731,9 +734,15 @@ mod tests {
 
     #[test]
     fn test_apply_gpu_appends_to_existing_files_section() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
         let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/home/user:/home/user\n".to_string();
         let new_state = crate::nspawn::platform::nvidia::NvidiaState {
-            device_binds: vec!["/dev/nvidia0".to_string()],
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
             ..Default::default()
         };
 
@@ -748,9 +757,15 @@ mod tests {
 
     #[test]
     fn test_apply_gpu_preserves_comments() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
         let content = "[Exec]\nBoot=yes\n# My custom comment\n".to_string();
         let new_state = crate::nspawn::platform::nvidia::NvidiaState {
-            device_binds: vec!["/dev/nvidia0".to_string()],
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
             ..Default::default()
         };
 
@@ -761,9 +776,15 @@ mod tests {
 
     #[test]
     fn test_apply_gpu_dedup_legacy_binds() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
         let content = "[Exec]\nBoot=yes\n\n[Files]\nBind=/dev/nvidia0\n".to_string();
         let new_state = crate::nspawn::platform::nvidia::NvidiaState {
-            device_binds: vec!["/dev/nvidia0".to_string()],
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
             ..Default::default()
         };
 
@@ -787,5 +808,32 @@ mod tests {
                 .unwrap();
         assert!(!updated.contains("[Files]"));
         assert!(!updated.contains("X-Lasper-Nvidia-Begin"));
+    }
+
+    #[test]
+    fn test_apply_gpu_with_symlink_as_bind() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content = "[Exec]\nBoot=yes\n".to_string();
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/host/libcuda.so.595.58.03".into(),
+                    container_path: "/usr/lib/libcuda.so.1".into(),
+                    readonly: true,
+                },
+                PassthroughBind {
+                    host_path: "/host/libcuda.so.595.58.03".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("BindReadOnly=/host/libcuda.so.595.58.03:/usr/lib/libcuda.so.1"));
+        assert!(updated.contains("BindReadOnly=/host/libcuda.so.595.58.03:/usr/lib/libcuda.so"));
     }
 }

@@ -67,44 +67,46 @@ pub struct SymlinkEntry {
     pub link_path: String,
 }
 
+/// Classify a single path by matching against well-known FHS subdirectories
+/// and file extensions. Returns `None` when the path doesn't match any category.
+pub fn classify_path(path: &str) -> Option<NvidiaFileCategory> {
+    let lower = path.to_lowercase();
+
+    if lower.ends_with(".json") {
+        Some(NvidiaFileCategory::Config)
+    } else if lower.ends_with(".so") || lower.contains(".so.") {
+        if lower.contains("xorg") || lower.contains("modules/drivers") {
+            Some(NvidiaFileCategory::Xorg)
+        } else if lower.contains("vdpau") {
+            Some(NvidiaFileCategory::Vdpau)
+        } else if lower.contains("gbm") {
+            Some(NvidiaFileCategory::Gbm)
+        } else if lower.contains("/lib32/")
+            || lower.contains("/i386-linux-gnu/")
+            || lower.contains("/i686/")
+        {
+            Some(NvidiaFileCategory::Lib32)
+        } else {
+            Some(NvidiaFileCategory::Lib64)
+        }
+    } else if lower.contains("/bin/") {
+        Some(NvidiaFileCategory::Bin)
+    } else if lower.contains("/lib/firmware/") {
+        Some(NvidiaFileCategory::Firmware)
+    } else {
+        None
+    }
+}
+
 /// Extracts classification results from CDI mounts.
+/// Classification uses `container_path` (where CDI intends the file to live)
+/// rather than `host_path` (which may be WSL-specific or non-FHS).
 pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<BindMount>) {
     let mut classified = Vec::new();
     let mut unclassified = Vec::new();
 
     for m in mounts {
-        let path = m.host_path.clone();
-        let lower = path.to_lowercase();
-
-        let category = if lower.ends_with(".json") {
-            Some(NvidiaFileCategory::Config)
-        } else if lower.ends_with(".so") || lower.contains(".so.") {
-            if lower.contains("xorg") || lower.contains("modules/drivers") {
-                Some(NvidiaFileCategory::Xorg)
-            } else if lower.contains("vdpau") {
-                Some(NvidiaFileCategory::Vdpau)
-            } else if lower.contains("gbm") {
-                Some(NvidiaFileCategory::Gbm)
-            } else if lower.contains("/lib32/")
-                || lower.contains("/i386-linux-gnu/")
-                || lower.contains("/i686/")
-            {
-                Some(NvidiaFileCategory::Lib32)
-            } else {
-                Some(NvidiaFileCategory::Lib64)
-            }
-        } else if lower.contains("/bin/") {
-            Some(NvidiaFileCategory::Bin)
-        } else if lower.contains("/lib/firmware/")
-            || lower.contains("/share/nvidia/")
-            || lower.ends_with(".bin")
-        {
-            Some(NvidiaFileCategory::Firmware)
-        } else {
-            None
-        };
-
-        if let Some(cat) = category {
+        if let Some(cat) = classify_path(&m.container_path) {
             classified.push(ClassifiedEntry {
                 host_path: m.host_path,
                 default_container_path: m.container_path,
@@ -406,6 +408,39 @@ mod tests {
         let folders = parse_ldcache_folders(&hooks);
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0], "/usr/lib");
+    }
+
+    #[test]
+    fn test_nvoptix_bin_not_firmware() {
+        // nvoptix.bin lives at /usr/share/nvidia/ on a standard install.
+        // It's a driver data file, not GSP firmware.
+        let mounts = vec![CdiMount {
+            host_path: "/usr/share/nvidia/nvoptix.bin".into(),
+            container_path: "/usr/share/nvidia/nvoptix.bin".into(),
+            options: None,
+        }];
+        let (classified, unclassified) = classify_mounts(mounts);
+        // Should NOT be Firmware — it ends in .bin but is not under /lib/firmware/
+        assert!(!classified
+            .iter()
+            .any(|e| e.category == NvidiaFileCategory::Firmware));
+        // Should fall through to unclassified since it's not a lib, not a bin, etc.
+        assert_eq!(unclassified.len(), 1);
+        assert_eq!(unclassified[0].source, "/usr/share/nvidia/nvoptix.bin");
+    }
+
+    #[test]
+    fn test_firmware_bin_still_classified() {
+        // GSP firmware under /lib/firmware/nvidia should still be Firmware
+        let mounts = vec![CdiMount {
+            host_path: "/lib/firmware/nvidia/595.58.03/gsp_ga10x.bin".into(),
+            container_path: "/lib/firmware/nvidia/595.58.03/gsp_ga10x.bin".into(),
+            options: None,
+        }];
+        let (classified, _) = classify_mounts(mounts);
+        assert!(classified
+            .iter()
+            .any(|e| e.category == NvidiaFileCategory::Firmware));
     }
 
     #[test]
