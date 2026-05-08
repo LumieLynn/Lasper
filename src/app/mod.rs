@@ -13,7 +13,7 @@ use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
 };
-use crate::ui::core::Component;
+use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
@@ -21,14 +21,6 @@ use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
 use std::io::Stdout;
 
 pub use terminal::TerminalManager;
-
-/// Which top-level panel has keyboard focus.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ActivePanel {
-    ContainerList,
-    DetailPanel,
-    TerminalPanel,
-}
 
 /// Whether the user is in panel resize mode (toggled by `R`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,8 +35,8 @@ pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
 
 pub struct AppUi {
-    pub active_panel: ActivePanel,
-    pub prev_active_panel: ActivePanel,
+    pub focus: FocusTracker,
+    pub prev_active_idx: usize,
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
@@ -71,8 +63,8 @@ pub struct AppUi {
 impl AppUi {
     pub fn new(_is_root: bool) -> Self {
         Self {
-            active_panel: ActivePanel::ContainerList,
-            prev_active_panel: ActivePanel::ContainerList,
+            focus: FocusTracker::new(),
+            prev_active_idx: 0,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
@@ -93,20 +85,6 @@ impl AppUi {
         }
     }
 
-    pub fn toggle_focus(&mut self, terminal_showing: bool) {
-        self.active_panel = match self.active_panel {
-            ActivePanel::ContainerList => ActivePanel::DetailPanel,
-            ActivePanel::DetailPanel => {
-                if terminal_showing {
-                    self.prev_active_panel = self.active_panel.clone();
-                    ActivePanel::TerminalPanel
-                } else {
-                    ActivePanel::ContainerList
-                }
-            }
-            ActivePanel::TerminalPanel => ActivePanel::ContainerList,
-        };
-    }
 }
 
 // App

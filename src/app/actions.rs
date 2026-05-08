@@ -350,7 +350,7 @@ impl App {
     }
 
     pub fn spawn_terminal(&mut self) {
-        self.ui.prev_active_panel = self.ui.active_panel.clone();
+        self.ui.prev_active_idx = self.ui.focus.active_idx;
         let rows = self.ui.pane_height.max(10);
         let entry = match self.data.entries.get(self.data.selected) {
             Some(e) => e.clone(),
@@ -359,7 +359,7 @@ impl App {
 
         match self.data.terminal.spawn(&entry, rows, &self.ui.app_tx) {
             Ok(_idx) => {
-                self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
+                self.ui.focus.active_idx = 2;
                 self.set_status(
                     format!("Logged into {}", entry.name),
                     crate::ui::StatusLevel::Info,

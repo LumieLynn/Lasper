@@ -1,4 +1,4 @@
-use super::{ActivePanel, App};
+use super::App;
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
@@ -36,7 +36,7 @@ impl App {
         }
 
         // Layer 2 – terminal panel when it owns focus
-        if self.ui.active_panel == ActivePanel::TerminalPanel
+        if self.ui.focus.active_idx == 2
             && self.handle_terminal_focused_key(key).await
         {
             return;
@@ -111,11 +111,11 @@ impl App {
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
 
         // If closing a tab emptied the terminal panel, restore focus to a valid panel.
-        if self.ui.active_panel == ActivePanel::TerminalPanel && !self.data.terminal.is_showing() {
-            self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
-                ActivePanel::ContainerList
+        if self.ui.focus.active_idx == 2 && !self.data.terminal.is_showing() {
+            self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+                0
             } else {
-                self.ui.prev_active_panel.clone()
+                self.ui.prev_active_idx
             };
         }
 
@@ -218,8 +218,13 @@ impl App {
                 true
             }
             KeyCode::Tab => {
-                let terminal_showing = self.data.terminal.is_showing();
-                self.ui.toggle_focus(terminal_showing);
+                let n = if self.data.terminal.is_showing() { 3 } else { 2 };
+                self.ui.focus.cycle_forward(n);
+                true
+            }
+            KeyCode::BackTab => {
+                let n = if self.data.terminal.is_showing() { 3 } else { 2 };
+                self.ui.focus.cycle_backward(n);
                 true
             }
             KeyCode::Char('s') => {
@@ -277,19 +282,20 @@ impl App {
 
 impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
-        match self.ui.active_panel {
-            ActivePanel::ContainerList => {
+        match self.ui.focus.active_idx {
+            0 => {
                 let result = self.ui.container_list.handle_key(key);
                 self.handle_container_list_result(result).await;
             }
-            ActivePanel::DetailPanel => {
+            1 => {
                 let result = self.ui.detail_panel.handle_key(key);
                 self.handle_detail_panel_result(result).await;
             }
-            ActivePanel::TerminalPanel => {
+            2 => {
                 // Already handled in layer 2; only reached when there are
                 // no active sessions (empty terminal panel).
             }
+            _ => {}
         }
     }
 
@@ -355,11 +361,11 @@ impl App {
     fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            if self.ui.active_panel == ActivePanel::TerminalPanel {
-                self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
-                    ActivePanel::ContainerList
+            if self.ui.focus.active_idx == 2 {
+                self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+                    0
                 } else {
-                    self.ui.prev_active_panel.clone()
+                    self.ui.prev_active_idx
                 };
             }
         } else {
@@ -395,7 +401,7 @@ impl App {
 
 impl App {
     fn is_terminal_insert_mode(&self) -> bool {
-        self.ui.active_panel == ActivePanel::TerminalPanel
+        self.ui.focus.active_idx == 2
             && self
                 .data
                 .terminal

@@ -284,6 +284,7 @@ impl TerminalManager {
                 }
 
                 KeyCode::Tab
+                | KeyCode::BackTab
                 | KeyCode::Char('q')
                 | KeyCode::Char('?')
                 | KeyCode::Char('t')

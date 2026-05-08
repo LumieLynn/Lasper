@@ -97,9 +97,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 // Content
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
-    let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
-    let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
-    let terminal_focused = app.ui.active_panel == crate::app::ActivePanel::TerminalPanel;
+    let list_focused = app.ui.focus.active_idx == 0;
+    let detail_focused = app.ui.focus.active_idx == 1;
+    let terminal_focused = app.ui.focus.active_idx == 2;
     let resize_mode = app.ui.resize_mode == crate::app::ResizeMode::Active;
 
     app.ui.detail_panel.set_focus(detail_focused);
@@ -195,12 +195,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             hspan(" detail/terminal height"),
         ])
     } else {
-        match app.ui.active_panel {
-            crate::app::ActivePanel::ContainerList => Line::from(vec![
+        match app.ui.focus.active_idx {
+            0 => Line::from(vec![
                 kspan("[j/k]"),
                 hspan(" nav "),
-                kspan("[Tab]"),
-                hspan(" → detail "),
+                kspan("[Tab/⇧Tab]"),
+                hspan(" panels "),
                 kspan("[s]"),
                 hspan(" start "),
                 kspan("[S]"),
@@ -220,7 +220,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[q]"),
                 hspan(" quit"),
             ]),
-            crate::app::ActivePanel::DetailPanel => Line::from(vec![
+            1 => Line::from(vec![
                 kspan("[Alt+1..5]"),
                 hspan(" panes "),
                 kspan("[[/]]"),
@@ -229,8 +229,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" scroll "),
                 kspan("[PgUp/Dn]"),
                 hspan(" page "),
-                kspan("[Tab]"),
-                hspan(" → list "),
+                kspan("[Tab/⇧Tab]"),
+                hspan(" panels "),
                 kspan("[t]"),
                 hspan(" terminal "),
                 kspan("[?]"),
@@ -238,7 +238,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[q]"),
                 hspan(" quit"),
             ]),
-            crate::app::ActivePanel::TerminalPanel => {
+            2 => {
                 let insert_mode = app
                     .data
                     .terminal
@@ -263,6 +263,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         hspan(" insert mode "),
                         kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs "),
+                        kspan("[Tab/⇧Tab]"),
+                        hspan(" panels "),
                         kspan("[T]"),
                         hspan(t_label),
                         kspan("[t]"),
@@ -274,6 +276,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     ])
                 }
             }
+            _ => Line::from(vec![]),
         }
     };
 
@@ -315,9 +318,9 @@ fn render_help(f: &mut Frame) {
         hrow("D    ", "Delete container [root]"),
         hrow("x / ⏎", "Actions / Power menu  [root]"),
         Line::from(""),
-        hrow("n    ", "New container / Import wizard  [root]"),
+        hrow("n / a", "New container / Import wizard  [root]"),
         Line::from(""),
-        hrow("Tab  ", "Toggle focus: list ↔ detail panel"),
+        hrow("Tab/⇧Tab", "Switch focus"),
         hrow("r    ", "Refresh list"),
         hrow("R    ", "Enter resize mode"),
         hrow("?    ", "Toggle help"),
