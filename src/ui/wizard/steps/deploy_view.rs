@@ -70,7 +70,7 @@ impl Component for DeployStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .margin(2)
+            .margin(1)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(0),

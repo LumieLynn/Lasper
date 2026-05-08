@@ -190,6 +190,14 @@ impl PassthroughStepView {
 
 impl Component for PassthroughStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        // Manual margin(1) — shrink area to match other step views
+        let area = Rect::new(
+            area.x + 1,
+            area.y + 1,
+            area.width.saturating_sub(2),
+            area.height.saturating_sub(2),
+        );
+
         let items = layout_items!(self);
 
         // Map focus index -> visual index for scroll-to-active
@@ -289,6 +297,10 @@ impl Component for PassthroughStepView {
 
     fn validate(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    fn set_focus(&mut self, focused: bool) {
+        wizard_set_focus!(self, focused, active_comps);
     }
 }
 

@@ -30,6 +30,19 @@ macro_rules! impl_wizard_nav {
 }
 
 #[macro_export]
+macro_rules! wizard_set_focus {
+    ($self:ident, $focused:ident, $comps_macro:ident) => {{
+        if $focused {
+            $self.update_focus();
+        } else {
+            for comp in $comps_macro!($self) {
+                comp.set_focus(false);
+            }
+        }
+    }};
+}
+
+#[macro_export]
 macro_rules! delegate_wizard_navigation {
     ($self:ident, $key:ident, $comps_macro:ident) => {{
         match $key.code {

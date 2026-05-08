@@ -69,6 +69,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
                 .passthrough
                 .extract_config(context.network.network_mode()),
             &context.passthrough.unclassified_files,
+            context.passthrough.nvidia_toolkit_installed,
         )),
 
         WizardStep::Review => Box::new(review_view::ReviewStepView::new(

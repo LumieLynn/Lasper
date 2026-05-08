@@ -1,6 +1,6 @@
 use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode;
-use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
+use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
@@ -16,26 +16,43 @@ use ratatui::{
     Frame,
 };
 
+macro_rules! active_comps {
+    ($self:ident) => {{
+        // Read fields before any mutable borrows to avoid borrow conflicts
+        let nvidia_enabled = $self.nvidia_enabled;
+        let is_categorized = matches!(
+            $self.nvidia_mode,
+            $crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode::Categorized
+        );
+        let uc_empty = $self.unclassified_list.items().is_empty();
+        let has_uc = nvidia_enabled && is_categorized && !uc_empty;
+
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.nvidia_toggle];
+        if has_uc {
+            comps.push(&mut $self.unclassified_list);
+        }
+        comps.push(&mut $self.bind_list);
+        comps
+    }};
+}
+
+impl_wizard_nav!(DevicesStepView, active_comps);
+
 pub struct DevicesStepView {
     bind_list: EditableList<BindMount>,
     unclassified_list: SelectableList<UnclassifiedFile>,
     nvidia_toggle: Checkbox,
     nvidia_enabled: bool,
     nvidia_mode: NvidiaPassthroughMode,
-    focus: FocusTarget,
-}
-
-#[derive(PartialEq)]
-enum FocusTarget {
-    Nvidia,
-    Unclassified,
-    BindList,
+    nvidia_toolkit_installed: bool,
+    focus: FocusTracker,
 }
 
 impl DevicesStepView {
     pub fn new(
         initial_data: &PassthroughConfig,
         unclassified_files: &[UnclassifiedFile],
+        nvidia_toolkit_installed: bool,
     ) -> Self {
         let nvidia_enabled = initial_data.nvidia_gpu;
         let nvidia_mode = initial_data
@@ -63,7 +80,7 @@ impl DevicesStepView {
             |idx| AppMessage::Wizard(WizardMessage::BindMountRemoved(idx)),
         );
 
-        let mut unclassified_list = SelectableList::new(
+        let unclassified_list = SelectableList::new(
             " Unclassified CDI Files (E to reclassify) ",
             unclassified_files.to_vec(),
             |uf| {
@@ -81,27 +98,27 @@ impl DevicesStepView {
                 format!("  {} -> {} ({}) [{}]", uf.host_path, dest, cat_label, mode)
             },
         );
-        if nvidia_enabled && !unclassified_files.is_empty() {
-            unclassified_list.set_focus(true);
-        }
 
-        let focus = if nvidia_enabled
+        let has_uc = nvidia_enabled
             && nvidia_mode == NvidiaPassthroughMode::Categorized
-            && !unclassified_files.is_empty()
-        {
-            FocusTarget::Unclassified
-        } else {
-            FocusTarget::Nvidia
-        };
+            && !unclassified_files.is_empty();
 
-        Self {
+        let mut view = Self {
             bind_list,
             unclassified_list,
-            nvidia_toggle: Checkbox::new(" NVIDIA GPU Passthrough", nvidia_enabled),
+            nvidia_toggle: Checkbox::new(" NVIDIA GPU Passthrough", nvidia_enabled)
+                .with_enabled(nvidia_toolkit_installed),
             nvidia_enabled,
             nvidia_mode,
-            focus,
+            nvidia_toolkit_installed,
+            focus: FocusTracker::new(),
+        };
+
+        if has_uc {
+            view.focus.active_idx = 1; // focus unclassified list
         }
+        view.update_focus();
+        view
     }
 
     fn has_unclassified(&self) -> bool {
@@ -109,17 +126,6 @@ impl DevicesStepView {
             && self.nvidia_mode == NvidiaPassthroughMode::Categorized
             && !self.unclassified_list.items().is_empty()
     }
-
-    fn update_focus(&mut self) {
-        let has_uc = self.has_unclassified();
-        self.nvidia_toggle
-            .set_focus(self.focus == FocusTarget::Nvidia);
-        self.unclassified_list
-            .set_focus(has_uc && self.focus == FocusTarget::Unclassified);
-        self.bind_list
-            .set_focus(self.focus == FocusTarget::BindList || (!has_uc && self.focus == FocusTarget::Unclassified));
-    }
-
 }
 
 impl Component for DevicesStepView {
@@ -135,7 +141,7 @@ impl Component for DevicesStepView {
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .margin(2)
+            .margin(1)
             .constraints(constraints)
             .split(area);
 
@@ -149,20 +155,7 @@ impl Component for DevicesStepView {
         }
         self.bind_list.render(f, chunks[next]);
 
-        let footer = match self.focus {
-            FocusTarget::Unclassified => {
-                " [E]dit reclassification, [Tab] focus NVIDIA, [Enter] next "
-            }
-            FocusTarget::BindList => {
-                " [A]dd mount, [E]dit mount, [D]elete mount, [Tab] focus NVIDIA, [Enter] next "
-            }
-            FocusTarget::Nvidia if has_uc => {
-                " [Space] toggle NVIDIA, [Tab] focus unclassified files "
-            }
-            FocusTarget::Nvidia => {
-                " [Space] toggle NVIDIA, [Tab] focus bind mounts "
-            }
-        };
+        let footer = " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next ";
         f.render_widget(
             Paragraph::new(footer).style(Style::default().fg(Color::Yellow)),
             chunks[next + 1],
@@ -170,38 +163,28 @@ impl Component for DevicesStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        // Tab cycles through focus targets
-        if key.code == KeyCode::Tab {
-            let has_uc = self.has_unclassified();
-            self.focus = match self.focus {
-                FocusTarget::Nvidia if has_uc => FocusTarget::Unclassified,
-                FocusTarget::Nvidia => FocusTarget::BindList,
-                FocusTarget::Unclassified => FocusTarget::BindList,
-                FocusTarget::BindList => FocusTarget::Nvidia,
-            };
-            self.update_focus();
-            return EventResult::Consumed;
-        }
-
-        match self.focus {
-            FocusTarget::Nvidia => {
-                let was_checked = self.nvidia_toggle.checked();
-                let res = self.nvidia_toggle.handle_key(key);
-                let now_checked = self.nvidia_toggle.checked();
-                if !was_checked && now_checked {
-                    // Open dialog; don't set nvidia_enabled until submit
+        // Custom keys for focused components (before macro delegation)
+        if self.bind_list.is_focused() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
                     return EventResult::Message(AppMessage::Wizard(
-                        WizardMessage::OpenNvidiaConfigDialog,
+                        WizardMessage::OpenBindDialog,
                     ));
                 }
-                if was_checked && !now_checked {
-                    self.nvidia_enabled = false;
-                    self.update_focus();
-                    return EventResult::Consumed;
+                KeyCode::Char('e') | KeyCode::Char('E') => {
+                    if let Some(bm) = self.bind_list.selected_item() {
+                        let idx = self.bind_list.selected();
+                        return EventResult::Message(AppMessage::Wizard(
+                            WizardMessage::OpenBindEditDialog(idx, bm.clone()),
+                        ));
+                    }
                 }
-                res
+                _ => {}
             }
-            FocusTarget::Unclassified => match key.code {
+        }
+
+        if self.unclassified_list.is_focused() {
+            match key.code {
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     if let Some(idx) = self.unclassified_list.selected_idx() {
                         if let Some(uf) = self.unclassified_list.selected_item().cloned() {
@@ -210,46 +193,34 @@ impl Component for DevicesStepView {
                             ));
                         }
                     }
-                    EventResult::Ignored
                 }
-                _ => self.unclassified_list.handle_key(key),
-            },
-            FocusTarget::BindList => {
-                match key.code {
-                    KeyCode::Char('a') | KeyCode::Char('A') => {
-                        return EventResult::Message(AppMessage::Wizard(
-                            WizardMessage::OpenBindDialog,
-                        ));
-                    }
-                    KeyCode::Char('e') | KeyCode::Char('E') => {
-                        if let Some(bm) = self.bind_list.selected_item() {
-                            let idx = self.bind_list.selected();
-                            return EventResult::Message(AppMessage::Wizard(
-                                WizardMessage::OpenBindEditDialog(idx, bm.clone()),
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-                self.bind_list.handle_key(key)
+                _ => {}
             }
         }
+
+        // NVIDIA toggle: intercept Space to control dialog flow
+        if self.nvidia_toggle.is_focused() && key.code == KeyCode::Char(' ') {
+            let was_checked = self.nvidia_toggle.checked();
+            let _ = self.nvidia_toggle.handle_key(key);
+            let now_checked = self.nvidia_toggle.checked();
+            if !was_checked && now_checked {
+                return EventResult::Message(AppMessage::Wizard(
+                    WizardMessage::OpenNvidiaConfigDialog,
+                ));
+            }
+            if was_checked && !now_checked {
+                self.nvidia_enabled = false;
+                self.update_focus();
+                return EventResult::Consumed;
+            }
+            return EventResult::Consumed;
+        }
+
+        delegate_wizard_navigation!(self, key, active_comps)
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.nvidia_toggle.set_focus(false);
-            self.unclassified_list.set_focus(false);
-            self.bind_list.set_focus(false);
-        }
-    }
-
-    fn is_focused(&self) -> bool {
-        self.bind_list.is_focused()
-            || self.unclassified_list.is_focused()
-            || self.nvidia_toggle.is_focused()
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn validate(&mut self) -> Result<(), String> {
@@ -271,9 +242,10 @@ impl StepComponent for DevicesStepView {
             AppMessage::Wizard(WizardMessage::NvidiaConfigSaved(result)) => {
                 self.nvidia_enabled = true;
                 self.nvidia_mode = result.mode.clone();
-                self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", true);
+                self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", true)
+                    .with_enabled(self.nvidia_toolkit_installed);
                 if self.has_unclassified() {
-                    self.focus = FocusTarget::Unclassified;
+                    self.focus.active_idx = 1;
                 }
                 self.update_focus();
                 StepAction::CloseDialog
@@ -284,9 +256,9 @@ impl StepComponent for DevicesStepView {
                 StepAction::CloseDialog
             }
             AppMessage::Wizard(WizardMessage::DialogCancel) => {
-                // Revert toggle if dialog was cancelled and NVIDIA wasn't already on
                 if !self.nvidia_enabled {
-                    self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", false);
+                    self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", false)
+                        .with_enabled(self.nvidia_toolkit_installed);
                 }
                 StepAction::CloseDialog
             }

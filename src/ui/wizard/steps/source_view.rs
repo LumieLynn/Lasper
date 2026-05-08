@@ -224,18 +224,7 @@ impl Component for SourceStepView {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.kind_list.set_focus(false);
-            self.oci_url.set_focus(false);
-            self.deboot_mirror.set_focus(false);
-            self.deboot_suite.set_focus(false);
-            self.bootstrap_pkgs.set_focus(false);
-            self.local_path.set_focus(false);
-            self.pull_url.set_focus(false);
-            self.pull_format.set_focus(false);
-        }
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn validate(&mut self) -> Result<(), String> {
