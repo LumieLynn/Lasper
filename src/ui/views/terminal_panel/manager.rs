@@ -203,7 +203,7 @@ impl TerminalManager {
                 return TerminalKeyOutcome::Consumed;
             }
             // Forward everything else to the PTY
-            let bytes = crate::ui::views::terminal_panel::encode_key(key);
+            let bytes = super::encode_key(key);
             let _ = session
                 .pty_tx
                 .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));

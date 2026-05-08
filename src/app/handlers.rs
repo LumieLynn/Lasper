@@ -103,7 +103,7 @@ impl App {
 
 impl App {
     async fn handle_terminal_focused_key(&mut self, key: KeyEvent) -> bool {
-        use crate::app::terminal::TerminalKeyOutcome;
+        use crate::ui::views::terminal_panel::TerminalKeyOutcome;
 
         let outcome =
             self.data

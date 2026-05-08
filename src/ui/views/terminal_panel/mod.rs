@@ -1,4 +1,5 @@
-use crate::app::terminal::TerminalSession;
+pub mod manager;
+pub use manager::{TerminalKeyOutcome, TerminalManager, TerminalSession};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},

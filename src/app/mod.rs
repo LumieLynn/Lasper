@@ -2,7 +2,6 @@
 
 pub mod actions;
 pub mod handlers;
-pub mod terminal;
 
 use anyhow::Result;
 use std::collections::{HashMap, VecDeque};
@@ -20,7 +19,7 @@ use crate::ui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
 use std::io::Stdout;
 
-pub use terminal::TerminalManager;
+pub use crate::ui::views::terminal_panel::TerminalManager;
 
 /// Whether the user is in panel resize mode (toggled by `R`).
 #[derive(Debug, Clone, Copy, PartialEq)]
