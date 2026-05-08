@@ -236,6 +236,35 @@ fn remap_binds(binds: &mut [PassthroughBind], profile: &NvidiaPassthroughProfile
     }
 }
 
+/// Apply manual reclassifications from the profile.
+/// Overrides container_path and readonly flag for matched binds.
+/// Only touches binds whose container_path is currently unclassified —
+/// skips binds that already have a classified path (e.g. from symlink hooks),
+/// since those already carry the correct FHS mapping.
+/// Runs before category-based remapping so user-assigned categories
+/// can then participate in `remap_binds`.
+fn apply_manual_classifications(
+    binds: &mut [PassthroughBind],
+    profile: &NvidiaPassthroughProfile,
+) {
+    for bind in binds.iter_mut() {
+        if let Some(mc) = profile
+            .manual_classifications
+            .iter()
+            .find(|mc| mc.host_path == bind.host_path)
+        {
+            // Skip binds that are already properly classified (e.g. symlink hooks)
+            if classify::classify_path(&bind.container_path).is_some() {
+                continue;
+            }
+            if !mc.destination.is_empty() {
+                bind.container_path = mc.destination.clone();
+            }
+            bind.readonly = mc.readonly;
+        }
+    }
+}
+
 /// Build a classified_entries list from binds for backward compat with UI consumers.
 fn extract_classified_entries(binds: &[PassthroughBind]) -> Vec<ClassifiedEntry> {
     binds
@@ -365,6 +394,14 @@ pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Res
         }
     }
     binds.extend(extra_binds);
+
+    // 3.5. Apply manual reclassifications before category remapping,
+    // so user-assigned files can participate in remap_binds.
+    if let Some(prof) = profile {
+        if !prof.manual_classifications.is_empty() {
+            apply_manual_classifications(&mut binds, prof);
+        }
+    }
 
     // 4. Apply category remapping uniformly to all binds (CDI + ldconfig)
     if let Some(prof) = profile {

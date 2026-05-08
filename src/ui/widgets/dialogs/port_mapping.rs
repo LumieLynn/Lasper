@@ -83,4 +83,9 @@ impl PortMappingBox {
     }
 }
 
-form_dialog!(PortMappingBox, " Add Port Forward ", (30, 40), [host_port, container_port, protocol]);
+form_dialog!(
+    PortMappingBox,
+    " Add Port Forward ",
+    (30, 40),
+    [host_port, container_port, protocol]
+);

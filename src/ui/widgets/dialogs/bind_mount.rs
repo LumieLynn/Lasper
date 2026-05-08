@@ -144,4 +144,9 @@ impl BindMountBox {
     }
 }
 
-form_dialog!(BindMountBox, " Add Bind Mount ", (45, 55), [source_path, target_path, readonly, suffix]);
+form_dialog!(
+    BindMountBox,
+    " Add Bind Mount ",
+    (45, 55),
+    [source_path, target_path, readonly, suffix]
+);

@@ -13,11 +13,26 @@ pub enum NvidiaFileCategory {
     Xorg,
     Vdpau,
     Gbm,
+    Other,
 }
 
 impl NvidiaFileCategory {
     pub fn all_static() -> Vec<Self> {
         vec![Self::Lib64, Self::Lib32, Self::Bin, Self::Firmware]
+    }
+
+    pub fn all() -> Vec<Self> {
+        vec![
+            Self::Lib64,
+            Self::Lib32,
+            Self::Bin,
+            Self::Firmware,
+            Self::Config,
+            Self::Xorg,
+            Self::Vdpau,
+            Self::Gbm,
+            Self::Other,
+        ]
     }
 
     pub fn label(&self) -> &str {
@@ -30,6 +45,7 @@ impl NvidiaFileCategory {
             Self::Xorg => "Xorg Modules",
             Self::Vdpau => "VDPAU",
             Self::Gbm => "GBM",
+            Self::Other => "Other / Unclassified",
         }
     }
 
@@ -48,6 +64,7 @@ impl NvidiaFileCategory {
             Self::Xorg => "/usr/lib/xorg/modules",
             Self::Vdpau => "/usr/lib/vdpau",
             Self::Gbm => "/usr/lib/gbm",
+            Self::Other => "",
         }
     }
 }

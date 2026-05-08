@@ -108,4 +108,9 @@ impl UserEditor {
     }
 }
 
-form_dialog!(UserEditor, " Add/Edit User ", (40, 60), [username, password, shell, sudoer]);
+form_dialog!(
+    UserEditor,
+    " Add/Edit User ",
+    (40, 60),
+    [username, password, shell, sudoer]
+);

@@ -59,11 +59,8 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
                 .passthrough
                 .extract_config(context.network.network_mode()),
             context.network.network_mode(),
-            context.passthrough.nvidia_toolkit_installed,
             context.passthrough.wayland_sockets.clone(),
             context.passthrough.discovered_gpus.clone(),
-            context.passthrough.nvidia_available_devices.clone(),
-            context.passthrough.active_nvidia_categories.clone(),
             context.passthrough.hardware_scanning,
         )),
 
@@ -71,6 +68,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
             &context
                 .passthrough
                 .extract_config(context.network.network_mode()),
+            &context.passthrough.unclassified_files,
         )),
 
         WizardStep::Review => Box::new(review_view::ReviewStepView::new(

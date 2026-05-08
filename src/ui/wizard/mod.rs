@@ -39,8 +39,8 @@ impl WizardStep {
             WizardStep::Storage => "Storage Settings",
             WizardStep::User => "User Management",
             WizardStep::Network => "Network Configuration",
-            WizardStep::Passthrough => "Hardware Passthrough",
-            WizardStep::Devices => "Device & Mounts",
+            WizardStep::Passthrough => "Host Integration",
+            WizardStep::Devices => "Bind Mounts",
             WizardStep::Review => "Final Review",
             WizardStep::Deploy => "Deployment Progress",
         }
