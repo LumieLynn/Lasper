@@ -220,11 +220,17 @@ impl App {
             KeyCode::Tab => {
                 let n = if self.data.terminal.is_showing() { 3 } else { 2 };
                 self.ui.focus.cycle_forward(n);
+                if self.data.terminal.is_showing() && self.data.terminal.maximized && self.ui.focus.active_idx == 1 {
+                    self.ui.focus.cycle_forward(n);
+                }
                 true
             }
             KeyCode::BackTab => {
                 let n = if self.data.terminal.is_showing() { 3 } else { 2 };
                 self.ui.focus.cycle_backward(n);
+                if self.data.terminal.is_showing() && self.data.terminal.maximized && self.ui.focus.active_idx == 1 {
+                    self.ui.focus.cycle_backward(n);
+                }
                 true
             }
             KeyCode::Char('s') => {
@@ -266,6 +272,9 @@ impl App {
             KeyCode::Char('T') => {
                 if self.data.terminal.is_showing() {
                     self.data.terminal.maximized = !self.data.terminal.maximized;
+                    if self.data.terminal.maximized && self.ui.focus.active_idx == 1 {
+                        self.ui.focus.active_idx = 2;
+                    }
                 }
                 true
             }

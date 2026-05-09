@@ -32,12 +32,16 @@ macro_rules! layout_items {
         if is_accel && has_gpus {
             let height = (gpu_count + 2).min(10);
             items.push((&mut $self.gpu_list, height, true));
+        } else if is_accel && !has_gpus {
+            items.push((&mut $self.gpu_empty, 3, false));
         }
 
         items.push((&mut $self.wayland_socket, 3, true));
 
         if wayland_selector_active {
             items.push((&mut $self.wayland_selector, 3, true));
+        } else if wayland_checked {
+            items.push((&mut $self.wayland_empty, 3, false));
         }
 
         items.push((&mut $self.privileged, 3, true));
@@ -68,9 +72,11 @@ pub struct PassthroughStepView {
     graphics_acceleration: Checkbox,
     discovered_gpus: Vec<GpuDevice>,
     gpu_list: Checklist<GpuDevice>,
+    gpu_empty: TextBlock,
     wayland_socket: Checkbox,
     wayland_selector: RadioGroup,
     wayland_sockets: Vec<String>,
+    wayland_empty: TextBlock,
 
     privileged: Checkbox,
     private_users: RadioGroup,
@@ -147,9 +153,17 @@ impl PassthroughStepView {
             ),
             discovered_gpus,
             gpu_list,
+            gpu_empty: TextBlock::new(
+                " No GPUs Detected ",
+                "No compatible GPU devices found on the host. Graphics acceleration may not work as expected.",
+            ),
             wayland_socket: Checkbox::new(wayland_label, initial_wayland).with_enabled(is_host_nw),
             wayland_selector: RadioGroup::new("Source Socket", wayland_options, initial_socket_idx),
             wayland_sockets,
+            wayland_empty: TextBlock::new(
+                " No Wayland Sockets Detected ",
+                "No Wayland display sockets found in the host runtime directory. Check if a Wayland compositor is running.",
+            ),
 
             privileged: Checkbox::new("Privileged Mode (NOT RECOMMENDED)", initial_data.privileged),
             private_users: RadioGroup::new(

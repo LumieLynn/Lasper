@@ -151,6 +151,16 @@ macro_rules! impl_wizard_nav {
                 if self.focus.active_idx >= len {
                     self.focus.active_idx = len.saturating_sub(1);
                 }
+                // Advance past disabled components so focus lands on the first focusable one.
+                if len > 0 {
+                    let start = self.focus.active_idx;
+                    while !comps[self.focus.active_idx].is_focusable() {
+                        self.focus.active_idx = (self.focus.active_idx + 1) % len;
+                        if self.focus.active_idx == start {
+                            break;
+                        }
+                    }
+                }
                 self.focus.update_focus(&mut comps, true);
             }
 
