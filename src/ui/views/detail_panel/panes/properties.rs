@@ -18,18 +18,19 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     let props = match &data.properties {
         Ok(p) => p,
         Err(e) => {
+            let t = crate::ui::theme::theme();
             let error_text = vec![
                 ratatui::text::Line::from(""),
                 ratatui::text::Line::from(vec![
                     ratatui::text::Span::styled(
                         "  Error: ",
                         ratatui::style::Style::default()
-                            .fg(ratatui::style::Color::Red)
+                            .fg(t.error)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
                     ratatui::text::Span::styled(
                         e.clone(),
-                        ratatui::style::Style::default().fg(ratatui::style::Color::Red),
+                        ratatui::style::Style::default().fg(t.error),
                     ),
                 ]),
             ];

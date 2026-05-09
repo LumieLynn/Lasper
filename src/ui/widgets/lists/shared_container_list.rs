@@ -1,8 +1,9 @@
 use crate::nspawn::{ContainerEntry, ContainerState};
+use crate::ui::theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState},
     Frame,
@@ -46,6 +47,8 @@ impl SharedContainerList {
         entries: &[ContainerEntry],
         resize_mode: bool,
     ) {
+        let t = theme::theme();
+
         // If background data changes and current selection is out of bounds, clamp it.
         if let Some(current) = self.state.selected() {
             if entries.is_empty() {
@@ -66,34 +69,35 @@ impl SharedContainerList {
                 let is_selected = Some(i) == selected_idx;
                 let state_label = e.state.label();
 
-                // Icon style (Yellow for alive, Gray for dead)
                 let icon_style = match &e.state {
                     ContainerState::Running | ContainerState::Starting => {
-                        Style::default().fg(Color::Yellow)
+                        Style::default().fg(t.list_icon_alive)
                     }
-                    _ => Style::default().fg(Color::DarkGray),
+                    _ => Style::default().fg(t.list_icon_dead),
                 };
 
-                // Text style (Yellow for selected, Gray for others)
                 let text_style = if is_selected {
-                    let s = Style::default().fg(Color::Yellow);
+                    let s = Style::default().fg(if self.focused {
+                        t.list_selected_focused
+                    } else {
+                        t.list_selected_unfocused
+                    });
                     if self.focused {
                         s.add_modifier(Modifier::BOLD)
                     } else {
                         s
                     }
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(t.list_unselected)
                 };
 
-                // Cursor logic (Yellow if focused, DarkGray if unfocused)
                 let cursor_symbol = if is_selected { ">> " } else { "   " };
                 let cursor_style = if self.focused {
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(t.list_cursor_focused)
                         .add_modifier(Modifier::BOLD)
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(t.list_cursor_unfocused)
                 };
 
                 let icon = match &e.state {
@@ -114,7 +118,7 @@ impl SharedContainerList {
                     spans.push(Span::styled(
                         format!(" - {}", addr),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(t.list_addr)
                             .add_modifier(Modifier::DIM),
                     ));
                 }
@@ -123,7 +127,7 @@ impl SharedContainerList {
             })
             .collect();
 
-        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, Color::White);
+        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, true);
 
         let list = List::new(items)
             .block(

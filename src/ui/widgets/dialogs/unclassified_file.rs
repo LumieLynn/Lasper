@@ -8,7 +8,7 @@ use crate::ui::wizard::core::context::UnclassifiedFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
@@ -118,7 +118,7 @@ impl Component for UnclassifiedFileDialog {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(" Reclassify File ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(crate::ui::theme::theme().dialog_border));
         let inner = block.inner(dialog_area);
         f.render_widget(block, dialog_area);
 
@@ -140,11 +140,11 @@ impl Component for UnclassifiedFileDialog {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(" Host Path ")
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(crate::ui::theme::theme().dialog_host_border));
         let host_inner = host_block.inner(chunks[0]);
         f.render_widget(host_block, chunks[0]);
         f.render_widget(
-            Paragraph::new(self.host_path.as_str()).style(Style::default().fg(Color::Gray)),
+            Paragraph::new(self.host_path.as_str()).style(Style::default().fg(crate::ui::theme::theme().dialog_host_text)),
             host_inner,
         );
 

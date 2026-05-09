@@ -10,7 +10,7 @@ use crate::ui::wizard::StepAction;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::Paragraph,
     Frame,
 };
@@ -71,7 +71,7 @@ impl Component for UserStepView {
 
         let hint = " [Tab] switch, [A]dd user, [E]dit user, [D]elete user, [Enter] next ";
         f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(hint).style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
             chunks[2],
         );
     }

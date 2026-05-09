@@ -43,7 +43,9 @@ macro_rules! form_dialog {
                     .borders(ratatui::widgets::Borders::ALL)
                     .border_type(ratatui::widgets::BorderType::Rounded)
                     .title($title)
-                    .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan));
+                    .border_style(ratatui::style::Style::default().fg(
+                        crate::ui::theme::theme().dialog_border,
+                    ));
                 let inner = block.inner(dialog_area);
                 f.render_widget(block, dialog_area);
 

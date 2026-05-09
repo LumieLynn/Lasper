@@ -1,7 +1,8 @@
 use crate::ui::core::{Component, EventResult};
+use crate::ui::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
@@ -23,6 +24,7 @@ impl ConfirmationDialog {
 
 impl Component for ConfirmationDialog {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let t = theme::theme();
         let width = 50;
         let height = 8;
 
@@ -37,7 +39,7 @@ impl Component for ConfirmationDialog {
             .title(format!(" {} ", self.title))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(Style::default().fg(t.dialog_border_warn));
 
         let inner = block.inner(dialog_area);
         f.render_widget(block, dialog_area);
@@ -49,19 +51,19 @@ impl Component for ConfirmationDialog {
 
         let msg_para = Paragraph::new(self.message.as_str())
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(t.dialog_text));
 
         let hint = Line::from(vec![
             Span::styled(
                 " [y] ",
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(t.confirm_hint)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Confirm   "),
             Span::styled(
                 " [n/Esc] ",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.cancel_hint).add_modifier(Modifier::BOLD),
             ),
             Span::raw("Cancel"),
         ]);

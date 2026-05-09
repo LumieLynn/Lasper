@@ -9,7 +9,7 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
@@ -229,7 +229,7 @@ impl Component for NvidiaConfigDialog {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .title(" NVIDIA Passthrough ")
-            .border_style(Style::default().fg(Color::Cyan));
+            .border_style(Style::default().fg(crate::ui::theme::theme().dialog_border));
         let inner = block.inner(dialog_area);
         f.render_widget(block, dialog_area);
 

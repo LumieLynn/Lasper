@@ -2,7 +2,7 @@ use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState},
     Frame,
 };
@@ -177,6 +177,7 @@ impl<T> SelectableList<T> {
     pub fn render(&mut self, f: &mut Frame, area: Rect) {
         let style = Style::default().fg(crate::ui::widget_border_color(self.focused, self.enabled));
 
+        let t = crate::ui::theme::theme();
         let items: Vec<ListItem> = self
             .items
             .iter()
@@ -186,7 +187,7 @@ impl<T> SelectableList<T> {
                 let item_style = if self.is_item_enabled(i) {
                     Style::default()
                 } else {
-                    Style::default().fg(Color::DarkGray)
+                    Style::default().fg(t.list_disabled_item)
                 };
                 ListItem::new(content).style(item_style)
             })
@@ -204,7 +205,7 @@ impl<T> SelectableList<T> {
             list = list
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(t.list_highlight_symbol)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol(">> ");

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::super::core::utils::empty_block;
 use crate::app::AppData;
+use crate::ui::theme;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {
@@ -15,6 +16,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         return;
     }
 
+    let t = theme::theme();
     let text = match &data.config_content {
         Some(c) => c.clone(),
         None => {
@@ -34,19 +36,19 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                 Line::from(Span::styled(
                     l.to_owned(),
                     Style::default()
-                        .fg(Color::Cyan)
+                        .fg(t.config_section)
                         .add_modifier(Modifier::BOLD),
                 ))
             } else if let Some(pos) = l.find('=') {
                 let (k, v) = l.split_at(pos);
                 Line::from(vec![
-                    Span::styled(k.to_owned(), Style::default().fg(Color::Yellow)),
-                    Span::styled(v.to_owned(), Style::default().fg(Color::White)),
+                    Span::styled(k.to_owned(), Style::default().fg(t.config_key)),
+                    Span::styled(v.to_owned(), Style::default().fg(t.config_value)),
                 ])
             } else {
                 Line::from(Span::styled(
                     l.to_owned(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(t.text_secondary),
                 ))
             }
         })

@@ -281,6 +281,9 @@ impl App {
 
     /// Starts the main application loop.
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        // Initialize the global theme before any rendering.
+        crate::ui::theme::init_theme(crate::ui::theme::load_theme());
+
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
         let (backend_tx, mut backend_rx) =

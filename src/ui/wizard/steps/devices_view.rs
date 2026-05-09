@@ -12,7 +12,7 @@ use crate::ui::wizard::StepAction;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::Paragraph,
     Frame,
 };
@@ -158,7 +158,7 @@ impl Component for DevicesStepView {
 
         let footer = " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next ";
         f.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(footer).style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
             chunks[next + 1],
         );
     }

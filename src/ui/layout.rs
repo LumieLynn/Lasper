@@ -1,13 +1,13 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::app::App;
-use crate::ui::StatusLevel;
+use crate::ui::theme;
 use crate::ui::{centered_rect, core::Component};
 
 pub fn render(f: &mut Frame, app: &mut App) {
@@ -52,17 +52,18 @@ pub fn render(f: &mut Frame, app: &mut App) {
 // Title
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
+    let t = theme::theme();
     let badge = if app.is_root {
         Span::styled(
             " [ ⚡ ROOT ] ",
             Style::default()
-                .fg(Color::Green)
+                .fg(t.badge_root)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
             " [ ⚠  READ-ONLY — run with sudo for full control ] ",
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(t.badge_readonly),
         )
     };
 
@@ -70,7 +71,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             " Lasper ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(t.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         badge,
@@ -80,14 +81,14 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         spans.push(Span::styled(
             " [ ⚡ CMD-MODE ] ",
             Style::default()
-                .fg(Color::Rgb(255, 140, 0))
+                .fg(t.badge_cmd_mode)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
     spans.push(Span::styled(
         format!("  {} container(s)", app.data.entries.len()),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.text_secondary),
     ));
 
     let line = Line::from(spans);
@@ -174,13 +175,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 // Status bar
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
+    let t = theme::theme();
     let line = if let Some((msg, level)) = &app.ui.status_message {
-        let color = match level {
-            StatusLevel::Info => Color::White,
-            StatusLevel::Success => Color::Green,
-            StatusLevel::Warn => Color::Rgb(255, 140, 0),
-            StatusLevel::Error => Color::Red,
-        };
+        let color = t.status_color(level);
         Line::from(vec![
             Span::raw("  "),
             Span::styled(msg.as_str(), Style::default().fg(color)),
@@ -284,22 +281,23 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn kspan(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::default().fg(Color::Cyan))
+    Span::styled(s, Style::default().fg(theme::theme().key_hint_fg))
 }
 fn hspan(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::default().fg(Color::DarkGray))
+    Span::styled(s, Style::default().fg(theme::theme().hint_fg))
 }
 
 // Help overlay
 
 fn render_help(f: &mut Frame) {
+    let t = theme::theme();
     let area = centered_rect(50, 85, f.area());
     f.render_widget(Clear, area);
     let rows: Vec<Line> = vec![
         Line::from(Span::styled(
             "  Keybindings",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(t.help_title)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
@@ -328,7 +326,7 @@ fn render_help(f: &mut Frame) {
         Line::from(""),
         Line::from(Span::styled(
             "  Press any key to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(t.help_close_hint),
         )),
     ];
     f.render_widget(
@@ -337,16 +335,17 @@ fn render_help(f: &mut Frame) {
                 .title(" Help ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(t.help_border)),
         ),
         area,
     );
 }
 
 fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
+    let t = theme::theme();
     Line::from(vec![
         Span::raw("  "),
-        Span::styled(k, Style::default().fg(Color::Yellow)),
+        Span::styled(k, Style::default().fg(t.help_key)),
         Span::raw("  "),
         Span::raw(d),
     ])

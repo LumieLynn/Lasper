@@ -25,16 +25,17 @@ impl TerminalPanel {
         }
 
         // Collect tab labels and session metadata before any mutable borrow.
+        let t = crate::ui::theme::theme();
         let mut tab_spans = Vec::new();
         let session_count = sessions.len();
         for (i, s) in sessions.iter().enumerate() {
-            let mut style = Style::default().fg(Color::DarkGray);
+            let mut style = Style::default().fg(t.tab_inactive);
             if i == active_idx {
                 style = style
                     .fg(if is_focused {
-                        Color::Yellow
+                        t.tab_active_focused
                     } else {
-                        Color::White
+                        t.tab_active_unfocused
                     })
                     .add_modifier(Modifier::BOLD);
             }
@@ -49,15 +50,15 @@ impl TerminalPanel {
         let mut term = session.terminal.lock();
 
         let border_color = if resize_mode {
-            crate::ui::panel_border_color(true, is_focused, Color::DarkGray)
+            crate::ui::panel_border_color(true, is_focused, false)
         } else if is_focused {
             if session.insert_mode {
-                Color::Green
+                t.terminal_insert_border
             } else {
-                Color::Cyan
+                t.accent
             }
         } else {
-            Color::DarkGray
+            t.border_panel_secondary
         };
 
         let title_suffix = if session.insert_mode {

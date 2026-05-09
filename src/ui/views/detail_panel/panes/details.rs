@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Line,
     widgets::{Paragraph, Wrap},
     Frame,
@@ -20,14 +20,15 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     let props = match &data.properties {
         Ok(p) => p,
         Err(e) => {
+            let t = crate::ui::theme::theme();
             let error_text = vec![
                 Line::from(""),
                 Line::from(vec![
                     ratatui::text::Span::styled(
                         "  Error: ",
-                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        Style::default().fg(t.error).add_modifier(Modifier::BOLD),
                     ),
-                    ratatui::text::Span::styled(e.clone(), Style::default().fg(Color::Red)),
+                    ratatui::text::Span::styled(e.clone(), Style::default().fg(t.error)),
                 ]),
             ];
             f.render_widget(Paragraph::new(error_text).wrap(Wrap { trim: false }), area);
@@ -49,6 +50,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     let mut sorted_groups = props.groups.clone();
     sorted_groups.sort_by_key(|g| g.display_priority());
 
+    let t = crate::ui::theme::theme();
     for group in &sorted_groups {
         if group.properties.is_empty() {
             continue;
@@ -58,7 +60,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         lines.push(Line::from(vec![ratatui::text::Span::styled(
             format!("[ {} ]", group.name.to_uppercase()),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(t.highlight)
                 .add_modifier(Modifier::BOLD),
         )]));
 

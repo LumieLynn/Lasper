@@ -4,7 +4,7 @@ pub mod panes;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
@@ -96,7 +96,7 @@ impl DetailPanel {
     ) {
         // Border
         let border_color =
-            crate::ui::panel_border_color(resize_mode, self.focused, Color::DarkGray);
+            crate::ui::panel_border_color(resize_mode, self.focused, false);
 
         let tabs_line = self.get_tabs_line(data);
 
@@ -167,14 +167,15 @@ impl DetailPanel {
 
         let mut spans = Vec::new();
 
+        let t = crate::ui::theme::theme();
         for (i, label) in labels.iter().enumerate() {
-            let mut style = Style::default().fg(Color::DarkGray);
+            let mut style = Style::default().fg(t.tab_inactive);
             if i == selected {
                 style = style
                     .fg(if self.focused {
-                        Color::Yellow
+                        t.tab_active_focused
                     } else {
-                        Color::White
+                        t.tab_active_unfocused
                     })
                     .add_modifier(Modifier::BOLD);
             }

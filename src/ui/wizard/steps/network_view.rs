@@ -11,7 +11,7 @@ use crate::ui::wizard::StepAction;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::Paragraph,
     Frame,
 };
@@ -243,7 +243,7 @@ impl Component for NetworkStepView {
         };
         if !hint.is_empty() {
             f.render_widget(
-                Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+                Paragraph::new(hint).style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
                 chunks[2],
             );
         }

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
@@ -8,6 +8,7 @@ use ratatui::{
 
 use super::super::core::utils::empty_block;
 use crate::app::AppData;
+use crate::ui::theme;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {
@@ -19,7 +20,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         f.render_widget(
             Paragraph::new(vec![Line::from(Span::styled(
                 "No log output.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::theme().text_secondary),
             ))]),
             area,
         );
