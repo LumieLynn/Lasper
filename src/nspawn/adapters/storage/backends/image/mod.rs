@@ -28,10 +28,10 @@ impl StorageBackend for DiskImageBackend {
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("raw");
-                PathBuf::from(format!("/var/lib/machines/{}.{}", name, ext))
+                crate::paths::machine_image(name, ext)
             }
             DiskImageSource::CreateNew { .. } => {
-                PathBuf::from(format!("/var/lib/machines/{}.raw", name))
+                crate::paths::machine_raw_image(name)
             }
         }
     }
@@ -64,7 +64,7 @@ impl StorageBackend for DiskImageBackend {
     }
 
     async fn exists(&self, name: &str) -> bool {
-        let base = PathBuf::from("/var/lib/machines").join(name);
+        let base = crate::paths::machine_root(name);
         for ext in ["raw", "img"] {
             if tokio::fs::try_exists(base.with_extension(ext))
                 .await

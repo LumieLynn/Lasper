@@ -171,19 +171,13 @@ fn split_host_container(s: &str) -> (String, String) {
         .unwrap_or((s.to_string(), s.to_string()))
 }
 
+#[allow(dead_code)]
 pub(crate) fn get_state_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("LASPER_STATE_DIR") {
-        return PathBuf::from(dir);
-    }
-    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
-        return PathBuf::from(xdg).join("lasper").join("states");
-    }
-    PathBuf::from("/var/lib/lasper/states")
+    crate::paths::state_dir()
 }
 
 pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
-    let dir = get_state_dir();
-    let path = dir.join(format!("{}.json", name));
+    let path = crate::paths::state_file(name);
     if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
         return Ok(None);
     }
@@ -196,8 +190,7 @@ pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
 }
 
 pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
-    let dir = get_state_dir();
-    let path = dir.join(format!("{}.json", name));
+    let path = crate::paths::state_file(name);
     let content = serde_json::to_string_pretty(state)?;
 
     crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |_| Ok(content)).await?;

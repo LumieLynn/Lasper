@@ -61,18 +61,13 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(
-            " [ ⚠  READ-ONLY — run with sudo for full control ] ",
-            Style::default().fg(t.badge_readonly),
-        )
+        Span::styled(" [ READ-ONLY ] ", Style::default().fg(t.badge_readonly))
     };
 
     let mut spans = vec![
         Span::styled(
             " Lasper ",
-            Style::default()
-                .fg(t.accent)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ),
         badge,
     ];

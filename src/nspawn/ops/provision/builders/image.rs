@@ -80,7 +80,7 @@ impl Deployer for NetworkImageDeployer {
         // Use /var/cache/lasper for isolated downloads to bypass systemd-machined interference (Error 23)
         let cache_dir = "/var/cache/lasper/downloads";
         let _ = tokio::fs::create_dir_all(cache_dir).await;
-        let _ = tokio::fs::create_dir_all("/var/lib/machines").await;
+        let _ = tokio::fs::create_dir_all(crate::paths::machines_dir()).await;
 
         let _ = logs
             .send(format!("Downloading container from {}...", clean_url))
@@ -93,7 +93,7 @@ impl Deployer for NetworkImageDeployer {
                 .send("Streaming and provisioning RAW disk image to cache...".into())
                 .await;
 
-            let dest = format!("/var/lib/machines/{}.raw", name);
+            let dest = crate::paths::machine_raw_image(name);
             let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
 
             // Phase 1: Download and decompress into isolated cache

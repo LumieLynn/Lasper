@@ -31,11 +31,11 @@ impl StorageType {
     pub fn get_path(&self, name: &str) -> PathBuf {
         match self {
             Self::Directory | Self::Subvolume => {
-                PathBuf::from(format!("/var/lib/machines/{}", name))
+                crate::paths::machine_root(name)
             }
             Self::DiskImage => {
                 // Only raw disk images are supported by systemd-nspawn
-                let base = PathBuf::from("/var/lib/machines").join(name);
+                let base = crate::paths::machine_root(name);
                 for ext in ["raw", "img"] {
                     let p = base.with_extension(ext);
                     if p.exists() {
@@ -80,7 +80,7 @@ fn into_backend<T: StorageBackend + 'static>(backend: T) -> Box<dyn StorageBacke
 
 /// Factory function to get the appropriate storage backend for an existing machine.
 pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
-    let base = PathBuf::from("/var/lib/machines").join(name);
+    let base = crate::paths::machine_root(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
     let extensions = ["raw", "img", "iso"];

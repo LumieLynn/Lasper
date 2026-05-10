@@ -143,7 +143,7 @@ async fn run_deploy_internal(
             storage.mount(&name).await?
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
-            std::path::PathBuf::from(format!("/var/lib/machines/{}", name))
+            crate::paths::machine_root(&name)
         };
 
         // 3. Perform base deployment
@@ -163,7 +163,7 @@ async fn run_deploy_internal(
         let mut actual_rootfs = rootfs.clone();
 
         if !tokio::fs::try_exists(&actual_rootfs).await.unwrap_or(false) {
-            let raw_path = std::path::PathBuf::from(format!("/var/lib/machines/{}.raw", name));
+            let raw_path = crate::paths::machine_raw_image(&name);
             if let Ok(meta) = tokio::fs::metadata(&raw_path).await {
                 if meta.is_file() {
                     let dissect_parent = "/var/cache/lasper/mounts";

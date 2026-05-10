@@ -9,6 +9,7 @@ mod config;
 mod detect;
 
 pub use config::load_theme;
+pub use config::PartialTheme;
 
 // ---------------------------------------------------------------------------
 // Global theme accessor

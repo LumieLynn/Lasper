@@ -15,8 +15,8 @@ enum SubvolumeType {
 
 impl SubvolumeBackend {
     async fn detect_type(&self) -> Result<SubvolumeType> {
-        let machines_dir = Path::new("/var/lib/machines");
-        let fs_type = get_filesystem_type(machines_dir).await?;
+        let machines_dir = crate::paths::machines_dir();
+        let fs_type = get_filesystem_type(&machines_dir).await?;
 
         match fs_type.as_str() {
             "btrfs" => Ok(SubvolumeType::Btrfs),
@@ -55,7 +55,7 @@ impl StorageBackend for SubvolumeBackend {
     }
 
     fn get_path(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/var/lib/machines/{}", name))
+        crate::paths::machine_root(name)
     }
 
     async fn create(&self, name: &str) -> Result<PathBuf> {
@@ -77,8 +77,8 @@ impl StorageBackend for SubvolumeBackend {
                 }
             }
             SubvolumeType::Zfs => {
-                let machines_dir = Path::new("/var/lib/machines");
-                let parent_dataset = self.get_zfs_dataset(machines_dir).await?;
+                let machines_dir = crate::paths::machines_dir();
+                let parent_dataset = self.get_zfs_dataset(&machines_dir).await?;
                 let dataset_name = format!("{}/{}", parent_dataset, name);
 
                 let out = new_command("zfs")
@@ -135,8 +135,8 @@ impl StorageBackend for SubvolumeBackend {
                 }
             }
             SubvolumeType::Zfs => {
-                let machines_dir = Path::new("/var/lib/machines");
-                let parent_dataset = match self.get_zfs_dataset(machines_dir).await {
+                let machines_dir = crate::paths::machines_dir();
+                let parent_dataset = match self.get_zfs_dataset(&machines_dir).await {
                     Ok(ds) => ds,
                     Err(_) => return Ok(()), // Machines dir not a ZFS dataset, nothing to destroy
                 };

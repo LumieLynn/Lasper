@@ -84,41 +84,20 @@ pub struct PartialTheme {
     pub terminal_insert_border: Option<ColorDef>,
 }
 
-/// Wrapper for the top-level `[theme]` section in lasper.toml.
-#[derive(Debug, Default, serde::Deserialize)]
-#[serde(default)]
-struct ThemeConfig {
-    theme: PartialTheme,
-}
-
 /// Load the theme: config file takes precedence, then auto-detection, then dark fallback.
 pub fn load_theme() -> Theme {
-    if let Some(cfg) = read_config() {
-        return merge(cfg);
+    if let Some(cfg) = crate::config::load_config() {
+        if let Some(partial) = cfg.theme {
+            return merge(partial);
+        }
     }
 
-    // No config file — auto-detect terminal background.
+    // No config or theme section — auto-detect terminal background.
     if is_light_background() {
         Theme::light()
     } else {
         Theme::dark()
     }
-}
-
-fn read_config() -> Option<PartialTheme> {
-    let path = config_path()?;
-    let content = std::fs::read_to_string(&path).ok()?;
-    match toml::from_str::<ThemeConfig>(&content) {
-        Ok(cfg) => Some(cfg.theme),
-        Err(e) => {
-            log::warn!("Failed to parse theme config {}: {}", path.display(), e);
-            None
-        }
-    }
-}
-
-fn config_path() -> Option<std::path::PathBuf> {
-    dirs::config_dir().map(|d| d.join("lasper").join("lasper.toml"))
 }
 
 /// Merge partial config over the auto-detected base theme.

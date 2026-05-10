@@ -8,35 +8,35 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 
 mod app;
+mod config;
 mod events;
 mod nspawn;
+mod paths;
 mod term;
 mod ui;
 
-use std::env;
-use std::os::unix::fs::chown;
 use std::path::{Path, PathBuf};
-use uzers::os::unix::UserExt;
 
-fn get_user_home(username: &str) -> Option<PathBuf> {
-    uzers::get_user_by_name(username).map(|u| u.home_dir().to_path_buf())
-}
-
+/// Resolve the log directory.
+///
+/// * `LASPER_LOG_DIR` env var — set by the parent before re-exec; use as-is.
+/// * Not root — normal user with intact XDG environment.
+/// * Root without `LASPER_LOG_DIR` — true root session, system-global fallback.
 fn get_log_dir() -> PathBuf {
-    if let Ok(sudo_user) = env::var("SUDO_USER") {
-        if sudo_user != "root" {
-            if let Some(home) = get_user_home(&sudo_user) {
-                return home.join(".local/state/lasper");
-            }
-        }
+    if let Ok(dir) = std::env::var("LASPER_LOG_DIR") {
+        return PathBuf::from(dir);
     }
-    dirs::state_dir()
-        .map(|p| p.join("lasper"))
-        .unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .map(|p| p.join("lasper"))
-                .unwrap_or_else(|| PathBuf::from(".").join("lasper"))
-        })
+    if uzers::get_current_uid() != 0 {
+        return dirs::state_dir()
+            .map(|p| p.join("lasper"))
+            .unwrap_or_else(|| {
+                dirs::data_local_dir()
+                    .map(|p| p.join("lasper"))
+                    .unwrap_or_else(|| PathBuf::from(".").join("lasper"))
+            });
+    }
+    // True root session — no XDG env, no LASPER_LOG_DIR from a parent.
+    crate::paths::log_dir()
 }
 
 fn cleanup_old_logs(log_dir: &Path, keep: usize) {
@@ -62,77 +62,102 @@ fn cleanup_old_logs(log_dir: &Path, keep: usize) {
     }
 }
 
-fn try_chown_to_sudo_user(path: &Path) {
-    let sudo_uid = env::var("SUDO_UID")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
-    let sudo_gid = env::var("SUDO_GID")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok());
+/// Re-execute the current binary via sudo. Returns `true` if the child exited
+/// successfully (meaning the elevated instance took over), `false` otherwise.
+fn try_elevate() -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| a != "--elevate" && a != "-e")
+        .collect();
 
-    if let (Some(uid), Some(gid)) = (sudo_uid, sudo_gid) {
-        // Refuse to chown if the path is a symlink (prevents symlink-following attacks)
-        match std::fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                eprintln!("Warning: Refusing to chown {:?} — it is a symlink", path);
-                return;
-            }
-            Err(e) => {
-                eprintln!("Warning: Cannot stat {:?}: {}", path, e);
-                return;
-            }
-            _ => {}
+    match std::process::Command::new("sudo")
+        .arg("--preserve-env=PATH,TERM,COLORTERM,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_RUNTIME_DIR,HOME,USER,LOGNAME,LASPER_LOG_DIR")
+        .arg(exe)
+        .args(&args)
+        .status()
+    {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            eprintln!("lasper: sudo exited with status {}", s);
+            false
         }
-
-        if let Err(e) = chown(path, Some(uid), Some(gid)) {
-            eprintln!(
-                "Warning: Failed to chown {:?} to {}:{}: {}",
-                path, uid, gid, e
-            );
+        Err(e) => {
+            eprintln!("lasper: failed to run sudo: {}", e);
+            false
         }
     }
 }
 
+fn print_help() {
+    println!(
+        "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
+         USAGE:\n    lasper [FLAGS]\n\n\
+         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Request root elevation via sudo\n\n\
+         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    Set [settings] elevate = true to always request elevation.",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Handle CLI flags before terminal takeover
-    if let Some(arg) = std::env::args().nth(1) {
-        if arg == "--version" || arg == "-v" {
-            println!("lasper {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
-        }
-        if arg == "--help" || arg == "-h" {
-            println!(
-                "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
-                 USAGE:\n    lasper\n\n\
-                 FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message",
-                env!("CARGO_PKG_VERSION")
-            );
-            return Ok(());
+    // 1. Parse CLI flags (before terminal takeover)
+    let mut want_elevation = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--version" | "-v" => {
+                println!("lasper {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Ok(());
+            }
+            "--elevate" | "-e" => want_elevation = true,
+            other => {
+                eprintln!("lasper: unknown flag: {}", other);
+                std::process::exit(1);
+            }
         }
     }
-    // Detect privilege level (uid 0 = root)
+
+    // 2. Load config for elevation setting
+    if !want_elevation {
+        if let Some(settings) = crate::config::load_settings() {
+            want_elevation = settings.elevate;
+        }
+    }
+
+    // 3. Resolve log directory while XDG_STATE_HOME is still intact.
+    //    Hand the pre-computed path to any re-exec'd child via env var so
+    //    it doesn't need to re-detect env vars that sudo may have stripped.
+    let log_dir = get_log_dir();
+    std::env::set_var("LASPER_LOG_DIR", &log_dir);
+
+    // 4. Elevate if requested and not already root
+    if want_elevation && uzers::get_current_uid() != 0 {
+        // Create the log directory now (user-owned) so the root child can
+        // write into it without creating a root-owned parent directory.
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        if try_elevate() {
+            std::process::exit(0);
+        }
+        eprintln!("lasper: elevation failed, continuing in read-only mode");
+    }
+
+    // 5. Determine final privilege level
     let is_root = uzers::get_current_uid() == 0;
 
-    // Setup file-based logging to $HOME/.local/state/lasper/
-    let log_dir = get_log_dir();
+    // 6. Setup logging
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-    // Only chown the directory, ensuring the regular user still owns the folder
-    // when created using sudo.
-    try_chown_to_sudo_user(&log_dir);
-
-    // Clean up old logs (keep last 7)
     cleanup_old_logs(&log_dir, 7);
 
-    // Isolate log files based on privilege to prevent root-owned files from
-    // crashing subsequent regular user runs. Both are readable by the user.
-    let log_prefix = if is_root {
-        "lasper-root.log"
-    } else {
-        "lasper.log"
-    };
-    let file_appender = tracing_appender::rolling::daily(&log_dir, log_prefix);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "lasper.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::fmt()
@@ -140,10 +165,10 @@ async fn main() -> Result<()> {
         .with_ansi(false)
         .init();
 
-    log::info!("Lasper starting");
+    log::info!("Lasper starting (log dir: {})", log_dir.display());
     log::info!("Running as root: {}", is_root);
 
-    // Install panic hook to restore terminal before printing panic info
+    // 6. Install panic hook
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -151,7 +176,7 @@ async fn main() -> Result<()> {
         original_hook(info);
     }));
 
-    // Initialize terminal
+    // 7. Initialize terminal
     enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
@@ -159,10 +184,10 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
 
-    // Run the application
+    // 8. Run the application
     let result = app::App::new(is_root).run(&mut terminal).await;
 
-    // Always restore terminal
+    // 9. Restore terminal
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),

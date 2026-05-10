@@ -45,7 +45,7 @@ impl DefaultManager {
             dbus: std::sync::Arc::new(DefaultDbusProvider::new()),
             cli: std::sync::Arc::new(DefaultCliProvider::new(is_root)),
             last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![PathBuf::from("/var/lib/machines")],
+            watch_paths: vec![crate::paths::machines_dir()],
         }
     }
 
@@ -187,7 +187,7 @@ impl NspawnManager for DefaultManager {
         ))
         .await;
         let _ = tokio::fs::remove_file(
-            crate::nspawn::platform::nvidia::state::get_state_dir().join(format!("{}.json", name)),
+            crate::paths::state_file(name),
         )
         .await;
 

@@ -12,7 +12,7 @@ impl StorageBackend for DirectoryBackend {
         StorageType::Directory
     }
     fn get_path(&self, name: &str) -> PathBuf {
-        PathBuf::from(format!("/var/lib/machines/{}", name))
+        crate::paths::machine_root(name)
     }
 
     async fn create(&self, name: &str) -> Result<PathBuf> {
