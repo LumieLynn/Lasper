@@ -12,6 +12,9 @@ use std::path::PathBuf;
 pub struct AppSettings {
     /// Always request root elevation on startup (equivalent to -e / --elevate).
     pub elevate: bool,
+    /// Force CLI-only mode — skip DBus entirely. Useful for debugging.
+    #[serde(rename = "cli-mode")]
+    pub cli_mode: bool,
 }
 
 /// Top-level sections in lasper.toml.

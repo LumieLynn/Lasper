@@ -74,7 +74,7 @@ pub struct Theme {
     // Badges
     pub badge_root: Color,
     pub badge_readonly: Color,
-    pub badge_cmd_mode: Color,
+    pub badge_cli: Color,
 
     // Status bar
     pub status_info: Color,
@@ -196,7 +196,7 @@ impl Theme {
             // --- Badges ---
             badge_root: Color::Green,
             badge_readonly: Color::Yellow,
-            badge_cmd_mode: Color::Yellow,
+            badge_cli: Color::Yellow,
 
             // --- Status bar ---
             status_info: Color::White,
@@ -318,7 +318,7 @@ impl Theme {
             // --- Badges ---
             badge_root: Color::Green,
             badge_readonly: Color::Yellow,
-            badge_cmd_mode: Color::Yellow,
+            badge_cli: Color::Yellow,
 
             // --- Status bar ---
             status_info: Color::Black,

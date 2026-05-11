@@ -1,38 +1,17 @@
+use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
+use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::sys::{CommandRunner, DefaultCommandRunner};
 use std::collections::HashMap;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait::async_trait]
-pub trait CliProvider: Send + Sync + 'static {
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
-    async fn running_map(&self) -> Result<HashMap<String, Vec<String>>>;
-    async fn start(&self, name: &str) -> Result<()>;
-    async fn terminate(&self, name: &str) -> Result<()>;
-    async fn poweroff(&self, name: &str) -> Result<()>;
-    async fn reboot(&self, name: &str) -> Result<()>;
-    async fn enable(&self, name: &str) -> Result<()>;
-    async fn disable(&self, name: &str) -> Result<()>;
-    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
-    async fn remove(&self, name: &str) -> Result<()>;
-    fn spawn_log_stream(
-        &self,
-        name: &str,
-        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    ) -> tokio::task::JoinHandle<()>;
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
-}
 
 #[derive(Clone)]
-pub struct DefaultCliProvider {
+pub struct CliBackend {
     is_root: bool,
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
 }
 
-impl DefaultCliProvider {
+impl CliBackend {
     pub fn new(is_root: bool) -> Self {
         Self {
             is_root,
@@ -66,10 +45,77 @@ impl DefaultCliProvider {
         }
         Ok(())
     }
+
+    /// Returns a map of running machine names to their IP addresses.
+    pub(crate) async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
+        let out = self
+            .cmd_runner
+            .run(
+                "machinectl",
+                vec![
+                    "list".to_string(),
+                    "-l".to_string(),
+                    "--no-legend".to_string(),
+                    "--no-pager".to_string(),
+                ],
+            )
+            .await
+            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
+
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.is_empty() && !stderr.contains("No machines") {
+                return Err(NspawnError::cmd_failed(
+                    "machinectl list",
+                    "machinectl list -l --no-legend --no-pager",
+                    &out,
+                ));
+            }
+            return Ok(HashMap::new());
+        }
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut current_machine = String::new();
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if line.starts_with(|c: char| c.is_whitespace()) {
+                let ip = line.trim();
+                if !current_machine.is_empty() && !ip.is_empty() {
+                    if let Some(ips) = map.get_mut(&current_machine) {
+                        ips.push(ip.to_string());
+                    }
+                }
+                continue;
+            }
+
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.is_empty() {
+                continue;
+            }
+            current_machine = parts[0].to_string();
+            if current_machine == ".host" {
+                continue;
+            }
+            let mut ips = Vec::new();
+            if let Some(addr) = parts.get(5).copied() {
+                if !addr.is_empty() && addr != "-" {
+                    ips.push(addr.to_string());
+                }
+            }
+            map.insert(current_machine.clone(), ips);
+        }
+        Ok(map)
+    }
 }
 
 #[async_trait::async_trait]
-impl CliProvider for DefaultCliProvider {
+impl ContainerBackend for CliBackend {
+    async fn is_available(&self) -> bool {
+        which::which("machinectl").is_ok()
+    }
+
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
         let running = self.running_map().await?;
 
@@ -163,68 +209,6 @@ impl CliProvider for DefaultCliProvider {
         Ok(entries)
     }
 
-    async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
-        let out = self
-            .cmd_runner
-            .run(
-                "machinectl",
-                vec![
-                    "list".to_string(),
-                    "-l".to_string(),
-                    "--no-legend".to_string(),
-                    "--no-pager".to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() && !stderr.contains("No machines") {
-                return Err(NspawnError::cmd_failed(
-                    "machinectl list",
-                    "machinectl list -l --no-legend --no-pager",
-                    &out,
-                ));
-            }
-            return Ok(HashMap::new());
-        }
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut current_machine = String::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line.starts_with(|c: char| c.is_whitespace()) {
-                let ip = line.trim();
-                if !current_machine.is_empty() && !ip.is_empty() {
-                    if let Some(ips) = map.get_mut(&current_machine) {
-                        ips.push(ip.to_string());
-                    }
-                }
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-            current_machine = parts[0].to_string();
-            if current_machine == ".host" {
-                continue;
-            }
-            let mut ips = Vec::new();
-            if let Some(addr) = parts.get(5).copied() {
-                if !addr.is_empty() && addr != "-" {
-                    ips.push(addr.to_string());
-                }
-            }
-            map.insert(current_machine.clone(), ips);
-        }
-        Ok(map)
-    }
-
     async fn start(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["start", name]).await
     }
@@ -255,48 +239,6 @@ impl CliProvider for DefaultCliProvider {
 
     async fn remove(&self, name: &str) -> Result<()> {
         self.run_machinectl(&["remove", name]).await
-    }
-
-    fn spawn_log_stream(
-        &self,
-        name: &str,
-        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    ) -> tokio::task::JoinHandle<()> {
-        let name = name.to_string();
-        tokio::spawn(async move {
-            let res: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-                let mut child = tokio::process::Command::new("journalctl")
-                    .args(["-M", &name, "-n", "1000", "-f", "--no-pager", "--output=short"])
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::null())
-                    .spawn()?;
-
-                let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-
-                loop {
-                    tokio::select! {
-                        line_res = lines.next_line() => {
-                            if let Ok(Some(line)) = line_res {
-                                tx.send(crate::events::AppEvent::LogLine(line)).await.map_err(|_| "Channel closed")?;
-                            } else {
-                                break;
-                            }
-                        }
-                        _ = child.wait() => break,
-                    }
-                }
-                Ok(())
-            }
-            .await;
-
-            if let Err(e) = res {
-                tx.send(crate::events::AppEvent::LogLine(format!(
-                    "Log stream stopped: {e}"
-                )))
-                .await
-                .ok();
-            }
-        })
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
@@ -348,31 +290,11 @@ impl CliProvider for DefaultCliProvider {
                             key,
                             &zbus::zvariant::Value::Str(val.into()),
                         );
-                        if matches!(
-                            key,
-                            "After"
-                                | "Before"
-                                | "Wants"
-                                | "WantedBy"
-                                | "Requires"
-                                | "RequiredBy"
-                                | "Conflicts"
-                                | "ConflictedBy"
-                        ) {
-                            if !formatted.is_empty() && formatted != "[]" {
-                                props.insert(
-                                    crate::nspawn::models::GROUP_DEPENDENCIES,
-                                    key.to_string(),
-                                    formatted,
-                                );
-                            }
-                        } else {
-                            props.insert(
-                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                                key.to_string(),
-                                formatted,
-                            );
-                        }
+                        crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                            &mut props,
+                            key.to_string(),
+                            formatted,
+                        );
                     }
                 }
             }
@@ -388,6 +310,44 @@ impl CliProvider for DefaultCliProvider {
         }
 
         Ok(props)
+    }
+
+    async fn reload_daemon(&self) -> Result<()> {
+        let out = self
+            .cmd_runner
+            .run("systemctl", vec!["daemon-reload".to_string()])
+            .await
+            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("systemctl"), e))?;
+
+        crate::nspawn::sys::log_output("systemctl", &out);
+
+        if !out.status.success() {
+            return Err(NspawnError::cmd_failed(
+                "systemctl daemon-reload",
+                "systemctl daemon-reload",
+                &out,
+            ));
+        }
+        Ok(())
+    }
+
+    async fn watch_events(&self, _tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+        Err(NspawnError::Dbus(zbus::Error::Failure(
+            "watch_events not supported on CLI backend".into(),
+        )))
+    }
+
+}
+
+#[async_trait::async_trait]
+impl ProvisionBackend for CliBackend {
+    async fn clone_image(&self, source: &str, dest: &str) -> Result<()> {
+        self.run_machinectl(&["clone", source, dest]).await
+    }
+
+    async fn reload_daemon(&self) -> Result<()> {
+        // Delegates to the same `systemctl daemon-reload` used by the runtime backend.
+        ContainerBackend::reload_daemon(self).await
     }
 }
 
@@ -420,7 +380,7 @@ mod tests {
             r
         });
 
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
         let map = provider.running_map().await.unwrap();
 
         assert_eq!(map.len(), 2);
@@ -438,7 +398,7 @@ mod tests {
             r
         });
 
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
         let map = provider.running_map().await.unwrap();
         assert!(map.is_empty());
     }
@@ -455,7 +415,7 @@ mod tests {
             r
         });
 
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
         let map = provider.running_map().await.unwrap();
 
         assert_eq!(map.len(), 1);
@@ -487,7 +447,7 @@ mod tests {
             });
             r
         });
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
 
         let entries = provider.list_all().await.unwrap();
 
@@ -513,7 +473,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out_list.clone()));
             r
         });
-        let provider = DefaultCliProvider::with_runner(false, runner);
+        let provider = CliBackend::with_runner(false, runner);
 
         let entries = provider.list_all().await.unwrap();
 
@@ -541,7 +501,7 @@ mod tests {
             });
             r
         });
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
 
         let props = provider.get_properties("test-ctr").await.unwrap();
 
@@ -559,7 +519,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out2.clone()));
             r
         });
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
 
         let result = provider.get_properties("missing-ctr").await;
         assert!(result.is_err());
@@ -575,7 +535,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out.clone()));
             r
         });
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
 
         provider.start("my-ctr").await.unwrap();
     }
@@ -588,7 +548,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out.clone()));
             r
         });
-        let provider = DefaultCliProvider::with_runner(true, runner);
+        let provider = CliBackend::with_runner(true, runner);
 
         provider.kill("my-ctr", "SIGTERM").await.unwrap();
     }

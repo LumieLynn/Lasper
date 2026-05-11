@@ -134,10 +134,7 @@ pub async fn inject_env_once(name: &str, state: &NvidiaState) -> Result<()> {
     Ok(())
 }
 
-pub async fn ensure_gpu_passthrough(
-    name: &str,
-    dbus: &dyn crate::nspawn::adapters::comm::dbus::DbusProvider,
-) -> Result<()> {
+pub async fn ensure_gpu_passthrough(name: &str) -> Result<()> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
     let config = match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(name).await
     {
@@ -186,7 +183,6 @@ pub async fn ensure_gpu_passthrough(
                 name
             );
             inject_persistent_device_allow(name, &host_state).await?;
-            let _ = dbus.reload_daemon().await;
             return Ok(());
         }
         log::info!(
@@ -238,8 +234,6 @@ pub async fn ensure_gpu_passthrough(
         "Lifecycle",
         "Reloading systemd daemon to commit changes."
     );
-    dbus.reload_daemon().await?;
-
     log_step!(name, "Lifecycle", "GPU surgery successful.");
     Ok(())
 }

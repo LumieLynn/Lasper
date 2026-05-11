@@ -96,8 +96,8 @@ fn print_help() {
     println!(
         "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
          USAGE:\n    lasper [FLAGS]\n\n\
-         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Request root elevation via sudo\n\n\
-         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    Set [settings] elevate = true to always request elevation.",
+         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Request root elevation via sudo\n    -c, --cli-mode   Force CLI-only mode (skip DBus)\n\n\
+         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    Set [settings] elevate = true to always request elevation.\n    Set [settings] cli-mode = true to force CLI-only mode.",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -106,6 +106,7 @@ fn print_help() {
 async fn main() -> Result<()> {
     // 1. Parse CLI flags (before terminal takeover)
     let mut want_elevation = false;
+    let mut want_cli_mode = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-v" => {
@@ -117,6 +118,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--elevate" | "-e" => want_elevation = true,
+            "--cli-mode" | "-c" => want_cli_mode = true,
             other => {
                 eprintln!("lasper: unknown flag: {}", other);
                 std::process::exit(1);
@@ -124,10 +126,13 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 2. Load config for elevation setting
-    if !want_elevation {
-        if let Some(settings) = crate::config::load_settings() {
+    // 2. Load config for settings (elevation, cli_mode)
+    if let Some(settings) = crate::config::load_settings() {
+        if !want_elevation {
             want_elevation = settings.elevate;
+        }
+        if !want_cli_mode {
+            want_cli_mode = settings.cli_mode;
         }
     }
 
@@ -185,7 +190,7 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
 
     // 8. Run the application
-    let result = app::App::new(is_root).run(&mut terminal).await;
+    let result = app::App::new(is_root, want_cli_mode).run(&mut terminal).await;
 
     // 9. Restore terminal
     let _ = disable_raw_mode();

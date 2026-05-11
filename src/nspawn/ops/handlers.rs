@@ -9,8 +9,13 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     tokio::spawn(async move {
         match cmd {
             BackendCommand::SubmitConfig(ctx) => {
+                let provision: std::sync::Arc<
+                    dyn crate::nspawn::ops::provision::backend::ProvisionBackend,
+                > = std::sync::Arc::new(
+                    crate::nspawn::adapters::comm::cli::CliBackend::new(true),
+                );
                 let built = ctx.build_config();
-                let (deployer, storage) = ctx.get_deployer_and_storage();
+                let (deployer, storage) = ctx.get_deployer_and_storage(provision);
                 let name = built.cfg.name.clone();
                 let cfg = built.cfg;
                 let nvidia_profile = built.nvidia_profile;

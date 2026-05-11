@@ -1,26 +1,11 @@
 #![allow(clippy::type_complexity)]
 
+use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
 use zbus::zvariant::OwnedObjectPath;
 use zbus::{proxy, Connection};
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait::async_trait]
-pub trait DbusProvider: Send + Sync + 'static {
-    async fn is_available(&self) -> bool;
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
-    async fn start(&self, name: &str) -> Result<()>;
-    async fn terminate(&self, name: &str) -> Result<()>;
-    async fn poweroff(&self, name: &str) -> Result<()>;
-    async fn reboot(&self, name: &str) -> Result<()>;
-    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
-    async fn remove(&self, name: &str) -> Result<()>;
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
-    async fn reload_daemon(&self) -> Result<()>;
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()>;
-}
 
 #[proxy(
     interface = "org.freedesktop.machine1.Manager",
@@ -57,11 +42,11 @@ trait Machine {
 }
 
 #[derive(Clone)]
-pub struct DefaultDbusProvider {
+pub struct DbusBackend {
     conn: std::sync::Arc<tokio::sync::OnceCell<Option<Connection>>>,
 }
 
-impl DefaultDbusProvider {
+impl DbusBackend {
     pub fn new() -> Self {
         Self {
             conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
@@ -83,7 +68,7 @@ impl DefaultDbusProvider {
 }
 
 #[async_trait::async_trait]
-impl DbusProvider for DefaultDbusProvider {
+impl ContainerBackend for DbusBackend {
     async fn is_available(&self) -> bool {
         self.connection().await.is_some()
     }
@@ -218,6 +203,44 @@ impl DbusProvider for DefaultDbusProvider {
         Ok(())
     }
 
+    async fn enable(&self, name: &str) -> Result<()> {
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let unit = format!("systemd-nspawn@{}.service", name);
+        let files: Vec<(&str, bool)> = vec![(&unit, false)];
+        conn.call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "EnableUnitFiles",
+            &(files, false),
+        )
+        .await
+        .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    async fn disable(&self, name: &str) -> Result<()> {
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let unit = format!("systemd-nspawn@{}.service", name);
+        let files: Vec<&str> = vec![&unit];
+        conn.call_method(
+            Some("org.freedesktop.systemd1"),
+            "/org/freedesktop/systemd1",
+            Some("org.freedesktop.systemd1.Manager"),
+            "DisableUnitFiles",
+            &(files, false),
+        )
+        .await
+        .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
         let proxy = self
             .manager_proxy()
@@ -259,23 +282,9 @@ impl DbusProvider for DefaultDbusProvider {
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
         if let Ok(sd_props) = get_systemd1_properties(&conn, name).await {
             for (k, v) in sd_props {
-                if matches!(
-                    k.as_str(),
-                    "After"
-                        | "Before"
-                        | "Wants"
-                        | "WantedBy"
-                        | "Requires"
-                        | "RequiredBy"
-                        | "Conflicts"
-                        | "ConflictedBy"
-                ) {
-                    if !v.is_empty() && v != "[]" {
-                        props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, k, v);
-                    }
-                } else {
-                    props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, k, v);
-                }
+                crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                    &mut props, k, v,
+                );
             }
         }
 
@@ -305,7 +314,6 @@ impl DbusProvider for DefaultDbusProvider {
         Ok(())
     }
 
-    /// Block and watch for machine start/stop events. Sends a signal to tx whenever a change occurs.
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
         use futures_util::StreamExt;
         let proxy = self
@@ -333,6 +341,7 @@ impl DbusProvider for DefaultDbusProvider {
             }
         }
     }
+
 }
 
 async fn get_machine1_properties(

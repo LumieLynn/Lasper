@@ -428,8 +428,11 @@ impl WizardContext {
         self.build_config().preview
     }
 
-    pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        self.builder().get_deployer_and_storage()
+    pub fn get_deployer_and_storage(
+        &self,
+        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+        self.builder().get_deployer_and_storage(provision)
     }
 
     pub fn update_hardware_data(

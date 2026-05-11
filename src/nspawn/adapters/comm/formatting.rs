@@ -1,4 +1,32 @@
+use crate::nspawn::models::MachineProperties;
 use zbus::zvariant::Value;
+
+/// Keys that should be routed to the Dependencies group instead of Systemd Unit.
+const DEPENDENCY_KEYS: &[&str] = &[
+    "After",
+    "Before",
+    "Wants",
+    "WantedBy",
+    "Requires",
+    "RequiredBy",
+    "Conflicts",
+    "ConflictedBy",
+];
+
+pub fn is_dependency_key(key: &str) -> bool {
+    DEPENDENCY_KEYS.contains(&key)
+}
+
+/// Insert a formatted systemd unit property into the correct group.
+pub fn insert_systemd_property(props: &mut MachineProperties, key: String, value: String) {
+    if is_dependency_key(&key) {
+        if !value.is_empty() && value != "[]" {
+            props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, key, value);
+        }
+    } else {
+        props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, key, value);
+    }
+}
 
 const DEPENDENCY_BLOCKLIST: &[&str] = &[
     "basic.target",

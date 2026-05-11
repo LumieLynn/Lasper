@@ -184,7 +184,10 @@ impl ContainerConfigBuilder {
         }
     }
 
-    pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+    pub fn get_deployer_and_storage(
+        &self,
+        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
         use crate::nspawn::ops::provision::*;
 
@@ -224,6 +227,7 @@ impl ContainerConfigBuilder {
         let deployer: Box<dyn Deployer> = match source.kind {
             SourceKind::Copy => Box::new(clone::CloneDeployer {
                 source_name: source.clone_source.clone(),
+                provision: provision.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Oci => Box::new(image::OciDeployer {
                 url: source.oci_url.clone(),

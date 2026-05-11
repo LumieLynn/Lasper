@@ -1,10 +1,12 @@
-use crate::nspawn::adapters::comm::cli::{CliProvider, DefaultCliProvider};
-use crate::nspawn::adapters::comm::dbus::{DbusProvider, DefaultDbusProvider};
+use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::cli::CliBackend;
+use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
+use tokio::io::AsyncBufReadExt;
 
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
@@ -17,7 +19,11 @@ pub trait NspawnManager: Send + Sync + 'static {
         name: &str,
         tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     ) -> tokio::task::JoinHandle<()>;
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
+    async fn get_properties(
+        &self,
+        name: &str,
+        entry: &ContainerEntry,
+    ) -> Result<MachineProperties>;
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
     async fn poweroff(&self, name: &str) -> Result<()>;
@@ -32,18 +38,23 @@ pub trait NspawnManager: Send + Sync + 'static {
 
 pub struct DefaultManager {
     is_root: bool,
-    dbus: std::sync::Arc<dyn DbusProvider>,
-    cli: std::sync::Arc<dyn CliProvider>,
+    cli_mode: bool,
+    dbus: std::sync::Arc<dyn ContainerBackend>,
+    cli: std::sync::Arc<dyn ContainerBackend>,
     last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
 }
 
 impl DefaultManager {
-    pub fn new(is_root: bool) -> Self {
+    pub fn new(is_root: bool, cli_mode: bool) -> Self {
+        if cli_mode {
+            log::info!("CLI mode active — DBus backend disabled");
+        }
         Self {
             is_root,
-            dbus: std::sync::Arc::new(DefaultDbusProvider::new()),
-            cli: std::sync::Arc::new(DefaultCliProvider::new(is_root)),
+            cli_mode,
+            dbus: std::sync::Arc::new(DbusBackend::new()),
+            cli: std::sync::Arc::new(CliBackend::new(is_root)),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![crate::paths::machines_dir()],
         }
@@ -58,11 +69,37 @@ impl DefaultManager {
     }
 
     fn mark_fallback(&self, reason: &str) {
+        if self.cli_mode {
+            return;
+        }
         *self.last_fallback_reason.lock() = Some(reason.to_string());
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &*self.dbus).await
+        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name).await?;
+        // Reload systemd after GPU surgery — always needed when device allows change.
+        let _ = self.reload_daemon_fallback().await;
+        Ok(())
+    }
+
+    /// DBus-first / CLI-fallback for `reload_daemon` (takes no name, doesn't fit the macro).
+    async fn reload_daemon_fallback(&self) -> Result<()> {
+        if self.dbus.is_available().await {
+            match self.dbus.reload_daemon().await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!("DBus reload_daemon failed, falling back to CLI: {}", e);
+                    self.mark_fallback(&format!("{}", e));
+                }
+            }
+        } else {
+            log::debug!("DBus not available for reload_daemon, using CLI");
+            self.mark_fallback("DBus not available");
+        }
+        self.cli.reload_daemon().await.map_err(|e| {
+            log::error!("CLI reload_daemon failed: {}", e);
+            e
+        })
     }
 }
 
@@ -135,18 +172,12 @@ impl NspawnManager for DefaultManager {
 
     async fn enable(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        self.cli.enable(name).await.map_err(|e| {
-            log::error!("CLI enable failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, enable, name)
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
         self.require_root()?;
-        self.cli.disable(name).await.map_err(|e| {
-            log::error!("CLI disable failed for {}: {}", name, e);
-            e
-        })
+        fallback_to_cli!(self, disable, name)
     }
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
@@ -199,29 +230,131 @@ impl NspawnManager for DefaultManager {
         name: &str,
         tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     ) -> tokio::task::JoinHandle<()> {
-        self.cli.spawn_log_stream(name, tx)
+        let name = name.to_string();
+        tokio::spawn(async move {
+            let res: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+                let mut child = tokio::process::Command::new("journalctl")
+                    .args(["-M", &name, "-n", "1000", "-f", "--no-pager", "--output=short"])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()?;
+
+                let mut lines =
+                    tokio::io::BufReader::new(child.stdout.take().unwrap())
+                        .lines();
+
+                loop {
+                    tokio::select! {
+                        line_res = lines.next_line() => {
+                            if let Ok(Some(line)) = line_res {
+                                tx.send(crate::events::AppEvent::LogLine(line))
+                                    .await
+                                    .map_err(|_| "Channel closed")?;
+                            } else {
+                                break;
+                            }
+                        }
+                        _ = child.wait() => break,
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(e) = res {
+                tx.send(crate::events::AppEvent::LogLine(format!(
+                    "Log stream stopped: {e}"
+                )))
+                .await
+                .ok();
+            }
+        })
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        if self.dbus.is_available().await {
+    async fn get_properties(
+        &self,
+        name: &str,
+        entry: &ContainerEntry,
+    ) -> Result<MachineProperties> {
+        let mut props = if self.dbus.is_available().await {
             match self.dbus.get_properties(name).await {
-                Ok(p) => return Ok(p),
+                Ok(p) => p,
                 Err(e) => {
                     log::warn!("DBus get_properties failed, falling back to CLI: {}", e);
                     self.mark_fallback(&format!("{}", e));
+                    self.cli.get_properties(name).await?
                 }
             }
         } else {
             log::debug!("DBus not available for get_properties, using CLI");
             self.mark_fallback("DBus not available");
+            self.cli.get_properties(name).await?
+        };
+
+        // Enrich with entry-derived fields
+        if !entry.all_addresses.is_empty() {
+            props.insert(
+                crate::nspawn::models::GROUP_MACHINE,
+                "IPAddresses".into(),
+                entry.all_addresses.join(", "),
+            );
         }
-        self.cli.get_properties(name).await.map_err(|e| {
-            log::error!("CLI get_properties failed for {}: {}", name, e);
-            e
-        })
+        if let Some(ufs) = props
+            .get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+            .get("UnitFileState")
+        {
+            let ufs = ufs.clone();
+            props.insert(
+                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                "Enabled".into(),
+                ufs,
+            );
+        }
+        if let Some(image_type) = &entry.image_type {
+            if let Some(machine_type) = props
+                .get_group_mut(crate::nspawn::models::GROUP_MACHINE)
+                .remove("Type")
+            {
+                props.insert(
+                    crate::nspawn::models::GROUP_MACHINE,
+                    "Class".into(),
+                    machine_type,
+                );
+            }
+            props.insert(
+                crate::nspawn::models::GROUP_MACHINE,
+                "Type".into(),
+                image_type.clone(),
+            );
+        }
+        if !entry.state.is_running() {
+            props.insert(
+                crate::nspawn::models::GROUP_MACHINE,
+                "ReadOnly".into(),
+                entry.readonly.to_string(),
+            );
+            if let Some(u) = &entry.usage {
+                props.insert(
+                    crate::nspawn::models::GROUP_MACHINE,
+                    "Usage".into(),
+                    u.clone(),
+                );
+            }
+            props.insert(
+                crate::nspawn::models::GROUP_MACHINE,
+                "State".into(),
+                entry.state.label().into(),
+            );
+        }
+
+        Ok(props)
     }
 
     async fn is_dbus_available(&self) -> bool {
+        if self.cli_mode {
+            log::debug!("is_dbus_available → false (cli_mode active)");
+            return false;
+        }
         self.dbus.is_available().await
     }
 
@@ -302,8 +435,7 @@ impl NspawnManager for DefaultManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::adapters::comm::cli::MockCliProvider;
-    use crate::nspawn::adapters::comm::dbus::MockDbusProvider;
+    use crate::nspawn::adapters::comm::backend::MockContainerBackend;
     use crate::nspawn::errors::NspawnError;
     use crate::nspawn::models::ContainerState;
 
@@ -319,16 +451,16 @@ mod tests {
         }
     }
 
-    fn mock_dbus_available() -> MockDbusProvider {
-        let mut dbus = MockDbusProvider::new();
-        dbus.expect_is_available().returning(|| true);
-        dbus
+    fn mock_dbus_available() -> MockContainerBackend {
+        let mut backend = MockContainerBackend::new();
+        backend.expect_is_available().returning(|| true);
+        backend
     }
 
-    fn mock_dbus_unavailable() -> MockDbusProvider {
-        let mut dbus = MockDbusProvider::new();
-        dbus.expect_is_available().returning(|| false);
-        dbus
+    fn mock_dbus_unavailable() -> MockContainerBackend {
+        let mut backend = MockContainerBackend::new();
+        backend.expect_is_available().returning(|| false);
+        backend
     }
 
     // list_all
@@ -339,10 +471,11 @@ mod tests {
         dbus.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("dbus-entry")]));
 
-        let cli = MockCliProvider::new(); // cli should never be called
+        let cli = MockContainerBackend::new(); // cli should never be called
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -361,12 +494,13 @@ mod tests {
         dbus.expect_list_all()
             .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("dbus down".into()))));
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("cli-entry")]));
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -382,12 +516,13 @@ mod tests {
     async fn test_list_all_uses_cli_when_dbus_unavailable() {
         let dbus = mock_dbus_unavailable();
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("cli-only")]));
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -401,14 +536,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_list_all_non_root_uses_cli_only() {
-        let dbus = MockDbusProvider::new(); // never called for non-root
+        let dbus = MockContainerBackend::new(); // never called for non-root
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("non-root")]));
 
         let mgr = DefaultManager {
             is_root: false,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -424,10 +560,11 @@ mod tests {
     #[tokio::test]
     async fn test_start_requires_root() {
         let dbus = mock_dbus_available();
-        let cli = MockCliProvider::new();
+        let cli = MockContainerBackend::new();
 
         let mgr = DefaultManager {
-            is_root: false, // not root
+            is_root: false,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -443,14 +580,16 @@ mod tests {
     #[tokio::test]
     async fn test_start_falls_back_to_cli_when_dbus_fails() {
         let mut dbus = mock_dbus_available();
+        dbus.expect_reload_daemon().returning(|| Ok(()));
         dbus.expect_start()
             .returning(|_| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_start().returning(|_| Ok(()));
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -461,19 +600,20 @@ mod tests {
         assert!(mgr.did_fallback().is_some());
     }
 
-    // enable/disable bypass DBus
+    // enable/disable now use DBus-first fallback
 
     #[tokio::test]
-    async fn test_enable_calls_cli_directly() {
-        let dbus = MockDbusProvider::new(); // should never be called for enable
-
-        let mut cli = MockCliProvider::new();
-        cli.expect_enable()
+    async fn test_enable_calls_dbus_first() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_enable()
             .with(mockall::predicate::eq("test-ctr"))
             .returning(|_| Ok(()));
 
+        let cli = MockContainerBackend::new(); // should never be called
+
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -481,19 +621,23 @@ mod tests {
         };
 
         mgr.enable("test-ctr").await.unwrap();
+        assert!(mgr.did_fallback().is_none());
     }
 
     #[tokio::test]
-    async fn test_disable_calls_cli_directly() {
-        let dbus = MockDbusProvider::new();
+    async fn test_disable_falls_back_to_cli_when_dbus_fails() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_disable()
+            .returning(|_| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_disable()
             .with(mockall::predicate::eq("test-ctr"))
             .returning(|_| Ok(()));
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -501,6 +645,7 @@ mod tests {
         };
 
         mgr.disable("test-ctr").await.unwrap();
+        assert!(mgr.did_fallback().is_some());
     }
 
     // did_fallback state
@@ -511,12 +656,13 @@ mod tests {
         dbus.expect_list_all()
             .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
 
-        let mut cli = MockCliProvider::new();
+        let mut cli = MockContainerBackend::new();
         cli.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("test")]));
 
         let mgr = DefaultManager {
             is_root: true,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
@@ -533,10 +679,11 @@ mod tests {
     #[tokio::test]
     async fn test_remove_requires_root() {
         let dbus = mock_dbus_available();
-        let cli = MockCliProvider::new();
+        let cli = MockContainerBackend::new();
 
         let mgr = DefaultManager {
             is_root: false,
+            cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),

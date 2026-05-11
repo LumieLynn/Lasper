@@ -1,5 +1,6 @@
 //! Deployment trait and orchestrator.
 
+pub mod backend;
 pub mod builders;
 
 use crate::events::AppEvent;
@@ -105,6 +106,9 @@ async fn run_deploy_internal(
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
+    let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
+        std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(true));
+
     macro_rules! push_log {
         ($msg:expr) => {
             let _ = logs.send($msg).await;
@@ -310,6 +314,8 @@ async fn run_deploy_internal(
                 cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
             ).await?;
+
+            let _ = provision.reload_daemon().await;
         }
 
         if is_mounted_dir {

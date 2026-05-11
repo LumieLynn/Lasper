@@ -74,9 +74,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 
     if !app.data.dbus_active {
         spans.push(Span::styled(
-            " [ ⚡ CMD-MODE ] ",
+            " [ ⚡ CLI ] ",
             Style::default()
-                .fg(t.badge_cmd_mode)
+                .fg(t.badge_cli)
                 .add_modifier(Modifier::BOLD),
         ));
     }

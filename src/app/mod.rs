@@ -125,7 +125,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(is_root: bool) -> Self {
+    pub fn new(is_root: bool, cli_mode: bool) -> Self {
         Self {
             is_root,
             should_quit: false,
@@ -138,8 +138,8 @@ impl App {
                 log_wrapped_height: 0,
                 log_stream: None,
                 config_content: None,
-                dbus_active: true,
-                manager: std::sync::Arc::new(DefaultManager::new(is_root)),
+                dbus_active: !cli_mode,
+                manager: std::sync::Arc::new(DefaultManager::new(is_root, cli_mode)),
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
                 metrics: HashMap::new(),
@@ -378,7 +378,7 @@ mod tests {
     }
 
     fn make_app(is_root: bool) -> App {
-        App::new(is_root)
+        App::new(is_root, false)
     }
 
     mod merge_transitional_states {

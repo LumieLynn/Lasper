@@ -1,16 +1,15 @@
 //! Container cloning deployment implementation.
 
-use crate::nspawn::sys::{new_command, CommandLogged};
 use async_trait::async_trait;
-#[allow(unused_imports)]
-use std::sync::{Arc, Mutex};
 
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::errors::Result;
 use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::ops::provision::Deployer;
 
 pub struct CloneDeployer {
     pub source_name: String,
+    pub provision: std::sync::Arc<dyn ProvisionBackend>,
 }
 
 #[async_trait]
@@ -37,21 +36,7 @@ impl Deployer for CloneDeployer {
             ))
             .await;
 
-        let out = new_command("machinectl")
-            .args(["clone", &self.source_name, name])
-            .logged_output("machinectl")
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-
-        if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "machinectl clone",
-                format!("machinectl clone {} {}", self.source_name, name),
-                &out,
-            ));
-        }
-
-        // machinectl clone creates the container in /var/lib/machines/NAME automatically.
+        self.provision.clone_image(&self.source_name, name).await?;
 
         // Clone configs
         if let Err(e) = crate::nspawn::adapters::config::nspawn_file::clone_nspawn_config(
@@ -74,6 +59,8 @@ impl Deployer for CloneDeployer {
                 .send(format!("WARNING: Failed to clone systemd override: {}", e))
                 .await;
         }
+
+        let _ = self.provision.reload_daemon().await;
 
         Ok(())
     }

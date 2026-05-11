@@ -66,66 +66,8 @@ impl App {
 
         match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
-                match self.data.manager.get_properties(&entry.name).await {
-                    Ok(mut p) => {
-                        if !entry.all_addresses.is_empty() {
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "IPAddresses".into(),
-                                entry.all_addresses.join(", "),
-                            );
-                        }
-                        if let Some(ufs) = p
-                            .get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
-                            .get("UnitFileState")
-                        {
-                            let ufs = ufs.clone();
-                            p.insert(
-                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                                "Enabled".into(),
-                                ufs,
-                            );
-                        }
-                        // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
-                        if let Some(image_type) = &entry.image_type {
-                            if let Some(machine_type) = p
-                                .get_group_mut(crate::nspawn::models::GROUP_MACHINE)
-                                .remove("Type")
-                            {
-                                p.insert(
-                                    crate::nspawn::models::GROUP_MACHINE,
-                                    "Class".into(),
-                                    machine_type,
-                                );
-                            }
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "Type".into(),
-                                image_type.clone(),
-                            );
-                        }
-
-                        // For stopped containers, manually ensure expected static fields
-                        if !entry.state.is_running() {
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "ReadOnly".into(),
-                                entry.readonly.to_string(),
-                            );
-                            if let Some(u) = &entry.usage {
-                                p.insert(
-                                    crate::nspawn::models::GROUP_MACHINE,
-                                    "Usage".into(),
-                                    u.clone(),
-                                );
-                            }
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "State".into(),
-                                entry.state.label().into(),
-                            );
-                        }
-
+                match self.data.manager.get_properties(&entry.name, &entry).await {
+                    Ok(p) => {
                         self.data.properties = Ok(p);
                         self.data.properties_dirty = true;
                         self.data.details_dirty = true;

@@ -1,5 +1,4 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::CommandLogged;
 use ini::Ini;
 use std::path::PathBuf;
 
@@ -64,19 +63,6 @@ pub async fn write_systemd_override(
     })
     .await?;
 
-    let out = crate::nspawn::sys::new_command("systemctl")
-        .arg("daemon-reload")
-        .logged_output("systemctl")
-        .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemctl"), e))?;
-
-    if !out.status.success() {
-        log::warn!(
-            "systemctl daemon-reload failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
     Ok(())
 }
 
@@ -104,11 +90,6 @@ pub async fn clone_systemd_override(source_name: &str, dest_name: &str) -> Resul
         Ok(source_content.clone())
     })
     .await?;
-
-    let _ = crate::nspawn::sys::new_command("systemctl")
-        .arg("daemon-reload")
-        .logged_output("systemctl")
-        .await;
 
     Ok(())
 }

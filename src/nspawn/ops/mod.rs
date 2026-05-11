@@ -5,7 +5,7 @@ pub mod provision;
 
 pub use manager::{DefaultManager, NspawnManager};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BackendCommand {
     SubmitConfig(Box<crate::ui::wizard::context::WizardContext>),
     ValidateInterface { name: String, is_bridge_mode: bool },
