@@ -3,12 +3,16 @@ use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::sys::{CommandRunner, DefaultCommandRunner};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct CliBackend {
     is_root: bool,
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
+    nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
 impl CliBackend {
@@ -16,7 +20,12 @@ impl CliBackend {
         Self {
             is_root,
             cmd_runner: std::sync::Arc::new(DefaultCommandRunner),
+            nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
+    }
+
+    pub fn set_nudge(&self, rx: tokio::sync::watch::Receiver<()>) {
+        *self.nudge_rx.lock() = Some(rx);
     }
 
     #[cfg(test)]
@@ -24,6 +33,7 @@ impl CliBackend {
         Self {
             is_root,
             cmd_runner: runner,
+            nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -331,10 +341,35 @@ impl ContainerBackend for CliBackend {
         Ok(())
     }
 
-    async fn watch_events(&self, _tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
-        Err(NspawnError::Dbus(zbus::Error::Failure(
-            "watch_events not supported on CLI backend".into(),
-        )))
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+        let mut nudge_rx = self
+            .nudge_rx
+            .lock()
+            .take()
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure(
+                "watch_events: no nudge channel set on CliBackend".into(),
+            )))?;
+
+        let mut prev: HashSet<String> = HashSet::new();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(WATCH_POLL_INTERVAL) => {}
+                _ = nudge_rx.changed() => {}
+            }
+
+            match self.list_all().await {
+                Ok(entries) => {
+                    let current: HashSet<_> = entries.into_iter().map(|e| e.name).collect();
+                    if current != prev {
+                        let _ = tx.send(()).await;
+                        prev = current;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("CLI watch_events: list_all failed: {}", e);
+                }
+            }
+        }
     }
 
 }

@@ -43,6 +43,7 @@ pub struct DefaultManager {
     cli: std::sync::Arc<dyn ContainerBackend>,
     last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
+    nudge_tx: tokio::sync::watch::Sender<()>,
 }
 
 impl DefaultManager {
@@ -50,13 +51,17 @@ impl DefaultManager {
         if cli_mode {
             log::info!("CLI mode active — DBus backend disabled");
         }
+        let cli_backend = CliBackend::new(is_root);
+        let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
+        cli_backend.set_nudge(nudge_rx);
         Self {
             is_root,
             cli_mode,
             dbus: std::sync::Arc::new(DbusBackend::new()),
-            cli: std::sync::Arc::new(CliBackend::new(is_root)),
+            cli: std::sync::Arc::new(cli_backend),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![crate::paths::machines_dir()],
+            nudge_tx,
         }
     }
 
@@ -75,16 +80,21 @@ impl DefaultManager {
         *self.last_fallback_reason.lock() = Some(reason.to_string());
     }
 
+    fn nudge(&self) {
+        let _ = self.nudge_tx.send(());
+    }
+
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name).await?;
         // Reload systemd after GPU surgery — always needed when device allows change.
         let _ = self.reload_daemon_fallback().await;
+        self.nudge();
         Ok(())
     }
 
     /// DBus-first / CLI-fallback for `reload_daemon` (takes no name, doesn't fit the macro).
     async fn reload_daemon_fallback(&self) -> Result<()> {
-        if self.dbus.is_available().await {
+        if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.reload_daemon().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
@@ -106,19 +116,24 @@ impl DefaultManager {
 /// Try DBus first, then fall back to CLI with consistent logging and error reporting.
 macro_rules! fallback_to_cli {
     ($self:ident, $method:ident, $name:expr $(, $arg:expr)*) => {{
-        if $self.dbus.is_available().await {
+        let result = if !$self.cli_mode && $self.dbus.is_available().await {
             match $self.dbus.$method($name, $($arg),*).await {
-                Ok(v) => return Ok(v),
+                Ok(v) => Ok(v),
                 Err(e) => {
                     log::warn!("DBus {} failed, falling back to CLI: {}", stringify!($method), e);
                     $self.mark_fallback(&format!("{}", e));
+                    $self.cli.$method($name, $($arg),*).await
                 }
             }
         } else {
             log::warn!("DBus not available for {}, falling back to CLI", stringify!($method));
             $self.mark_fallback("DBus not available");
+            $self.cli.$method($name, $($arg),*).await
+        };
+        if result.is_ok() {
+            $self.nudge();
         }
-        $self.cli.$method($name, $($arg),*).await.map_err(|e| {
+        result.map_err(|e| {
             log::error!("CLI {} failed for {}: {}", stringify!($method), $name, e);
             e
         })
@@ -131,7 +146,7 @@ impl NspawnManager for DefaultManager {
         if !self.is_root {
             return self.cli.list_all().await;
         }
-        if self.dbus.is_available().await {
+        if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.list_all().await {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
@@ -188,7 +203,7 @@ impl NspawnManager for DefaultManager {
     async fn remove(&self, name: &str) -> Result<()> {
         self.require_root()?;
 
-        let result = if self.dbus.is_available().await {
+        let result = if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.remove(name).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
@@ -222,6 +237,9 @@ impl NspawnManager for DefaultManager {
         )
         .await;
 
+        if result.is_ok() {
+            self.nudge();
+        }
         result
     }
 
@@ -276,7 +294,7 @@ impl NspawnManager for DefaultManager {
         name: &str,
         entry: &ContainerEntry,
     ) -> Result<MachineProperties> {
-        let mut props = if self.dbus.is_available().await {
+        let mut props = if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.get_properties(name).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -363,13 +381,24 @@ impl NspawnManager for DefaultManager {
     }
 
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {
+        let dbus_available = self.is_root && self.dbus.is_available().await;
+
         // 1. DBus Engine: Instant lifecycle updates
-        if self.is_root && self.dbus.is_available().await {
+        if dbus_available {
             let dbus_clone = self.dbus.clone();
             let tx_dbus = tx.clone();
             tokio::spawn(async move {
                 if let Err(e) = dbus_clone.watch_events(tx_dbus).await {
                     log::error!("DBus watcher crashed: {}", e);
+                }
+            });
+        } else {
+            // CLI watcher: poll-based lifecycle detection with action nudging
+            let cli_clone = self.cli.clone();
+            let tx_cli = tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cli_clone.watch_events(tx_cli).await {
+                    log::error!("CLI watcher crashed: {}", e);
                 }
             });
         }
@@ -382,8 +411,15 @@ impl NspawnManager for DefaultManager {
 
             let mut watcher = match RecommendedWatcher::new(
                 move |res: std::result::Result<Event, notify::Error>| {
-                    if res.is_ok() {
-                        let _ = notify_tx.send(());
+                    if let Ok(event) = &res {
+                        // Only react to files appearing or disappearing;
+                        // ignore Modify events from container disk writes.
+                        if matches!(
+                            event.kind,
+                            notify::EventKind::Create(_) | notify::EventKind::Remove(_)
+                        ) {
+                            let _ = notify_tx.send(());
+                        }
                     }
                 },
                 Config::default(),
@@ -405,7 +441,6 @@ impl NspawnManager for DefaultManager {
                 }
             }
 
-            // Debouncer loop
             loop {
                 if notify_rx.recv().await.is_some() {
                     // Wait 200ms to consolidate burst events
@@ -422,6 +457,7 @@ impl NspawnManager for DefaultManager {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
             loop {
                 interval.tick().await;
+                log::debug!("Heartbeat nudge");
                 let _ = tx_hb.send(()).await;
             }
         });
@@ -480,6 +516,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let entries = mgr.list_all().await.unwrap();
@@ -505,6 +542,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let entries = mgr.list_all().await.unwrap();
@@ -527,6 +565,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let entries = mgr.list_all().await.unwrap();
@@ -549,6 +588,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let entries = mgr.list_all().await.unwrap();
@@ -569,6 +609,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let err = mgr.start("test").await.unwrap_err();
@@ -594,6 +635,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         mgr.start("test").await.unwrap();
@@ -618,6 +660,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         mgr.enable("test-ctr").await.unwrap();
@@ -642,6 +685,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         mgr.disable("test-ctr").await.unwrap();
@@ -667,6 +711,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         mgr.list_all().await.unwrap();
@@ -688,6 +733,7 @@ mod tests {
             cli: std::sync::Arc::new(cli),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         let err = mgr.remove("test").await.unwrap_err();

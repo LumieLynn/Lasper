@@ -209,7 +209,7 @@ fn format_dependencies(v: &Value<'_>) -> String {
     let units: Vec<&str> = raw.split_whitespace().collect();
     let original_count = units.len();
 
-    let filtered: Vec<&str> = units
+    let mut filtered: Vec<&str> = units
         .into_iter()
         .filter(|u| !DEPENDENCY_BLOCKLIST.contains(u))
         .collect();
@@ -219,6 +219,8 @@ fn format_dependencies(v: &Value<'_>) -> String {
     if filtered.is_empty() && hidden_count > 0 {
         return "(system default)".to_string();
     }
+
+    filtered.sort_unstable();
 
     let mut result = filtered.join(" ");
     if hidden_count > 0 {

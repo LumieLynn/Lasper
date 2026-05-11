@@ -308,12 +308,14 @@ impl App {
         let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
             while dirty_rx.recv().await.is_some() {
+                log::debug!("Refresh: dirty_rx nudge, running list_all...");
                 if let Ok(entries) = manager_clone.list_all().await {
                     let _ = refresh_tx_clone.send(entries).await;
                 }
             }
         });
 
+        log::debug!("Refresh: initial nudge");
         let _ = dirty_tx.send(()).await;
 
         loop {

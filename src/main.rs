@@ -75,7 +75,7 @@ fn try_elevate() -> bool {
         .collect();
 
     match std::process::Command::new("sudo")
-        .arg("--preserve-env=PATH,TERM,COLORTERM,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_RUNTIME_DIR,HOME,USER,LOGNAME,LASPER_LOG_DIR")
+        .arg("--preserve-env=PATH,TERM,COLORTERM,XDG_CONFIG_HOME,XDG_STATE_HOME,XDG_RUNTIME_DIR,HOME,USER,LOGNAME,LASPER_LOG_DIR,RUST_LOG,RUST_BACKTRACE")
         .arg(exe)
         .args(&args)
         .status()
