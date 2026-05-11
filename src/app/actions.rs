@@ -187,7 +187,10 @@ impl App {
             if let Some(state) = transition {
                 self.data
                     .transitions
-                    .insert(e.name.clone(), (state, Instant::now()));
+                    .insert(e.name.clone(), (state.clone(), Instant::now()));
+                // Apply immediately so the transition icon shows on the next
+                // frame even when no watcher nudge arrives mid-operation.
+                e.state = state;
             }
 
             let tx = match &self.ui.app_tx {
