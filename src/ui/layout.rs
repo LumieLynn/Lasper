@@ -2,13 +2,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::app::App;
 use crate::ui::theme;
-use crate::ui::{centered_rect, core::Component};
+use crate::ui::core::Component;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -36,7 +36,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
     }
     if app.ui.show_help {
-        render_help(f);
+        crate::ui::widgets::help::HelpOverlay::new().render(f, area);
     }
     if let Some(dialog) = &mut app.ui.quit_dialog {
         dialog.render(f, area);
@@ -282,66 +282,3 @@ fn hspan(s: &'static str) -> Span<'static> {
     Span::styled(s, Style::default().fg(theme::theme().hint_fg))
 }
 
-// Help overlay
-
-fn render_help(f: &mut Frame) {
-    let t = theme::theme();
-    let area = centered_rect(50, 85, f.area());
-    f.render_widget(Clear, area);
-    let rows: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "  Keybindings",
-            Style::default()
-                .fg(t.help_title)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        hrow("j / ↓", "Select next container"),
-        hrow("k / ↑", "Select previous container"),
-        Line::from(""),
-        hrow("Alt+1..5", "Switch detail pane"),
-        hrow("[ / ]  ", "Cycle detail panes"),
-        hrow("↑/↓ | j/k", "Scroll / navigate in detail pane"),
-        Line::from(""),
-        hrow("Alt+1..9", "Switch terminal tab"),
-        hrow("[ / ]  ", "Cycle terminal tabs"),
-        Line::from(""),
-        hrow("s    ", "Start container  [root]"),
-        hrow("S    ", "Poweroff container [root]"),
-        hrow("D    ", "Delete container [root]"),
-        hrow("x / ⏎", "Actions / Power menu  [root]"),
-        Line::from(""),
-        hrow("n / a", "New container / Import wizard  [root]"),
-        Line::from(""),
-        hrow("Tab/⇧Tab", "Switch focus"),
-        hrow("r    ", "Refresh list"),
-        hrow("R    ", "Enter resize mode"),
-        hrow("?    ", "Toggle help"),
-        hrow("q    ", "Quit"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Press any key to close",
-            Style::default().fg(t.help_close_hint),
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .title(" Help ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(t.help_border)),
-        ),
-        area,
-    );
-}
-
-fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
-    let t = theme::theme();
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(k, Style::default().fg(t.help_key)),
-        Span::raw("  "),
-        Span::raw(d),
-    ])
-}
