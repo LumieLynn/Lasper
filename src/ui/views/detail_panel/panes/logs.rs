@@ -16,7 +16,21 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         return;
     }
 
-    if data.log_lines.is_empty() {
+    let buffer = match data.log_manager.active_buffer() {
+        Some(b) => b,
+        None => {
+            f.render_widget(
+                Paragraph::new(vec![Line::from(Span::styled(
+                    "No log output.",
+                    Style::default().fg(theme::theme().text_secondary),
+                ))]),
+                area,
+            );
+            return;
+        }
+    };
+
+    if buffer.lines.is_empty() {
         f.render_widget(
             Paragraph::new(vec![Line::from(Span::styled(
                 "No log output.",
@@ -27,30 +41,24 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         return;
     }
 
-    // Binary search to find the first logical line that is visible at the current scroll
     let scroll_y = scroll as usize;
-    let first_line_idx = match data.log_offset_index.binary_search(&scroll_y) {
+    let first_line_idx = match buffer.offset_index.binary_search(&scroll_y) {
         Ok(idx) => idx,
         Err(idx) => idx.saturating_sub(1),
     };
 
-    // Calculate how many visual lines into the first visible logical line we are
-    let first_line_start_y = data
-        .log_offset_index
+    let first_line_start_y = buffer
+        .offset_index
         .get(first_line_idx)
         .copied()
         .unwrap_or(0);
     let skip_visual_lines = scroll_y.saturating_sub(first_line_start_y);
 
-    // Collect only enough lines to fill the viewport plus a small buffer
     let mut visible_lines = Vec::new();
-
-    // Collect all remaining lines from the start index to ensure the bottom is never cut off
-    for i in first_line_idx..data.log_lines.len() {
-        let line = &data.log_lines[i];
+    for i in first_line_idx..buffer.lines.len() {
+        let line = &buffer.lines[i];
         visible_lines.push(line.clone());
 
-        // Use a loose limit for performance, but 500 lines is safe
         if visible_lines.len() > 500 {
             break;
         }

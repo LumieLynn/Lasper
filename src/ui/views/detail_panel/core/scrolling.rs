@@ -102,29 +102,31 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         data.config_dirty = false;
     }
 
-    // 4. Logs (The hot path)
-    if data.logs_dirty || width_changed {
-        if width_changed || data.log_lines.len() < data.log_offset_index.len() {
-            // Full re-calculate index
-            data.log_offset_index.clear();
-            let mut current_y = 0;
-            for line in &data.log_lines {
-                data.log_offset_index.push(current_y);
-                current_y += calculate_line_wrapped_height(line, width);
+    // 4. Logs (The hot path) — read from active buffer
+    if let Some(buf) = data.log_manager.active_buffer_mut() {
+        if buf.dirty || width_changed {
+            if width_changed || buf.lines.len() < buf.offset_index.len() {
+                buf.offset_index.clear();
+                let mut current_y = 0;
+                for line in &buf.lines {
+                    buf.offset_index.push(current_y);
+                    current_y += calculate_line_wrapped_height(line, width);
+                }
+                buf.wrapped_height = current_y;
+            } else {
+                let mut current_y = buf.wrapped_height;
+                let start_idx = buf.offset_index.len();
+                for i in start_idx..buf.lines.len() {
+                    buf.offset_index.push(current_y);
+                    current_y += calculate_line_wrapped_height(&buf.lines[i], width);
+                }
+                buf.wrapped_height = current_y;
             }
-            data.log_wrapped_height = current_y;
-        } else {
-            // Incremental append
-            let mut current_y = data.log_wrapped_height;
-            let start_idx = data.log_offset_index.len();
-            for i in start_idx..data.log_lines.len() {
-                data.log_offset_index.push(current_y);
-                current_y += calculate_line_wrapped_height(&data.log_lines[i], width);
-            }
-            data.log_wrapped_height = current_y;
+            panel.logs_len = buf.wrapped_height;
+            buf.dirty = false;
         }
-        panel.logs_len = data.log_wrapped_height;
-        data.logs_dirty = false;
+    } else {
+        panel.logs_len = 0;
     }
 
     // Sticky autoscroll for Logs

@@ -46,21 +46,19 @@ impl App {
             Option::None => {
                 self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
                 self.data.properties_dirty = true;
-                self.data.log_lines.clear();
-                self.data.logs_dirty = true;
+                self.data.log_manager.cleanup_all();
                 self.data.config_content = Option::None;
                 self.data.config_dirty = true;
-                if let Some((_, handle)) = self.data.log_stream.take() {
-                    handle.abort();
-                }
                 return;
             }
         };
 
         // Stop log stream if we are not in the Logs pane
         if self.ui.detail_panel.active_pane != DetailPane::Logs {
-            if let Some((_, handle)) = self.data.log_stream.take() {
-                handle.abort();
+            if let Some(buf) = self.data.log_manager.active_buffer_mut() {
+                if let Some(handle) = buf.stream.take() {
+                    handle.abort();
+                }
             }
         }
 
@@ -81,32 +79,32 @@ impl App {
                 }
             }
             DetailPane::Logs => {
-                if entry.state.is_running() {
-                    let needs_new_stream =
-                        !matches!(&self.data.log_stream, Some((name, _)) if name == &entry.name);
+                let buffer = self.data.log_manager.get_or_create(&entry.name);
 
-                    if needs_new_stream {
-                        // Stop old stream
-                        if let Some((_, handle)) = self.data.log_stream.take() {
-                            handle.abort();
-                        }
-                        self.data.log_lines.clear();
-                        self.data.logs_dirty = true;
+                if entry.state.is_running() {
+                    let stream_dead = buffer
+                        .stream
+                        .as_ref()
+                        .map(|h| h.is_finished())
+                        .unwrap_or(true);
+                    if stream_dead {
                         if let Some(tx) = &self.ui.app_tx {
                             let handle =
                                 self.data.manager.spawn_log_stream(&entry.name, tx.clone());
-                            self.data.log_stream = Some((entry.name.clone(), handle));
+                            buffer.stream = Some(handle);
                         }
                     }
                 } else {
-                    if let Some((_, handle)) = self.data.log_stream.take() {
+                    let had_stream = buffer.stream.is_some();
+                    if let Some(handle) = buffer.stream.take() {
                         handle.abort();
                     }
-                    self.data.log_lines.clear();
-                    self.data
-                        .log_lines
-                        .push_back(Line::from("Container is not running."));
-                    self.data.logs_dirty = true;
+                    if had_stream {
+                        buffer
+                            .lines
+                            .push_back(Line::from("[CONTAINER STOPPED]"));
+                        buffer.dirty = true;
+                    }
                 }
             }
             DetailPane::Config => {

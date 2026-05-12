@@ -1,4 +1,5 @@
 pub mod core;
+pub mod log_manager;
 pub mod panes;
 
 use crossterm::event::{KeyCode, KeyEvent};

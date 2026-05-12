@@ -15,6 +15,9 @@ pub struct AppSettings {
     /// Force CLI-only mode — skip DBus entirely. Useful for debugging.
     #[serde(rename = "cli-mode")]
     pub cli_mode: bool,
+    /// Maximum log lines retained per container buffer.
+    #[serde(rename = "log-buffer-lines")]
+    pub log_buffer_lines: usize,
 }
 
 /// Top-level sections in lasper.toml.

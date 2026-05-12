@@ -126,8 +126,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 2. Load config for settings (elevation, cli_mode)
-    if let Some(settings) = crate::config::load_settings() {
+    // 2. Load config for settings (elevation, cli_mode, log_buffer_lines)
+    let app_settings = crate::config::load_settings();
+    if let Some(ref settings) = app_settings {
         if !want_elevation {
             want_elevation = settings.elevate;
         }
@@ -190,7 +191,10 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
 
     // 8. Run the application
-    let result = app::App::new(is_root, want_cli_mode).run(&mut terminal).await;
+    let log_buffer_lines = app_settings.as_ref().map(|s| s.log_buffer_lines).unwrap_or(0);
+    let result = app::App::new(is_root, want_cli_mode, log_buffer_lines)
+        .run(&mut terminal)
+        .await;
 
     // 9. Restore terminal
     let _ = disable_raw_mode();

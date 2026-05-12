@@ -4,7 +4,7 @@ pub mod actions;
 pub mod handlers;
 
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
@@ -92,10 +92,7 @@ pub struct AppData {
     pub entries: Vec<ContainerEntry>,
     pub selected: usize,
     pub properties: Result<crate::nspawn::models::MachineProperties, String>,
-    pub log_lines: VecDeque<Line<'static>>,
-    pub log_offset_index: Vec<usize>,
-    pub log_wrapped_height: usize,
-    pub log_stream: Option<(String, tokio::task::JoinHandle<()>)>,
+    pub log_manager: crate::ui::views::detail_panel::log_manager::LogManager,
     pub config_content: Option<String>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
@@ -110,7 +107,6 @@ pub struct AppData {
     pub properties_dirty: bool,
     pub config_dirty: bool,
     pub details_dirty: bool,
-    pub logs_dirty: bool,
 
     // Terminal state
     pub terminal: TerminalManager,
@@ -125,7 +121,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(is_root: bool, cli_mode: bool) -> Self {
+    pub fn new(is_root: bool, cli_mode: bool, log_buffer_lines: usize) -> Self {
         Self {
             is_root,
             should_quit: false,
@@ -133,10 +129,9 @@ impl App {
                 entries: Vec::new(),
                 selected: 0,
                 properties: Ok(crate::nspawn::models::MachineProperties::default()),
-                log_lines: VecDeque::with_capacity(5000),
-                log_offset_index: Vec::with_capacity(5000),
-                log_wrapped_height: 0,
-                log_stream: None,
+                log_manager: crate::ui::views::detail_panel::log_manager::LogManager::new(
+                    log_buffer_lines,
+                ),
                 config_content: None,
                 dbus_active: !cli_mode,
                 manager: std::sync::Arc::new(DefaultManager::new(is_root, cli_mode)),
@@ -150,7 +145,6 @@ impl App {
                 properties_dirty: true,
                 config_dirty: true,
                 details_dirty: true,
-                logs_dirty: true,
                 terminal: TerminalManager::new(),
             },
             ui: AppUi::new(is_root),
@@ -211,6 +205,9 @@ impl App {
         self.data
             .metrics
             .retain(|name, _| active_names.contains(name));
+        self.data
+            .log_manager
+            .remove_stale(&active_names.into_iter().cloned().collect());
         self.data.selected = prev_name
             .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
             .unwrap_or(0)
@@ -269,11 +266,14 @@ impl App {
                 self.update_metrics(name, time_x, cpu, ram)
             }
             AppEvent::LogLine(line) => {
-                self.data.log_lines.push_back(Line::from(line));
-                if self.data.log_lines.len() > 5000 {
-                    self.data.log_lines.pop_front();
+                let max = self.data.log_manager.max_lines;
+                if let Some(buf) = self.data.log_manager.active_buffer_mut() {
+                    buf.lines.push_back(Line::from(line));
+                    if buf.lines.len() > max {
+                        buf.lines.pop_front();
+                    }
+                    buf.dirty = true;
                 }
-                self.data.logs_dirty = true;
             }
             AppEvent::TerminalRedraw => {}
         }
@@ -345,6 +345,7 @@ impl App {
             }
         }
         self.data.terminal.cleanup_all();
+        self.data.log_manager.cleanup_all();
         Ok(())
     }
 
@@ -380,7 +381,7 @@ mod tests {
     }
 
     fn make_app(is_root: bool) -> App {
-        App::new(is_root, false)
+        App::new(is_root, false, 0)
     }
 
     mod merge_transitional_states {
