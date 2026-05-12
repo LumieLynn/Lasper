@@ -97,34 +97,44 @@ fn print_help() {
         "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
          USAGE:\n    lasper [FLAGS]\n\n\
          FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Request root elevation via sudo\n    -c, --cli-mode   Force CLI-only mode (skip DBus)\n\n\
-         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    Set [settings] elevate = true to always request elevation.\n    Set [settings] cli-mode = true to force CLI-only mode.",
+         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Always request elevation.\n    [settings] cli-mode = true         Force CLI-only mode.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
         env!("CARGO_PKG_VERSION")
     );
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. Parse CLI flags (before terminal takeover)
+/// Result of CLI flag parsing: either proceed with these options, or exit now.
+fn parse_flags() -> std::result::Result<(bool, bool), i32> {
     let mut want_elevation = false;
     let mut want_cli_mode = false;
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--version" | "-v" => {
                 println!("lasper {}", env!("CARGO_PKG_VERSION"));
-                return Ok(());
+                return Err(0);
             }
             "--help" | "-h" => {
                 print_help();
-                return Ok(());
+                return Err(0);
             }
             "--elevate" | "-e" => want_elevation = true,
             "--cli-mode" | "-c" => want_cli_mode = true,
             other => {
                 eprintln!("lasper: unknown flag: {}", other);
-                std::process::exit(1);
+                return Err(1);
             }
         }
     }
+    Ok((want_elevation, want_cli_mode))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 1. Parse CLI flags — all early exits happen here, before terminal
+    //    takeover, so raw-mode / alternate-screen restoration is never needed.
+    let (mut want_elevation, mut want_cli_mode) = match parse_flags() {
+        Ok(opts) => opts,
+        Err(code) => std::process::exit(code),
+    };
 
     // 2. Load config for settings (elevation, cli_mode, log_buffer_lines)
     let app_settings = crate::config::load_settings();
@@ -191,7 +201,10 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
 
     // 8. Run the application
-    let log_buffer_lines = app_settings.as_ref().map(|s| s.log_buffer_lines).unwrap_or(0);
+    let log_buffer_lines = app_settings
+        .as_ref()
+        .map(|s| s.log_buffer_lines)
+        .unwrap_or(0);
     let result = app::App::new(is_root, want_cli_mode, log_buffer_lines)
         .run(&mut terminal)
         .await;

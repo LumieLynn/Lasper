@@ -19,11 +19,8 @@ pub trait NspawnManager: Send + Sync + 'static {
         name: &str,
         tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
     ) -> tokio::task::JoinHandle<()>;
-    async fn get_properties(
-        &self,
-        name: &str,
-        entry: &ContainerEntry,
-    ) -> Result<MachineProperties>;
+    async fn get_properties(&self, name: &str, entry: &ContainerEntry)
+        -> Result<MachineProperties>;
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
     async fn poweroff(&self, name: &str) -> Result<()>;
@@ -232,10 +229,7 @@ impl NspawnManager for DefaultManager {
             name
         ))
         .await;
-        let _ = tokio::fs::remove_file(
-            crate::paths::state_file(name),
-        )
-        .await;
+        let _ = tokio::fs::remove_file(crate::paths::state_file(name)).await;
 
         if result.is_ok() {
             self.nudge();
@@ -252,22 +246,32 @@ impl NspawnManager for DefaultManager {
         tokio::spawn(async move {
             let res: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
                 let mut child = tokio::process::Command::new("journalctl")
-                    .args(["-M", &name, "-n", "1000", "-f", "--no-pager", "--output=short"])
+                    .args([
+                        "-M",
+                        &name,
+                        "-n",
+                        "1000",
+                        "-f",
+                        "--no-pager",
+                        "--output=short",
+                    ])
                     .stdout(std::process::Stdio::piped())
                     .stderr(std::process::Stdio::null())
                     .spawn()?;
 
-                let mut lines =
-                    tokio::io::BufReader::new(child.stdout.take().unwrap())
-                        .lines();
+                let stdout = child.stdout.take().ok_or("journalctl stdout not piped")?;
+                let mut lines = tokio::io::BufReader::new(stdout).lines();
 
                 loop {
                     tokio::select! {
                         line_res = lines.next_line() => {
                             if let Ok(Some(line)) = line_res {
-                                tx.send(crate::events::AppEvent::LogLine(line))
-                                    .await
-                                    .map_err(|_| "Channel closed")?;
+                                tx.send(crate::events::AppEvent::LogLine(
+                                    line,
+                                    name.clone(),
+                                ))
+                                .await
+                                .map_err(|_| "Channel closed")?;
                             } else {
                                 break;
                             }
@@ -280,9 +284,10 @@ impl NspawnManager for DefaultManager {
             .await;
 
             if let Err(e) = res {
-                tx.send(crate::events::AppEvent::LogLine(format!(
-                    "Log stream stopped: {e}"
-                )))
+                tx.send(crate::events::AppEvent::LogLine(
+                    format!("Log stream stopped: {e}"),
+                    name.clone(),
+                ))
                 .await
                 .ok();
             }

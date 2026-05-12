@@ -46,7 +46,10 @@ impl ContainerListComponent {
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),
-                    Line::from(Span::styled(hint, Style::default().fg(crate::ui::theme::theme().text_secondary))),
+                    Line::from(Span::styled(
+                        hint,
+                        Style::default().fg(crate::ui::theme::theme().text_secondary),
+                    )),
                 ]),
                 area,
             );

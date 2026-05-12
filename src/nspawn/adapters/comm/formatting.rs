@@ -87,9 +87,7 @@ pub fn format_property(key: &str, value: &Value<'_>) -> String {
 
         // ExecCommand structures (systemd's custom serialization).
         // ExecMain* keys are metadata (timestamps, PID, code) — not commands.
-        k if k.starts_with("Exec") && !k.starts_with("ExecMain") => {
-            format_exec_command(value)
-        }
+        k if k.starts_with("Exec") && !k.starts_with("ExecMain") => format_exec_command(value),
 
         // Fallback to type-based formatting
         _ => format_dbus_value(value),
@@ -147,8 +145,7 @@ pub fn format_dbus_value(v: &Value<'_>) -> String {
                 return format!("[{}]", bytes.join(" "));
             }
 
-            let formatted: Vec<String> =
-                arr.iter().map(|v| format_dbus_value(v)).collect();
+            let formatted: Vec<String> = arr.iter().map(|v| format_dbus_value(v)).collect();
             formatted.join(" ")
         }
 
@@ -288,10 +285,8 @@ fn format_exec_command(v: &Value<'_>) -> String {
                         let fields = s.fields();
                         if fields.len() >= 2 {
                             if let Value::Array(ref argv_arr) = fields[1] {
-                                let args: Vec<String> = argv_arr
-                                    .iter()
-                                    .map(|a| format_dbus_value(a))
-                                    .collect();
+                                let args: Vec<String> =
+                                    argv_arr.iter().map(|a| format_dbus_value(a)).collect();
                                 return args.join(" ");
                             }
                         }
@@ -547,7 +542,7 @@ fn format_timestamp(v: &Value<'_>) -> String {
         let len = libc::strftime(
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
-            b"%a %Y-%m-%d %H:%M:%S %Z\0".as_ptr() as *const libc::c_char,
+            c"%a %Y-%m-%d %H:%M:%S %Z".as_ptr(),
             &tm,
         );
 
@@ -762,10 +757,26 @@ mod tests {
         let result = format_timestamp(&Value::U64(1713415975000000));
         // The exact output depends on local timezone, but should contain
         // the date components and NOT look like raw epoch seconds.
-        assert!(result.contains("2024"), "expected year in result: {}", result);
-        assert!(result.contains("04"), "expected month in result: {}", result);
-        assert!(!result.contains("unix epoch"), "should not be raw epoch: {}", result);
-        assert!(!result.ends_with('s'), "should not end with 's': {}", result);
+        assert!(
+            result.contains("2024"),
+            "expected year in result: {}",
+            result
+        );
+        assert!(
+            result.contains("04"),
+            "expected month in result: {}",
+            result
+        );
+        assert!(
+            !result.contains("unix epoch"),
+            "should not be raw epoch: {}",
+            result
+        );
+        assert!(
+            !result.ends_with('s'),
+            "should not end with 's': {}",
+            result
+        );
     }
 
     #[test]
@@ -853,10 +864,7 @@ mod tests {
     fn test_format_exec_command_single() {
         let raw = "{ path=systemd-nspawn ; argv[]=systemd-nspawn --quiet --boot --machine=ubuntu-LTS ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }";
         let result = format_exec_command(&Value::Str(raw.into()));
-        assert_eq!(
-            result,
-            "systemd-nspawn --quiet --boot --machine=ubuntu-LTS"
-        );
+        assert_eq!(result, "systemd-nspawn --quiet --boot --machine=ubuntu-LTS");
     }
 
     #[test]
@@ -876,7 +884,8 @@ mod tests {
 
     #[test]
     fn test_format_exec_command_multiple() {
-        let raw = "{ path=/bin/foo ; argv[]=/bin/foo arg1 } { path=/bin/bar ; argv[]=/bin/bar arg2 }";
+        let raw =
+            "{ path=/bin/foo ; argv[]=/bin/foo arg1 } { path=/bin/bar ; argv[]=/bin/bar arg2 }";
         let result = format_exec_command(&Value::Str(raw.into()));
         assert_eq!(result, "/bin/foo arg1\n/bin/bar arg2");
     }

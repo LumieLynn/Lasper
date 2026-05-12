@@ -8,11 +8,7 @@
 /// 3. Falls back to false (dark) — the overwhelming default.
 pub fn is_light_background() -> bool {
     if let Ok(val) = std::env::var("COLORFGBG") {
-        if let Some(bg) = val
-            .split(';')
-            .nth(1)
-            .and_then(|s| s.parse::<u8>().ok())
-        {
+        if let Some(bg) = val.split(';').nth(1).and_then(|s| s.parse::<u8>().ok()) {
             if bg == 7 || bg == 15 {
                 return true;
             }

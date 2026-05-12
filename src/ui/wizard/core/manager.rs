@@ -63,9 +63,9 @@ impl Wizard {
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(ratatui::style::Style::default().fg(
-                crate::ui::theme::theme().wizard_border,
-            ));
+            .border_style(
+                ratatui::style::Style::default().fg(crate::ui::theme::theme().wizard_border),
+            );
 
         let inner = block.inner(area);
         f.render_widget(block, area);

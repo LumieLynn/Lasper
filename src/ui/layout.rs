@@ -7,8 +7,8 @@ use ratatui::{
 };
 
 use crate::app::App;
-use crate::ui::theme;
 use crate::ui::core::Component;
+use crate::ui::theme;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -281,4 +281,3 @@ fn kspan(s: &'static str) -> Span<'static> {
 fn hspan(s: &'static str) -> Span<'static> {
     Span::styled(s, Style::default().fg(theme::theme().hint_fg))
 }
-

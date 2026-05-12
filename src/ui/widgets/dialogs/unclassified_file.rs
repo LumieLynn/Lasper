@@ -2,8 +2,8 @@ use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::text_box::TextBox;
-use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
+use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::wizard::core::context::UnclassifiedFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -48,11 +48,8 @@ impl UnclassifiedFileDialog {
             .as_ref()
             .and_then(|c| categories.iter().position(|cat| cat == c))
             .unwrap_or(categories.len() - 1); // default to Other (last)
-        let mut category_list = SelectableList::new(
-            " Category ",
-            categories,
-            |c| format!("  {}", c.label()),
-        );
+        let mut category_list =
+            SelectableList::new(" Category ", categories, |c| format!("  {}", c.label()));
         category_list.select(selected_cat_idx);
 
         let dest = if file.custom_destination.is_empty() {
@@ -67,10 +64,7 @@ impl UnclassifiedFileDialog {
             category_list,
             readonly: Checkbox::new(" Read-only", file.readonly),
             btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
-            btn_cancel: Button::new(
-                "Cancel",
-                AppMessage::Wizard(WizardMessage::DialogCancel),
-            ),
+            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
         }
@@ -144,7 +138,8 @@ impl Component for UnclassifiedFileDialog {
         let host_inner = host_block.inner(chunks[0]);
         f.render_widget(host_block, chunks[0]);
         f.render_widget(
-            Paragraph::new(self.host_path.as_str()).style(Style::default().fg(crate::ui::theme::theme().dialog_host_text)),
+            Paragraph::new(self.host_path.as_str())
+                .style(Style::default().fg(crate::ui::theme::theme().dialog_host_text)),
             host_inner,
         );
 

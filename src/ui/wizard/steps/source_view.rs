@@ -1,4 +1,3 @@
-use crate::{impl_wizard_nav, delegate_wizard_navigation, wizard_set_focus};
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::text_box::TextBox;
@@ -6,6 +5,7 @@ use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::KeyEvent;
 use ratatui::{

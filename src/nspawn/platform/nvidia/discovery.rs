@@ -243,10 +243,7 @@ fn remap_binds(binds: &mut [PassthroughBind], profile: &NvidiaPassthroughProfile
 /// since those already carry the correct FHS mapping.
 /// Runs before category-based remapping so user-assigned categories
 /// can then participate in `remap_binds`.
-fn apply_manual_classifications(
-    binds: &mut [PassthroughBind],
-    profile: &NvidiaPassthroughProfile,
-) {
+fn apply_manual_classifications(binds: &mut [PassthroughBind], profile: &NvidiaPassthroughProfile) {
     for bind in binds.iter_mut() {
         if let Some(mc) = profile
             .manual_classifications

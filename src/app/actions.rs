@@ -53,15 +53,6 @@ impl App {
             }
         };
 
-        // Stop log stream if we are not in the Logs pane
-        if self.ui.detail_panel.active_pane != DetailPane::Logs {
-            if let Some(buf) = self.data.log_manager.active_buffer_mut() {
-                if let Some(handle) = buf.stream.take() {
-                    handle.abort();
-                }
-            }
-        }
-
         match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
                 match self.data.manager.get_properties(&entry.name, &entry).await {
@@ -100,9 +91,7 @@ impl App {
                         handle.abort();
                     }
                     if had_stream {
-                        buffer
-                            .lines
-                            .push_back(Line::from("[CONTAINER STOPPED]"));
+                        buffer.lines.push_back(Line::from("[CONTAINER STOPPED]"));
                         buffer.dirty = true;
                     }
                 }

@@ -163,8 +163,7 @@ impl NetworkState {
 pub struct UnclassifiedFile {
     pub host_path: String,
     pub default_container_path: String,
-    pub assigned_category:
-        Option<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
+    pub assigned_category: Option<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
     pub custom_destination: String,
     pub readonly: bool,
 }
@@ -219,8 +218,8 @@ impl PassthroughState {
                     .unclassified_files
                     .iter()
                     .filter(|f| f.assigned_category.is_some())
-                    .map(|f| {
-                        crate::nspawn::platform::nvidia::profile::ManualClassification {
+                    .map(
+                        |f| crate::nspawn::platform::nvidia::profile::ManualClassification {
                             host_path: f.host_path.clone(),
                             category: f.assigned_category.clone().unwrap(),
                             destination: if f.custom_destination.is_empty() {
@@ -229,8 +228,8 @@ impl PassthroughState {
                                 f.custom_destination.clone()
                             },
                             readonly: f.readonly,
-                        }
-                    })
+                        },
+                    )
                     .collect();
 
                 Some(

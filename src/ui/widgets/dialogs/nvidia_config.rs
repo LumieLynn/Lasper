@@ -17,10 +17,7 @@ use ratatui::{
 macro_rules! active_comps {
     ($self:ident) => {{
         let mode_idx = $self.mode.selected_idx();
-        let mut comps: Vec<&mut dyn Component> = vec![
-            &mut $self.gpu_device,
-            &mut $self.mode,
-        ];
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.gpu_device, &mut $self.mode];
         if mode_idx == 1 {
             for (_, tb) in &mut $self.dest_inputs {
                 comps.push(tb);
@@ -102,10 +99,7 @@ impl NvidiaConfigDialog {
             dest_inputs,
             inject_env: Checkbox::new("Inject environment (/etc/environment)", false),
             btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
-            btn_cancel: Button::new(
-                "Cancel",
-                AppMessage::Wizard(WizardMessage::DialogCancel),
-            ),
+            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
             focus: FocusTracker::new(),
             scroll_offset: 0,
             on_submit: Box::new(on_submit),
@@ -306,8 +300,8 @@ impl Component for NvidiaConfigDialog {
 
             if max_scroll > 0 {
                 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-                let mut state = ScrollbarState::new(max_scroll as usize)
-                    .position(self.scroll_offset as usize);
+                let mut state =
+                    ScrollbarState::new(max_scroll as usize).position(self.scroll_offset as usize);
                 let scrollbar = Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(Some("▲"))

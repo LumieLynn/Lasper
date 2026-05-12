@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Style},
+    style::Style,
     symbols,
     text::Span,
     widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType},

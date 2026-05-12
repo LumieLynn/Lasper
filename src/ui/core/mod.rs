@@ -23,10 +23,7 @@ pub enum WizardMessage {
     OpenBindEditDialog(usize, crate::nspawn::models::BindMount),
     OpenNvidiaConfigDialog,
     NvidiaConfigSaved(crate::ui::widgets::dialogs::nvidia_config::NvidiaConfigResult),
-    OpenUnclassifiedEditDialog(
-        usize,
-        crate::ui::wizard::core::context::UnclassifiedFile,
-    ),
+    OpenUnclassifiedEditDialog(usize, crate::ui::wizard::core::context::UnclassifiedFile),
 
     // Macro-events for atomic data changes
     UserAdded(crate::nspawn::models::CreateUser),
@@ -38,10 +35,7 @@ pub enum WizardMessage {
     BindMountAdded(crate::nspawn::models::BindMount),
     BindMountUpdated(usize, crate::nspawn::models::BindMount),
     BindMountRemoved(usize),
-    UnclassifiedFileUpdated(
-        usize,
-        crate::ui::wizard::core::context::UnclassifiedFile,
-    ),
+    UnclassifiedFileUpdated(usize, crate::ui::wizard::core::context::UnclassifiedFile),
 }
 
 #[derive(Debug, Clone, PartialEq)]

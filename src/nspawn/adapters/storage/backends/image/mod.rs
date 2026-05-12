@@ -30,9 +30,7 @@ impl StorageBackend for DiskImageBackend {
                     .unwrap_or("raw");
                 crate::paths::machine_image(name, ext)
             }
-            DiskImageSource::CreateNew { .. } => {
-                crate::paths::machine_raw_image(name)
-            }
+            DiskImageSource::CreateNew { .. } => crate::paths::machine_raw_image(name),
         }
     }
 

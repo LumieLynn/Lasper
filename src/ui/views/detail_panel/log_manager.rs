@@ -39,25 +39,22 @@ impl LogManager {
         }
     }
 
+    /// Find a buffer by container name (not just position 0).
+    /// Used to route incoming log lines from background streams to the
+    /// correct buffer regardless of which container is currently selected.
+    pub fn buffer_for(&mut self, name: &str) -> Option<&mut LogBuffer> {
+        self.buffers.iter_mut().find(|b| b.container_name == name)
+    }
+
     pub fn get_or_create(&mut self, name: &str) -> &mut LogBuffer {
         if let Some(idx) = self.buffers.iter().position(|b| b.container_name == name) {
             if idx != 0 {
-                // Abort the old active buffer's stream before switching
-                if let Some(handle) = self.buffers[0].stream.take() {
-                    handle.abort();
-                }
                 let mut buf = self.buffers.remove(idx);
                 buf.dirty = true; // force sync_data_lengths to recalc panel.logs_len
                 self.buffers.insert(0, buf);
             }
             &mut self.buffers[0]
         } else {
-            // Abort the old active buffer's stream before switching to a new one
-            if let Some(first) = self.buffers.first_mut() {
-                if let Some(handle) = first.stream.take() {
-                    handle.abort();
-                }
-            }
             let cap = self.max_lines;
             self.buffers.insert(
                 0,

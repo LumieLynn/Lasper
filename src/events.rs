@@ -15,8 +15,8 @@ pub enum AppEvent {
     ActionDone(String, crate::ui::StatusLevel),
     /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
     MetricsUpdate(String, f64, f64, f64),
-    /// Real-time log line from a container.
-    LogLine(String),
+    /// Real-time log line from a container: (line, container_name).
+    LogLine(String, String),
     /// Request a UI redraw for the terminal.
     TerminalRedraw,
 }

@@ -31,9 +31,7 @@ macro_rules! render_column_layout {
             if i == 0 {
                 spans.push(ratatui::text::Span::styled(
                     format!("{:<width$}", $key, width = $key_width),
-                    ratatui::style::Style::default().fg(
-                        crate::ui::theme::theme().accent,
-                    ),
+                    ratatui::style::Style::default().fg($crate::ui::theme::theme().accent),
                 ));
             } else {
                 spans.push(ratatui::text::Span::raw(" ".repeat($key_width)));

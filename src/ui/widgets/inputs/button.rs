@@ -27,7 +27,9 @@ impl Component for Button {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let t = crate::ui::theme::theme();
         let style = if self.focused {
-            Style::default().fg(t.button_focused_fg).bg(t.button_focused_bg)
+            Style::default()
+                .fg(t.button_focused_fg)
+                .bg(t.button_focused_bg)
         } else {
             Style::default().fg(t.button_unfocused_fg)
         };

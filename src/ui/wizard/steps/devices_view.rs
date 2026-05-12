@@ -1,4 +1,3 @@
-use crate::{impl_wizard_nav, delegate_wizard_navigation, wizard_set_focus};
 use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
@@ -8,6 +7,7 @@ use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::wizard::context::{PassthroughConfig, UnclassifiedFile, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -156,9 +156,11 @@ impl Component for DevicesStepView {
         }
         self.bind_list.render(f, chunks[next]);
 
-        let footer = " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next ";
+        let footer =
+            " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next ";
         f.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
+            Paragraph::new(footer)
+                .style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
             chunks[next + 1],
         );
     }
@@ -168,9 +170,7 @@ impl Component for DevicesStepView {
         if self.bind_list.is_focused() {
             match key.code {
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    return EventResult::Message(AppMessage::Wizard(
-                        WizardMessage::OpenBindDialog,
-                    ));
+                    return EventResult::Message(AppMessage::Wizard(WizardMessage::OpenBindDialog));
                 }
                 KeyCode::Char('e') | KeyCode::Char('E') => {
                     if let Some(bm) = self.bind_list.selected_item() {

@@ -1,4 +1,3 @@
-use crate::{impl_wizard_nav, delegate_wizard_navigation, wizard_set_focus};
 use crate::nspawn::models::CreateUser;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::inputs::password_box::PasswordBox;
@@ -6,6 +5,7 @@ use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::wizard::context::{UserConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -71,7 +71,8 @@ impl Component for UserStepView {
 
         let hint = " [Tab] switch, [A]dd user, [E]dit user, [D]elete user, [Enter] next ";
         f.render_widget(
-            Paragraph::new(hint).style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
+            Paragraph::new(hint)
+                .style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
             chunks[2],
         );
     }

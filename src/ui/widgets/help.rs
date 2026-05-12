@@ -24,9 +24,7 @@ impl Component for HelpOverlay {
         let area = centered_rect(60, 85, area);
         f.render_widget(Clear, area);
 
-        let header_style = Style::default()
-            .fg(t.accent)
-            .add_modifier(Modifier::BOLD);
+        let header_style = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
         let key_style = Style::default().fg(t.help_key);
         let desc_style = Style::default().fg(t.text_primary);
         let close_style = Style::default().fg(t.help_close_hint);
@@ -52,7 +50,12 @@ impl Component for HelpOverlay {
             key_row("S", "Poweroff container", key_style, desc_style),
             key_row("D", "Delete container", key_style, desc_style),
             key_row("x / Enter", "Actions / Power menu", key_style, desc_style),
-            key_row("n / a", "New container / Import wizard", key_style, desc_style),
+            key_row(
+                "n / a",
+                "New container / Import wizard",
+                key_style,
+                desc_style,
+            ),
             spacer_row(),
             category_row(" General ", header_style),
             key_row("Tab / Shift+Tab", "Switch focus", key_style, desc_style),
@@ -62,10 +65,7 @@ impl Component for HelpOverlay {
             key_row("q", "Quit", key_style, desc_style),
             spacer_row(),
             Row::new(vec![
-                Cell::from(Span::styled(
-                    " Press any key to close",
-                    close_style,
-                )),
+                Cell::from(Span::styled(" Press any key to close", close_style)),
                 Cell::from(""),
             ]),
         ];
@@ -87,13 +87,15 @@ impl Component for HelpOverlay {
 }
 
 fn category_row(title: &'static str, style: Style) -> Row<'static> {
-    Row::new(vec![
-        Cell::from(Span::styled(title, style)),
-        Cell::from(""),
-    ])
+    Row::new(vec![Cell::from(Span::styled(title, style)), Cell::from("")])
 }
 
-fn key_row(key: &'static str, desc: &'static str, key_style: Style, desc_style: Style) -> Row<'static> {
+fn key_row(
+    key: &'static str,
+    desc: &'static str,
+    key_style: Style,
+    desc_style: Style,
+) -> Row<'static> {
     Row::new(vec![
         Cell::from(Span::styled(format!("  {}", key), key_style)),
         Cell::from(Span::styled(desc, desc_style)),

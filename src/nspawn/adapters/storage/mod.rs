@@ -30,9 +30,7 @@ impl StorageType {
 
     pub fn get_path(&self, name: &str) -> PathBuf {
         match self {
-            Self::Directory | Self::Subvolume => {
-                crate::paths::machine_root(name)
-            }
+            Self::Directory | Self::Subvolume => crate::paths::machine_root(name),
             Self::DiskImage => {
                 // Only raw disk images are supported by systemd-nspawn
                 let base = crate::paths::machine_root(name);

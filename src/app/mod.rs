@@ -83,7 +83,6 @@ impl AppUi {
             detail_pct: 60,
         }
     }
-
 }
 
 // App
@@ -265,9 +264,9 @@ impl App {
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
-            AppEvent::LogLine(line) => {
+            AppEvent::LogLine(line, container) => {
                 let max = self.data.log_manager.max_lines;
-                if let Some(buf) = self.data.log_manager.active_buffer_mut() {
+                if let Some(buf) = self.data.log_manager.buffer_for(&container) {
                     buf.lines.push_back(Line::from(line));
                     if buf.lines.len() > max {
                         buf.lines.pop_front();
@@ -319,8 +318,13 @@ impl App {
         let _ = dirty_tx.send(()).await;
 
         loop {
-            while let Ok(entries) = refresh_rx.try_recv() {
-                self.sync_entries(entries).await;
+            // Drain at most 3 refresh batches per frame so rapid background
+            // updates can't starve user-input events from the select! below.
+            for _ in 0..3 {
+                match refresh_rx.try_recv() {
+                    Ok(entries) => self.sync_entries(entries).await,
+                    Err(_) => break,
+                }
             }
 
             // Render a frame

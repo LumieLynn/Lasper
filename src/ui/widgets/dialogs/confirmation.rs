@@ -63,7 +63,9 @@ impl Component for ConfirmationDialog {
             Span::raw("Confirm   "),
             Span::styled(
                 " [n/Esc] ",
-                Style::default().fg(t.cancel_hint).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(t.cancel_hint)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw("Cancel"),
         ]);

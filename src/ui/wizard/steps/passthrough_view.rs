@@ -1,4 +1,3 @@
-use crate::{impl_wizard_nav, delegate_wizard_navigation, wizard_set_focus};
 use crate::nspawn::models::NetworkMode;
 use crate::nspawn::platform::gpu::GpuDevice;
 use crate::ui::core::{Component, EventResult, FocusTracker};
@@ -8,6 +7,7 @@ use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{layout::Rect, Frame};
 

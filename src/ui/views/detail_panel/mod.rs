@@ -96,8 +96,7 @@ impl DetailPanel {
         resize_mode: bool,
     ) {
         // Border
-        let border_color =
-            crate::ui::panel_border_color(resize_mode, self.focused, false);
+        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, false);
 
         let tabs_line = self.get_tabs_line(data);
 

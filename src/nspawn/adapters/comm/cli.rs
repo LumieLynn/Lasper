@@ -342,13 +342,11 @@ impl ContainerBackend for CliBackend {
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
-        let mut nudge_rx = self
-            .nudge_rx
-            .lock()
-            .take()
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure(
+        let mut nudge_rx = self.nudge_rx.lock().take().ok_or_else(|| {
+            NspawnError::Dbus(zbus::Error::Failure(
                 "watch_events: no nudge channel set on CliBackend".into(),
-            )))?;
+            ))
+        })?;
 
         let mut prev: HashSet<String> = HashSet::new();
         loop {
@@ -371,7 +369,6 @@ impl ContainerBackend for CliBackend {
             }
         }
     }
-
 }
 
 #[async_trait::async_trait]
