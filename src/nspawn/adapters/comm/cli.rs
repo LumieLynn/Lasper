@@ -541,7 +541,7 @@ mod tests {
         let props = provider.get_properties("test-ctr").await.unwrap();
 
         assert!(props.groups.iter().any(|g| g.name == "Machine"));
-        assert!(props.groups.iter().any(|g| g.name == "Systemd Unit"));
+        assert!(props.groups.iter().any(|g| g.name == "Systemd"));
     }
 
     #[tokio::test]

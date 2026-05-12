@@ -61,7 +61,7 @@ pub struct PropertyGroup {
 }
 
 pub const GROUP_MACHINE: &str = "Machine";
-pub const GROUP_SYSTEMD_UNIT: &str = "Systemd Unit";
+pub const GROUP_SYSTEMD_UNIT: &str = "Systemd";
 pub const GROUP_DEPENDENCIES: &str = "Dependencies";
 
 impl PropertyGroup {

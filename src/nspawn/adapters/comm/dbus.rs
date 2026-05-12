@@ -341,7 +341,6 @@ impl ContainerBackend for DbusBackend {
             }
         }
     }
-
 }
 
 async fn get_machine1_properties(
@@ -386,6 +385,7 @@ async fn get_systemd1_properties(
         .destination("org.freedesktop.systemd1")?
         .path(unit_path)?;
     let props_proxy = b.build().await?;
+
     let interface: zbus::names::InterfaceName = "org.freedesktop.systemd1.Unit".try_into().unwrap();
     let all_props = props_proxy.get_all(Some(interface).into()).await?;
     let mut map = HashMap::new();
@@ -393,5 +393,16 @@ async fn get_systemd1_properties(
         let val = crate::nspawn::adapters::comm::formatting::format_property(&k, &v.into());
         map.insert(k, val);
     }
+
+    // Also fetch Service interface properties
+    let svc_interface: zbus::names::InterfaceName =
+        "org.freedesktop.systemd1.Service".try_into().unwrap();
+    if let Ok(svc_props) = props_proxy.get_all(Some(svc_interface).into()).await {
+        for (k, v) in svc_props {
+            let val = crate::nspawn::adapters::comm::formatting::format_property(&k, &v.into());
+            map.insert(k, val);
+        }
+    }
+
     Ok(map)
 }
