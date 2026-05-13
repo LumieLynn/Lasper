@@ -16,7 +16,7 @@ use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
-use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::Stdout;
 
 pub use crate::ui::views::terminal_panel::TerminalManager;
@@ -264,16 +264,6 @@ impl App {
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
-            AppEvent::LogLine(line, container) => {
-                let max = self.data.log_manager.max_lines;
-                if let Some(buf) = self.data.log_manager.buffer_for(&container) {
-                    buf.lines.push_back(Line::from(line));
-                    if buf.lines.len() > max {
-                        buf.lines.pop_front();
-                    }
-                    buf.dirty = true;
-                }
-            }
             AppEvent::TerminalRedraw => {}
         }
     }
@@ -326,6 +316,9 @@ impl App {
                     Err(_) => break,
                 }
             }
+
+            // Drain per-buffer log channels before rendering
+            self.data.log_manager.drain_all();
 
             // Render a frame
             terminal.draw(|f| crate::ui::draw(f, self))?;

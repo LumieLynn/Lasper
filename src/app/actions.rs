@@ -1,7 +1,6 @@
 use super::App;
 use crate::nspawn::models::{ContainerEntry, ContainerState};
 use crate::ui::views::detail_panel::DetailPane;
-use ratatui::text::Line;
 use std::time::{Duration, Instant};
 
 impl App {
@@ -70,30 +69,22 @@ impl App {
                 }
             }
             DetailPane::Logs => {
-                let buffer = self.data.log_manager.get_or_create(&entry.name);
+                self.data.log_manager.get_or_create(&entry.name);
 
                 if entry.state.is_running() {
-                    let stream_dead = buffer
-                        .stream
-                        .as_ref()
-                        .map(|h| h.is_finished())
-                        .unwrap_or(true);
-                    if stream_dead {
-                        if let Some(tx) = &self.ui.app_tx {
+                    if !self.data.log_manager.stream_is_active(&entry.name) {
+                        if let Some(tx) = self.data.log_manager.start_stream(&entry.name) {
                             let handle =
-                                self.data.manager.spawn_log_stream(&entry.name, tx.clone());
-                            buffer.stream = Some(handle);
+                                self.data.manager.spawn_log_stream(&entry.name, tx);
+                            self.data
+                                .log_manager
+                                .attach_stream_handle(&entry.name, handle);
                         }
                     }
-                } else {
-                    let had_stream = buffer.stream.is_some();
-                    if let Some(handle) = buffer.stream.take() {
-                        handle.abort();
-                    }
-                    if had_stream {
-                        buffer.lines.push_back(Line::from("[CONTAINER STOPPED]"));
-                        buffer.dirty = true;
-                    }
+                } else if self.data.log_manager.stop_stream(&entry.name) {
+                    self.data
+                        .log_manager
+                        .push_line(&entry.name, "[CONTAINER STOPPED]");
                 }
             }
             DetailPane::Config => {

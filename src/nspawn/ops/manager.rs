@@ -17,7 +17,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> tokio::task::JoinHandle<()>;
     async fn get_properties(&self, name: &str, entry: &ContainerEntry)
         -> Result<MachineProperties>;
@@ -240,7 +240,7 @@ impl NspawnManager for DefaultManager {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+        tx: tokio::sync::mpsc::UnboundedSender<String>,
     ) -> tokio::task::JoinHandle<()> {
         let name = name.to_string();
         tokio::spawn(async move {
@@ -266,12 +266,9 @@ impl NspawnManager for DefaultManager {
                     tokio::select! {
                         line_res = lines.next_line() => {
                             if let Ok(Some(line)) = line_res {
-                                tx.send(crate::events::AppEvent::LogLine(
-                                    line,
-                                    name.clone(),
-                                ))
-                                .await
-                                .map_err(|_| "Channel closed")?;
+                                if tx.send(line).is_err() {
+                                    break; // receiver dropped
+                                }
                             } else {
                                 break;
                             }
@@ -284,12 +281,7 @@ impl NspawnManager for DefaultManager {
             .await;
 
             if let Err(e) = res {
-                tx.send(crate::events::AppEvent::LogLine(
-                    format!("Log stream stopped: {e}"),
-                    name.clone(),
-                ))
-                .await
-                .ok();
+                let _ = tx.send(format!("Log stream stopped: {e}"));
             }
         })
     }

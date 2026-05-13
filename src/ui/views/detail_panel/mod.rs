@@ -63,6 +63,7 @@ pub struct DetailPanel {
     pub(crate) logs_len: usize,
     pub(crate) config_len: usize,
     pub(crate) last_rendered_width: u16,
+    pub(crate) log_cache: core::scrolling::LogRenderCache,
 }
 
 impl DetailPanel {
@@ -81,6 +82,7 @@ impl DetailPanel {
             logs_len: 0,
             config_len: 0,
             last_rendered_width: 0,
+            log_cache: core::scrolling::LogRenderCache::new(),
         }
     }
 
@@ -126,7 +128,7 @@ impl DetailPanel {
                 panes::properties::render(f, data, inner_area, self.properties_scroll)
             }
             DetailPane::Details => panes::details::render(f, data, inner_area, self.details_scroll),
-            DetailPane::Logs => panes::logs::render(f, data, inner_area, self.log_scroll),
+            DetailPane::Logs => panes::logs::render(f, data, self, inner_area),
             DetailPane::Config => panes::configs::render(f, data, inner_area, self.config_scroll),
             DetailPane::Metrics => panes::metrics::render(f, data, inner_area),
         }
