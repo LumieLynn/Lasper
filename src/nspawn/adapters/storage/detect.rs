@@ -24,6 +24,7 @@ pub async fn detect_available_storage_types() -> StorageInfo {
 }
 
 /// Check if a path is a Btrfs subvolume or ZFS dataset.
+#[allow(dead_code)]
 pub async fn is_subvolume(path: &Path) -> bool {
     if !tokio::fs::try_exists(path).await.unwrap_or(false) {
         return false;

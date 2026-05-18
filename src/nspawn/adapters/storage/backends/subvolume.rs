@@ -2,7 +2,7 @@
 
 use super::super::{StorageBackend, StorageType};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::{get_filesystem_type, new_command, CommandLogged};
+use crate::nspawn::sys::{get_filesystem_type, log_output, CommandRunner, ElevatedIo};
 use std::path::{Path, PathBuf};
 
 pub struct SubvolumeBackend;
@@ -17,25 +17,28 @@ impl SubvolumeBackend {
     async fn detect_type(&self) -> Result<SubvolumeType> {
         let machines_dir = crate::paths::machines_dir();
         let fs_type = get_filesystem_type(&machines_dir).await?;
-
         match fs_type.as_str() {
             "btrfs" => Ok(SubvolumeType::Btrfs),
             "zfs" => Ok(SubvolumeType::Zfs),
             _ => Err(NspawnError::Generic(format!(
-                "Path /var/lib/machines is on {} which does not support subvolumes in this context",
+                "/var/lib/machines is on {} which does not support subvolumes",
                 fs_type
             ))),
         }
     }
 
-    /// Gets the ZFS dataset name for a given path.
-    async fn get_zfs_dataset(&self, path: &Path) -> Result<String> {
-        let out = crate::nspawn::sys::new_command("zfs")
-            .args(["list", "-H", "-o", "name", &path.to_string_lossy()])
-            .logged_output("zfs")
+    async fn get_zfs_dataset(
+        &self,
+        path: &Path,
+        cmd_runner: &dyn CommandRunner,
+    ) -> Result<String> {
+        let out = cmd_runner
+            .run(
+                "zfs",
+                vec!["list".into(), "-H".into(), "-o".into(), "name".into(), path.to_string_lossy().to_string()],
+            )
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
-
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
         } else {
@@ -58,16 +61,27 @@ impl StorageBackend for SubvolumeBackend {
         crate::paths::machine_root(name)
     }
 
-    async fn create(&self, name: &str) -> Result<PathBuf> {
+    async fn create(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<PathBuf> {
         let path = self.get_path(name);
         match self.detect_type().await? {
             SubvolumeType::Btrfs => {
-                let out = new_command("btrfs")
-                    .args(["subvolume", "create", &path.to_string_lossy()])
-                    .logged_output("btrfs")
+                let out = cmd_runner
+                    .run(
+                        "btrfs",
+                        vec![
+                            "subvolume".into(),
+                            "create".into(),
+                            path.to_string_lossy().to_string(),
+                        ],
+                    )
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
-
+                log_output("btrfs", &out);
                 if !out.status.success() {
                     return Err(NspawnError::cmd_failed(
                         "btrfs subvolume create",
@@ -78,15 +92,13 @@ impl StorageBackend for SubvolumeBackend {
             }
             SubvolumeType::Zfs => {
                 let machines_dir = crate::paths::machines_dir();
-                let parent_dataset = self.get_zfs_dataset(&machines_dir).await?;
+                let parent_dataset = self.get_zfs_dataset(&machines_dir, cmd_runner).await?;
                 let dataset_name = format!("{}/{}", parent_dataset, name);
-
-                let out = new_command("zfs")
-                    .args(["create", &dataset_name])
-                    .logged_output("zfs")
+                let out = cmd_runner
+                    .run("zfs", vec!["create".into(), dataset_name.clone()])
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
-
+                log_output("zfs", &out);
                 if !out.status.success() {
                     return Err(NspawnError::cmd_failed(
                         "zfs create dataset",
@@ -99,32 +111,49 @@ impl StorageBackend for SubvolumeBackend {
         Ok(path)
     }
 
-    async fn mount(&self, name: &str) -> Result<PathBuf> {
+    async fn mount(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<PathBuf> {
         Ok(self.get_path(name))
     }
 
-    async fn unmount(&self, _name: &str) -> Result<()> {
+    async fn unmount(
+        &self,
+        _name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn delete(&self, name: &str) -> Result<()> {
+    async fn delete(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<()> {
         let path = self.get_path(name);
         match self.detect_type().await? {
             SubvolumeType::Btrfs => {
-                let out = new_command("btrfs")
-                    .args(["subvolume", "delete", &path.to_string_lossy()])
-                    .logged_output("btrfs")
+                let out = cmd_runner
+                    .run(
+                        "btrfs",
+                        vec![
+                            "subvolume".into(),
+                            "delete".into(),
+                            path.to_string_lossy().to_string(),
+                        ],
+                    )
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("btrfs"), e))?;
-
+                log_output("btrfs", &out);
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
-                    if err.contains("no such file or directory") || err.contains("not a subvolume")
-                    {
-                        log::warn!(
-                            "Btrfs subvolume already missing for deletion: {}",
-                            path.display()
-                        );
+                    if err.contains("no such file or directory") || err.contains("not a subvolume") {
+                        log::warn!("Btrfs subvolume already missing: {}", path.display());
                     } else {
                         return Err(NspawnError::cmd_failed(
                             "btrfs subvolume delete",
@@ -136,22 +165,20 @@ impl StorageBackend for SubvolumeBackend {
             }
             SubvolumeType::Zfs => {
                 let machines_dir = crate::paths::machines_dir();
-                let parent_dataset = match self.get_zfs_dataset(&machines_dir).await {
+                let parent_dataset = match self.get_zfs_dataset(&machines_dir, cmd_runner).await {
                     Ok(ds) => ds,
-                    Err(_) => return Ok(()), // Machines dir not a ZFS dataset, nothing to destroy
+                    Err(_) => return Ok(()),
                 };
                 let dataset_name = format!("{}/{}", parent_dataset, name);
-
-                let out = new_command("zfs")
-                    .args(["destroy", &dataset_name])
-                    .logged_output("zfs")
+                let out = cmd_runner
+                    .run("zfs", vec!["destroy".into(), dataset_name.clone()])
                     .await
                     .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
-
+                log_output("zfs", &out);
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
                     if err.contains("dataset does not exist") {
-                        log::warn!("ZFS dataset already missing for deletion: {}", dataset_name);
+                        log::warn!("ZFS dataset already missing: {}", dataset_name);
                     } else {
                         return Err(NspawnError::cmd_failed(
                             "zfs destroy dataset",

@@ -53,15 +53,22 @@ pub fn render(f: &mut Frame, app: &mut App) {
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
     let t = theme::theme();
-    let badge = if app.is_root {
-        Span::styled(
-            " [ ⚡ ROOT ] ",
+    let badge = match app.permissions.level() {
+        crate::nspawn::ops::PermissionLevel::Root => Span::styled(
+            " [ ROOT ] ",
             Style::default()
                 .fg(t.badge_root)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(" [ READ-ONLY ] ", Style::default().fg(t.badge_readonly))
+        ),
+        crate::nspawn::ops::PermissionLevel::Elevated => Span::styled(
+            " [ SUDO ] ",
+            Style::default()
+                .fg(t.badge_cli)
+                .add_modifier(Modifier::BOLD),
+        ),
+        crate::nspawn::ops::PermissionLevel::User => {
+            Span::styled(" [ USER ] ", Style::default().fg(t.badge_readonly))
+        }
     };
 
     let mut spans = vec![
@@ -156,7 +163,6 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         list_area,
         &app.data.entries,
         app.data.selected,
-        app.is_root,
         list_focused,
         resize_mode,
     );

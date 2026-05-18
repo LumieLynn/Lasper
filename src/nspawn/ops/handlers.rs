@@ -17,7 +17,8 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let msg = format!(
                 "Backend task panicked: {}",
                 panic_err
-                    .downcast_ref::<&str>().copied()
+                    .downcast_ref::<&str>()
+                    .copied()
                     .or_else(|| panic_err.downcast_ref::<String>().map(|s| s.as_str()))
                     .unwrap_or("(unknown)")
             );
@@ -32,11 +33,25 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     match cmd {
         BackendCommand::SubmitConfig(ctx) => {
+            let permission_level = ctx.permission_level;
+            let daemon = ctx.daemon.clone();
+            let cli_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner> = match &daemon {
+                Some(d) => {
+                    std::sync::Arc::new(crate::nspawn::sys::DaemonCommandRunner::new(d.clone()))
+                }
+                None => std::sync::Arc::new(crate::nspawn::sys::DefaultCommandRunner),
+            };
             let provision: std::sync::Arc<
                 dyn crate::nspawn::ops::provision::backend::ProvisionBackend,
-            > = std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(true));
+            > = std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
+                cli_runner.clone(),
+            ));
+            let io = match &daemon {
+                Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(permission_level, d.clone()),
+                None => crate::nspawn::sys::ElevatedIo::new(permission_level),
+            };
             let built = ctx.build_config();
-            let (deployer, storage) = ctx.get_deployer_and_storage(provision);
+            let (deployer, storage) = ctx.get_deployer_and_storage(provision, io, cli_runner);
             let name = built.cfg.name.clone();
             let cfg = built.cfg;
             let nvidia_profile = built.nvidia_profile;
@@ -63,6 +78,8 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     name,
                     cfg,
                     nvidia_profile,
+                    permission_level,
+                    daemon,
                     log_mpsc_tx,
                     done,
                     success,

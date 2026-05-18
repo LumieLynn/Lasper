@@ -1,4 +1,4 @@
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::errors::Result;
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -176,24 +176,30 @@ pub(crate) fn get_state_dir() -> PathBuf {
     crate::paths::state_dir()
 }
 
-pub async fn get_external_state(name: &str) -> Result<Option<NvidiaState>> {
+pub async fn get_external_state(
+    name: &str,
+    io: &crate::nspawn::sys::ElevatedIo,
+) -> Result<Option<NvidiaState>> {
     let path = crate::paths::state_file(name);
-    if !tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        return Ok(None);
-    }
-    let content = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| NspawnError::Io(path.clone(), e))?;
+    let content = match io.read_to_string(&path).await? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
     let mut state: NvidiaState = serde_json::from_str(&content)?;
     state.migrate_from_legacy();
     Ok(Some(state))
 }
 
-pub async fn save_external_state(name: &str, state: &NvidiaState) -> Result<()> {
+pub async fn save_external_state(
+    name: &str,
+    state: &NvidiaState,
+    io: &crate::nspawn::sys::ElevatedIo,
+) -> Result<()> {
     let path = crate::paths::state_file(name);
     let content = serde_json::to_string_pretty(state)?;
 
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |_| Ok(content)).await?;
+    crate::nspawn::sys::io::AsyncLockedWriter::write_locked_elevated(&path, |_| Ok(content), io)
+        .await?;
     Ok(())
 }
 

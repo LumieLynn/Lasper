@@ -15,6 +15,7 @@ impl AsyncLockedWriter {
     /// 1. Uses a sidecar `.lock` file to avoid inode-switch race conditions.
     /// 2. Uses an async backoff loop to acquire the lock without blocking the Tokio executor.
     /// 3. Performs an atomic write via rename.
+    #[allow(dead_code)] // kept for Root-mode atomic write path, currently all writes go through ElevatedIo
     pub async fn write_locked<F>(path: &Path, content_generator: F) -> Result<()>
     where
         F: FnOnce(Option<String>) -> Result<String>,
@@ -138,6 +139,7 @@ impl AsyncLockedWriter {
     }
 
     /// Safely copies a file using atomic rename to ensure the destination is никогда partially written.
+    #[allow(dead_code)]
     pub async fn atomic_copy(src: &Path, dest: &Path) -> Result<()> {
         let tmp_path = dest.with_extension("copy.tmp");
 
@@ -168,5 +170,39 @@ impl AsyncLockedWriter {
         }
 
         Ok(())
+    }
+
+    /// Write via [`ElevatedIo`], skipping the lock.
+    ///
+    /// **Cannot support read-modify-write.** The callback always receives
+    /// `None` for existing content because the elevated I/O path (daemon
+    /// RPC / sudo subprocess) has no read primitive. Callers that need to
+    /// mutate existing file content must load it beforehand and pass it to
+    /// the callback through a closure capture, not via this parameter.
+    pub async fn write_locked_elevated<F>(
+        path: &Path,
+        content_generator: F,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<()>
+    where
+        F: FnOnce(Option<String>) -> Result<String>,
+    {
+        let content = content_generator(None)?;
+        io.write(path, &content).await
+    }
+
+    /// Write via [`ElevatedIo`].  Root/User paths use local atomic write
+    /// (tmp → fsync → rename); Elevated uses the daemon (which also does
+    /// atomic writes via [`write_locked_impl`]).
+    pub async fn write_atomic_elevated(
+        path: &Path,
+        content: &str,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<()> {
+        if io.is_elevated() {
+            io.write(path, content).await
+        } else {
+            Self::write_atomic(path, content).await
+        }
     }
 }

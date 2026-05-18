@@ -28,8 +28,10 @@ impl Wizard {
         entries: Vec<ContainerEntry>,
         nvidia_toolkit_installed: bool,
         command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
+        permission_level: crate::nspawn::ops::PermissionLevel,
+        daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
     ) -> Self {
-        let mut context = WizardContext::new(entries).await;
+        let mut context = WizardContext::new(entries, permission_level, daemon).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {

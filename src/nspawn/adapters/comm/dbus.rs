@@ -4,7 +4,8 @@ use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::proxy::MethodFlags;
+use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
 
 #[proxy(
@@ -19,9 +20,12 @@ trait Manager {
     ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
+    #[zbus(allow_interactive_auth)]
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
     fn get_machine_addresses(&self, name: &str) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
+    #[zbus(allow_interactive_auth)]
     fn remove_image(&self, name: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn machine_new(&self, machine: String, path: OwnedObjectPath) -> zbus::Result<()>;
@@ -64,6 +68,38 @@ impl DbusBackend {
     pub async fn manager_proxy(&self) -> Option<ManagerProxy<'static>> {
         let conn = self.connection().await?;
         ManagerProxy::new(&conn).await.ok()
+    }
+
+    /// Call a method on `org.freedesktop.systemd1.Manager` with
+    /// `AllowInteractiveAuth` set, so polkit can trigger the desktop
+    /// environment's authentication agent (the same path `machinectl` uses).
+    async fn call_systemd1<B, R>(&self, method: &str, body: &B) -> Result<()>
+    where
+        B: serde::Serialize + zvariant::DynamicType,
+        R: serde::de::DeserializeOwned + zvariant::Type,
+    {
+        let conn = self.connection().await.ok_or_else(|| {
+            NspawnError::Dbus(zbus::Error::Failure("No connection".into()))
+        })?;
+        let proxy = zbus::proxy::Proxy::new(
+            &conn,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await
+        .map_err(NspawnError::Dbus)?;
+        let _: R = proxy
+            .call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body)
+            .await
+            .map_err(NspawnError::Dbus)?
+            .ok_or_else(|| {
+                NspawnError::Dbus(zbus::Error::Failure(format!(
+                    "no reply from systemd1.Manager.{}",
+                    method
+                )))
+            })?;
+        Ok(())
     }
 }
 
@@ -149,21 +185,9 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let unit = format!("systemd-nspawn@{}.service", name);
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "StartUnit",
-            &(&unit, "fail"),
-        )
-        .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
+        self.call_systemd1::<_, OwnedObjectPath>("StartUnit", &(&unit, "fail"))
+            .await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
@@ -204,41 +228,23 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let unit = format!("systemd-nspawn@{}.service", name);
         let files: Vec<(&str, bool)> = vec![(&unit, false)];
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
+        self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
             "EnableUnitFiles",
             &(files, false),
         )
         .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let unit = format!("systemd-nspawn@{}.service", name);
         let files: Vec<&str> = vec![&unit];
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
+        self.call_systemd1::<_, Vec<(String, String, String)>>(
             "DisableUnitFiles",
             &(files, false),
         )
         .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
     }
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
@@ -298,20 +304,7 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn reload_daemon(&self) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "Reload",
-            &(),
-        )
-        .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
+        self.call_systemd1::<_, ()>("Reload", &()).await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {

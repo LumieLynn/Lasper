@@ -29,7 +29,6 @@ impl ContainerListComponent {
         area: Rect,
         entries: &[ContainerEntry],
         selected: usize,
-        _is_root: bool,
         focused: bool,
         resize_mode: bool,
     ) {

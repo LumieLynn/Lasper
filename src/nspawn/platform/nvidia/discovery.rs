@@ -57,6 +57,17 @@ pub(crate) fn dedup(mut v: Vec<String>) -> Vec<String> {
     v
 }
 
+/// Container paths that conflict with distribution-provided libraries
+/// (e.g. Mesa).  These are NOT bind-mounted — the container should use its
+/// own version.
+const NVIDIA_CDI_SKIP_CONTAINER_PATHS: &[&str] = &[
+    "/usr/lib/libGLX_indirect.so.0",
+];
+
+fn is_conflict_container_path(path: &str) -> bool {
+    NVIDIA_CDI_SKIP_CONTAINER_PATHS.contains(&path)
+}
+
 /// Convert a parsed CDI spec into mirror-mode `PassthroughBind` entries.
 /// Remapping is NOT applied here — call `remap_binds` afterwards if needed.
 fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
@@ -64,6 +75,13 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
     let mut seen: HashSet<String> = HashSet::new();
 
     let mut push = |binds: &mut Vec<PassthroughBind>, b: PassthroughBind| {
+        if is_conflict_container_path(&b.container_path) {
+            log::debug!(
+                "Skipping CDI entry with conflicting container path: {}",
+                b.container_path
+            );
+            return;
+        }
         if seen.insert(b.container_path.clone()) {
             binds.push(b);
         }

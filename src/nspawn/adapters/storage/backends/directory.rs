@@ -2,6 +2,7 @@
 
 use super::super::{StorageBackend, StorageType};
 use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 pub struct DirectoryBackend;
@@ -15,29 +16,51 @@ impl StorageBackend for DirectoryBackend {
         crate::paths::machine_root(name)
     }
 
-    async fn create(&self, name: &str) -> Result<PathBuf> {
+    async fn create(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
         let path = self.get_path(name);
-        tokio::fs::create_dir_all(&path)
-            .await
-            .map_err(|e| NspawnError::Io(path.clone(), e))?;
+        io.create_dir_all(&path).await?;
         Ok(path)
     }
 
-    async fn mount(&self, name: &str) -> Result<PathBuf> {
+    async fn mount(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<PathBuf> {
         Ok(self.get_path(name))
     }
 
-    async fn unmount(&self, _name: &str) -> Result<()> {
+    async fn unmount(
+        &self,
+        _name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
+    ) -> Result<()> {
         Ok(())
     }
 
-    async fn delete(&self, name: &str) -> Result<()> {
+    async fn delete(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<()> {
         let path = self.get_path(name);
-        if let Err(e) = tokio::fs::remove_dir_all(&path).await {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        if let Err(e) = io.remove_dir_all(&path).await {
+            if matches!(
+                e,
+                NspawnError::Io(_, ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::NotFound
+            ) {
                 log::warn!("Directory already missing for deletion: {}", path.display());
             } else {
-                return Err(NspawnError::Io(path, e));
+                return Err(e);
             }
         }
         Ok(())

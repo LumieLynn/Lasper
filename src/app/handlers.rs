@@ -86,7 +86,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.data.terminal.cleanup_all();
-                self.should_quit = true;
+                self.signal_quit();
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.ui.quit_dialog = None;
@@ -207,7 +207,7 @@ impl App {
                             "Active terminal sessions are still running.\nQuit and terminate all logins?",
                         ));
                 } else {
-                    self.should_quit = true;
+                    self.signal_quit();
                 }
                 true
             }
@@ -278,7 +278,7 @@ impl App {
                 true
             }
             KeyCode::Char('t') => {
-                self.toggle_terminal();
+                self.toggle_terminal().await;
                 true
             }
             KeyCode::Char('T') => {
@@ -351,7 +351,7 @@ impl App {
 
 impl App {
     async fn begin_wizard(&mut self) {
-        if !self.is_root {
+        if !self.permissions.level().is_elevated() {
             self.set_status(
                 "Root required — run: sudo lasper".into(),
                 StatusLevel::Error,
@@ -365,6 +365,8 @@ impl App {
                 self.data.entries.clone(),
                 nvidia_installed,
                 tx.clone(),
+                self.permissions.level(),
+                self.data.daemon.clone(),
             )
             .await;
 
@@ -379,7 +381,7 @@ impl App {
         }
     }
 
-    fn toggle_terminal(&mut self) {
+    async fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
             if self.ui.focus.active_idx == 2 {
@@ -390,7 +392,7 @@ impl App {
                 };
             }
         } else {
-            self.spawn_terminal();
+            self.spawn_terminal().await;
         }
     }
 

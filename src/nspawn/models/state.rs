@@ -1,4 +1,6 @@
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ContainerState {
     Running,
     Starting,
@@ -21,7 +23,7 @@ impl ContainerState {
 }
 
 /// A container known to machinectl — either running, poweroff, or both.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerEntry {
     /// The name used by machinectl
     pub name: String,
@@ -54,7 +56,7 @@ impl PartialOrd for ContainerEntry {
 }
 
 /// A group of related properties for a machine/container.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PropertyGroup {
     pub name: String,
     pub properties: std::collections::HashMap<String, String>,
@@ -90,7 +92,7 @@ pub const IMPORTANT_KEYS: &[&str] = &[
 ];
 
 /// Strongly-typed properties for a machine/container.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MachineProperties {
     /// Grouped properties (e.g., GROUP_MACHINE, GROUP_SYSTEMD_UNIT, GROUP_DEPENDENCIES).
     pub groups: Vec<PropertyGroup>,

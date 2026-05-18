@@ -1,9 +1,11 @@
 pub mod handlers;
 pub mod inspect;
 pub mod manager;
+pub mod permission;
 pub mod provision;
 
 pub use manager::{DefaultManager, NspawnManager};
+pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
 
 #[derive(Clone)]
 pub enum BackendCommand {

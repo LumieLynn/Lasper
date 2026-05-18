@@ -73,9 +73,11 @@ impl App {
 
                 if entry.state.is_running() {
                     if !self.data.log_manager.stream_is_active(&entry.name) {
-                        if let Some(tx) = self.data.log_manager.start_stream(&entry.name) {
+                        if let Some((tx, fatal)) =
+                            self.data.log_manager.start_stream(&entry.name)
+                        {
                             let handle =
-                                self.data.manager.spawn_log_stream(&entry.name, tx);
+                                self.data.manager.spawn_log_stream(&entry.name, tx, fatal);
                             self.data
                                 .log_manager
                                 .attach_stream_handle(&entry.name, handle);
@@ -178,8 +180,24 @@ impl App {
             (e.name.clone(), self.data.manager.clone(), tx)
         };
 
+        let pm = self.permissions.clone();
         tokio::spawn(async move {
-            let res = action(name.clone(), manager.clone()).await;
+            let audit = match pm.request_elevation(action_label.to_string()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("{}", e),
+                            crate::ui::StatusLevel::Error,
+                        ))
+                        .await;
+                    return;
+                }
+            };
+
+            let res = audit.run(action(name.clone(), manager.clone())).await;
+            // audit dropped — scope closed
+
             let suffix = match manager.did_fallback() {
                 Some(reason) => format!(" (CLI fallback: {})", reason),
                 None => String::new(),
@@ -272,7 +290,7 @@ impl App {
         );
     }
 
-    pub fn spawn_terminal(&mut self) {
+    pub async fn spawn_terminal(&mut self) {
         self.ui.prev_active_idx = self.ui.focus.active_idx;
         let rows = self.ui.pane_height.max(10);
         let entry = match self.data.entries.get(self.data.selected) {
@@ -280,7 +298,12 @@ impl App {
             None => return,
         };
 
-        match self.data.terminal.spawn(&entry, rows, &self.ui.app_tx) {
+        match self
+            .data
+            .terminal
+            .spawn(&entry, rows, &self.ui.app_tx, &self.data.daemon)
+            .await
+        {
             Ok(_idx) => {
                 self.ui.focus.active_idx = 2;
                 self.set_status(

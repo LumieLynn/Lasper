@@ -10,6 +10,7 @@ use crate::nspawn::ops::provision::Deployer;
 pub struct CloneDeployer {
     pub source_name: String,
     pub provision: std::sync::Arc<dyn ProvisionBackend>,
+    pub io: crate::nspawn::sys::ElevatedIo,
 }
 
 #[async_trait]
@@ -42,6 +43,7 @@ impl Deployer for CloneDeployer {
         if let Err(e) = crate::nspawn::adapters::config::nspawn_file::clone_nspawn_config(
             &self.source_name,
             name,
+            &self.io,
         )
         .await
         {
@@ -52,6 +54,7 @@ impl Deployer for CloneDeployer {
         if let Err(e) = crate::nspawn::adapters::config::systemd_unit::clone_systemd_override(
             &self.source_name,
             name,
+            &self.io,
         )
         .await
         {

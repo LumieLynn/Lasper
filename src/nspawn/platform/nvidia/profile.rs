@@ -50,12 +50,16 @@ impl Default for NvidiaPassthroughProfile {
 }
 
 impl NvidiaPassthroughProfile {
-    pub async fn save(&self, name: &str) -> crate::nspawn::errors::Result<()> {
-        let mut state = super::state::get_external_state(name)
+    pub async fn save(
+        &self,
+        name: &str,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> crate::nspawn::errors::Result<()> {
+        let mut state = super::state::get_external_state(name, io)
             .await?
             .unwrap_or_default();
         state.profile = Some(self.clone());
-        super::state::save_external_state(name, &state).await
+        super::state::save_external_state(name, &state, io).await
     }
 }
 

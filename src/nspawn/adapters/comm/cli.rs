@@ -2,7 +2,7 @@ use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
-use crate::nspawn::sys::{CommandRunner, DefaultCommandRunner};
+use crate::nspawn::sys::CommandRunner;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -10,16 +10,14 @@ const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct CliBackend {
-    is_root: bool,
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
     nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
 impl CliBackend {
-    pub fn new(is_root: bool) -> Self {
+    pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
         Self {
-            is_root,
-            cmd_runner: std::sync::Arc::new(DefaultCommandRunner),
+            cmd_runner: runner,
             nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -29,12 +27,8 @@ impl CliBackend {
     }
 
     #[cfg(test)]
-    fn with_runner(is_root: bool, runner: std::sync::Arc<dyn CommandRunner>) -> Self {
-        Self {
-            is_root,
-            cmd_runner: runner,
-            nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
-        }
+    fn with_runner(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
+        Self::new(runner)
     }
 
     async fn run_machinectl(&self, args: &[&str]) -> Result<()> {
@@ -128,22 +122,6 @@ impl ContainerBackend for CliBackend {
 
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
         let running = self.running_map().await?;
-
-        if !self.is_root {
-            return Ok(running
-                .into_iter()
-                .filter(|(name, _)| name != ".host")
-                .map(|(name, addrs)| ContainerEntry {
-                    state: ContainerState::Running,
-                    name,
-                    image_type: None,
-                    readonly: false,
-                    usage: None,
-                    address: addrs.first().cloned().filter(|s| !s.is_empty()),
-                    all_addresses: addrs,
-                })
-                .collect());
-        }
 
         let out = self
             .cmd_runner
@@ -412,7 +390,7 @@ mod tests {
             r
         });
 
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
         let map = provider.running_map().await.unwrap();
 
         assert_eq!(map.len(), 2);
@@ -430,7 +408,7 @@ mod tests {
             r
         });
 
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
         let map = provider.running_map().await.unwrap();
         assert!(map.is_empty());
     }
@@ -447,7 +425,7 @@ mod tests {
             r
         });
 
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
         let map = provider.running_map().await.unwrap();
 
         assert_eq!(map.len(), 1);
@@ -479,7 +457,7 @@ mod tests {
             });
             r
         });
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
 
         let entries = provider.list_all().await.unwrap();
 
@@ -505,13 +483,14 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out_list.clone()));
             r
         });
-        let provider = CliBackend::with_runner(false, runner);
+        let provider = CliBackend::with_runner(runner);
 
         let entries = provider.list_all().await.unwrap();
 
+        // Full merge: list-images returns "container" as image type
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].state, ContainerState::Running);
-        assert_eq!(entries[0].image_type, None);
+        assert_eq!(entries[0].image_type.as_deref(), Some("container"));
     }
 
     // get_properties
@@ -533,7 +512,7 @@ mod tests {
             });
             r
         });
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
 
         let props = provider.get_properties("test-ctr").await.unwrap();
 
@@ -551,7 +530,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out2.clone()));
             r
         });
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
 
         let result = provider.get_properties("missing-ctr").await;
         assert!(result.is_err());
@@ -567,7 +546,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out.clone()));
             r
         });
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
 
         provider.start("my-ctr").await.unwrap();
     }
@@ -580,7 +559,7 @@ mod tests {
             r.expect_run().returning(move |_, _| Ok(out.clone()));
             r
         });
-        let provider = CliBackend::with_runner(true, runner);
+        let provider = CliBackend::with_runner(runner);
 
         provider.kill("my-ctr", "SIGTERM").await.unwrap();
     }

@@ -2,6 +2,7 @@
 
 use crate::events::AppEvent;
 use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::Arc;
 
@@ -46,11 +47,16 @@ impl TerminalManager {
 
     /// Spawn a `machinectl login` PTY for `entry`.  Returns the new session
     /// index on success so the caller can update focus.
-    pub fn spawn(
+    ///
+    /// When `daemon` is `Some`, the daemon spawns `machinectl login` as root
+    /// and passes back the PTY master fd. Otherwise `machinectl login` runs
+    /// directly as the current user.
+    pub async fn spawn(
         &mut self,
         entry: &ContainerEntry,
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+        daemon: &Option<Arc<ElevatedDaemon>>,
     ) -> Result<usize, String> {
         if !entry.state.is_running() {
             return Err(format!("Container {} is not running", entry.name));
@@ -72,30 +78,45 @@ impl TerminalManager {
             .ok_or_else(|| "Internal error: app_tx not set".to_string())?;
 
         let cols: u16 = 80;
-        let args: [&str; 2] = ["login", &entry.name];
 
-        crate::nspawn::adapters::comm::pty::spawn_terminal(
-            "machinectl",
-            &args,
-            cols,
-            rows,
-            tx.clone(),
-        )
-        .map(|(term, pty_tx, handle)| {
-            let session = TerminalSession {
-                container_name: entry.name.clone(),
-                terminal: term,
-                pty_tx,
-                handle,
-                scroll_offset: 0,
-                insert_mode: true,
-            };
-            self.sessions.push(session);
-            self.active_idx = self.sessions.len() - 1;
-            self.show = true;
-            self.active_idx
-        })
-        .map_err(|e| format!("Failed to spawn terminal: {}", e))
+        let (term, pty_tx, handle) = if let Some(ref daemon) = daemon {
+            // Elevated: daemon spawns machinectl login as root, passes back PTY master fd.
+            let master_fd = daemon
+                .spawn_login(&entry.name, cols, rows)
+                .await
+                .map_err(|e| format!("Failed to spawn login via daemon: {}", e))?;
+
+            crate::nspawn::adapters::comm::pty::spawn_terminal_with_fd(
+                master_fd,
+                cols,
+                rows,
+                tx.clone(),
+            )
+            .map_err(|e| format!("Failed to setup PTY from fd: {}", e))?
+        } else {
+            let args: [&str; 2] = ["login", &entry.name];
+            crate::nspawn::adapters::comm::pty::spawn_terminal(
+                "machinectl",
+                &args,
+                cols,
+                rows,
+                tx.clone(),
+            )
+            .map_err(|e| format!("Failed to spawn terminal: {}", e))?
+        };
+
+        let session = TerminalSession {
+            container_name: entry.name.clone(),
+            terminal: term,
+            pty_tx,
+            handle,
+            scroll_offset: 0,
+            insert_mode: true,
+        };
+        self.sessions.push(session);
+        self.active_idx = self.sessions.len() - 1;
+        self.show = true;
+        Ok(self.active_idx)
     }
 
     pub fn close_active(&mut self) {

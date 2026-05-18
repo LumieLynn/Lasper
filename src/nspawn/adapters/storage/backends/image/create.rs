@@ -4,11 +4,16 @@ use super::DiskImageBackend;
 use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::DiskImageSource;
-use crate::nspawn::sys::{log_output, new_command, CommandLogged};
+use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 impl DiskImageBackend {
-    pub(super) async fn create_impl(&self, name: &str) -> Result<PathBuf> {
+    pub(super) async fn create_impl(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
         let dest_path = self.get_path(name);
 
         match &self.config.source {
@@ -16,23 +21,22 @@ impl DiskImageBackend {
                 let src_path = PathBuf::from(path);
                 if !src_path.exists() {
                     return Err(NspawnError::Validation(format!(
-                        "Source image not found: {}",
-                        path
+                        "Source image not found: {}", path
                     )));
                 }
-                log::info!(
-                    "Importing existing image from {} to {}",
-                    src_path.display(),
-                    dest_path.display()
-                );
-                crate::nspawn::sys::io::AsyncLockedWriter::atomic_copy(&src_path, &dest_path)
-                    .await?;
+                // Copy via read+write through ElevatedIo
+                let content = io
+                    .read_to_string(&src_path)
+                    .await?
+                    .ok_or_else(|| NspawnError::Validation(format!("Cannot read source: {}", path)))?;
+                io.write(&dest_path, &content).await?;
             }
             DiskImageSource::CreateNew { size, fs_type } => {
-                let out = new_command("truncate")
-                    .args(["-s", size, &dest_path.to_string_lossy()])
-                    .logged_output("truncate")
+                let dest_s = dest_path.to_string_lossy().to_string();
+                let out = cmd_runner
+                    .run("truncate", vec!["-s".into(), size.clone(), dest_s.clone()])
                     .await?;
+                log_output("truncate", &out);
                 if !out.status.success() {
                     return Err(NspawnError::cmd_failed(
                         "truncate",
@@ -40,63 +44,64 @@ impl DiskImageBackend {
                         &out,
                     ));
                 }
-
-                self.format_plain(&dest_path, fs_type).await?;
+                self.format_plain(&dest_path, fs_type, cmd_runner).await?;
             }
         }
         Ok(dest_path)
     }
 
-    pub(super) async fn format_plain(&self, path: &std::path::Path, fs_type: &str) -> Result<()> {
+    pub(super) async fn format_plain(
+        &self,
+        path: &std::path::Path,
+        fs_type: &str,
+        cmd_runner: &dyn CommandRunner,
+    ) -> Result<()> {
         let root_uuid = super::utils::get_discoverable_root_uuid();
+        let path_s = path.to_string_lossy().to_string();
         let sfdisk_script = format!("label: gpt\ntype={}\n", root_uuid);
 
-        // 1. Partition with sfdisk
-        let mut child = new_command("sfdisk")
-            .arg(path)
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            stdin.write_all(sfdisk_script.as_bytes()).await?;
-        }
-
-        let out = child.wait_with_output().await?;
+        // 1. Partition with sfdisk (stdin piped via sh -c)
+        let out = cmd_runner
+            .run(
+                "sh",
+                vec![
+                    "-c".into(),
+                    format!("printf '%s' '{}' | sfdisk {}", sfdisk_script, path_s),
+                ],
+            )
+            .await?;
         log_output("sfdisk", &out);
         if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "sfdisk",
-                "sfdisk gpt partition",
-                &out,
-            ));
+            return Err(NspawnError::cmd_failed("sfdisk", "sfdisk gpt partition", &out));
         }
 
         // 2. Setup loop device with partition scanning
-        let out = new_command("losetup")
-            .args(["--find", "--partscan", "--show", &path.to_string_lossy()])
-            .logged_output("losetup")
+        let out = cmd_runner
+            .run(
+                "losetup",
+                vec![
+                    "--find".into(),
+                    "--partscan".into(),
+                    "--show".into(),
+                    path_s.clone(),
+                ],
+            )
             .await?;
+        log_output("losetup", &out);
         if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "losetup -P",
-                "losetup --find -P --show",
-                &out,
-            ));
+            return Err(NspawnError::cmd_failed("losetup -P", "losetup --find -P --show", &out));
         }
         let loop_dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let part_dev = format!("{}p1", loop_dev);
 
-        let _ = new_command("udevadm")
-            .args(["settle", "--timeout=5"])
-            .logged_output("udevadm")
-            .await;
+        // Wait for udev
+        cmd_runner
+            .run("udevadm", vec!["settle".into(), "--timeout=5".into()])
+            .await?;
 
         if !std::path::Path::new(&part_dev).exists() {
-            let _ = new_command("losetup")
-                .args(["-d", &loop_dev])
-                .logged_output("losetup")
+            let _ = cmd_runner
+                .run("losetup", vec!["-d".into(), loop_dev.clone()])
                 .await;
             return Err(NspawnError::Generic(format!(
                 "Timeout waiting for partition device {}. Ensure loop module supports partitions.",
@@ -106,19 +111,15 @@ impl DiskImageBackend {
 
         // 3. Format partition
         let mkfs = format!("mkfs.{}", fs_type);
-        let force_flag = match fs_type {
-            "xfs" => "-f",
-            _ => "-F", // ext2/ext3/ext4
-        };
-        let out = new_command(&mkfs)
-            .args([force_flag, &part_dev])
-            .logged_output(&mkfs)
+        let force_flag = match fs_type { "xfs" => "-f", _ => "-F" };
+        let out = cmd_runner
+            .run(&mkfs, vec![force_flag.into(), part_dev.clone()])
             .await?;
+        log_output(&mkfs, &out);
 
         // 4. Cleanup
-        let _ = new_command("losetup")
-            .args(["-d", &loop_dev])
-            .logged_output("losetup")
+        let _ = cmd_runner
+            .run("losetup", vec!["-d".into(), loop_dev])
             .await;
 
         if !out.status.success() {

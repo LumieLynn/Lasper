@@ -6,6 +6,8 @@ use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType}
 use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::PermissionLevel;
+use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
@@ -301,10 +303,16 @@ pub struct WizardContext {
     pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
     pub xdg_runtime: Option<String>,
+    pub permission_level: PermissionLevel,
+    pub daemon: Option<Arc<ElevatedDaemon>>,
 }
 
 impl WizardContext {
-    pub async fn new(entries: Vec<ContainerEntry>) -> Self {
+    pub async fn new(
+        entries: Vec<ContainerEntry>,
+        permission_level: PermissionLevel,
+        daemon: Option<Arc<ElevatedDaemon>>,
+    ) -> Self {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
             .await
             .ok();
@@ -405,6 +413,8 @@ impl WizardContext {
             },
             entries,
             xdg_runtime,
+            permission_level,
+            daemon,
         }
     }
 
@@ -430,8 +440,10 @@ impl WizardContext {
     pub fn get_deployer_and_storage(
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+        io: crate::nspawn::sys::ElevatedIo,
+        cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        self.builder().get_deployer_and_storage(provision)
+        self.builder().get_deployer_and_storage(provision, io, cmd_runner)
     }
 
     pub fn update_hardware_data(

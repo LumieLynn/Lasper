@@ -72,6 +72,79 @@ impl NspawnError {
     pub fn mount_failed(msg: impl Into<String>) -> Self {
         Self::StorageError(msg.into())
     }
+
+    /// Whether this error is a polkit authorization rejection from DBus.
+    ///
+    /// systemd-machined returns these DBus error names when polkit blocks
+    /// an operation that requires `auth_self` or `auth_admin`.
+    pub fn is_polkit_rejection(&self) -> bool {
+        match self {
+            Self::Dbus(e) => {
+                let msg = e.to_string();
+                msg.contains("InteractiveAuthorizationRequired")
+                    || msg.contains("PolicyKit1.Error.NotAuthorized")
+                    || msg.contains("PolicyKit1.Error.Failed")
+                    || msg.contains("PolicyKit1.Error.AuthorizationFailed")
+                    || msg.contains("DBus.Error.AccessDenied")
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, NspawnError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dbus_err(msg: &str) -> NspawnError {
+        NspawnError::Dbus(zbus::Error::Failure(msg.into()))
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_interactive_auth() {
+        let err = dbus_err(
+            "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired: \
+             Access denied as the requested operation requires interactive \
+             authentication.",
+        );
+        assert!(err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_not_authorized() {
+        let err = dbus_err("org.freedesktop.PolicyKit1.Error.NotAuthorized: Not authorized");
+        assert!(err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_access_denied() {
+        let err = dbus_err("org.freedesktop.DBus.Error.AccessDenied: Access denied");
+        assert!(err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_auth_failed() {
+        let err = dbus_err("org.freedesktop.PolicyKit1.Error.AuthorizationFailed: ...");
+        assert!(err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_polkit_failed() {
+        let err = dbus_err("org.freedesktop.PolicyKit1.Error.Failed: Action not allowed");
+        assert!(err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_false_for_other_dbus_error() {
+        let err = dbus_err("org.freedesktop.machine1.NoSuchMachine: No machine 'foo' known");
+        assert!(!err.is_polkit_rejection());
+    }
+
+    #[test]
+    fn test_is_polkit_rejection_false_for_non_dbus_error() {
+        let err = NspawnError::Generic("something else".into());
+        assert!(!err.is_polkit_rejection());
+    }
+}

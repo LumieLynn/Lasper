@@ -11,6 +11,7 @@ use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
+    sys::daemon::ElevatedDaemon,
 };
 use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
@@ -57,10 +58,15 @@ pub struct AppUi {
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
     pub detail_pct: u16,
+
+    /// Signalled when the user confirms quit; included in the main
+    /// `select!` so we break immediately instead of waiting for the next
+    /// event or channel close.
+    pub quit_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl AppUi {
-    pub fn new(_is_root: bool) -> Self {
+    pub fn new() -> Self {
         Self {
             focus: FocusTracker::new(),
             prev_active_idx: 0,
@@ -81,6 +87,7 @@ impl AppUi {
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
             detail_pct: 60,
+            quit_tx: None,
         }
     }
 }
@@ -95,6 +102,7 @@ pub struct AppData {
     pub config_content: Option<String>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
+    pub daemon: Option<std::sync::Arc<ElevatedDaemon>>,
     pub action_cooldown: Option<Instant>,
     pub transitions:
         std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
@@ -113,16 +121,26 @@ pub struct AppData {
 
 /// Global application state.
 pub struct App {
-    pub is_root: bool,
+    pub permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
     pub should_quit: bool,
     pub data: AppData,
     pub ui: AppUi,
 }
 
 impl App {
-    pub fn new(is_root: bool, cli_mode: bool, log_buffer_lines: usize) -> Self {
+    pub fn new(
+        permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
+        cli_mode: bool,
+        log_buffer_lines: usize,
+        daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+    ) -> Self {
+        let manager = std::sync::Arc::new(DefaultManager::new(
+            permissions.clone(),
+            cli_mode,
+            daemon.clone(),
+        ));
         Self {
-            is_root,
+            permissions,
             should_quit: false,
             data: AppData {
                 entries: Vec::new(),
@@ -133,7 +151,8 @@ impl App {
                 ),
                 config_content: None,
                 dbus_active: !cli_mode,
-                manager: std::sync::Arc::new(DefaultManager::new(is_root, cli_mode)),
+                manager,
+                daemon,
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
                 metrics: HashMap::new(),
@@ -146,8 +165,18 @@ impl App {
                 details_dirty: true,
                 terminal: TerminalManager::new(),
             },
-            ui: AppUi::new(is_root),
+            ui: AppUi::new(),
         }
+    }
+
+    /// Fire the quit signal so the event loop breaks out of `select!`
+    /// immediately, then mark `should_quit`.
+    fn signal_quit(&mut self) {
+        log::info!("[lasper] signal_quit() called");
+        if let Some(tx) = self.ui.quit_tx.take() {
+            let _ = tx.send(());
+        }
+        self.should_quit = true;
     }
 
     /// Helper to apply active transitions (Starting/Exiting) to a list of entries.
@@ -281,6 +310,12 @@ impl App {
         self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());
 
+        // Quit signal — the oneshot fires in the select! below so we
+        // break out of the event loop immediately when the user confirms
+        // quit, instead of blocking until a background task sends an event.
+        let (quit_tx, mut quit_rx) = tokio::sync::oneshot::channel::<()>();
+        self.ui.quit_tx = Some(quit_tx);
+
         // Start nspawn metrics collection engine
         crate::nspawn::ops::inspect::metrics::spawn_collector(
             events.tx.clone(),
@@ -334,15 +369,29 @@ impl App {
                 Some(cmd) = backend_rx.recv() => {
                     crate::nspawn::ops::handlers::handle_command(cmd, events.tx.clone());
                 }
-                else => break,
+                _ = &mut quit_rx => {
+                    log::info!("[lasper] select!: quit_rx fired");
+                    break;
+                }
+                else => {
+                    log::info!("[lasper] select!: else branch");
+                    break;
+                }
             }
 
             if self.should_quit {
+                log::info!("[lasper] main loop: should_quit=true, breaking");
                 break;
             }
         }
+        log::info!("[lasper] run() cleaning up...");
         self.data.terminal.cleanup_all();
         self.data.log_manager.cleanup_all();
+        // Shut down the EventStream while the terminal is still in raw mode
+        // so the internal stdin thread can unblock quickly instead of
+        // blocking on a cooked-mode read after terminal restore.
+        events.shutdown();
+        log::info!("[lasper] run() returning Ok(())");
         Ok(())
     }
 
@@ -377,8 +426,13 @@ mod tests {
         }
     }
 
-    fn make_app(is_root: bool) -> App {
-        App::new(is_root, false, 0)
+    fn make_app() -> App {
+        App::new(
+            std::sync::Arc::new(crate::nspawn::ops::DefaultPermissionManager::new()),
+            false, // cli_mode
+            0,
+            None, // daemon
+        )
     }
 
     mod merge_transitional_states {
@@ -386,7 +440,7 @@ mod tests {
 
         #[test]
         fn adds_starting_overlay() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Starting, Instant::now()),
@@ -400,7 +454,7 @@ mod tests {
 
         #[test]
         fn adds_exiting_overlay() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Exiting, Instant::now()),
@@ -414,7 +468,7 @@ mod tests {
 
         #[test]
         fn expires_stale() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (
@@ -432,7 +486,7 @@ mod tests {
 
         #[test]
         fn removes_when_backend_resolved() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Starting, Instant::now()),
@@ -451,7 +505,7 @@ mod tests {
 
         #[test]
         fn next_wraps() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![
                 make_entry("a", ContainerState::Off),
                 make_entry("b", ContainerState::Off),
@@ -465,7 +519,7 @@ mod tests {
 
         #[test]
         fn prev_wraps() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![
                 make_entry("a", ContainerState::Off),
                 make_entry("b", ContainerState::Off),
@@ -479,7 +533,7 @@ mod tests {
 
         #[test]
         fn next_empty_no_panic() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![];
             app.data.selected = 0;
 
@@ -488,7 +542,7 @@ mod tests {
 
         #[test]
         fn prev_empty_no_panic() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![];
             app.data.selected = 0;
 
@@ -501,13 +555,13 @@ mod tests {
 
         #[test]
         fn allows_first() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             assert!(app.check_action_cooldown());
         }
 
         #[test]
         fn blocks_within_2s() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             assert!(app.check_action_cooldown());
             assert!(!app.check_action_cooldown());
         }
@@ -518,7 +572,7 @@ mod tests {
 
         #[test]
         fn sets_message_and_expiry() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.set_status("hello".into(), crate::ui::StatusLevel::Info);
 
             let (msg, level) = app.ui.status_message.as_ref().unwrap();

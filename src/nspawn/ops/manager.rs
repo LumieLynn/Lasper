@@ -1,11 +1,16 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::adapters::comm::cli::CliBackend;
+use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::errors::Result;
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::ops::{PermissionLevel, PermissionManager};
+use crate::nspawn::sys::daemon::ElevatedDaemon;
+use crate::nspawn::sys::{CommandRunner, DaemonCommandRunner, DefaultCommandRunner};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
 
 #[cfg_attr(test, mockall::automock)]
@@ -18,6 +23,7 @@ pub trait NspawnManager: Send + Sync + 'static {
         &self,
         name: &str,
         tx: tokio::sync::mpsc::UnboundedSender<String>,
+        fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()>;
     async fn get_properties(&self, name: &str, entry: &ContainerEntry)
         -> Result<MachineProperties>;
@@ -34,39 +40,55 @@ pub trait NspawnManager: Send + Sync + 'static {
 }
 
 pub struct DefaultManager {
-    is_root: bool,
+    pm: std::sync::Arc<dyn PermissionManager>,
     cli_mode: bool,
     dbus: std::sync::Arc<dyn ContainerBackend>,
     cli: std::sync::Arc<dyn ContainerBackend>,
+    daemon: Option<std::sync::Arc<ElevatedDaemon>>,
     last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
     nudge_tx: tokio::sync::watch::Sender<()>,
 }
 
 impl DefaultManager {
-    pub fn new(is_root: bool, cli_mode: bool) -> Self {
+    pub fn new(
+        pm: std::sync::Arc<dyn PermissionManager>,
+        cli_mode: bool,
+        daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+    ) -> Self {
         if cli_mode {
             log::info!("CLI mode active — DBus backend disabled");
         }
-        let cli_backend = CliBackend::new(is_root);
+
+        let cli_runner: std::sync::Arc<dyn CommandRunner> = match pm.level() {
+            PermissionLevel::Elevated => std::sync::Arc::new(DaemonCommandRunner::new(
+                daemon.clone().expect("daemon required for Elevated mode"),
+            )),
+            _ => std::sync::Arc::new(DefaultCommandRunner),
+        };
+
+        let dbus_backend: std::sync::Arc<dyn ContainerBackend> = match pm.level() {
+            PermissionLevel::Elevated => {
+                log::info!("Elevated mode — DBus operations proxied through daemon");
+                std::sync::Arc::new(DaemonBackend::new(
+                    daemon.clone().expect("daemon required for Elevated mode"),
+                ))
+            }
+            _ => std::sync::Arc::new(DbusBackend::new()),
+        };
+
+        let cli_backend = CliBackend::new(cli_runner);
         let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
         cli_backend.set_nudge(nudge_rx);
         Self {
-            is_root,
+            pm,
             cli_mode,
-            dbus: std::sync::Arc::new(DbusBackend::new()),
+            dbus: dbus_backend,
             cli: std::sync::Arc::new(cli_backend),
+            daemon,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![crate::paths::machines_dir()],
             nudge_tx,
-        }
-    }
-
-    fn require_root(&self) -> Result<()> {
-        if !self.is_root {
-            Err(NspawnError::PermissionDenied)
-        } else {
-            Ok(())
         }
     }
 
@@ -77,12 +99,37 @@ impl DefaultManager {
         *self.last_fallback_reason.lock() = Some(reason.to_string());
     }
 
+    /// Classify a DBus error into a human-readable fallback reason.
+    ///
+    /// - Polkit rejection → tells the user *why* CLI was needed
+    /// - System bus unavailable → generic "DBus not available"
+    /// - Other errors → passes through the error message
+    fn classify_fallback(err: &crate::nspawn::errors::NspawnError) -> String {
+        if err.is_polkit_rejection() {
+            "polkit denied access — try running with -e to elevate".into()
+        } else {
+            format!("{}", err)
+        }
+    }
+
     fn nudge(&self) {
         let _ = self.nudge_tx.send(());
     }
 
+    fn elevated_io(&self) -> crate::nspawn::sys::ElevatedIo {
+        match &self.daemon {
+            Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(self.pm.level(), d.clone()),
+            None => crate::nspawn::sys::ElevatedIo::new(self.pm.level()),
+        }
+    }
+
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name).await?;
+        let io = self.elevated_io();
+        let cmd_runner: std::sync::Arc<dyn CommandRunner> = match &self.daemon {
+            Some(d) => std::sync::Arc::new(DaemonCommandRunner::new(d.clone())),
+            None => std::sync::Arc::new(DefaultCommandRunner),
+        };
+        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &io, cmd_runner.as_ref()).await?;
         // Reload systemd after GPU surgery — always needed when device allows change.
         let _ = self.reload_daemon_fallback().await;
         self.nudge();
@@ -95,8 +142,12 @@ impl DefaultManager {
             match self.dbus.reload_daemon().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    log::warn!("DBus reload_daemon failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!(
+                        "DBus reload_daemon failed ({}), falling back to CLI",
+                        reason
+                    );
+                    self.mark_fallback(&reason);
                 }
             }
         } else {
@@ -111,19 +162,26 @@ impl DefaultManager {
 }
 
 /// Try DBus first, then fall back to CLI with consistent logging and error reporting.
+/// When Elevated, the CLI backend runs via `sudo`, making elevated DBus calls through
+/// `machinectl`.
 macro_rules! fallback_to_cli {
     ($self:ident, $method:ident, $name:expr $(, $arg:expr)*) => {{
         let result = if !$self.cli_mode && $self.dbus.is_available().await {
             match $self.dbus.$method($name, $($arg),*).await {
                 Ok(v) => Ok(v),
                 Err(e) => {
-                    log::warn!("DBus {} failed, falling back to CLI: {}", stringify!($method), e);
-                    $self.mark_fallback(&format!("{}", e));
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!(
+                        "DBus {} failed ({}), falling back to CLI",
+                        stringify!($method),
+                        reason
+                    );
+                    $self.mark_fallback(&reason);
                     $self.cli.$method($name, $($arg),*).await
                 }
             }
         } else {
-            log::warn!("DBus not available for {}, falling back to CLI", stringify!($method));
+            log::debug!("DBus not available for {}, using CLI", stringify!($method));
             $self.mark_fallback("DBus not available");
             $self.cli.$method($name, $($arg),*).await
         };
@@ -140,15 +198,16 @@ macro_rules! fallback_to_cli {
 #[async_trait]
 impl NspawnManager for DefaultManager {
     async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
-        if !self.is_root {
-            return self.cli.list_all().await;
-        }
         if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.list_all().await {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
-                    log::warn!("DBus list_all failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!(
+                        "DBus list_all failed ({}), falling back to CLI",
+                        reason
+                    );
+                    self.mark_fallback(&reason);
                 }
             }
         } else {
@@ -162,50 +221,45 @@ impl NspawnManager for DefaultManager {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         self._ensure_gpu_passthrough(name).await?;
         fallback_to_cli!(self, start, name)
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, terminate, name)
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, poweroff, name)
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, reboot, name)
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, enable, name)
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, disable, name)
     }
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
-        self.require_root()?;
         fallback_to_cli!(self, kill, name, signal)
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        self.require_root()?;
-
         let result = if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.remove(name).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
-                    log::warn!("DBus remove failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!(
+                        "DBus remove failed ({}), falling back to CLI",
+                        reason
+                    );
+                    self.mark_fallback(&reason);
                     self.cli.remove(name).await.map_err(|e| {
                         log::error!("CLI remove failed for {}: {}", name, e);
                         e
@@ -220,16 +274,19 @@ impl NspawnManager for DefaultManager {
         };
 
         // systemd may or may not clean these up — an extra unlink is harmless
-        let _ = tokio::fs::remove_file(
-            crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
-        )
-        .await;
-        let _ = tokio::fs::remove_dir_all(format!(
-            "/etc/systemd/system/systemd-nspawn@{}.service.d",
-            name
-        ))
-        .await;
-        let _ = tokio::fs::remove_file(crate::paths::state_file(name)).await;
+        let io = self.elevated_io();
+        let _ = io
+            .remove_file(
+                &crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
+            )
+            .await;
+        let _ = io
+            .remove_dir_all(&std::path::PathBuf::from(format!(
+                "/etc/systemd/system/systemd-nspawn@{}.service.d",
+                name
+            )))
+            .await;
+        let _ = io.remove_file(&crate::paths::state_file(name)).await;
 
         if result.is_ok() {
             self.nudge();
@@ -241,46 +298,115 @@ impl NspawnManager for DefaultManager {
         &self,
         name: &str,
         tx: tokio::sync::mpsc::UnboundedSender<String>,
+        fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let name = name.to_string();
-        tokio::spawn(async move {
-            let res: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
-                let mut child = tokio::process::Command::new("journalctl")
-                    .args([
-                        "-M",
-                        &name,
-                        "-n",
-                        "1000",
-                        "-f",
-                        "--no-pager",
-                        "--output=short",
-                    ])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()?;
 
-                let stdout = child.stdout.take().ok_or("journalctl stdout not piped")?;
-                let mut lines = tokio::io::BufReader::new(stdout).lines();
+        if let Some(ref daemon) = self.daemon {
+            let daemon = daemon.clone();
+            let name = name.clone();
+            let fatal_clone = fatal.clone();
+            return tokio::spawn(async move {
+                let stdout_fd = match daemon.spawn_journalctl(&name).await {
+                    Ok(fd) => fd,
+                    Err(e) => {
+                        fatal_clone.store(true, Ordering::Relaxed);
+                        let _ = tx.send(format!("Log stream error: {e}"));
+                        return;
+                    }
+                };
 
-                loop {
-                    tokio::select! {
-                        line_res = lines.next_line() => {
-                            if let Ok(Some(line)) = line_res {
-                                if tx.send(line).is_err() {
-                                    break; // receiver dropped
-                                }
-                            } else {
+                // Use tokio async pipe so the runtime can cancel this during shutdown.
+                match pipe_reader(stdout_fd) {
+                    Ok(receiver) => {
+                        let mut lines = tokio::io::BufReader::new(receiver).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if tx.send(line).is_err() {
                                 break;
                             }
                         }
-                        _ = child.wait() => break,
+                    }
+                    Err(e) => {
+                        let _ = tx.send(format!("Log stream error: {e}"));
                     }
                 }
-                Ok(())
-            }
-            .await;
+            });
+        }
 
-            if let Err(e) = res {
+        tokio::spawn(async move {
+            let mut child = match crate::nspawn::sys::new_command("journalctl")
+                .args([
+                    "-M",
+                    &name,
+                    "-n",
+                    "1000",
+                    "-f",
+                    "--no-pager",
+                    "--output=short",
+                ])
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    fatal.store(true, Ordering::Relaxed);
+                    let _ = tx.send(format!("Log stream error: {e}"));
+                    if e.kind() == std::io::ErrorKind::PermissionDenied {
+                        let _ = tx.send(
+                            "Hint: add yourself to the 'systemd-journal' \
+                             group: sudo usermod -a -G systemd-journal $USER"
+                                .into(),
+                        );
+                    }
+                    return;
+                }
+            };
+
+            let stdout = child
+                .stdout
+                .take()
+                .expect("journalctl stdout piped");
+            let mut stderr_pipe = child
+                .stderr
+                .take()
+                .expect("journalctl stderr piped");
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+
+            let stream_result: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
+                async {
+                    loop {
+                        tokio::select! {
+                            line_res = lines.next_line() => {
+                                if let Ok(Some(line)) = line_res {
+                                    if tx.send(line).is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            _ = child.wait() => break,
+                        }
+                    }
+
+                    // Drain stderr after the stream ends — journalctl writes
+                    // permission hints (e.g. "add yourself to systemd-journal")
+                    // to stderr.
+                    use tokio::io::AsyncReadExt;
+                    let mut buf = Vec::new();
+                    if let Ok(n) = stderr_pipe.read_to_end(&mut buf).await {
+                        if n > 0 {
+                            fatal.store(true, Ordering::Relaxed);
+                            let _ = tx.send(format!(
+                                "Log stream: {}",
+                                String::from_utf8_lossy(&buf)
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+                .await;
+
+            if let Err(e) = stream_result {
                 let _ = tx.send(format!("Log stream stopped: {e}"));
             }
         })
@@ -295,8 +421,12 @@ impl NspawnManager for DefaultManager {
             match self.dbus.get_properties(name).await {
                 Ok(p) => p,
                 Err(e) => {
-                    log::warn!("DBus get_properties failed, falling back to CLI: {}", e);
-                    self.mark_fallback(&format!("{}", e));
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!(
+                        "DBus get_properties failed ({}), falling back to CLI",
+                        reason
+                    );
+                    self.mark_fallback(&reason);
                     self.cli.get_properties(name).await?
                 }
             }
@@ -378,15 +508,28 @@ impl NspawnManager for DefaultManager {
     }
 
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {
-        let dbus_available = self.is_root && self.dbus.is_available().await;
+        let dbus_available = self.dbus.is_available().await;
 
-        // 1. DBus Engine: Instant lifecycle updates
+        // 1. DBus Engine: Instant lifecycle updates via signals.
+        //    Falls back to CLI polling when watch_events is unsupported
+        //    (e.g. DaemonBackend without streaming RPC) or DBus is down.
         if dbus_available {
             let dbus_clone = self.dbus.clone();
+            let cli_clone = self.cli.clone();
             let tx_dbus = tx.clone();
+            let tx_cli = tx.clone();
             tokio::spawn(async move {
-                if let Err(e) = dbus_clone.watch_events(tx_dbus).await {
-                    log::error!("DBus watcher crashed: {}", e);
+                match dbus_clone.watch_events(tx_dbus).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        log::warn!(
+                            "DBus watcher unavailable ({}), falling back to CLI polling",
+                            e
+                        );
+                        if let Err(e2) = cli_clone.watch_events(tx_cli).await {
+                            log::error!("CLI watcher crashed: {}", e2);
+                        }
+                    }
                 }
             });
         } else {
@@ -465,13 +608,27 @@ impl NspawnManager for DefaultManager {
     }
 }
 
+/// Wrap a raw pipe fd in a tokio async pipe `Receiver` so the runtime can
+/// cancel reads during shutdown (unlike `spawn_blocking`).
+///
+/// Uses the checked [`Receiver::from_owned_fd`] which verifies the fd is a
+/// pipe, is readable, and sets O_NONBLOCK.
+fn pipe_reader(
+    fd: std::os::unix::io::RawFd,
+) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::io::FromRawFd;
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nspawn::adapters::comm::backend::MockContainerBackend;
     use crate::nspawn::errors::NspawnError;
     use crate::nspawn::models::ContainerState;
-
+    use crate::nspawn::ops::DefaultPermissionManager;
     fn dummy_entry(name: &str) -> ContainerEntry {
         ContainerEntry {
             name: name.to_string(),
@@ -482,6 +639,10 @@ mod tests {
             address: None,
             all_addresses: vec![],
         }
+    }
+
+    fn test_pm() -> std::sync::Arc<dyn crate::nspawn::ops::PermissionManager> {
+        std::sync::Arc::new(DefaultPermissionManager::new())
     }
 
     fn mock_dbus_available() -> MockContainerBackend {
@@ -504,13 +665,14 @@ mod tests {
         dbus.expect_list_all()
             .returning(|| Ok(vec![dummy_entry("dbus-entry")]));
 
-        let cli = MockContainerBackend::new(); // cli should never be called
+        let cli = MockContainerBackend::new();
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -533,10 +695,11 @@ mod tests {
             .returning(|| Ok(vec![dummy_entry("cli-entry")]));
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -556,10 +719,11 @@ mod tests {
             .returning(|| Ok(vec![dummy_entry("cli-only")]));
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -568,49 +732,6 @@ mod tests {
         let entries = mgr.list_all().await.unwrap();
         assert_eq!(entries[0].name, "cli-only");
         assert!(mgr.did_fallback().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_list_all_non_root_uses_cli_only() {
-        let dbus = MockContainerBackend::new(); // never called for non-root
-
-        let mut cli = MockContainerBackend::new();
-        cli.expect_list_all()
-            .returning(|| Ok(vec![dummy_entry("non-root")]));
-
-        let mgr = DefaultManager {
-            is_root: false,
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
-
-        let entries = mgr.list_all().await.unwrap();
-        assert_eq!(entries[0].name, "non-root");
-    }
-
-    // permission guard
-
-    #[tokio::test]
-    async fn test_start_requires_root() {
-        let dbus = mock_dbus_available();
-        let cli = MockContainerBackend::new();
-
-        let mgr = DefaultManager {
-            is_root: false,
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
-
-        let err = mgr.start("test").await.unwrap_err();
-        assert!(matches!(err, NspawnError::PermissionDenied));
     }
 
     // fallback paths
@@ -626,10 +747,11 @@ mod tests {
         cli.expect_start().returning(|_| Ok(()));
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -648,13 +770,14 @@ mod tests {
             .with(mockall::predicate::eq("test-ctr"))
             .returning(|_| Ok(()));
 
-        let cli = MockContainerBackend::new(); // should never be called
+        let cli = MockContainerBackend::new();
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -676,10 +799,11 @@ mod tests {
             .returning(|_| Ok(()));
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -702,38 +826,18 @@ mod tests {
             .returning(|| Ok(vec![dummy_entry("test")]));
 
         let mgr = DefaultManager {
-            is_root: true,
+            pm: test_pm(),
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
+            daemon: None,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
         mgr.list_all().await.unwrap();
-        assert!(mgr.did_fallback().is_some()); // first read returns reason
-        assert!(mgr.did_fallback().is_none()); // second returns None (taken)
-    }
-
-    // remove
-
-    #[tokio::test]
-    async fn test_remove_requires_root() {
-        let dbus = mock_dbus_available();
-        let cli = MockContainerBackend::new();
-
-        let mgr = DefaultManager {
-            is_root: false,
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
-
-        let err = mgr.remove("test").await.unwrap_err();
-        assert!(matches!(err, NspawnError::PermissionDenied));
+        assert!(mgr.did_fallback().is_some());
+        assert!(mgr.did_fallback().is_none());
     }
 }

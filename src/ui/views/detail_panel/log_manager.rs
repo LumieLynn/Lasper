@@ -1,4 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub struct LogBuffer {
@@ -6,6 +8,11 @@ pub struct LogBuffer {
     pub dirty: bool,
     pub stream: Option<tokio::task::JoinHandle<()>>,
     pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    /// Set by the spawned log-stream task when it hits a non-recoverable
+    /// error (e.g. permission denied).  Checked by [`LogManager::start_stream`]
+    /// to avoid restart loops.
+    pub fatal_flag: Option<Arc<AtomicBool>>,
+    pub stream_failed: bool,
 }
 
 pub struct LogManager {
@@ -50,6 +57,8 @@ impl LogManager {
                 dirty: true,
                 stream: None,
                 log_rx: None,
+                fatal_flag: None,
+                stream_failed: false,
             });
         if switched {
             buf.dirty = true;
@@ -68,9 +77,13 @@ impl LogManager {
             .unwrap_or(false)
     }
 
-    /// Create a channel for `name` and return the sender half.
-    /// The caller passes this sender to `spawn_log_stream`.
-    pub fn start_stream(&mut self, name: &str) -> Option<mpsc::UnboundedSender<String>> {
+    /// Create a channel for `name` and return the sender half together with
+    /// a fatal flag.  The spawned log-stream task sets the flag on
+    /// non-recoverable errors so we avoid restart loops.
+    pub fn start_stream(
+        &mut self,
+        name: &str,
+    ) -> Option<(mpsc::UnboundedSender<String>, Arc<AtomicBool>)> {
         let buf = self.buffers.get_mut(name)?;
         if buf
             .stream
@@ -80,9 +93,15 @@ impl LogManager {
         {
             return None; // already running
         }
+        if buf.stream_failed {
+            return None; // previous attempt failed permanently
+        }
+        buf.stream_failed = false;
         let (tx, rx) = mpsc::unbounded_channel();
+        let fatal = Arc::new(AtomicBool::new(false));
+        buf.fatal_flag = Some(Arc::clone(&fatal));
         buf.log_rx = Some(rx);
-        Some(tx)
+        Some((tx, fatal))
     }
 
     /// Store the JoinHandle returned by `spawn_log_stream`.
@@ -101,6 +120,8 @@ impl LogManager {
                     h.abort();
                 }
                 buf.log_rx = None;
+                buf.fatal_flag = None;
+                buf.stream_failed = false;
                 had
             }
             None => false,
@@ -111,6 +132,15 @@ impl LogManager {
     /// Call once per frame, before rendering.
     pub fn drain_all(&mut self) {
         for buf in self.buffers.values_mut() {
+            // Detect fatal stream failures signalled by the spawned task.
+            if !buf.stream_failed {
+                if let Some(ref flag) = buf.fatal_flag {
+                    if flag.load(Ordering::Relaxed) {
+                        buf.stream_failed = true;
+                    }
+                }
+            }
+
             let Some(rx) = &mut buf.log_rx else { continue };
             let mut changed = false;
             while let Ok(line) = rx.try_recv() {

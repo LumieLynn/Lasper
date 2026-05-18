@@ -7,7 +7,6 @@ use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
-use crate::nspawn::sys::CommandLogged;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -53,6 +52,8 @@ pub async fn run_deploy_task(
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
+    permission_level: crate::nspawn::ops::PermissionLevel,
+    daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
     logs: tokio::sync::mpsc::Sender<String>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
@@ -69,6 +70,8 @@ pub async fn run_deploy_task(
         name.clone(),
         cfg,
         nvidia_profile,
+        permission_level,
+        daemon,
         logs.clone(),
     )
     .await
@@ -98,16 +101,29 @@ pub async fn run_deploy_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_deploy_internal(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
+    permission_level: crate::nspawn::ops::PermissionLevel,
+    daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
+    let io = match &daemon {
+        Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(permission_level, d.clone()),
+        None => crate::nspawn::sys::ElevatedIo::new(permission_level),
+    };
+    let cli_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner> = match &daemon {
+        Some(d) => std::sync::Arc::new(crate::nspawn::sys::DaemonCommandRunner::new(d.clone())),
+        None => std::sync::Arc::new(crate::nspawn::sys::DefaultCommandRunner),
+    };
     let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
-        std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(true));
+        std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
+            cli_runner.clone(),
+        ));
 
     macro_rules! push_log {
         ($msg:expr) => {
@@ -129,7 +145,7 @@ async fn run_deploy_internal(
             "Creating storage (type: {:?})...",
             storage.get_type()
         ));
-        storage.create(&name).await?;
+        storage.create(&name, cli_runner.as_ref(), &io).await?;
     }
 
     // 2. Deployment & Configuration scoping
@@ -144,7 +160,7 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Mounting storage...".to_string());
-            storage.mount(&name).await?
+            storage.mount(&name, cli_runner.as_ref(), &io).await?
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
             crate::paths::machine_root(&name)
@@ -166,64 +182,77 @@ async fn run_deploy_internal(
         // ---- systemd-dissect raw mounting ----
         let mut actual_rootfs = rootfs.clone();
 
-        if !tokio::fs::try_exists(&actual_rootfs).await.unwrap_or(false) {
+        // Check via ElevatedIo so Elevated mode can verify the rootfs
+        let rootfs_exists = io
+            .read_to_string(&actual_rootfs.join("etc/os-release"))
+            .await?
+            .is_some();
+        if !rootfs_exists {
             let raw_path = crate::paths::machine_raw_image(&name);
-            if let Ok(meta) = tokio::fs::metadata(&raw_path).await {
-                if meta.is_file() {
-                    let dissect_parent = "/var/cache/lasper/mounts";
-                    let _ = tokio::fs::create_dir_all(dissect_parent).await;
+            let raw_exists = io
+                .read_to_string(&raw_path)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if raw_exists {
+                let dissect_parent = "/var/cache/lasper/mounts";
+                let _ = io.create_dir_all(std::path::Path::new(dissect_parent)).await;
 
-                    let tmp_mnt = tempfile::Builder::new()
-                        .prefix(&format!("lasper-dissect-{}-", name))
-                        .tempdir_in(dissect_parent)
-                        .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary mount point: {}", e)))?;
+                let tmp_mnt = tempfile::Builder::new()
+                    .prefix(&format!("lasper-dissect-{}-", name))
+                    .tempdir_in(dissect_parent)
+                    .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary mount point: {}", e)))?;
 
-                    let mount_point = tmp_mnt.path().to_path_buf();
-                    push_log!("Mounting raw image for configuration...".to_string());
+                let mount_point = tmp_mnt.path().to_path_buf();
+                push_log!("Mounting raw image for configuration...".to_string());
 
-                    let out = crate::nspawn::sys::new_command("systemd-dissect")
-                        .args([
-                            "--mount",
-                            raw_path.to_str().unwrap(),
-                            mount_point.to_str().unwrap(),
-                        ])
-                        .logged_output("systemd-dissect")
-                        .await;
+                let out = cli_runner
+                    .run(
+                        "systemd-dissect",
+                        vec![
+                            "--mount".into(),
+                            raw_path.to_str().unwrap().into(),
+                            mount_point.to_str().unwrap().into(),
+                        ],
+                    )
+                    .await;
+                if let Ok(ref cmd) = out {
+                    crate::nspawn::sys::log_output("systemd-dissect", cmd);
+                }
 
-                    if let Ok(cmd) = out {
-                        if cmd.status.success() {
-                            actual_rootfs = mount_point.clone();
-                            dissect_mount_dir = Some(mount_point);
-                            _dissect_guard = Some(tmp_mnt);
-                        } else {
-                            push_log!(
-                                "WARNING: Failed to mount raw image with systemd-dissect.".into()
-                            );
-                        }
+                if let Ok(cmd) = out {
+                    if cmd.status.success() {
+                        actual_rootfs = mount_point.clone();
+                        dissect_mount_dir = Some(mount_point);
+                        _dissect_guard = Some(tmp_mnt);
+                    } else {
+                        push_log!(
+                            "WARNING: Failed to mount raw image with systemd-dissect.".into()
+                        );
                     }
                 }
             }
         }
 
-        let is_mounted_dir = if let Ok(meta) = tokio::fs::metadata(&actual_rootfs).await {
-            meta.is_dir()
-        } else {
-            false
-        };
+        let is_mounted_dir = io
+            .read_to_string(&actual_rootfs.join("etc/os-release"))
+            .await?
+            .is_some();
 
         if is_mounted_dir {
             if let Some(pwd) = &cfg.root_password {
                 push_log!("Setting root password...".to_string());
-                crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd, &logs).await?;
+                crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd, &logs, cli_runner.as_ref()).await?;
             }
 
             for user in &cfg.users {
                 push_log!(format!("Creating user {}...", user.username));
-                crate::nspawn::adapters::rootfs::users::create_user_in_container(&actual_rootfs, user, &logs).await?;
+                crate::nspawn::adapters::rootfs::users::create_user_in_container(&actual_rootfs, user, &logs, cli_runner.as_ref(), &io).await?;
 
                 if cfg.wayland_socket.is_some() {
                     push_log!(format!("Setting up wayland env for {}...", user.username));
-                    crate::nspawn::adapters::rootfs::wayland::setup_wayland_shell_env(&actual_rootfs, user).await?;
+                    crate::nspawn::adapters::rootfs::wayland::setup_wayland_shell_env(&actual_rootfs, user, &io).await?;
                 }
             }
         } else {
@@ -239,7 +268,7 @@ async fn run_deploy_internal(
 
             // Save profile so lifecycle.rs can reload it on container start
             if let Some(prof) = &nvidia_profile {
-                let _ = prof.save(&name).await;
+                let _ = prof.save(&name, &io).await;
             }
 
             // Run initial CDI discovery to seed the .nspawn config and state.
@@ -267,15 +296,17 @@ async fn run_deploy_internal(
                 }
 
                 // Persist initial state for lifecycle diffing
-                if let Err(e) =
-                    crate::nspawn::platform::nvidia::state::save_external_state(&name, &state).await
+                if let Err(e) = crate::nspawn::platform::nvidia::state::save_external_state(
+                    &name, &state, &io,
+                )
+                .await
                 {
                     push_log!(format!("WARNING: Failed to save NVIDIA state: {}", e));
                 }
 
                 // Write ld.so.conf.d and env vars into rootfs (one-time setup)
                 if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
-                    &name, &state,
+                    &name, &state, &io, cli_runner.as_ref(),
                 )
                 .await
                 {
@@ -299,7 +330,7 @@ async fn run_deploy_internal(
         push_log!("Writing .nspawn config...".to_string());
         let nspawn_path = crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
 
-        crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&nspawn_path, |_| Ok(nspawn_content)).await?;
+        io.write(&nspawn_path, &nspawn_content).await?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             log::info!(
@@ -313,6 +344,7 @@ async fn run_deploy_internal(
                 cfg.nvidia_gpu,
                 cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
+                &io,
             ).await?;
 
             let _ = provision.reload_daemon().await;
@@ -325,7 +357,7 @@ async fn run_deploy_internal(
                     NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
                 ) {
                     push_log!("Enabling container network (systemd-networkd)...".to_string());
-                    if let Err(e) = crate::nspawn::adapters::rootfs::network::enable_container_networkd(&actual_rootfs).await {
+                    if let Err(e) = crate::nspawn::adapters::rootfs::network::enable_container_networkd(&actual_rootfs, cli_runner.as_ref(), &io).await {
                         push_log!(format!("WARNING: {} (might not be a systemd container)", e));
                     }
                 }
@@ -340,17 +372,17 @@ async fn run_deploy_internal(
     // 1. Unmount systemd-dissect if it was used
     if let Some(mnt) = dissect_mount_dir {
         push_log!("Unmounting raw image...".to_string());
-        let _ = crate::nspawn::sys::new_command("systemd-dissect")
-            .args(["--umount", mnt.to_str().unwrap()])
-            .logged_output("systemd-dissect")
-            .await;
+        let _ = cli_runner.run(
+            "systemd-dissect",
+            vec!["--umount".into(), mnt.to_str().unwrap().into()],
+        ).await;
         // _dissect_guard will automatically clean up the directory when it drops
     }
 
     // 2. Unmount Lasper storage
     if !is_ext {
         push_log!("Unmounting storage...".to_string());
-        let _ = storage.unmount(&name).await;
+        let _ = storage.unmount(&name, cli_runner.as_ref(), &io).await;
     }
 
     // 3. Transactional Rollback
@@ -362,18 +394,18 @@ async fn run_deploy_internal(
         let nspawn_path =
             crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
         let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
-        let _ = tokio::fs::remove_file(&nspawn_path).await;
-        let _ = tokio::fs::remove_dir_all(&override_dir).await;
+        let _ = io.remove_file(&nspawn_path).await;
+        let _ = io.remove_dir_all(std::path::Path::new(&override_dir)).await;
 
         if is_ext {
             // Cleanup systemd-managed storage (downloaded/imported junk)
-            let _ = crate::nspawn::sys::new_command("machinectl")
-                .args(["remove", &name])
-                .logged_output("machinectl")
-                .await;
+            let _ = cli_runner.run(
+                "machinectl",
+                vec!["remove".into(), name.clone()],
+            ).await;
         } else {
             // Cleanup Lasper-managed storage
-            let _ = storage.delete(&name).await;
+            let _ = storage.delete(&name, cli_runner.as_ref(), &io).await;
         }
         return Err(e);
     }

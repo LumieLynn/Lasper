@@ -50,11 +50,7 @@ pub fn render(f: &mut Frame, data: &AppData, panel: &DetailPanel, area: Rect) {
         Err(idx) => idx.saturating_sub(1),
     };
 
-    let first_line_start_y = cache
-        .offset_index
-        .get(first_line_idx)
-        .copied()
-        .unwrap_or(0);
+    let first_line_start_y = cache.offset_index.get(first_line_idx).copied().unwrap_or(0);
     let skip_visual_lines = scroll_y.saturating_sub(first_line_start_y);
 
     // Convert String lines to ratatui Lines for rendering

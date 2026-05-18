@@ -7,6 +7,7 @@ pub mod utils;
 use super::super::{StorageBackend, StorageType};
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::DiskImageConfig;
+use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 pub struct DiskImageBackend {
@@ -34,28 +35,49 @@ impl StorageBackend for DiskImageBackend {
         }
     }
 
-    async fn create(&self, name: &str) -> Result<PathBuf> {
-        self.create_impl(name).await
+    async fn create(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
+        self.create_impl(name, cmd_runner, io).await
     }
 
-    async fn mount(&self, name: &str) -> Result<PathBuf> {
-        self.mount_impl(name).await
+    async fn mount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
+        self.mount_impl(name, cmd_runner, io).await
     }
 
-    async fn unmount(&self, name: &str) -> Result<()> {
-        self.unmount_impl(name).await
+    async fn unmount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<()> {
+        self.unmount_impl(name, cmd_runner, io).await
     }
 
-    async fn delete(&self, name: &str) -> Result<()> {
+    async fn delete(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<()> {
         let path = self.get_path(name);
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                log::warn!(
-                    "Image file already missing for deletion: {}",
-                    path.display()
-                );
+        if let Err(e) = io.remove_file(&path).await {
+            if matches!(
+                e,
+                crate::nspawn::errors::NspawnError::Io(_, ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::NotFound
+            ) {
+                log::warn!("Image file already missing for deletion: {}", path.display());
             } else {
-                return Err(crate::nspawn::errors::NspawnError::Io(path, e));
+                return Err(e);
             }
         }
         Ok(())
