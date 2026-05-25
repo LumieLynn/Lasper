@@ -5,8 +5,7 @@ use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
 use crate::nspawn::ops::{PermissionLevel, PermissionManager};
-use crate::nspawn::sys::daemon::ElevatedDaemon;
-use crate::nspawn::sys::{CommandRunner, DaemonCommandRunner, DefaultCommandRunner};
+use crate::nspawn::sys::ExecutionContext;
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -40,11 +39,12 @@ pub trait NspawnManager: Send + Sync + 'static {
 }
 
 pub struct DefaultManager {
+    #[allow(dead_code)] // used in constructor and tests via struct literals
     pm: std::sync::Arc<dyn PermissionManager>,
     cli_mode: bool,
     dbus: std::sync::Arc<dyn ContainerBackend>,
     cli: std::sync::Arc<dyn ContainerBackend>,
-    daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+    exec_ctx: std::sync::Arc<ExecutionContext>,
     last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
     nudge_tx: tokio::sync::watch::Sender<()>,
@@ -54,30 +54,26 @@ impl DefaultManager {
     pub fn new(
         pm: std::sync::Arc<dyn PermissionManager>,
         cli_mode: bool,
-        daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+        exec_ctx: std::sync::Arc<ExecutionContext>,
     ) -> Self {
         if cli_mode {
             log::info!("CLI mode active — DBus backend disabled");
         }
 
-        let cli_runner: std::sync::Arc<dyn CommandRunner> = match pm.level() {
-            PermissionLevel::Elevated => std::sync::Arc::new(DaemonCommandRunner::new(
-                daemon.clone().expect("daemon required for Elevated mode"),
-            )),
-            _ => std::sync::Arc::new(DefaultCommandRunner),
-        };
-
         let dbus_backend: std::sync::Arc<dyn ContainerBackend> = match pm.level() {
             PermissionLevel::Elevated => {
                 log::info!("Elevated mode — DBus operations proxied through daemon");
                 std::sync::Arc::new(DaemonBackend::new(
-                    daemon.clone().expect("daemon required for Elevated mode"),
+                    exec_ctx
+                        .daemon_ref()
+                        .cloned()
+                        .expect("daemon required for Elevated mode"),
                 ))
             }
             _ => std::sync::Arc::new(DbusBackend::new()),
         };
 
-        let cli_backend = CliBackend::new(cli_runner);
+        let cli_backend = CliBackend::new(exec_ctx.cmd.clone());
         let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
         cli_backend.set_nudge(nudge_rx);
         Self {
@@ -85,7 +81,7 @@ impl DefaultManager {
             cli_mode,
             dbus: dbus_backend,
             cli: std::sync::Arc::new(cli_backend),
-            daemon,
+            exec_ctx,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![crate::paths::machines_dir()],
             nudge_tx,
@@ -117,19 +113,17 @@ impl DefaultManager {
     }
 
     fn elevated_io(&self) -> crate::nspawn::sys::ElevatedIo {
-        match &self.daemon {
-            Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(self.pm.level(), d.clone()),
-            None => crate::nspawn::sys::ElevatedIo::new(self.pm.level()),
-        }
+        self.exec_ctx.io.clone()
     }
 
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
         let io = self.elevated_io();
-        let cmd_runner: std::sync::Arc<dyn CommandRunner> = match &self.daemon {
-            Some(d) => std::sync::Arc::new(DaemonCommandRunner::new(d.clone())),
-            None => std::sync::Arc::new(DefaultCommandRunner),
-        };
-        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(name, &io, cmd_runner.as_ref()).await?;
+        crate::nspawn::platform::nvidia::ensure_gpu_passthrough(
+            name,
+            &io,
+            self.exec_ctx.cmd.as_ref(),
+        )
+        .await?;
         // Reload systemd after GPU surgery — always needed when device allows change.
         let _ = self.reload_daemon_fallback().await;
         self.nudge();
@@ -302,8 +296,7 @@ impl NspawnManager for DefaultManager {
     ) -> tokio::task::JoinHandle<()> {
         let name = name.to_string();
 
-        if let Some(ref daemon) = self.daemon {
-            let daemon = daemon.clone();
+        if let Some(daemon) = self.exec_ctx.daemon_ref().cloned() {
             let name = name.clone();
             let fatal_clone = fatal.clone();
             return tokio::spawn(async move {
@@ -645,6 +638,13 @@ mod tests {
         std::sync::Arc::new(DefaultPermissionManager::new())
     }
 
+    fn test_exec_ctx() -> std::sync::Arc<crate::nspawn::sys::ExecutionContext> {
+        std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
+            crate::nspawn::ops::PermissionLevel::User,
+            None,
+        ))
+    }
+
     fn mock_dbus_available() -> MockContainerBackend {
         let mut backend = MockContainerBackend::new();
         backend.expect_is_available().returning(|| true);
@@ -672,7 +672,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -699,7 +699,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -723,7 +723,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -751,7 +751,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -777,7 +777,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -803,7 +803,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
@@ -830,7 +830,7 @@ mod tests {
             cli_mode: false,
             dbus: std::sync::Arc::new(dbus),
             cli: std::sync::Arc::new(cli),
-            daemon: None,
+            exec_ctx: test_exec_ctx(),
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,

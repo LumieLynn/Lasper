@@ -11,7 +11,7 @@ use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
-    sys::daemon::ElevatedDaemon,
+    sys::ExecutionContext,
 };
 use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
@@ -102,7 +102,7 @@ pub struct AppData {
     pub config_content: Option<String>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
-    pub daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+    pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
     pub transitions:
         std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
@@ -132,12 +132,12 @@ impl App {
         permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
         cli_mode: bool,
         log_buffer_lines: usize,
-        daemon: Option<std::sync::Arc<ElevatedDaemon>>,
+        exec_ctx: std::sync::Arc<ExecutionContext>,
     ) -> Self {
         let manager = std::sync::Arc::new(DefaultManager::new(
             permissions.clone(),
             cli_mode,
-            daemon.clone(),
+            exec_ctx.clone(),
         ));
         Self {
             permissions,
@@ -152,7 +152,7 @@ impl App {
                 config_content: None,
                 dbus_active: !cli_mode,
                 manager,
-                daemon,
+                exec_ctx,
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
                 metrics: HashMap::new(),
@@ -431,7 +431,10 @@ mod tests {
             std::sync::Arc::new(crate::nspawn::ops::DefaultPermissionManager::new()),
             false, // cli_mode
             0,
-            None, // daemon
+            std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
+                crate::nspawn::ops::PermissionLevel::User,
+                None,
+            )),
         )
     }
 

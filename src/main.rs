@@ -169,6 +169,11 @@ async fn main() -> Result<()> {
             None
         };
 
+    // 3c. Build execution context — one-time routing for commands and file I/O.
+    let exec_ctx = std::sync::Arc::new(
+        crate::nspawn::sys::ExecutionContext::new(pm.level(), daemon),
+    );
+
     // 4. Setup logging — always owned by the current user.
     let log_dir = get_log_dir();
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
@@ -207,7 +212,7 @@ async fn main() -> Result<()> {
         .as_ref()
         .map(|s| s.log_buffer_lines)
         .unwrap_or(0);
-    let result = app::App::new(pm, want_cli_mode, log_buffer_lines, daemon.clone())
+    let result = app::App::new(pm, want_cli_mode, log_buffer_lines, exec_ctx.clone())
         .run(&mut terminal)
         .await;
 
@@ -227,11 +232,9 @@ async fn main() -> Result<()> {
         eprintln!("Error: {:#}", e);
     }
 
-    if let Some(d) = daemon {
-        log::info!("[lasper] calling daemon.exit()...");
-        d.exit().await;
-        log::info!("[lasper] daemon.exit() completed");
-    }
+    log::info!("[lasper] calling daemon.exit()...");
+    exec_ctx.exit_daemon().await;
+    log::info!("[lasper] daemon.exit() completed");
 
     log::info!("[lasper] main() returning");
     let code = if result.is_ok() { 0 } else { 1 };

@@ -21,12 +21,14 @@
 //! over a Unix domain socket using the [`sendfd`] crate.
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use fs2::FileExt;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
-use std::process::Output;
+use std::process::{ExitStatus, Output};
+use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
@@ -61,6 +63,52 @@ struct CommandResult {
     status: i32,
     stdout: String,
     stderr: String,
+}
+
+// ── DaemonCommandRunner — adapts ElevatedDaemon to CommandRunner ──
+
+/// Routes commands through the elevated daemon (root child process).
+pub struct DaemonCommandRunner {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+impl DaemonCommandRunner {
+    pub fn new(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self { daemon }
+    }
+}
+
+#[async_trait::async_trait]
+impl CommandRunner for DaemonCommandRunner {
+    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
+        self.daemon.run_command(program, &args).await
+    }
+
+    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
+        let cmd_id = self.daemon.reserve_spawn_id();
+        let stdout_fd = self
+            .daemon
+            .spawn_shell_cmd(cmd_id, program, &args)
+            .await?;
+        let receiver = pipe_reader(stdout_fd)?;
+        Ok(SpawnedProcess::new(
+            Box::new(receiver),
+            {
+                let daemon = self.daemon.clone();
+                async move {
+                    let code = daemon.wait_command(cmd_id).await?;
+                    Ok(ExitStatus::from_raw(code))
+                }
+            },
+        ))
+    }
+}
+
+fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::io::FromRawFd;
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
 }
 
 type RpcCall = (RpcRequest, tokio::sync::oneshot::Sender<RpcResponse>);
@@ -111,8 +159,8 @@ impl ElevatedDaemon {
         let sock_token = uuid::Uuid::new_v4();
         let sock_path = format!("/tmp/lasper-fd-{}.sock", sock_token);
 
-        let mut child = crate::nspawn::sys::new_command("sudo")
-            .arg(exe)
+        let mut child = tokio::process::Command::new("sudo")
+            .arg(&exe)
             .args([
                 "--daemon",
                 "--fd-sock",
@@ -120,9 +168,9 @@ impl ElevatedDaemon {
                 "--daemon-uid",
                 &user_uid.to_string(),
             ])
-            .stderr(std::process::Stdio::inherit())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
             .spawn()?;
 
         let pid = child.id().expect("child has pid");

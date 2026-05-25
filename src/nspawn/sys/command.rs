@@ -1,24 +1,27 @@
 //! Command builder helpers.
 
-use std::os::unix::process::ExitStatusExt;
+use std::pin::Pin;
+use std::future::Future;
 use std::process::{ExitStatus, Output, Stdio};
 
 /// Handle to a spawned command: stderr merged into stdout via `2>&1`,
 /// exit status retrievable via [`SpawnedProcess::wait`].
 pub struct SpawnedProcess {
     pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    exit: SpawnExit,
-}
-
-enum SpawnExit {
-    Local(tokio::process::Child),
-    Daemon {
-        daemon: std::sync::Arc<super::daemon::ElevatedDaemon>,
-        cmd_id: u64,
-    },
+    wait_fn: Option<Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send>>>,
 }
 
 impl SpawnedProcess {
+    pub fn new(
+        stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        wait_fn: impl Future<Output = std::io::Result<ExitStatus>> + Send + 'static,
+    ) -> Self {
+        Self {
+            stdout,
+            wait_fn: Some(Box::pin(wait_fn)),
+        }
+    }
+
     pub async fn wait(mut self) -> std::io::Result<ExitStatus> {
         // Drain any unread stdout before waiting — avoids pipe deadlocks.
         use tokio::io::AsyncReadExt;
@@ -26,13 +29,7 @@ impl SpawnedProcess {
         while self.stdout.read(&mut buf).await? > 0 {}
         drop(self.stdout);
 
-        match self.exit {
-            SpawnExit::Local(child) => child.wait_with_output().await.map(|o| o.status),
-            SpawnExit::Daemon { daemon, cmd_id } => {
-                let code = daemon.wait_command(cmd_id).await?;
-                Ok(ExitStatus::from_raw(code))
-            }
-        }
+        self.wait_fn.take().unwrap().await
     }
 }
 
@@ -70,54 +67,10 @@ impl CommandRunner for DefaultCommandRunner {
             .stderr(Stdio::null())
             .spawn()?;
         let stdout = Box::new(child.stdout.take().expect("stdout piped"));
-        Ok(SpawnedProcess {
-            stdout,
-            exit: SpawnExit::Local(child),
-        })
+        Ok(SpawnedProcess::new(stdout, async move {
+            child.wait_with_output().await.map(|o| o.status)
+        }))
     }
-}
-
-/// Routes commands through the elevated daemon (root child process).
-pub struct DaemonCommandRunner {
-    daemon: std::sync::Arc<super::daemon::ElevatedDaemon>,
-}
-
-impl DaemonCommandRunner {
-    pub fn new(daemon: std::sync::Arc<super::daemon::ElevatedDaemon>) -> Self {
-        Self { daemon }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandRunner for DaemonCommandRunner {
-    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
-        self.daemon.run_command(program, &args).await
-    }
-
-    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
-        let cmd_id = self.daemon.reserve_spawn_id();
-        let stdout_fd = self
-            .daemon
-            .spawn_shell_cmd(cmd_id, program, &args)
-            .await?;
-        let receiver = pipe_reader(stdout_fd)?;
-        Ok(SpawnedProcess {
-            stdout: Box::new(receiver),
-            exit: SpawnExit::Daemon {
-                daemon: self.daemon.clone(),
-                cmd_id,
-            },
-        })
-    }
-}
-
-fn pipe_reader(
-    fd: std::os::unix::io::RawFd,
-) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
-    use std::os::fd::OwnedFd;
-    use std::os::unix::io::FromRawFd;
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
 }
 
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set

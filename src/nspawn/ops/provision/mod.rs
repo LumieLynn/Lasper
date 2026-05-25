@@ -52,8 +52,7 @@ pub async fn run_deploy_task(
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
-    permission_level: crate::nspawn::ops::PermissionLevel,
-    daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
+    exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<String>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
@@ -70,8 +69,7 @@ pub async fn run_deploy_task(
         name.clone(),
         cfg,
         nvidia_profile,
-        permission_level,
-        daemon,
+        exec_ctx,
         logs.clone(),
     )
     .await
@@ -108,18 +106,11 @@ async fn run_deploy_internal(
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
-    permission_level: crate::nspawn::ops::PermissionLevel,
-    daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
+    exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
-    let io = match &daemon {
-        Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(permission_level, d.clone()),
-        None => crate::nspawn::sys::ElevatedIo::new(permission_level),
-    };
-    let cli_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner> = match &daemon {
-        Some(d) => std::sync::Arc::new(crate::nspawn::sys::DaemonCommandRunner::new(d.clone())),
-        None => std::sync::Arc::new(crate::nspawn::sys::DefaultCommandRunner),
-    };
+    let io = exec_ctx.io.clone();
+    let cli_runner = exec_ctx.cmd.clone();
     let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
         std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
             cli_runner.clone(),

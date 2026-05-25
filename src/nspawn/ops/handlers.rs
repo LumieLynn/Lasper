@@ -33,23 +33,14 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     match cmd {
         BackendCommand::SubmitConfig(ctx) => {
-            let permission_level = ctx.permission_level;
-            let daemon = ctx.daemon.clone();
-            let cli_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner> = match &daemon {
-                Some(d) => {
-                    std::sync::Arc::new(crate::nspawn::sys::DaemonCommandRunner::new(d.clone()))
-                }
-                None => std::sync::Arc::new(crate::nspawn::sys::DefaultCommandRunner),
-            };
+            let exec_ctx = ctx.exec_ctx.clone();
+            let cli_runner = exec_ctx.cmd.clone();
             let provision: std::sync::Arc<
                 dyn crate::nspawn::ops::provision::backend::ProvisionBackend,
             > = std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
                 cli_runner.clone(),
             ));
-            let io = match &daemon {
-                Some(d) => crate::nspawn::sys::ElevatedIo::with_daemon(permission_level, d.clone()),
-                None => crate::nspawn::sys::ElevatedIo::new(permission_level),
-            };
+            let io = exec_ctx.io.clone();
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(provision, io, cli_runner);
             let name = built.cfg.name.clone();
@@ -78,8 +69,7 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     name,
                     cfg,
                     nvidia_profile,
-                    permission_level,
-                    daemon,
+                    exec_ctx,
                     log_mpsc_tx,
                     done,
                     success,

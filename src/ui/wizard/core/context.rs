@@ -7,7 +7,7 @@ use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::ops::provision::Deployer;
 use crate::nspawn::ops::PermissionLevel;
-use crate::nspawn::sys::daemon::ElevatedDaemon;
+use crate::nspawn::sys::ExecutionContext;
 use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
@@ -304,14 +304,14 @@ pub struct WizardContext {
     pub entries: Vec<ContainerEntry>,
     pub xdg_runtime: Option<String>,
     pub permission_level: PermissionLevel,
-    pub daemon: Option<Arc<ElevatedDaemon>>,
+    pub exec_ctx: Arc<ExecutionContext>,
 }
 
 impl WizardContext {
     pub async fn new(
         entries: Vec<ContainerEntry>,
         permission_level: PermissionLevel,
-        daemon: Option<Arc<ElevatedDaemon>>,
+        exec_ctx: Arc<ExecutionContext>,
     ) -> Self {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
             .await
@@ -414,7 +414,7 @@ impl WizardContext {
             entries,
             xdg_runtime,
             permission_level,
-            daemon,
+            exec_ctx,
         }
     }
 

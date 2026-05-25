@@ -120,7 +120,7 @@ async fn inject_persistent_device_allow(
         }
     }
 
-    crate::nspawn::sys::io::AsyncLockedWriter::write_atomic_elevated(&path, &content, io).await?;
+    io.write(&path, &content).await?;
 
     let transient_path = format!(
         "/run/systemd/system/systemd-nspawn@{}.service.d/10-lasper-nvidia.conf",

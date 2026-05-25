@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Wraps file I/O with elevation awareness.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ElevatedIo {
     level: PermissionLevel,
     daemon: Option<Arc<crate::nspawn::sys::daemon::ElevatedDaemon>>,
@@ -68,10 +68,6 @@ impl ElevatedIo {
                 }
             }
         }
-    }
-
-    pub fn is_elevated(&self) -> bool {
-        self.level.is_elevated()
     }
 
     /// Write `content` to `path`, elevating via daemon or `sudo tee` when needed.
@@ -177,14 +173,7 @@ impl ElevatedIo {
     // ── private helpers ──
 
     async fn write_direct(path: &Path, content: &str) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
-        }
-        tokio::fs::write(path, content)
-            .await
-            .map_err(|e| NspawnError::Io(path.to_path_buf(), e))
+        crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(path, content).await
     }
 
     async fn write_sudo(path: &Path, content: &str) -> Result<()> {

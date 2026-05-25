@@ -366,7 +366,7 @@ impl App {
                 nvidia_installed,
                 tx.clone(),
                 self.permissions.level(),
-                self.data.daemon.clone(),
+                self.data.exec_ctx.clone(),
             )
             .await;
 

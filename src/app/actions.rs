@@ -301,7 +301,7 @@ impl App {
         match self
             .data
             .terminal
-            .spawn(&entry, rows, &self.ui.app_tx, &self.data.daemon)
+            .spawn(&entry, rows, &self.ui.app_tx, &*self.data.exec_ctx)
             .await
         {
             Ok(_idx) => {

@@ -198,8 +198,7 @@ pub async fn save_external_state(
     let path = crate::paths::state_file(name);
     let content = serde_json::to_string_pretty(state)?;
 
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked_elevated(&path, |_| Ok(content), io)
-        .await?;
+    io.write(&path, &content).await?;
     Ok(())
 }
 
