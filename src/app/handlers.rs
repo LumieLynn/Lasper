@@ -2,7 +2,7 @@ use super::App;
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 // Top-level dispatch
 //
@@ -53,6 +53,50 @@ impl App {
         // Layer 5 – route to the focused panel
         self.route_to_focused_panel(key).await;
     }
+}
+
+// Mouse dispatch
+
+impl App {
+    pub async fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Hit-test: which panel is the mouse over?
+        let layout = &self.ui.panel_layout;
+        let col = mouse.column;
+        let row = mouse.row;
+
+        let maximized = self.data.terminal.is_showing() && self.data.terminal.maximized;
+
+        let hit = if in_rect(col, row, layout.list) {
+            Some(0usize)
+        } else if !maximized && in_rect(col, row, layout.detail) {
+            Some(1usize)
+        } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
+            Some(2usize)
+        } else {
+            None
+        };
+
+        // Click-to-focus on button press.
+        if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
+            let n = if self.data.terminal.is_showing() { 3 } else { 2 };
+            if panel_idx < n
+                && !(self.data.terminal.maximized
+                    && self.data.terminal.is_showing()
+                    && panel_idx == 1)
+            {
+                self.ui.focus.active_idx = panel_idx;
+            }
+        }
+
+        // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
+        if self.ui.focus.active_idx == 2 && self.data.terminal.is_showing() {
+            self.data.terminal.handle_mouse(mouse);
+        }
+    }
+}
+
+fn in_rect(col: u16, row: u16, r: ratatui::layout::Rect) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 // Layer 0: delete confirmation

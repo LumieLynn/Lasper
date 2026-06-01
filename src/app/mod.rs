@@ -17,7 +17,7 @@ use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io::Stdout;
 
 pub use crate::ui::views::terminal_panel::TerminalManager;
@@ -33,6 +33,14 @@ pub const CONTAINER_LIST_PCT_MIN: u16 = 15;
 pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
 pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
+
+/// Screen-area rects for mouse hit-testing, populated on each render.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PanelLayout {
+    pub list: Rect,
+    pub detail: Rect,
+    pub terminal: Option<Rect>,
+}
 
 pub struct AppUi {
     pub focus: FocusTracker,
@@ -58,6 +66,9 @@ pub struct AppUi {
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
     pub detail_pct: u16,
+
+    /// Current panel screen rects for mouse hit-testing.
+    pub panel_layout: PanelLayout,
 
     /// Signalled when the user confirms quit; included in the main
     /// `select!` so we break immediately instead of waiting for the next
@@ -87,6 +98,7 @@ impl AppUi {
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
             detail_pct: 60,
+            panel_layout: PanelLayout::default(),
             quit_tx: None,
         }
     }
@@ -284,6 +296,7 @@ impl App {
     async fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,
+            AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Tick => self.tick().await,
             AppEvent::BackendResult(res) => self.handle_backend_result(res),
             AppEvent::ActionDone(msg, level) => {

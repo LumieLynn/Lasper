@@ -137,25 +137,25 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     let detail_area = right_chunks[0];
 
+    // Store panel rects for mouse hit-testing.
+    app.ui.panel_layout.list = list_area;
+    app.ui.panel_layout.detail = detail_area;
+
+    let terminal_area = if app.data.terminal.is_showing() {
+        let ta = if maximized { right_chunks[0] } else { right_chunks[1] };
+        app.ui.panel_layout.terminal = Some(ta);
+        Some(ta)
+    } else {
+        app.ui.panel_layout.terminal = None;
+        None
+    };
+
     app.ui.pane_height = list_area.height.saturating_sub(2);
     app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
 
-    if app.data.terminal.is_showing() {
-        let terminal_area = if maximized {
-            right_chunks[0]
-        } else {
-            right_chunks[1]
-        };
-        let active_idx = app.data.terminal.active_idx;
+    if let Some(terminal_area) = terminal_area {
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
-        terminal_panel.render(
-            f,
-            terminal_area,
-            &mut app.data.terminal.sessions,
-            active_idx,
-            terminal_focused,
-            resize_mode,
-        );
+        terminal_panel.render(f, terminal_area, &mut app.data.terminal, terminal_focused, resize_mode);
     }
 
     app.ui.container_list.render_with_data(
@@ -269,6 +269,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         hspan(" hide "),
                         kspan("[x]"),
                         hspan(" close tab "),
+                        kspan("[y]"),
+                        hspan(" yank "),
                         kspan("[q]"),
                         hspan(" quit"),
                     ])

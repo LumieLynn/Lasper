@@ -1,4 +1,6 @@
-use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind, MouseEvent,
+};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;
@@ -9,6 +11,7 @@ use tokio_stream::StreamExt;
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Tick,
     BackendResult(crate::nspawn::ops::BackendResponse),
     /// Background action execution finished.
@@ -51,6 +54,9 @@ impl EventHandler {
                                 {
                                     break;
                                 }
+                            }
+                            Some(Ok(CrosstermEvent::Mouse(mouse))) => {
+                                let _ = tx_key.send(AppEvent::Mouse(mouse)).await;
                             }
                             None => break,
                             _ => {}

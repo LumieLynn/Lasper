@@ -101,8 +101,14 @@ pub struct Screen {
 
 impl Screen {
     #[must_use]
-    pub fn get_selected_text(&self, low_x: i32, low_y: i32, high_x: i32, high_y: i32) -> String {
-        self.grid().get_selected_text(low_x, low_y, high_x, high_y)
+    pub fn get_selected_text(
+        &self,
+        anchor_col: i32,
+        anchor_row: i32,
+        extent_col: i32,
+        extent_row: i32,
+    ) -> String {
+        self.grid().get_selected_text(anchor_col, anchor_row, extent_col, extent_row)
     }
 
     pub(crate) fn new(size: Size, scrollback_len: usize) -> Self {
