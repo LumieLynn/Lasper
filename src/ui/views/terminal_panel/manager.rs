@@ -486,9 +486,7 @@ fn copy_selection(
 
 /// Adjust a terminal session's scroll offset.  Free function so the borrow checker can see it only touches `session`, not `self`.
 fn adjust_scroll(session: &mut TerminalSession, f: impl FnOnce(usize, usize) -> usize) {
-    let mut screen = session.terminal.lock().screen().clone();
-    screen.set_scrollback(usize::MAX);
-    let max_scroll = screen.scrollback();
+    let max_scroll = session.terminal.lock().screen().row0_count();
     session.scroll_offset = f(session.scroll_offset, max_scroll);
 }
 

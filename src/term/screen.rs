@@ -169,6 +169,12 @@ impl Screen {
         self.grid().scrollback_len()
     }
 
+    /// Number of scrollback rows available (actual, not configured limit).
+    #[must_use]
+    pub fn row0_count(&self) -> usize {
+        self.grid().row0_count()
+    }
+
     pub fn set_scrollback(&mut self, rows: usize) {
         self.grid_mut().set_scrollback(rows);
     }

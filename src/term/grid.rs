@@ -260,6 +260,12 @@ impl Grid {
         self.rows.len() - self.size.height as usize
     }
 
+    /// Number of scrollback rows available above the visible area.
+    /// Equivalent to `set_scrollback(usize::MAX); scrollback()` without cloning.
+    pub fn row0_count(&self) -> usize {
+        self.row0()
+    }
+
     pub fn visible_rows(&self) -> impl Iterator<Item = &Row> {
         self.rows
             .iter()
