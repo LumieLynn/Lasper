@@ -85,18 +85,20 @@ pub async fn cleanup_container_garbage(
         ));
     }
 
-    cmd_runner.run(
-        "systemd-nspawn",
-        vec![
-            "-D".to_string(),
-            rootfs.to_string_lossy().to_string(),
-            "--settings=no".to_string(),
-            "-q".to_string(),
-            "sh".to_string(),
-            "-c".to_string(),
-            script,
-        ],
-    ).await?;
+    cmd_runner
+        .run(
+            "systemd-nspawn",
+            vec![
+                "-D".to_string(),
+                rootfs.to_string_lossy().to_string(),
+                "--settings=no".to_string(),
+                "-q".to_string(),
+                "sh".to_string(),
+                "-c".to_string(),
+                script,
+            ],
+        )
+        .await?;
 
     Ok(())
 }
@@ -170,21 +172,23 @@ pub async fn inject_env_once(
     if !ld_content.is_empty() {
         let tmp = format!("/tmp/lasper-inject-ld-{}-{}.conf", name, pid);
         io.write(std::path::Path::new(&tmp), &ld_content).await?;
-        let _ = cmd_runner.run(
-            "systemd-nspawn",
-            vec![
-                "-D".to_string(),
-                rootfs_str.to_string(),
-                "--bind".to_string(),
-                format!("{}:{}", tmp, tmp),
-                "sh".to_string(),
-                "-c".to_string(),
-                format!(
-                    "mkdir -p /etc/ld.so.conf.d && cp {} /etc/ld.so.conf.d/lasper-nvidia.conf",
-                    tmp
-                ),
-            ],
-        ).await;
+        let _ = cmd_runner
+            .run(
+                "systemd-nspawn",
+                vec![
+                    "-D".to_string(),
+                    rootfs_str.to_string(),
+                    "--bind".to_string(),
+                    format!("{}:{}", tmp, tmp),
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "mkdir -p /etc/ld.so.conf.d && cp {} /etc/ld.so.conf.d/lasper-nvidia.conf",
+                        tmp
+                    ),
+                ],
+            )
+            .await;
         let _ = io.remove_file(std::path::Path::new(&tmp)).await;
     }
 
@@ -217,18 +221,20 @@ pub async fn inject_env_once(
 
         let tmp = format!("/tmp/lasper-inject-env-{}-{}.conf", name, pid);
         io.write(std::path::Path::new(&tmp), &new_env).await?;
-        let _ = cmd_runner.run(
-            "systemd-nspawn",
-            vec![
-                "-D".to_string(),
-                rootfs_str.to_string(),
-                "--bind".to_string(),
-                format!("{}:{}", tmp, tmp),
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("cp {} /etc/environment", tmp),
-            ],
-        ).await;
+        let _ = cmd_runner
+            .run(
+                "systemd-nspawn",
+                vec![
+                    "-D".to_string(),
+                    rootfs_str.to_string(),
+                    "--bind".to_string(),
+                    format!("{}:{}", tmp, tmp),
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!("cp {} /etc/environment", tmp),
+                ],
+            )
+            .await;
         let _ = io.remove_file(std::path::Path::new(&tmp)).await;
     }
 

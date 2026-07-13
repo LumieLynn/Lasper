@@ -405,15 +405,10 @@ impl TerminalManager {
                     extent: (r, rel_col),
                 };
             }
-            MouseEventKind::Drag(MouseButton::Left)
-                if session.selection.active =>
-            {
-                session.selection.extent =
-                    (rel_row as i32 - session.scroll_offset as i32, rel_col);
+            MouseEventKind::Drag(MouseButton::Left) if session.selection.active => {
+                session.selection.extent = (rel_row as i32 - session.scroll_offset as i32, rel_col);
             }
-            MouseEventKind::Up(MouseButton::Left)
-                if session.selection.active =>
-            {
+            MouseEventKind::Up(MouseButton::Left) if session.selection.active => {
                 session.selection.active = false;
                 copy_selection(session, &mut self.clipboard, CopyTarget::Primary);
             }
@@ -426,7 +421,6 @@ impl TerminalManager {
             _ => {}
         }
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -449,7 +443,9 @@ fn copy_selection(
     // Rows are already row0-relative — no scroll-offset conversion needed.
     let text = {
         let guard = session.terminal.lock();
-        guard.screen().get_selected_text(ac as i32, ar, ec as i32, er)
+        guard
+            .screen()
+            .get_selected_text(ac as i32, ar, ec as i32, er)
     };
 
     if text.is_empty() {
@@ -476,7 +472,11 @@ fn copy_selection(
             }
             CopyTarget::Primary => {
                 #[cfg(target_os = "linux")]
-                if let Err(e) = cb.set().clipboard(arboard::LinuxClipboardKind::Primary).text(&text) {
+                if let Err(e) = cb
+                    .set()
+                    .clipboard(arboard::LinuxClipboardKind::Primary)
+                    .text(&text)
+                {
                     log::error!("Failed to copy to PRIMARY: {e}");
                 }
             }

@@ -108,7 +108,8 @@ impl Screen {
         extent_col: i32,
         extent_row: i32,
     ) -> String {
-        self.grid().get_selected_text(anchor_col, anchor_row, extent_col, extent_row)
+        self.grid()
+            .get_selected_text(anchor_col, anchor_row, extent_col, extent_row)
     }
 
     pub(crate) fn new(size: Size, scrollback_len: usize) -> Self {

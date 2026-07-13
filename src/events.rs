@@ -1,6 +1,4 @@
-use crossterm::event::{
-    Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind, MouseEvent,
-};
+use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind, MouseEvent};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::interval;

@@ -32,10 +32,14 @@ impl DiskImageBackend {
         }
 
         let err = String::from_utf8_lossy(&out.stderr);
-        log::warn!("systemd-dissect failed ({}). Attempting fallback...", err.trim());
+        log::warn!(
+            "systemd-dissect failed ({}). Attempting fallback...",
+            err.trim()
+        );
 
         // 2. Fallback
-        self.mount_fallback(&img_path, &mount_point, cmd_runner).await
+        self.mount_fallback(&img_path, &mount_point, cmd_runner)
+            .await
     }
 
     pub(super) async fn unmount_impl(
@@ -57,9 +61,7 @@ impl DiskImageBackend {
             let err = String::from_utf8_lossy(&out.stderr);
             if !err.contains("not mounted") && !err.contains("no such file") {
                 log::warn!("systemd-dissect umount failed. Forcing standard umount.");
-                let _ = cmd_runner
-                    .run("umount", vec![mnt_s])
-                    .await;
+                let _ = cmd_runner.run("umount", vec![mnt_s]).await;
             }
         }
 
@@ -82,12 +84,7 @@ impl DiskImageBackend {
         let out = cmd_runner
             .run(
                 "losetup",
-                vec![
-                    "--find".into(),
-                    "--partscan".into(),
-                    "--show".into(),
-                    img_s,
-                ],
+                vec!["--find".into(), "--partscan".into(), "--show".into(), img_s],
             )
             .await?;
         log_output("losetup", &out);
@@ -111,26 +108,20 @@ impl DiskImageBackend {
         };
 
         if !std::path::Path::new(&dev).exists() {
-            let _ = cmd_runner
-                .run("losetup", vec!["-d".into(), loop_dev])
-                .await;
+            let _ = cmd_runner.run("losetup", vec!["-d".into(), loop_dev]).await;
             return Err(NspawnError::mount_failed(format!(
                 "Final device {} does not exist for mounting.",
                 dev
             )));
         }
-        let out = cmd_runner
-            .run("mount", vec![dev, mnt_s])
-            .await?;
+        let out = cmd_runner.run("mount", vec![dev, mnt_s]).await?;
         log_output("mount", &out);
 
         if out.status.success() {
             return Ok(mount_point.to_path_buf());
         }
 
-        let _ = cmd_runner
-            .run("losetup", vec!["-d".into(), loop_dev])
-            .await;
+        let _ = cmd_runner.run("losetup", vec!["-d".into(), loop_dev]).await;
 
         Err(NspawnError::mount_failed("Fallback mount failed."))
     }
@@ -142,11 +133,13 @@ impl DiskImageBackend {
         io: &ElevatedIo,
     ) -> Result<()> {
         let img_path = self.get_path(name);
-        if let Ok(Some(loop_dev)) =
-            super::utils::find_loop_device(&img_path, cmd_runner, io).await
+        if let Ok(Some(loop_dev)) = super::utils::find_loop_device(&img_path, cmd_runner, io).await
         {
             let _ = cmd_runner
-                .run("losetup", vec!["-d".into(), loop_dev.to_string_lossy().to_string()])
+                .run(
+                    "losetup",
+                    vec!["-d".into(), loop_dev.to_string_lossy().to_string()],
+                )
                 .await;
         }
         Ok(())

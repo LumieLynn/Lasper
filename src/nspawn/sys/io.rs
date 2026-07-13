@@ -137,5 +137,4 @@ impl AsyncLockedWriter {
 
         Ok(())
     }
-
 }

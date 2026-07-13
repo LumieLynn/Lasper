@@ -7,6 +7,16 @@ use crate::nspawn::models::DiskImageSource;
 use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
+fn copy_image_args(src_path: &std::path::Path, dest_path: &std::path::Path) -> Vec<String> {
+    vec![
+        "--reflink=auto".into(),
+        "--sparse=always".into(),
+        "--".into(),
+        src_path.to_string_lossy().to_string(),
+        dest_path.to_string_lossy().to_string(),
+    ]
+}
+
 impl DiskImageBackend {
     pub(super) async fn create_impl(
         &self,
@@ -21,15 +31,25 @@ impl DiskImageBackend {
                 let src_path = PathBuf::from(path);
                 if !src_path.exists() {
                     return Err(NspawnError::Validation(format!(
-                        "Source image not found: {}", path
+                        "Source image not found: {}",
+                        path
                     )));
                 }
-                // Copy via read+write through ElevatedIo
-                let content = io
-                    .read_to_string(&src_path)
-                    .await?
-                    .ok_or_else(|| NspawnError::Validation(format!("Cannot read source: {}", path)))?;
-                io.write(&dest_path, &content).await?;
+                if let Some(parent) = dest_path.parent() {
+                    io.create_dir_all(parent).await?;
+                }
+                let out = cmd_runner
+                    .run("cp", copy_image_args(&src_path, &dest_path))
+                    .await
+                    .map_err(|e| NspawnError::Io(dest_path.clone(), e))?;
+                log_output("cp", &out);
+                if !out.status.success() {
+                    return Err(NspawnError::cmd_failed(
+                        "copy disk image",
+                        format!("cp {} {}", src_path.display(), dest_path.display()),
+                        &out,
+                    ));
+                }
             }
             DiskImageSource::CreateNew { size, fs_type } => {
                 let dest_s = dest_path.to_string_lossy().to_string();
@@ -72,7 +92,11 @@ impl DiskImageBackend {
             .await?;
         log_output("sfdisk", &out);
         if !out.status.success() {
-            return Err(NspawnError::cmd_failed("sfdisk", "sfdisk gpt partition", &out));
+            return Err(NspawnError::cmd_failed(
+                "sfdisk",
+                "sfdisk gpt partition",
+                &out,
+            ));
         }
 
         // 2. Setup loop device with partition scanning
@@ -89,7 +113,11 @@ impl DiskImageBackend {
             .await?;
         log_output("losetup", &out);
         if !out.status.success() {
-            return Err(NspawnError::cmd_failed("losetup -P", "losetup --find -P --show", &out));
+            return Err(NspawnError::cmd_failed(
+                "losetup -P",
+                "losetup --find -P --show",
+                &out,
+            ));
         }
         let loop_dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
         let part_dev = format!("{}p1", loop_dev);
@@ -111,16 +139,17 @@ impl DiskImageBackend {
 
         // 3. Format partition
         let mkfs = format!("mkfs.{}", fs_type);
-        let force_flag = match fs_type { "xfs" => "-f", _ => "-F" };
+        let force_flag = match fs_type {
+            "xfs" => "-f",
+            _ => "-F",
+        };
         let out = cmd_runner
             .run(&mkfs, vec![force_flag.into(), part_dev.clone()])
             .await?;
         log_output(&mkfs, &out);
 
         // 4. Cleanup
-        let _ = cmd_runner
-            .run("losetup", vec!["-d".into(), loop_dev])
-            .await;
+        let _ = cmd_runner.run("losetup", vec!["-d".into(), loop_dev]).await;
 
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
@@ -131,5 +160,29 @@ impl DiskImageBackend {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_existing_uses_binary_safe_sparse_copy() {
+        let args = copy_image_args(
+            std::path::Path::new("/tmp/source image.raw"),
+            std::path::Path::new("/var/lib/machines/test.raw"),
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                "--reflink=auto",
+                "--sparse=always",
+                "--",
+                "/tmp/source image.raw",
+                "/var/lib/machines/test.raw",
+            ]
+        );
     }
 }

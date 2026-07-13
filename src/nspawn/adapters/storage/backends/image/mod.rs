@@ -75,7 +75,10 @@ impl StorageBackend for DiskImageBackend {
                 crate::nspawn::errors::NspawnError::Io(_, ref io_err)
                     if io_err.kind() == std::io::ErrorKind::NotFound
             ) {
-                log::warn!("Image file already missing for deletion: {}", path.display());
+                log::warn!(
+                    "Image file already missing for deletion: {}",
+                    path.display()
+                );
             } else {
                 return Err(e);
             }

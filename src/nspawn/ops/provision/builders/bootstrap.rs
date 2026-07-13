@@ -43,7 +43,7 @@ impl Deployer for DebootstrapDeployer {
             args.push(self.mirror.clone());
         }
 
-        run_bootstrap(self.cmd_runner.as_ref(),"debootstrap", args, logs).await
+        run_bootstrap(self.cmd_runner.as_ref(), "debootstrap", args, logs).await
     }
 }
 
@@ -71,7 +71,7 @@ impl Deployer for PacstrapDeployer {
         }
         args.extend(self.packages.split_whitespace().map(|s| s.to_string()));
 
-        run_bootstrap(self.cmd_runner.as_ref(),"pacstrap", args, logs).await
+        run_bootstrap(self.cmd_runner.as_ref(), "pacstrap", args, logs).await
     }
 }
 

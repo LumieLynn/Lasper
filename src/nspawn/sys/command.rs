@@ -1,7 +1,7 @@
 //! Command builder helpers.
 
-use std::pin::Pin;
 use std::future::Future;
+use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
 
 /// Handle to a spawned command: stderr merged into stdout via `2>&1`,

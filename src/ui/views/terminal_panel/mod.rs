@@ -259,13 +259,22 @@ pub fn encode_mouse(mouse: crossterm::event::MouseEvent) -> Option<Vec<u8>> {
         MouseEventKind::ScrollRight => 67,
     };
 
-    if mouse.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+    if mouse
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::SHIFT)
+    {
         cb |= 4;
     }
-    if mouse.modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+    if mouse
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::ALT)
+    {
         cb |= 8;
     }
-    if mouse.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+    if mouse
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
         cb |= 16;
     }
 

@@ -155,12 +155,8 @@ pub fn spawn_terminal_with_fd(
         ));
     }
 
-    let mut reader = std::mem::ManuallyDrop::new(unsafe {
-        std::fs::File::from_raw_fd(reader_fd)
-    });
-    let mut writer = std::mem::ManuallyDrop::new(unsafe {
-        std::fs::File::from_raw_fd(writer_fd)
-    });
+    let mut reader = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(reader_fd) });
+    let mut writer = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(writer_fd) });
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
 

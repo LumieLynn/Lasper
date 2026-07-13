@@ -72,7 +72,11 @@ end
         return Ok(());
     }
 
-    let rc_file = if shell.ends_with("zsh") { ".zshrc" } else { ".bashrc" };
+    let rc_file = if shell.ends_with("zsh") {
+        ".zshrc"
+    } else {
+        ".bashrc"
+    };
     let rc_full_path = rootfs.join(format!("{}/{}", home_dir.trim_start_matches('/'), rc_file));
     let existing = io.read_to_string(&rc_full_path).await?.unwrap_or_default();
     if !existing.contains("source ~/.wayland-env") {

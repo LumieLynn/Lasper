@@ -31,3 +31,17 @@ By the way, setting the socket's name to `wayland-socket` allows you to run nest
 ## 5. Security & Bind Mounts
 Lasper just offers basic bind mounts settings. If you needs `:idmap` or other advanced settings, you need to configure it by yourself. Never do binds if you're uncertain about what you're doing.
 - **Warning**: Incorrectly mounting host directories without the "Read Only" flag can grant the container root user full write access to critical host files. Review your mounts carefully.
+
+## 6. Elevated Daemon Security Boundary
+
+`lasper -e` keeps the TUI unprivileged and starts a separate root daemon. The
+FD-passing socket is private to the user and accepts requests only when the
+kernel-reported PID/UID matches the launching TUI and the request contains the
+per-session token delivered through the daemon's stdin bootstrap pipe.
+
+This protects the root FD interface from independent local processes, including
+other processes running under the same UID. It does not protect against an
+attacker who can inspect or execute code inside the Lasper TUI process. The
+daemon also still exposes broad command and file-operation RPCs, so Elevated
+mode should be used only with a trusted Lasper binary and trusted plugins or
+terminal environment.

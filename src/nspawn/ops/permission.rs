@@ -18,7 +18,7 @@ use std::future::Future;
 pub enum PermissionLevel {
     /// Process is root — all operations work without sudo.
     Root,
-    /// Non-root with sudo wrapping for privileged commands (`-e` flag).
+    /// Non-root with privileged operations routed through a sudo daemon.
     Elevated,
     /// Non-root, no sudo — polkit handles authorization.
     User,

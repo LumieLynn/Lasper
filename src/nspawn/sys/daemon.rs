@@ -18,7 +18,10 @@
 //!
 //! Long-running commands (journalctl -f, machinectl login) are spawned by
 //! the daemon as root. The daemon passes the resulting fd back to the parent
-//! over a Unix domain socket using the [`sendfd`] crate.
+//! over a Unix domain socket using the [`sendfd`] crate. The socket is scoped
+//! to a private per-session directory, owned by the launching user, and each
+//! connection must match both the TUI's PID/UID via `SO_PEERCRED` and a random
+//! session token delivered through the private stdin bootstrap pipe.
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
@@ -27,11 +30,28 @@ use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
+
+const DAEMON_BOOTSTRAP_VERSION: u32 = 1;
+
+#[derive(Serialize, Deserialize)]
+struct DaemonBootstrap {
+    protocol_version: u32,
+    fd_auth_token: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct FdRequest {
+    method: String,
+    auth_token: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RpcRequest {
@@ -86,21 +106,15 @@ impl CommandRunner for DaemonCommandRunner {
 
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
         let cmd_id = self.daemon.reserve_spawn_id();
-        let stdout_fd = self
-            .daemon
-            .spawn_shell_cmd(cmd_id, program, &args)
-            .await?;
+        let stdout_fd = self.daemon.spawn_shell_cmd(cmd_id, program, &args).await?;
         let receiver = pipe_reader(stdout_fd)?;
-        Ok(SpawnedProcess::new(
-            Box::new(receiver),
-            {
-                let daemon = self.daemon.clone();
-                async move {
-                    let code = daemon.wait_command(cmd_id).await?;
-                    Ok(ExitStatus::from_raw(code))
-                }
-            },
-        ))
+        Ok(SpawnedProcess::new(Box::new(receiver), {
+            let daemon = self.daemon.clone();
+            async move {
+                let code = daemon.wait_command(cmd_id).await?;
+                Ok(ExitStatus::from_raw(code))
+            }
+        }))
     }
 }
 
@@ -120,15 +134,26 @@ enum HandleOutcome {
 
 // ── Parent-side handle ──
 
-#[derive(Debug)]
 pub struct ElevatedDaemon {
     request_tx: tokio::sync::mpsc::Sender<RpcCall>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     event_tx: tokio::sync::broadcast::Sender<()>,
     pid: u32,
-    fd_sock_path: String,
+    fd_sock_path: PathBuf,
+    fd_auth_token: Arc<str>,
+    _fd_sock_dir: Arc<tempfile::TempDir>,
     next_spawn_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     spawn_exit_codes: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u64, i32>>>,
+}
+
+impl std::fmt::Debug for ElevatedDaemon {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElevatedDaemon")
+            .field("pid", &self.pid)
+            .field("fd_sock_path", &self.fd_sock_path)
+            .field("fd_auth_token", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl Clone for ElevatedDaemon {
@@ -139,6 +164,8 @@ impl Clone for ElevatedDaemon {
             event_tx: self.event_tx.clone(),
             pid: self.pid,
             fd_sock_path: self.fd_sock_path.clone(),
+            fd_auth_token: self.fd_auth_token.clone(),
+            _fd_sock_dir: self._fd_sock_dir.clone(),
             next_spawn_id: self.next_spawn_id.clone(),
             spawn_exit_codes: self.spawn_exit_codes.clone(),
         }
@@ -151,23 +178,78 @@ impl PartialEq for ElevatedDaemon {
     }
 }
 
+fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::MetadataExt;
+
+    let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    let runtime_dir = xdg_runtime_dir
+        .filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir() && metadata.uid() == user_uid && metadata.mode() & 0o077 == 0
+            })
+        })
+        .or_else(|| {
+            let path = PathBuf::from(format!("/run/user/{}", user_uid));
+            std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == user_uid && metadata.mode() & 0o077 == 0
+                })
+                .then_some(path)
+        });
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("lasper-");
+    let directory = match runtime_dir {
+        Some(path) => builder.tempdir_in(path),
+        None => builder.tempdir(),
+    }?;
+    let metadata = std::fs::symlink_metadata(directory.path())?;
+    if metadata.uid() != user_uid || metadata.mode() & 0o777 != 0o700 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fd socket directory ownership or mode verification failed",
+        ));
+    }
+    Ok(directory)
+}
+
+fn configure_fd_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if metadata.uid() != user_uid {
+        std::os::unix::fs::chown(path, Some(user_uid), None)?;
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+
+    let secured = std::fs::symlink_metadata(path)?;
+    if secured.uid() != user_uid || secured.mode() & 0o777 != 0o600 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "fd socket ownership or mode verification failed",
+        ));
+    }
+    Ok(())
+}
+
 impl ElevatedDaemon {
     pub async fn spawn() -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let user_uid = uzers::get_current_uid();
-
-        let sock_token = uuid::Uuid::new_v4();
-        let sock_path = format!("/tmp/lasper-fd-{}.sock", sock_token);
+        let parent_pid = std::process::id();
+        let fd_auth_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
+        let fd_sock_dir = Arc::new(create_fd_socket_dir(user_uid)?);
+        let sock_path = fd_sock_dir.path().join("fd.sock");
 
         let mut child = tokio::process::Command::new("sudo")
             .arg(&exe)
-            .args([
-                "--daemon",
-                "--fd-sock",
-                &sock_path,
-                "--daemon-uid",
-                &user_uid.to_string(),
-            ])
+            .arg("--daemon")
+            .arg("--fd-sock")
+            .arg(&sock_path)
+            .arg("--daemon-uid")
+            .arg(user_uid.to_string())
+            .arg("--daemon-pid")
+            .arg(parent_pid.to_string())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
@@ -183,12 +265,34 @@ impl ElevatedDaemon {
 
         let io_pid = pid;
         let event_tx_io = event_tx.clone();
+        let bootstrap_token = fd_auth_token.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
             let mut stdin = tokio::io::BufWriter::new(child_stdin);
             let mut stdout = tokio::io::BufReader::new(child_stdout);
             let mut line_buf = String::new();
+
+            let bootstrap = DaemonBootstrap {
+                protocol_version: DAEMON_BOOTSTRAP_VERSION,
+                fd_auth_token: bootstrap_token.to_string(),
+            };
+            let mut bootstrap_line = match serde_json::to_vec(&bootstrap) {
+                Ok(line) => line,
+                Err(e) => {
+                    log::error!("Daemon I/O: failed to serialize bootstrap: {}", e);
+                    return;
+                }
+            };
+            bootstrap_line.push(b'\n');
+            if let Err(e) = stdin.write_all(&bootstrap_line).await {
+                log::error!("Daemon I/O: failed to write bootstrap: {}", e);
+                return;
+            }
+            if let Err(e) = stdin.flush().await {
+                log::error!("Daemon I/O: failed to flush bootstrap: {}", e);
+                return;
+            }
 
             let mut pending: std::collections::HashMap<
                 u64,
@@ -278,7 +382,10 @@ impl ElevatedDaemon {
                 }
             }
 
-            log::info!("[lasper] I/O task exiting, waiting for child pid={}...", io_pid);
+            log::info!(
+                "[lasper] I/O task exiting, waiting for child pid={}...",
+                io_pid
+            );
             let _ = child.wait().await;
             log::info!("[lasper] I/O task done (child reaped)");
         });
@@ -291,6 +398,8 @@ impl ElevatedDaemon {
             event_tx,
             pid,
             fd_sock_path: sock_path,
+            fd_auth_token,
+            _fd_sock_dir: fd_sock_dir,
             next_spawn_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             spawn_exit_codes: std::sync::Arc::new(parking_lot::Mutex::new(
                 std::collections::HashMap::new(),
@@ -348,9 +457,10 @@ impl ElevatedDaemon {
             )
         })?;
         if let Some(err) = response.error {
-            return Err(std::io::Error::other(
-                format!("daemon error (code={}): {}", err.code, err.message),
-            ));
+            return Err(std::io::Error::other(format!(
+                "daemon error (code={}): {}",
+                err.code, err.message
+            )));
         }
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }
@@ -364,6 +474,8 @@ impl ElevatedDaemon {
         log::info!("[lasper] daemon::exit() sending RPC...");
         // Send exit command and ignore response since daemon will exit immediately
         let _ = self.rpc_call("exit", serde_json::json!({})).await;
+        let _ = tokio::fs::remove_file(&self.fd_sock_path).await;
+        let _ = tokio::fs::remove_dir(self._fd_sock_dir.path()).await;
         log::info!("[lasper] daemon::exit() RPC returned");
     }
 
@@ -383,10 +495,7 @@ impl ElevatedDaemon {
         })
     }
 
-    pub async fn read_file(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<String> {
+    pub async fn read_file(&self, path: &std::path::Path) -> crate::nspawn::errors::Result<String> {
         let result = self
             .rpc_call(
                 "read_file",
@@ -395,7 +504,9 @@ impl ElevatedDaemon {
             .await
             .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
         let content = result["content"].as_str().ok_or_else(|| {
-            crate::nspawn::errors::NspawnError::Runtime("daemon read_file: missing content field".into())
+            crate::nspawn::errors::NspawnError::Runtime(
+                "daemon read_file: missing content field".into(),
+            )
         })?;
         Ok(content.to_string())
     }
@@ -457,16 +568,9 @@ impl ElevatedDaemon {
     // is unreliable when mixed with prior read/write ops on the same fd).
 
     pub async fn spawn_journalctl(&self, name: &str) -> std::io::Result<RawFd> {
-        use tokio::io::AsyncWriteExt;
-        let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
-        let req = format!(
-            "{{\"method\":\"spawn_journalctl\",\"params\":{{\"name\":\"{}\"}}}}\n",
-            name
-        );
-        sock.write_all(req.as_bytes()).await?;
-
-        let std_sock = sock.into_std()?;
-        std_sock.set_nonblocking(false)?;
+        let std_sock = self
+            .open_fd_channel("spawn_journalctl", serde_json::json!({"name": name}))
+            .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
@@ -485,16 +589,12 @@ impl ElevatedDaemon {
     }
 
     pub async fn spawn_login(&self, name: &str, cols: u16, rows: u16) -> std::io::Result<RawFd> {
-        use tokio::io::AsyncWriteExt;
-        let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
-        let req = format!(
-            "{{\"method\":\"spawn_login\",\"params\":{{\"name\":\"{}\",\"cols\":{},\"rows\":{}}}}}\n",
-            name, cols, rows
-        );
-        sock.write_all(req.as_bytes()).await?;
-
-        let std_sock = sock.into_std()?;
-        std_sock.set_nonblocking(false)?;
+        let std_sock = self
+            .open_fd_channel(
+                "spawn_login",
+                serde_json::json!({"name": name, "cols": cols, "rows": rows}),
+            )
+            .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
@@ -528,22 +628,16 @@ impl ElevatedDaemon {
         program: &str,
         args: &[String],
     ) -> std::io::Result<RawFd> {
-        use tokio::io::AsyncWriteExt;
-        let mut sock: tokio::net::UnixStream =
-            tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
-        let params = serde_json::json!({
-            "cmd_id": cmd_id,
-            "program": program,
-            "args": args,
-        });
-        let req = format!(
-            "{{\"method\":\"spawn_shell_cmd\",\"params\":{}}}\n",
-            serde_json::to_string(&params).unwrap()
-        );
-        sock.write_all(req.as_bytes()).await?;
-
-        let std_sock = sock.into_std()?;
-        std_sock.set_nonblocking(false)?;
+        let std_sock = self
+            .open_fd_channel(
+                "spawn_shell_cmd",
+                serde_json::json!({
+                    "cmd_id": cmd_id,
+                    "program": program,
+                    "args": args,
+                }),
+            )
+            .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 128];
             let mut fds = [0i32 as RawFd; 1];
@@ -552,19 +646,42 @@ impl ElevatedDaemon {
                 Ok(fds[0])
             } else {
                 let msg = String::from_utf8_lossy(&buf[..n]);
-                Err(std::io::Error::other(format!("daemon error: {}", msg.trim())))
+                Err(std::io::Error::other(format!(
+                    "daemon error: {}",
+                    msg.trim()
+                )))
             }
         })
         .await?
     }
 
+    async fn open_fd_channel(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> std::io::Result<std::os::unix::net::UnixStream> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
+        let request = FdRequest {
+            method: method.to_string(),
+            auth_token: self.fd_auth_token.to_string(),
+            params,
+        };
+        let mut request_line = serde_json::to_vec(&request)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        request_line.push(b'\n');
+        sock.write_all(&request_line).await?;
+
+        let std_sock = sock.into_std()?;
+        std_sock.set_nonblocking(false)?;
+        Ok(std_sock)
+    }
+
     /// Poll the daemon for the exit code of a spawned command.
     pub async fn wait_command(&self, cmd_id: u64) -> std::io::Result<i32> {
         let result = self
-            .rpc_call(
-                "wait_command",
-                serde_json::json!({"cmd_id": cmd_id}),
-            )
+            .rpc_call("wait_command", serde_json::json!({"cmd_id": cmd_id}))
             .await?;
         result["exit_code"]
             .as_i64()
@@ -577,11 +694,42 @@ impl ElevatedDaemon {
 
 // ── Daemon main loop (child side) ──
 
-pub async fn daemon_main(fd_sock_opt: Option<String>, user_uid: u32) -> ! {
+pub async fn daemon_main(
+    fd_sock_opt: Option<PathBuf>,
+    user_uid: u32,
+    expected_parent_pid: u32,
+) -> ! {
     use tokio::io::AsyncBufReadExt;
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
+
+    let bootstrap_line = match lines.next_line().await {
+        Ok(Some(line)) => line,
+        Ok(None) => {
+            eprintln!("lasper daemon: missing bootstrap message");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("lasper daemon: failed to read bootstrap: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let bootstrap: DaemonBootstrap = match serde_json::from_str(&bootstrap_line) {
+        Ok(bootstrap) => bootstrap,
+        Err(e) => {
+            eprintln!("lasper daemon: invalid bootstrap message: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if bootstrap.protocol_version != DAEMON_BOOTSTRAP_VERSION
+        || uuid::Uuid::parse_str(&bootstrap.fd_auth_token).is_err()
+        || expected_parent_pid == 0
+    {
+        eprintln!("lasper daemon: rejected bootstrap message");
+        std::process::exit(1);
+    }
+    let fd_auth_token: Arc<str> = Arc::from(bootstrap.fd_auth_token);
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
 
@@ -631,9 +779,13 @@ pub async fn daemon_main(fd_sock_opt: Option<String>, user_uid: u32) -> ! {
     }
 
     // ── FD-passing Unix socket ──
-    let sock_path =
-        fd_sock_opt.unwrap_or_else(|| format!("/tmp/lasper-fd-{}.sock", std::process::id()));
-    let _ = std::fs::remove_file(&sock_path);
+    let sock_path = match fd_sock_opt {
+        Some(path) => path,
+        None => {
+            log::error!("Daemon: missing fd socket path");
+            std::process::exit(1);
+        }
+    };
     let listener = match UnixListener::bind(&sock_path) {
         Ok(l) => l,
         Err(e) => {
@@ -641,21 +793,24 @@ pub async fn daemon_main(fd_sock_opt: Option<String>, user_uid: u32) -> ! {
             std::process::exit(1);
         }
     };
-    use std::os::unix::fs::PermissionsExt;
-    // Socket must be connectable by the unprivileged user (the TUI).
-    // Security is enforced by SO_PEERCRED verification in handle_fd_connection,
-    // not by filesystem permissions.
-    if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o666)) {
-        log::error!("Daemon: chmod failed: {}", e);
+    if let Err(e) = configure_fd_socket(&sock_path, user_uid) {
+        log::error!("Daemon: failed to secure fd socket: {}", e);
         std::process::exit(1);
     }
-    // Spawn accept loop.  Peer credential verification inside
-    // handle_fd_connection restricts access to the launching user.
+
+    let expected_peer = PeerCredentials {
+        pid: expected_parent_pid,
+        uid: user_uid,
+    };
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
-                    tokio::spawn(handle_fd_connection(stream, user_uid));
+                    tokio::spawn(handle_fd_connection(
+                        stream,
+                        expected_peer,
+                        fd_auth_token.clone(),
+                    ));
                 }
                 Err(e) => {
                     log::error!("Daemon fd listener: {}", e);
@@ -782,8 +937,12 @@ async fn handle_request(
                     .await
                     .map_err(|e| format!("read {}: {}", path_str, e));
                 let response = match result {
-                    Ok(content) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":content}}),
-                    Err(e) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}}),
+                    Ok(content) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":content}})
+                    }
+                    Err(e) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
+                    }
                 };
                 let line = serde_json::to_string(&response).unwrap();
                 let _ = out_tx.send(line).await;
@@ -1056,10 +1215,23 @@ where
 
 // ── Peer credential verification ──
 
-/// Returns the UID of the process on the other end of a Unix socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PeerCredentials {
+    pid: u32,
+    uid: u32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FdAuthorizationError {
+    UnexpectedUid { actual: u32, expected: u32 },
+    UnexpectedPid { actual: u32, expected: u32 },
+    InvalidToken,
+}
+
+/// Returns the PID and UID of the process on the other end of a Unix socket.
 /// Uses `SO_PEERCRED` — the kernel fills in the credentials, so they
 /// cannot be forged by the connecting process.
-fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+fn get_peer_credentials(stream: &UnixStream) -> std::io::Result<PeerCredentials> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     let mut ucred: libc::ucred = unsafe { std::mem::zeroed() };
@@ -1076,30 +1248,91 @@ fn get_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    Ok(ucred.uid)
+    let pid = u32::try_from(ucred.pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "peer reported an invalid PID",
+        )
+    })?;
+    Ok(PeerCredentials {
+        pid,
+        uid: ucred.uid,
+    })
+}
+
+fn authorize_fd_peer(
+    actual: PeerCredentials,
+    expected: PeerCredentials,
+) -> Result<(), FdAuthorizationError> {
+    if actual.uid != expected.uid {
+        return Err(FdAuthorizationError::UnexpectedUid {
+            actual: actual.uid,
+            expected: expected.uid,
+        });
+    }
+    if actual.pid != expected.pid {
+        return Err(FdAuthorizationError::UnexpectedPid {
+            actual: actual.pid,
+            expected: expected.pid,
+        });
+    }
+    Ok(())
+}
+
+fn authorize_fd_token(actual: &str, expected: &str) -> Result<(), FdAuthorizationError> {
+    if actual.len() != expected.len() {
+        return Err(FdAuthorizationError::InvalidToken);
+    }
+
+    let difference = actual
+        .as_bytes()
+        .iter()
+        .zip(expected.as_bytes())
+        .fold(0u8, |difference, (actual, expected)| {
+            difference | (actual ^ expected)
+        });
+    if difference == 0 {
+        Ok(())
+    } else {
+        Err(FdAuthorizationError::InvalidToken)
+    }
 }
 
 // ── Daemon side fd-passing handler ──
 
-async fn handle_fd_connection(stream: UnixStream, expected_uid: u32) {
+async fn handle_fd_connection(
+    stream: UnixStream,
+    expected_peer: PeerCredentials,
+    expected_auth_token: Arc<str>,
+) {
     use tokio::io::AsyncBufReadExt;
 
-    // Verify the connecting process belongs to the user who launched Lasper.
-    // SO_PEERCRED is filled by the kernel and cannot be forged by the sender.
-    match get_peer_uid(&stream) {
-        Ok(uid) if uid == 0 || uid == expected_uid => {} // root or expected user
-        Ok(uid) => {
-            log::warn!(
-                "Daemon fd-handler: rejected connection from uid {} (expected {})",
-                uid,
-                expected_uid
-            );
-            return;
-        }
+    let actual_peer = match get_peer_credentials(&stream) {
+        Ok(credentials) => credentials,
         Err(e) => {
             log::warn!("Daemon fd-handler: SO_PEERCRED failed: {}", e);
             return;
         }
+    };
+    if let Err(e) = authorize_fd_peer(actual_peer, expected_peer) {
+        match e {
+            FdAuthorizationError::UnexpectedUid { actual, expected } => {
+                log::warn!(
+                    "Daemon fd-handler: rejected uid {} (expected {})",
+                    actual,
+                    expected
+                );
+            }
+            FdAuthorizationError::UnexpectedPid { actual, expected } => {
+                log::warn!(
+                    "Daemon fd-handler: rejected pid {} (expected {})",
+                    actual,
+                    expected
+                );
+            }
+            FdAuthorizationError::InvalidToken => unreachable!(),
+        }
+        return;
     }
 
     let mut buf_reader = tokio::io::BufReader::new(stream);
@@ -1109,16 +1342,23 @@ async fn handle_fd_connection(stream: UnixStream, expected_uid: u32) {
         return;
     }
 
-    let request: serde_json::Value = match serde_json::from_str(line.trim()) {
+    let request: FdRequest = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(e) => {
             log::warn!("Daemon fd-handler: parse error: {}", e);
             return;
         }
     };
+    if authorize_fd_token(&request.auth_token, &expected_auth_token).is_err() {
+        log::warn!(
+            "Daemon fd-handler: rejected unauthenticated request from pid {}",
+            actual_peer.pid
+        );
+        return;
+    }
 
     let stream = buf_reader.into_inner();
-    let method = request["method"].as_str().unwrap_or("");
+    let method = request.method.as_str();
 
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
@@ -1136,7 +1376,7 @@ async fn handle_fd_connection(stream: UnixStream, expected_uid: u32) {
 
     match method {
         "spawn_journalctl" => {
-            let name = request["params"]["name"].as_str().unwrap_or("");
+            let name = request.params["name"].as_str().unwrap_or("");
             match crate::nspawn::sys::new_sync_command("journalctl")
                 .args([
                     "-M",
@@ -1169,9 +1409,9 @@ async fn handle_fd_connection(stream: UnixStream, expected_uid: u32) {
         }
 
         "spawn_login" => {
-            let name = request["params"]["name"].as_str().unwrap_or("");
-            let cols: u16 = request["params"]["cols"].as_u64().unwrap_or(80) as u16;
-            let rows: u16 = request["params"]["rows"].as_u64().unwrap_or(24) as u16;
+            let name = request.params["name"].as_str().unwrap_or("");
+            let cols: u16 = request.params["cols"].as_u64().unwrap_or(80) as u16;
+            let rows: u16 = request.params["rows"].as_u64().unwrap_or(24) as u16;
 
             use portable_pty::{native_pty_system, CommandBuilder, PtySize};
             let pty_system = native_pty_system();
@@ -1210,12 +1450,9 @@ async fn handle_fd_connection(stream: UnixStream, expected_uid: u32) {
         }
 
         "spawn_shell_cmd" => {
-            let cmd_id = request["params"]["cmd_id"].as_u64().unwrap_or(0);
-            let program = request["params"]["program"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
-            let args: Vec<String> = request["params"]["args"]
+            let cmd_id = request.params["cmd_id"].as_u64().unwrap_or(0);
+            let program = request.params["program"].as_str().unwrap_or("").to_string();
+            let args: Vec<String> = request.params["args"]
                 .as_array()
                 .map(|a| {
                     a.iter()
@@ -1347,6 +1584,8 @@ async fn write_locked_impl(path_str: &str, content: &str) -> Result<(), String> 
 mod tests {
     use super::*;
 
+    const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
+
     #[test]
     fn test_command_result_serde() {
         let cr = CommandResult {
@@ -1359,5 +1598,90 @@ mod tests {
         assert_eq!(json["stdout"], "hello");
         let parsed: CommandResult = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.status, 0);
+    }
+
+    #[test]
+    fn fd_peer_rejects_another_process_with_same_uid() {
+        let expected = PeerCredentials {
+            pid: 1000,
+            uid: 1000,
+        };
+        let actual = PeerCredentials {
+            pid: 1001,
+            uid: 1000,
+        };
+
+        assert_eq!(
+            authorize_fd_peer(actual, expected),
+            Err(FdAuthorizationError::UnexpectedPid {
+                actual: 1001,
+                expected: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn fd_peer_rejects_unexpected_uid() {
+        let expected = PeerCredentials {
+            pid: 1000,
+            uid: 1000,
+        };
+        let actual = PeerCredentials {
+            pid: 1000,
+            uid: 1001,
+        };
+
+        assert_eq!(
+            authorize_fd_peer(actual, expected),
+            Err(FdAuthorizationError::UnexpectedUid {
+                actual: 1001,
+                expected: 1000,
+            })
+        );
+    }
+
+    #[test]
+    fn fd_token_requires_exact_session_secret() {
+        assert_eq!(authorize_fd_token(TEST_TOKEN, TEST_TOKEN), Ok(()));
+        assert_eq!(
+            authorize_fd_token("f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce1", TEST_TOKEN),
+            Err(FdAuthorizationError::InvalidToken)
+        );
+        assert_eq!(
+            authorize_fd_token("short", TEST_TOKEN),
+            Err(FdAuthorizationError::InvalidToken)
+        );
+    }
+
+    #[test]
+    fn fd_request_without_authentication_is_rejected_by_parser() {
+        let request = r#"{"method":"spawn_shell_cmd","params":{"program":"id","args":[]}}"#;
+        assert!(serde_json::from_str::<FdRequest>(request).is_err());
+    }
+
+    #[tokio::test]
+    async fn peer_credentials_identify_the_connecting_process() {
+        let (client, _server) = UnixStream::pair().unwrap();
+        let credentials = get_peer_credentials(&client).unwrap();
+
+        assert_eq!(credentials.pid, std::process::id());
+        assert_eq!(credentials.uid, uzers::get_current_uid());
+        assert_eq!(authorize_fd_peer(credentials, credentials), Ok(()));
+    }
+
+    #[test]
+    fn fd_socket_is_user_owned_and_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("fd.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let uid = uzers::get_current_uid();
+
+        configure_fd_socket(&socket_path, uid).unwrap();
+
+        let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
     }
 }

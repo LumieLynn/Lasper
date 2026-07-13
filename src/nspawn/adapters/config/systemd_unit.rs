@@ -52,7 +52,12 @@ pub async fn write_systemd_override(
         name
     ));
     let path = dir.join("override.conf");
-    let content = systemd_override_content(device_binds, nvidia_gpu, graphics_acceleration, wayland_socket);
+    let content = systemd_override_content(
+        device_binds,
+        nvidia_gpu,
+        graphics_acceleration,
+        wayland_socket,
+    );
     io.write(&path, &content).await
 }
 

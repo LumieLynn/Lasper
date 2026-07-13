@@ -61,19 +61,31 @@ fn print_help() {
     println!(
         "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
          USAGE:\n    lasper [FLAGS]\n\n\
-         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use sudo for privileged CLI commands\n    -c, --cli-mode   Force CLI-only mode (skip DBus)\n\n\
-         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use sudo for privileged CLI commands.\n    [settings] cli-mode = true         Force CLI-only mode.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
+         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use an isolated sudo daemon for privileged operations\n    -c, --cli-mode   Force CLI-only mode (skip DBus)\n\n\
+         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use the isolated sudo daemon.\n    [settings] cli-mode = true         Force CLI-only mode.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
         env!("CARGO_PKG_VERSION")
     );
 }
 
+struct CliOptions {
+    want_elevation: bool,
+    want_cli_mode: bool,
+    is_daemon: bool,
+    fd_sock: Option<PathBuf>,
+    daemon_uid: u32,
+    daemon_pid: u32,
+}
+
 /// Result of CLI flag parsing: either proceed with these options, or exit now.
-fn parse_flags() -> std::result::Result<(bool, bool, bool, Option<String>, u32), i32> {
-    let mut want_elevation = false;
-    let mut want_cli_mode = false;
-    let mut is_daemon = false;
-    let mut fd_sock: Option<String> = None;
-    let mut daemon_uid: u32 = 0;
+fn parse_flags() -> std::result::Result<CliOptions, i32> {
+    let mut options = CliOptions {
+        want_elevation: false,
+        want_cli_mode: false,
+        is_daemon: false,
+        fd_sock: None,
+        daemon_uid: 0,
+        daemon_pid: 0,
+    };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -86,16 +98,16 @@ fn parse_flags() -> std::result::Result<(bool, bool, bool, Option<String>, u32),
                 print_help();
                 return Err(0);
             }
-            "--elevate" | "-e" => want_elevation = true,
-            "--cli-mode" | "-c" => want_cli_mode = true,
-            "--daemon" => is_daemon = true,
+            "--elevate" | "-e" => options.want_elevation = true,
+            "--cli-mode" | "-c" => options.want_cli_mode = true,
+            "--daemon" => options.is_daemon = true,
             "--fd-sock" => {
                 i += 1;
                 if i >= args.len() {
                     eprintln!("lasper: --fd-sock requires a path argument");
                     return Err(1);
                 }
-                fd_sock = Some(args[i].clone());
+                options.fd_sock = Some(PathBuf::from(&args[i]));
             }
             "--daemon-uid" => {
                 i += 1;
@@ -103,10 +115,24 @@ fn parse_flags() -> std::result::Result<(bool, bool, bool, Option<String>, u32),
                     eprintln!("lasper: --daemon-uid requires a uid argument");
                     return Err(1);
                 }
-                daemon_uid = match args[i].parse::<u32>() {
+                options.daemon_uid = match args[i].parse::<u32>() {
                     Ok(uid) => uid,
                     Err(_) => {
                         eprintln!("lasper: --daemon-uid must be a positive integer");
+                        return Err(1);
+                    }
+                };
+            }
+            "--daemon-pid" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --daemon-pid requires a pid argument");
+                    return Err(1);
+                }
+                options.daemon_pid = match args[i].parse::<u32>() {
+                    Ok(pid) if pid > 0 => pid,
+                    _ => {
+                        eprintln!("lasper: --daemon-pid must be a positive integer");
                         return Err(1);
                     }
                 };
@@ -118,21 +144,28 @@ fn parse_flags() -> std::result::Result<(bool, bool, bool, Option<String>, u32),
         }
         i += 1;
     }
-    Ok((want_elevation, want_cli_mode, is_daemon, fd_sock, daemon_uid))
+    Ok(options)
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     // 1. Parse CLI flags — all early exits happen here, before terminal
     //    takeover, so raw-mode / alternate-screen restoration is never needed.
-    let (want_elevation, mut want_cli_mode, is_daemon, fd_sock, daemon_uid) = match parse_flags() {
-        Ok(opts) => opts,
+    let options = match parse_flags() {
+        Ok(options) => options,
         Err(code) => std::process::exit(code),
     };
+    let want_elevation = options.want_elevation;
+    let mut want_cli_mode = options.want_cli_mode;
 
     // 1b. Internal daemon mode — run as root child process, exit early.
-    if is_daemon {
-        crate::nspawn::sys::daemon::daemon_main(fd_sock, daemon_uid).await;
+    if options.is_daemon {
+        crate::nspawn::sys::daemon::daemon_main(
+            options.fd_sock,
+            options.daemon_uid,
+            options.daemon_pid,
+        )
+        .await;
     }
 
     // 2. Load config for settings (elevation, cli_mode, log_buffer_lines)
@@ -144,7 +177,7 @@ async fn main() -> Result<()> {
     }
 
     // 3. Permission manager — no full-process elevation.
-    //    `-e` / `elevate = true` means sudo wraps privileged CLI commands.
+    //    `-e` / `elevate = true` routes privileged work through a sudo daemon.
     let use_sudo = crate::nspawn::ops::DefaultPermissionManager::wants_elevation(
         want_elevation,
         &app_settings,
@@ -170,9 +203,10 @@ async fn main() -> Result<()> {
         };
 
     // 3c. Build execution context — one-time routing for commands and file I/O.
-    let exec_ctx = std::sync::Arc::new(
-        crate::nspawn::sys::ExecutionContext::new(pm.level(), daemon),
-    );
+    let exec_ctx = std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
+        pm.level(),
+        daemon,
+    ));
 
     // 4. Setup logging — always owned by the current user.
     let log_dir = get_log_dir();

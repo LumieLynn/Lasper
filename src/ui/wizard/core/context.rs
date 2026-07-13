@@ -443,7 +443,8 @@ impl WizardContext {
         io: crate::nspawn::sys::ElevatedIo,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        self.builder().get_deployer_and_storage(provision, io, cmd_runner)
+        self.builder()
+            .get_deployer_and_storage(provision, io, cmd_runner)
     }
 
     pub fn update_hardware_data(

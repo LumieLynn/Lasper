@@ -78,7 +78,11 @@ impl App {
 
         // Click-to-focus on button press.
         if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
-            let n = if self.data.terminal.is_showing() { 3 } else { 2 };
+            let n = if self.data.terminal.is_showing() {
+                3
+            } else {
+                2
+            };
             if panel_idx < n
                 && !(self.data.terminal.maximized
                     && self.data.terminal.is_showing()

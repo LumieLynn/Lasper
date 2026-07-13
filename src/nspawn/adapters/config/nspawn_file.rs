@@ -398,11 +398,15 @@ pub async fn clone_nspawn_config(
 ) -> Result<()> {
     validate_machine_name(source_name)?;
     validate_machine_name(dest_name)?;
-    let content = match io.read_to_string(&NspawnConfig::default_path(source_name)).await? {
+    let content = match io
+        .read_to_string(&NspawnConfig::default_path(source_name))
+        .await?
+    {
         Some(c) => c,
         None => return Ok(()),
     };
-    io.write(&NspawnConfig::default_path(dest_name), &content).await
+    io.write(&NspawnConfig::default_path(dest_name), &content)
+        .await
 }
 
 #[cfg(test)]

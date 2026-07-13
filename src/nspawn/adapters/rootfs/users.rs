@@ -70,16 +70,18 @@ pub async fn create_user_in_container(
                 #[cfg(unix)]
                 {
                     // best-effort chmod via systemd-nspawn
-                    let _ = cmd_runner.run(
-                        "systemd-nspawn",
-                        vec![
-                            "-D".into(),
-                            rootfs_s.clone(),
-                            "chmod".into(),
-                            "440".into(),
-                            format!("/etc/sudoers.d/{}", group),
-                        ],
-                    ).await;
+                    let _ = cmd_runner
+                        .run(
+                            "systemd-nspawn",
+                            vec![
+                                "-D".into(),
+                                rootfs_s.clone(),
+                                "chmod".into(),
+                                "440".into(),
+                                format!("/etc/sudoers.d/{}", group),
+                            ],
+                        )
+                        .await;
                 }
                 break;
             }

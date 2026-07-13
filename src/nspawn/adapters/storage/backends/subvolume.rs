@@ -27,15 +27,17 @@ impl SubvolumeBackend {
         }
     }
 
-    async fn get_zfs_dataset(
-        &self,
-        path: &Path,
-        cmd_runner: &dyn CommandRunner,
-    ) -> Result<String> {
+    async fn get_zfs_dataset(&self, path: &Path, cmd_runner: &dyn CommandRunner) -> Result<String> {
         let out = cmd_runner
             .run(
                 "zfs",
-                vec!["list".into(), "-H".into(), "-o".into(), "name".into(), path.to_string_lossy().to_string()],
+                vec![
+                    "list".into(),
+                    "-H".into(),
+                    "-o".into(),
+                    "name".into(),
+                    path.to_string_lossy().to_string(),
+                ],
             )
             .await
             .map_err(|e| NspawnError::Io(PathBuf::from("zfs"), e))?;
@@ -152,7 +154,8 @@ impl StorageBackend for SubvolumeBackend {
                 log_output("btrfs", &out);
                 if !out.status.success() {
                     let err = String::from_utf8_lossy(&out.stderr);
-                    if err.contains("no such file or directory") || err.contains("not a subvolume") {
+                    if err.contains("no such file or directory") || err.contains("not a subvolume")
+                    {
                         log::warn!("Btrfs subvolume already missing: {}", path.display());
                     } else {
                         return Err(NspawnError::cmd_failed(

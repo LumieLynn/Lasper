@@ -78,9 +78,10 @@ impl DbusBackend {
         B: serde::Serialize + zvariant::DynamicType,
         R: serde::de::DeserializeOwned + zvariant::Type,
     {
-        let conn = self.connection().await.ok_or_else(|| {
-            NspawnError::Dbus(zbus::Error::Failure("No connection".into()))
-        })?;
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let proxy = zbus::proxy::Proxy::new(
             &conn,
             "org.freedesktop.systemd1",
@@ -240,11 +241,8 @@ impl ContainerBackend for DbusBackend {
     async fn disable(&self, name: &str) -> Result<()> {
         let unit = format!("systemd-nspawn@{}.service", name);
         let files: Vec<&str> = vec![&unit];
-        self.call_systemd1::<_, Vec<(String, String, String)>>(
-            "DisableUnitFiles",
-            &(files, false),
-        )
-        .await
+        self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
+            .await
     }
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {

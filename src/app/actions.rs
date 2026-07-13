@@ -73,11 +73,8 @@ impl App {
 
                 if entry.state.is_running() {
                     if !self.data.log_manager.stream_is_active(&entry.name) {
-                        if let Some((tx, fatal)) =
-                            self.data.log_manager.start_stream(&entry.name)
-                        {
-                            let handle =
-                                self.data.manager.spawn_log_stream(&entry.name, tx, fatal);
+                        if let Some((tx, fatal)) = self.data.log_manager.start_stream(&entry.name) {
+                            let handle = self.data.manager.spawn_log_stream(&entry.name, tx, fatal);
                             self.data
                                 .log_manager
                                 .attach_stream_handle(&entry.name, handle);

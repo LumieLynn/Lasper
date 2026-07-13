@@ -142,7 +142,11 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui.panel_layout.detail = detail_area;
 
     let terminal_area = if app.data.terminal.is_showing() {
-        let ta = if maximized { right_chunks[0] } else { right_chunks[1] };
+        let ta = if maximized {
+            right_chunks[0]
+        } else {
+            right_chunks[1]
+        };
         app.ui.panel_layout.terminal = Some(ta);
         Some(ta)
     } else {
@@ -155,7 +159,13 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     if let Some(terminal_area) = terminal_area {
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
-        terminal_panel.render(f, terminal_area, &mut app.data.terminal, terminal_focused, resize_mode);
+        terminal_panel.render(
+            f,
+            terminal_area,
+            &mut app.data.terminal,
+            terminal_focused,
+            resize_mode,
+        );
     }
 
     app.ui.container_list.render_with_data(

@@ -197,10 +197,7 @@ impl NspawnManager for DefaultManager {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
-                    log::warn!(
-                        "DBus list_all failed ({}), falling back to CLI",
-                        reason
-                    );
+                    log::warn!("DBus list_all failed ({}), falling back to CLI", reason);
                     self.mark_fallback(&reason);
                 }
             }
@@ -249,10 +246,7 @@ impl NspawnManager for DefaultManager {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
-                    log::warn!(
-                        "DBus remove failed ({}), falling back to CLI",
-                        reason
-                    );
+                    log::warn!("DBus remove failed ({}), falling back to CLI", reason);
                     self.mark_fallback(&reason);
                     self.cli.remove(name).await.map_err(|e| {
                         log::error!("CLI remove failed for {}: {}", name, e);
@@ -266,6 +260,8 @@ impl NspawnManager for DefaultManager {
                 e
             })
         };
+
+        result?;
 
         // systemd may or may not clean these up — an extra unlink is harmless
         let io = self.elevated_io();
@@ -282,10 +278,8 @@ impl NspawnManager for DefaultManager {
             .await;
         let _ = io.remove_file(&crate::paths::state_file(name)).await;
 
-        if result.is_ok() {
-            self.nudge();
-        }
-        result
+        self.nudge();
+        Ok(())
     }
 
     fn spawn_log_stream(
@@ -354,14 +348,8 @@ impl NspawnManager for DefaultManager {
                 }
             };
 
-            let stdout = child
-                .stdout
-                .take()
-                .expect("journalctl stdout piped");
-            let mut stderr_pipe = child
-                .stderr
-                .take()
-                .expect("journalctl stderr piped");
+            let stdout = child.stdout.take().expect("journalctl stdout piped");
+            let mut stderr_pipe = child.stderr.take().expect("journalctl stderr piped");
             let mut lines = tokio::io::BufReader::new(stdout).lines();
 
             let stream_result: std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> =
@@ -389,10 +377,8 @@ impl NspawnManager for DefaultManager {
                     if let Ok(n) = stderr_pipe.read_to_end(&mut buf).await {
                         if n > 0 {
                             fatal.store(true, Ordering::Relaxed);
-                            let _ = tx.send(format!(
-                                "Log stream: {}",
-                                String::from_utf8_lossy(&buf)
-                            ));
+                            let _ =
+                                tx.send(format!("Log stream: {}", String::from_utf8_lossy(&buf)));
                         }
                     }
                     Ok(())
@@ -606,9 +592,7 @@ impl NspawnManager for DefaultManager {
 ///
 /// Uses the checked [`Receiver::from_owned_fd`] which verifies the fd is a
 /// pipe, is readable, and sets O_NONBLOCK.
-fn pipe_reader(
-    fd: std::os::unix::io::RawFd,
-) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+fn pipe_reader(fd: std::os::unix::io::RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::FromRawFd;
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };

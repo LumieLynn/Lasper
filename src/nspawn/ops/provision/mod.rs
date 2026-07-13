@@ -363,10 +363,12 @@ async fn run_deploy_internal(
     // 1. Unmount systemd-dissect if it was used
     if let Some(mnt) = dissect_mount_dir {
         push_log!("Unmounting raw image...".to_string());
-        let _ = cli_runner.run(
-            "systemd-dissect",
-            vec!["--umount".into(), mnt.to_str().unwrap().into()],
-        ).await;
+        let _ = cli_runner
+            .run(
+                "systemd-dissect",
+                vec!["--umount".into(), mnt.to_str().unwrap().into()],
+            )
+            .await;
         // _dissect_guard will automatically clean up the directory when it drops
     }
 
@@ -390,10 +392,9 @@ async fn run_deploy_internal(
 
         if is_ext {
             // Cleanup systemd-managed storage (downloaded/imported junk)
-            let _ = cli_runner.run(
-                "machinectl",
-                vec!["remove".into(), name.clone()],
-            ).await;
+            let _ = cli_runner
+                .run("machinectl", vec!["remove".into(), name.clone()])
+                .await;
         } else {
             // Cleanup Lasper-managed storage
             let _ = storage.delete(&name, cli_runner.as_ref(), &io).await;
