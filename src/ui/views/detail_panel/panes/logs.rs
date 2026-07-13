@@ -1,59 +1,66 @@
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
 };
 
 use super::super::core::utils::empty_block;
+use super::super::DetailPanel;
 use crate::app::AppData;
+use crate::ui::theme;
 
-pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
+pub fn render(f: &mut Frame, data: &AppData, panel: &DetailPanel, area: Rect) {
     if data.entries.is_empty() {
         f.render_widget(empty_block(" Logs "), area);
         return;
     }
 
-    if data.log_lines.is_empty() {
+    let buffer = match data.log_manager.active_buffer() {
+        Some(b) => b,
+        None => {
+            f.render_widget(
+                Paragraph::new(vec![Line::from(Span::styled(
+                    "No log output.",
+                    Style::default().fg(theme::theme().text_secondary),
+                ))]),
+                area,
+            );
+            return;
+        }
+    };
+
+    if buffer.lines.is_empty() {
         f.render_widget(
             Paragraph::new(vec![Line::from(Span::styled(
                 "No log output.",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme::theme().text_secondary),
             ))]),
             area,
         );
         return;
     }
 
-    // Binary search to find the first logical line that is visible at the current scroll
-    let scroll_y = scroll as usize;
-    let first_line_idx = match data.log_offset_index.binary_search(&scroll_y) {
+    let scroll_y = panel.log_scroll as usize;
+    let cache = &panel.log_cache;
+
+    let first_line_idx = match cache.offset_index.binary_search(&scroll_y) {
         Ok(idx) => idx,
         Err(idx) => idx.saturating_sub(1),
     };
 
-    // Calculate how many visual lines into the first visible logical line we are
-    let first_line_start_y = data
-        .log_offset_index
-        .get(first_line_idx)
-        .copied()
-        .unwrap_or(0);
+    let first_line_start_y = cache.offset_index.get(first_line_idx).copied().unwrap_or(0);
     let skip_visual_lines = scroll_y.saturating_sub(first_line_start_y);
 
-    // Collect only enough lines to fill the viewport plus a small buffer
-    let mut visible_lines = Vec::new();
-
-    // Collect all remaining lines from the start index to ensure the bottom is never cut off
-    for i in first_line_idx..data.log_lines.len() {
-        let line = &data.log_lines[i];
-        visible_lines.push(line.clone());
-
-        // Use a loose limit for performance, but 500 lines is safe
-        if visible_lines.len() > 500 {
-            break;
-        }
-    }
+    // Convert String lines to ratatui Lines for rendering
+    let visible_lines: Vec<Line> = buffer
+        .lines
+        .iter()
+        .skip(first_line_idx)
+        .take(500)
+        .map(|s| Line::from(Span::raw(s.clone())))
+        .collect();
 
     f.render_widget(
         Paragraph::new(visible_lines)

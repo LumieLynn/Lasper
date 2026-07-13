@@ -2,6 +2,7 @@ use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::wizard::context::{BasicConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -70,6 +71,7 @@ impl Component for BasicStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
+            .margin(1)
             .constraints([Constraint::Length(3), Constraint::Length(3)])
             .split(area);
 
@@ -82,12 +84,7 @@ impl Component for BasicStepView {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.name.set_focus(false);
-            self.hostname.set_focus(false);
-        }
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn validate(&mut self) -> Result<(), String> {

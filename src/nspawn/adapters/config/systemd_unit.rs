@@ -1,5 +1,4 @@
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::CommandLogged;
+use crate::nspawn::errors::Result;
 use ini::Ini;
 use std::path::PathBuf;
 
@@ -42,6 +41,7 @@ pub async fn write_systemd_override(
     nvidia_gpu: bool,
     graphics_acceleration: bool,
     wayland_socket: bool,
+    io: &crate::nspawn::sys::ElevatedIo,
 ) -> Result<()> {
     if device_binds.is_empty() && !nvidia_gpu && !wayland_socket && !graphics_acceleration {
         return Ok(());
@@ -52,65 +52,34 @@ pub async fn write_systemd_override(
         name
     ));
     let path = dir.join("override.conf");
-
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&path, |_existing| {
-        let content = systemd_override_content(
-            device_binds,
-            nvidia_gpu,
-            graphics_acceleration,
-            wayland_socket,
-        );
-        Ok(content)
-    })
-    .await?;
-
-    let out = crate::nspawn::sys::new_command("systemctl")
-        .arg("daemon-reload")
-        .logged_output("systemctl")
-        .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemctl"), e))?;
-
-    if !out.status.success() {
-        log::warn!(
-            "systemctl daemon-reload failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    Ok(())
+    let content = systemd_override_content(
+        device_binds,
+        nvidia_gpu,
+        graphics_acceleration,
+        wayland_socket,
+    );
+    io.write(&path, &content).await
 }
 
 /// Clones a systemd service override from one container to another.
-pub async fn clone_systemd_override(source_name: &str, dest_name: &str) -> Result<()> {
-    let source_path = format!(
+pub async fn clone_systemd_override(
+    source_name: &str,
+    dest_name: &str,
+    io: &crate::nspawn::sys::ElevatedIo,
+) -> Result<()> {
+    let source_path = PathBuf::from(format!(
         "/etc/systemd/system/systemd-nspawn@{}.service.d/override.conf",
         source_name
-    );
-
-    if !tokio::fs::try_exists(&source_path).await.unwrap_or(false) {
-        return Ok(());
-    }
-
+    ));
+    let content = match io.read_to_string(&source_path).await? {
+        Some(c) => c,
+        None => return Ok(()),
+    };
     let dest_path = PathBuf::from(format!(
         "/etc/systemd/system/systemd-nspawn@{}.service.d/override.conf",
         dest_name
     ));
-
-    let source_content = tokio::fs::read_to_string(&source_path)
-        .await
-        .map_err(|e| NspawnError::Io(PathBuf::from(&source_path), e))?;
-
-    crate::nspawn::sys::io::AsyncLockedWriter::write_locked(&dest_path, |_| {
-        Ok(source_content.clone())
-    })
-    .await?;
-
-    let _ = crate::nspawn::sys::new_command("systemctl")
-        .arg("daemon-reload")
-        .logged_output("systemctl")
-        .await;
-
-    Ok(())
+    io.write(&dest_path, &content).await
 }
 
 #[cfg(test)]

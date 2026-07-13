@@ -7,10 +7,11 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{NetworkConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     widgets::Paragraph,
     Frame,
 };
@@ -242,7 +243,8 @@ impl Component for NetworkStepView {
         };
         if !hint.is_empty() {
             f.render_widget(
-                Paragraph::new(hint).style(Style::default().fg(Color::Yellow)),
+                Paragraph::new(hint)
+                    .style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
                 chunks[2],
             );
         }
@@ -285,25 +287,7 @@ impl Component for NetworkStepView {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.mode_selector.set_focus(false);
-            self.bridge_list.set_focus(false);
-            self.custom_bridge.set_focus(false);
-            self.interface_list.set_focus(false);
-            self.custom_interface.set_focus(false);
-            self.port_list.set_focus(false);
-        }
-    }
-
-    fn is_focused(&self) -> bool {
-        self.mode_selector.is_focused()
-            || self.bridge_list.is_focused()
-            || self.custom_bridge.is_focused()
-            || self.interface_list.is_focused()
-            || self.custom_interface.is_focused()
-            || self.port_list.is_focused()
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn validate(&mut self) -> Result<(), String> {

@@ -1,14 +1,14 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 
 use crate::app::App;
-use crate::ui::StatusLevel;
-use crate::ui::{centered_rect, core::Component};
+use crate::ui::core::Component;
+use crate::ui::theme;
 
 pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
@@ -36,7 +36,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
         }
     }
     if app.ui.show_help {
-        render_help(f);
+        crate::ui::widgets::help::HelpOverlay::new().render(f, area);
     }
     if let Some(dialog) = &mut app.ui.quit_dialog {
         dialog.render(f, area);
@@ -52,42 +52,45 @@ pub fn render(f: &mut Frame, app: &mut App) {
 // Title
 
 fn render_title(f: &mut Frame, app: &App, area: Rect) {
-    let badge = if app.is_root {
-        Span::styled(
-            " [ ⚡ ROOT ] ",
+    let t = theme::theme();
+    let badge = match app.permissions.level() {
+        crate::nspawn::ops::PermissionLevel::Root => Span::styled(
+            " [ ROOT ] ",
             Style::default()
-                .fg(Color::Green)
+                .fg(t.badge_root)
                 .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            " [ ⚠  READ-ONLY — run with sudo for full control ] ",
-            Style::default().fg(Color::Yellow),
-        )
+        ),
+        crate::nspawn::ops::PermissionLevel::Elevated => Span::styled(
+            " [ SUDO ] ",
+            Style::default()
+                .fg(t.badge_cli)
+                .add_modifier(Modifier::BOLD),
+        ),
+        crate::nspawn::ops::PermissionLevel::User => {
+            Span::styled(" [ USER ] ", Style::default().fg(t.badge_readonly))
+        }
     };
 
     let mut spans = vec![
         Span::styled(
             " Lasper ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
         ),
         badge,
     ];
 
     if !app.data.dbus_active {
         spans.push(Span::styled(
-            " [ ⚡ CMD-MODE ] ",
+            " [ ⚡ CLI ] ",
             Style::default()
-                .fg(Color::Rgb(255, 140, 0))
+                .fg(t.badge_cli)
                 .add_modifier(Modifier::BOLD),
         ));
     }
 
     spans.push(Span::styled(
         format!("  {} container(s)", app.data.entries.len()),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(t.text_secondary),
     ));
 
     let line = Line::from(spans);
@@ -97,9 +100,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 // Content
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
-    let list_focused = app.ui.active_panel == crate::app::ActivePanel::ContainerList;
-    let detail_focused = app.ui.active_panel == crate::app::ActivePanel::DetailPanel;
-    let terminal_focused = app.ui.active_panel == crate::app::ActivePanel::TerminalPanel;
+    let list_focused = app.ui.focus.active_idx == 0;
+    let detail_focused = app.ui.focus.active_idx == 1;
+    let terminal_focused = app.ui.focus.active_idx == 2;
     let resize_mode = app.ui.resize_mode == crate::app::ResizeMode::Active;
 
     app.ui.detail_panel.set_focus(detail_focused);
@@ -134,22 +137,32 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     let detail_area = right_chunks[0];
 
-    app.ui.pane_height = list_area.height.saturating_sub(2);
-    app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
+    // Store panel rects for mouse hit-testing.
+    app.ui.panel_layout.list = list_area;
+    app.ui.panel_layout.detail = detail_area;
 
-    if app.data.terminal.is_showing() {
-        let terminal_area = if maximized {
+    let terminal_area = if app.data.terminal.is_showing() {
+        let ta = if maximized {
             right_chunks[0]
         } else {
             right_chunks[1]
         };
-        let active_idx = app.data.terminal.active_idx;
+        app.ui.panel_layout.terminal = Some(ta);
+        Some(ta)
+    } else {
+        app.ui.panel_layout.terminal = None;
+        None
+    };
+
+    app.ui.pane_height = list_area.height.saturating_sub(2);
+    app.ui.detail_panel.pane_height = detail_area.height.saturating_sub(2);
+
+    if let Some(terminal_area) = terminal_area {
         let terminal_panel = crate::ui::views::terminal_panel::TerminalPanel;
         terminal_panel.render(
             f,
             terminal_area,
-            &mut app.data.terminal.sessions,
-            active_idx,
+            &mut app.data.terminal,
             terminal_focused,
             resize_mode,
         );
@@ -160,7 +173,6 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         list_area,
         &app.data.entries,
         app.data.selected,
-        app.is_root,
         list_focused,
         resize_mode,
     );
@@ -174,13 +186,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 // Status bar
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
+    let t = theme::theme();
     let line = if let Some((msg, level)) = &app.ui.status_message {
-        let color = match level {
-            StatusLevel::Info => Color::White,
-            StatusLevel::Success => Color::Green,
-            StatusLevel::Warn => Color::Rgb(255, 140, 0),
-            StatusLevel::Error => Color::Red,
-        };
+        let color = t.status_color(level);
         Line::from(vec![
             Span::raw("  "),
             Span::styled(msg.as_str(), Style::default().fg(color)),
@@ -195,12 +203,12 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             hspan(" detail/terminal height"),
         ])
     } else {
-        match app.ui.active_panel {
-            crate::app::ActivePanel::ContainerList => Line::from(vec![
+        match app.ui.focus.active_idx {
+            0 => Line::from(vec![
                 kspan("[j/k]"),
                 hspan(" nav "),
-                kspan("[Tab]"),
-                hspan(" → detail "),
+                kspan("[Tab/⇧Tab]"),
+                hspan(" panels "),
                 kspan("[s]"),
                 hspan(" start "),
                 kspan("[S]"),
@@ -220,7 +228,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[q]"),
                 hspan(" quit"),
             ]),
-            crate::app::ActivePanel::DetailPanel => Line::from(vec![
+            1 => Line::from(vec![
                 kspan("[Alt+1..5]"),
                 hspan(" panes "),
                 kspan("[[/]]"),
@@ -229,8 +237,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 hspan(" scroll "),
                 kspan("[PgUp/Dn]"),
                 hspan(" page "),
-                kspan("[Tab]"),
-                hspan(" → list "),
+                kspan("[Tab/⇧Tab]"),
+                hspan(" panels "),
                 kspan("[t]"),
                 hspan(" terminal "),
                 kspan("[?]"),
@@ -238,7 +246,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[q]"),
                 hspan(" quit"),
             ]),
-            crate::app::ActivePanel::TerminalPanel => {
+            2 => {
                 let insert_mode = app
                     .data
                     .terminal
@@ -263,17 +271,22 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         hspan(" insert mode "),
                         kspan("[Alt+1..9 / [/]]"),
                         hspan(" switch tabs "),
+                        kspan("[Tab/⇧Tab]"),
+                        hspan(" panels "),
                         kspan("[T]"),
                         hspan(t_label),
                         kspan("[t]"),
                         hspan(" hide "),
                         kspan("[x]"),
                         hspan(" close tab "),
+                        kspan("[y]"),
+                        hspan(" yank "),
                         kspan("[q]"),
                         hspan(" quit"),
                     ])
                 }
             }
+            _ => Line::from(vec![]),
         }
     };
 
@@ -281,70 +294,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn kspan(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::default().fg(Color::Cyan))
+    Span::styled(s, Style::default().fg(theme::theme().key_hint_fg))
 }
 fn hspan(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::default().fg(Color::DarkGray))
-}
-
-// Help overlay
-
-fn render_help(f: &mut Frame) {
-    let area = centered_rect(50, 85, f.area());
-    f.render_widget(Clear, area);
-    let rows: Vec<Line> = vec![
-        Line::from(Span::styled(
-            "  Keybindings",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        hrow("j / ↓", "Select next container"),
-        hrow("k / ↑", "Select previous container"),
-        Line::from(""),
-        hrow("Alt+1..5", "Switch detail pane"),
-        hrow("[ / ]  ", "Cycle detail panes"),
-        hrow("↑/↓ | j/k", "Scroll / navigate in detail pane"),
-        Line::from(""),
-        hrow("Alt+1..9", "Switch terminal tab"),
-        hrow("[ / ]  ", "Cycle terminal tabs"),
-        Line::from(""),
-        hrow("s    ", "Start container  [root]"),
-        hrow("S    ", "Poweroff container [root]"),
-        hrow("D    ", "Delete container [root]"),
-        hrow("x / ⏎", "Actions / Power menu  [root]"),
-        Line::from(""),
-        hrow("n    ", "New container / Import wizard  [root]"),
-        Line::from(""),
-        hrow("Tab  ", "Toggle focus: list ↔ detail panel"),
-        hrow("r    ", "Refresh list"),
-        hrow("R    ", "Enter resize mode"),
-        hrow("?    ", "Toggle help"),
-        hrow("q    ", "Quit"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Press any key to close",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    f.render_widget(
-        Paragraph::new(rows).block(
-            Block::default()
-                .title(" Help ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Cyan)),
-        ),
-        area,
-    );
-}
-
-fn hrow(k: &'static str, d: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(k, Style::default().fg(Color::Yellow)),
-        Span::raw("  "),
-        Span::raw(d),
-    ])
+    Span::styled(s, Style::default().fg(theme::theme().hint_fg))
 }

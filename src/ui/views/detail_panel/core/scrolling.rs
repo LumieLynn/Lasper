@@ -1,6 +1,5 @@
 use ratatui::{
     layout::Rect,
-    text::Line,
     widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
@@ -8,6 +7,34 @@ use ratatui::{
 use super::super::DetailPane;
 use super::super::DetailPanel;
 use crate::app::AppData;
+
+/// Presentation cache for the log pane: pre-computed wrapped-line offsets
+/// so scrolling is O(log N) binary search instead of O(N) counting.
+#[derive(Default, Clone)]
+pub struct LogRenderCache {
+    pub offset_index: Vec<usize>,
+    pub wrapped_height: usize,
+}
+
+impl LogRenderCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Full recompute from raw log strings and a terminal width.
+    pub fn compute(lines: &[&str], width: usize) -> Self {
+        let mut offset_index = Vec::with_capacity(lines.len());
+        let mut current_y = 0;
+        for line in lines {
+            offset_index.push(current_y);
+            current_y += calculate_str_wrapped_height(line, width);
+        }
+        Self {
+            offset_index,
+            wrapped_height: current_y,
+        }
+    }
+}
 
 pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usize) {
     let old_logs_len = panel.logs_len;
@@ -102,29 +129,16 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         data.config_dirty = false;
     }
 
-    // 4. Logs (The hot path)
-    if data.logs_dirty || width_changed {
-        if width_changed || data.log_lines.len() < data.log_offset_index.len() {
-            // Full re-calculate index
-            data.log_offset_index.clear();
-            let mut current_y = 0;
-            for line in &data.log_lines {
-                data.log_offset_index.push(current_y);
-                current_y += calculate_line_wrapped_height(line, width);
-            }
-            data.log_wrapped_height = current_y;
-        } else {
-            // Incremental append
-            let mut current_y = data.log_wrapped_height;
-            let start_idx = data.log_offset_index.len();
-            for i in start_idx..data.log_lines.len() {
-                data.log_offset_index.push(current_y);
-                current_y += calculate_line_wrapped_height(&data.log_lines[i], width);
-            }
-            data.log_wrapped_height = current_y;
+    // 4. Logs — compute render cache from raw strings
+    if let Some(buf) = data.log_manager.active_buffer_mut() {
+        if buf.dirty || width_changed {
+            let lines: Vec<&str> = buf.lines.iter().map(|s| s.as_str()).collect();
+            panel.log_cache = LogRenderCache::compute(&lines, width);
+            panel.logs_len = panel.log_cache.wrapped_height;
+            buf.dirty = false;
         }
-        panel.logs_len = data.log_wrapped_height;
-        data.logs_dirty = false;
+    } else {
+        panel.logs_len = 0;
     }
 
     // Sticky autoscroll for Logs
@@ -161,41 +175,36 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         .min(prop_max.min(u16::MAX as usize) as u16);
 }
 
-fn calculate_line_wrapped_height(line: &Line, width: usize) -> usize {
+fn calculate_str_wrapped_height(line: &str, width: usize) -> usize {
     if width == 0 {
         return 1;
     }
     let mut lines = 0;
     let mut current_line_width = 0;
 
-    for span in &line.spans {
-        // Split by whitespace to simulate word wrapping
-        for word in span.content.split_inclusive(' ') {
-            let mut word_width = 0;
-            for c in word.chars() {
-                if c == '\t' {
-                    word_width += 8 - (word_width % 8);
-                } else {
-                    word_width += 1;
-                }
-            }
-
-            if current_line_width + word_width > width {
-                if word_width > width {
-                    // Single long word wraps multiple times
-                    if current_line_width > 0 {
-                        lines += 1;
-                    }
-                    lines += (word_width - 1) / width;
-                    current_line_width = word_width % width;
-                } else {
-                    // Word moves to new line
-                    lines += 1;
-                    current_line_width = word_width;
-                }
+    for word in line.split_inclusive(' ') {
+        let mut word_width = 0;
+        for c in word.chars() {
+            if c == '\t' {
+                word_width += 8 - (word_width % 8);
             } else {
-                current_line_width += word_width;
+                word_width += 1;
             }
+        }
+
+        if current_line_width + word_width > width {
+            if word_width > width {
+                if current_line_width > 0 {
+                    lines += 1;
+                }
+                lines += (word_width - 1) / width;
+                current_line_width = word_width % width;
+            } else {
+                lines += 1;
+                current_line_width = word_width;
+            }
+        } else {
+            current_line_width += word_width;
         }
     }
     if current_line_width > 0 || lines == 0 {

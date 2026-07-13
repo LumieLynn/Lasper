@@ -3,7 +3,7 @@ use crate::ui::widgets::inputs::text_input_base::TextInputBase;
 use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
@@ -39,7 +39,7 @@ impl PasswordBox {
 impl Component for PasswordBox {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let style = if self.base.error_msg.is_some() {
-            Style::default().fg(Color::Red)
+            Style::default().fg(crate::ui::theme::theme().editor_error)
         } else {
             Style::default().fg(crate::ui::widget_border_color(
                 self.base.focused,

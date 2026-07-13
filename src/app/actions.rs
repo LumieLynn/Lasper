@@ -1,7 +1,6 @@
 use super::App;
 use crate::nspawn::models::{ContainerEntry, ContainerState};
 use crate::ui::views::detail_panel::DetailPane;
-use ratatui::text::Line;
 use std::time::{Duration, Instant};
 
 impl App {
@@ -46,86 +45,17 @@ impl App {
             Option::None => {
                 self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
                 self.data.properties_dirty = true;
-                self.data.log_lines.clear();
-                self.data.logs_dirty = true;
+                self.data.log_manager.cleanup_all();
                 self.data.config_content = Option::None;
                 self.data.config_dirty = true;
-                if let Some((_, handle)) = self.data.log_stream.take() {
-                    handle.abort();
-                }
                 return;
             }
         };
 
-        // Stop log stream if we are not in the Logs pane
-        if self.ui.detail_panel.active_pane != DetailPane::Logs {
-            if let Some((_, handle)) = self.data.log_stream.take() {
-                handle.abort();
-            }
-        }
-
         match self.ui.detail_panel.active_pane {
             DetailPane::Properties | DetailPane::Details => {
-                match self.data.manager.get_properties(&entry.name).await {
-                    Ok(mut p) => {
-                        if !entry.all_addresses.is_empty() {
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "IPAddresses".into(),
-                                entry.all_addresses.join(", "),
-                            );
-                        }
-                        if let Some(ufs) = p
-                            .get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
-                            .get("UnitFileState")
-                        {
-                            let ufs = ufs.clone();
-                            p.insert(
-                                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                                "Enabled".into(),
-                                ufs,
-                            );
-                        }
-                        // Preserve storage type as "Type" and rename machinectl's "Type" to "Class"
-                        if let Some(image_type) = &entry.image_type {
-                            if let Some(machine_type) = p
-                                .get_group_mut(crate::nspawn::models::GROUP_MACHINE)
-                                .remove("Type")
-                            {
-                                p.insert(
-                                    crate::nspawn::models::GROUP_MACHINE,
-                                    "Class".into(),
-                                    machine_type,
-                                );
-                            }
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "Type".into(),
-                                image_type.clone(),
-                            );
-                        }
-
-                        // For stopped containers, manually ensure expected static fields
-                        if !entry.state.is_running() {
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "ReadOnly".into(),
-                                entry.readonly.to_string(),
-                            );
-                            if let Some(u) = &entry.usage {
-                                p.insert(
-                                    crate::nspawn::models::GROUP_MACHINE,
-                                    "Usage".into(),
-                                    u.clone(),
-                                );
-                            }
-                            p.insert(
-                                crate::nspawn::models::GROUP_MACHINE,
-                                "State".into(),
-                                entry.state.label().into(),
-                            );
-                        }
-
+                match self.data.manager.get_properties(&entry.name, &entry).await {
+                    Ok(p) => {
                         self.data.properties = Ok(p);
                         self.data.properties_dirty = true;
                         self.data.details_dirty = true;
@@ -139,32 +69,21 @@ impl App {
                 }
             }
             DetailPane::Logs => {
-                if entry.state.is_running() {
-                    let needs_new_stream =
-                        !matches!(&self.data.log_stream, Some((name, _)) if name == &entry.name);
+                self.data.log_manager.get_or_create(&entry.name);
 
-                    if needs_new_stream {
-                        // Stop old stream
-                        if let Some((_, handle)) = self.data.log_stream.take() {
-                            handle.abort();
-                        }
-                        self.data.log_lines.clear();
-                        self.data.logs_dirty = true;
-                        if let Some(tx) = &self.ui.app_tx {
-                            let handle =
-                                self.data.manager.spawn_log_stream(&entry.name, tx.clone());
-                            self.data.log_stream = Some((entry.name.clone(), handle));
+                if entry.state.is_running() {
+                    if !self.data.log_manager.stream_is_active(&entry.name) {
+                        if let Some((tx, fatal)) = self.data.log_manager.start_stream(&entry.name) {
+                            let handle = self.data.manager.spawn_log_stream(&entry.name, tx, fatal);
+                            self.data
+                                .log_manager
+                                .attach_stream_handle(&entry.name, handle);
                         }
                     }
-                } else {
-                    if let Some((_, handle)) = self.data.log_stream.take() {
-                        handle.abort();
-                    }
-                    self.data.log_lines.clear();
+                } else if self.data.log_manager.stop_stream(&entry.name) {
                     self.data
-                        .log_lines
-                        .push_back(Line::from("Container is not running."));
-                    self.data.logs_dirty = true;
+                        .log_manager
+                        .push_line(&entry.name, "[CONTAINER STOPPED]");
                 }
             }
             DetailPane::Config => {
@@ -245,7 +164,10 @@ impl App {
             if let Some(state) = transition {
                 self.data
                     .transitions
-                    .insert(e.name.clone(), (state, Instant::now()));
+                    .insert(e.name.clone(), (state.clone(), Instant::now()));
+                // Apply immediately so the transition icon shows on the next
+                // frame even when no watcher nudge arrives mid-operation.
+                e.state = state;
             }
 
             let tx = match &self.ui.app_tx {
@@ -255,8 +177,24 @@ impl App {
             (e.name.clone(), self.data.manager.clone(), tx)
         };
 
+        let pm = self.permissions.clone();
         tokio::spawn(async move {
-            let res = action(name.clone(), manager.clone()).await;
+            let audit = match pm.request_elevation(action_label.to_string()).await {
+                Ok(a) => a,
+                Err(e) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("{}", e),
+                            crate::ui::StatusLevel::Error,
+                        ))
+                        .await;
+                    return;
+                }
+            };
+
+            let res = audit.run(action(name.clone(), manager.clone())).await;
+            // audit dropped — scope closed
+
             let suffix = match manager.did_fallback() {
                 Some(reason) => format!(" (CLI fallback: {})", reason),
                 None => String::new(),
@@ -349,17 +287,22 @@ impl App {
         );
     }
 
-    pub fn spawn_terminal(&mut self) {
-        self.ui.prev_active_panel = self.ui.active_panel.clone();
+    pub async fn spawn_terminal(&mut self) {
+        self.ui.prev_active_idx = self.ui.focus.active_idx;
         let rows = self.ui.pane_height.max(10);
         let entry = match self.data.entries.get(self.data.selected) {
             Some(e) => e.clone(),
             None => return,
         };
 
-        match self.data.terminal.spawn(&entry, rows, &self.ui.app_tx) {
+        match self
+            .data
+            .terminal
+            .spawn(&entry, rows, &self.ui.app_tx, &self.data.exec_ctx)
+            .await
+        {
             Ok(_idx) => {
-                self.ui.active_panel = crate::app::ActivePanel::TerminalPanel;
+                self.ui.focus.active_idx = 2;
                 self.set_status(
                     format!("Logged into {}", entry.name),
                     crate::ui::StatusLevel::Info,

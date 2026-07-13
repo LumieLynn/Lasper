@@ -7,6 +7,7 @@ pub mod utils;
 use super::super::{StorageBackend, StorageType};
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::DiskImageConfig;
+use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 pub struct DiskImageBackend {
@@ -28,43 +29,65 @@ impl StorageBackend for DiskImageBackend {
                     .extension()
                     .and_then(|e| e.to_str())
                     .unwrap_or("raw");
-                PathBuf::from(format!("/var/lib/machines/{}.{}", name, ext))
+                crate::paths::machine_image(name, ext)
             }
-            DiskImageSource::CreateNew { .. } => {
-                PathBuf::from(format!("/var/lib/machines/{}.raw", name))
-            }
+            DiskImageSource::CreateNew { .. } => crate::paths::machine_raw_image(name),
         }
     }
 
-    async fn create(&self, name: &str) -> Result<PathBuf> {
-        self.create_impl(name).await
+    async fn create(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
+        self.create_impl(name, cmd_runner, io).await
     }
 
-    async fn mount(&self, name: &str) -> Result<PathBuf> {
-        self.mount_impl(name).await
+    async fn mount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<PathBuf> {
+        self.mount_impl(name, cmd_runner, io).await
     }
 
-    async fn unmount(&self, name: &str) -> Result<()> {
-        self.unmount_impl(name).await
+    async fn unmount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<()> {
+        self.unmount_impl(name, cmd_runner, io).await
     }
 
-    async fn delete(&self, name: &str) -> Result<()> {
+    async fn delete(
+        &self,
+        name: &str,
+        _cmd_runner: &dyn CommandRunner,
+        io: &ElevatedIo,
+    ) -> Result<()> {
         let path = self.get_path(name);
-        if let Err(e) = tokio::fs::remove_file(&path).await {
-            if e.kind() == std::io::ErrorKind::NotFound {
+        if let Err(e) = io.remove_file(&path).await {
+            if matches!(
+                e,
+                crate::nspawn::errors::NspawnError::Io(_, ref io_err)
+                    if io_err.kind() == std::io::ErrorKind::NotFound
+            ) {
                 log::warn!(
                     "Image file already missing for deletion: {}",
                     path.display()
                 );
             } else {
-                return Err(crate::nspawn::errors::NspawnError::Io(path, e));
+                return Err(e);
             }
         }
         Ok(())
     }
 
     async fn exists(&self, name: &str) -> bool {
-        let base = PathBuf::from("/var/lib/machines").join(name);
+        let base = crate::paths::machine_root(name);
         for ext in ["raw", "img"] {
             if tokio::fs::try_exists(base.with_extension(ext))
                 .await

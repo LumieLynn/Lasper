@@ -28,8 +28,10 @@ impl Wizard {
         entries: Vec<ContainerEntry>,
         nvidia_toolkit_installed: bool,
         command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
+        permission_level: crate::nspawn::ops::PermissionLevel,
+        exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     ) -> Self {
-        let mut context = WizardContext::new(entries).await;
+        let mut context = WizardContext::new(entries, permission_level, exec_ctx).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {
@@ -63,7 +65,9 @@ impl Wizard {
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(ratatui::style::Style::default().fg(ratatui::style::Color::Cyan));
+            .border_style(
+                ratatui::style::Style::default().fg(crate::ui::theme::theme().wizard_border),
+            );
 
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -273,12 +277,75 @@ impl Wizard {
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
+                WizardMessage::OpenNvidiaConfigDialog => {
+                    let gpu_devices = self.context.passthrough.nvidia_available_devices.clone();
+                    let active_cats = self.context.passthrough.active_nvidia_categories.clone();
+                    let gpu_device = self.context.passthrough.nvidia_gpu_device.clone();
+                    let mode = self.context.passthrough.nvidia_passthrough_mode.clone();
+                    let saved_dests: Vec<_> = self
+                        .context
+                        .passthrough
+                        .nvidia_category_destinations
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    let inject_env = self.context.passthrough.nvidia_inject_env;
+
+                    let mut dialog =
+                        crate::ui::widgets::dialogs::nvidia_config::NvidiaConfigDialog::new(
+                            gpu_devices,
+                            active_cats.clone(),
+                            |r| AppMessage::Wizard(WizardMessage::NvidiaConfigSaved(r)),
+                        )
+                        .with_profile(
+                            &gpu_device,
+                            &mode,
+                            &saved_dests,
+                            inject_env,
+                            active_cats,
+                        );
+                    dialog.set_focus(true);
+                    StepAction::OpenDialog(Box::new(dialog))
+                }
+                WizardMessage::OpenUnclassifiedEditDialog(idx, ref file) => {
+                    let idx = *idx;
+                    let file = file.clone();
+                    let mut dialog =
+                        crate::ui::widgets::dialogs::unclassified_file::UnclassifiedFileDialog::new(
+                            file,
+                            move |updated| {
+                                AppMessage::Wizard(WizardMessage::UnclassifiedFileUpdated(
+                                    idx, updated,
+                                ))
+                            },
+                        );
+                    dialog.set_focus(true);
+                    StepAction::OpenDialog(Box::new(dialog))
+                }
+                WizardMessage::NvidiaConfigSaved(ref result) => {
+                    let p = &mut self.context.passthrough;
+                    p.nvidia_gpu = true;
+                    p.nvidia_gpu_device = result.gpu_device.clone();
+                    p.nvidia_passthrough_mode = result.mode.clone();
+                    p.nvidia_category_destinations.clear();
+                    for (cat, dest) in &result.category_destinations {
+                        p.nvidia_category_destinations
+                            .insert(cat.clone(), dest.clone());
+                    }
+                    p.nvidia_inject_env = result.inject_env;
+                    if let Some(view) = &mut self.active_view {
+                        view.handle_message(&msg)
+                    } else {
+                        StepAction::None
+                    }
+                }
                 WizardMessage::UserAdded(_)
                 | WizardMessage::UserUpdated(_, _)
                 | WizardMessage::PortForwardAdded(_)
                 | WizardMessage::PortForwardUpdated(_, _)
                 | WizardMessage::BindMountAdded(_)
                 | WizardMessage::BindMountUpdated(_, _)
+                | WizardMessage::UnclassifiedFileUpdated(_, _)
                 | WizardMessage::DialogCancel => {
                     if let Some(view) = &mut self.active_view {
                         view.handle_message(&msg)

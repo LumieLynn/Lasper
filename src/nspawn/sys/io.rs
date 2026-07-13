@@ -15,6 +15,7 @@ impl AsyncLockedWriter {
     /// 1. Uses a sidecar `.lock` file to avoid inode-switch race conditions.
     /// 2. Uses an async backoff loop to acquire the lock without blocking the Tokio executor.
     /// 3. Performs an atomic write via rename.
+    #[allow(dead_code)] // kept for Root-mode atomic write path, currently all writes go through ElevatedIo
     pub async fn write_locked<F>(path: &Path, content_generator: F) -> Result<()>
     where
         F: FnOnce(Option<String>) -> Result<String>,
@@ -129,39 +130,6 @@ impl AsyncLockedWriter {
 
         // 4. Sync parent directory
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = fs::File::open(parent).await {
-                let _ = dir.sync_all().await;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Safely copies a file using atomic rename to ensure the destination is никогда partially written.
-    pub async fn atomic_copy(src: &Path, dest: &Path) -> Result<()> {
-        let tmp_path = dest.with_extension("copy.tmp");
-
-        // 1. Optimized copy to temp
-        fs::copy(src, &tmp_path)
-            .await
-            .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-
-        // 2. Ensure durability
-        let f = fs::File::open(&tmp_path)
-            .await
-            .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-        f.sync_data()
-            .await
-            .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-        drop(f);
-
-        // 3. Atomic swap
-        fs::rename(&tmp_path, dest)
-            .await
-            .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
-
-        // 4. Sync parent directory
-        if let Some(parent) = dest.parent() {
             if let Ok(dir) = fs::File::open(parent).await {
                 let _ = dir.sync_all().await;
             }

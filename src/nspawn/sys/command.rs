@@ -1,19 +1,51 @@
 //! Command builder helpers.
-//!
-//! All commands have stdout/stderr piped to prevent leaking into the TUI's
-//! raw-mode terminal. Use [`CommandLogged::logged_output`] to run a command
-//! and automatically route its output through the `log` crate.
 
-use std::process::{Output, Stdio};
+use std::future::Future;
+use std::pin::Pin;
+use std::process::{ExitStatus, Output, Stdio};
 
-/// Trait abstracting over command execution — enables mocking in tests.
+/// Handle to a spawned command: stderr merged into stdout via `2>&1`,
+/// exit status retrievable via [`SpawnedProcess::wait`].
+pub struct SpawnedProcess {
+    pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    wait_fn: Option<Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send>>>,
+}
+
+impl SpawnedProcess {
+    pub fn new(
+        stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        wait_fn: impl Future<Output = std::io::Result<ExitStatus>> + Send + 'static,
+    ) -> Self {
+        Self {
+            stdout,
+            wait_fn: Some(Box::pin(wait_fn)),
+        }
+    }
+
+    pub async fn wait(mut self) -> std::io::Result<ExitStatus> {
+        // Drain any unread stdout before waiting — avoids pipe deadlocks.
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 4096];
+        while self.stdout.read(&mut buf).await? > 0 {}
+        drop(self.stdout);
+
+        self.wait_fn.take().unwrap().await
+    }
+}
+
+/// Trait abstracting over command execution.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
+    /// Run a command, capturing stdout/stderr after it exits.
     async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output>;
+
+    /// Spawn a command for streaming.  Stderr merged into stdout.
+    /// Use [`SpawnedProcess::wait`] for the exit status.
+    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess>;
 }
 
-/// Default production implementation that shells out via tokio::process::Command.
+/// Default implementation — direct [`tokio::process::Command`].
 pub struct DefaultCommandRunner;
 
 #[async_trait::async_trait]
@@ -21,6 +53,23 @@ impl CommandRunner for DefaultCommandRunner {
     async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         new_command(program).args(&args_refs).output().await
+    }
+
+    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
+        let mut argv = vec![program.to_string()];
+        argv.extend(args);
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec \"$@\" 2>&1")
+            .arg("--")
+            .args(&argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let stdout = Box::new(child.stdout.take().expect("stdout piped"));
+        Ok(SpawnedProcess::new(stdout, async move {
+            child.wait_with_output().await.map(|o| o.status)
+        }))
     }
 }
 
@@ -38,7 +87,6 @@ pub fn new_command(program: &str) -> tokio::process::Command {
 /// Creates a new `std::process::Command` with `LC_ALL=C` set
 /// and stdout/stderr piped by default to prevent leaking output
 /// into the TUI's raw-mode terminal.
-#[allow(dead_code)]
 pub fn new_sync_command(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     cmd.env("LC_ALL", "C");

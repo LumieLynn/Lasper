@@ -5,6 +5,7 @@ use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{SourceConfig, SourceKind, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -224,18 +225,7 @@ impl Component for SourceStepView {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.kind_list.set_focus(false);
-            self.oci_url.set_focus(false);
-            self.deboot_mirror.set_focus(false);
-            self.deboot_suite.set_focus(false);
-            self.bootstrap_pkgs.set_focus(false);
-            self.local_path.set_focus(false);
-            self.pull_url.set_focus(false);
-            self.pull_format.set_focus(false);
-        }
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn validate(&mut self) -> Result<(), String> {

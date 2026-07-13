@@ -1,8 +1,8 @@
-use super::{ActivePanel, App};
+use super::App;
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 // Top-level dispatch
 //
@@ -36,9 +36,7 @@ impl App {
         }
 
         // Layer 2 – terminal panel when it owns focus
-        if self.ui.active_panel == ActivePanel::TerminalPanel
-            && self.handle_terminal_focused_key(key).await
-        {
+        if self.ui.focus.active_idx == 2 && self.handle_terminal_focused_key(key).await {
             return;
         }
 
@@ -55,6 +53,54 @@ impl App {
         // Layer 5 – route to the focused panel
         self.route_to_focused_panel(key).await;
     }
+}
+
+// Mouse dispatch
+
+impl App {
+    pub async fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Hit-test: which panel is the mouse over?
+        let layout = &self.ui.panel_layout;
+        let col = mouse.column;
+        let row = mouse.row;
+
+        let maximized = self.data.terminal.is_showing() && self.data.terminal.maximized;
+
+        let hit = if in_rect(col, row, layout.list) {
+            Some(0usize)
+        } else if !maximized && in_rect(col, row, layout.detail) {
+            Some(1usize)
+        } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
+            Some(2usize)
+        } else {
+            None
+        };
+
+        // Click-to-focus on button press.
+        if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
+            let n = if self.data.terminal.is_showing() {
+                3
+            } else {
+                2
+            };
+            if panel_idx < n
+                && !(self.data.terminal.maximized
+                    && self.data.terminal.is_showing()
+                    && panel_idx == 1)
+            {
+                self.ui.focus.active_idx = panel_idx;
+            }
+        }
+
+        // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
+        if self.ui.focus.active_idx == 2 && self.data.terminal.is_showing() {
+            self.data.terminal.handle_mouse(mouse);
+        }
+    }
+}
+
+fn in_rect(col: u16, row: u16, r: ratatui::layout::Rect) -> bool {
+    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
 }
 
 // Layer 0: delete confirmation
@@ -88,7 +134,7 @@ impl App {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 self.data.terminal.cleanup_all();
-                self.should_quit = true;
+                self.signal_quit();
             }
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.ui.quit_dialog = None;
@@ -103,7 +149,7 @@ impl App {
 
 impl App {
     async fn handle_terminal_focused_key(&mut self, key: KeyEvent) -> bool {
-        use crate::app::terminal::TerminalKeyOutcome;
+        use crate::ui::views::terminal_panel::TerminalKeyOutcome;
 
         let outcome =
             self.data
@@ -111,11 +157,11 @@ impl App {
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
 
         // If closing a tab emptied the terminal panel, restore focus to a valid panel.
-        if self.ui.active_panel == ActivePanel::TerminalPanel && !self.data.terminal.is_showing() {
-            self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
-                ActivePanel::ContainerList
+        if self.ui.focus.active_idx == 2 && !self.data.terminal.is_showing() {
+            self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+                0
             } else {
-                self.ui.prev_active_panel.clone()
+                self.ui.prev_active_idx
             };
         }
 
@@ -209,7 +255,7 @@ impl App {
                             "Active terminal sessions are still running.\nQuit and terminate all logins?",
                         ));
                 } else {
-                    self.should_quit = true;
+                    self.signal_quit();
                 }
                 true
             }
@@ -218,8 +264,33 @@ impl App {
                 true
             }
             KeyCode::Tab => {
-                let terminal_showing = self.data.terminal.is_showing();
-                self.ui.toggle_focus(terminal_showing);
+                let n = if self.data.terminal.is_showing() {
+                    3
+                } else {
+                    2
+                };
+                self.ui.focus.cycle_forward(n);
+                if self.data.terminal.is_showing()
+                    && self.data.terminal.maximized
+                    && self.ui.focus.active_idx == 1
+                {
+                    self.ui.focus.cycle_forward(n);
+                }
+                true
+            }
+            KeyCode::BackTab => {
+                let n = if self.data.terminal.is_showing() {
+                    3
+                } else {
+                    2
+                };
+                self.ui.focus.cycle_backward(n);
+                if self.data.terminal.is_showing()
+                    && self.data.terminal.maximized
+                    && self.ui.focus.active_idx == 1
+                {
+                    self.ui.focus.cycle_backward(n);
+                }
                 true
             }
             KeyCode::Char('s') => {
@@ -255,12 +326,15 @@ impl App {
                 true
             }
             KeyCode::Char('t') => {
-                self.toggle_terminal();
+                self.toggle_terminal().await;
                 true
             }
             KeyCode::Char('T') => {
                 if self.data.terminal.is_showing() {
                     self.data.terminal.maximized = !self.data.terminal.maximized;
+                    if self.data.terminal.maximized && self.ui.focus.active_idx == 1 {
+                        self.ui.focus.active_idx = 2;
+                    }
                 }
                 true
             }
@@ -277,19 +351,20 @@ impl App {
 
 impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
-        match self.ui.active_panel {
-            ActivePanel::ContainerList => {
+        match self.ui.focus.active_idx {
+            0 => {
                 let result = self.ui.container_list.handle_key(key);
                 self.handle_container_list_result(result).await;
             }
-            ActivePanel::DetailPanel => {
+            1 => {
                 let result = self.ui.detail_panel.handle_key(key);
                 self.handle_detail_panel_result(result).await;
             }
-            ActivePanel::TerminalPanel => {
+            2 => {
                 // Already handled in layer 2; only reached when there are
                 // no active sessions (empty terminal panel).
             }
+            _ => {}
         }
     }
 
@@ -324,7 +399,7 @@ impl App {
 
 impl App {
     async fn begin_wizard(&mut self) {
-        if !self.is_root {
+        if !self.permissions.level().is_elevated() {
             self.set_status(
                 "Root required — run: sudo lasper".into(),
                 StatusLevel::Error,
@@ -338,6 +413,8 @@ impl App {
                 self.data.entries.clone(),
                 nvidia_installed,
                 tx.clone(),
+                self.permissions.level(),
+                self.data.exec_ctx.clone(),
             )
             .await;
 
@@ -352,18 +429,18 @@ impl App {
         }
     }
 
-    fn toggle_terminal(&mut self) {
+    async fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            if self.ui.active_panel == ActivePanel::TerminalPanel {
-                self.ui.active_panel = if self.ui.prev_active_panel == ActivePanel::TerminalPanel {
-                    ActivePanel::ContainerList
+            if self.ui.focus.active_idx == 2 {
+                self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+                    0
                 } else {
-                    self.ui.prev_active_panel.clone()
+                    self.ui.prev_active_idx
                 };
             }
         } else {
-            self.spawn_terminal();
+            self.spawn_terminal().await;
         }
     }
 
@@ -395,7 +472,7 @@ impl App {
 
 impl App {
     fn is_terminal_insert_mode(&self) -> bool {
-        self.ui.active_panel == ActivePanel::TerminalPanel
+        self.ui.focus.active_idx == 2
             && self
                 .data
                 .terminal

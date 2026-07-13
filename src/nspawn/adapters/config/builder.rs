@@ -184,7 +184,12 @@ impl ContainerConfigBuilder {
         }
     }
 
-    pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+    pub fn get_deployer_and_storage(
+        &self,
+        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+        io: crate::nspawn::sys::ElevatedIo,
+        cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
+    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
         use crate::nspawn::ops::provision::*;
 
@@ -224,16 +229,23 @@ impl ContainerConfigBuilder {
         let deployer: Box<dyn Deployer> = match source.kind {
             SourceKind::Copy => Box::new(clone::CloneDeployer {
                 source_name: source.clone_source.clone(),
+                provision: provision.clone(),
+                io: io.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Oci => Box::new(image::OciDeployer {
                 url: source.oci_url.clone(),
+                cmd_runner: cmd_runner.clone(),
+                io: io.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::LocalFile => Box::new(image::DiskImageDeployer {
                 path: source.local_path.clone(),
+                cmd_runner: cmd_runner.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Pull => Box::new(image::NetworkImageDeployer {
                 url: source.pull_url.clone(),
                 is_raw: source.is_pull_raw,
+                cmd_runner: cmd_runner.clone(),
+                io: io.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer {
                 mirror: source.deboot_mirror.clone(),
@@ -243,9 +255,11 @@ impl ContainerConfigBuilder {
                     source.deboot_suite.clone()
                 },
                 packages: source.bootstrap_pkgs.clone(),
+                cmd_runner: cmd_runner.clone(),
             }) as Box<dyn Deployer>,
             SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer {
                 packages: source.bootstrap_pkgs.clone(),
+                cmd_runner: cmd_runner.clone(),
             }) as Box<dyn Deployer>,
         };
 

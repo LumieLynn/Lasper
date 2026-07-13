@@ -53,31 +53,56 @@ impl Grid {
         }
     }
 
-    pub fn get_selected_text(&self, low_x: i32, low_y: i32, high_x: i32, high_y: i32) -> String {
-        let lines = self
-            .rows
-            .iter()
-            .skip((self.row0() as i32 + low_y) as usize)
-            .take((high_y - low_y) as usize + 1)
-            .enumerate();
+    /// Extract selected text treating the selection as a stream (not a block).
+    /// Coordinates are scrollback-adjusted: caller subtracts `scroll_offset`
+    /// from the viewport-relative row before calling.
+    pub fn get_selected_text(
+        &self,
+        anchor_col: i32,
+        anchor_row: i32,
+        extent_col: i32,
+        extent_row: i32,
+    ) -> String {
+        let ac = anchor_col;
+        let ar = anchor_row;
+        let ec = extent_col;
+        let er = extent_row;
+
+        let first_row = ar.min(er);
+        let last_row = ar.max(er);
+        let is_downward = ar < er || (ar == er && ac <= ec);
+
+        let row0 = self.row0() as i64;
+        let start = (row0 + first_row as i64).max(0) as usize;
+        let end = (row0 + last_row as i64).max(0) as usize;
+        let count = end.saturating_sub(start).saturating_add(1);
+        let lines = self.rows.iter().skip(start).take(count).enumerate();
+
+        let line_count = last_row - first_row;
 
         let mut contents = String::new();
 
-        let lines_len = high_y - low_y + 1;
         for (i, row) in lines {
             let i = i as i32;
-            let start = if i == 0 { low_x } else { 0 };
+            let max_col: i32 = row.cols() as i32 - 1;
 
-            let width: i32 = row.cols().into();
-            let width = if i == lines_len - 1 {
-                width.min(high_x + 1)
+            let (col_start, col_end) = if ar == er {
+                (ac.min(ec), ac.max(ec))
+            } else if i == 0 {
+                let sc = if is_downward { ac } else { ec };
+                (sc, max_col)
+            } else if i == line_count {
+                let ec2 = if is_downward { ec } else { ac };
+                (0, ec2.min(max_col))
             } else {
-                width
+                (0, max_col)
             };
-            let width = width - start;
 
-            row.write_contents(&mut contents, start as u16, width as u16, false);
-            if i != lines_len - 1 && !row.wrapped() {
+            let w = col_end - col_start + 1;
+            if w > 0 {
+                row.write_contents(&mut contents, col_start as u16, w as u16, false);
+            }
+            if i != line_count && !row.wrapped() {
                 contents.push('\n');
             }
         }
@@ -233,6 +258,12 @@ impl Grid {
 
     fn row0(&self) -> usize {
         self.rows.len() - self.size.height as usize
+    }
+
+    /// Number of scrollback rows available above the visible area.
+    /// Equivalent to `set_scrollback(usize::MAX); scrollback()` without cloning.
+    pub fn row0_count(&self) -> usize {
+        self.row0()
     }
 
     pub fn visible_rows(&self) -> impl Iterator<Item = &Row> {

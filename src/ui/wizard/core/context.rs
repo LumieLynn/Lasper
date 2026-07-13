@@ -6,6 +6,8 @@ use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType}
 use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::PermissionLevel;
+use crate::nspawn::sys::ExecutionContext;
 use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
@@ -160,6 +162,15 @@ impl NetworkState {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct UnclassifiedFile {
+    pub host_path: String,
+    pub default_container_path: String,
+    pub assigned_category: Option<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
+    pub custom_destination: String,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
     pub privileged: bool,
     pub private_users: Option<String>,
@@ -183,6 +194,7 @@ pub struct PassthroughState {
     pub nvidia_available_devices: Vec<String>,
     pub active_nvidia_categories:
         Vec<crate::nspawn::platform::nvidia::classify::NvidiaFileCategory>,
+    pub unclassified_files: Vec<UnclassifiedFile>,
     pub hardware_scanning: bool,
 }
 
@@ -202,12 +214,33 @@ impl PassthroughState {
             },
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
             nvidia_profile: if self.nvidia_gpu {
+                let manual_classifications: Vec<
+                    crate::nspawn::platform::nvidia::profile::ManualClassification,
+                > = self
+                    .unclassified_files
+                    .iter()
+                    .filter(|f| f.assigned_category.is_some())
+                    .map(
+                        |f| crate::nspawn::platform::nvidia::profile::ManualClassification {
+                            host_path: f.host_path.clone(),
+                            category: f.assigned_category.clone().unwrap(),
+                            destination: if f.custom_destination.is_empty() {
+                                f.default_container_path.clone()
+                            } else {
+                                f.custom_destination.clone()
+                            },
+                            readonly: f.readonly,
+                        },
+                    )
+                    .collect();
+
                 Some(
                     crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile {
                         gpu_device: self.nvidia_gpu_device.clone(),
                         mode: self.nvidia_passthrough_mode.clone(),
                         category_destinations: self.nvidia_category_destinations.clone(),
                         inject_env: self.nvidia_inject_env,
+                        manual_classifications,
                     },
                 )
             } else {
@@ -270,10 +303,16 @@ pub struct WizardContext {
     pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
     pub xdg_runtime: Option<String>,
+    pub permission_level: PermissionLevel,
+    pub exec_ctx: Arc<ExecutionContext>,
 }
 
 impl WizardContext {
-    pub async fn new(entries: Vec<ContainerEntry>) -> Self {
+    pub async fn new(
+        entries: Vec<ContainerEntry>,
+        permission_level: PermissionLevel,
+        exec_ctx: Arc<ExecutionContext>,
+    ) -> Self {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
             .await
             .ok();
@@ -354,9 +393,10 @@ impl WizardContext {
                     crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode::Mirror,
                 nvidia_gpu_device: "all".to_string(),
                 nvidia_category_destinations: std::collections::HashMap::new(),
-                nvidia_inject_env: true,
+                nvidia_inject_env: false,
                 nvidia_available_devices,
                 active_nvidia_categories,
+                unclassified_files: vec![],
                 hardware_scanning: true,
             },
             review: ReviewState {
@@ -373,6 +413,8 @@ impl WizardContext {
             },
             entries,
             xdg_runtime,
+            permission_level,
+            exec_ctx,
         }
     }
 
@@ -395,8 +437,14 @@ impl WizardContext {
         self.build_config().preview
     }
 
-    pub fn get_deployer_and_storage(&self) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        self.builder().get_deployer_and_storage()
+    pub fn get_deployer_and_storage(
+        &self,
+        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+        io: crate::nspawn::sys::ElevatedIo,
+        cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
+    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+        self.builder()
+            .get_deployer_and_storage(provision, io, cmd_runner)
     }
 
     pub fn update_hardware_data(
@@ -412,6 +460,35 @@ impl WizardContext {
             crate::nspawn::platform::nvidia::classify::detect_active_categories(
                 &state.classified_entries,
             );
+        // Merge fresh unclassified CDI files with existing user reclassifications
+        let fresh_unclassified: Vec<UnclassifiedFile> = state
+            .binds
+            .iter()
+            .filter(|b| {
+                b.readonly
+                    && crate::nspawn::platform::nvidia::classify::classify_path(&b.container_path)
+                        .is_none()
+            })
+            .map(|b| UnclassifiedFile {
+                host_path: b.host_path.clone(),
+                default_container_path: b.container_path.clone(),
+                assigned_category: None,
+                custom_destination: String::new(),
+                readonly: true,
+            })
+            .collect();
+
+        let old_files = std::mem::take(&mut self.passthrough.unclassified_files);
+        self.passthrough.unclassified_files = fresh_unclassified
+            .into_iter()
+            .map(|fresh| {
+                old_files
+                    .iter()
+                    .find(|o| o.host_path == fresh.host_path)
+                    .cloned()
+                    .unwrap_or(fresh)
+            })
+            .collect();
     }
 }
 
@@ -482,9 +559,10 @@ mod tests {
                 crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode::Mirror,
             nvidia_gpu_device: "all".to_string(),
             nvidia_category_destinations: std::collections::HashMap::new(),
-            nvidia_inject_env: true,
+            nvidia_inject_env: false,
             nvidia_available_devices: vec!["all".to_string()],
             active_nvidia_categories: vec![],
+            unclassified_files: vec![],
             hardware_scanning: false,
         };
 

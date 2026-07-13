@@ -1,11 +1,13 @@
 use ratatui::{
-    style::{Color, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Block, Paragraph},
 };
 
+use crate::ui::theme;
+
 pub fn detail_block(_title: &str) -> Block<'static> {
-    Block::default().style(Style::default().fg(Color::White))
+    Block::default().style(Style::default().fg(theme::theme().text_primary))
 }
 
 pub fn empty_block(title: &str) -> Paragraph<'static> {
@@ -13,7 +15,7 @@ pub fn empty_block(title: &str) -> Paragraph<'static> {
         Line::from(""),
         Line::from(Span::styled(
             "  No container selected.",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::theme().text_secondary),
         )),
     ])
     .block(detail_block(title))

@@ -4,7 +4,10 @@ use crate::ui::wizard::context::WizardContext;
 use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{layout::Rect, Frame};
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Rect},
+    Frame,
+};
 
 pub struct ReviewStepView {
     preview: TextBlock,
@@ -20,6 +23,11 @@ impl ReviewStepView {
 
 impl Component for ReviewStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let area = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Min(0)])
+            .split(area)[0];
         self.preview.set_focus(true);
         self.preview.render(f, area);
     }

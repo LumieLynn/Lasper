@@ -2,33 +2,25 @@
 
 pub mod actions;
 pub mod handlers;
-pub mod terminal;
 
 use anyhow::Result;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
     ops::{DefaultManager, NspawnManager},
+    sys::ExecutionContext,
 };
-use crate::ui::core::Component;
+use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::wizard::Wizard;
-use ratatui::{backend::CrosstermBackend, text::Line, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io::Stdout;
 
-pub use terminal::TerminalManager;
-
-/// Which top-level panel has keyboard focus.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ActivePanel {
-    ContainerList,
-    DetailPanel,
-    TerminalPanel,
-}
+pub use crate::ui::views::terminal_panel::TerminalManager;
 
 /// Whether the user is in panel resize mode (toggled by `R`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -42,9 +34,17 @@ pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
 pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
 
+/// Screen-area rects for mouse hit-testing, populated on each render.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PanelLayout {
+    pub list: Rect,
+    pub detail: Rect,
+    pub terminal: Option<Rect>,
+}
+
 pub struct AppUi {
-    pub active_panel: ActivePanel,
-    pub prev_active_panel: ActivePanel,
+    pub focus: FocusTracker,
+    pub prev_active_idx: usize,
     pub container_list: ContainerListComponent,
     pub detail_panel: DetailPanel,
 
@@ -66,13 +66,21 @@ pub struct AppUi {
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
     pub detail_pct: u16,
+
+    /// Current panel screen rects for mouse hit-testing.
+    pub panel_layout: PanelLayout,
+
+    /// Signalled when the user confirms quit; included in the main
+    /// `select!` so we break immediately instead of waiting for the next
+    /// event or channel close.
+    pub quit_tx: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 impl AppUi {
-    pub fn new(_is_root: bool) -> Self {
+    pub fn new() -> Self {
         Self {
-            active_panel: ActivePanel::ContainerList,
-            prev_active_panel: ActivePanel::ContainerList,
+            focus: FocusTracker::new(),
+            prev_active_idx: 0,
             container_list: ContainerListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
@@ -90,22 +98,9 @@ impl AppUi {
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
             detail_pct: 60,
+            panel_layout: PanelLayout::default(),
+            quit_tx: None,
         }
-    }
-
-    pub fn toggle_focus(&mut self, terminal_showing: bool) {
-        self.active_panel = match self.active_panel {
-            ActivePanel::ContainerList => ActivePanel::DetailPanel,
-            ActivePanel::DetailPanel => {
-                if terminal_showing {
-                    self.prev_active_panel = self.active_panel.clone();
-                    ActivePanel::TerminalPanel
-                } else {
-                    ActivePanel::ContainerList
-                }
-            }
-            ActivePanel::TerminalPanel => ActivePanel::ContainerList,
-        };
     }
 }
 
@@ -115,13 +110,11 @@ pub struct AppData {
     pub entries: Vec<ContainerEntry>,
     pub selected: usize,
     pub properties: Result<crate::nspawn::models::MachineProperties, String>,
-    pub log_lines: VecDeque<Line<'static>>,
-    pub log_offset_index: Vec<usize>,
-    pub log_wrapped_height: usize,
-    pub log_stream: Option<(String, tokio::task::JoinHandle<()>)>,
+    pub log_manager: crate::ui::views::detail_panel::log_manager::LogManager,
     pub config_content: Option<String>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
+    pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
     pub transitions:
         std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
@@ -133,7 +126,6 @@ pub struct AppData {
     pub properties_dirty: bool,
     pub config_dirty: bool,
     pub details_dirty: bool,
-    pub logs_dirty: bool,
 
     // Terminal state
     pub terminal: TerminalManager,
@@ -141,28 +133,38 @@ pub struct AppData {
 
 /// Global application state.
 pub struct App {
-    pub is_root: bool,
+    pub permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
     pub should_quit: bool,
     pub data: AppData,
     pub ui: AppUi,
 }
 
 impl App {
-    pub fn new(is_root: bool) -> Self {
+    pub fn new(
+        permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
+        cli_mode: bool,
+        log_buffer_lines: usize,
+        exec_ctx: std::sync::Arc<ExecutionContext>,
+    ) -> Self {
+        let manager = std::sync::Arc::new(DefaultManager::new(
+            permissions.clone(),
+            cli_mode,
+            exec_ctx.clone(),
+        ));
         Self {
-            is_root,
+            permissions,
             should_quit: false,
             data: AppData {
                 entries: Vec::new(),
                 selected: 0,
                 properties: Ok(crate::nspawn::models::MachineProperties::default()),
-                log_lines: VecDeque::with_capacity(5000),
-                log_offset_index: Vec::with_capacity(5000),
-                log_wrapped_height: 0,
-                log_stream: None,
+                log_manager: crate::ui::views::detail_panel::log_manager::LogManager::new(
+                    log_buffer_lines,
+                ),
                 config_content: None,
-                dbus_active: true,
-                manager: std::sync::Arc::new(DefaultManager::new(is_root)),
+                dbus_active: !cli_mode,
+                manager,
+                exec_ctx,
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
                 metrics: HashMap::new(),
@@ -173,11 +175,20 @@ impl App {
                 properties_dirty: true,
                 config_dirty: true,
                 details_dirty: true,
-                logs_dirty: true,
                 terminal: TerminalManager::new(),
             },
-            ui: AppUi::new(is_root),
+            ui: AppUi::new(),
         }
+    }
+
+    /// Fire the quit signal so the event loop breaks out of `select!`
+    /// immediately, then mark `should_quit`.
+    fn signal_quit(&mut self) {
+        log::info!("[lasper] signal_quit() called");
+        if let Some(tx) = self.ui.quit_tx.take() {
+            let _ = tx.send(());
+        }
+        self.should_quit = true;
     }
 
     /// Helper to apply active transitions (Starting/Exiting) to a list of entries.
@@ -234,6 +245,9 @@ impl App {
         self.data
             .metrics
             .retain(|name, _| active_names.contains(name));
+        self.data
+            .log_manager
+            .remove_stale(&active_names.into_iter().cloned().collect());
         self.data.selected = prev_name
             .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
             .unwrap_or(0)
@@ -282,6 +296,7 @@ impl App {
     async fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,
+            AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Tick => self.tick().await,
             AppEvent::BackendResult(res) => self.handle_backend_result(res),
             AppEvent::ActionDone(msg, level) => {
@@ -291,19 +306,15 @@ impl App {
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
-            AppEvent::LogLine(line) => {
-                self.data.log_lines.push_back(Line::from(line));
-                if self.data.log_lines.len() > 5000 {
-                    self.data.log_lines.pop_front();
-                }
-                self.data.logs_dirty = true;
-            }
             AppEvent::TerminalRedraw => {}
         }
     }
 
     /// Starts the main application loop.
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+        // Initialize the global theme before any rendering.
+        crate::ui::theme::init_theme(crate::ui::theme::load_theme());
+
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
         let (backend_tx, mut backend_rx) =
@@ -311,6 +322,12 @@ impl App {
 
         self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());
+
+        // Quit signal — the oneshot fires in the select! below so we
+        // break out of the event loop immediately when the user confirms
+        // quit, instead of blocking until a background task sends an event.
+        let (quit_tx, mut quit_rx) = tokio::sync::oneshot::channel::<()>();
+        self.ui.quit_tx = Some(quit_tx);
 
         // Start nspawn metrics collection engine
         crate::nspawn::ops::inspect::metrics::spawn_collector(
@@ -328,18 +345,28 @@ impl App {
         let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
             while dirty_rx.recv().await.is_some() {
+                log::debug!("Refresh: dirty_rx nudge, running list_all...");
                 if let Ok(entries) = manager_clone.list_all().await {
                     let _ = refresh_tx_clone.send(entries).await;
                 }
             }
         });
 
+        log::debug!("Refresh: initial nudge");
         let _ = dirty_tx.send(()).await;
 
         loop {
-            while let Ok(entries) = refresh_rx.try_recv() {
-                self.sync_entries(entries).await;
+            // Drain at most 3 refresh batches per frame so rapid background
+            // updates can't starve user-input events from the select! below.
+            for _ in 0..3 {
+                match refresh_rx.try_recv() {
+                    Ok(entries) => self.sync_entries(entries).await,
+                    Err(_) => break,
+                }
             }
+
+            // Drain per-buffer log channels before rendering
+            self.data.log_manager.drain_all();
 
             // Render a frame
             terminal.draw(|f| crate::ui::draw(f, self))?;
@@ -355,14 +382,29 @@ impl App {
                 Some(cmd) = backend_rx.recv() => {
                     crate::nspawn::ops::handlers::handle_command(cmd, events.tx.clone());
                 }
-                else => break,
+                _ = &mut quit_rx => {
+                    log::info!("[lasper] select!: quit_rx fired");
+                    break;
+                }
+                else => {
+                    log::info!("[lasper] select!: else branch");
+                    break;
+                }
             }
 
             if self.should_quit {
+                log::info!("[lasper] main loop: should_quit=true, breaking");
                 break;
             }
         }
+        log::info!("[lasper] run() cleaning up...");
         self.data.terminal.cleanup_all();
+        self.data.log_manager.cleanup_all();
+        // Shut down the EventStream while the terminal is still in raw mode
+        // so the internal stdin thread can unblock quickly instead of
+        // blocking on a cooked-mode read after terminal restore.
+        events.shutdown();
+        log::info!("[lasper] run() returning Ok(())");
         Ok(())
     }
 
@@ -397,8 +439,16 @@ mod tests {
         }
     }
 
-    fn make_app(is_root: bool) -> App {
-        App::new(is_root)
+    fn make_app() -> App {
+        App::new(
+            std::sync::Arc::new(crate::nspawn::ops::DefaultPermissionManager::new()),
+            false, // cli_mode
+            0,
+            std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
+                crate::nspawn::ops::PermissionLevel::User,
+                None,
+            )),
+        )
     }
 
     mod merge_transitional_states {
@@ -406,7 +456,7 @@ mod tests {
 
         #[test]
         fn adds_starting_overlay() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Starting, Instant::now()),
@@ -420,7 +470,7 @@ mod tests {
 
         #[test]
         fn adds_exiting_overlay() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Exiting, Instant::now()),
@@ -434,7 +484,7 @@ mod tests {
 
         #[test]
         fn expires_stale() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (
@@ -452,7 +502,7 @@ mod tests {
 
         #[test]
         fn removes_when_backend_resolved() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.transitions.insert(
                 "test".to_string(),
                 (ContainerState::Starting, Instant::now()),
@@ -471,7 +521,7 @@ mod tests {
 
         #[test]
         fn next_wraps() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![
                 make_entry("a", ContainerState::Off),
                 make_entry("b", ContainerState::Off),
@@ -485,7 +535,7 @@ mod tests {
 
         #[test]
         fn prev_wraps() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![
                 make_entry("a", ContainerState::Off),
                 make_entry("b", ContainerState::Off),
@@ -499,7 +549,7 @@ mod tests {
 
         #[test]
         fn next_empty_no_panic() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![];
             app.data.selected = 0;
 
@@ -508,7 +558,7 @@ mod tests {
 
         #[test]
         fn prev_empty_no_panic() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.data.entries = vec![];
             app.data.selected = 0;
 
@@ -521,13 +571,13 @@ mod tests {
 
         #[test]
         fn allows_first() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             assert!(app.check_action_cooldown());
         }
 
         #[test]
         fn blocks_within_2s() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             assert!(app.check_action_cooldown());
             assert!(!app.check_action_cooldown());
         }
@@ -538,7 +588,7 @@ mod tests {
 
         #[test]
         fn sets_message_and_expiry() {
-            let mut app = make_app(true);
+            let mut app = make_app();
             app.set_status("hello".into(), crate::ui::StatusLevel::Info);
 
             let (msg, level) = app.ui.status_message.as_ref().unwrap();

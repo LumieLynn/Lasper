@@ -1,9 +1,14 @@
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::errors::Result;
 use crate::nspawn::models::CreateUser;
+use crate::nspawn::sys::ElevatedIo;
 use std::path::Path;
 
 /// Sets up the target user's shell environments with exported Wayland variables.
-pub async fn setup_wayland_shell_env(rootfs: &Path, user: &CreateUser) -> Result<()> {
+pub async fn setup_wayland_shell_env(
+    rootfs: &Path,
+    user: &CreateUser,
+    io: &ElevatedIo,
+) -> Result<()> {
     let home_dir = if user.username == "root" {
         "/root".to_string()
     } else {
@@ -33,25 +38,17 @@ fi
 
     let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
     if let Some(parent) = full_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
+        io.create_dir_all(parent).await?;
     }
-    tokio::fs::write(&full_path, script_content)
-        .await
-        .map_err(|e| NspawnError::Io(full_path, e))?;
+    io.write(&full_path, &script_content).await?;
 
     let shell = user.shell.as_str();
-    let rc_file = if shell.ends_with("zsh") {
-        ".zshrc"
-    } else if shell.ends_with("fish") {
+    if shell.ends_with("fish") {
         let fish_dir = rootfs.join(format!(
             "{}/.config/fish/conf.d",
             home_dir.trim_start_matches('/')
         ));
-        tokio::fs::create_dir_all(&fish_dir)
-            .await
-            .map_err(|e| NspawnError::Io(fish_dir.clone(), e))?;
+        io.create_dir_all(&fish_dir).await?;
         let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
         let fish_script = format!(
             r#"
@@ -71,25 +68,23 @@ end
             host_display
         );
         let script_path = fish_dir.join("wayland-env.fish");
-        tokio::fs::write(&script_path, fish_script)
-            .await
-            .map_err(|e| NspawnError::Io(script_path, e))?;
+        io.write(&script_path, &fish_script).await?;
         return Ok(());
+    }
+
+    let rc_file = if shell.ends_with("zsh") {
+        ".zshrc"
     } else {
         ".bashrc"
     };
-
     let rc_full_path = rootfs.join(format!("{}/{}", home_dir.trim_start_matches('/'), rc_file));
-    if let Ok(mut f) = tokio::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&rc_full_path)
-        .await
-    {
-        use tokio::io::AsyncWriteExt;
-        let _ = f
-            .write_all(b"\n[ -f ~/.wayland-env ] && source ~/.wayland-env\n")
-            .await;
+    let existing = io.read_to_string(&rc_full_path).await?.unwrap_or_default();
+    if !existing.contains("source ~/.wayland-env") {
+        let appended = format!(
+            "{}\n[ -f ~/.wayland-env ] && source ~/.wayland-env\n",
+            existing
+        );
+        io.write(&rc_full_path, &appended).await?;
     }
 
     Ok(())

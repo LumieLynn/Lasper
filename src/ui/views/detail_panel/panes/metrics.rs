@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
+    style::Style,
     symbols,
     text::Span,
     widgets::{Axis, Block, BorderType, Borders, Chart, Dataset, GraphType},
@@ -49,13 +49,14 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
     let max_cpu_x = cpu_data.last().map(|(x, _)| *x).unwrap_or(0.0);
     let min_cpu_x = (max_cpu_x - 60.0).max(0.0);
 
+    let t = crate::ui::theme::theme();
     let cpu_dataset = Dataset::default()
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(if is_running {
-            Color::Cyan
+            t.chart_cpu
         } else {
-            Color::DarkGray
+            t.text_secondary
         }))
         .data(cpu_data);
 
@@ -88,13 +89,13 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         )
         .x_axis(
             Axis::default()
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(t.chart_axis))
                 .bounds([min_cpu_x, max_cpu_x])
                 .labels(vec![Span::raw("-60s"), Span::raw("now")]),
         )
         .y_axis(
             Axis::default()
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(t.chart_axis))
                 .bounds([min_cpu_val, max_cpu_val])
                 .labels(get_ticks(min_cpu_val, max_cpu_val, format_cpu)),
         );
@@ -130,9 +131,9 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         .marker(symbols::Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(if is_running {
-            Color::Magenta
+            t.chart_ram
         } else {
-            Color::DarkGray
+            t.text_secondary
         }))
         .data(ram_data);
 
@@ -145,13 +146,13 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         )
         .x_axis(
             Axis::default()
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(t.chart_axis))
                 .bounds([min_ram_x, max_ram_x])
                 .labels(vec![Span::raw("-60s"), Span::raw("now")]),
         )
         .y_axis(
             Axis::default()
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(t.chart_axis))
                 .bounds([min_ram_val, max_ram_val])
                 .labels(get_ticks(min_ram_val, max_ram_val, format_memory)),
         );

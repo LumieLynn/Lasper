@@ -1,10 +1,11 @@
 pub mod core;
+pub mod log_manager;
 pub mod panes;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
@@ -62,6 +63,7 @@ pub struct DetailPanel {
     pub(crate) logs_len: usize,
     pub(crate) config_len: usize,
     pub(crate) last_rendered_width: u16,
+    pub(crate) log_cache: core::scrolling::LogRenderCache,
 }
 
 impl DetailPanel {
@@ -80,6 +82,7 @@ impl DetailPanel {
             logs_len: 0,
             config_len: 0,
             last_rendered_width: 0,
+            log_cache: core::scrolling::LogRenderCache::new(),
         }
     }
 
@@ -95,8 +98,7 @@ impl DetailPanel {
         resize_mode: bool,
     ) {
         // Border
-        let border_color =
-            crate::ui::panel_border_color(resize_mode, self.focused, Color::DarkGray);
+        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, false);
 
         let tabs_line = self.get_tabs_line(data);
 
@@ -126,7 +128,7 @@ impl DetailPanel {
                 panes::properties::render(f, data, inner_area, self.properties_scroll)
             }
             DetailPane::Details => panes::details::render(f, data, inner_area, self.details_scroll),
-            DetailPane::Logs => panes::logs::render(f, data, inner_area, self.log_scroll),
+            DetailPane::Logs => panes::logs::render(f, data, self, inner_area),
             DetailPane::Config => panes::configs::render(f, data, inner_area, self.config_scroll),
             DetailPane::Metrics => panes::metrics::render(f, data, inner_area),
         }
@@ -167,14 +169,15 @@ impl DetailPanel {
 
         let mut spans = Vec::new();
 
+        let t = crate::ui::theme::theme();
         for (i, label) in labels.iter().enumerate() {
-            let mut style = Style::default().fg(Color::DarkGray);
+            let mut style = Style::default().fg(t.tab_inactive);
             if i == selected {
                 style = style
                     .fg(if self.focused {
-                        Color::Yellow
+                        t.tab_active_focused
                     } else {
-                        Color::White
+                        t.tab_active_unfocused
                     })
                     .add_modifier(Modifier::BOLD);
             }

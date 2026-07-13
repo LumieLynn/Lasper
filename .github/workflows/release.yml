@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    name: validate release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      note: ${{ steps.release.outputs.note }}
+      prerelease: ${{ steps.release.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag and release note
+        id: release
+        shell: bash
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          EXPECTED_TAG="v${VERSION}"
+          NOTE="release-notes/${EXPECTED_TAG}.md"
+
+          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION}" >&2
+            exit 1
+          fi
+
+          if [[ ! -s "${NOTE}" ]]; then
+            echo "Required release note ${NOTE} is missing or empty" >&2
+            exit 1
+          fi
+
+          git fetch origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+            echo "Tag ${GITHUB_REF_NAME} is not attached to the main branch" >&2
+            exit 1
+          fi
+
+          echo "note=${NOTE}" >> "${GITHUB_OUTPUT}"
+          if [[ "${VERSION}" == *-* ]]; then
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+          fi
+
+  verify:
+    name: verify release
+    runs-on: ubuntu-latest
+    needs: metadata
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: Run tests
+        run: cargo test --all-targets --locked
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Audit dependencies
+        run: >-
+          cargo audit
+          --ignore RUSTSEC-2026-0194
+          --ignore RUSTSEC-2026-0195
+
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            zig: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            zig: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Setup zig
+        if: ${{ matrix.zig }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.zig }}
+        run: cargo install cargo-zigbuild
+
+      - name: Build (glibc)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked
+
+      - name: Install target
+        if: ${{ matrix.zig }}
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (musl)
+        if: ${{ matrix.zig }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/lasper" "lasper-${{ matrix.target }}"
+          else
+            cp target/release/lasper "lasper-${{ matrix.target }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lasper-${{ matrix.target }}
+          path: lasper-${{ matrix.target }}
+          if-no-files-found: error
+
+  release:
+    name: publish GitHub release
+    runs-on: ubuntu-latest
+    needs: [metadata, verify, build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lasper-*
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum lasper-* > SHA256SUMS
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ needs.metadata.outputs.note }}
+          files: dist/*
+          prerelease: ${{ needs.metadata.outputs.prerelease }}
+          make_latest: ${{ needs.metadata.outputs.prerelease == 'false' }}
+          fail_on_unmatched_files: true

@@ -35,9 +35,12 @@ pub async fn scan_available_wayland_sockets() -> Vec<String> {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
 
-            // Match wayland-* but exclude .lock files
+            // Match wayland-* but exclude .lock files.
+            // Use tokio::fs::metadata (stat, follows symlinks) instead of
+            // entry.metadata() (lstat) so that WSL symlink-to-socket entries
+            // are detected correctly.
             if name.starts_with("wayland-") && !name.ends_with(".lock") {
-                if let Ok(meta) = entry.metadata().await {
+                if let Ok(meta) = tokio::fs::metadata(entry.path()).await {
                     if meta.file_type().is_socket() {
                         sockets.push(name.to_string());
                     }

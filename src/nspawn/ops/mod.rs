@@ -1,11 +1,13 @@
 pub mod handlers;
 pub mod inspect;
 pub mod manager;
+pub mod permission;
 pub mod provision;
 
 pub use manager::{DefaultManager, NspawnManager};
+pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BackendCommand {
     SubmitConfig(Box<crate::ui::wizard::context::WizardContext>),
     ValidateInterface { name: String, is_bridge_mode: bool },

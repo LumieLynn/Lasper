@@ -2,7 +2,7 @@ use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState},
     Frame,
 };
@@ -139,10 +139,11 @@ impl<T> Checklist<T> {
         );
 
         if self.enabled {
+            let t = crate::ui::theme::theme();
             list = list
                 .highlight_style(
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(t.list_highlight_symbol)
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol(">> ");

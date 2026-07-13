@@ -1,17 +1,10 @@
 use crate::nspawn::models::{BindMount, IdmapSuffix};
-use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+use crate::ui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, BorderType, Borders, Clear},
-    Frame,
-};
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -85,23 +78,6 @@ impl BindMountBox {
         }
     }
 
-    fn update_focus(&mut self) {
-        let mut comps = active_comps!(self);
-        self.focus.update_focus(&mut comps, true);
-    }
-
-    fn next(&mut self) {
-        let comps = active_comps!(self);
-        self.focus.next(&comps);
-        self.update_focus();
-    }
-
-    fn prev(&mut self) {
-        let comps = active_comps!(self);
-        self.focus.prev(&comps);
-        self.update_focus();
-    }
-
     pub fn with_mount(mut self, bm: &BindMount) -> Self {
         self.source_path = PathBox::new("Source Path", bm.source.clone()).with_validator(|v| {
             let path = std::path::Path::new(v.trim());
@@ -168,106 +144,9 @@ impl BindMountBox {
     }
 }
 
-impl Component for BindMountBox {
-    fn render(&mut self, f: &mut Frame, area: Rect) {
-        let dialog_area = crate::ui::centered_rect(45, 55, area);
-        f.render_widget(Clear, dialog_area);
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" Add Bind Mount ")
-            .border_style(Style::default().fg(Color::Cyan));
-        let inner = block.inner(dialog_area);
-        f.render_widget(block, dialog_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(0),
-                Constraint::Length(3),
-            ])
-            .split(inner);
-
-        self.source_path.render(f, chunks[0]);
-        self.target_path.render(f, chunks[1]);
-        self.readonly.render(f, chunks[2]);
-        self.suffix.render(f, chunks[3]);
-
-        let btn_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[5]);
-
-        let ok_area = crate::ui::centered_rect(60, 100, btn_chunks[0]);
-        let cancel_area = crate::ui::centered_rect(60, 100, btn_chunks[1]);
-        self.btn_ok.render(f, ok_area);
-        self.btn_cancel.render(f, cancel_area);
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Tab => {
-                self.next();
-                return EventResult::Consumed;
-            }
-            KeyCode::BackTab => {
-                self.prev();
-                return EventResult::Consumed;
-            }
-            KeyCode::Enter if !self.btn_ok.is_focused() && !self.btn_cancel.is_focused() => {
-                return if let Some(msg) = self.try_submit() {
-                    EventResult::Message(msg)
-                } else {
-                    EventResult::Consumed
-                };
-            }
-            _ => {}
-        }
-
-        let mut comps = active_comps!(self);
-        let res = comps[self.focus.active_idx].handle_key(key);
-        match res {
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
-                if let Some(msg) = self.try_submit() {
-                    EventResult::Message(msg)
-                } else {
-                    EventResult::Consumed
-                }
-            }
-            EventResult::Message(AppMessage::Wizard(WizardMessage::DialogCancel)) => res,
-            EventResult::FocusNext => {
-                self.next();
-                EventResult::Consumed
-            }
-            EventResult::FocusPrev => {
-                self.prev();
-                EventResult::Consumed
-            }
-            _ => res,
-        }
-    }
-
-    fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.source_path.set_focus(false);
-            self.target_path.set_focus(false);
-            self.readonly.set_focus(false);
-            self.suffix.set_focus(false);
-            self.btn_ok.set_focus(false);
-            self.btn_cancel.set_focus(false);
-        }
-    }
-
-    fn is_focused(&self) -> bool {
-        self.source_path.is_focused()
-            || self.target_path.is_focused()
-            || self.readonly.is_focused()
-            || self.suffix.is_focused()
-    }
-}
+form_dialog!(
+    BindMountBox,
+    " Add Bind Mount ",
+    (45, 55),
+    [source_path, target_path, readonly, suffix]
+);

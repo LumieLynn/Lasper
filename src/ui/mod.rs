@@ -12,33 +12,18 @@ pub enum StatusLevel {
 }
 
 /// Border color for top-level panels (container list, detail, terminal).
-pub fn panel_border_color(resize_mode: bool, focused: bool, unfocused: Color) -> Color {
-    if resize_mode {
-        if focused {
-            Color::Yellow
-        } else {
-            Color::Rgb(180, 140, 0)
-        }
-    } else if focused {
-        Color::Cyan
-    } else {
-        unfocused
-    }
+pub fn panel_border_color(resize_mode: bool, focused: bool, is_primary: bool) -> Color {
+    theme::theme().panel_border(resize_mode, focused, is_primary)
 }
 
 /// Border color for inner widgets (selectable lists, checklists, inputs).
 pub fn widget_border_color(focused: bool, enabled: bool) -> Color {
-    if !enabled {
-        Color::DarkGray
-    } else if focused {
-        Color::Cyan
-    } else {
-        Color::White
-    }
+    theme::theme().widget_border(focused, enabled)
 }
 
 pub mod core;
 pub mod layout;
+pub mod theme;
 pub mod views;
 pub mod widgets;
 pub mod wizard;

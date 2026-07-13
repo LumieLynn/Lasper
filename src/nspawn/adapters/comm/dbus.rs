@@ -1,26 +1,12 @@
 #![allow(clippy::type_complexity)]
 
+use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
 use std::collections::HashMap;
-use zbus::zvariant::OwnedObjectPath;
+use zbus::proxy::MethodFlags;
+use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait::async_trait]
-pub trait DbusProvider: Send + Sync + 'static {
-    async fn is_available(&self) -> bool;
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
-    async fn start(&self, name: &str) -> Result<()>;
-    async fn terminate(&self, name: &str) -> Result<()>;
-    async fn poweroff(&self, name: &str) -> Result<()>;
-    async fn reboot(&self, name: &str) -> Result<()>;
-    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
-    async fn remove(&self, name: &str) -> Result<()>;
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
-    async fn reload_daemon(&self) -> Result<()>;
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()>;
-}
 
 #[proxy(
     interface = "org.freedesktop.machine1.Manager",
@@ -34,9 +20,12 @@ trait Manager {
     ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
+    #[zbus(allow_interactive_auth)]
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
     fn get_machine_addresses(&self, name: &str) -> zbus::Result<Vec<(i32, Vec<u8>)>>;
+    #[zbus(allow_interactive_auth)]
     fn remove_image(&self, name: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn machine_new(&self, machine: String, path: OwnedObjectPath) -> zbus::Result<()>;
@@ -57,11 +46,11 @@ trait Machine {
 }
 
 #[derive(Clone)]
-pub struct DefaultDbusProvider {
+pub struct DbusBackend {
     conn: std::sync::Arc<tokio::sync::OnceCell<Option<Connection>>>,
 }
 
-impl DefaultDbusProvider {
+impl DbusBackend {
     pub fn new() -> Self {
         Self {
             conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
@@ -80,10 +69,43 @@ impl DefaultDbusProvider {
         let conn = self.connection().await?;
         ManagerProxy::new(&conn).await.ok()
     }
+
+    /// Call a method on `org.freedesktop.systemd1.Manager` with
+    /// `AllowInteractiveAuth` set, so polkit can trigger the desktop
+    /// environment's authentication agent (the same path `machinectl` uses).
+    async fn call_systemd1<B, R>(&self, method: &str, body: &B) -> Result<()>
+    where
+        B: serde::Serialize + zvariant::DynamicType,
+        R: serde::de::DeserializeOwned + zvariant::Type,
+    {
+        let conn = self
+            .connection()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let proxy = zbus::proxy::Proxy::new(
+            &conn,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        )
+        .await
+        .map_err(NspawnError::Dbus)?;
+        let _: R = proxy
+            .call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body)
+            .await
+            .map_err(NspawnError::Dbus)?
+            .ok_or_else(|| {
+                NspawnError::Dbus(zbus::Error::Failure(format!(
+                    "no reply from systemd1.Manager.{}",
+                    method
+                )))
+            })?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
-impl DbusProvider for DefaultDbusProvider {
+impl ContainerBackend for DbusBackend {
     async fn is_available(&self) -> bool {
         self.connection().await.is_some()
     }
@@ -164,21 +186,9 @@ impl DbusProvider for DefaultDbusProvider {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let unit = format!("systemd-nspawn@{}.service", name);
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "StartUnit",
-            &(&unit, "fail"),
-        )
-        .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
+        self.call_systemd1::<_, OwnedObjectPath>("StartUnit", &(&unit, "fail"))
+            .await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
@@ -216,6 +226,23 @@ impl DbusProvider for DefaultDbusProvider {
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())
+    }
+
+    async fn enable(&self, name: &str) -> Result<()> {
+        let unit = format!("systemd-nspawn@{}.service", name);
+        let files: Vec<(&str, bool)> = vec![(&unit, false)];
+        self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
+            "EnableUnitFiles",
+            &(files, false),
+        )
+        .await
+    }
+
+    async fn disable(&self, name: &str) -> Result<()> {
+        let unit = format!("systemd-nspawn@{}.service", name);
+        let files: Vec<&str> = vec![&unit];
+        self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
+            .await
     }
 
     async fn kill(&self, name: &str, signal: &str) -> Result<()> {
@@ -259,23 +286,9 @@ impl DbusProvider for DefaultDbusProvider {
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
         if let Ok(sd_props) = get_systemd1_properties(&conn, name).await {
             for (k, v) in sd_props {
-                if matches!(
-                    k.as_str(),
-                    "After"
-                        | "Before"
-                        | "Wants"
-                        | "WantedBy"
-                        | "Requires"
-                        | "RequiredBy"
-                        | "Conflicts"
-                        | "ConflictedBy"
-                ) {
-                    if !v.is_empty() && v != "[]" {
-                        props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, k, v);
-                    }
-                } else {
-                    props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, k, v);
-                }
+                crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                    &mut props, k, v,
+                );
             }
         }
 
@@ -289,23 +302,9 @@ impl DbusProvider for DefaultDbusProvider {
     }
 
     async fn reload_daemon(&self) -> Result<()> {
-        let conn = self
-            .connection()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        conn.call_method(
-            Some("org.freedesktop.systemd1"),
-            "/org/freedesktop/systemd1",
-            Some("org.freedesktop.systemd1.Manager"),
-            "Reload",
-            &(),
-        )
-        .await
-        .map_err(NspawnError::Dbus)?;
-        Ok(())
+        self.call_systemd1::<_, ()>("Reload", &()).await
     }
 
-    /// Block and watch for machine start/stop events. Sends a signal to tx whenever a change occurs.
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
         use futures_util::StreamExt;
         let proxy = self
@@ -377,6 +376,7 @@ async fn get_systemd1_properties(
         .destination("org.freedesktop.systemd1")?
         .path(unit_path)?;
     let props_proxy = b.build().await?;
+
     let interface: zbus::names::InterfaceName = "org.freedesktop.systemd1.Unit".try_into().unwrap();
     let all_props = props_proxy.get_all(Some(interface).into()).await?;
     let mut map = HashMap::new();
@@ -384,5 +384,16 @@ async fn get_systemd1_properties(
         let val = crate::nspawn::adapters::comm::formatting::format_property(&k, &v.into());
         map.insert(k, val);
     }
+
+    // Also fetch Service interface properties
+    let svc_interface: zbus::names::InterfaceName =
+        "org.freedesktop.systemd1.Service".try_into().unwrap();
+    if let Ok(svc_props) = props_proxy.get_all(Some(svc_interface).into()).await {
+        for (k, v) in svc_props {
+            let val = crate::nspawn::adapters::comm::formatting::format_property(&k, &v.into());
+            map.insert(k, val);
+        }
+    }
+
     Ok(map)
 }

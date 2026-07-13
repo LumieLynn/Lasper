@@ -30,12 +30,10 @@ impl StorageType {
 
     pub fn get_path(&self, name: &str) -> PathBuf {
         match self {
-            Self::Directory | Self::Subvolume => {
-                PathBuf::from(format!("/var/lib/machines/{}", name))
-            }
+            Self::Directory | Self::Subvolume => crate::paths::machine_root(name),
             Self::DiskImage => {
                 // Only raw disk images are supported by systemd-nspawn
-                let base = PathBuf::from("/var/lib/machines").join(name);
+                let base = crate::paths::machine_root(name);
                 for ext in ["raw", "img"] {
                     let p = base.with_extension(ext);
                     if p.exists() {
@@ -59,28 +57,50 @@ pub struct StorageInfo {
 pub trait StorageBackend: Send + Sync {
     fn get_type(&self) -> StorageType;
     fn get_path(&self, name: &str) -> PathBuf;
-    async fn create(&self, name: &str) -> Result<PathBuf>;
+    async fn create(
+        &self,
+        name: &str,
+        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<PathBuf>;
 
     /// Mount the storage and return the path to the rootfs.
-    async fn mount(&self, name: &str) -> Result<PathBuf>;
+    async fn mount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<PathBuf>;
 
     /// Unmount the storage.
-    async fn unmount(&self, name: &str) -> Result<()>;
+    async fn unmount(
+        &self,
+        name: &str,
+        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<()>;
 
-    async fn delete(&self, name: &str) -> Result<()>;
+    async fn delete(
+        &self,
+        name: &str,
+        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> Result<()>;
     #[allow(dead_code)]
     async fn exists(&self, name: &str) -> bool;
 }
 
 // Helper to eliminate verbose explicit trait object casting and aid type inference
+#[allow(dead_code)]
 #[inline]
 fn into_backend<T: StorageBackend + 'static>(backend: T) -> Box<dyn StorageBackend> {
     Box::new(backend)
 }
 
+#[allow(dead_code)] // mount/unmount paths removed; kept for future storage-aware operations
 /// Factory function to get the appropriate storage backend for an existing machine.
 pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
-    let base = PathBuf::from("/var/lib/machines").join(name);
+    let base = crate::paths::machine_root(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
     let extensions = ["raw", "img", "iso"];

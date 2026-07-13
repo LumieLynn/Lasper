@@ -18,14 +18,19 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 ## Prerequisites
 
 - `systemd-container` (provides `machinectl` and `systemd-nspawn`)
-- Root privileges (run via `sudo`)
+- Permission to perform privileged container operations. The recommended mode
+  is `lasper -e`: the TUI stays unprivileged and starts a separate root daemon
+  through `sudo`. Running the entire TUI with `sudo lasper` remains supported
+  for compatibility but has a larger root attack surface.
 - *Optional*: `skopeo` and `umoci` (for OCI image support)
 - *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
 - *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
 ## ⚠️ Before You Begin – Must Read
 
-Lasper is in **early development**. **All users must read [CAVEATS.md](CAVEATS.md) before using Lasper.**  
+Lasper is in **early development**. **All users must read [CAVEATS.md](CAVEATS.md) before using Lasper.**
+The elevated daemon trust model and current dependency exceptions are documented
+in [SECURITY.md](SECURITY.md).
 Failure to review these caveats may lead to unexpected behavior or data loss.  
 For common questions, see [FAQ.md](FAQ.md).
 
@@ -45,11 +50,14 @@ sudo cp target/release/lasper /usr/local/bin/
 
 ## Usage
 
-Start the UI:
+Start the UI in the recommended elevated-daemon mode:
 
 ```bash
-sudo lasper
+lasper -e
 ```
+
+Run `lasper` without `-e` to rely on systemd/polkit for operations supported by
+the host policy.
 
 Pass `--version` or `--help` for version info and usage.
 

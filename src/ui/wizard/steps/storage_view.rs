@@ -6,6 +6,7 @@ use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{StorageState, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
+use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
 use crossterm::event::KeyEvent;
 use ratatui::{
@@ -133,7 +134,6 @@ impl Component for StorageStepView {
                 constraints.push(Constraint::Length(3)); // FS
             }
         }
-        constraints.push(Constraint::Length(1)); // Hint
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -177,15 +177,7 @@ impl Component for StorageStepView {
     }
 
     fn set_focus(&mut self, focused: bool) {
-        if focused {
-            self.update_focus();
-        } else {
-            self.list.set_focus(false);
-            self.creation_method.set_focus(false);
-            self.disk_size.set_focus(false);
-            self.disk_fs.set_focus(false);
-            self.import_path.set_focus(false);
-        }
+        wizard_set_focus!(self, focused, active_comps);
     }
 
     fn is_enabled(&self) -> bool {

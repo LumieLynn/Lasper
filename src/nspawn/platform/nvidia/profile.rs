@@ -20,6 +20,21 @@ pub struct NvidiaPassthroughProfile {
     pub category_destinations: HashMap<NvidiaFileCategory, String>,
     /// Whether to inject env vars into /etc/environment
     pub inject_env: bool,
+    /// User-assigned reclassifications for files the auto-classifier can't categorize.
+    #[serde(default)]
+    pub manual_classifications: Vec<ManualClassification>,
+}
+
+/// User-assigned reclassification for a single CDI file that couldn't be
+/// auto-categorized. Each entry maps a host_path to a category, destination,
+/// and bind type. Stored in the profile so it persists across sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ManualClassification {
+    pub host_path: String,
+    pub category: NvidiaFileCategory,
+    /// Container path override (empty = use CDI default container_path).
+    pub destination: String,
+    pub readonly: bool,
 }
 
 impl Default for NvidiaPassthroughProfile {
@@ -28,18 +43,23 @@ impl Default for NvidiaPassthroughProfile {
             gpu_device: "all".to_string(),
             mode: NvidiaPassthroughMode::Mirror,
             category_destinations: HashMap::new(),
-            inject_env: true,
+            inject_env: false,
+            manual_classifications: Vec::new(),
         }
     }
 }
 
 impl NvidiaPassthroughProfile {
-    pub async fn save(&self, name: &str) -> crate::nspawn::errors::Result<()> {
-        let mut state = super::state::get_external_state(name)
+    pub async fn save(
+        &self,
+        name: &str,
+        io: &crate::nspawn::sys::ElevatedIo,
+    ) -> crate::nspawn::errors::Result<()> {
+        let mut state = super::state::get_external_state(name, io)
             .await?
             .unwrap_or_default();
         state.profile = Some(self.clone());
-        super::state::save_external_state(name, &state).await
+        super::state::save_external_state(name, &state, io).await
     }
 }
 

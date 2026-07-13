@@ -2,7 +2,7 @@ use crate::ui::core::{AppMessage, Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::{Color, Style},
+    style::Style,
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
@@ -25,10 +25,13 @@ impl Button {
 
 impl Component for Button {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let t = crate::ui::theme::theme();
         let style = if self.focused {
-            Style::default().fg(Color::Black).bg(Color::Cyan)
+            Style::default()
+                .fg(t.button_focused_fg)
+                .bg(t.button_focused_bg)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(t.button_unfocused_fg)
         };
 
         let label = format!(" {} ", self.label);
@@ -36,9 +39,9 @@ impl Component for Button {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(if self.focused {
-                Style::default().fg(Color::Cyan)
+                Style::default().fg(t.button_border_focused)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(t.button_border_unfocused)
             });
 
         let p = Paragraph::new(label)
