@@ -179,7 +179,7 @@ impl PartialEq for ElevatedDaemon {
 }
 
 fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::TempDir> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let xdg_runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     let runtime_dir = xdg_runtime_dir
@@ -199,6 +199,7 @@ fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::TempDir> {
 
     let mut builder = tempfile::Builder::new();
     builder.prefix("lasper-");
+    builder.permissions(std::fs::Permissions::from_mode(0o700));
     let directory = match runtime_dir {
         Some(path) => builder.tempdir_in(path),
         None => builder.tempdir(),
@@ -207,7 +208,14 @@ fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::TempDir> {
     if metadata.uid() != user_uid || metadata.mode() & 0o777 != 0o700 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "fd socket directory ownership or mode verification failed",
+            format!(
+                "fd socket directory ownership or mode verification failed: \
+                 path={}, uid={} (expected {}), mode={:o} (expected 700)",
+                directory.path().display(),
+                metadata.uid(),
+                user_uid,
+                metadata.mode() & 0o777
+            ),
         ));
     }
     Ok(directory)
@@ -253,7 +261,13 @@ impl ElevatedDaemon {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .spawn()?;
+            .spawn()
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("failed to launch sudo daemon: {}", error),
+                )
+            })?;
 
         let pid = child.id().expect("child has pid");
 
@@ -386,6 +400,7 @@ impl ElevatedDaemon {
                 "[lasper] I/O task exiting, waiting for child pid={}...",
                 io_pid
             );
+            drop(stdin);
             let _ = child.wait().await;
             log::info!("[lasper] I/O task done (child reaped)");
         });
@@ -405,7 +420,12 @@ impl ElevatedDaemon {
                 std::collections::HashMap::new(),
             )),
         };
-        daemon.ping().await?;
+        daemon.ping().await.map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("daemon health check failed after sudo launch: {}", error),
+            )
+        })?;
 
         log::info!("Elevated daemon ready (pid={})", pid);
         Ok(daemon)
@@ -1683,5 +1703,17 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn fd_socket_directory_is_user_owned_and_private() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let uid = uzers::get_current_uid();
+        let directory = create_fd_socket_dir(uid).unwrap();
+        let metadata = std::fs::symlink_metadata(directory.path()).unwrap();
+
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
     }
 }

@@ -193,8 +193,11 @@ async fn main() -> Result<()> {
             match crate::nspawn::sys::daemon::ElevatedDaemon::spawn().await {
                 Ok(d) => Some(std::sync::Arc::new(d)),
                 Err(e) => {
-                    eprintln!("Failed to spawn elevated daemon: {}", e);
-                    eprintln!("Make sure you have sudo privileges.");
+                    eprintln!("Failed to start elevated daemon: {}", e);
+                    eprintln!(
+                        "For sudo errors, run `sudo -v`; otherwise inspect the reported \
+                         path or permission details."
+                    );
                     std::process::exit(1);
                 }
             }
