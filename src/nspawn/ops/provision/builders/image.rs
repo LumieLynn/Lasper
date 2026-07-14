@@ -6,7 +6,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::provision::{send_deploy_stream_log, Deployer};
 use crate::nspawn::sys::{log_output, CommandRunner};
 
 pub struct OciDeployer {
@@ -244,7 +244,7 @@ async fn stream_spawned(
         while let Ok(Some(line)) = lines.next_line().await {
             let trimmed = line.trim().to_string();
             if !trimmed.is_empty() {
-                let _ = logs.send(trimmed).await;
+                send_deploy_stream_log(&logs, trimmed).await;
             }
         }
     }
@@ -343,7 +343,7 @@ pub async fn import_oci_image(
                 while let Ok(Some(line)) = lines.next_line().await {
                     let trimmed = line.trim().to_string();
                     if !trimmed.is_empty() {
-                        let _ = logs.send(trimmed).await;
+                        send_deploy_stream_log(logs, trimmed).await;
                     }
                 }
             }

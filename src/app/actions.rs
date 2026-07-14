@@ -87,10 +87,17 @@ impl App {
                 }
             }
             DetailPane::Config => {
-                let new_content =
-                    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name)
-                        .await
-                        .map(|c| c.content);
+                let new_content = match self.data.exec_ctx.nspawn.read(&entry.name).await {
+                    Ok(config) => config.map(|config| config.content),
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to read .nspawn config for {}: {}",
+                            entry.name,
+                            error
+                        );
+                        None
+                    }
+                };
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
                     self.data.config_dirty = true;
@@ -252,10 +259,14 @@ impl App {
 
     pub fn action_kill(&mut self) {
         self.perform_container_action(
-            "Sent SIGTERM to",
+            "Sent SIGKILL to",
             None,
             |e| e.state.is_running(),
-            |name, manager| async move { manager.kill(&name, "SIGTERM").await },
+            |name, manager| async move {
+                manager
+                    .kill(&name, crate::nspawn::models::AllowedSignal::Kill)
+                    .await
+            },
         );
     }
 

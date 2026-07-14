@@ -1,5 +1,5 @@
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{AllowedSignal, ContainerEntry, MachineProperties};
 
 /// Unified backend for communicating with systemd-machined.
 ///
@@ -17,7 +17,7 @@ pub trait ContainerBackend: Send + Sync + 'static {
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
-    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
     async fn remove(&self, name: &str) -> Result<()>;
     async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
     async fn reload_daemon(&self) -> Result<()>;

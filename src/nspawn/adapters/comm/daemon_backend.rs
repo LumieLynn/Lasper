@@ -85,7 +85,7 @@ impl ContainerBackend for DaemonBackend {
         Ok(())
     }
 
-    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
+    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
         self.call(
             "dbus_kill",
             serde_json::json!({"name": name, "signal": signal}),

@@ -6,6 +6,7 @@
 //! never need to match on the daemon again — they just use `ctx.cmd`
 //! and `ctx.io`.
 
+use crate::nspawn::adapters::config::NspawnConfigStore;
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::{DaemonCommandRunner, ElevatedDaemon};
@@ -19,6 +20,7 @@ use std::sync::Arc;
 pub struct ExecutionContext {
     pub cmd: Arc<dyn CommandRunner>,
     pub io: ElevatedIo,
+    pub nspawn: NspawnConfigStore,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
 
@@ -34,7 +36,13 @@ impl ExecutionContext {
             Some(d) => ElevatedIo::with_daemon(level, d.clone()),
             None => ElevatedIo::new(level),
         };
-        Self { cmd, io, daemon }
+        let nspawn = NspawnConfigStore::new(daemon.clone());
+        Self {
+            cmd,
+            io,
+            nspawn,
+            daemon,
+        }
     }
 
     /// Expose the daemon reference for callers that need daemon-specific
@@ -55,6 +63,7 @@ impl std::fmt::Debug for ExecutionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionContext")
             .field("io", &self.io)
+            .field("nspawn", &self.nspawn)
             .field("daemon", &self.daemon)
             .finish()
     }

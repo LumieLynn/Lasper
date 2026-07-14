@@ -3,7 +3,7 @@ use crate::nspawn::adapters::comm::cli::CliBackend;
 use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{AllowedSignal, ContainerEntry, MachineProperties};
 use crate::nspawn::ops::{PermissionLevel, PermissionManager};
 use crate::nspawn::sys::ExecutionContext;
 use async_trait::async_trait;
@@ -30,7 +30,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn disable(&self, name: &str) -> Result<()>;
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
-    async fn kill(&self, name: &str, signal: &str) -> Result<()>;
+    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
     async fn remove(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
@@ -121,6 +121,7 @@ impl DefaultManager {
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(
             name,
             &io,
+            &self.exec_ctx.nspawn,
             self.exec_ctx.cmd.as_ref(),
         )
         .await?;
@@ -236,7 +237,7 @@ impl NspawnManager for DefaultManager {
         fallback_to_cli!(self, disable, name)
     }
 
-    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
+    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
         fallback_to_cli!(self, kill, name, signal)
     }
 
@@ -265,11 +266,7 @@ impl NspawnManager for DefaultManager {
 
         // systemd may or may not clean these up — an extra unlink is harmless
         let io = self.elevated_io();
-        let _ = io
-            .remove_file(
-                &crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
-            )
-            .await;
+        let _ = self.exec_ctx.nspawn.remove(name).await;
         let _ = io
             .remove_dir_all(&std::path::PathBuf::from(format!(
                 "/etc/systemd/system/systemd-nspawn@{}.service.d",

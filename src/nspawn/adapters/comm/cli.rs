@@ -221,8 +221,9 @@ impl ContainerBackend for CliBackend {
         self.run_machinectl(&["disable", name]).await
     }
 
-    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
-        self.run_machinectl(&["kill", "-s", signal, name]).await
+    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
+        self.run_machinectl(&["kill", "-s", signal.as_name(), name])
+            .await
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
@@ -556,11 +557,25 @@ mod tests {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
             let out = mock_output(true, "", "");
-            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r.expect_run()
+                .withf(|program, args| {
+                    program == "machinectl"
+                        && args
+                            == &[
+                                "kill".to_string(),
+                                "-s".to_string(),
+                                "SIGTERM".to_string(),
+                                "my-ctr".to_string(),
+                            ]
+                })
+                .returning(move |_, _| Ok(out.clone()));
             r
         });
         let provider = CliBackend::with_runner(runner);
 
-        provider.kill("my-ctr", "SIGTERM").await.unwrap();
+        provider
+            .kill("my-ctr", crate::nspawn::models::AllowedSignal::Terminate)
+            .await
+            .unwrap();
     }
 }

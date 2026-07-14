@@ -24,8 +24,11 @@
 //! session token delivered through the private stdin bootstrap pipe.
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::config::store::{
+    execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
+};
+use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
-use fs2::FileExt;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -37,7 +40,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 1;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct DaemonBootstrap {
@@ -47,10 +50,41 @@ struct DaemonBootstrap {
 
 #[derive(Serialize, Deserialize)]
 struct FdRequest {
-    method: String,
     auth_token: String,
-    #[serde(default)]
-    params: serde_json::Value,
+    #[serde(flatten)]
+    operation: FdOperation,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "method", content = "params")]
+enum FdOperation {
+    #[serde(rename = "spawn_journalctl")]
+    Journalctl(SpawnJournalctlParams),
+    #[serde(rename = "spawn_login")]
+    Login(SpawnLoginParams),
+    #[serde(rename = "spawn_shell_cmd")]
+    ShellCommand(SpawnShellCmdParams),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnJournalctlParams {
+    name: MachineName,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnLoginParams {
+    name: MachineName,
+    size: TerminalSize,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnShellCmdParams {
+    cmd_id: u64,
+    program: String,
+    args: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -457,20 +491,20 @@ impl ElevatedDaemon {
             params,
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        log::info!("[lasper] rpc_call: sending {} (id={})...", method, id);
+        log::trace!("[lasper] rpc_call: sending {} (id={})", method, id);
         self.request_tx
             .send((request, response_tx))
             .await
             .map_err(|_| {
-                log::info!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
+                log::warn!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "daemon I/O task has stopped",
                 )
             })?;
-        log::info!("[lasper] rpc_call: waiting for response...");
+        log::trace!("[lasper] rpc_call: waiting for response id={}", id);
         let response = response_rx.await.map_err(|_| {
-            log::info!("[lasper] rpc_call: response channel cancelled");
+            log::warn!("[lasper] rpc_call: response channel cancelled id={}", id);
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "daemon response channel cancelled",
@@ -581,6 +615,17 @@ impl ElevatedDaemon {
         Ok(())
     }
 
+    pub(crate) async fn nspawn_config(
+        &self,
+        operation: NspawnConfigOperation,
+    ) -> std::io::Result<NspawnConfigResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     // ── FD-passing ──
     //
     // Connect and write the request async, then hand the fd to a blocking
@@ -588,8 +633,10 @@ impl ElevatedDaemon {
     // is unreliable when mixed with prior read/write ops on the same fd).
 
     pub async fn spawn_journalctl(&self, name: &str) -> std::io::Result<RawFd> {
+        let name = MachineName::try_from(name)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let std_sock = self
-            .open_fd_channel("spawn_journalctl", serde_json::json!({"name": name}))
+            .open_fd_channel(FdOperation::Journalctl(SpawnJournalctlParams { name }))
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 256];
@@ -609,11 +656,12 @@ impl ElevatedDaemon {
     }
 
     pub async fn spawn_login(&self, name: &str, cols: u16, rows: u16) -> std::io::Result<RawFd> {
+        let name = MachineName::try_from(name)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let size = TerminalSize::new(cols, rows)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let std_sock = self
-            .open_fd_channel(
-                "spawn_login",
-                serde_json::json!({"name": name, "cols": cols, "rows": rows}),
-            )
+            .open_fd_channel(FdOperation::Login(SpawnLoginParams { name, size }))
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 256];
@@ -649,14 +697,11 @@ impl ElevatedDaemon {
         args: &[String],
     ) -> std::io::Result<RawFd> {
         let std_sock = self
-            .open_fd_channel(
-                "spawn_shell_cmd",
-                serde_json::json!({
-                    "cmd_id": cmd_id,
-                    "program": program,
-                    "args": args,
-                }),
-            )
+            .open_fd_channel(FdOperation::ShellCommand(SpawnShellCmdParams {
+                cmd_id,
+                program: program.to_string(),
+                args: args.to_vec(),
+            }))
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 128];
@@ -677,16 +722,14 @@ impl ElevatedDaemon {
 
     async fn open_fd_channel(
         &self,
-        method: &str,
-        params: serde_json::Value,
+        operation: FdOperation,
     ) -> std::io::Result<std::os::unix::net::UnixStream> {
         use tokio::io::AsyncWriteExt;
 
         let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
         let request = FdRequest {
-            method: method.to_string(),
             auth_token: self.fd_auth_token.to_string(),
-            params,
+            operation,
         };
         let mut request_line = serde_json::to_vec(&request)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -876,7 +919,7 @@ pub async fn daemon_main(
             }
         };
 
-        match handle_request(&request, &dbus, &out_tx).await {
+        match handle_request(&request, &dbus, &out_tx, user_uid).await {
             HandleOutcome::Spawned => {}
             HandleOutcome::Sync(Ok(result)) => {
                 send_or_exit(
@@ -904,11 +947,44 @@ async fn handle_request(
     request: &RpcRequest,
     dbus: &Option<crate::nspawn::adapters::comm::dbus::DbusBackend>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
+    invoking_uid: u32,
 ) -> HandleOutcome {
     use crate::nspawn::adapters::comm::backend::ContainerBackend;
 
     match request.method.as_str() {
         "ping" => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+
+        "nspawn_config" => {
+            let operation: NspawnConfigOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid nspawn_config request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_nspawn_config_operation(operation, invoking_uid).await
+                {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
 
         "run_command" => {
             let id = request.id;
@@ -982,7 +1058,7 @@ async fn handle_request(
             };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let result: Result<(), String> = write_locked_impl(&path_str, &content).await;
+                let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
                 let response = match result {
                     Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     Err(e) => {
@@ -1126,15 +1202,18 @@ async fn handle_request(
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let name = match request.params["name"].as_str() {
-                Some(n) => n,
-                None => return HandleOutcome::Sync(Err("missing name".into())),
+            let name = match request_machine_name(request) {
+                Ok(name) => name,
+                Err(error) => return HandleOutcome::Sync(Err(error)),
             };
-            let signal = match request.params["signal"].as_str() {
-                Some(s) => s,
-                None => return HandleOutcome::Sync(Err("missing signal".into())),
-            };
-            match dbus.kill(name, signal).await {
+            let signal: AllowedSignal =
+                match serde_json::from_value(request.params["signal"].clone()) {
+                    Ok(signal) => signal,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!("invalid signal: {error}")));
+                    }
+                };
+            match dbus.kill(name.as_str(), signal).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
@@ -1145,11 +1224,11 @@ async fn handle_request(
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let name = match request.params["name"].as_str() {
-                Some(n) => n,
-                None => return HandleOutcome::Sync(Err("missing name".into())),
+            let name = match request_machine_name(request) {
+                Ok(name) => name,
+                Err(error) => return HandleOutcome::Sync(Err(error)),
             };
-            match dbus.get_properties(name).await {
+            match dbus.get_properties(name.as_str()).await {
                 Ok(props) => match serde_json::to_value(props) {
                     Ok(v) => HandleOutcome::Sync(Ok(v)),
                     Err(e) => HandleOutcome::Sync(Err(e.to_string())),
@@ -1223,14 +1302,21 @@ where
         Some(d) => d,
         None => return HandleOutcome::Sync(Err("DBus not available".into())),
     };
-    let name = match request.params["name"].as_str() {
-        Some(n) => n.to_owned(),
-        None => return HandleOutcome::Sync(Err("missing name".into())),
+    let name = match request_machine_name(request) {
+        Ok(name) => name,
+        Err(error) => return HandleOutcome::Sync(Err(error)),
     };
-    match f(dbus.clone(), name).await {
+    match f(dbus.clone(), name.into_string()).await {
         Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
         Err(e) => HandleOutcome::Sync(Err(e)),
     }
+}
+
+fn request_machine_name(request: &RpcRequest) -> Result<MachineName, String> {
+    let name = request.params["name"]
+        .as_str()
+        .ok_or_else(|| "missing name".to_string())?;
+    MachineName::try_from(name).map_err(|error| error.to_string())
 }
 
 // ── Peer credential verification ──
@@ -1377,8 +1463,8 @@ async fn handle_fd_connection(
         return;
     }
 
+    let operation = request.operation;
     let stream = buf_reader.into_inner();
-    let method = request.method.as_str();
 
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
@@ -1394,13 +1480,12 @@ async fn handle_fd_connection(
         }
     };
 
-    match method {
-        "spawn_journalctl" => {
-            let name = request.params["name"].as_str().unwrap_or("");
+    match operation {
+        FdOperation::Journalctl(SpawnJournalctlParams { name }) => {
             match crate::nspawn::sys::new_sync_command("journalctl")
                 .args([
                     "-M",
-                    name,
+                    name.as_str(),
                     "-n",
                     "1000",
                     "-f",
@@ -1428,16 +1513,12 @@ async fn handle_fd_connection(
             }
         }
 
-        "spawn_login" => {
-            let name = request.params["name"].as_str().unwrap_or("");
-            let cols: u16 = request.params["cols"].as_u64().unwrap_or(80) as u16;
-            let rows: u16 = request.params["rows"].as_u64().unwrap_or(24) as u16;
-
+        FdOperation::Login(SpawnLoginParams { name, size }) => {
             use portable_pty::{native_pty_system, CommandBuilder, PtySize};
             let pty_system = native_pty_system();
             let pair = match pty_system.openpty(PtySize {
-                rows,
-                cols,
+                rows: size.rows(),
+                cols: size.cols(),
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
@@ -1449,7 +1530,7 @@ async fn handle_fd_connection(
             };
 
             let mut cmd = CommandBuilder::new("machinectl");
-            cmd.args(["login", name]);
+            cmd.args(["login", name.as_str()]);
             match pair.slave.spawn_command(cmd) {
                 Ok(mut child) => {
                     drop(pair.slave);
@@ -1469,18 +1550,11 @@ async fn handle_fd_connection(
             }
         }
 
-        "spawn_shell_cmd" => {
-            let cmd_id = request.params["cmd_id"].as_u64().unwrap_or(0);
-            let program = request.params["program"].as_str().unwrap_or("").to_string();
-            let args: Vec<String> = request.params["args"]
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
+        FdOperation::ShellCommand(SpawnShellCmdParams {
+            cmd_id,
+            program,
+            args,
+        }) => {
             match crate::nspawn::sys::new_sync_command("sh")
                 .arg("-c")
                 .arg("exec \"$@\" 2>&1")
@@ -1514,8 +1588,6 @@ async fn handle_fd_connection(
                 }
             }
         }
-
-        _ => log::warn!("Daemon fd-handler: unknown method: {}", method),
     }
 }
 
@@ -1523,81 +1595,15 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-// ── Atomic locked write (daemon side) ──
+// ── Atomic write (daemon side) ──
 
-/// Lock → write tmp → fsync → rename → parent fsync → unlock.
-///
-/// Mirrors [`crate::nspawn::sys::io::AsyncLockedWriter::write_locked`]
-/// but runs inside the root daemon so all file I/O is privileged.
-async fn write_locked_impl(path_str: &str, content: &str) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::{sleep, Duration};
-
+/// Generic daemon file writes are one-shot replacements. Cross-process
+/// read-modify-write paths must use a typed operation with its own lock.
+async fn write_atomic_impl(path_str: &str, content: &str) -> Result<(), String> {
     let path = std::path::Path::new(path_str);
-    let lock_path = path.with_extension("lock");
-    let tmp_path = path.with_extension("tmp");
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir -p {}: {}", parent.display(), e))?;
-    }
-
-    // Acquire exclusive lock (async backoff loop)
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("open lock {:?}: {}", lock_path, e))?;
-
-    let mut attempts = 0;
-    loop {
-        match lock_file.try_lock_exclusive() {
-            Ok(_) => break,
-            Err(_) if attempts < 100 => {
-                attempts += 1;
-                sleep(Duration::from_millis(10)).await;
-            }
-            Err(e) => {
-                return Err(format!(
-                    "could not acquire lock on {:?} after {} attempts: {}",
-                    lock_path, attempts, e
-                ));
-            }
-        }
-    }
-
-    // Write + fsync to temp file
-    {
-        let mut f = tokio::fs::File::create(&tmp_path)
-            .await
-            .map_err(|e| format!("create tmp {:?}: {}", tmp_path, e))?;
-        f.write_all(content.as_bytes())
-            .await
-            .map_err(|e| format!("write tmp {:?}: {}", tmp_path, e))?;
-        f.sync_data()
-            .await
-            .map_err(|e| format!("fsync tmp {:?}: {}", tmp_path, e))?;
-    }
-
-    // Atomic rename
-    tokio::fs::rename(&tmp_path, path)
+    crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(path, content)
         .await
-        .map_err(|e| format!("rename {:?} -> {:?}: {}", tmp_path, path, e))?;
-
-    // Sync parent directory
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    // Remove lock file before closing handle (safe on Linux: unlink while open)
-    let _ = tokio::fs::remove_file(&lock_path).await;
-
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1618,6 +1624,23 @@ mod tests {
         assert_eq!(json["stdout"], "hello");
         let parsed: CommandResult = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.status, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_write_file_is_atomic_without_persistent_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".wayland-env");
+
+        write_atomic_impl(path.to_str().unwrap(), "WAYLAND_DISPLAY=wayland-0\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "WAYLAND_DISPLAY=wayland-0\n"
+        );
+        assert!(!path.with_extension("lock").exists());
+        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[test]
@@ -1677,6 +1700,75 @@ mod tests {
     fn fd_request_without_authentication_is_rejected_by_parser() {
         let request = r#"{"method":"spawn_shell_cmd","params":{"program":"id","args":[]}}"#;
         assert!(serde_json::from_str::<FdRequest>(request).is_err());
+    }
+
+    #[test]
+    fn fd_request_round_trip_uses_typed_login_parameters() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::Login(SpawnLoginParams {
+                name: MachineName::new("test-machine").unwrap(),
+                size: TerminalSize::new(120, 40).unwrap(),
+            }),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "spawn_login");
+        assert_eq!(json["params"]["name"], "test-machine");
+        assert_eq!(json["params"]["size"]["cols"], 120);
+        assert_eq!(json["params"]["size"]["rows"], 40);
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        match parsed.operation {
+            FdOperation::Login(params) => {
+                assert_eq!(params.name.as_str(), "test-machine");
+                assert_eq!(params.size, TerminalSize::new(120, 40).unwrap());
+            }
+            _ => panic!("expected spawn_login"),
+        }
+    }
+
+    #[test]
+    fn fd_request_rejects_invalid_machine_name_and_terminal_size() {
+        let invalid_name = format!(
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_journalctl","params":{{"name":"../escape"}}}}"#
+        );
+        assert!(serde_json::from_str::<FdRequest>(&invalid_name).is_err());
+
+        let zero_size = format!(
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_login","params":{{"name":"test","size":{{"cols":80,"rows":0}}}}}}"#
+        );
+        assert!(serde_json::from_str::<FdRequest>(&zero_size).is_err());
+
+        let out_of_range = format!(
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_login","params":{{"name":"test","size":{{"cols":65536,"rows":24}}}}}}"#
+        );
+        assert!(serde_json::from_str::<FdRequest>(&out_of_range).is_err());
+
+        let unknown_parameter = format!(
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_journalctl","params":{{"name":"test","unexpected":true}}}}"#
+        );
+        assert!(serde_json::from_str::<FdRequest>(&unknown_parameter).is_err());
+    }
+
+    #[test]
+    fn rpc_machine_name_validation_runs_on_daemon_request() {
+        let valid = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "dbus_start".into(),
+            params: serde_json::json!({"name": "valid-machine"}),
+        };
+        assert_eq!(
+            request_machine_name(&valid).unwrap().as_str(),
+            "valid-machine"
+        );
+
+        let invalid = RpcRequest {
+            params: serde_json::json!({"name": "../escape"}),
+            ..valid
+        };
+        assert!(request_machine_name(&invalid).is_err());
     }
 
     #[tokio::test]
