@@ -252,10 +252,14 @@ impl App {
 
     pub fn action_kill(&mut self) {
         self.perform_container_action(
-            "Sent SIGTERM to",
+            "Sent SIGKILL to",
             None,
             |e| e.state.is_running(),
-            |name, manager| async move { manager.kill(&name, "SIGTERM").await },
+            |name, manager| async move {
+                manager
+                    .kill(&name, crate::nspawn::models::AllowedSignal::Kill)
+                    .await
+            },
         );
     }
 

@@ -245,14 +245,13 @@ impl ContainerBackend for DbusBackend {
             .await
     }
 
-    async fn kill(&self, name: &str, signal: &str) -> Result<()> {
+    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let sig = signal.parse::<i32>().unwrap_or(15);
         proxy
-            .kill_machine(name, "all", sig)
+            .kill_machine(name, "all", signal.as_raw())
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())

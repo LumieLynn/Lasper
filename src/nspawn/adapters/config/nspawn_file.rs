@@ -14,20 +14,9 @@ pub struct NspawnConfig {
 /// Defense-in-depth: the wizard UI already validates this, but backend
 /// must not trust inputs blindly in case of restricted-sudo environments.
 pub fn validate_machine_name(name: &str) -> Result<()> {
-    if name.is_empty()
-        || name.len() > 64
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-        || name.starts_with('.')
-        || name.contains("..")
-    {
-        return Err(NspawnError::Validation(format!(
-            "Invalid machine name: '{}'. Must be 1-64 chars, [a-zA-Z0-9_.-], no leading dot or '..'",
-            name
-        )));
-    }
-    Ok(())
+    crate::nspawn::models::MachineName::new(name)
+        .map(|_| ())
+        .map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 impl NspawnConfig {
