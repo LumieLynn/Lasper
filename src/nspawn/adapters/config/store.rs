@@ -197,11 +197,7 @@ pub(crate) async fn execute_nspawn_config_operation(
         }
         NspawnConfigOperation::Remove(request) => {
             let path = nspawn_path(&request.machine);
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(NspawnError::Io(path, error)),
-            }
+            remove_config_at(&path).await?;
             Ok(NspawnConfigResult::default())
         }
     }
@@ -221,6 +217,21 @@ async fn read_optional(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
     }
+}
+
+async fn remove_optional_file(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn remove_config_at(path: &Path) -> Result<()> {
+    remove_optional_file(path).await?;
+    remove_optional_file(&crate::nspawn::sys::io::lock_path_for(path)).await?;
+    remove_optional_file(&path.with_extension("lock")).await?;
+    Ok(())
 }
 
 async fn write_content(path: &Path, content: String) -> Result<()> {
@@ -435,6 +446,23 @@ mod tests {
         assert!(content.contains("Boot=yes"));
         assert!(content.contains("Hostname=test-host"));
         assert!(crate::nspawn::sys::io::lock_path_for(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn remove_config_deletes_config_and_lock_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.nspawn");
+        let lock_path = crate::nspawn::sys::io::lock_path_for(&path);
+        let legacy_lock_path = path.with_extension("lock");
+        tokio::fs::write(&path, "[Exec]\nBoot=yes\n").await.unwrap();
+        tokio::fs::write(&lock_path, "").await.unwrap();
+        tokio::fs::write(&legacy_lock_path, "").await.unwrap();
+
+        remove_config_at(&path).await.unwrap();
+
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+        assert!(!legacy_lock_path.exists());
     }
 
     #[tokio::test]
