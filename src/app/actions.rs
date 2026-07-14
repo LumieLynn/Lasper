@@ -87,10 +87,17 @@ impl App {
                 }
             }
             DetailPane::Config => {
-                let new_content =
-                    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(&entry.name)
-                        .await
-                        .map(|c| c.content);
+                let new_content = match self.data.exec_ctx.nspawn.read(&entry.name).await {
+                    Ok(config) => config.map(|config| config.content),
+                    Err(error) => {
+                        log::warn!(
+                            "Failed to read .nspawn config for {}: {}",
+                            entry.name,
+                            error
+                        );
+                        None
+                    }
+                };
                 if self.data.config_content != new_content {
                     self.ui.detail_panel.config_scroll = 0;
                     self.data.config_dirty = true;

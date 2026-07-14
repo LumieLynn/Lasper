@@ -92,8 +92,9 @@ impl AsyncLockedWriter {
             }
         }
 
-        // Lock Hygiene: Delete lock file before closing handle
-        let _ = fs::remove_file(&lock_path).await;
+        // Keep the sidecar lock file persistent. Removing it would allow a
+        // concurrent process to open a new inode while another process still
+        // holds a lock on the old, unlinked inode.
 
         Ok(())
     }

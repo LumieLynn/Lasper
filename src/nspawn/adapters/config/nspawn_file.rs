@@ -1,7 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode};
 use ini::Ini;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
 pub struct NspawnConfig {
@@ -13,7 +13,8 @@ pub struct NspawnConfig {
 /// Validates a container name matches systemd machine name constraints.
 /// Defense-in-depth: the wizard UI already validates this, but backend
 /// must not trust inputs blindly in case of restricted-sudo environments.
-pub fn validate_machine_name(name: &str) -> Result<()> {
+#[cfg(test)]
+fn validate_machine_name(name: &str) -> Result<()> {
     crate::nspawn::models::MachineName::new(name)
         .map(|_| ())
         .map_err(|error| NspawnError::Validation(error.to_string()))
@@ -22,21 +23,6 @@ pub fn validate_machine_name(name: &str) -> Result<()> {
 impl NspawnConfig {
     pub fn default_path(name: &str) -> PathBuf {
         PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
-    }
-
-    /// Load the `.nspawn` config for a container by name.
-    pub async fn load(name: &str) -> Option<NspawnConfig> {
-        if validate_machine_name(name).is_err() {
-            return None;
-        }
-        let path = Self::default_path(name);
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) => Some(NspawnConfig { path, content }),
-            Err(e) => {
-                log::debug!("Could not read .nspawn config for {}: {}", name, e);
-                Option::None
-            }
-        }
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
@@ -54,26 +40,6 @@ impl NspawnConfig {
             .or(in_global)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
-    }
-
-    /// Update the .nspawn config using precision AST mutation.
-    ///
-    /// `existing_content` is the already-loaded file content — the caller
-    /// ([`ensure_gpu_passthrough`]) reads it once via [`NspawnConfig::load`].
-    /// Passing it here avoids a read-modify-write round-trip that the
-    /// elevated I/O path cannot support.
-    pub async fn update_gpu_passthrough(
-        name: &str,
-        existing_content: String,
-        new_state: &crate::nspawn::platform::nvidia::NvidiaState,
-        death_list: &[String],
-        io: &crate::nspawn::sys::ElevatedIo,
-    ) -> Result<()> {
-        validate_machine_name(name)?;
-        let path = Self::default_path(name);
-        let content =
-            Self::apply_gpu_passthrough_to_content(existing_content, new_state, death_list)?;
-        io.write(&path, &content).await
     }
 
     /// Scans the raw content for markers and removes the block.
@@ -229,10 +195,27 @@ impl NspawnConfig {
 
 /// Generate the content of a `.nspawn` container config file using AST.
 pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
-    validate_machine_name(&cfg.name)?;
+    let spec = NspawnConfigSpec::try_from(cfg)?;
+    nspawn_config_content_from_spec(&spec, xdg_runtime)
+}
+
+/// Generate `.nspawn` content from the privilege-safe configuration subset.
+pub fn nspawn_config_content_from_spec(
+    spec: &NspawnConfigSpec,
+    xdg_runtime: Option<&str>,
+) -> Result<String> {
+    nspawn_config_content_from_spec_with_wayland_path(spec, xdg_runtime, None)
+}
+
+pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
+    spec: &NspawnConfigSpec,
+    xdg_runtime: Option<&str>,
+    verified_wayland_socket: Option<&Path>,
+) -> Result<String> {
+    spec.validate()?;
     let mut conf = Ini::new();
 
-    if cfg.nvidia_gpu {
+    if spec.nvidia_gpu {
         conf.with_section(Some("General"))
             .set("X-Lasper-Nvidia-Enabled", "true");
     }
@@ -240,26 +223,26 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
     //[Exec]
     {
         let mut exec = conf.with_section(Some("Exec"));
-        if cfg.boot {
+        if spec.boot {
             exec.set("Boot", "yes");
         } else {
             exec.set("Boot", "no");
         }
 
-        if let Some(v) = &cfg.private_users {
-            exec.set("PrivateUsers", v.as_str());
+        if let Some(mode) = spec.private_users {
+            exec.set("PrivateUsers", mode.as_str());
         }
 
-        if cfg.privileged {
+        if spec.privileged {
             exec.set("Capability", "all");
         }
-        if !cfg.hostname.is_empty() && cfg.hostname != cfg.name {
-            exec.set("Hostname", &cfg.hostname);
+        if !spec.hostname.is_empty() && spec.hostname != spec.machine.as_str() {
+            exec.set("Hostname", &spec.hostname);
         }
     }
 
     //[Network]
-    if let Some(mode) = &cfg.network {
+    if let Some(mode) = &spec.network {
         use crate::nspawn::models::NetworkMode;
         match mode {
             NetworkMode::Host => {
@@ -273,8 +256,11 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
                 conf.with_section(Some("Network"))
                     .set("VirtualEthernet", "yes");
                 let net = conf.section_mut(Some("Network")).unwrap();
-                for pf in &cfg.port_forwards {
-                    net.append("Port", format!("{}:{}:{}", pf.proto, pf.host, pf.container));
+                for pf in &spec.port_forwards {
+                    net.append(
+                        "Port",
+                        format!("{}:{}:{}", pf.protocol.as_str(), pf.host, pf.container),
+                    );
                 }
             }
             NetworkMode::Bridge(name) => {
@@ -282,8 +268,11 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
                     .set("VirtualEthernet", "yes")
                     .set("Bridge", name.clone());
                 let net = conf.section_mut(Some("Network")).unwrap();
-                for pf in &cfg.port_forwards {
-                    net.append("Port", format!("{}:{}:{}", pf.proto, pf.host, pf.container));
+                for pf in &spec.port_forwards {
+                    net.append(
+                        "Port",
+                        format!("{}:{}:{}", pf.protocol.as_str(), pf.host, pf.container),
+                    );
                 }
             }
             NetworkMode::MacVlan(iface) => {
@@ -308,25 +297,25 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
     }
 
     //[Files]
-    let has_files = !cfg.device_binds.is_empty()
-        || !cfg.readonly_binds.is_empty()
-        || !cfg.bind_mounts.is_empty()
-        || cfg.wayland_socket.is_some()
-        || cfg.graphics_acceleration
-        || matches!(cfg.network, Some(crate::nspawn::models::NetworkMode::Host));
+    let has_files = !spec.device_binds.is_empty()
+        || !spec.readonly_binds.is_empty()
+        || !spec.bind_mounts.is_empty()
+        || spec.wayland_socket.is_some()
+        || spec.graphics_acceleration
+        || matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host));
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
         let files = conf.section_mut(Some("Files")).unwrap();
         files.remove("__ensure_files");
 
-        for dev in &cfg.device_binds {
+        for dev in &spec.device_binds {
             files.append("Bind", dev.clone());
         }
-        for ro in &cfg.readonly_binds {
+        for ro in &spec.readonly_binds {
             files.append("BindReadOnly", ro.clone());
         }
-        for bm in &cfg.bind_mounts {
+        for bm in &spec.bind_mounts {
             if bm.readonly {
                 files.append(
                     "BindReadOnly",
@@ -337,26 +326,26 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
             }
         }
 
-        let suffix = if cfg.private_users.as_deref() == Some("no") {
+        let suffix = if spec.private_users == Some(PrivateUsersMode::No) {
             ":noidmap"
         } else {
             ":idmap"
         };
 
-        if matches!(cfg.network, Some(crate::nspawn::models::NetworkMode::Host)) {
+        if matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host)) {
             files.append(
                 "BindReadOnly",
                 format!("/etc/resolv.conf:/etc/resolv.conf{}", suffix),
             );
         }
 
-        if let Some(socket_name) = &cfg.wayland_socket {
-            if let Some(runtime) = xdg_runtime {
-                let socket_path = std::path::PathBuf::from(runtime).join(socket_name);
-                files.append(
-                    "Bind",
-                    format!("{}:/mnt/wayland-socket{}", socket_path.display(), suffix),
-                );
+        if let Some(socket_name) = &spec.wayland_socket {
+            let socket_path = verified_wayland_socket
+                .map(PathBuf::from)
+                .or_else(|| xdg_runtime.map(|runtime| PathBuf::from(runtime).join(socket_name)));
+            if let Some(socket_path) = socket_path {
+                let socket_path = validated_nspawn_path("Wayland socket path", &socket_path)?;
+                files.append("Bind", format!("{socket_path}:/mnt/wayland-socket{suffix}"));
             }
 
             files.append(
@@ -379,23 +368,16 @@ pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -
     Ok(String::from_utf8_lossy(&buffer).into_owned())
 }
 
-/// Clones an .nspawn configuration file from one container to another.
-pub async fn clone_nspawn_config(
-    source_name: &str,
-    dest_name: &str,
-    io: &crate::nspawn::sys::ElevatedIo,
-) -> Result<()> {
-    validate_machine_name(source_name)?;
-    validate_machine_name(dest_name)?;
-    let content = match io
-        .read_to_string(&NspawnConfig::default_path(source_name))
-        .await?
-    {
-        Some(c) => c,
-        None => return Ok(()),
-    };
-    io.write(&NspawnConfig::default_path(dest_name), &content)
-        .await
+fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| NspawnError::Validation(format!("{label} is not valid UTF-8")))?;
+    if path.chars().any(char::is_control) {
+        return Err(NspawnError::Validation(format!(
+            "{label} contains control characters"
+        )));
+    }
+    Ok(path)
 }
 
 #[cfg(test)]

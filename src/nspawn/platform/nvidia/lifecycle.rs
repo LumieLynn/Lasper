@@ -244,11 +244,11 @@ pub async fn inject_env_once(
 pub async fn ensure_gpu_passthrough(
     name: &str,
     io: &crate::nspawn::sys::ElevatedIo,
+    nspawn: &crate::nspawn::adapters::config::NspawnConfigStore,
     cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
 ) -> Result<()> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
-    let config = match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::load(name).await
-    {
+    let config = match nspawn.read(name).await? {
         Some(c) => c,
         None => return Ok(()),
     };
@@ -324,14 +324,7 @@ pub async fn ensure_gpu_passthrough(
 
     // 5. Update .nspawn config (symlinks are now synthesized as Bind entries here)
     log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
-    crate::nspawn::adapters::config::nspawn_file::NspawnConfig::update_gpu_passthrough(
-        name,
-        config.content,
-        &host_state,
-        &death_list,
-        io,
-    )
-    .await?;
+    nspawn.update_gpu(name, &host_state, &death_list).await?;
 
     // 6. Persist state and inject DeviceAllow rules
     log_step!(

@@ -11,6 +11,7 @@ pub struct CloneDeployer {
     pub source_name: String,
     pub provision: std::sync::Arc<dyn ProvisionBackend>,
     pub io: crate::nspawn::sys::ElevatedIo,
+    pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
 }
 
 #[async_trait]
@@ -40,13 +41,7 @@ impl Deployer for CloneDeployer {
         self.provision.clone_image(&self.source_name, name).await?;
 
         // Clone configs
-        if let Err(e) = crate::nspawn::adapters::config::nspawn_file::clone_nspawn_config(
-            &self.source_name,
-            name,
-            &self.io,
-        )
-        .await
-        {
+        if let Err(e) = self.nspawn.clone_config(&self.source_name, name).await {
             let _ = logs
                 .send(format!("WARNING: Failed to clone .nspawn config: {}", e))
                 .await;

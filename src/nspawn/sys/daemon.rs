@@ -24,6 +24,9 @@
 //! session token delivered through the private stdin bootstrap pipe.
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::config::store::{
+    execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
+};
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use fs2::FileExt;
@@ -489,20 +492,20 @@ impl ElevatedDaemon {
             params,
         };
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        log::info!("[lasper] rpc_call: sending {} (id={})...", method, id);
+        log::trace!("[lasper] rpc_call: sending {} (id={})", method, id);
         self.request_tx
             .send((request, response_tx))
             .await
             .map_err(|_| {
-                log::info!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
+                log::warn!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "daemon I/O task has stopped",
                 )
             })?;
-        log::info!("[lasper] rpc_call: waiting for response...");
+        log::trace!("[lasper] rpc_call: waiting for response id={}", id);
         let response = response_rx.await.map_err(|_| {
-            log::info!("[lasper] rpc_call: response channel cancelled");
+            log::warn!("[lasper] rpc_call: response channel cancelled id={}", id);
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "daemon response channel cancelled",
@@ -611,6 +614,17 @@ impl ElevatedDaemon {
         .await
         .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
         Ok(())
+    }
+
+    pub(crate) async fn nspawn_config(
+        &self,
+        operation: NspawnConfigOperation,
+    ) -> std::io::Result<NspawnConfigResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
     // ── FD-passing ──
@@ -906,7 +920,7 @@ pub async fn daemon_main(
             }
         };
 
-        match handle_request(&request, &dbus, &out_tx).await {
+        match handle_request(&request, &dbus, &out_tx, user_uid).await {
             HandleOutcome::Spawned => {}
             HandleOutcome::Sync(Ok(result)) => {
                 send_or_exit(
@@ -934,11 +948,44 @@ async fn handle_request(
     request: &RpcRequest,
     dbus: &Option<crate::nspawn::adapters::comm::dbus::DbusBackend>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
+    invoking_uid: u32,
 ) -> HandleOutcome {
     use crate::nspawn::adapters::comm::backend::ContainerBackend;
 
     match request.method.as_str() {
         "ping" => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+
+        "nspawn_config" => {
+            let operation: NspawnConfigOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid nspawn_config request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_nspawn_config_operation(operation, invoking_uid).await
+                {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
 
         "run_command" => {
             let id = request.id;
@@ -1620,8 +1667,8 @@ async fn write_locked_impl(path_str: &str, content: &str) -> Result<(), String> 
         }
     }
 
-    // Remove lock file before closing handle (safe on Linux: unlink while open)
-    let _ = tokio::fs::remove_file(&lock_path).await;
+    // Keep the sidecar lock file persistent so every process locks the same
+    // inode across successive writes.
 
     Ok(())
 }

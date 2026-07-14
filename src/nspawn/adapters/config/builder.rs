@@ -188,6 +188,7 @@ impl ContainerConfigBuilder {
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
         io: crate::nspawn::sys::ElevatedIo,
+        nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
@@ -231,6 +232,7 @@ impl ContainerConfigBuilder {
                 source_name: source.clone_source.clone(),
                 provision: provision.clone(),
                 io: io.clone(),
+                nspawn,
             }) as Box<dyn Deployer>,
             SourceKind::Oci => Box::new(image::OciDeployer {
                 url: source.oci_url.clone(),

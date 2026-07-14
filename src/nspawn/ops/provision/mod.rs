@@ -9,6 +9,7 @@ use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NetworkMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 
 /// RAII guard to ensure the 'done' flag is always set, even on panic or early return.
 struct DoneGuard {
@@ -42,6 +43,18 @@ pub trait Deployer: Send + Sync {
     fn requires_post_config(&self) -> bool {
         true
     }
+}
+
+pub(crate) async fn send_deploy_log(logs: &Sender<String>, message: impl Into<String>) {
+    let message = message.into();
+    log::info!("[DEPLOY] {}", message);
+    let _ = logs.send(message).await;
+}
+
+pub(crate) async fn send_deploy_stream_log(logs: &Sender<String>, message: impl Into<String>) {
+    let message = message.into();
+    log::debug!("[DEPLOY stream] {}", message);
+    let _ = logs.send(message).await;
 }
 
 /// Orchestrates the asynchronous deployment of a new container.
@@ -118,7 +131,7 @@ async fn run_deploy_internal(
 
     macro_rules! push_log {
         ($msg:expr) => {
-            let _ = logs.send($msg).await;
+            send_deploy_log(&logs, $msg).await;
         };
     }
 
@@ -218,9 +231,7 @@ async fn run_deploy_internal(
                         dissect_mount_dir = Some(mount_point);
                         _dissect_guard = Some(tmp_mnt);
                     } else {
-                        push_log!(
-                            "WARNING: Failed to mount raw image with systemd-dissect.".into()
-                        );
+                        push_log!("WARNING: Failed to mount raw image with systemd-dissect.");
                     }
                 }
             }
@@ -251,8 +262,10 @@ async fn run_deploy_internal(
             push_log!("WARNING: Target is unmounted. Skipping passwords and user creation.".to_string());
         }
 
-        let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime().await.ok();
-        let mut nspawn_content = crate::nspawn::adapters::config::nspawn_file::nspawn_config_content(&cfg, xdg_runtime.as_deref())?;
+        let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
+            .await
+            .ok();
+        let mut initial_nvidia_state = None;
 
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
@@ -269,23 +282,6 @@ async fn run_deploy_internal(
             )
             .await
             {
-                // Write .nspawn markers from initial state
-                match crate::nspawn::adapters::config::nspawn_file::NspawnConfig::apply_gpu_passthrough_to_content(
-                    nspawn_content.clone(),
-                    &state,
-                    &[],
-                ) {
-                    Ok(mutated) => {
-                        nspawn_content = mutated;
-                    }
-                    Err(e) => {
-                        push_log!(format!(
-                            "WARNING: Failed to apply NVIDIA AST surgery: {}",
-                            e
-                        ));
-                    }
-                }
-
                 // Persist initial state for lifecycle diffing
                 if let Err(e) = crate::nspawn::platform::nvidia::state::save_external_state(
                     &name, &state, &io,
@@ -303,6 +299,7 @@ async fn run_deploy_internal(
                 {
                     push_log!(format!("WARNING: Failed to inject NVIDIA env/ldconfig: {}", e));
                 }
+                initial_nvidia_state = Some(state);
             } else {
                 push_log!("WARNING: NVIDIA CDI discovery failed. GPU passthrough will be retried on container start.".to_string());
             }
@@ -319,9 +316,14 @@ async fn run_deploy_internal(
         }
 
         push_log!("Writing .nspawn config...".to_string());
-        let nspawn_path = crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
-
-        io.write(&nspawn_path, &nspawn_content).await?;
+        exec_ctx
+            .nspawn
+            .write_generated(
+                &cfg,
+                xdg_runtime.as_deref(),
+                initial_nvidia_state.as_ref(),
+            )
+            .await?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             log::info!(
@@ -384,10 +386,8 @@ async fn run_deploy_internal(
         push_log!("Rolling back broken container...".to_string());
 
         // Clean up host-side configurations to prevent "ghost configs"
-        let nspawn_path =
-            crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(&name);
         let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
-        let _ = io.remove_file(&nspawn_path).await;
+        let _ = exec_ctx.nspawn.remove(&name).await;
         let _ = io.remove_dir_all(std::path::Path::new(&override_dir)).await;
 
         if is_ext {
@@ -402,7 +402,7 @@ async fn run_deploy_internal(
         return Err(e);
     }
 
-    push_log!("".into());
+    push_log!("");
     push_log!("=== Deployment Complete ===".to_string());
     Ok(())
 }

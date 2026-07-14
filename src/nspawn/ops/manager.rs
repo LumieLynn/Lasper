@@ -121,6 +121,7 @@ impl DefaultManager {
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(
             name,
             &io,
+            &self.exec_ctx.nspawn,
             self.exec_ctx.cmd.as_ref(),
         )
         .await?;
@@ -265,11 +266,7 @@ impl NspawnManager for DefaultManager {
 
         // systemd may or may not clean these up — an extra unlink is harmless
         let io = self.elevated_io();
-        let _ = io
-            .remove_file(
-                &crate::nspawn::adapters::config::nspawn_file::NspawnConfig::default_path(name),
-            )
-            .await;
+        let _ = self.exec_ctx.nspawn.remove(name).await;
         let _ = io
             .remove_dir_all(&std::path::PathBuf::from(format!(
                 "/etc/systemd/system/systemd-nspawn@{}.service.d",

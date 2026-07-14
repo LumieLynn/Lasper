@@ -6,7 +6,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::provision::{send_deploy_stream_log, Deployer};
 use crate::nspawn::sys::CommandRunner;
 
 pub struct DebootstrapDeployer {
@@ -92,7 +92,7 @@ async fn run_bootstrap(
         let reader = &mut spawned.stdout;
         let mut lines = tokio::io::BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let _ = logs.send(line).await;
+            send_deploy_stream_log(&logs, line).await;
         }
     }
 
