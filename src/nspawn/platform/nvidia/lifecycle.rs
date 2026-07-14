@@ -2,6 +2,7 @@ use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
 use super::state::{calculate_death_list, get_external_state, save_external_state, NvidiaState};
 use crate::nspawn::errors::Result;
+use crate::nspawn::sys::log_output;
 use std::path::PathBuf;
 
 macro_rules! log_step {
@@ -172,7 +173,7 @@ pub async fn inject_env_once(
     if !ld_content.is_empty() {
         let tmp = format!("/tmp/lasper-inject-ld-{}-{}.conf", name, pid);
         io.write(std::path::Path::new(&tmp), &ld_content).await?;
-        let _ = cmd_runner
+        let copy = cmd_runner
             .run(
                 "systemd-nspawn",
                 vec![
@@ -189,6 +190,23 @@ pub async fn inject_env_once(
                 ],
             )
             .await;
+        match copy {
+            Ok(output) => {
+                log_output("nvidia ld.so.conf", &output);
+                if output.status.success() {
+                    refresh_container_ld_cache(name, &rootfs_str, cmd_runner).await;
+                } else {
+                    log::warn!("Failed to inject NVIDIA ld.so.conf into container {}", name);
+                }
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to run NVIDIA ld.so.conf injection for container {}: {}",
+                    name,
+                    error
+                );
+            }
+        }
         let _ = io.remove_file(std::path::Path::new(&tmp)).await;
     }
 
@@ -239,6 +257,39 @@ pub async fn inject_env_once(
     }
 
     Ok(())
+}
+
+async fn refresh_container_ld_cache(
+    name: &str,
+    rootfs: &str,
+    cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+) {
+    let output = cmd_runner
+        .run(
+            "systemd-nspawn",
+            vec![
+                "-D".to_string(),
+                rootfs.to_string(),
+                "--quiet".to_string(),
+                "ldconfig".to_string(),
+            ],
+        )
+        .await;
+    match output {
+        Ok(output) => {
+            log_output("ldconfig", &output);
+            if !output.status.success() {
+                log::warn!("ldconfig failed inside NVIDIA container {}", name);
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to run ldconfig inside NVIDIA container {}: {}",
+                name,
+                error
+            );
+        }
+    }
 }
 
 pub async fn ensure_gpu_passthrough(
@@ -343,4 +394,55 @@ pub async fn ensure_gpu_passthrough(
     );
     log_step!(name, "Lifecycle", "GPU surgery successful.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::ops::PermissionLevel;
+    use crate::nspawn::sys::command::MockCommandRunner;
+    use crate::nspawn::sys::ElevatedIo;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+    use std::sync::{Arc, Mutex};
+
+    fn mock_output(status: bool) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(if status { 0 } else { 256 }),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_env_refreshes_ld_cache_after_writing_ld_config() {
+        let io = ElevatedIo::new(PermissionLevel::Root);
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut runner = MockCommandRunner::new();
+        {
+            let calls = calls.clone();
+            runner.expect_run().returning(move |program, args| {
+                assert_eq!(program, "systemd-nspawn");
+                calls.lock().unwrap().push(args.clone());
+                Ok(mock_output(true))
+            });
+        }
+        let state = NvidiaState {
+            ldcache_folders: vec![
+                "/usr/lib/wsl/drivers/nvam.inf_amd64_example".into(),
+                "/usr/lib/wsl/lib".into(),
+            ],
+            ..Default::default()
+        };
+        let name = format!("ldconfig-test-{}", std::process::id());
+
+        inject_env_once(&name, &state, &io, &runner).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0]
+            .iter()
+            .any(|arg| arg.contains("/etc/ld.so.conf.d/lasper-nvidia.conf")));
+        assert!(calls[1].iter().any(|arg| arg == "ldconfig"));
+    }
 }

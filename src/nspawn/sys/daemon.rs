@@ -29,7 +29,6 @@ use crate::nspawn::adapters::config::store::{
 };
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
-use fs2::FileExt;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -1059,7 +1058,7 @@ async fn handle_request(
             };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let result: Result<(), String> = write_locked_impl(&path_str, &content).await;
+                let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
                 let response = match result {
                     Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     Err(e) => {
@@ -1596,81 +1595,15 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-// ── Atomic locked write (daemon side) ──
+// ── Atomic write (daemon side) ──
 
-/// Lock → write tmp → fsync → rename → parent fsync → unlock.
-///
-/// Mirrors [`crate::nspawn::sys::io::AsyncLockedWriter::write_locked`]
-/// but runs inside the root daemon so all file I/O is privileged.
-async fn write_locked_impl(path_str: &str, content: &str) -> Result<(), String> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::time::{sleep, Duration};
-
+/// Generic daemon file writes are one-shot replacements. Cross-process
+/// read-modify-write paths must use a typed operation with its own lock.
+async fn write_atomic_impl(path_str: &str, content: &str) -> Result<(), String> {
     let path = std::path::Path::new(path_str);
-    let lock_path = path.with_extension("lock");
-    let tmp_path = path.with_extension("tmp");
-
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("mkdir -p {}: {}", parent.display(), e))?;
-    }
-
-    // Acquire exclusive lock (async backoff loop)
-    let lock_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|e| format!("open lock {:?}: {}", lock_path, e))?;
-
-    let mut attempts = 0;
-    loop {
-        match lock_file.try_lock_exclusive() {
-            Ok(_) => break,
-            Err(_) if attempts < 100 => {
-                attempts += 1;
-                sleep(Duration::from_millis(10)).await;
-            }
-            Err(e) => {
-                return Err(format!(
-                    "could not acquire lock on {:?} after {} attempts: {}",
-                    lock_path, attempts, e
-                ));
-            }
-        }
-    }
-
-    // Write + fsync to temp file
-    {
-        let mut f = tokio::fs::File::create(&tmp_path)
-            .await
-            .map_err(|e| format!("create tmp {:?}: {}", tmp_path, e))?;
-        f.write_all(content.as_bytes())
-            .await
-            .map_err(|e| format!("write tmp {:?}: {}", tmp_path, e))?;
-        f.sync_data()
-            .await
-            .map_err(|e| format!("fsync tmp {:?}: {}", tmp_path, e))?;
-    }
-
-    // Atomic rename
-    tokio::fs::rename(&tmp_path, path)
+    crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(path, content)
         .await
-        .map_err(|e| format!("rename {:?} -> {:?}: {}", tmp_path, path, e))?;
-
-    // Sync parent directory
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = tokio::fs::File::open(parent).await {
-            let _ = dir.sync_all().await;
-        }
-    }
-
-    // Keep the sidecar lock file persistent so every process locks the same
-    // inode across successive writes.
-
-    Ok(())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1691,6 +1624,23 @@ mod tests {
         assert_eq!(json["stdout"], "hello");
         let parsed: CommandResult = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.status, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_write_file_is_atomic_without_persistent_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(".wayland-env");
+
+        write_atomic_impl(path.to_str().unwrap(), "WAYLAND_DISPLAY=wayland-0\n")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "WAYLAND_DISPLAY=wayland-0\n"
+        );
+        assert!(!path.with_extension("lock").exists());
+        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[test]

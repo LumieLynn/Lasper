@@ -434,7 +434,7 @@ mod tests {
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Boot=yes"));
         assert!(content.contains("Hostname=test-host"));
-        assert!(path.with_extension("lock").exists());
+        assert!(crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[tokio::test]

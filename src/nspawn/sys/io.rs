@@ -1,9 +1,20 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use fs2::FileExt;
+use std::ffi::OsString;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::time::{sleep, Duration};
+
+pub(crate) fn lock_path_for(path: &Path) -> std::path::PathBuf {
+    let Some(file_name) = path.file_name() else {
+        return path.with_extension("lock");
+    };
+    let mut lock_name = OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    path.with_file_name(lock_name)
+}
 
 /// Manages transactional, locked and atomic writes to configuration files.
 pub struct AsyncLockedWriter;
@@ -21,7 +32,7 @@ impl AsyncLockedWriter {
         F: FnOnce(Option<String>) -> Result<String>,
     {
         let path_buf = path.to_path_buf();
-        let lock_path = path.with_extension("lock");
+        let lock_path = lock_path_for(path);
         let tmp_path = path.with_extension("tmp");
 
         // Ensure parent exists
