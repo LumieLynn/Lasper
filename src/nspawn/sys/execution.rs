@@ -3,10 +3,10 @@
 //! When the program starts, [`ExecutionContext::new`] inspects the
 //! [`PermissionLevel`] and optional [`ElevatedDaemon`] to construct the
 //! correct [`CommandRunner`] and [`ElevatedIo`].  After that, consumers
-//! never need to match on the daemon again — they just use `ctx.cmd`
-//! and `ctx.io`.
+//! never need to match on the daemon again — they just use typed stores
+//! or the remaining low-level `ctx.cmd`/`ctx.io` surfaces.
 
-use crate::nspawn::adapters::config::NspawnConfigStore;
+use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::{DaemonCommandRunner, ElevatedDaemon};
@@ -21,6 +21,7 @@ pub struct ExecutionContext {
     pub cmd: Arc<dyn CommandRunner>,
     pub io: ElevatedIo,
     pub nspawn: NspawnConfigStore,
+    pub systemd_unit: SystemdUnitStore,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
 
@@ -37,10 +38,12 @@ impl ExecutionContext {
             None => ElevatedIo::new(level),
         };
         let nspawn = NspawnConfigStore::new(daemon.clone());
+        let systemd_unit = SystemdUnitStore::new(daemon.clone());
         Self {
             cmd,
             io,
             nspawn,
+            systemd_unit,
             daemon,
         }
     }
@@ -64,6 +67,7 @@ impl std::fmt::Debug for ExecutionContext {
         f.debug_struct("ExecutionContext")
             .field("io", &self.io)
             .field("nspawn", &self.nspawn)
+            .field("systemd_unit", &self.systemd_unit)
             .field("daemon", &self.daemon)
             .finish()
     }

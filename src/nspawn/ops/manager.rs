@@ -267,12 +267,7 @@ impl NspawnManager for DefaultManager {
         // systemd may or may not clean these up — an extra unlink is harmless
         let io = self.elevated_io();
         let _ = self.exec_ctx.nspawn.remove(name).await;
-        let _ = io
-            .remove_dir_all(&std::path::PathBuf::from(format!(
-                "/etc/systemd/system/systemd-nspawn@{}.service.d",
-                name
-            )))
-            .await;
+        let _ = self.exec_ctx.systemd_unit.remove_overrides(name).await;
         let _ = io.remove_file(&crate::paths::state_file(name)).await;
 
         self.nudge();

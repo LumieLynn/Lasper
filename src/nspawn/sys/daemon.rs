@@ -27,6 +27,9 @@ use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::adapters::config::store::{
     execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
 };
+use crate::nspawn::adapters::config::systemd_unit::{
+    execute_systemd_unit_operation, SystemdUnitOperation, SystemdUnitResult,
+};
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use sendfd::{RecvWithFd, SendWithFd};
@@ -626,6 +629,17 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
+    pub(crate) async fn systemd_unit(
+        &self,
+        operation: SystemdUnitOperation,
+    ) -> std::io::Result<SystemdUnitResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("systemd_unit", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     // ── FD-passing ──
     //
     // Connect and write the request async, then hand the fd to a blocking
@@ -969,6 +983,37 @@ async fn handle_request(
             tokio::spawn(async move {
                 let response = match execute_nspawn_config_operation(operation, invoking_uid).await
                 {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "systemd_unit" => {
+            let operation: SystemdUnitOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid systemd_unit request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_systemd_unit_operation(operation).await {
                     Ok(result) => {
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }

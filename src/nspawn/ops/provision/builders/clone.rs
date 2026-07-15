@@ -10,8 +10,8 @@ use crate::nspawn::ops::provision::Deployer;
 pub struct CloneDeployer {
     pub source_name: String,
     pub provision: std::sync::Arc<dyn ProvisionBackend>,
-    pub io: crate::nspawn::sys::ElevatedIo,
     pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
+    pub systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
 }
 
 #[async_trait]
@@ -46,12 +46,10 @@ impl Deployer for CloneDeployer {
                 .send(format!("WARNING: Failed to clone .nspawn config: {}", e))
                 .await;
         }
-        if let Err(e) = crate::nspawn::adapters::config::systemd_unit::clone_systemd_override(
-            &self.source_name,
-            name,
-            &self.io,
-        )
-        .await
+        if let Err(e) = self
+            .systemd_unit
+            .clone_override(&self.source_name, name)
+            .await
         {
             let _ = logs
                 .send(format!("WARNING: Failed to clone systemd override: {}", e))

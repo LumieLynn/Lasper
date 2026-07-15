@@ -442,10 +442,11 @@ impl WizardContext {
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
         io: crate::nspawn::sys::ElevatedIo,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
+        systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder()
-            .get_deployer_and_storage(provision, io, nspawn, cmd_runner)
+            .get_deployer_and_storage(provision, io, nspawn, systemd_unit, cmd_runner)
     }
 
     pub fn update_hardware_data(

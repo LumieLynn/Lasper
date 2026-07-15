@@ -331,13 +331,12 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Writing systemd service override...".to_string());
-            crate::nspawn::adapters::config::systemd_unit::write_systemd_override(
+            exec_ctx.systemd_unit.write_override(
                 &name,
                 &cfg.device_binds,
                 cfg.nvidia_gpu,
                 cfg.graphics_acceleration,
                 cfg.wayland_socket.is_some(),
-                &io,
             ).await?;
 
             let _ = provision.reload_daemon().await;
@@ -386,9 +385,8 @@ async fn run_deploy_internal(
         push_log!("Rolling back broken container...".to_string());
 
         // Clean up host-side configurations to prevent "ghost configs"
-        let override_dir = format!("/etc/systemd/system/systemd-nspawn@{}.service.d", name);
         let _ = exec_ctx.nspawn.remove(&name).await;
-        let _ = io.remove_dir_all(std::path::Path::new(&override_dir)).await;
+        let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
 
         if is_ext {
             // Cleanup systemd-managed storage (downloaded/imported junk)
