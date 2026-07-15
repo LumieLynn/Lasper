@@ -272,7 +272,7 @@ async fn run_deploy_internal(
 
             // Save profile so lifecycle.rs can reload it on container start
             if let Some(prof) = &nvidia_profile {
-                let _ = prof.save(&name, &io).await;
+                let _ = prof.save(&name, &exec_ctx.nvidia_state).await;
             }
 
             // Run initial CDI discovery to seed the .nspawn config and state.
@@ -283,11 +283,7 @@ async fn run_deploy_internal(
             .await
             {
                 // Persist initial state for lifecycle diffing
-                if let Err(e) = crate::nspawn::platform::nvidia::state::save_external_state(
-                    &name, &state, &io,
-                )
-                .await
-                {
+                if let Err(e) = exec_ctx.nvidia_state.write(&name, &state).await {
                     push_log!(format!("WARNING: Failed to save NVIDIA state: {}", e));
                 }
 

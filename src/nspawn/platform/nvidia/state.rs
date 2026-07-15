@@ -1,8 +1,15 @@
-use crate::nspawn::errors::Result;
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::MachineName;
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
+use crate::nspawn::sys::daemon::ElevatedDaemon;
+use crate::nspawn::sys::io::AsyncLockedWriter;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+const MAX_NVIDIA_STATE_BYTES: usize = 1024 * 1024;
+const MAX_NVIDIA_STATE_ITEMS: usize = 16384;
 
 /// A single host→container path mapping for an nspawn Bind= or BindReadOnly= entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -176,29 +183,268 @@ pub(crate) fn get_state_dir() -> PathBuf {
     crate::paths::state_dir()
 }
 
-pub async fn get_external_state(
-    name: &str,
-    io: &crate::nspawn::sys::ElevatedIo,
-) -> Result<Option<NvidiaState>> {
-    let path = crate::paths::state_file(name);
-    let content = match io.read_to_string(&path).await? {
-        Some(c) => c,
-        None => return Ok(None),
+/// Typed access to Lasper-managed NVIDIA state files.
+#[derive(Clone)]
+pub struct NvidiaStateStore {
+    daemon: Option<Arc<ElevatedDaemon>>,
+}
+
+impl NvidiaStateStore {
+    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
+        Self { daemon }
+    }
+
+    pub async fn read(&self, name: &str) -> Result<Option<NvidiaState>> {
+        let result = self
+            .execute(NvidiaStateOperation::Read(ReadNvidiaState {
+                machine: parse_machine_name(name)?,
+            }))
+            .await?;
+        Ok(result.state)
+    }
+
+    pub async fn write(&self, name: &str, state: &NvidiaState) -> Result<()> {
+        self.execute(NvidiaStateOperation::Write(Box::new(WriteNvidiaState {
+            machine: parse_machine_name(name)?,
+            state: state.clone(),
+        })))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove(&self, name: &str) -> Result<()> {
+        self.execute(NvidiaStateOperation::Remove(RemoveNvidiaState {
+            machine: parse_machine_name(name)?,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
+        if let Some(daemon) = &self.daemon {
+            daemon
+                .nvidia_state(operation)
+                .await
+                .map_err(|error| NspawnError::Runtime(error.to_string()))
+        } else {
+            execute_nvidia_state_operation(operation).await
+        }
+    }
+}
+
+impl std::fmt::Debug for NvidiaStateStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NvidiaStateStore")
+            .field("daemon", &self.daemon)
+            .finish()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "params", rename_all = "snake_case")]
+pub(crate) enum NvidiaStateOperation {
+    Read(ReadNvidiaState),
+    Write(Box<WriteNvidiaState>),
+    Remove(RemoveNvidiaState),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadNvidiaState {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteNvidiaState {
+    machine: MachineName,
+    state: NvidiaState,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoveNvidiaState {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NvidiaStateResult {
+    state: Option<NvidiaState>,
+}
+
+pub(crate) async fn execute_nvidia_state_operation(
+    operation: NvidiaStateOperation,
+) -> Result<NvidiaStateResult> {
+    match operation {
+        NvidiaStateOperation::Read(request) => Ok(NvidiaStateResult {
+            state: read_state_at(&state_path(&request.machine)).await?,
+        }),
+        NvidiaStateOperation::Write(request) => {
+            write_state_at(&state_path(&request.machine), &request.state).await?;
+            Ok(NvidiaStateResult::default())
+        }
+        NvidiaStateOperation::Remove(request) => {
+            remove_state_at(&state_path(&request.machine)).await?;
+            Ok(NvidiaStateResult::default())
+        }
+    }
+}
+
+fn parse_machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn state_path(machine: &MachineName) -> PathBuf {
+    crate::paths::state_file(machine.as_str())
+}
+
+async fn read_state_at(path: &Path) -> Result<Option<NvidiaState>> {
+    let content = match tokio::fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
     };
+    if content.len() > MAX_NVIDIA_STATE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA state exceeds {} bytes",
+            MAX_NVIDIA_STATE_BYTES
+        )));
+    }
     let mut state: NvidiaState = serde_json::from_str(&content)?;
     state.migrate_from_legacy();
+    validate_state(&state)?;
     Ok(Some(state))
 }
 
-pub async fn save_external_state(
-    name: &str,
-    state: &NvidiaState,
-    io: &crate::nspawn::sys::ElevatedIo,
-) -> Result<()> {
-    let path = crate::paths::state_file(name);
+async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
+    validate_state(state)?;
     let content = serde_json::to_string_pretty(state)?;
+    if content.len() > MAX_NVIDIA_STATE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA state exceeds {} bytes",
+            MAX_NVIDIA_STATE_BYTES
+        )));
+    }
+    AsyncLockedWriter::write_atomic(path, &content).await
+}
 
-    io.write(&path, &content).await?;
+async fn remove_state_at(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+fn validate_state(state: &NvidiaState) -> Result<()> {
+    let total_items = state.binds.len()
+        + state.readonly_binds.len()
+        + state.device_binds.len()
+        + state.classified_entries.len()
+        + state.symlinks.len()
+        + state.ldcache_folders.len()
+        + state.env_vars.len()
+        + state
+            .profile
+            .as_ref()
+            .map(|profile| {
+                profile.category_destinations.len() + profile.manual_classifications.len()
+            })
+            .unwrap_or_default();
+    if total_items > MAX_NVIDIA_STATE_ITEMS {
+        return Err(NspawnError::Validation(
+            "Too many entries in NVIDIA state".into(),
+        ));
+    }
+
+    validate_text_value("driver version", &state.driver_version, true)?;
+    for bind in &state.binds {
+        validate_absolute_value("NVIDIA host path", &bind.host_path)?;
+        validate_absolute_value("NVIDIA container path", &bind.container_path)?;
+    }
+    for bind in &state.readonly_binds {
+        validate_bind_expression("legacy read-only bind", bind)?;
+    }
+    for bind in &state.device_binds {
+        validate_bind_expression("legacy device bind", bind)?;
+    }
+    for entry in &state.classified_entries {
+        validate_absolute_value("classified host path", &entry.host_path)?;
+        validate_absolute_value("classified container path", &entry.default_container_path)?;
+    }
+    for symlink in &state.symlinks {
+        validate_absolute_value("symlink target", &symlink.target)?;
+        validate_absolute_value("symlink path", &symlink.link_path)?;
+    }
+    for folder in &state.ldcache_folders {
+        validate_absolute_value("ldcache folder", folder)?;
+    }
+    for (key, value) in &state.env_vars {
+        validate_env_key(key)?;
+        validate_text_value("environment value", value, true)?;
+    }
+    if let Some(profile) = &state.profile {
+        validate_text_value("GPU device selector", &profile.gpu_device, false)?;
+        for destination in profile.category_destinations.values() {
+            validate_absolute_value("NVIDIA category destination", destination)?;
+        }
+        for classification in &profile.manual_classifications {
+            validate_absolute_value("manual classification host path", &classification.host_path)?;
+            if !classification.destination.is_empty() {
+                validate_absolute_value(
+                    "manual classification destination",
+                    &classification.destination,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_bind_expression(label: &str, value: &str) -> Result<()> {
+    validate_text_value(label, value, false)?;
+    let source = value.split_once(':').map_or(value, |(source, _)| source);
+    if !Path::new(source).is_absolute() {
+        return Err(NspawnError::Validation(format!(
+            "{label} source must be absolute: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_absolute_value(label: &str, value: &str) -> Result<()> {
+    validate_text_value(label, value, false)?;
+    if !Path::new(value).is_absolute() {
+        return Err(NspawnError::Validation(format!(
+            "{label} must be absolute: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_env_key(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 255
+        || value.contains('=')
+        || value.chars().any(char::is_control)
+    {
+        return Err(NspawnError::Validation(format!(
+            "Invalid environment key: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_text_value(label: &str, value: &str, allow_empty: bool) -> Result<()> {
+    if (!allow_empty && value.is_empty())
+        || value.len() > 4096
+        || value.chars().any(char::is_control)
+    {
+        return Err(NspawnError::Validation(format!(
+            "Invalid {label}: {value:?}"
+        )));
+    }
     Ok(())
 }
 
@@ -520,5 +766,59 @@ mod tests {
             Some(v) => std::env::set_var("LASPER_STATE_DIR", v),
             None => std::env::remove_var("LASPER_STATE_DIR"),
         }
+    }
+
+    #[test]
+    fn operation_deserialization_rejects_invalid_machine_name() {
+        let json = r#"{
+            "operation": "read",
+            "params": {"machine": "../escape"}
+        }"#;
+        assert!(serde_json::from_str::<NvidiaStateOperation>(json).is_err());
+    }
+
+    #[test]
+    fn state_validation_rejects_relative_bind_paths() {
+        let state = NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "relative/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_state(&state).is_err());
+    }
+
+    #[tokio::test]
+    async fn state_write_read_round_trip_is_atomic_without_persistent_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.json");
+        let state = NvidiaState {
+            driver_version: "555.0".into(),
+            binds: vec![PassthroughBind {
+                host_path: "/host/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+
+        write_state_at(&path, &state).await.unwrap();
+        let read = read_state_at(&path).await.unwrap().unwrap();
+
+        assert_eq!(read.driver_version, "555.0");
+        assert_eq!(read.binds, state.binds);
+        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn remove_state_ignores_missing_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.json");
+
+        remove_state_at(&path).await.unwrap();
+
+        assert!(!path.exists());
     }
 }

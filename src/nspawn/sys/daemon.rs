@@ -31,6 +31,9 @@ use crate::nspawn::adapters::config::systemd_unit::{
     execute_systemd_unit_operation, SystemdUnitOperation, SystemdUnitResult,
 };
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
+use crate::nspawn::platform::nvidia::state::{
+    execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
+};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
@@ -640,6 +643,17 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
+    pub(crate) async fn nvidia_state(
+        &self,
+        operation: NvidiaStateOperation,
+    ) -> std::io::Result<NvidiaStateResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("nvidia_state", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     // ── FD-passing ──
     //
     // Connect and write the request async, then hand the fd to a blocking
@@ -1014,6 +1028,37 @@ async fn handle_request(
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let response = match execute_systemd_unit_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "nvidia_state" => {
+            let operation: NvidiaStateOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid nvidia_state request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_nvidia_state_operation(operation).await {
                     Ok(result) => {
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }

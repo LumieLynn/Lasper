@@ -1,6 +1,6 @@
 use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
-use super::state::{calculate_death_list, get_external_state, save_external_state, NvidiaState};
+use super::state::{calculate_death_list, NvidiaState};
 use crate::nspawn::errors::Result;
 use crate::nspawn::sys::log_output;
 use std::path::PathBuf;
@@ -296,6 +296,7 @@ pub async fn ensure_gpu_passthrough(
     name: &str,
     io: &crate::nspawn::sys::ElevatedIo,
     nspawn: &crate::nspawn::adapters::config::NspawnConfigStore,
+    state_store: &crate::nspawn::platform::nvidia::NvidiaStateStore,
     cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
 ) -> Result<()> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
@@ -316,7 +317,7 @@ pub async fn ensure_gpu_passthrough(
     // 2. Load old state and profile, then scan host
     log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
 
-    let external_cache = get_external_state(name, io).await?.unwrap_or_default();
+    let external_cache = state_store.read(name).await?.unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
 
     // Remapping already happens inside get_nvidia_state
@@ -383,7 +384,7 @@ pub async fn ensure_gpu_passthrough(
         "Surgery",
         "Persisting state and injecting persistent DeviceAllow rules..."
     );
-    save_external_state(name, &host_state, io).await?;
+    state_store.write(name, &host_state).await?;
     inject_persistent_device_allow(name, &host_state, io).await?;
 
     // 7. Reload daemon

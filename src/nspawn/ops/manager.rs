@@ -122,6 +122,7 @@ impl DefaultManager {
             name,
             &io,
             &self.exec_ctx.nspawn,
+            &self.exec_ctx.nvidia_state,
             self.exec_ctx.cmd.as_ref(),
         )
         .await?;
@@ -265,10 +266,9 @@ impl NspawnManager for DefaultManager {
         result?;
 
         // systemd may or may not clean these up — an extra unlink is harmless
-        let io = self.elevated_io();
         let _ = self.exec_ctx.nspawn.remove(name).await;
         let _ = self.exec_ctx.systemd_unit.remove_overrides(name).await;
-        let _ = io.remove_file(&crate::paths::state_file(name)).await;
+        let _ = self.exec_ctx.nvidia_state.remove(name).await;
 
         self.nudge();
         Ok(())
