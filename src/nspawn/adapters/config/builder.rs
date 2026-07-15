@@ -190,6 +190,7 @@ impl ContainerConfigBuilder {
         io: crate::nspawn::sys::ElevatedIo,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
+        managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
@@ -201,7 +202,9 @@ impl ContainerConfigBuilder {
         });
 
         let storage: Box<dyn StorageBackend> = match storage_cfg.storage_type {
-            StorageType::Directory => Box::new(DirectoryBackend) as Box<dyn StorageBackend>,
+            StorageType::Directory => {
+                Box::new(DirectoryBackend::new(managed_storage)) as Box<dyn StorageBackend>
+            }
             StorageType::Subvolume => Box::new(SubvolumeBackend) as Box<dyn StorageBackend>,
             StorageType::DiskImage => Box::new(DiskImageBackend {
                 config: storage_cfg

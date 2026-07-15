@@ -30,6 +30,9 @@ use crate::nspawn::adapters::config::store::{
 use crate::nspawn::adapters::config::systemd_unit::{
     execute_systemd_unit_operation, SystemdUnitOperation, SystemdUnitResult,
 };
+use crate::nspawn::adapters::storage::store::{
+    execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
+};
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
 use crate::nspawn::platform::nvidia::staging::{
     execute_nvidia_staging_operation, NvidiaStagingOperation, NvidiaStagingResult,
@@ -668,6 +671,17 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
+    pub(crate) async fn managed_storage(
+        &self,
+        operation: ManagedStorageOperation,
+    ) -> std::io::Result<ManagedStorageResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("managed_storage", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     // ── FD-passing ──
     //
     // Connect and write the request async, then hand the fd to a blocking
@@ -1104,6 +1118,37 @@ async fn handle_request(
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let response = match execute_nvidia_staging_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "managed_storage" => {
+            let operation: ManagedStorageOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid managed_storage request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_managed_storage_operation(operation).await {
                     Ok(result) => {
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }

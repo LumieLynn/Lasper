@@ -43,9 +43,16 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let io = exec_ctx.io.clone();
             let nspawn = exec_ctx.nspawn.clone();
             let systemd_unit = exec_ctx.systemd_unit.clone();
+            let managed_storage = exec_ctx.managed_storage.clone();
             let built = ctx.build_config();
-            let (deployer, storage) =
-                ctx.get_deployer_and_storage(provision, io, nspawn, systemd_unit, cli_runner);
+            let (deployer, storage) = ctx.get_deployer_and_storage(
+                provision,
+                io,
+                nspawn,
+                systemd_unit,
+                managed_storage,
+                cli_runner,
+            );
             let name = built.cfg.name.clone();
             let cfg = built.cfg;
             let nvidia_profile = built.nvidia_profile;

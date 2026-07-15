@@ -2,6 +2,7 @@
 
 pub mod backends;
 pub mod detect;
+pub mod store;
 
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{DiskImageConfig, DiskImageSource};
@@ -11,6 +12,7 @@ use std::path::PathBuf;
 pub use backends::directory::DirectoryBackend;
 pub use backends::image::DiskImageBackend;
 pub use backends::subvolume::SubvolumeBackend;
+pub use store::ManagedStorageStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -140,5 +142,5 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     }
 
     // 4. Default to DirectoryBackend
-    into_backend(DirectoryBackend)
+    into_backend(DirectoryBackend::default())
 }
