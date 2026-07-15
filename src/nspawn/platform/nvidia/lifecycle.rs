@@ -3,7 +3,6 @@ use super::profile::NvidiaPassthroughMode;
 use super::state::{calculate_death_list, NvidiaState};
 use crate::nspawn::errors::Result;
 use crate::nspawn::sys::log_output;
-use std::path::PathBuf;
 
 macro_rules! log_step {
     ($name:expr, $step:expr, $msg:expr) => {
@@ -107,31 +106,17 @@ pub async fn cleanup_container_garbage(
 async fn inject_persistent_device_allow(
     name: &str,
     state: &NvidiaState,
-    io: &crate::nspawn::sys::ElevatedIo,
+    systemd_unit: &crate::nspawn::adapters::config::SystemdUnitStore,
 ) -> Result<()> {
-    let dir = PathBuf::from(format!(
-        "/etc/systemd/system/systemd-nspawn@{}.service.d",
-        name
-    ));
-    io.create_dir_all(&dir).await?;
-
-    let path = dir.join("10-lasper-nvidia.conf");
-    let mut content = String::from("[Service]\n");
-    for bind in &state.binds {
-        if !bind.readonly {
-            content.push_str(&format!("DeviceAllow={} rw\n", bind.host_path));
-        }
-    }
-
-    io.write(&path, &content).await?;
-
-    let transient_path = format!(
-        "/run/systemd/system/systemd-nspawn@{}.service.d/10-lasper-nvidia.conf",
-        name
-    );
-    let _ = io.remove_file(std::path::Path::new(&transient_path)).await;
-
-    Ok(())
+    let device_paths = state
+        .binds
+        .iter()
+        .filter(|bind| !bind.readonly)
+        .map(|bind| bind.host_path.clone())
+        .collect::<Vec<_>>();
+    systemd_unit
+        .write_nvidia_device_allow(name, &device_paths)
+        .await
 }
 
 /// Write ld.so.conf.d entry and /etc/environment vars into the container
@@ -294,8 +279,8 @@ async fn refresh_container_ld_cache(
 
 pub async fn ensure_gpu_passthrough(
     name: &str,
-    io: &crate::nspawn::sys::ElevatedIo,
     nspawn: &crate::nspawn::adapters::config::NspawnConfigStore,
+    systemd_unit: &crate::nspawn::adapters::config::SystemdUnitStore,
     state_store: &crate::nspawn::platform::nvidia::NvidiaStateStore,
     cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
 ) -> Result<()> {
@@ -346,7 +331,7 @@ pub async fn ensure_gpu_passthrough(
                 "GPU state identity match for {}, skipping re-assembly.",
                 name
             );
-            inject_persistent_device_allow(name, &host_state, io).await?;
+            inject_persistent_device_allow(name, &host_state, systemd_unit).await?;
             return Ok(());
         }
         log::info!(
@@ -385,7 +370,7 @@ pub async fn ensure_gpu_passthrough(
         "Persisting state and injecting persistent DeviceAllow rules..."
     );
     state_store.write(name, &host_state).await?;
-    inject_persistent_device_allow(name, &host_state, io).await?;
+    inject_persistent_device_allow(name, &host_state, systemd_unit).await?;
 
     // 7. Reload daemon
     log_step!(

@@ -55,6 +55,21 @@ impl SystemdUnitStore {
         Ok(())
     }
 
+    pub async fn write_nvidia_device_allow(
+        &self,
+        name: &str,
+        device_paths: &[String],
+    ) -> Result<()> {
+        self.execute(SystemdUnitOperation::WriteNvidiaDeviceAllow(
+            WriteNvidiaDeviceAllow {
+                machine: parse_machine_name(name)?,
+                device_paths: device_paths.to_vec(),
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
     pub async fn remove_overrides(&self, name: &str) -> Result<()> {
         self.execute(SystemdUnitOperation::RemoveOverrides(
             RemoveServiceOverrides {
@@ -90,6 +105,7 @@ impl std::fmt::Debug for SystemdUnitStore {
 pub(crate) enum SystemdUnitOperation {
     WriteOverride(WriteServiceOverride),
     CloneOverride(CloneServiceOverride),
+    WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
     RemoveOverrides(RemoveServiceOverrides),
 }
 
@@ -105,6 +121,13 @@ pub(crate) struct WriteServiceOverride {
 pub(crate) struct CloneServiceOverride {
     source: MachineName,
     destination: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteNvidiaDeviceAllow {
+    machine: MachineName,
+    device_paths: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,6 +170,17 @@ pub(crate) async fn execute_systemd_unit_operation(
                 validate_content_size(&content)?;
                 write_override_at(&service_override_path(&request.destination), &content).await?;
             }
+        }
+        SystemdUnitOperation::WriteNvidiaDeviceAllow(request) => {
+            validate_device_allow_paths(&request.device_paths)?;
+            let content = nvidia_device_allow_content(&request.device_paths);
+            validate_content_size(&content)?;
+            write_nvidia_device_allow_at(
+                &persistent_nvidia_override_path(&request.machine),
+                &transient_nvidia_override_path(&request.machine),
+                &content,
+            )
+            .await?;
         }
         SystemdUnitOperation::RemoveOverrides(request) => {
             remove_overrides_at(&service_override_dir(&request.machine)).await?;
@@ -203,6 +237,21 @@ fn service_override_path(machine: &MachineName) -> PathBuf {
     service_override_dir(machine).join("override.conf")
 }
 
+fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
+    PathBuf::from(format!(
+        "/run/systemd/system/systemd-nspawn@{}.service.d",
+        machine.as_str()
+    ))
+}
+
+fn persistent_nvidia_override_path(machine: &MachineName) -> PathBuf {
+    service_override_dir(machine).join("10-lasper-nvidia.conf")
+}
+
+fn transient_nvidia_override_path(machine: &MachineName) -> PathBuf {
+    transient_service_override_dir(machine).join("10-lasper-nvidia.conf")
+}
+
 fn validate_override_spec(spec: &ServiceOverrideSpec) -> Result<()> {
     if spec.device_binds.len() > MAX_DEVICE_ALLOW_ENTRIES {
         return Err(NspawnError::Validation(
@@ -212,6 +261,19 @@ fn validate_override_spec(spec: &ServiceOverrideSpec) -> Result<()> {
 
     for bind in &spec.device_binds {
         validate_device_allow(bind)?;
+    }
+    Ok(())
+}
+
+fn validate_device_allow_paths(device_paths: &[String]) -> Result<()> {
+    if device_paths.len() > MAX_DEVICE_ALLOW_ENTRIES {
+        return Err(NspawnError::Validation(
+            "Too many DeviceAllow entries".into(),
+        ));
+    }
+
+    for path in device_paths {
+        validate_device_allow(path)?;
     }
     Ok(())
 }
@@ -227,6 +289,14 @@ fn validate_device_allow(value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn nvidia_device_allow_content(device_paths: &[String]) -> String {
+    let mut content = String::from("[Service]\n");
+    for path in device_paths {
+        content.push_str(&format!("DeviceAllow={} rw\n", path));
+    }
+    content
 }
 
 fn validate_content_size(content: &str) -> Result<()> {
@@ -249,6 +319,30 @@ async fn read_optional(path: &Path) -> Result<Option<String>> {
 
 async fn write_override_at(path: &Path, content: &str) -> Result<()> {
     AsyncLockedWriter::write_atomic(path, content).await
+}
+
+async fn write_nvidia_device_allow_at(
+    persistent_path: &Path,
+    transient_path: &Path,
+    content: &str,
+) -> Result<()> {
+    write_override_at(persistent_path, content).await?;
+    if let Err(error) = remove_optional_file(transient_path).await {
+        log::warn!(
+            "Failed to remove transient NVIDIA service override {}: {}",
+            transient_path.display(),
+            error
+        );
+    }
+    Ok(())
+}
+
+async fn remove_optional_file(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
 }
 
 async fn remove_overrides_at(path: &Path) -> Result<()> {
@@ -324,6 +418,19 @@ mod tests {
         assert!(validate_override_spec(&spec).is_err());
     }
 
+    #[test]
+    fn nvidia_device_allow_rejects_relative_device_path() {
+        assert!(validate_device_allow_paths(&["dev/nvidia0".into()]).is_err());
+    }
+
+    #[test]
+    fn nvidia_device_allow_content_uses_service_section() {
+        let content = nvidia_device_allow_content(&["/dev/nvidia0".into()]);
+        assert!(content.contains("[Service]"));
+        assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
+        assert!(Ini::load_from_str(&content).is_ok());
+    }
+
     #[tokio::test]
     async fn write_override_is_atomic_without_persistent_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -336,6 +443,28 @@ mod tests {
         assert!(written.contains("DeviceAllow=/dev/nvidia0 rw"));
         assert!(written.contains("DeviceAllow=/dev/dri rw"));
         assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn write_nvidia_device_allow_removes_transient_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("etc/10-lasper-nvidia.conf");
+        let transient = directory.path().join("run/10-lasper-nvidia.conf");
+        tokio::fs::create_dir_all(transient.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&transient, "[Service]\nDeviceAllow=/dev/old rw\n")
+            .await
+            .unwrap();
+        let content = nvidia_device_allow_content(&["/dev/nvidia0".into()]);
+
+        write_nvidia_device_allow_at(&persistent, &transient, &content)
+            .await
+            .unwrap();
+
+        let written = tokio::fs::read_to_string(&persistent).await.unwrap();
+        assert!(written.contains("DeviceAllow=/dev/nvidia0 rw"));
+        assert!(!transient.exists());
     }
 
     #[tokio::test]

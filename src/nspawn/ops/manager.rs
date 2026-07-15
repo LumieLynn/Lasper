@@ -112,16 +112,11 @@ impl DefaultManager {
         let _ = self.nudge_tx.send(());
     }
 
-    fn elevated_io(&self) -> crate::nspawn::sys::ElevatedIo {
-        self.exec_ctx.io.clone()
-    }
-
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        let io = self.elevated_io();
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(
             name,
-            &io,
             &self.exec_ctx.nspawn,
+            &self.exec_ctx.systemd_unit,
             &self.exec_ctx.nvidia_state,
             self.exec_ctx.cmd.as_ref(),
         )
