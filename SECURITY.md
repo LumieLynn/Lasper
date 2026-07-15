@@ -24,7 +24,16 @@ The daemon exits when Lasper shuts it down normally. A crashed or forcibly termi
 
 The authentication above isolates independent local processes and Lasper sessions. It does not protect against code already executing inside the launching Lasper process.
 
-The daemon currently exposes broad command and path-based file RPCs. A compromised TUI process can therefore exercise a large part of the daemon's root authority. Command allowlisting and path authorization remain required defense-in-depth work before a stable 0.3 release.
+The daemon currently still exposes broad command and path-based file RPCs. A compromised TUI process can therefore exercise a large part of the daemon's root authority.
+
+The intended fix is an incremental migration to typed daemon operations:
+
+- machine operations such as start, poweroff, enable, remove, and journal/login;
+- managed host-configuration operations such as `.nspawn`, service overrides, and Lasper state;
+- storage operations that derive `/var/lib/machines` paths inside the daemon;
+- provisioning operations with fixed executables, validated arguments, staging, and explicit results.
+
+Simple executable allowlists or path-prefix checks can be useful as temporary guardrails, but they are not the final security model. The stable `0.3.0` line should not depend on arbitrary root `program + argv` execution or unrestricted absolute-path file operations as normal product APIs.
 
 Prefer `lasper -e` over running the complete interface with `sudo lasper`. Running the whole TUI as root also elevates terminal parsing, clipboard integration, configuration parsing, and all UI code.
 
