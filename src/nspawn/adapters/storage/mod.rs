@@ -12,7 +12,7 @@ use std::path::PathBuf;
 pub use backends::directory::DirectoryBackend;
 pub use backends::image::DiskImageBackend;
 pub use backends::subvolume::SubvolumeBackend;
-pub use store::ManagedStorageStore;
+pub use store::{ManagedImageKind, ManagedStorageStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -33,17 +33,7 @@ impl StorageType {
     pub fn get_path(&self, name: &str) -> PathBuf {
         match self {
             Self::Directory | Self::Subvolume => crate::paths::machine_root(name),
-            Self::DiskImage => {
-                // Only raw disk images are supported by systemd-nspawn
-                let base = crate::paths::machine_root(name);
-                for ext in ["raw", "img"] {
-                    let p = base.with_extension(ext);
-                    if p.exists() {
-                        return p;
-                    }
-                }
-                base.with_extension("raw") // Default to .raw for new
-            }
+            Self::DiskImage => crate::paths::machine_raw_image(name),
         }
     }
 }
@@ -105,18 +95,22 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     let base = crate::paths::machine_root(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
-    let extensions = ["raw", "img", "iso"];
-    for ext in extensions {
+    let extensions = [
+        ("raw", ManagedImageKind::Raw),
+        ("img", ManagedImageKind::LegacyImg),
+    ];
+    for (ext, kind) in extensions {
         let path = base.with_extension(ext);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return into_backend(DiskImageBackend {
-                config: DiskImageConfig {
+            return into_backend(DiskImageBackend::existing_managed(
+                DiskImageConfig {
                     source: DiskImageSource::ImportExisting {
                         path: path.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
                 },
-            });
+                kind,
+            ));
         }
     }
 
@@ -125,14 +119,15 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     if let Ok(meta) = tokio::fs::metadata(&block_dev).await {
         use std::os::unix::fs::FileTypeExt;
         if meta.file_type().is_block_device() {
-            return into_backend(DiskImageBackend {
-                config: DiskImageConfig {
+            return into_backend(DiskImageBackend::external(
+                DiskImageConfig {
                     source: DiskImageSource::ImportExisting {
                         path: block_dev.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
                 },
-            });
+                block_dev,
+            ));
         }
     }
 
@@ -143,4 +138,17 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
 
     // 4. Default to DirectoryBackend
     into_backend(DirectoryBackend::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_disk_image_paths_are_canonical_raw() {
+        assert_eq!(
+            StorageType::DiskImage.get_path("test"),
+            crate::paths::machine_raw_image("test")
+        );
+    }
 }

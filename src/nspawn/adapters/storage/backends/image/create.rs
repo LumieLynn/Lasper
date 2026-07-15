@@ -1,10 +1,9 @@
 //! Disk image creation and formatting logic.
 
 use super::DiskImageBackend;
-use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::DiskImageSource;
-use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
+use crate::nspawn::sys::{log_output, CommandRunner};
 use std::path::PathBuf;
 
 fn copy_image_args(src_path: &std::path::Path, dest_path: &std::path::Path) -> Vec<String> {
@@ -22,51 +21,78 @@ impl DiskImageBackend {
         &self,
         name: &str,
         cmd_runner: &dyn CommandRunner,
-        io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        let dest_path = self.get_path(name);
+        if self.managed_kind() != Some(crate::nspawn::adapters::storage::ManagedImageKind::Raw) {
+            return Err(NspawnError::Validation(
+                "Only new managed raw images can be created".into(),
+            ));
+        }
 
-        match &self.config.source {
-            DiskImageSource::ImportExisting { path } => {
-                let src_path = PathBuf::from(path);
-                if !src_path.exists() {
-                    return Err(NspawnError::Validation(format!(
-                        "Source image not found: {}",
-                        path
-                    )));
-                }
-                if let Some(parent) = dest_path.parent() {
-                    io.create_dir_all(parent).await?;
-                }
-                let out = cmd_runner
-                    .run("cp", copy_image_args(&src_path, &dest_path))
-                    .await
-                    .map_err(|e| NspawnError::Io(dest_path.clone(), e))?;
-                log_output("cp", &out);
-                if !out.status.success() {
-                    return Err(NspawnError::cmd_failed(
-                        "copy disk image",
-                        format!("cp {} {}", src_path.display(), dest_path.display()),
-                        &out,
-                    ));
-                }
-            }
-            DiskImageSource::CreateNew { size, fs_type } => {
-                let dest_s = dest_path.to_string_lossy().to_string();
-                let out = cmd_runner
-                    .run("truncate", vec!["-s".into(), size.clone(), dest_s.clone()])
-                    .await?;
-                log_output("truncate", &out);
-                if !out.status.success() {
-                    return Err(NspawnError::cmd_failed(
-                        "truncate",
-                        format!("truncate -s {} {}", size, dest_path.display()),
-                        &out,
-                    ));
-                }
-                self.format_plain(&dest_path, fs_type, cmd_runner).await?;
+        if let DiskImageSource::ImportExisting { path } = &self.config.source {
+            if !PathBuf::from(path).exists() {
+                return Err(NspawnError::Validation(format!(
+                    "Source image not found: {}",
+                    path
+                )));
             }
         }
+
+        let dest_path = self.store.reserve_raw_image(name).await?;
+        let create_result: Result<()> = async {
+            match &self.config.source {
+                DiskImageSource::ImportExisting { path } => {
+                    let src_path = PathBuf::from(path);
+                    let out = cmd_runner
+                        .run("cp", copy_image_args(&src_path, &dest_path))
+                        .await
+                        .map_err(|e| NspawnError::Io(dest_path.clone(), e))?;
+                    log_output("cp", &out);
+                    if !out.status.success() {
+                        return Err(NspawnError::cmd_failed(
+                            "copy disk image",
+                            format!("cp {} {}", src_path.display(), dest_path.display()),
+                            &out,
+                        ));
+                    }
+                }
+                DiskImageSource::CreateNew { size, fs_type } => {
+                    let dest_s = dest_path.to_string_lossy().to_string();
+                    let out = cmd_runner
+                        .run("truncate", vec!["-s".into(), size.clone(), dest_s.clone()])
+                        .await?;
+                    log_output("truncate", &out);
+                    if !out.status.success() {
+                        return Err(NspawnError::cmd_failed(
+                            "truncate",
+                            format!("truncate -s {} {}", size, dest_path.display()),
+                            &out,
+                        ));
+                    }
+                    self.format_plain(&dest_path, fs_type, cmd_runner).await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = create_result {
+            if let Err(cleanup_error) = self
+                .store
+                .remove_image(
+                    name,
+                    crate::nspawn::adapters::storage::ManagedImageKind::Raw,
+                )
+                .await
+            {
+                log::warn!(
+                    "Failed to clean partial raw image {}: {}",
+                    dest_path.display(),
+                    cleanup_error
+                );
+            }
+            return Err(error);
+        }
+
         Ok(dest_path)
     }
 

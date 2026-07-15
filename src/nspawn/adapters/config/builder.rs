@@ -203,11 +203,11 @@ impl ContainerConfigBuilder {
 
         let storage: Box<dyn StorageBackend> = match storage_cfg.storage_type {
             StorageType::Directory => {
-                Box::new(DirectoryBackend::new(managed_storage)) as Box<dyn StorageBackend>
+                Box::new(DirectoryBackend::new(managed_storage.clone())) as Box<dyn StorageBackend>
             }
             StorageType::Subvolume => Box::new(SubvolumeBackend) as Box<dyn StorageBackend>,
-            StorageType::DiskImage => Box::new(DiskImageBackend {
-                config: storage_cfg
+            StorageType::DiskImage => Box::new(DiskImageBackend::new(
+                storage_cfg
                     .disk_config
                     .unwrap_or(crate::nspawn::models::DiskImageConfig {
                         source: crate::nspawn::models::DiskImageSource::CreateNew {
@@ -216,7 +216,8 @@ impl ContainerConfigBuilder {
                         },
                         use_partition_table: false,
                     }),
-            }) as Box<dyn StorageBackend>,
+                managed_storage,
+            )) as Box<dyn StorageBackend>,
         };
 
         let source = self.source.as_ref().cloned().unwrap_or(SourceConfig {
