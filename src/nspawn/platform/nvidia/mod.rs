@@ -6,8 +6,10 @@ pub mod discovery;
 pub mod lifecycle;
 pub mod profile;
 pub mod resolve;
+pub mod staging;
 pub mod state;
 
 pub use discovery::{get_nvidia_state, nvidia_ctk_available};
 pub use lifecycle::ensure_gpu_passthrough;
+pub use staging::NvidiaStagingStore;
 pub use state::{NvidiaState, NvidiaStateStore};

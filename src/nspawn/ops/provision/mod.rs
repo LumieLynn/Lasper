@@ -289,7 +289,10 @@ async fn run_deploy_internal(
 
                 // Write ld.so.conf.d and env vars into rootfs (one-time setup)
                 if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
-                    &name, &state, &io, cli_runner.as_ref(),
+                    &name,
+                    &state,
+                    &exec_ctx.nvidia_staging,
+                    cli_runner.as_ref(),
                 )
                 .await
                 {

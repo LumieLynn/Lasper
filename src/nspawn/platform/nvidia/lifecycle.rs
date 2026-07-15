@@ -1,5 +1,6 @@
 use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
+use super::staging::NvidiaInjectionFileKind;
 use super::state::{calculate_death_list, NvidiaState};
 use crate::nspawn::errors::Result;
 use crate::nspawn::sys::log_output;
@@ -122,20 +123,20 @@ async fn inject_persistent_device_allow(
 /// Write ld.so.conf.d entry and /etc/environment vars into the container
 /// rootfs via `systemd-nspawn -D <root> --bind <tmp>:<tmp> sh -c "cp ..."`.
 ///
-/// Content is staged in host temp files via [`ElevatedIo`] so it works in
-/// Elevated mode.  Uses the supplied [`CommandRunner`] to execute nspawn
-/// (which goes through the daemon when elevated).
+/// Content is staged through a typed NVIDIA staging store so Elevated mode
+/// does not expose arbitrary host temp-file paths. Uses the supplied
+/// [`CommandRunner`] to execute nspawn (which goes through the daemon when
+/// elevated).
 ///
 /// Done at creation time (not every startup) — called from provisioning.
 pub async fn inject_env_once(
     name: &str,
     state: &NvidiaState,
-    io: &crate::nspawn::sys::ElevatedIo,
+    staging: &crate::nspawn::platform::nvidia::NvidiaStagingStore,
     cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
 ) -> Result<()> {
     let rootfs = crate::paths::machine_root(name);
     let rootfs_str = rootfs.to_string_lossy();
-    let pid = std::process::id();
 
     // ── ld.so.conf.d ──
     let mut ld_content = String::new();
@@ -156,8 +157,10 @@ pub async fn inject_env_once(
     }
 
     if !ld_content.is_empty() {
-        let tmp = format!("/tmp/lasper-inject-ld-{}-{}.conf", name, pid);
-        io.write(std::path::Path::new(&tmp), &ld_content).await?;
+        let file = staging
+            .create_injection_file(name, NvidiaInjectionFileKind::LdConfig, &ld_content)
+            .await?;
+        let tmp = file.path.clone();
         let copy = cmd_runner
             .run(
                 "systemd-nspawn",
@@ -192,7 +195,7 @@ pub async fn inject_env_once(
                 );
             }
         }
-        let _ = io.remove_file(std::path::Path::new(&tmp)).await;
+        let _ = staging.remove_injection_file(name, &file).await;
     }
 
     // ── /etc/environment ──
@@ -222,8 +225,10 @@ pub async fn inject_env_once(
         }
         let new_env = lines.join("\n") + "\n";
 
-        let tmp = format!("/tmp/lasper-inject-env-{}-{}.conf", name, pid);
-        io.write(std::path::Path::new(&tmp), &new_env).await?;
+        let file = staging
+            .create_injection_file(name, NvidiaInjectionFileKind::Environment, &new_env)
+            .await?;
+        let tmp = file.path.clone();
         let _ = cmd_runner
             .run(
                 "systemd-nspawn",
@@ -238,7 +243,7 @@ pub async fn inject_env_once(
                 ],
             )
             .await;
-        let _ = io.remove_file(std::path::Path::new(&tmp)).await;
+        let _ = staging.remove_injection_file(name, &file).await;
     }
 
     Ok(())
@@ -385,9 +390,7 @@ pub async fn ensure_gpu_passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::ops::PermissionLevel;
     use crate::nspawn::sys::command::MockCommandRunner;
-    use crate::nspawn::sys::ElevatedIo;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
     use std::sync::{Arc, Mutex};
@@ -402,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn inject_env_refreshes_ld_cache_after_writing_ld_config() {
-        let io = ElevatedIo::new(PermissionLevel::Root);
+        let staging = crate::nspawn::platform::nvidia::NvidiaStagingStore::new(None);
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
         {
@@ -422,7 +425,9 @@ mod tests {
         };
         let name = format!("ldconfig-test-{}", std::process::id());
 
-        inject_env_once(&name, &state, &io, &runner).await.unwrap();
+        inject_env_once(&name, &state, &staging, &runner)
+            .await
+            .unwrap();
 
         let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 2);

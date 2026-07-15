@@ -8,7 +8,7 @@
 
 use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::nspawn::ops::PermissionLevel;
-use crate::nspawn::platform::nvidia::NvidiaStateStore;
+use crate::nspawn::platform::nvidia::{NvidiaStagingStore, NvidiaStateStore};
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::{DaemonCommandRunner, ElevatedDaemon};
 use crate::nspawn::sys::elevated_io::ElevatedIo;
@@ -24,6 +24,7 @@ pub struct ExecutionContext {
     pub nspawn: NspawnConfigStore,
     pub systemd_unit: SystemdUnitStore,
     pub nvidia_state: NvidiaStateStore,
+    pub nvidia_staging: NvidiaStagingStore,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
 
@@ -42,12 +43,14 @@ impl ExecutionContext {
         let nspawn = NspawnConfigStore::new(daemon.clone());
         let systemd_unit = SystemdUnitStore::new(daemon.clone());
         let nvidia_state = NvidiaStateStore::new(daemon.clone());
+        let nvidia_staging = NvidiaStagingStore::new(daemon.clone());
         Self {
             cmd,
             io,
             nspawn,
             systemd_unit,
             nvidia_state,
+            nvidia_staging,
             daemon,
         }
     }
@@ -73,6 +76,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("nspawn", &self.nspawn)
             .field("systemd_unit", &self.systemd_unit)
             .field("nvidia_state", &self.nvidia_state)
+            .field("nvidia_staging", &self.nvidia_staging)
             .field("daemon", &self.daemon)
             .finish()
     }
