@@ -179,7 +179,9 @@ impl Component for StorageStepView {
                 constraints.push(Constraint::Length(3)); // Import Path
             } else {
                 constraints.push(Constraint::Length(3)); // Size
-                constraints.push(Constraint::Length(4)); // FS
+                constraints.push(Constraint::Length(
+                    DiskImageFilesystem::ALL.len() as u16 + 2,
+                )); // FS
                 constraints.push(Constraint::Length(3)); // Partition table
             }
         }
