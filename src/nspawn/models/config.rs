@@ -103,10 +103,66 @@ pub struct CreateUser {
     pub shell: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskImageFilesystem {
+    #[default]
+    Ext4,
+    Xfs,
+    Btrfs,
+}
+
+impl DiskImageFilesystem {
+    pub const ALL: [Self; 3] = [Self::Ext4, Self::Xfs, Self::Btrfs];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Xfs => "xfs",
+            Self::Btrfs => "btrfs",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ext4 => "Ext4",
+            Self::Xfs => "XFS",
+            Self::Btrfs => "Btrfs",
+        }
+    }
+
+    pub fn mkfs_tool(self) -> &'static str {
+        match self {
+            Self::Ext4 => "mkfs.ext4",
+            Self::Xfs => "mkfs.xfs",
+            Self::Btrfs => "mkfs.btrfs",
+        }
+    }
+
+    pub fn to_index(self) -> usize {
+        match self {
+            Self::Ext4 => 0,
+            Self::Xfs => 1,
+            Self::Btrfs => 2,
+        }
+    }
+}
+
+impl std::fmt::Display for DiskImageFilesystem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DiskImageSource {
-    CreateNew { size: String, fs_type: String },
-    ImportExisting { path: String },
+    CreateNew {
+        size: String,
+        fs_type: DiskImageFilesystem,
+    },
+    ImportExisting {
+        path: String,
+    },
 }
 
 /// Configuration for disk image storage.
@@ -121,9 +177,9 @@ impl Default for DiskImageConfig {
         Self {
             source: DiskImageSource::CreateNew {
                 size: "10G".to_string(),
-                fs_type: "ext4".to_string(),
+                fs_type: DiskImageFilesystem::Ext4,
             },
-            use_partition_table: false,
+            use_partition_table: true,
         }
     }
 }

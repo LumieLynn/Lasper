@@ -125,7 +125,7 @@ impl StorageBackend for DiskImageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::DiskImageSource;
+    use crate::nspawn::models::{DiskImageFilesystem, DiskImageSource};
 
     #[test]
     fn new_imports_publish_to_canonical_raw_path() {
@@ -161,5 +161,17 @@ mod tests {
             backend.get_path("test"),
             crate::paths::machine_image("test", "img")
         );
+    }
+
+    #[test]
+    fn default_disk_image_config_uses_partition_table() {
+        assert_eq!(
+            DiskImageConfig::default().source,
+            DiskImageSource::CreateNew {
+                size: "10G".into(),
+                fs_type: DiskImageFilesystem::Ext4,
+            }
+        );
+        assert!(DiskImageConfig::default().use_partition_table);
     }
 }

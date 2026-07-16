@@ -1,8 +1,10 @@
 use crate::nspawn::adapters::storage::StorageType;
+use crate::nspawn::models::DiskImageFilesystem;
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::path_box::PathBox;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
+use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{StorageState, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
@@ -27,6 +29,7 @@ macro_rules! active_comps {
                 // Create New
                 comps.push(&mut $self.disk_size);
                 comps.push(&mut $self.disk_fs);
+                comps.push(&mut $self.partition_table);
             } else {
                 // Import
                 comps.push(&mut $self.import_path);
@@ -42,7 +45,8 @@ pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
     creation_method: RadioGroup,
     disk_size: TextBox,
-    disk_fs: TextBox,
+    disk_fs: SelectableList<(DiskImageFilesystem, bool)>,
+    partition_table: Checkbox,
     import_path: PathBox,
     focus: FocusTracker,
 }
@@ -72,6 +76,36 @@ impl StorageStepView {
 
         list.select(selected_idx);
 
+        let fs_options: Vec<(DiskImageFilesystem, bool)> = DiskImageFilesystem::ALL
+            .iter()
+            .map(|fs| {
+                (
+                    *fs,
+                    crate::nspawn::ops::provision::builders::image::check_tool(fs.mkfs_tool())
+                        .is_ok(),
+                )
+            })
+            .collect();
+        let mut disk_fs = SelectableList::new(" Filesystem ", fs_options, |(fs, supported)| {
+            if *supported {
+                fs.label().to_string()
+            } else {
+                format!("{} (missing {})", fs.label(), fs.mkfs_tool())
+            }
+        })
+        .with_item_enablement(|(_, supported)| *supported);
+        let mut fs_idx = initial_data.disk_fs.to_index();
+        if let Some((_, supported)) = disk_fs.items().get(fs_idx) {
+            if !*supported {
+                fs_idx = disk_fs
+                    .items()
+                    .iter()
+                    .position(|(_, supported)| *supported)
+                    .unwrap_or(fs_idx);
+            }
+        }
+        disk_fs.select(fs_idx);
+
         let mut view = Self {
             list,
             creation_method: RadioGroup::new(
@@ -90,18 +124,32 @@ impl StorageStepView {
                     Ok(())
                 }
             }),
-            disk_fs: TextBox::new(
-                " Filesystem Type (ext4, xfs) ",
-                initial_data.disk_fs.clone(),
-            )
-            .with_validator(|v| {
-                if v.trim().is_empty() {
-                    Err("Filesystem required".into())
-                } else {
-                    Ok(())
-                }
-            }),
-            import_path: PathBox::new(" Source Image Path ", initial_data.import_path.clone()),
+            disk_fs,
+            partition_table: Checkbox::new(" GPT Partition Table ", initial_data.disk_partition),
+            import_path: PathBox::new(" Source Image Path ", initial_data.import_path.clone())
+                .with_validator(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        return Err("Source image path required".into());
+                    }
+                    let metadata = std::fs::metadata(trimmed)
+                        .map_err(|_| "Source image path does not exist".to_string())?;
+                    let file_type = metadata.file_type();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileTypeExt;
+                        if file_type.is_file() || file_type.is_block_device() {
+                            return Ok(());
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        if file_type.is_file() {
+                            return Ok(());
+                        }
+                    }
+                    Err("Source image path must be a file or block device".into())
+                }),
             focus: FocusTracker::new(),
         };
         view.update_focus();
@@ -131,7 +179,8 @@ impl Component for StorageStepView {
                 constraints.push(Constraint::Length(3)); // Import Path
             } else {
                 constraints.push(Constraint::Length(3)); // Size
-                constraints.push(Constraint::Length(3)); // FS
+                constraints.push(Constraint::Length(4)); // FS
+                constraints.push(Constraint::Length(3)); // Partition table
             }
         }
 
@@ -161,6 +210,8 @@ impl Component for StorageStepView {
                 self.disk_size.render(f, chunks[current]);
                 current += 1;
                 self.disk_fs.render(f, chunks[current]);
+                current += 1;
+                self.partition_table.render(f, chunks[current]);
             }
         }
     }
@@ -194,7 +245,20 @@ impl Component for StorageStepView {
         if self.is_disk_image_selected() {
             if self.creation_method.selected_idx() == 0 {
                 self.disk_size.validate()?;
-                self.disk_fs.validate()?;
+                let Some((fs, supported)) = self.disk_fs.selected_item() else {
+                    return Err("Filesystem required".into());
+                };
+                if !*supported {
+                    return Err(format!("Missing dependency: {}", fs.mkfs_tool()));
+                }
+                crate::nspawn::ops::provision::builders::image::check_tool("truncate")
+                    .map_err(|_| "Missing dependency: truncate".to_string())?;
+                if self.partition_table.checked() {
+                    for tool in ["sfdisk", "losetup", "udevadm"] {
+                        crate::nspawn::ops::provision::builders::image::check_tool(tool)
+                            .map_err(|_| format!("Missing dependency: {}", tool))?;
+                    }
+                }
             } else {
                 self.import_path.validate()?;
             }
@@ -210,7 +274,10 @@ impl StepComponent for StorageStepView {
         }
         ctx.storage.creation_method_idx = self.creation_method.selected_idx();
         ctx.storage.disk_size = self.disk_size.value().to_string();
-        ctx.storage.disk_fs = self.disk_fs.value().to_string();
+        if let Some((fs, _)) = self.disk_fs.selected_item() {
+            ctx.storage.disk_fs = *fs;
+        }
+        ctx.storage.disk_partition = self.partition_table.checked();
         ctx.storage.import_path = self.import_path.value().to_string();
     }
 

@@ -212,9 +212,9 @@ impl ContainerConfigBuilder {
                     .unwrap_or(crate::nspawn::models::DiskImageConfig {
                         source: crate::nspawn::models::DiskImageSource::CreateNew {
                             size: "2G".to_string(),
-                            fs_type: "ext4".to_string(),
+                            fs_type: crate::nspawn::models::DiskImageFilesystem::Ext4,
                         },
-                        use_partition_table: false,
+                        use_partition_table: true,
                     }),
                 managed_storage,
             )) as Box<dyn StorageBackend>,

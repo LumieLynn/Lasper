@@ -4,6 +4,7 @@ pub use crate::nspawn::adapters::config::builder::{
 };
 use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
 use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::models::DiskImageFilesystem;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::ops::provision::Deployer;
 use crate::nspawn::ops::PermissionLevel;
@@ -77,7 +78,7 @@ pub struct StorageState {
     pub info: StorageInfo,
     pub creation_method_idx: usize, // 0: Create New, 1: Import Existing
     pub disk_size: String,
-    pub disk_fs: String,
+    pub disk_fs: DiskImageFilesystem,
     pub disk_partition: bool,
     pub import_path: String,
 }
@@ -95,7 +96,7 @@ impl StorageState {
                 } else {
                     crate::nspawn::models::DiskImageSource::CreateNew {
                         size: self.disk_size.clone(),
-                        fs_type: self.disk_fs.clone(),
+                        fs_type: self.disk_fs,
                     }
                 };
 
@@ -347,8 +348,8 @@ impl WizardContext {
                     .await,
                 creation_method_idx: 0,
                 disk_size: "2G".to_string(),
-                disk_fs: "ext4".to_string(),
-                disk_partition: false,
+                disk_fs: DiskImageFilesystem::Ext4,
+                disk_partition: true,
                 import_path: "".to_string(),
             },
             user: UserState {
