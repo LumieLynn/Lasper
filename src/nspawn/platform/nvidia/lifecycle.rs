@@ -2,8 +2,10 @@ use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
 use super::staging::NvidiaInjectionFileKind;
 use super::state::{calculate_death_list, NvidiaState};
-use crate::nspawn::errors::Result;
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::MachineName;
 use crate::nspawn::sys::log_output;
+use std::path::Path;
 
 macro_rules! log_step {
     ($name:expr, $step:expr, $msg:expr) => {
@@ -69,6 +71,11 @@ pub async fn cleanup_container_garbage(
     if death_list.is_empty() {
         return Ok(());
     }
+    let machine =
+        MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
+    for path in death_list {
+        validate_cleanup_path(path)?;
+    }
 
     log_step!(
         name,
@@ -76,31 +83,31 @@ pub async fn cleanup_container_garbage(
         "Inspecting and removing leftover driver files..."
     );
 
-    let rootfs = crate::paths::machine_root(name);
-    let mut script = String::new();
-    for path in death_list {
-        // [ -f F ]: regular file   [ ! -s F ]: size is zero
-        script.push_str(&format!(
-            "[ -f '{}' ] && [ ! -s '{}' ] && rm -f '{}'\n",
-            path, path, path
-        ));
+    let rootfs = crate::paths::machine_root(machine.as_str());
+    let mut args = vec![
+        "-D".to_string(),
+        rootfs.to_string_lossy().to_string(),
+        "--settings=no".to_string(),
+        "-q".to_string(),
+        "sh".to_string(),
+        "-c".to_string(),
+        "for path do [ -f \"$path\" ] && [ ! -s \"$path\" ] && rm -f -- \"$path\"; done"
+            .to_string(),
+        "_".to_string(),
+    ];
+    args.extend(death_list.iter().cloned());
+
+    cmd_runner.run("systemd-nspawn", args).await?;
+
+    Ok(())
+}
+
+fn validate_cleanup_path(path: &str) -> Result<()> {
+    if path.is_empty() || path.chars().any(char::is_control) || !Path::new(path).is_absolute() {
+        return Err(NspawnError::Validation(format!(
+            "Invalid NVIDIA cleanup path: {path:?}"
+        )));
     }
-
-    cmd_runner
-        .run(
-            "systemd-nspawn",
-            vec![
-                "-D".to_string(),
-                rootfs.to_string_lossy().to_string(),
-                "--settings=no".to_string(),
-                "-q".to_string(),
-                "sh".to_string(),
-                "-c".to_string(),
-                script,
-            ],
-        )
-        .await?;
-
     Ok(())
 }
 
@@ -401,6 +408,53 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn cleanup_container_garbage_routes_paths_as_shell_args() {
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut runner = MockCommandRunner::new();
+        {
+            let calls = calls.clone();
+            runner.expect_run().once().returning(move |program, args| {
+                assert_eq!(program, "systemd-nspawn");
+                calls.lock().unwrap().push(args.clone());
+                Ok(mock_output(true))
+            });
+        }
+
+        cleanup_container_garbage(
+            "valid-machine",
+            &["/usr/lib/odd'path.so".into(), "/usr/lib/zero.so".into()],
+            &runner,
+        )
+        .await
+        .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0];
+        let script_index = args
+            .iter()
+            .position(|arg| arg == "-c")
+            .expect("shell script marker")
+            + 1;
+        let script = &args[script_index];
+        assert!(script.contains("\"$path\""));
+        assert!(!script.contains("odd'path"));
+        assert!(args.iter().any(|arg| arg == "/usr/lib/odd'path.so"));
+        assert!(args.iter().any(|arg| arg == "/usr/lib/zero.so"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_container_garbage_rejects_invalid_machine_name_before_nspawn() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        let result =
+            cleanup_container_garbage("../escape", &["/usr/lib/libcuda.so".into()], &runner).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
 
     #[tokio::test]
