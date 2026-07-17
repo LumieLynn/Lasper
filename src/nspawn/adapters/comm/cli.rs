@@ -1,6 +1,6 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
+use crate::nspawn::models::{ContainerEntry, ContainerState, MachineName, MachineProperties};
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::sys::CommandRunner;
 use std::collections::{HashMap, HashSet};
@@ -198,44 +198,56 @@ impl ContainerBackend for CliBackend {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["start", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["start", name.as_str()]).await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["terminate", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["terminate", name.as_str()]).await
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["poweroff", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["poweroff", name.as_str()]).await
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["reboot", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["reboot", name.as_str()]).await
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["enable", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["enable", name.as_str()]).await
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["disable", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["disable", name.as_str()]).await
     }
 
     async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
-        self.run_machinectl(&["kill", "-s", signal.as_name(), name])
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["kill", "-s", signal.as_name(), name.as_str()])
             .await
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        self.run_machinectl(&["remove", name]).await
+        let name = parse_machine_name(name)?;
+        self.run_machinectl(&["remove", name.as_str()]).await
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+        let name = parse_machine_name(name)?;
         let mut props = MachineProperties::default();
 
         let machine_out = self
             .cmd_runner
-            .run("machinectl", vec!["show".to_string(), name.to_string()])
+            .run(
+                "machinectl",
+                vec!["show".to_string(), name.as_str().to_string()],
+            )
             .await;
 
         if let Ok(out) = machine_out {
@@ -262,10 +274,7 @@ impl ContainerBackend for CliBackend {
             .cmd_runner
             .run(
                 "systemctl",
-                vec![
-                    "show".to_string(),
-                    format!("systemd-nspawn@{}.service", name),
-                ],
+                vec!["show".to_string(), name.systemd_nspawn_unit()],
             )
             .await;
 
@@ -291,7 +300,7 @@ impl ContainerBackend for CliBackend {
 
         if props.groups.is_empty() {
             return Err(NspawnError::CommandFailed(
-                format!("machinectl/systemctl show {}", name),
+                format!("machinectl/systemctl show {}", name.as_str()),
                 "No properties found".to_string(),
                 "The target machine might not exist or systemd-nspawn is not managing it."
                     .to_string(),
@@ -353,13 +362,20 @@ impl ContainerBackend for CliBackend {
 #[async_trait::async_trait]
 impl ProvisionBackend for CliBackend {
     async fn clone_image(&self, source: &str, dest: &str) -> Result<()> {
-        self.run_machinectl(&["clone", source, dest]).await
+        let source = parse_machine_name(source)?;
+        let dest = parse_machine_name(dest)?;
+        self.run_machinectl(&["clone", source.as_str(), dest.as_str()])
+            .await
     }
 
     async fn reload_daemon(&self) -> Result<()> {
         // Delegates to the same `systemctl daemon-reload` used by the runtime backend.
         ContainerBackend::reload_daemon(self).await
     }
+}
+
+fn parse_machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 #[cfg(test)]
@@ -553,6 +569,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_start_rejects_invalid_machine_name_before_machinectl() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().never();
+            r
+        });
+        let provider = CliBackend::with_runner(runner);
+
+        let result = provider.start("../escape").await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
     async fn test_kill_calls_machinectl_kill_with_signal() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
@@ -577,5 +607,19 @@ mod tests {
             .kill("my-ctr", crate::nspawn::models::AllowedSignal::Terminate)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_clone_rejects_invalid_machine_name_before_machinectl() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run().never();
+            r
+        });
+        let provider = CliBackend::with_runner(runner);
+
+        let result = provider.clone_image("source", "bad/name").await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
 }

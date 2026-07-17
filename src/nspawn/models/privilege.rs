@@ -30,6 +30,10 @@ impl MachineName {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    pub fn systemd_nspawn_unit(&self) -> String {
+        format!("systemd-nspawn@{}.service", self.0)
+    }
 }
 
 impl fmt::Display for MachineName {
@@ -178,6 +182,16 @@ mod tests {
     fn machine_name_deserialization_validates_the_value() {
         assert!(serde_json::from_str::<MachineName>(r#""valid-machine_1""#).is_ok());
         assert!(serde_json::from_str::<MachineName>(r#""../invalid""#).is_err());
+    }
+
+    #[test]
+    fn machine_name_builds_systemd_nspawn_unit_name() {
+        let machine = MachineName::new("valid-machine_1").unwrap();
+
+        assert_eq!(
+            machine.systemd_nspawn_unit(),
+            "systemd-nspawn@valid-machine_1.service"
+        );
     }
 
     #[test]

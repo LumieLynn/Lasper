@@ -2,7 +2,7 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ContainerState, MachineProperties};
+use crate::nspawn::models::{ContainerEntry, ContainerState, MachineName, MachineProperties};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -186,50 +186,55 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        let unit = format!("systemd-nspawn@{}.service", name);
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
         self.call_systemd1::<_, OwnedObjectPath>("StartUnit", &(&unit, "fail"))
             .await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         proxy
-            .terminate_machine(name)
+            .terminate_machine(name.as_str())
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let sig = libc::SIGRTMIN() + 4;
         proxy
-            .kill_machine(name, "leader", sig)
+            .kill_machine(name.as_str(), "leader", sig)
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         proxy
-            .kill_machine(name, "leader", libc::SIGINT)
+            .kill_machine(name.as_str(), "leader", libc::SIGINT)
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        let unit = format!("systemd-nspawn@{}.service", name);
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
         let files: Vec<(&str, bool)> = vec![(&unit, false)];
         self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
             "EnableUnitFiles",
@@ -239,34 +244,41 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        let unit = format!("systemd-nspawn@{}.service", name);
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
         let files: Vec<&str> = vec![&unit];
         self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
             .await
     }
 
     async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
+        let name = parse_machine_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         proxy
-            .kill_machine(name, "all", signal.as_raw())
+            .kill_machine(name.as_str(), "all", signal.as_raw())
             .await
             .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy.remove_image(name).await.map_err(NspawnError::Dbus)?;
+        proxy
+            .remove_image(name.as_str())
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+        let name = parse_machine_name(name)?;
         let conn = self
             .connection()
             .await
@@ -275,7 +287,7 @@ impl ContainerBackend for DbusBackend {
         let mut props = MachineProperties::default();
 
         // 1) Try machine1 properties (only works for running/registered machines)
-        if let Ok(m1_props) = get_machine1_properties(&conn, name).await {
+        if let Ok(m1_props) = get_machine1_properties(&conn, &name).await {
             let group = props.get_group_mut(crate::nspawn::models::GROUP_MACHINE);
             for (k, v) in m1_props {
                 group.insert(k, v);
@@ -283,7 +295,7 @@ impl ContainerBackend for DbusBackend {
         }
 
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
-        if let Ok(sd_props) = get_systemd1_properties(&conn, name).await {
+        if let Ok(sd_props) = get_systemd1_properties(&conn, &name).await {
             for (k, v) in sd_props {
                 crate::nspawn::adapters::comm::formatting::insert_systemd_property(
                     &mut props, k, v,
@@ -333,12 +345,16 @@ impl ContainerBackend for DbusBackend {
     }
 }
 
+fn parse_machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
 async fn get_machine1_properties(
     conn: &Connection,
-    name: &str,
+    name: &MachineName,
 ) -> zbus::Result<HashMap<String, String>> {
     let proxy = ManagerProxy::new(conn).await?;
-    let path = proxy.get_machine(name).await?;
+    let path = proxy.get_machine(name.as_str()).await?;
     let b = zbus::fdo::PropertiesProxy::builder(conn)
         .destination("org.freedesktop.machine1")?
         .path(path)?;
@@ -356,9 +372,9 @@ async fn get_machine1_properties(
 
 async fn get_systemd1_properties(
     conn: &Connection,
-    name: &str,
+    name: &MachineName,
 ) -> zbus::Result<HashMap<String, String>> {
-    let unit = format!("systemd-nspawn@{}.service", name);
+    let unit = name.systemd_nspawn_unit();
     let reply = conn
         .call_method(
             Some("org.freedesktop.systemd1"),
