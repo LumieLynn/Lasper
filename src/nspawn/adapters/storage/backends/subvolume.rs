@@ -2,6 +2,7 @@
 
 use super::super::{StorageBackend, StorageType};
 use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::MachineName;
 use crate::nspawn::sys::{get_filesystem_type, log_output, CommandRunner, ElevatedIo};
 use std::path::{Path, PathBuf};
 
@@ -69,7 +70,8 @@ impl StorageBackend for SubvolumeBackend {
         cmd_runner: &dyn CommandRunner,
         _io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        let path = self.get_path(name);
+        let machine = parse_machine_name(name)?;
+        let path = machine_path(&machine);
         match self.detect_type().await? {
             SubvolumeType::Btrfs => {
                 let out = cmd_runner
@@ -95,7 +97,7 @@ impl StorageBackend for SubvolumeBackend {
             SubvolumeType::Zfs => {
                 let machines_dir = crate::paths::machines_dir();
                 let parent_dataset = self.get_zfs_dataset(&machines_dir, cmd_runner).await?;
-                let dataset_name = format!("{}/{}", parent_dataset, name);
+                let dataset_name = zfs_child_dataset(&parent_dataset, &machine)?;
                 let out = cmd_runner
                     .run("zfs", vec!["create".into(), dataset_name.clone()])
                     .await
@@ -119,7 +121,7 @@ impl StorageBackend for SubvolumeBackend {
         _cmd_runner: &dyn CommandRunner,
         _io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        Ok(self.get_path(name))
+        Ok(machine_path(&parse_machine_name(name)?))
     }
 
     async fn unmount(
@@ -137,7 +139,8 @@ impl StorageBackend for SubvolumeBackend {
         cmd_runner: &dyn CommandRunner,
         _io: &ElevatedIo,
     ) -> Result<()> {
-        let path = self.get_path(name);
+        let machine = parse_machine_name(name)?;
+        let path = machine_path(&machine);
         match self.detect_type().await? {
             SubvolumeType::Btrfs => {
                 let out = cmd_runner
@@ -172,7 +175,7 @@ impl StorageBackend for SubvolumeBackend {
                     Ok(ds) => ds,
                     Err(_) => return Ok(()),
                 };
-                let dataset_name = format!("{}/{}", parent_dataset, name);
+                let dataset_name = zfs_child_dataset(&parent_dataset, &machine)?;
                 let out = cmd_runner
                     .run("zfs", vec!["destroy".into(), dataset_name.clone()])
                     .await
@@ -196,8 +199,90 @@ impl StorageBackend for SubvolumeBackend {
     }
 
     async fn exists(&self, name: &str) -> bool {
-        tokio::fs::try_exists(self.get_path(name))
+        let Ok(machine) = parse_machine_name(name) else {
+            return false;
+        };
+        tokio::fs::try_exists(machine_path(&machine))
             .await
             .unwrap_or(false)
+    }
+}
+
+fn parse_machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn machine_path(machine: &MachineName) -> PathBuf {
+    crate::paths::machine_root(machine.as_str())
+}
+
+fn zfs_child_dataset(parent_dataset: &str, machine: &MachineName) -> Result<String> {
+    let parent_dataset = parent_dataset.trim();
+    if parent_dataset.is_empty() || parent_dataset.chars().any(char::is_control) {
+        return Err(NspawnError::Validation(
+            "Invalid parent ZFS dataset name".into(),
+        ));
+    }
+    Ok(format!("{}/{}", parent_dataset, machine.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::ops::PermissionLevel;
+    use crate::nspawn::sys::command::MockCommandRunner;
+
+    #[tokio::test]
+    async fn create_rejects_invalid_machine_name_before_external_detection() {
+        let backend = SubvolumeBackend;
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+        let io = ElevatedIo::new(PermissionLevel::Root);
+
+        let result = backend.create("../escape", &runner, &io).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_invalid_machine_name_before_external_detection() {
+        let backend = SubvolumeBackend;
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+        let io = ElevatedIo::new(PermissionLevel::Root);
+
+        let result = backend.delete("bad/name", &runner, &io).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn mount_rejects_invalid_machine_name() {
+        let backend = SubvolumeBackend;
+        let runner = MockCommandRunner::new();
+        let io = ElevatedIo::new(PermissionLevel::Root);
+
+        let result = backend.mount(".hidden", &runner, &io).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn exists_returns_false_for_invalid_machine_name() {
+        let backend = SubvolumeBackend;
+
+        assert!(!backend.exists("../escape").await);
+    }
+
+    #[test]
+    fn zfs_dataset_child_uses_validated_machine_name() {
+        let machine = parse_machine_name("valid_1").unwrap();
+
+        assert_eq!(
+            zfs_child_dataset("tank/machines", &machine).unwrap(),
+            "tank/machines/valid_1"
+        );
+        assert!(zfs_child_dataset("", &machine).is_err());
+        assert!(zfs_child_dataset("tank\nmachines", &machine).is_err());
     }
 }
