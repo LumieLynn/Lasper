@@ -1,4 +1,5 @@
-use crate::nspawn::models::CreateUser;
+use crate::nspawn::errors::NspawnError;
+use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
@@ -31,6 +32,13 @@ pub struct UserStepView {
     focus: FocusTracker,
 }
 
+fn validate_root_password(password: &str) -> Result<(), String> {
+    validate_chpasswd_secret("Root password", password).map_err(|error| match error {
+        NspawnError::Validation(message) => message,
+        other => other.to_string(),
+    })
+}
+
 impl UserStepView {
     pub fn new(initial_data: &UserConfig) -> Self {
         let users = initial_data.users.clone();
@@ -39,7 +47,8 @@ impl UserStepView {
             root_password: PasswordBox::new(
                 " Root Password (optional) ",
                 initial_data.root_password.clone().unwrap_or_default(),
-            ),
+            )
+            .with_validator(validate_root_password),
             user_list: EditableList::new(
                 " Regular Users ",
                 users,

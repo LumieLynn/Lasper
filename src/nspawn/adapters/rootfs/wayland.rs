@@ -1,5 +1,5 @@
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::CreateUser;
+use crate::nspawn::models::{validate_login_shell, validate_login_username, CreateUser};
 use crate::nspawn::sys::ElevatedIo;
 use std::path::Path;
 
@@ -9,6 +9,9 @@ pub async fn setup_wayland_shell_env(
     user: &CreateUser,
     io: &ElevatedIo,
 ) -> Result<()> {
+    validate_login_username(&user.username)?;
+    validate_login_shell(&user.shell)?;
+
     let home_dir = if user.username == "root" {
         "/root".to_string()
     } else {

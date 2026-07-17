@@ -1,4 +1,6 @@
+use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
+use std::path::{Component, Path};
 
 /// Represents the network configuration for a container.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -101,6 +103,108 @@ pub struct CreateUser {
     pub sudoer: bool,
     /// Login shell (e.g., /bin/bash).
     pub shell: String,
+}
+
+impl CreateUser {
+    pub fn validate(&self) -> Result<()> {
+        validate_login_username(&self.username)?;
+        validate_login_shell(&self.shell)?;
+        validate_chpasswd_secret("user password", &self.password)
+    }
+
+    pub fn login_shell(&self) -> &str {
+        if self.shell.is_empty() {
+            "/bin/bash"
+        } else {
+            self.shell.as_str()
+        }
+    }
+}
+
+pub fn validate_login_username(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return validation_error("Username cannot be empty");
+    }
+    if name.len() > 32 {
+        return validation_error("Username is too long");
+    }
+
+    let bytes = name.as_bytes();
+    if !bytes.is_ascii() {
+        return validation_error("Username must be ASCII");
+    }
+
+    let first = bytes[0];
+    if !first.is_ascii_alphabetic() && first != b'_' {
+        return validation_error("Username must start with a letter or '_'");
+    }
+
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' {
+            continue;
+        }
+        if i == bytes.len() - 1 && b == b'$' {
+            continue;
+        }
+        return validation_error("Username contains invalid characters");
+    }
+
+    Ok(())
+}
+
+pub fn validate_login_shell(shell: &str) -> Result<()> {
+    if shell.is_empty() {
+        return Ok(());
+    }
+    if shell.trim() != shell {
+        return validation_error("Login shell cannot contain leading or trailing whitespace");
+    }
+    if shell.len() > 255
+        || shell.contains(':')
+        || shell.chars().any(char::is_control)
+        || !shell.bytes().all(is_safe_shell_path_byte)
+    {
+        return validation_error("Login shell contains invalid characters");
+    }
+
+    let path = Path::new(shell);
+    if !path.is_absolute() {
+        return validation_error("Login shell must be an absolute path");
+    }
+    let mut has_normal_component = false;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(_) => {
+                has_normal_component = true;
+            }
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => {
+                return validation_error("Login shell path must not contain relative components");
+            }
+        }
+    }
+    if !has_normal_component {
+        return validation_error("Login shell must include an executable path");
+    }
+
+    Ok(())
+}
+
+pub fn validate_chpasswd_secret(label: &str, secret: &str) -> Result<()> {
+    if secret.chars().any(char::is_control) {
+        return Err(NspawnError::Validation(format!(
+            "{label} cannot contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn is_safe_shell_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+')
+}
+
+fn validation_error<T>(message: impl Into<String>) -> Result<T> {
+    Err(NspawnError::Validation(message.into()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -271,6 +375,43 @@ mod tests {
         assert_eq!(IdmapSuffix::from_index(3), IdmapSuffix::Rootidmap);
         assert_eq!(IdmapSuffix::from_index(4), IdmapSuffix::Owneridmap);
         assert_eq!(IdmapSuffix::from_index(99), IdmapSuffix::None);
+    }
+
+    #[test]
+    fn create_user_accepts_default_shell_and_valid_system_names() {
+        let user = CreateUser {
+            username: "_svc-user$".into(),
+            password: "secret:with:colons".into(),
+            shell: String::new(),
+            sudoer: false,
+        };
+
+        assert!(user.validate().is_ok());
+        assert_eq!(user.login_shell(), "/bin/bash");
+    }
+
+    #[test]
+    fn create_user_rejects_invalid_username_shell_and_chpasswd_records() {
+        for name in ["", "1alice", "bad/name", "bad name", "bad\nname"] {
+            assert!(
+                validate_login_username(name).is_err(),
+                "username should be rejected: {name:?}"
+            );
+        }
+
+        for shell in ["bash", "/", "/bin/../bash", "/bin/ba sh", "/bin/bash\n"] {
+            assert!(
+                validate_login_shell(shell).is_err(),
+                "shell should be rejected: {shell:?}"
+            );
+        }
+
+        for secret in ["one\ntwo", "one\rtwo", "one\0two"] {
+            assert!(
+                validate_chpasswd_secret("password", secret).is_err(),
+                "secret should be rejected: {secret:?}"
+            );
+        }
     }
 
     #[test]

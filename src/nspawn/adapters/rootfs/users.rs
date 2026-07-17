@@ -1,5 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::CreateUser;
+use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
 use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
 use std::path::{Path, PathBuf};
 
@@ -11,12 +11,9 @@ pub async fn create_user_in_container(
     cmd_runner: &dyn CommandRunner,
     io: &ElevatedIo,
 ) -> Result<()> {
+    user.validate()?;
     let rootfs_s = rootfs.to_string_lossy().to_string();
-    let shell = if user.shell.is_empty() {
-        "/bin/bash"
-    } else {
-        user.shell.as_str()
-    };
+    let shell = user.login_shell();
 
     let out = cmd_runner
         .run(
@@ -135,6 +132,7 @@ pub async fn set_root_password(
     if password.is_empty() {
         return Ok(());
     }
+    validate_chpasswd_secret("root password", password)?;
     // Pass credentials as a positional shell parameter ($1), never
     // interpolated into the script string.  $1 is data (from execve argv),
     // not code; "$1" prevents word-splitting and globbing.
@@ -166,4 +164,82 @@ pub async fn set_root_password(
         let _ = logs.send(msg).await;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::ops::PermissionLevel;
+    use crate::nspawn::sys::command::MockCommandRunner;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+    use tokio::sync::mpsc;
+
+    fn success_output() -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_user_uses_default_shell_after_validation() {
+        let (logs, _rx) = mpsc::channel(1);
+        let io = ElevatedIo::new(PermissionLevel::Root);
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().once().returning(|program, args| {
+            assert_eq!(program, "systemd-nspawn");
+            assert!(args.windows(2).any(|pair| pair == ["-s", "/bin/bash"]));
+            assert!(args.iter().any(|arg| arg == "alice"));
+            Ok(success_output())
+        });
+
+        let user = CreateUser {
+            username: "alice".into(),
+            shell: String::new(),
+            ..Default::default()
+        };
+
+        create_user_in_container(Path::new("/tmp/rootfs"), &user, &logs, &runner, &io)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_user_rejects_chpasswd_record_injection_before_running() {
+        let (logs, _rx) = mpsc::channel(1);
+        let io = ElevatedIo::new(PermissionLevel::Root);
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        let user = CreateUser {
+            username: "alice".into(),
+            password: "safe\nroot:pwned".into(),
+            shell: "/bin/bash".into(),
+            sudoer: false,
+        };
+
+        let result =
+            create_user_in_container(Path::new("/tmp/rootfs"), &user, &logs, &runner, &io).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn set_root_password_rejects_chpasswd_record_injection_before_running() {
+        let (logs, _rx) = mpsc::channel(1);
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        let result = set_root_password(
+            Path::new("/tmp/rootfs"),
+            "safe\nalice:pwned",
+            &logs,
+            &runner,
+        )
+        .await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
 }
