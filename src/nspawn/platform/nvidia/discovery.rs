@@ -6,7 +6,7 @@ use super::state::{NvidiaState, PassthroughBind};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::sys::{new_command, CommandLogged};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Check whether `nvidia-ctk` is available on PATH.
 pub fn nvidia_ctk_available() -> bool {
@@ -86,11 +86,15 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
     };
 
     let (all_mounts, all_hooks, all_device_nodes) = collect_cdi_edits(spec);
+    let mut source_map: HashMap<String, String> = HashMap::new();
+    let mut writable_sources: HashSet<String> = HashSet::new();
 
     // Device nodes → Bind (read-write)
     for node in &all_device_nodes {
         let path = &node.path;
         let host = node.host_path.as_deref().unwrap_or(path);
+        source_map.insert(path.clone(), host.to_string());
+        writable_sources.insert(path.clone());
         push(
             &mut binds,
             PassthroughBind {
@@ -102,9 +106,8 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
     }
 
     // Mounts → BindReadOnly
-    let mut mount_map: HashMap<String, String> = HashMap::new();
     for m in &all_mounts {
-        mount_map.insert(m.container_path.clone(), m.host_path.clone());
+        source_map.insert(m.container_path.clone(), m.host_path.clone());
     }
 
     let (classified, unclassified) = classify::classify_mounts(all_mounts);
@@ -129,26 +132,39 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
         );
     }
 
-    // Symlink hooks -> synthetic BindReadOnly
+    // Symlink hooks -> synthetic binds backed by the terminal mount/device source.
     let symlinks = classify::parse_symlink_hooks(&all_hooks);
+    let symlink_map: HashMap<String, String> = symlinks
+        .iter()
+        .map(|symlink| (symlink.link_path.clone(), symlink.target.clone()))
+        .collect();
+    let mut unresolved_symlinks = 0usize;
     for sym in &symlinks {
-        let host_target = resolve_symlink_host_path(&sym.target, &sym.link_path, &mount_map);
-        if let Some(host_path) = host_target {
+        let host_target =
+            resolve_symlink_source(&sym.target, &sym.link_path, &source_map, &symlink_map);
+        if let Some((host_path, source_path)) = host_target {
             push(
                 &mut binds,
                 PassthroughBind {
                     host_path,
                     container_path: sym.link_path.clone(),
-                    readonly: true,
+                    readonly: !writable_sources.contains(&source_path),
                 },
             );
         } else {
-            log::warn!(
+            unresolved_symlinks += 1;
+            log::debug!(
                 "CDI symlink target '{}' (for link '{}') not found in CDI mounts — skipping",
                 sym.target,
                 sym.link_path
             );
         }
+    }
+    if unresolved_symlinks > 0 {
+        log::warn!(
+            "Skipped {} NVIDIA CDI symlink entries whose targets were not present in the selected CDI edits",
+            unresolved_symlinks
+        );
     }
 
     binds
@@ -193,30 +209,70 @@ fn collect_cdi_edits(
     (mounts, hooks, device_nodes)
 }
 
-/// Resolve a symlink target to a host path.
-///
-/// If target is absolute, look it up directly in the mount map (container_path -> host_path).
-/// If target is relative, resolve it against link_path's parent directory first.
+/// Resolve one symlink target directly against a container-path-to-host-path map.
+#[cfg(test)]
 fn resolve_symlink_host_path(
     target: &str,
     link_path: &str,
     mount_map: &HashMap<String, String>,
 ) -> Option<String> {
-    if target.starts_with('/') {
-        return mount_map.get(target).cloned();
+    resolve_symlink_source(target, link_path, mount_map, &HashMap::new())
+        .map(|(host_path, _)| host_path)
+}
+
+fn resolve_symlink_source(
+    target: &str,
+    link_path: &str,
+    source_map: &HashMap<String, String>,
+    symlink_map: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    let mut current = resolve_container_symlink_target(target, link_path)?;
+    let mut visited = HashSet::new();
+
+    loop {
+        if let Some(host_path) = source_map.get(&current) {
+            return Some((host_path.clone(), current));
+        }
+        if !visited.insert(current.clone()) {
+            return None;
+        }
+        let next_target = symlink_map.get(&current)?;
+        current = resolve_container_symlink_target(next_target, &current)?;
+    }
+}
+
+fn resolve_container_symlink_target(target: &str, link_path: &str) -> Option<String> {
+    let path = if target.starts_with('/') {
+        PathBuf::from(target)
+    } else {
+        Path::new(link_path).parent()?.join(target)
+    };
+    normalize_absolute_container_path(&path)
+}
+
+fn normalize_absolute_container_path(path: &Path) -> Option<String> {
+    if !path.is_absolute() {
+        return None;
     }
 
-    // Relative target: resolve against link_path's parent
-    let parent = Path::new(link_path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    let resolved = if parent.is_empty() || parent == "/" {
-        format!("/{}", target)
-    } else {
-        format!("{}/{}", parent, target)
-    };
-    mount_map.get(&resolved).cloned()
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir => parts.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                parts.pop()?;
+            }
+            Component::Normal(part) => parts.push(part),
+            Component::Prefix(_) => return None,
+        }
+    }
+
+    let mut normalized = PathBuf::from("/");
+    for part in parts {
+        normalized.push(part);
+    }
+    Some(normalized.to_string_lossy().into_owned())
 }
 
 /// Remap container_path in each bind based on profile's category destinations.
@@ -511,6 +567,58 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_symlink_normalizes_parent_components() {
+        let mut map = HashMap::new();
+        map.insert(
+            "/usr/lib/libnvidia-allocator.so.1".into(),
+            "/host/libnvidia-allocator.so.1".into(),
+        );
+
+        let result = resolve_symlink_host_path(
+            "../libnvidia-allocator.so.1",
+            "/usr/lib/gbm/nvidia-drm_gbm.so",
+            &map,
+        );
+
+        assert_eq!(result, Some("/host/libnvidia-allocator.so.1".into()));
+    }
+
+    #[test]
+    fn test_resolve_symlink_follows_hook_chain() {
+        let sources = HashMap::from([(
+            "/usr/lib/libcuda.so.595.58.03".into(),
+            "/host/libcuda.so.595.58.03".into(),
+        )]);
+        let symlinks = HashMap::from([(
+            "/usr/lib/libcuda.so.1".into(),
+            "libcuda.so.595.58.03".into(),
+        )]);
+
+        let result =
+            resolve_symlink_source("libcuda.so.1", "/usr/lib/libcuda.so", &sources, &symlinks);
+
+        assert_eq!(
+            result,
+            Some((
+                "/host/libcuda.so.595.58.03".into(),
+                "/usr/lib/libcuda.so.595.58.03".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_resolve_symlink_rejects_cycles_and_root_escape() {
+        let sources = HashMap::new();
+        let symlinks = HashMap::from([
+            ("/usr/lib/a".into(), "b".into()),
+            ("/usr/lib/b".into(), "a".into()),
+        ]);
+
+        assert!(resolve_symlink_source("b", "/usr/lib/a", &sources, &symlinks).is_none());
+        assert!(resolve_container_symlink_target("../../escape", "/usr/link").is_none());
+    }
+
+    #[test]
     fn test_resolve_symlink_not_found() {
         let map = HashMap::new();
         let result = resolve_symlink_host_path("/nonexistent/path", "/usr/bin/foo", &map);
@@ -541,6 +649,43 @@ mod tests {
         assert_eq!(binds[0].container_path, "/dev/nvidia0");
         assert_eq!(binds[0].host_path, "/dev/nvidia0");
         assert!(!binds[0].readonly);
+    }
+
+    #[test]
+    fn test_cdi_device_symlink_keeps_writable_binding() {
+        let spec = CdiSpec {
+            container_edits: Some(super::super::cdi::CdiEdits {
+                device_nodes: Some(vec![CdiDeviceNode {
+                    path: "/dev/dri/card0".into(),
+                    host_path: None,
+                    major: None,
+                    minor: None,
+                    permissions: None,
+                    gid: None,
+                }]),
+                mounts: None,
+                hooks: Some(vec![CdiHook {
+                    hook_name: "createContainer".into(),
+                    path: "/usr/bin/nvidia-cdi-hook".into(),
+                    args: Some(vec![
+                        "nvidia-cdi-hook".into(),
+                        "create-symlinks".into(),
+                        "--link".into(),
+                        "../card0::/dev/dri/by-path/gpu-card".into(),
+                    ]),
+                }]),
+                env: None,
+            }),
+            devices: None,
+        };
+
+        let binds = cdi_to_raw_binds(&spec);
+        let alias = binds
+            .iter()
+            .find(|bind| bind.container_path == "/dev/dri/by-path/gpu-card")
+            .expect("device alias bind should exist");
+        assert_eq!(alias.host_path, "/dev/dri/card0");
+        assert!(!alias.readonly);
     }
 
     #[test]

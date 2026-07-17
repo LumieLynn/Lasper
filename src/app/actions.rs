@@ -158,7 +158,7 @@ impl App {
             return;
         }
 
-        let (name, manager, tx) = {
+        let (name, manager, tx, previous_state) = {
             let e = match self.data.entries.get_mut(self.data.selected) {
                 Some(e) => e,
                 None => return,
@@ -168,6 +168,7 @@ impl App {
                 return;
             }
 
+            let previous_state = transition.as_ref().map(|_| e.state.clone());
             if let Some(state) = transition {
                 self.data
                     .transitions
@@ -181,7 +182,12 @@ impl App {
                 Some(tx) => tx.clone(),
                 None => return,
             };
-            (e.name.clone(), self.data.manager.clone(), tx)
+            (
+                e.name.clone(),
+                self.data.manager.clone(),
+                tx,
+                previous_state,
+            )
         };
 
         let pm = self.permissions.clone();
@@ -190,10 +196,11 @@ impl App {
                 Ok(a) => a,
                 Err(e) => {
                     let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            format!("{}", e),
-                            crate::ui::StatusLevel::Error,
-                        ))
+                        .send(crate::events::AppEvent::ContainerActionFailed {
+                            name,
+                            previous_state,
+                            message: e.to_string(),
+                        })
                         .await;
                     return;
                 }
@@ -207,18 +214,47 @@ impl App {
                 None => String::new(),
             };
 
-            let (msg, level) = match res {
-                Ok(_) => (
-                    format!("{} {}{}", action_label, name, suffix),
-                    crate::ui::StatusLevel::Success,
-                ),
-                Err(err) => (format!("Error: {err}"), crate::ui::StatusLevel::Error),
-            };
-
-            let _ = tx
-                .send(crate::events::AppEvent::ActionDone(msg, level))
-                .await;
+            match res {
+                Ok(_) => {
+                    let message = format!("{} {}{}", action_label, name, suffix);
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            message,
+                            crate::ui::StatusLevel::Success,
+                        ))
+                        .await;
+                }
+                Err(error) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ContainerActionFailed {
+                            name,
+                            previous_state,
+                            message: format!("Error: {error}"),
+                        })
+                        .await;
+                }
+            }
         });
+    }
+
+    pub(crate) fn rollback_container_transition(
+        &mut self,
+        name: &str,
+        previous_state: Option<ContainerState>,
+    ) {
+        if previous_state.is_some() {
+            self.data.transitions.remove(name);
+        }
+        if let Some(previous_state) = previous_state {
+            if let Some(entry) = self
+                .data
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == name)
+            {
+                entry.state = previous_state;
+            }
+        }
     }
 
     pub fn action_start(&mut self) {

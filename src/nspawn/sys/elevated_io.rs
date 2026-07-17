@@ -50,15 +50,7 @@ impl ElevatedIo {
             }
             PermissionLevel::Elevated => {
                 if let Some(ref daemon) = self.daemon {
-                    match daemon.read_file(path).await {
-                        Ok(c) => Ok(Some(c)),
-                        Err(NspawnError::Io(_, ref e))
-                            if e.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    }
+                    daemon.read_file(path).await
                 } else {
                     match tokio::fs::read_to_string(path).await {
                         Ok(c) => Ok(Some(c)),

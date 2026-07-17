@@ -1,5 +1,6 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
+use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent};
 use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
 use std::path::{Path, PathBuf};
 
@@ -7,7 +8,7 @@ use std::path::{Path, PathBuf};
 pub async fn create_user_in_container(
     rootfs: &Path,
     user: &CreateUser,
-    logs: &tokio::sync::mpsc::Sender<String>,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
     cmd_runner: &dyn CommandRunner,
     io: &ElevatedIo,
 ) -> Result<()> {
@@ -115,7 +116,7 @@ pub async fn create_user_in_container(
                 String::from_utf8_lossy(&res.stderr).trim()
             );
             log::warn!("{}", msg);
-            let _ = logs.send(msg).await;
+            send_deploy_log(logs, msg).await;
         }
     }
 
@@ -126,7 +127,7 @@ pub async fn create_user_in_container(
 pub async fn set_root_password(
     rootfs: &Path,
     password: &str,
-    logs: &tokio::sync::mpsc::Sender<String>,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
     cmd_runner: &dyn CommandRunner,
 ) -> Result<()> {
     if password.is_empty() {
@@ -161,7 +162,7 @@ pub async fn set_root_password(
             String::from_utf8_lossy(&res.stderr).trim()
         );
         log::warn!("{}", msg);
-        let _ = logs.send(msg).await;
+        send_deploy_log(logs, msg).await;
     }
     Ok(())
 }

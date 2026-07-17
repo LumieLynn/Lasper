@@ -42,6 +42,16 @@ pub fn machine_raw_image(name: &str) -> PathBuf {
     machine_image(name, "raw")
 }
 
+/// Stable mount point used while provisioning a managed disk image.
+pub fn machine_image_mount(name: &str) -> PathBuf {
+    PathBuf::from("/mnt").join(format!("lasper-{}", name))
+}
+
+/// Parent directory for short-lived mounts used to configure imported raw images.
+pub fn rootfs_mounts_dir() -> PathBuf {
+    PathBuf::from("/var/cache/lasper/mounts")
+}
+
 /// State directory (NVIDIA passthrough, etc.).
 /// `LASPER_STATE_DIR` env var overrides at runtime;
 /// otherwise the compile-time default (`/var/lib/lasper/states`).

@@ -11,6 +11,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeployProgress {
+    pub label: String,
+    pub permille: u16,
+}
+
+impl DeployProgress {
+    pub fn new(label: impl Into<String>, permille: u16) -> Self {
+        Self {
+            label: label.into(),
+            permille: permille.min(1000),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeployLogEvent {
+    Line(String),
+    Progress(DeployProgress),
+}
+
 /// RAII guard to ensure the 'done' flag is always set, even on panic or early return.
 struct DoneGuard {
     done: Arc<AtomicBool>,
@@ -30,7 +51,7 @@ pub trait Deployer: Send + Sync {
         name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()>;
 
     /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
@@ -45,16 +66,34 @@ pub trait Deployer: Send + Sync {
     }
 }
 
-pub(crate) async fn send_deploy_log(logs: &Sender<String>, message: impl Into<String>) {
+pub(crate) async fn send_deploy_log(logs: &Sender<DeployLogEvent>, message: impl Into<String>) {
     let message = message.into();
     log::info!("[DEPLOY] {}", message);
-    let _ = logs.send(message).await;
+    let _ = logs.send(DeployLogEvent::Line(message)).await;
 }
 
-pub(crate) async fn send_deploy_stream_log(logs: &Sender<String>, message: impl Into<String>) {
+pub(crate) async fn send_deploy_stream_log(
+    logs: &Sender<DeployLogEvent>,
+    message: impl Into<String>,
+) {
     let message = message.into();
     log::debug!("[DEPLOY stream] {}", message);
-    let _ = logs.send(message).await;
+    let _ = logs.send(DeployLogEvent::Line(message)).await;
+}
+
+pub(crate) async fn send_deploy_progress(
+    logs: &Sender<DeployLogEvent>,
+    label: impl Into<String>,
+    permille: u16,
+) {
+    let progress = DeployProgress::new(label, permille);
+    log::trace!(
+        "[DEPLOY progress] {}: {}.{:01}%",
+        progress.label,
+        progress.permille / 10,
+        progress.permille % 10
+    );
+    let _ = logs.send(DeployLogEvent::Progress(progress)).await;
 }
 
 /// Orchestrates the asynchronous deployment of a new container.
@@ -66,7 +105,7 @@ pub async fn run_deploy_task(
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
-    logs: tokio::sync::mpsc::Sender<String>,
+    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
     tx: tokio::sync::mpsc::Sender<AppEvent>,
@@ -90,7 +129,7 @@ pub async fn run_deploy_task(
         // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
         // if the log channel happens to be full.
         let err_msg = format!("FATAL ERROR: {}", e);
-        match logs.try_send(err_msg.clone()) {
+        match logs.try_send(DeployLogEvent::Line(err_msg.clone())) {
             Ok(_) => {}
             Err(_) => {
                 // If channel is full, we log to stdout as fallback
@@ -120,7 +159,7 @@ async fn run_deploy_internal(
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
-    logs: tokio::sync::mpsc::Sender<String>,
+    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
     let io = exec_ctx.io.clone();
     let cli_runner = exec_ctx.cmd.clone();
@@ -153,8 +192,7 @@ async fn run_deploy_internal(
     }
 
     // 2. Deployment & Configuration scoping
-    let mut dissect_mount_dir: Option<std::path::PathBuf> = None;
-    let mut _dissect_guard: Option<tempfile::TempDir> = None;
+    let mut raw_mount_target: Option<crate::nspawn::adapters::rootfs::RootfsTarget> = None;
 
     let result = async {
         // 2. Mount storage (returns rootfs path)
@@ -183,66 +221,41 @@ async fn run_deploy_internal(
             return Ok(());
         }
 
-        // ---- systemd-dissect raw mounting ----
-        let mut actual_rootfs = rootfs.clone();
-
-        // Check via ElevatedIo so Elevated mode can verify the rootfs
-        let rootfs_exists = io
-            .read_to_string(&actual_rootfs.join("etc/os-release"))
-            .await?
-            .is_some();
-        if !rootfs_exists {
-            let raw_path = crate::paths::machine_raw_image(&name);
-            let raw_exists = io
-                .read_to_string(&raw_path)
-                .await
-                .ok()
-                .flatten()
-                .is_some();
-            if raw_exists {
-                let dissect_parent = "/var/cache/lasper/mounts";
-                let _ = io.create_dir_all(std::path::Path::new(dissect_parent)).await;
-
-                let tmp_mnt = tempfile::Builder::new()
-                    .prefix(&format!("lasper-dissect-{}-", name))
-                    .tempdir_in(dissect_parent)
-                    .map_err(|e| NspawnError::Runtime(format!("Failed to create temporary mount point: {}", e)))?;
-
-                let mount_point = tmp_mnt.path().to_path_buf();
-                push_log!("Mounting raw image for configuration...".to_string());
-
-                let out = cli_runner
-                    .run(
-                        "systemd-dissect",
-                        vec![
-                            "--mount".into(),
-                            raw_path.to_str().unwrap().into(),
-                            mount_point.to_str().unwrap().into(),
-                        ],
-                    )
-                    .await;
-                if let Ok(ref cmd) = out {
-                    crate::nspawn::sys::log_output("systemd-dissect", cmd);
+        let mut actual_rootfs_target =
+            crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(&name, &rootfs)?;
+        let rootfs_exists = exec_ctx
+            .rootfs
+            .has_os_release(&actual_rootfs_target)
+            .await?;
+        if !rootfs_exists && actual_rootfs_target.supports_raw_fallback() {
+            push_log!("Mounting raw image for configuration...".to_string());
+            match exec_ctx.rootfs.mount_managed_raw(&name).await {
+                Ok(Some(target)) => {
+                    actual_rootfs_target = target.clone();
+                    raw_mount_target = Some(target);
                 }
-
-                if let Ok(cmd) = out {
-                    if cmd.status.success() {
-                        actual_rootfs = mount_point.clone();
-                        dissect_mount_dir = Some(mount_point);
-                        _dissect_guard = Some(tmp_mnt);
-                    } else {
-                        push_log!("WARNING: Failed to mount raw image with systemd-dissect.");
-                    }
+                Ok(None) => {}
+                Err(error) => {
+                    push_log!(format!(
+                        "WARNING: Failed to mount raw image with systemd-dissect: {}",
+                        error
+                    ));
                 }
             }
         }
 
-        let is_mounted_dir = io
-            .read_to_string(&actual_rootfs.join("etc/os-release"))
-            .await?
-            .is_some();
+        let actual_rootfs = actual_rootfs_target.path()?;
+        let has_os_layout = exec_ctx
+            .rootfs
+            .has_os_release(&actual_rootfs_target)
+            .await?;
+        let supports_offline_commands = has_os_layout
+            && exec_ctx
+                .rootfs
+                .supports_nspawn_commands(&actual_rootfs_target)
+                .await?;
 
-        if is_mounted_dir {
+        if supports_offline_commands {
             if let Some(pwd) = &cfg.root_password {
                 push_log!("Setting root password...".to_string());
                 crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd, &logs, cli_runner.as_ref()).await?;
@@ -257,9 +270,12 @@ async fn run_deploy_internal(
                     crate::nspawn::adapters::rootfs::wayland::setup_wayland_shell_env(&actual_rootfs, user, &io).await?;
                 }
             }
-        } else {
-            log::warn!("[AUDIT] [Container: {}] rootfs is not a directory. Skipping internal modifications.", name);
-            push_log!("WARNING: Target is unmounted. Skipping passwords and user creation.".to_string());
+        } else if !has_os_layout {
+            log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
+            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping passwords and user creation.".to_string());
+        } else if cfg.root_password.is_some() || !cfg.users.is_empty() {
+            log::warn!("[AUDIT] [Container: {}] rootfs has no /usr tree required by systemd-nspawn offline commands. Skipping account modifications.", name);
+            push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());
         }
 
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
@@ -288,15 +304,22 @@ async fn run_deploy_internal(
                 }
 
                 // Write ld.so.conf.d and env vars into rootfs (one-time setup)
-                if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
-                    &name,
-                    &state,
-                    &exec_ctx.nvidia_staging,
-                    cli_runner.as_ref(),
-                )
-                .await
-                {
-                    push_log!(format!("WARNING: Failed to inject NVIDIA env/ldconfig: {}", e));
+                if supports_offline_commands {
+                    if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
+                        &name,
+                        &actual_rootfs_target,
+                        &state,
+                        &exec_ctx.nvidia_staging,
+                        cli_runner.as_ref(),
+                    )
+                    .await
+                    {
+                        push_log!(format!("WARNING: Failed to inject NVIDIA env/ldconfig: {}", e));
+                    }
+                } else if has_os_layout {
+                    push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
+                } else {
+                    push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
                 }
                 initial_nvidia_state = Some(state);
             } else {
@@ -341,14 +364,14 @@ async fn run_deploy_internal(
             let _ = provision.reload_daemon().await;
         }
 
-        if is_mounted_dir {
+        if supports_offline_commands {
             if let Some(mode) = &cfg.network {
                 if matches!(
                     mode,
                     NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
                 ) {
                     push_log!("Enabling container network (systemd-networkd)...".to_string());
-                    if let Err(e) = crate::nspawn::adapters::rootfs::network::enable_container_networkd(&actual_rootfs, cli_runner.as_ref(), &io).await {
+                    if let Err(e) = exec_ctx.rootfs.configure_network(&actual_rootfs_target).await {
                         push_log!(format!("WARNING: {} (might not be a systemd container)", e));
                     }
                 }
@@ -360,16 +383,15 @@ async fn run_deploy_internal(
 
     // ---- Cleanup Guard ----
 
-    // 1. Unmount systemd-dissect if it was used
-    if let Some(mnt) = dissect_mount_dir {
+    // 1. Unmount the managed raw-image configuration mount if it was used
+    if let Some(target) = raw_mount_target {
         push_log!("Unmounting raw image...".to_string());
-        let _ = cli_runner
-            .run(
-                "systemd-dissect",
-                vec!["--umount".into(), mnt.to_str().unwrap().into()],
-            )
-            .await;
-        // _dissect_guard will automatically clean up the directory when it drops
+        if let Err(error) = exec_ctx.rootfs.unmount_managed_raw(&target).await {
+            log::warn!(
+                "Failed to clean up raw image configuration mount: {}",
+                error
+            );
+        }
     }
 
     // 2. Unmount Lasper storage

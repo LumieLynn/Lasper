@@ -6,7 +6,7 @@ use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType}
 use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::DiskImageFilesystem;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::ExecutionContext;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -259,8 +259,8 @@ pub struct ReviewState {
 use std::cell::RefCell;
 
 pub struct DeployState {
-    pub log_tx: broadcast::Sender<String>,
-    pub log_rx: RefCell<Option<broadcast::Receiver<String>>>,
+    pub log_tx: broadcast::Sender<DeployLogEvent>,
+    pub log_rx: RefCell<Option<broadcast::Receiver<DeployLogEvent>>>,
     pub done: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
 }

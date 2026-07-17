@@ -6,7 +6,7 @@ use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::{send_deploy_stream_log, Deployer};
+use crate::nspawn::ops::provision::{send_deploy_stream_log, DeployLogEvent, Deployer};
 use crate::nspawn::sys::CommandRunner;
 
 pub struct DebootstrapDeployer {
@@ -23,7 +23,7 @@ impl Deployer for DebootstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         let mut args = vec![];
         if cfg.users.iter().any(|u| u.sudoer) {
@@ -59,7 +59,7 @@ impl Deployer for PacstrapDeployer {
         _name: &str,
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         let mut args = vec![
             "-c".into(),
@@ -79,7 +79,7 @@ async fn run_bootstrap(
     cmd_runner: &dyn CommandRunner,
     prog: &str,
     args: Vec<String>,
-    logs: tokio::sync::mpsc::Sender<String>,
+    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
     let mut spawned = cmd_runner
         .spawn(prog, args.clone())

@@ -30,6 +30,9 @@ use crate::nspawn::adapters::config::store::{
 use crate::nspawn::adapters::config::systemd_unit::{
     execute_systemd_unit_operation, SystemdUnitOperation, SystemdUnitResult,
 };
+use crate::nspawn::adapters::rootfs::store::{
+    execute_rootfs_operation, RootfsOperation, RootfsResult,
+};
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
@@ -561,7 +564,10 @@ impl ElevatedDaemon {
         })
     }
 
-    pub async fn read_file(&self, path: &std::path::Path) -> crate::nspawn::errors::Result<String> {
+    pub async fn read_file(
+        &self,
+        path: &std::path::Path,
+    ) -> crate::nspawn::errors::Result<Option<String>> {
         let result = self
             .rpc_call(
                 "read_file",
@@ -569,12 +575,13 @@ impl ElevatedDaemon {
             )
             .await
             .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        let content = result["content"].as_str().ok_or_else(|| {
-            crate::nspawn::errors::NspawnError::Runtime(
-                "daemon read_file: missing content field".into(),
-            )
-        })?;
-        Ok(content.to_string())
+        match result.get("content") {
+            Some(serde_json::Value::String(content)) => Ok(Some(content.clone())),
+            Some(serde_json::Value::Null) => Ok(None),
+            _ => Err(crate::nspawn::errors::NspawnError::Runtime(
+                "daemon read_file: missing or invalid content field".into(),
+            )),
+        }
     }
 
     pub async fn write_file(
@@ -678,6 +685,14 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("managed_storage", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn rootfs(&self, operation: RootfsOperation) -> std::io::Result<RootfsResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("rootfs", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -1166,6 +1181,34 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
+        "rootfs" => {
+            let operation: RootfsOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
+                }
+            };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_rootfs_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
         "run_command" => {
             let id = request.id;
             let program = match request.params["program"].as_str() {
@@ -1209,15 +1252,16 @@ async fn handle_request(
             };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let result = tokio::fs::read_to_string(&path_str)
-                    .await
-                    .map_err(|e| format!("read {}: {}", path_str, e));
+                let result = read_optional_file_impl(&path_str).await;
                 let response = match result {
-                    Ok(content) => {
+                    Ok(Some(content)) => {
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":content}})
                     }
+                    Ok(None) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":null}})
+                    }
                     Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":format!("read {}: {}", path_str, e)}})
                     }
                 };
                 let line = serde_json::to_string(&response).unwrap();
@@ -1775,6 +1819,14 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+async fn read_optional_file_impl(path_str: &str) -> std::io::Result<Option<String>> {
+    match tokio::fs::read_to_string(path_str).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 // ── Atomic write (daemon side) ──
 
 /// Generic daemon file writes are one-shot replacements. Cross-process
@@ -1821,6 +1873,27 @@ mod tests {
         );
         assert!(!path.with_extension("lock").exists());
         assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn generic_read_file_distinguishes_missing_from_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing-zshrc");
+
+        assert_eq!(
+            read_optional_file_impl(path.to_str().unwrap())
+                .await
+                .unwrap(),
+            None
+        );
+
+        tokio::fs::write(&path, "# existing\n").await.unwrap();
+        assert_eq!(
+            read_optional_file_impl(path.to_str().unwrap())
+                .await
+                .unwrap(),
+            Some("# existing\n".into())
+        );
     }
 
     #[test]

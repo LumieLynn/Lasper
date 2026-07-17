@@ -44,13 +44,17 @@ fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
             continue;
         }
         if let Some(val) = trimmed.strip_prefix("BindReadOnly=") {
-            if let Some((host, container)) = val.split_once(':') {
-                file_binds.insert((host.to_string(), container.to_string(), true));
-            } else {
-                file_binds.insert((val.to_string(), val.to_string(), true));
+            if let Some((host, container)) =
+                crate::nspawn::adapters::config::nspawn_file::parse_nspawn_bind_paths(val)
+            {
+                file_binds.insert((host, container, true));
             }
         } else if let Some(val) = trimmed.strip_prefix("Bind=") {
-            file_binds.insert((val.to_string(), val.to_string(), false));
+            if let Some((host, container)) =
+                crate::nspawn::adapters::config::nspawn_file::parse_nspawn_bind_paths(val)
+            {
+                file_binds.insert((host, container, false));
+            }
         }
     }
 
@@ -136,13 +140,14 @@ async fn inject_persistent_device_allow(
 /// elevated).
 ///
 /// Done at creation time (not every startup) — called from provisioning.
-pub async fn inject_env_once(
+pub(crate) async fn inject_env_once(
     name: &str,
+    target: &crate::nspawn::adapters::rootfs::RootfsTarget,
     state: &NvidiaState,
     staging: &crate::nspawn::platform::nvidia::NvidiaStagingStore,
     cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
 ) -> Result<()> {
-    let rootfs = crate::paths::machine_root(name);
+    let rootfs = target.path()?;
     let rootfs_str = rootfs.to_string_lossy();
 
     // ── ld.so.conf.d ──
@@ -174,6 +179,7 @@ pub async fn inject_env_once(
                 vec![
                     "-D".to_string(),
                     rootfs_str.to_string(),
+                    "--settings=no".to_string(),
                     "--bind".to_string(),
                     format!("{}:{}", tmp, tmp),
                     "sh".to_string(),
@@ -214,6 +220,7 @@ pub async fn inject_env_once(
                 vec![
                     "-D".to_string(),
                     rootfs_str.to_string(),
+                    "--settings=no".to_string(),
                     "cat".to_string(),
                     "/etc/environment".to_string(),
                 ],
@@ -242,6 +249,7 @@ pub async fn inject_env_once(
                 vec![
                     "-D".to_string(),
                     rootfs_str.to_string(),
+                    "--settings=no".to_string(),
                     "--bind".to_string(),
                     format!("{}:{}", tmp, tmp),
                     "sh".to_string(),
@@ -268,6 +276,7 @@ async fn refresh_container_ld_cache(
                 "-D".to_string(),
                 rootfs.to_string(),
                 "--quiet".to_string(),
+                "--settings=no".to_string(),
                 "ldconfig".to_string(),
             ],
         )
@@ -347,16 +356,27 @@ pub async fn ensure_gpu_passthrough(
             return Ok(());
         }
         log::info!(
-            "GPU state matches but .nspawn markers missing or empty for {} — regenerating.",
+            "GPU state matches but managed .nspawn markers are missing or stale for {}; rebuilding configuration.",
+            name
+        );
+    } else if old_state.driver_version.is_empty() {
+        log::info!(
+            "No previous NVIDIA state found for {}; assembling configuration.",
+            name
+        );
+    } else if old_state.driver_version != host_state.driver_version {
+        log::info!(
+            "GPU driver change detected ({} -> {}), refreshing configuration...",
+            old_state.driver_version,
+            host_state.driver_version
+        );
+    } else {
+        log::info!(
+            "NVIDIA CDI state changed while driver version {} remained unchanged; refreshing configuration for {}.",
+            host_state.driver_version,
             name
         );
     }
-
-    log::info!(
-        "GPU driver change detected ({} -> {}), performing surgery...",
-        old_state.driver_version,
-        host_state.driver_version
-    );
 
     let death_list = calculate_death_list(&old_state, &host_state);
     if !death_list.is_empty() {
@@ -408,6 +428,40 @@ mod tests {
             stdout: Vec::new(),
             stderr: Vec::new(),
         }
+    }
+
+    #[test]
+    fn marker_match_preserves_writable_bind_destination() {
+        let state = NvidiaState {
+            binds: vec![crate::nspawn::platform::nvidia::state::PassthroughBind {
+                host_path: "/dev/dri/card0".into(),
+                container_path: "/dev/dri/by-path/nvidia-card".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let content = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/dri/card0:/dev/dri/by-path/nvidia-card\nX-Lasper-Nvidia-End=true\n";
+
+        assert!(marker_binds_match_state(content, &state));
+    }
+
+    #[test]
+    fn marker_match_decodes_escaped_pci_colons() {
+        let state = NvidiaState {
+            binds: vec![crate::nspawn::platform::nvidia::state::PassthroughBind {
+                host_path: "/dev/dri/card0".into(),
+                container_path: "/dev/dri/by-path/pci-0000:01:00.0-card".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let content = r"[Files]
+X-Lasper-Nvidia-Begin=managed-by-lasper
+Bind=/dev/dri/card0:/dev/dri/by-path/pci-0000\:01\:00.0-card
+X-Lasper-Nvidia-End=true
+";
+
+        assert!(marker_binds_match_state(content, &state));
     }
 
     #[tokio::test]
@@ -478,8 +532,13 @@ mod tests {
             ..Default::default()
         };
         let name = format!("ldconfig-test-{}", std::process::id());
+        let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
+            &name,
+            &crate::paths::machine_root(&name),
+        )
+        .unwrap();
 
-        inject_env_once(&name, &state, &staging, &runner)
+        inject_env_once(&name, &target, &state, &staging, &runner)
             .await
             .unwrap();
 

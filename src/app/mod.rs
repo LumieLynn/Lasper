@@ -303,6 +303,15 @@ impl App {
                 self.set_status(msg, level);
                 self.refresh().await;
             }
+            AppEvent::ContainerActionFailed {
+                name,
+                previous_state,
+                message,
+            } => {
+                self.rollback_container_transition(&name, previous_state);
+                self.set_status(message, crate::ui::StatusLevel::Error);
+                self.refresh().await;
+            }
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
@@ -513,6 +522,21 @@ mod tests {
 
             assert_eq!(result[0].state, ContainerState::Running);
             assert!(app.data.transitions.is_empty());
+        }
+
+        #[test]
+        fn failed_start_rolls_back_optimistic_state_immediately() {
+            let mut app = make_app();
+            app.data.entries = vec![make_entry("test", ContainerState::Starting)];
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            app.rollback_container_transition("test", Some(ContainerState::Off));
+
+            assert_eq!(app.data.entries[0].state, ContainerState::Off);
+            assert!(!app.data.transitions.contains_key("test"));
         }
     }
 

@@ -58,7 +58,8 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let nvidia_profile = built.nvidia_profile;
 
             // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
-            let (log_mpsc_tx, mut log_mpsc_rx) = tokio::sync::mpsc::channel::<String>(100);
+            let (log_mpsc_tx, mut log_mpsc_rx) =
+                tokio::sync::mpsc::channel::<crate::nspawn::ops::provision::DeployLogEvent>(100);
             let log_bcast_tx = ctx.deploy.log_tx.clone();
             tokio::spawn(async move {
                 while let Some(msg) = log_mpsc_rx.recv().await {

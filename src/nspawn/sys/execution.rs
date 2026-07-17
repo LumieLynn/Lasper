@@ -7,6 +7,7 @@
 //! or the remaining low-level `ctx.cmd`/`ctx.io` surfaces.
 
 use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
+use crate::nspawn::adapters::rootfs::RootfsStore;
 use crate::nspawn::adapters::storage::ManagedStorageStore;
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::platform::nvidia::{NvidiaStagingStore, NvidiaStateStore};
@@ -24,6 +25,7 @@ pub struct ExecutionContext {
     pub io: ElevatedIo,
     pub nspawn: NspawnConfigStore,
     pub systemd_unit: SystemdUnitStore,
+    pub rootfs: RootfsStore,
     pub managed_storage: ManagedStorageStore,
     pub nvidia_state: NvidiaStateStore,
     pub nvidia_staging: NvidiaStagingStore,
@@ -44,6 +46,7 @@ impl ExecutionContext {
         };
         let nspawn = NspawnConfigStore::new(daemon.clone());
         let systemd_unit = SystemdUnitStore::new(daemon.clone());
+        let rootfs = RootfsStore::new(daemon.clone());
         let managed_storage = ManagedStorageStore::new(daemon.clone());
         let nvidia_state = NvidiaStateStore::new(daemon.clone());
         let nvidia_staging = NvidiaStagingStore::new(daemon.clone());
@@ -52,6 +55,7 @@ impl ExecutionContext {
             io,
             nspawn,
             systemd_unit,
+            rootfs,
             managed_storage,
             nvidia_state,
             nvidia_staging,
@@ -79,6 +83,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("io", &self.io)
             .field("nspawn", &self.nspawn)
             .field("systemd_unit", &self.systemd_unit)
+            .field("rootfs", &self.rootfs)
             .field("managed_storage", &self.managed_storage)
             .field("nvidia_state", &self.nvidia_state)
             .field("nvidia_staging", &self.nvidia_staging)

@@ -15,7 +15,7 @@ impl DiskImageBackend {
     ) -> Result<PathBuf> {
         let img_path = self.get_path(name);
         let img_s = img_path.to_string_lossy().to_string();
-        let mount_point = PathBuf::from(format!("/mnt/lasper-{}", name));
+        let mount_point = crate::paths::machine_image_mount(name);
         let mnt_s = mount_point.to_string_lossy().to_string();
         io.create_dir_all(&mount_point).await?;
 
@@ -48,7 +48,7 @@ impl DiskImageBackend {
         cmd_runner: &dyn CommandRunner,
         io: &ElevatedIo,
     ) -> Result<()> {
-        let mount_point = PathBuf::from(format!("/mnt/lasper-{}", name));
+        let mount_point = crate::paths::machine_image_mount(name);
         let mnt_s = mount_point.to_string_lossy().to_string();
 
         // 1. Try systemd-dissect

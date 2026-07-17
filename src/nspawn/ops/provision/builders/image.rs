@@ -2,11 +2,13 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::{send_deploy_stream_log, Deployer};
+use crate::nspawn::ops::provision::{
+    send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent, Deployer,
+};
 use crate::nspawn::sys::{log_output, CommandRunner};
 
 pub struct OciDeployer {
@@ -22,7 +24,7 @@ impl Deployer for OciDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         import_oci_image(
             self.cmd_runner.as_ref(),
@@ -63,7 +65,7 @@ impl Deployer for DiskImageDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: tokio::sync::mpsc::Sender<String>,
+        _logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         import_disk_image(self.cmd_runner.as_ref(), &self.path, name, rootfs).await
     }
@@ -87,7 +89,7 @@ impl Deployer for NetworkImageDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         let clean_url = self.url.trim();
         let cache_dir = "/var/cache/lasper/downloads";
@@ -97,16 +99,20 @@ impl Deployer for NetworkImageDeployer {
             .await;
         let _ = self.io.create_dir_all(&crate::paths::machines_dir()).await;
 
-        let _ = logs
-            .send(format!("Downloading container from {}...", clean_url))
-            .await;
+        send_deploy_log(
+            &logs,
+            format!("Downloading container from {}...", clean_url),
+        )
+        .await;
         check_tool("curl")?;
 
         if self.is_raw {
             check_tool("bash")?;
-            let _ = logs
-                .send("Streaming and provisioning RAW disk image to cache...".into())
-                .await;
+            send_deploy_log(
+                &logs,
+                "Streaming and provisioning RAW disk image to cache...",
+            )
+            .await;
 
             let dest = crate::paths::machine_raw_image(name);
             let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
@@ -134,10 +140,10 @@ impl Deployer for NetworkImageDeployer {
                     )
                     .await
                     .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
-                stream_spawned(spawned, logs.clone()).await?;
+                stream_curl_output(spawned, logs.clone()).await?;
             }
 
-            let _ = logs.send("Validating disk image integrity...".into()).await;
+            send_deploy_log(&logs, "Validating disk image integrity...").await;
             let validate = self
                 .cmd_runner
                 .run(
@@ -177,9 +183,7 @@ impl Deployer for NetworkImageDeployer {
             check_tool("bash")?;
 
             let cache_tar = format!("{}/{}.tar.part", cache_dir, name);
-            let _ = logs
-                .send("Downloading compressed tarball to cache...".into())
-                .await;
+            send_deploy_log(&logs, "Downloading compressed tarball to cache...").await;
 
             let download_script = "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' \"$1\" -o \"$2\"";
             {
@@ -197,12 +201,10 @@ impl Deployer for NetworkImageDeployer {
                     )
                     .await
                     .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
-                stream_spawned(spawned, logs.clone()).await?;
+                stream_curl_output(spawned, logs.clone()).await?;
             }
 
-            let _ = logs
-                .send("Extracting tarball to storage backend...".into())
-                .await;
+            send_deploy_log(&logs, "Extracting tarball to storage backend...").await;
             let extract_out = self
                 .cmd_runner
                 .run(
@@ -233,21 +235,36 @@ impl Deployer for NetworkImageDeployer {
     }
 }
 
-/// Read stdout lines from a [`SpawnedProcess`], forward to logs, then wait
-/// for exit status.  Returns an error if the process failed.
-async fn stream_spawned(
+/// Parse curl's carriage-return progress frames, forward normal output, then wait.
+async fn stream_curl_output(
     mut spawned: crate::nspawn::sys::SpawnedProcess,
-    logs: tokio::sync::mpsc::Sender<String>,
+    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
+    const MAX_FRAME_BYTES: usize = 16 * 1024;
+    let mut chunk = [0u8; 4096];
+    let mut frame = Vec::new();
     {
-        let mut lines = tokio::io::BufReader::new(&mut spawned.stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() {
-                send_deploy_stream_log(&logs, trimmed).await;
+        loop {
+            let count = spawned
+                .stdout
+                .read(&mut chunk)
+                .await
+                .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+            if count == 0 {
+                break;
+            }
+            for byte in &chunk[..count] {
+                if *byte == b'\r' || *byte == b'\n' {
+                    forward_curl_frame(&logs, &frame, *byte == b'\r').await;
+                    frame.clear();
+                } else if frame.len() < MAX_FRAME_BYTES {
+                    frame.push(*byte);
+                }
             }
         }
     }
+    forward_curl_frame(&logs, &frame, false).await;
+
     let status = spawned
         .wait()
         .await
@@ -259,6 +276,39 @@ async fn stream_spawned(
         )));
     }
     Ok(())
+}
+
+async fn forward_curl_frame(
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    frame: &[u8],
+    carriage_return: bool,
+) {
+    let text = String::from_utf8_lossy(frame);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(permille) = parse_curl_progress(trimmed) {
+        send_deploy_progress(logs, "Downloading image", permille).await;
+    } else if !carriage_return || !looks_like_curl_progress(trimmed) {
+        send_deploy_stream_log(logs, trimmed).await;
+    }
+}
+
+fn parse_curl_progress(frame: &str) -> Option<u16> {
+    let percent = frame
+        .split_ascii_whitespace()
+        .rev()
+        .find_map(|part| part.strip_suffix('%')?.parse::<f64>().ok())?;
+    percent
+        .is_finite()
+        .then(|| (percent.clamp(0.0, 100.0) * 10.0).round() as u16)
+}
+
+fn looks_like_curl_progress(frame: &str) -> bool {
+    frame
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'#' | b'=' | b'-' | b'.' | b'0'..=b'9' | b'%'))
 }
 
 /// Normalize an OCI image reference for use with skopeo.
@@ -300,7 +350,7 @@ pub async fn import_oci_image(
     image_ref: &str,
     local_name: &str,
     dest: &std::path::Path,
-    logs: &tokio::sync::mpsc::Sender<String>,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
     check_tool("skopeo")?;
     check_tool("umoci")?;
@@ -322,12 +372,11 @@ pub async fn import_oci_image(
         let import_policy = r#"{ "default": [ { "type": "insecureAcceptAnything" } ] }"#;
         io.write(&policy_path, import_policy).await?;
 
-        let _ = logs
-            .send(format!(
-                "Pulling OCI image '{}' via skopeo...",
-                normalized_ref
-            ))
-            .await;
+        send_deploy_log(
+            logs,
+            format!("Pulling OCI image '{}' via skopeo...", normalized_ref),
+        )
+        .await;
 
         // skopeo copy — streamed
         {
@@ -364,7 +413,7 @@ pub async fn import_oci_image(
             io.create_dir_all(parent).await?;
         }
 
-        let _ = logs.send("Extracting rootfs with umoci...".into()).await;
+        send_deploy_log(logs, "Extracting rootfs with umoci...").await;
 
         let umoci_raw = cmd_runner
             .run(
@@ -381,14 +430,12 @@ pub async fn import_oci_image(
         log_output("umoci", &umoci_raw);
 
         if umoci_raw.status.success() {
-            let _ = logs.send("OCI image imported via raw-unpack.".into()).await;
+            send_deploy_log(logs, "OCI image imported via raw-unpack.").await;
             return Ok(());
         }
 
         // Fallback: umoci unpack
-        let _ = logs
-            .send("umoci raw-unpack failed, falling back to unpack...".into())
-            .await;
+        send_deploy_log(logs, "umoci raw-unpack failed, falling back to unpack...").await;
         let umoci = cmd_runner
             .run(
                 "umoci",
@@ -429,7 +476,7 @@ pub async fn import_oci_image(
             ));
         }
 
-        let _ = logs.send("Copying rootfs to destination...".into()).await;
+        send_deploy_log(logs, "Copying rootfs to destination...").await;
         let copy_out = cmd_runner
             .run(
                 "cp",
@@ -451,7 +498,7 @@ pub async fn import_oci_image(
             ));
         }
 
-        let _ = logs.send("OCI image imported successfully.".into()).await;
+        send_deploy_log(logs, "OCI image imported successfully.").await;
         Ok(())
     }
     .await;
@@ -584,5 +631,21 @@ mod tests {
         assert_eq!(args[1], "/var/cache/lasper/staging/policy.json");
         assert_eq!(args[2], "copy");
         assert!(!args.iter().any(|arg| arg == "/etc/containers/policy.json"));
+    }
+
+    #[test]
+    fn curl_progress_parser_reads_percentage_without_counting_bar_cells() {
+        assert_eq!(
+            parse_curl_progress("####################  37.4%"),
+            Some(374)
+        );
+        assert_eq!(parse_curl_progress("100.0%"), Some(1000));
+        assert_eq!(parse_curl_progress("curl: (22) HTTP error"), None);
+    }
+
+    #[test]
+    fn curl_progress_detection_does_not_hide_error_messages() {
+        assert!(looks_like_curl_progress("#######====  42.0%"));
+        assert!(!looks_like_curl_progress("curl: connection reset"));
     }
 }

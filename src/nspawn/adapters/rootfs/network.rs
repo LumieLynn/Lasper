@@ -1,24 +1,33 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::{log_output, CommandRunner, ElevatedIo};
+use crate::nspawn::sys::{log_output, CommandRunner};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
 /// Enable systemd-networkd and systemd-resolved inside the container.
-pub async fn enable_container_networkd(
+pub(crate) async fn configure_network_at(
     rootfs: &Path,
     cmd_runner: &dyn CommandRunner,
-    io: &ElevatedIo,
 ) -> Result<()> {
-    // Check systemctl exists before attempting anything
-    if io
-        .read_to_string(&rootfs.join("usr/bin/systemctl"))
-        .await?
-        .is_none()
-    {
+    let rootfs_s = rootfs.to_string_lossy().to_string();
+    let systemctl_probe = cmd_runner
+        .run(
+            "systemd-nspawn",
+            vec![
+                "-D".into(),
+                rootfs_s.clone(),
+                "--quiet".into(),
+                "--settings=no".into(),
+                "test".into(),
+                "-e".into(),
+                "/usr/bin/systemctl".into(),
+            ],
+        )
+        .await
+        .map_err(|error| NspawnError::Io(PathBuf::from("systemd-nspawn"), error))?;
+    log_output("systemctl probe", &systemctl_probe);
+    if !systemctl_probe.status.success() {
         return Ok(());
     }
-
-    let rootfs_s = rootfs.to_string_lossy().to_string();
 
     let networkd = enable_systemd_unit(rootfs, &rootfs_s, "systemd-networkd", cmd_runner).await?;
     if !networkd.status.success() {
@@ -59,6 +68,7 @@ async fn enable_systemd_unit(
                 "-D".into(),
                 rootfs_s.to_string(),
                 "--quiet".into(),
+                "--settings=no".into(),
                 "systemctl".into(),
                 "enable".into(),
                 unit.into(),
@@ -81,6 +91,7 @@ async fn update_resolv_conf(rootfs: &Path, rootfs_s: &str, cmd_runner: &dyn Comm
                 "-D".into(),
                 rootfs_s.to_string(),
                 "--quiet".into(),
+                "--settings=no".into(),
                 "rm".into(),
                 "-f".into(),
                 "/etc/resolv.conf".into(),
@@ -115,6 +126,7 @@ async fn update_resolv_conf(rootfs: &Path, rootfs_s: &str, cmd_runner: &dyn Comm
                 "-D".into(),
                 rootfs_s.to_string(),
                 "--quiet".into(),
+                "--settings=no".into(),
                 "ln".into(),
                 "-sf".into(),
                 "../run/systemd/resolve/stub-resolv.conf".into(),
@@ -135,7 +147,6 @@ async fn update_resolv_conf(rootfs: &Path, rootfs_s: &str, cmd_runner: &dyn Comm
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::ops::PermissionLevel;
     use crate::nspawn::sys::command::MockCommandRunner;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
@@ -159,7 +170,6 @@ mod tests {
     #[tokio::test]
     async fn resolved_failure_does_not_fail_networkd_enable() {
         let rootfs = rootfs_with_systemctl();
-        let io = ElevatedIo::new(PermissionLevel::Root);
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
         {
@@ -178,20 +188,17 @@ mod tests {
             });
         }
 
-        enable_container_networkd(rootfs.path(), &runner, &io)
-            .await
-            .unwrap();
+        configure_network_at(rootfs.path(), &runner).await.unwrap();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0].iter().any(|arg| arg == "systemd-networkd"));
-        assert!(calls[1].iter().any(|arg| arg == "systemd-resolved"));
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
+        assert!(calls[2].iter().any(|arg| arg == "systemd-resolved"));
     }
 
     #[tokio::test]
     async fn resolved_success_updates_resolv_conf_without_shell() {
         let rootfs = rootfs_with_systemctl();
-        let io = ElevatedIo::new(PermissionLevel::Root);
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
         {
@@ -203,30 +210,30 @@ mod tests {
             });
         }
 
-        enable_container_networkd(rootfs.path(), &runner, &io)
-            .await
-            .unwrap();
+        configure_network_at(rootfs.path(), &runner).await.unwrap();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 4);
-        assert!(calls[0].iter().any(|arg| arg == "systemd-networkd"));
-        assert!(calls[1].iter().any(|arg| arg == "systemd-resolved"));
-        assert!(calls[2].windows(2).any(|pair| pair == ["rm", "-f"]));
-        assert!(calls[2].iter().any(|arg| arg == "/etc/resolv.conf"));
-        assert!(calls[3].windows(2).any(|pair| pair == ["ln", "-sf"]));
-        assert!(calls[3]
+        assert_eq!(calls.len(), 5);
+        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
+        assert!(calls[2].iter().any(|arg| arg == "systemd-resolved"));
+        assert!(calls[3].windows(2).any(|pair| pair == ["rm", "-f"]));
+        assert!(calls[3].iter().any(|arg| arg == "/etc/resolv.conf"));
+        assert!(calls[4].windows(2).any(|pair| pair == ["ln", "-sf"]));
+        assert!(calls[4]
             .iter()
             .any(|arg| arg == "../run/systemd/resolve/stub-resolv.conf"));
-        assert!(calls[3].iter().any(|arg| arg == "/etc/resolv.conf"));
+        assert!(calls[4].iter().any(|arg| arg == "/etc/resolv.conf"));
         assert!(calls
             .iter()
             .all(|args| !args.iter().any(|arg| arg == "sh" || arg == "-c")));
+        assert!(calls
+            .iter()
+            .all(|args| args.iter().any(|arg| arg == "--settings=no")));
     }
 
     #[tokio::test]
     async fn networkd_failure_still_fails_network_enable() {
         let rootfs = rootfs_with_systemctl();
-        let io = ElevatedIo::new(PermissionLevel::Root);
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
         {
@@ -234,15 +241,40 @@ mod tests {
             runner.expect_run().returning(move |program, args| {
                 assert_eq!(program, "systemd-nspawn");
                 calls.lock().unwrap().push(args.clone());
-                Ok(mock_output(false, "networkd failed"))
+                if args.iter().any(|arg| arg == "test") {
+                    Ok(mock_output(true, ""))
+                } else {
+                    Ok(mock_output(false, "networkd failed"))
+                }
             });
         }
 
-        let result = enable_container_networkd(rootfs.path(), &runner, &io).await;
+        let result = configure_network_at(rootfs.path(), &runner).await;
 
         assert!(result.is_err());
         let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
+    }
+
+    #[tokio::test]
+    async fn missing_systemctl_skips_network_configuration() {
+        let rootfs = tempfile::tempdir().unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut runner = MockCommandRunner::new();
+        {
+            let calls = calls.clone();
+            runner.expect_run().returning(move |program, args| {
+                assert_eq!(program, "systemd-nspawn");
+                calls.lock().unwrap().push(args);
+                Ok(mock_output(false, "missing"))
+            });
+        }
+
+        configure_network_at(rootfs.path(), &runner).await.unwrap();
+
+        let calls = calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].iter().any(|arg| arg == "systemd-networkd"));
+        assert!(calls[0].iter().any(|arg| arg == "/usr/bin/systemctl"));
     }
 }
