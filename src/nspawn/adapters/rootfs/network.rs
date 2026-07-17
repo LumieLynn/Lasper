@@ -41,26 +41,7 @@ pub async fn enable_container_networkd(
         return Ok(());
     }
 
-    // Replace resolv.conf symlink only when systemd-resolved is available.
-    let link = cmd_runner.run(
-        "systemd-nspawn",
-        vec![
-            "-D".into(),
-            rootfs_s,
-            "--quiet".into(),
-            "sh".into(),
-            "-c".into(),
-            "rm -f /etc/resolv.conf && ln -sf ../run/systemd/resolve/stub-resolv.conf /etc/resolv.conf".into(),
-        ],
-    ).await;
-    match link {
-        Ok(output) => log_output("resolv.conf", &output),
-        Err(error) => log::warn!(
-            "Failed to update container resolv.conf inside {}: {}",
-            rootfs.display(),
-            error
-        ),
-    }
+    update_resolv_conf(rootfs, &rootfs_s, cmd_runner).await;
 
     Ok(())
 }
@@ -90,6 +71,65 @@ async fn enable_systemd_unit(
         log::warn!("Failed to enable {} inside {}", unit, rootfs.display());
     }
     Ok(out)
+}
+
+async fn update_resolv_conf(rootfs: &Path, rootfs_s: &str, cmd_runner: &dyn CommandRunner) {
+    let rm = cmd_runner
+        .run(
+            "systemd-nspawn",
+            vec![
+                "-D".into(),
+                rootfs_s.to_string(),
+                "--quiet".into(),
+                "rm".into(),
+                "-f".into(),
+                "/etc/resolv.conf".into(),
+            ],
+        )
+        .await;
+    match rm {
+        Ok(output) => {
+            log_output("resolv.conf rm", &output);
+            if !output.status.success() {
+                log::warn!(
+                    "Failed to remove container resolv.conf inside {}.",
+                    rootfs.display()
+                );
+                return;
+            }
+        }
+        Err(error) => {
+            log::warn!(
+                "Failed to remove container resolv.conf inside {}: {}",
+                rootfs.display(),
+                error
+            );
+            return;
+        }
+    }
+
+    let link = cmd_runner
+        .run(
+            "systemd-nspawn",
+            vec![
+                "-D".into(),
+                rootfs_s.to_string(),
+                "--quiet".into(),
+                "ln".into(),
+                "-sf".into(),
+                "../run/systemd/resolve/stub-resolv.conf".into(),
+                "/etc/resolv.conf".into(),
+            ],
+        )
+        .await;
+    match link {
+        Ok(output) => log_output("resolv.conf link", &output),
+        Err(error) => log::warn!(
+            "Failed to update container resolv.conf inside {}: {}",
+            rootfs.display(),
+            error
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -146,6 +186,41 @@ mod tests {
         assert_eq!(calls.len(), 2);
         assert!(calls[0].iter().any(|arg| arg == "systemd-networkd"));
         assert!(calls[1].iter().any(|arg| arg == "systemd-resolved"));
+    }
+
+    #[tokio::test]
+    async fn resolved_success_updates_resolv_conf_without_shell() {
+        let rootfs = rootfs_with_systemctl();
+        let io = ElevatedIo::new(PermissionLevel::Root);
+        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let mut runner = MockCommandRunner::new();
+        {
+            let calls = calls.clone();
+            runner.expect_run().returning(move |program, args| {
+                assert_eq!(program, "systemd-nspawn");
+                calls.lock().unwrap().push(args.clone());
+                Ok(mock_output(true, ""))
+            });
+        }
+
+        enable_container_networkd(rootfs.path(), &runner, &io)
+            .await
+            .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4);
+        assert!(calls[0].iter().any(|arg| arg == "systemd-networkd"));
+        assert!(calls[1].iter().any(|arg| arg == "systemd-resolved"));
+        assert!(calls[2].windows(2).any(|pair| pair == ["rm", "-f"]));
+        assert!(calls[2].iter().any(|arg| arg == "/etc/resolv.conf"));
+        assert!(calls[3].windows(2).any(|pair| pair == ["ln", "-sf"]));
+        assert!(calls[3]
+            .iter()
+            .any(|arg| arg == "../run/systemd/resolve/stub-resolv.conf"));
+        assert!(calls[3].iter().any(|arg| arg == "/etc/resolv.conf"));
+        assert!(calls
+            .iter()
+            .all(|args| !args.iter().any(|arg| arg == "sh" || arg == "-c")));
     }
 
     #[tokio::test]
