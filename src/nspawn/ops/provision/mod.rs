@@ -77,8 +77,27 @@ pub(crate) async fn send_deploy_stream_log(
     message: impl Into<String>,
 ) {
     let message = message.into();
-    log::debug!("[DEPLOY stream] {}", message);
+    if is_high_signal_deploy_stream(&message) {
+        log::warn!("[DEPLOY stream] {}", message);
+    } else {
+        log::debug!("[DEPLOY stream] {}", message);
+    }
     let _ = logs.send(DeployLogEvent::Line(message)).await;
+}
+
+fn is_high_signal_deploy_stream(message: &str) -> bool {
+    let message = message.trim_start().to_ascii_lowercase();
+    ["w:", "e:", "warning:", "error:", "fatal:"]
+        .iter()
+        .any(|prefix| message.starts_with(prefix))
+        || [
+            "permission denied",
+            "operation not permitted",
+            "failed",
+            "failure",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 pub(crate) async fn send_deploy_progress(
@@ -450,4 +469,38 @@ async fn run_deploy_internal(
     push_log!("");
     push_log!("=== Deployment Complete ===".to_string());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_high_signal_deploy_stream;
+
+    #[test]
+    fn deploy_stream_classifies_recoverable_bootstrap_diagnostics() {
+        for message in [
+            "W: Failure trying to run: test-dev-null",
+            "test-dev-null: Permission denied",
+            "E: bootstrap failed",
+            "operation not permitted while probing target",
+        ] {
+            assert!(
+                is_high_signal_deploy_stream(message),
+                "did not classify {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn deploy_stream_keeps_normal_progress_at_debug_level() {
+        for message in [
+            "I: Retrieving base-files",
+            "I: Extracting base-passwd",
+            "Download complete",
+        ] {
+            assert!(
+                !is_high_signal_deploy_stream(message),
+                "misclassified {message:?}"
+            );
+        }
+    }
 }

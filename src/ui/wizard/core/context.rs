@@ -4,8 +4,8 @@ pub use crate::nspawn::adapters::config::builder::{
 };
 use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
 use crate::nspawn::models::ContainerEntry;
-use crate::nspawn::models::DiskImageFilesystem;
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::ExecutionContext;
@@ -81,6 +81,7 @@ pub struct StorageState {
     pub disk_fs: DiskImageFilesystem,
     pub disk_partition: bool,
     pub import_path: String,
+    pub disk_root_partition: Option<DiskImagePartition>,
 }
 
 impl StorageState {
@@ -103,6 +104,11 @@ impl StorageState {
                 Some(crate::nspawn::models::DiskImageConfig {
                     source,
                     use_partition_table: self.disk_partition,
+                    root_partition: if self.creation_method_idx == 1 {
+                        self.disk_root_partition
+                    } else {
+                        None
+                    },
                 })
             } else {
                 None
@@ -351,6 +357,7 @@ impl WizardContext {
                 disk_fs: DiskImageFilesystem::Ext4,
                 disk_partition: true,
                 import_path: "".to_string(),
+                disk_root_partition: None,
             },
             user: UserState {
                 root_password: "".to_string(),
@@ -550,6 +557,29 @@ mod tests {
 
         state.local_path = "test.tar.gz".into();
         assert!(!state.is_storage_managed_externally());
+    }
+
+    #[test]
+    fn storage_state_applies_manual_root_only_to_imports() {
+        let mut state = StorageState {
+            type_idx: 0,
+            info: StorageInfo {
+                types: vec![(StorageType::DiskImage, true)],
+            },
+            creation_method_idx: 1,
+            disk_size: "2G".into(),
+            disk_fs: DiskImageFilesystem::Ext4,
+            disk_partition: true,
+            import_path: "/tmp/test.raw".into(),
+            disk_root_partition: Some(DiskImagePartition::new(2).unwrap()),
+        };
+
+        let imported = state.extract_config().disk_config.unwrap();
+        assert_eq!(imported.root_partition.unwrap().number(), 2);
+
+        state.creation_method_idx = 0;
+        let created = state.extract_config().disk_config.unwrap();
+        assert_eq!(created.root_partition, None);
     }
 
     #[test]

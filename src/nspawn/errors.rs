@@ -69,10 +69,6 @@ impl NspawnError {
         )
     }
 
-    pub fn mount_failed(msg: impl Into<String>) -> Self {
-        Self::StorageError(msg.into())
-    }
-
     /// Whether this error is a polkit authorization rejection from DBus.
     ///
     /// systemd-machined returns these DBus error names when polkit blocks

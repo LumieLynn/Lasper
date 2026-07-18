@@ -2,9 +2,10 @@
 
 pub mod create;
 pub mod mount;
-pub mod utils;
 
-use super::super::{ManagedImageKind, ManagedStorageStore, StorageBackend, StorageType};
+use super::super::{
+    ImageMountSource, ManagedImageKind, ManagedStorageStore, StorageBackend, StorageType,
+};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::DiskImageConfig;
 use crate::nspawn::sys::{CommandRunner, ElevatedIo};
@@ -31,18 +32,26 @@ impl DiskImageBackend {
         }
     }
 
-    pub(crate) fn existing_managed(config: DiskImageConfig, kind: ManagedImageKind) -> Self {
+    pub(crate) fn existing_managed(
+        config: DiskImageConfig,
+        kind: ManagedImageKind,
+        store: ManagedStorageStore,
+    ) -> Self {
         Self {
             config,
-            store: ManagedStorageStore::default(),
+            store,
             location: DiskImageLocation::Managed(kind),
         }
     }
 
-    pub(crate) fn external(config: DiskImageConfig, path: PathBuf) -> Self {
+    pub(crate) fn external(
+        config: DiskImageConfig,
+        path: PathBuf,
+        store: ManagedStorageStore,
+    ) -> Self {
         Self {
             config,
-            store: ManagedStorageStore::default(),
+            store,
             location: DiskImageLocation::External(path),
         }
     }
@@ -51,6 +60,19 @@ impl DiskImageBackend {
         match self.location {
             DiskImageLocation::Managed(kind) => Some(kind),
             DiskImageLocation::External(_) => None,
+        }
+    }
+
+    fn mount_source(&self, name: &str) -> Result<ImageMountSource> {
+        match &self.location {
+            DiskImageLocation::Managed(kind) => Ok(ImageMountSource::Managed(*kind)),
+            DiskImageLocation::External(path) if path == &PathBuf::from("/dev").join(name) => {
+                Ok(ImageMountSource::BlockDevice)
+            }
+            DiskImageLocation::External(path) => Err(NspawnError::Validation(format!(
+                "Refusing untyped external image path: {}",
+                path.display()
+            ))),
         }
     }
 }
@@ -76,28 +98,28 @@ impl StorageBackend for DiskImageBackend {
     async fn create(
         &self,
         name: &str,
-        cmd_runner: &dyn CommandRunner,
+        _cmd_runner: &dyn CommandRunner,
         _io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        self.create_impl(name, cmd_runner).await
+        self.create_impl(name).await
     }
 
     async fn mount(
         &self,
         name: &str,
-        cmd_runner: &dyn CommandRunner,
-        io: &ElevatedIo,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        self.mount_impl(name, cmd_runner, io).await
+        self.mount_impl(name).await
     }
 
     async fn unmount(
         &self,
         name: &str,
-        cmd_runner: &dyn CommandRunner,
-        io: &ElevatedIo,
+        _cmd_runner: &dyn CommandRunner,
+        _io: &ElevatedIo,
     ) -> Result<()> {
-        self.unmount_impl(name, cmd_runner, io).await
+        self.unmount_impl(name).await
     }
 
     async fn delete(
@@ -135,6 +157,7 @@ mod tests {
                     path: "/tmp/source.img".into(),
                 },
                 use_partition_table: false,
+                root_partition: None,
             },
             ManagedStorageStore::default(),
         );
@@ -153,8 +176,10 @@ mod tests {
                     path: "/var/lib/machines/test.img".into(),
                 },
                 use_partition_table: false,
+                root_partition: None,
             },
             ManagedImageKind::LegacyImg,
+            ManagedStorageStore::default(),
         );
 
         assert_eq!(

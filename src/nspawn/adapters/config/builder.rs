@@ -215,6 +215,7 @@ impl ContainerConfigBuilder {
                             fs_type: crate::nspawn::models::DiskImageFilesystem::Ext4,
                         },
                         use_partition_table: true,
+                        root_partition: None,
                     }),
                 managed_storage,
             )) as Box<dyn StorageBackend>,

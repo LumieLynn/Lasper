@@ -56,12 +56,14 @@ impl NspawnConfig {
             Ok(c) => c,
             Err(_) => return false,
         };
-        // Check both [General] and the global (None) section for compatibility
+        // Read legacy marker locations as well as the current [Files] location.
         let enabled_msg = "X-Lasper-Nvidia-Enabled";
+        let in_files = conf.get_from(Some("Files"), enabled_msg);
         let in_general = conf.get_from(Some("General"), enabled_msg);
         let in_global = conf.get_from(None::<&str>, enabled_msg);
 
-        in_general
+        in_files
+            .or(in_general)
             .or(in_global)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
@@ -242,11 +244,6 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     spec.validate()?;
     let mut conf = Ini::new();
 
-    if spec.nvidia_gpu {
-        conf.with_section(Some("General"))
-            .set("X-Lasper-Nvidia-Enabled", "true");
-    }
-
     //[Exec]
     {
         let mut exec = conf.with_section(Some("Exec"));
@@ -329,12 +326,16 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         || !spec.bind_mounts.is_empty()
         || spec.wayland_socket.is_some()
         || spec.graphics_acceleration
+        || spec.nvidia_gpu
         || matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host));
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
         let files = conf.section_mut(Some("Files")).unwrap();
         files.remove("__ensure_files");
+        if spec.nvidia_gpu {
+            files.append("X-Lasper-Nvidia-Enabled", "true");
+        }
 
         for dev in &spec.device_binds {
             files.append("Bind", dev.clone());
@@ -680,6 +681,8 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("X-Lasper-Nvidia-Enabled=true"));
+        assert!(content.contains("[Files]"));
+        assert!(!content.contains("[General]"));
     }
 
     #[test]

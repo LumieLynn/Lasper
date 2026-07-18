@@ -1,7 +1,7 @@
 use crate::nspawn::adapters::storage::StorageType;
-use crate::nspawn::models::DiskImageFilesystem;
+use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use crate::ui::core::{Component, EventResult, FocusTracker};
-use crate::ui::widgets::inputs::path_box::PathBox;
+use crate::ui::widgets::inputs::path_box::{expand_user_path, PathBox};
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
@@ -33,6 +33,7 @@ macro_rules! active_comps {
             } else {
                 // Import
                 comps.push(&mut $self.import_path);
+                comps.push(&mut $self.root_partition_choices);
             }
         }
         comps
@@ -41,6 +42,28 @@ macro_rules! active_comps {
 
 impl_wizard_nav!(StorageStepView, active_comps);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RootPartitionChoice {
+    partition: Option<DiskImagePartition>,
+    label: String,
+}
+
+impl RootPartitionChoice {
+    fn automatic() -> Self {
+        Self {
+            partition: None,
+            label: "Auto-detect".into(),
+        }
+    }
+
+    fn selected(partition: DiskImagePartition, type_label: impl Into<String>) -> Self {
+        Self {
+            partition: Some(partition),
+            label: format!("p{}  {}", partition.number(), type_label.into()),
+        }
+    }
+}
+
 pub struct StorageStepView {
     list: SelectableList<(StorageType, bool)>,
     creation_method: RadioGroup,
@@ -48,6 +71,7 @@ pub struct StorageStepView {
     disk_fs: SelectableList<(DiskImageFilesystem, bool)>,
     partition_table: Checkbox,
     import_path: PathBox,
+    root_partition_choices: SelectableList<RootPartitionChoice>,
     focus: FocusTracker,
 }
 
@@ -106,6 +130,19 @@ impl StorageStepView {
         }
         disk_fs.select(fs_idx);
 
+        let mut initial_root_choices = vec![RootPartitionChoice::automatic()];
+        if let Some(partition) = initial_data.disk_root_partition {
+            initial_root_choices.push(RootPartitionChoice::selected(partition, "Selected"));
+        }
+        let mut root_partition_choices = SelectableList::new(
+            " Root Partition ",
+            initial_root_choices,
+            |choice: &RootPartitionChoice| choice.label.clone(),
+        );
+        if initial_data.disk_root_partition.is_some() {
+            root_partition_choices.select(1);
+        }
+
         let mut view = Self {
             list,
             creation_method: RadioGroup::new(
@@ -118,11 +155,9 @@ impl StorageStepView {
                 initial_data.disk_size.clone(),
             )
             .with_validator(|v| {
-                if v.trim().is_empty() {
-                    Err("Size required".into())
-                } else {
-                    Ok(())
-                }
+                crate::nspawn::models::config::parse_disk_image_size(v)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             }),
             disk_fs,
             partition_table: Checkbox::new(" GPT Partition Table ", initial_data.disk_partition),
@@ -132,7 +167,8 @@ impl StorageStepView {
                     if trimmed.is_empty() {
                         return Err("Source image path required".into());
                     }
-                    let metadata = std::fs::metadata(trimmed)
+                    let path = expand_user_path(trimmed)?;
+                    let metadata = std::fs::metadata(&path)
                         .map_err(|_| "Source image path does not exist".to_string())?;
                     let file_type = metadata.file_type();
                     #[cfg(unix)]
@@ -150,6 +186,7 @@ impl StorageStepView {
                     }
                     Err("Source image path must be a file or block device".into())
                 }),
+            root_partition_choices,
             focus: FocusTracker::new(),
         };
         view.update_focus();
@@ -161,6 +198,111 @@ impl StorageStepView {
             return *st == StorageType::DiskImage;
         }
         false
+    }
+
+    fn selected_root_partition(&self) -> Option<DiskImagePartition> {
+        self.root_partition_choices
+            .selected_item()
+            .and_then(|choice| choice.partition)
+    }
+
+    fn root_partition_list_height(&self) -> u16 {
+        self.root_partition_choices.items().len().clamp(1, 6) as u16 + 2
+    }
+
+    fn refresh_root_partition_choices(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let probe = crate::nspawn::adapters::storage::image_ops::probe_image_partitions(path)
+            .map_err(|error| error.to_string())?;
+        self.apply_root_partition_probe(probe)
+    }
+
+    fn apply_root_partition_probe(
+        &mut self,
+        probe: Option<crate::nspawn::adapters::storage::image_ops::ImagePartitionProbe>,
+    ) -> Result<(), String> {
+        let previous = self.selected_root_partition();
+
+        let mut choices = vec![RootPartitionChoice::automatic()];
+        if let Some(probe) = &probe {
+            choices.extend(probe.partitions.iter().map(|partition| {
+                RootPartitionChoice::selected(
+                    partition.number,
+                    crate::nspawn::adapters::storage::image_ops::partition_type_label(
+                        &partition.type_id,
+                    ),
+                )
+            }));
+        }
+        self.root_partition_choices.set_items(choices);
+
+        if let Some(previous) = previous {
+            let selected = self
+                .root_partition_choices
+                .items()
+                .iter()
+                .position(|choice| choice.partition == Some(previous))
+                .ok_or_else(|| {
+                    format!(
+                        "Previously selected root partition p{} no longer exists",
+                        previous.number()
+                    )
+                })?;
+            self.root_partition_choices.select(selected);
+        } else {
+            self.root_partition_choices.select(0);
+        }
+
+        if let Some(probe) = probe {
+            let mut roots = Vec::new();
+            for partition in &probe.partitions {
+                if crate::nspawn::adapters::storage::image_ops::is_current_architecture_root_type(
+                    &partition.type_id,
+                )
+                .map_err(|error| error.to_string())?
+                {
+                    roots.push(partition.number);
+                }
+            }
+
+            if let Some(selected) = self.selected_root_partition() {
+                if probe.partitions.len() > 1 && !probe.label.eq_ignore_ascii_case("gpt") {
+                    return Err(
+                        "Manual root selection for a multi-partition image requires GPT".into(),
+                    );
+                }
+                match roots.as_slice() {
+                    [] => {}
+                    [root] if *root == selected => {}
+                    [root] => {
+                        return Err(format!(
+                            "p{} is already marked as root; select it or use Auto-detect",
+                            root.number()
+                        ));
+                    }
+                    _ => {
+                        return Err(
+                            "Multiple root partitions are marked for this architecture".into()
+                        );
+                    }
+                }
+            } else if probe.partitions.len() > 1 {
+                match roots.len() {
+                    1 => {}
+                    0 => {
+                        return Err(
+                            "No root partition is marked for this architecture; select one from the list"
+                                .into(),
+                        );
+                    }
+                    _ => {
+                        return Err(
+                            "Multiple root partitions are marked for this architecture".into()
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -177,6 +319,7 @@ impl Component for StorageStepView {
             constraints.push(Constraint::Length(3)); // Creation Method
             if is_import {
                 constraints.push(Constraint::Length(3)); // Import Path
+                constraints.push(Constraint::Length(self.root_partition_list_height()));
             } else {
                 constraints.push(Constraint::Length(3)); // Size
                 constraints.push(Constraint::Length(
@@ -208,6 +351,8 @@ impl Component for StorageStepView {
 
             if is_import {
                 self.import_path.render(f, chunks[current]);
+                current += 1;
+                self.root_partition_choices.render(f, chunks[current]);
             } else {
                 self.disk_size.render(f, chunks[current]);
                 current += 1;
@@ -219,6 +364,14 @@ impl Component for StorageStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if key.code == crossterm::event::KeyCode::Tab
+            && self.import_path.is_focused()
+            && self.import_path.validate().is_ok()
+        {
+            if let Ok(path) = expand_user_path(self.import_path.value()) {
+                let _ = self.refresh_root_partition_choices(&path);
+            }
+        }
         let res = delegate_wizard_navigation!(self, key, active_comps);
 
         if let EventResult::Consumed = res {
@@ -253,8 +406,6 @@ impl Component for StorageStepView {
                 if !*supported {
                     return Err(format!("Missing dependency: {}", fs.mkfs_tool()));
                 }
-                crate::nspawn::ops::provision::builders::image::check_tool("truncate")
-                    .map_err(|_| "Missing dependency: truncate".to_string())?;
                 if self.partition_table.checked() {
                     for tool in ["sfdisk", "losetup", "udevadm"] {
                         crate::nspawn::ops::provision::builders::image::check_tool(tool)
@@ -263,6 +414,10 @@ impl Component for StorageStepView {
                 }
             } else {
                 self.import_path.validate()?;
+                crate::nspawn::ops::provision::builders::image::check_tool("sfdisk")
+                    .map_err(|_| "Missing dependency: sfdisk".to_string())?;
+                let path = expand_user_path(self.import_path.value())?;
+                self.refresh_root_partition_choices(&path)?;
             }
         }
         Ok(())
@@ -280,10 +435,80 @@ impl StepComponent for StorageStepView {
             ctx.storage.disk_fs = *fs;
         }
         ctx.storage.disk_partition = self.partition_table.checked();
-        ctx.storage.import_path = self.import_path.value().to_string();
+        ctx.storage.import_path = expand_user_path(self.import_path.value())
+            .unwrap_or_else(|_| self.import_path.value().trim().into())
+            .to_string_lossy()
+            .into_owned();
+        ctx.storage.disk_root_partition = self.selected_root_partition();
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
         self.render(f, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::adapters::storage::image_ops::{ImagePartitionInfo, ImagePartitionProbe};
+    use crate::nspawn::adapters::storage::StorageInfo;
+
+    fn state() -> StorageState {
+        StorageState {
+            type_idx: 0,
+            info: StorageInfo {
+                types: vec![(StorageType::DiskImage, true)],
+            },
+            creation_method_idx: 1,
+            disk_size: "2G".into(),
+            disk_fs: DiskImageFilesystem::Ext4,
+            disk_partition: true,
+            import_path: "/tmp/test.raw".into(),
+            disk_root_partition: None,
+        }
+    }
+
+    fn partition(number: u32, type_id: &str) -> ImagePartitionInfo {
+        ImagePartitionInfo {
+            number: DiskImagePartition::new(number).unwrap(),
+            type_id: type_id.into(),
+        }
+    }
+
+    #[test]
+    fn partition_probe_populates_choices_and_preserves_manual_selection() {
+        let probe = ImagePartitionProbe {
+            label: "gpt".into(),
+            partitions: vec![
+                partition(1, "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"),
+                partition(2, "0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
+            ],
+        };
+        let mut view = StorageStepView::new(&state());
+
+        let error = view
+            .apply_root_partition_probe(Some(probe.clone()))
+            .unwrap_err();
+        assert!(error.contains("select one from the list"));
+        assert_eq!(view.root_partition_choices.items().len(), 3);
+
+        view.root_partition_choices.select(2);
+        view.apply_root_partition_probe(Some(probe)).unwrap();
+        assert_eq!(view.selected_root_partition().unwrap().number(), 2);
+    }
+
+    #[test]
+    fn partition_choice_list_has_a_stable_maximum_height() {
+        let probe = ImagePartitionProbe {
+            label: "gpt".into(),
+            partitions: (1..=12)
+                .map(|number| partition(number, "0FC63DAF-8483-4772-8E79-3D69D8477DE4"))
+                .collect(),
+        };
+        let mut view = StorageStepView::new(&state());
+        let _ = view.apply_root_partition_probe(Some(probe));
+
+        assert_eq!(view.root_partition_choices.items().len(), 13);
+        assert_eq!(view.root_partition_list_height(), 8);
     }
 }

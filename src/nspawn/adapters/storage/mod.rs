@@ -2,6 +2,7 @@
 
 pub mod backends;
 pub mod detect;
+pub(crate) mod image_ops;
 pub mod store;
 
 use crate::nspawn::errors::Result;
@@ -12,7 +13,7 @@ use std::path::PathBuf;
 pub use backends::directory::DirectoryBackend;
 pub use backends::image::DiskImageBackend;
 pub use backends::subvolume::SubvolumeBackend;
-pub use store::{ManagedImageKind, ManagedStorageStore};
+pub use store::{ImageMountSource, ManagedImageKind, ManagedStorageStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -91,7 +92,10 @@ fn into_backend<T: StorageBackend + 'static>(backend: T) -> Box<dyn StorageBacke
 
 #[allow(dead_code)] // mount/unmount paths removed; kept for future storage-aware operations
 /// Factory function to get the appropriate storage backend for an existing machine.
-pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
+pub async fn get_storage_backend_for(
+    name: &str,
+    managed_storage: ManagedStorageStore,
+) -> Box<dyn StorageBackend> {
     let base = crate::paths::machine_root(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
@@ -108,8 +112,10 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
                         path: path.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
+                    root_partition: None,
                 },
                 kind,
+                managed_storage.clone(),
             ));
         }
     }
@@ -125,8 +131,10 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
                         path: block_dev.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
+                    root_partition: None,
                 },
                 block_dev,
+                managed_storage.clone(),
             ));
         }
     }
@@ -137,7 +145,7 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     }
 
     // 4. Default to DirectoryBackend
-    into_backend(DirectoryBackend::default())
+    into_backend(DirectoryBackend::new(managed_storage))
 }
 
 #[cfg(test)]

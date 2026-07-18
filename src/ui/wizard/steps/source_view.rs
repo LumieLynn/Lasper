@@ -1,5 +1,6 @@
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
+use crate::ui::widgets::inputs::path_box::expand_user_path;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
@@ -121,9 +122,9 @@ impl SourceStepView {
             local_path: TextBox::new(" Local file path (.tar, .raw) ", initial_data.local_path.clone())
                 .with_validator(|v| {
                     if v.trim().is_empty() { return Err("Path required".into()); }
-                    let path = std::path::Path::new(v);
+                    let path = expand_user_path(v)?;
                     if !path.exists() { return Err("File not found".into()); }
-                    let s = v.to_lowercase();
+                    let s = path.to_string_lossy().to_lowercase();
                     if s.ends_with(".tar") || s.ends_with(".tar.gz") || s.ends_with(".tar.xz") || s.ends_with(".tar.zst") || s.ends_with(".tgz") || s.ends_with(".raw") {
                         Ok(())
                     } else {
@@ -277,7 +278,10 @@ impl StepComponent for SourceStepView {
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
         ctx.source.bootstrap_pkgs = self.bootstrap_pkgs.value().to_string();
-        ctx.source.local_path = self.local_path.value().to_string();
+        ctx.source.local_path = expand_user_path(self.local_path.value())
+            .unwrap_or_else(|_| self.local_path.value().trim().into())
+            .to_string_lossy()
+            .into_owned();
         ctx.source.pull_url = self.pull_url.value().to_string();
         ctx.source.is_pull_raw = self.pull_format.selected_idx() == 1;
     }

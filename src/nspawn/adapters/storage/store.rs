@@ -1,8 +1,8 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition, MachineName};
+use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use serde::{Deserialize, Serialize};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,17 +40,71 @@ impl ManagedStorageStore {
         Ok(())
     }
 
-    pub async fn reserve_raw_image(&self, name: &str) -> Result<PathBuf> {
+    pub async fn create_raw_image(
+        &self,
+        name: &str,
+        size: &str,
+        filesystem: DiskImageFilesystem,
+        partition_table: bool,
+    ) -> Result<PathBuf> {
         let result = self
-            .execute(ManagedStorageOperation::ReserveRawImage(
-                ReserveManagedRawImage {
+            .execute(ManagedStorageOperation::CreateRawImage(
+                CreateManagedRawImage {
                     machine: parse_machine_name(name)?,
+                    size: ManagedImageSize::parse(size)?,
+                    filesystem,
+                    partition_table,
                 },
             ))
             .await?;
-        result.path.ok_or_else(|| {
-            NspawnError::Runtime("managed storage operation returned no path".into())
-        })
+        result
+            .path
+            .ok_or_else(|| NspawnError::Runtime("managed image creation returned no path".into()))
+    }
+
+    pub async fn import_raw_image(&self, name: &str, source: &Path) -> Result<PathBuf> {
+        let machine = parse_machine_name(name)?;
+        let source_file = std::fs::File::open(source)
+            .map_err(|error| NspawnError::Io(source.to_path_buf(), error))?;
+        crate::nspawn::adapters::storage::image_ops::validate_import_source(&source_file)?;
+
+        if let Some(daemon) = &self.daemon {
+            daemon
+                .import_raw_image(machine.clone(), source_file)
+                .await
+                .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+        } else {
+            crate::nspawn::adapters::storage::image_ops::import_raw_image(&machine, source_file)
+                .await?;
+        }
+        Ok(crate::paths::machine_raw_image(machine.as_str()))
+    }
+
+    pub async fn mount_image(
+        &self,
+        name: &str,
+        source: ImageMountSource,
+        root_partition: Option<DiskImagePartition>,
+    ) -> Result<PathBuf> {
+        let result = self
+            .execute(ManagedStorageOperation::MountImage(MountManagedImage {
+                machine: parse_machine_name(name)?,
+                source,
+                root_partition,
+            }))
+            .await?;
+        result
+            .path
+            .ok_or_else(|| NspawnError::Runtime("managed image mount returned no path".into()))
+    }
+
+    pub async fn unmount_image(&self, name: &str, source: ImageMountSource) -> Result<()> {
+        self.execute(ManagedStorageOperation::UnmountImage(UnmountManagedImage {
+            machine: parse_machine_name(name)?,
+            source,
+        }))
+        .await?;
+        Ok(())
     }
 
     pub async fn remove_image(&self, name: &str, kind: ManagedImageKind) -> Result<()> {
@@ -93,7 +147,9 @@ impl Default for ManagedStorageStore {
 pub(crate) enum ManagedStorageOperation {
     CreateDirectory(CreateManagedDirectory),
     RemoveDirectory(RemoveManagedDirectory),
-    ReserveRawImage(ReserveManagedRawImage),
+    CreateRawImage(CreateManagedRawImage),
+    MountImage(MountManagedImage),
+    UnmountImage(UnmountManagedImage),
     RemoveImage(RemoveManagedImage),
 }
 
@@ -111,8 +167,27 @@ pub(crate) struct RemoveManagedDirectory {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ReserveManagedRawImage {
+pub(crate) struct CreateManagedRawImage {
     machine: MachineName,
+    size: ManagedImageSize,
+    filesystem: DiskImageFilesystem,
+    partition_table: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MountManagedImage {
+    machine: MachineName,
+    source: ImageMountSource,
+    #[serde(default)]
+    root_partition: Option<DiskImagePartition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UnmountManagedImage {
+    machine: MachineName,
+    source: ImageMountSource,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -129,6 +204,43 @@ pub enum ManagedImageKind {
     LegacyImg,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "format",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum ImageMountSource {
+    Managed(ManagedImageKind),
+    BlockDevice,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+struct ManagedImageSize(u64);
+
+impl ManagedImageSize {
+    fn new(bytes: u64) -> Result<Self> {
+        crate::nspawn::adapters::storage::image_ops::validate_size_bytes(bytes)?;
+        Ok(Self(bytes))
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        Self::new(crate::nspawn::models::config::parse_disk_image_size(value)?)
+    }
+}
+
+impl<'de> Deserialize<'de> for ManagedImageSize {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = u64::deserialize(deserializer)?;
+        Self::new(bytes).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ManagedStorageResult {
@@ -137,6 +249,13 @@ pub(crate) struct ManagedStorageResult {
 
 pub(crate) async fn execute_managed_storage_operation(
     operation: ManagedStorageOperation,
+) -> Result<ManagedStorageResult> {
+    execute_managed_storage_operation_with_runner(operation, &DefaultCommandRunner).await
+}
+
+pub(crate) async fn execute_managed_storage_operation_with_runner(
+    operation: ManagedStorageOperation,
+    runner: &dyn CommandRunner,
 ) -> Result<ManagedStorageResult> {
     match operation {
         ManagedStorageOperation::CreateDirectory(request) => {
@@ -152,14 +271,35 @@ pub(crate) async fn execute_managed_storage_operation(
             remove_directory_at(&directory_path(&request.machine)).await?;
             Ok(ManagedStorageResult::default())
         }
-        ManagedStorageOperation::ReserveRawImage(request) => {
-            let path = image_path(&request.machine, ManagedImageKind::Raw);
-            let conflicts = [
-                directory_path(&request.machine),
-                image_path(&request.machine, ManagedImageKind::LegacyImg),
-            ];
-            reserve_raw_image_at(&path, &conflicts).await?;
+        ManagedStorageOperation::CreateRawImage(request) => {
+            let path = crate::nspawn::adapters::storage::image_ops::create_raw_image(
+                &request.machine,
+                request.size.0,
+                request.filesystem,
+                request.partition_table,
+                runner,
+            )
+            .await?;
             Ok(ManagedStorageResult { path: Some(path) })
+        }
+        ManagedStorageOperation::MountImage(request) => {
+            let path = crate::nspawn::adapters::storage::image_ops::mount_image(
+                &request.machine,
+                request.source,
+                request.root_partition,
+                runner,
+            )
+            .await?;
+            Ok(ManagedStorageResult { path: Some(path) })
+        }
+        ManagedStorageOperation::UnmountImage(request) => {
+            crate::nspawn::adapters::storage::image_ops::unmount_image(
+                &request.machine,
+                request.source,
+                runner,
+            )
+            .await?;
+            Ok(ManagedStorageResult::default())
         }
         ManagedStorageOperation::RemoveImage(request) => {
             remove_image_at(&image_path(&request.machine, request.kind)).await?;
@@ -223,34 +363,6 @@ async fn remove_directory_at(path: &Path) -> Result<()> {
         .map_err(|error| NspawnError::Io(path.to_path_buf(), error))
 }
 
-async fn reserve_raw_image_at(path: &Path, conflicts: &[PathBuf]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| NspawnError::Io(parent.to_path_buf(), error))?;
-    }
-
-    reject_existing_paths(conflicts).await?;
-
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-    {
-        Ok(file) => file
-            .sync_all()
-            .map_err(|error| NspawnError::Io(path.to_path_buf(), error)),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(NspawnError::Validation(format!(
-                "Managed storage already exists: {}",
-                path.display()
-            )))
-        }
-        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
-    }
-}
-
 async fn reject_existing_paths(paths: &[PathBuf]) -> Result<()> {
     for path in paths {
         match tokio::fs::symlink_metadata(path).await {
@@ -297,6 +409,39 @@ mod tests {
             "params": {"machine": "../escape"}
         }"#;
         assert!(serde_json::from_str::<ManagedStorageOperation>(json).is_err());
+    }
+
+    #[test]
+    fn operation_deserialization_rejects_invalid_image_parameters() {
+        let zero_size = r#"{
+            "operation": "create_raw_image",
+            "params": {
+                "machine": "test",
+                "size": 0,
+                "filesystem": "ext4",
+                "partition_table": true
+            }
+        }"#;
+        assert!(serde_json::from_str::<ManagedStorageOperation>(zero_size).is_err());
+
+        let unknown_mount_source = r#"{
+            "operation": "mount_image",
+            "params": {
+                "machine": "test",
+                "source": {"kind": "managed", "format": "raw", "extra": true}
+            }
+        }"#;
+        assert!(serde_json::from_str::<ManagedStorageOperation>(unknown_mount_source).is_err());
+
+        let invalid_root_partition = r#"{
+            "operation": "mount_image",
+            "params": {
+                "machine": "test",
+                "source": {"kind": "managed", "format": "raw"},
+                "root_partition": 0
+            }
+        }"#;
+        assert!(serde_json::from_str::<ManagedStorageOperation>(invalid_root_partition).is_err());
     }
 
     #[tokio::test]
@@ -354,41 +499,6 @@ mod tests {
         let result = create_directory_at(&target, &[raw, legacy]).await;
         assert!(result.is_err());
         assert!(!target.exists());
-    }
-
-    #[tokio::test]
-    async fn reserve_and_remove_raw_image_round_trip() {
-        let directory = tempfile::tempdir().unwrap();
-        let raw = directory.path().join("machine.raw");
-        let conflicts = [
-            directory.path().join("machine"),
-            directory.path().join("machine.img"),
-        ];
-
-        reserve_raw_image_at(&raw, &conflicts).await.unwrap();
-        assert!(raw.is_file());
-
-        remove_image_at(&raw).await.unwrap();
-        assert!(!raw.exists());
-    }
-
-    #[tokio::test]
-    async fn reserve_raw_image_rejects_directory_and_legacy_image_conflicts() {
-        let directory = tempfile::tempdir().unwrap();
-        let raw = directory.path().join("machine.raw");
-        let machine_dir = directory.path().join("machine");
-        let legacy = directory.path().join("machine.img");
-        tokio::fs::create_dir(&machine_dir).await.unwrap();
-
-        let result = reserve_raw_image_at(&raw, &[machine_dir.clone(), legacy.clone()]).await;
-        assert!(result.is_err());
-
-        tokio::fs::remove_dir(&machine_dir).await.unwrap();
-        tokio::fs::write(&legacy, b"legacy").await.unwrap();
-
-        let result = reserve_raw_image_at(&raw, &[machine_dir, legacy]).await;
-        assert!(result.is_err());
-        assert!(!raw.exists());
     }
 
     #[tokio::test]

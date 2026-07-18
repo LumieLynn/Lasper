@@ -76,6 +76,8 @@ enum FdOperation {
     Login(SpawnLoginParams),
     #[serde(rename = "spawn_shell_cmd")]
     ShellCommand(SpawnShellCmdParams),
+    #[serde(rename = "import_raw_image")]
+    ImportRawImage(ImportRawImageParams),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -97,6 +99,18 @@ struct SpawnShellCmdParams {
     cmd_id: u64,
     program: String,
     args: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRawImageParams {
+    machine: MachineName,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRawImageResponse {
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -712,6 +726,42 @@ impl ElevatedDaemon {
                     "daemon error: {}",
                     msg.trim()
                 )))
+            }
+        })
+        .await?
+    }
+
+    pub(crate) async fn import_raw_image(
+        &self,
+        machine: MachineName,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        let std_sock = self
+            .open_fd_channel(FdOperation::ImportRawImage(ImportRawImageParams {
+                machine,
+            }))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+
+            let mut reader = std::io::BufReader::new(std_sock.try_clone()?);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line.trim() != "ready" {
+                return Err(std::io::Error::other(format!(
+                    "daemon refused image source fd: {}",
+                    line.trim()
+                )));
+            }
+
+            std_sock.send_with_fd(b"source", &[source.as_raw_fd()])?;
+            line.clear();
+            reader.read_line(&mut line)?;
+            let response: ImportRawImageResponse = serde_json::from_str(line.trim())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            match response.error {
+                Some(error) => Err(std::io::Error::other(error)),
+                None => Ok(()),
             }
         })
         .await?
@@ -1602,7 +1652,7 @@ async fn handle_fd_connection(
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
     // doesn't return EAGAIN.
-    let std_stream = match stream.into_std() {
+    let mut std_stream = match stream.into_std() {
         Ok(s) => {
             let _ = s.set_nonblocking(false);
             s
@@ -1719,6 +1769,56 @@ async fn handle_fd_connection(
                     log::error!("Daemon: spawn shell cmd failed: {}", e);
                     let _ = std_stream.send_with_fd(b"spawn failed", &[]);
                 }
+            }
+        }
+
+        FdOperation::ImportRawImage(ImportRawImageParams { machine }) => {
+            use std::io::Write;
+            use std::os::fd::FromRawFd;
+
+            if let Err(error) = std_stream.write_all(b"ready\n") {
+                log::error!("Daemon: failed to acknowledge image import fd: {}", error);
+                return;
+            }
+
+            let mut marker = [0u8; 16];
+            let mut fds = [0i32 as RawFd; 1];
+            let source = match std_stream.recv_with_fd(&mut marker, &mut fds) {
+                Ok((_, 1)) => unsafe { std::fs::File::from_raw_fd(fds[0]) },
+                Ok((_, count)) => {
+                    let response = ImportRawImageResponse {
+                        error: Some(format!(
+                            "expected exactly one image source fd, received {count}"
+                        )),
+                    };
+                    if let Ok(line) = serde_json::to_string(&response) {
+                        let _ = std_stream.write_all(format!("{line}\n").as_bytes());
+                    }
+                    return;
+                }
+                Err(error) => {
+                    let response = ImportRawImageResponse {
+                        error: Some(format!("failed to receive image source fd: {error}")),
+                    };
+                    if let Ok(line) = serde_json::to_string(&response) {
+                        let _ = std_stream.write_all(format!("{line}\n").as_bytes());
+                    }
+                    return;
+                }
+            };
+
+            let response = match crate::nspawn::adapters::storage::image_ops::import_raw_image(
+                &machine, source,
+            )
+            .await
+            {
+                Ok(_) => ImportRawImageResponse { error: None },
+                Err(error) => ImportRawImageResponse {
+                    error: Some(error.to_string()),
+                },
+            };
+            if let Ok(line) = serde_json::to_string(&response) {
+                let _ = std_stream.write_all(format!("{line}\n").as_bytes());
             }
         }
     }
@@ -1859,6 +1959,28 @@ mod tests {
             }
             _ => panic!("expected spawn_login"),
         }
+    }
+
+    #[test]
+    fn fd_request_round_trip_for_image_import_contains_no_source_path() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::ImportRawImage(ImportRawImageParams {
+                machine: MachineName::new("test-machine").unwrap(),
+            }),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "import_raw_image");
+        assert_eq!(json["params"]["machine"], "test-machine");
+        assert!(json["params"].get("path").is_none());
+        assert!(json["params"].get("source").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed.operation,
+            FdOperation::ImportRawImage(ImportRawImageParams { .. })
+        ));
     }
 
     #[test]
