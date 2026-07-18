@@ -244,7 +244,6 @@ async fn run_deploy_internal(
             }
         }
 
-        let actual_rootfs = actual_rootfs_target.path()?;
         let has_os_layout = exec_ctx
             .rootfs
             .has_os_release(&actual_rootfs_target)
@@ -258,16 +257,34 @@ async fn run_deploy_internal(
         if supports_offline_commands {
             if let Some(pwd) = &cfg.root_password {
                 push_log!("Setting root password...".to_string());
-                crate::nspawn::adapters::rootfs::users::set_root_password(&actual_rootfs, pwd, &logs, cli_runner.as_ref()).await?;
+                for warning in exec_ctx
+                    .rootfs
+                    .set_root_password(&actual_rootfs_target, pwd)
+                    .await?
+                {
+                    log::warn!("{}", warning);
+                    push_log!(warning);
+                }
             }
 
             for user in &cfg.users {
                 push_log!(format!("Creating user {}...", user.username));
-                crate::nspawn::adapters::rootfs::users::create_user_in_container(&actual_rootfs, user, &logs, cli_runner.as_ref(), &io).await?;
+                for warning in exec_ctx
+                    .rootfs
+                    .create_user(&actual_rootfs_target, user)
+                    .await?
+                {
+                    log::warn!("{}", warning);
+                    push_log!(warning);
+                }
 
                 if cfg.wayland_socket.is_some() {
                     push_log!(format!("Setting up wayland env for {}...", user.username));
-                    crate::nspawn::adapters::rootfs::wayland::setup_wayland_shell_env(&actual_rootfs, user, &io).await?;
+                    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
+                    exec_ctx
+                        .rootfs
+                        .configure_wayland(&actual_rootfs_target, user, &display)
+                        .await?;
                 }
             }
         } else if !has_os_layout {
@@ -305,16 +322,25 @@ async fn run_deploy_internal(
 
                 // Write ld.so.conf.d and env vars into rootfs (one-time setup)
                 if supports_offline_commands {
-                    if let Err(e) = crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
-                        &name,
+                    match crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
                         &actual_rootfs_target,
                         &state,
-                        &exec_ctx.nvidia_staging,
-                        cli_runner.as_ref(),
+                        &exec_ctx.rootfs,
                     )
                     .await
                     {
-                        push_log!(format!("WARNING: Failed to inject NVIDIA env/ldconfig: {}", e));
+                        Ok(warnings) => {
+                            for warning in warnings {
+                                log::warn!("{}", warning);
+                                push_log!(warning);
+                            }
+                        }
+                        Err(error) => {
+                            push_log!(format!(
+                                "WARNING: Failed to inject NVIDIA env/ldconfig: {}",
+                                error
+                            ));
+                        }
                     }
                 } else if has_os_layout {
                     push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());

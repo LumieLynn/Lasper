@@ -1,34 +1,34 @@
-use crate::nspawn::errors::Result;
-use crate::nspawn::models::{validate_login_shell, validate_login_username, CreateUser};
-use crate::nspawn::sys::ElevatedIo;
+use crate::nspawn::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::{validate_login_shell, validate_login_username};
+use crate::nspawn::sys::log_output;
 use std::path::Path;
 
 const WAYLAND_RC_MARKER: &str = "# Added by Lasper: Wayland passthrough";
 const WAYLAND_RC_SOURCE: &str = "[ -f ~/.wayland-env ] && source ~/.wayland-env";
+const MAX_DISPLAY_BYTES: usize = 255;
 
-/// Sets up the target user's shell environments with exported Wayland variables.
-pub async fn setup_wayland_shell_env(
+pub(crate) async fn setup_wayland_shell_env(
     rootfs: &Path,
-    user: &CreateUser,
-    io: &ElevatedIo,
+    username: &str,
+    shell: &str,
+    host_display: &str,
+    runner: &dyn RootfsProcessRunner,
 ) -> Result<()> {
-    validate_login_username(&user.username)?;
-    validate_login_shell(&user.shell)?;
+    validate_wayland_config(username, shell, host_display)?;
 
-    let home_dir = if user.username == "root" {
+    let home = if username == "root" {
         "/root".to_string()
     } else {
-        format!("/home/{}", user.username)
+        format!("/home/{username}")
     };
-    let env_script_path = format!("{}/.wayland-env", home_dir);
-
-    let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
-
-    let script_content = format!(
+    let env_path = format!("{home}/.wayland-env");
+    let display = shell_single_quote(host_display);
+    let script = format!(
         r#"
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
 export WAYLAND_DISPLAY=wayland-socket
-export DISPLAY={}
+export DISPLAY={display}
 mkdir -p "$XDG_RUNTIME_DIR"
 ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 if [ -d /mnt/host-x11 ] && [ -d /tmp/.X11-unix ]; then
@@ -38,29 +38,17 @@ if [ -d /mnt/host-x11 ] && [ -d /tmp/.X11-unix ]; then
         fi
     done
 fi
-"#,
-        host_display
+"#
     );
+    write_user_file(rootfs, username, &env_path, script.into_bytes(), runner).await?;
 
-    let full_path = rootfs.join(env_script_path.trim_start_matches('/'));
-    if let Some(parent) = full_path.parent() {
-        io.create_dir_all(parent).await?;
-    }
-    io.write(&full_path, &script_content).await?;
-
-    let shell = user.shell.as_str();
     if shell.ends_with("fish") {
-        let fish_dir = rootfs.join(format!(
-            "{}/.config/fish/conf.d",
-            home_dir.trim_start_matches('/')
-        ));
-        io.create_dir_all(&fish_dir).await?;
-        let host_display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
+        let fish_path = format!("{home}/.config/fish/conf.d/wayland-env.fish");
         let fish_script = format!(
             r#"
 set -gx XDG_RUNTIME_DIR /run/user/(id -u)
 set -gx WAYLAND_DISPLAY wayland-socket
-set -gx DISPLAY {}
+set -gx DISPLAY {display}
 mkdir -p "$XDG_RUNTIME_DIR"
 ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 if test -d /mnt/host-x11; and test -d /tmp/.X11-unix
@@ -70,11 +58,16 @@ if test -d /mnt/host-x11; and test -d /tmp/.X11-unix
         end
     end
 end
-"#,
-            host_display
+"#
         );
-        let script_path = fish_dir.join("wayland-env.fish");
-        io.write(&script_path, &fish_script).await?;
+        write_user_file(
+            rootfs,
+            username,
+            &fish_path,
+            fish_script.into_bytes(),
+            runner,
+        )
+        .await?;
         return Ok(());
     }
 
@@ -83,94 +76,182 @@ end
     } else {
         ".bashrc"
     };
-    let rc_full_path = rootfs.join(format!("{}/{}", home_dir.trim_start_matches('/'), rc_file));
-    let existing = io.read_to_string(&rc_full_path).await?;
-    if let Some(updated) = append_wayland_source(existing.as_deref()) {
-        io.write(&rc_full_path, &updated).await?;
-    }
+    append_wayland_source(rootfs, username, &format!("{home}/{rc_file}"), runner).await
+}
 
+pub(crate) fn validate_wayland_config(
+    username: &str,
+    shell: &str,
+    host_display: &str,
+) -> Result<()> {
+    validate_login_username(username)?;
+    validate_login_shell(shell)?;
+    validate_display(host_display)
+}
+
+async fn write_user_file(
+    rootfs: &Path,
+    username: &str,
+    target: &str,
+    content: Vec<u8>,
+    runner: &dyn RootfsProcessRunner,
+) -> Result<()> {
+    let output = runner
+        .run(
+            rootfs,
+            vec![
+                "sh".into(),
+                "-eu".into(),
+                "-c".into(),
+                concat!(
+                    "target=$1; owner=$2; parent=${target%/*}; ",
+                    "group=$(id -gn \"$owner\"); ",
+                    "install -d -m 0755 -o \"$owner\" -g \"$group\" \"$parent\"; ",
+                    "[ ! -L \"$target\" ]; ",
+                    "cat > \"$target\"; chmod 0644 \"$target\"; ",
+                    "chown \"$owner:$group\" \"$target\""
+                )
+                .into(),
+                "_".into(),
+                target.into(),
+                username.into(),
+            ],
+            Some(content),
+        )
+        .await
+        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
+    log_output("wayland environment", &output);
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(NspawnError::cmd_failed(
+            "write Wayland environment in container",
+            format!("systemd-nspawn -D {:?} -- write {target}", rootfs),
+            &output,
+        ))
+    }
+}
+
+async fn append_wayland_source(
+    rootfs: &Path,
+    username: &str,
+    target: &str,
+    runner: &dyn RootfsProcessRunner,
+) -> Result<()> {
+    let output = runner
+        .run(
+            rootfs,
+            vec![
+                "sh".into(),
+                "-eu".into(),
+                "-c".into(),
+                format!(
+                    concat!(
+                        "target=$1; owner=$2; parent=${{target%/*}}; ",
+                        "group=$(id -gn \"$owner\"); ",
+                        "install -d -m 0755 -o \"$owner\" -g \"$group\" \"$parent\"; ",
+                        "[ ! -L \"$target\" ]; ",
+                        "touch \"$target\"; ",
+                        "if ! grep -Fq {source} \"$target\"; then ",
+                        "if [ -s \"$target\" ]; then ",
+                        "last=$(tail -c 1 \"$target\"); [ -z \"$last\" ] || printf '\\n' >> \"$target\"; ",
+                        "printf '\\n' >> \"$target\"; fi; ",
+                        "printf '%s\\n%s\\n' {marker} {source} >> \"$target\"; fi; ",
+                        "chmod 0644 \"$target\"; chown \"$owner:$group\" \"$target\""
+                    ),
+                    marker = shell_single_quote(WAYLAND_RC_MARKER),
+                    source = shell_single_quote(WAYLAND_RC_SOURCE),
+                ),
+                "_".into(),
+                target.into(),
+                username.into(),
+            ],
+            None,
+        )
+        .await
+        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
+    log_output("wayland shell rc", &output);
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(NspawnError::cmd_failed(
+            "update Wayland shell rc in container",
+            format!("systemd-nspawn -D {:?} -- update {target}", rootfs),
+            &output,
+        ))
+    }
+}
+
+fn validate_display(display: &str) -> Result<()> {
+    if display.is_empty()
+        || display.len() > MAX_DISPLAY_BYTES
+        || display.chars().any(char::is_control)
+    {
+        return Err(NspawnError::Validation(
+            "DISPLAY must be non-empty, at most 255 bytes, and contain no control characters"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
-fn append_wayland_source(existing: Option<&str>) -> Option<String> {
-    let existing = existing.unwrap_or_default();
-    if existing.contains("source ~/.wayland-env") {
-        return None;
-    }
-
-    let mut updated = existing.to_string();
-    if !updated.is_empty() {
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push('\n');
-    }
-    updated.push_str(WAYLAND_RC_MARKER);
-    updated.push('\n');
-    updated.push_str(WAYLAND_RC_SOURCE);
-    updated.push('\n');
-    Some(updated)
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::ops::PermissionLevel;
+    use crate::nspawn::adapters::rootfs::process::MockRootfsProcessRunner;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+    use std::sync::{Arc, Mutex};
 
-    fn zsh_user() -> CreateUser {
-        CreateUser {
-            username: "alice".into(),
-            shell: "/usr/bin/zsh".into(),
-            ..Default::default()
+    fn success_output() -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
         }
     }
 
     #[tokio::test]
     async fn missing_zshrc_is_created_with_a_managed_source_block() {
-        let rootfs = tempfile::tempdir().unwrap();
-        let io = ElevatedIo::new(PermissionLevel::Root);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = MockRootfsProcessRunner::new();
+        let captured = calls.clone();
+        runner
+            .expect_run()
+            .times(2)
+            .returning(move |_, command, stdin| {
+                captured.lock().unwrap().push((command, stdin));
+                Ok(success_output())
+            });
 
-        setup_wayland_shell_env(rootfs.path(), &zsh_user(), &io)
-            .await
-            .unwrap();
+        setup_wayland_shell_env(
+            Path::new("/tmp/rootfs"),
+            "alice",
+            "/usr/bin/zsh",
+            ":0",
+            &runner,
+        )
+        .await
+        .unwrap();
 
-        let zshrc = tokio::fs::read_to_string(rootfs.path().join("home/alice/.zshrc"))
-            .await
-            .unwrap();
-        assert_eq!(
-            zshrc,
-            format!("{}\n{}\n", WAYLAND_RC_MARKER, WAYLAND_RC_SOURCE)
-        );
-    }
-
-    #[tokio::test]
-    async fn existing_rc_content_is_preserved_and_source_is_not_duplicated() {
-        let rootfs = tempfile::tempdir().unwrap();
-        let home = rootfs.path().join("home/alice");
-        tokio::fs::create_dir_all(&home).await.unwrap();
-        tokio::fs::write(home.join(".zshrc"), "export EDITOR=vim")
-            .await
-            .unwrap();
-        let io = ElevatedIo::new(PermissionLevel::Root);
-
-        setup_wayland_shell_env(rootfs.path(), &zsh_user(), &io)
-            .await
-            .unwrap();
-        setup_wayland_shell_env(rootfs.path(), &zsh_user(), &io)
-            .await
-            .unwrap();
-
-        let zshrc = tokio::fs::read_to_string(home.join(".zshrc"))
-            .await
-            .unwrap();
-        assert!(zshrc.starts_with("export EDITOR=vim\n\n"));
-        assert_eq!(zshrc.matches(WAYLAND_RC_MARKER).count(), 1);
-        assert_eq!(zshrc.matches(WAYLAND_RC_SOURCE).count(), 1);
+        let calls = calls.lock().unwrap();
+        assert!(calls[0]
+            .0
+            .iter()
+            .any(|arg| arg == "/home/alice/.wayland-env"));
+        assert!(calls[0].1.is_some());
+        assert!(calls[1].0.iter().any(|arg| arg == "/home/alice/.zshrc"));
+        assert!(calls[1].0.iter().any(|arg| arg.contains(WAYLAND_RC_MARKER)));
+        assert!(calls[1].1.is_none());
     }
 
     #[test]
-    fn legacy_unmarked_source_line_is_left_unchanged() {
-        let existing = format!("{}\n", WAYLAND_RC_SOURCE);
-        assert_eq!(append_wayland_source(Some(&existing)), None);
+    fn display_is_shell_quoted_and_control_characters_are_rejected() {
+        assert_eq!(shell_single_quote("host'quoted:0"), "'host'\"'\"'quoted:0'");
+        assert!(validate_display(":0\nmalicious").is_err());
     }
 }

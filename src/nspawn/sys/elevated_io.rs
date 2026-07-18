@@ -37,31 +37,6 @@ impl ElevatedIo {
         }
     }
 
-    /// Read file content, elevating via daemon when needed.
-    /// Returns `None` when the file does not exist.
-    pub async fn read_to_string(&self, path: &Path) -> Result<Option<String>> {
-        match self.level {
-            PermissionLevel::Root | PermissionLevel::User => {
-                match tokio::fs::read_to_string(path).await {
-                    Ok(c) => Ok(Some(c)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(NspawnError::Io(path.to_path_buf(), e)),
-                }
-            }
-            PermissionLevel::Elevated => {
-                if let Some(ref daemon) = self.daemon {
-                    daemon.read_file(path).await
-                } else {
-                    match tokio::fs::read_to_string(path).await {
-                        Ok(c) => Ok(Some(c)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                        Err(e) => Err(NspawnError::Io(path.to_path_buf(), e)),
-                    }
-                }
-            }
-        }
-    }
-
     /// Write `content` to `path`, elevating via daemon or `sudo tee` when needed.
     pub async fn write(&self, path: &Path, content: &str) -> Result<()> {
         match self.level {

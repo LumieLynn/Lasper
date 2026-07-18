@@ -1,11 +1,7 @@
 use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
-use super::staging::NvidiaInjectionFileKind;
 use super::state::{calculate_death_list, NvidiaState};
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
-use crate::nspawn::sys::log_output;
-use std::path::Path;
+use crate::nspawn::errors::Result;
 
 macro_rules! log_step {
     ($name:expr, $step:expr, $msg:expr) => {
@@ -67,54 +63,6 @@ fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
     file_binds == state_binds
 }
 
-pub async fn cleanup_container_garbage(
-    name: &str,
-    death_list: &[String],
-    cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-) -> Result<()> {
-    if death_list.is_empty() {
-        return Ok(());
-    }
-    let machine =
-        MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
-    for path in death_list {
-        validate_cleanup_path(path)?;
-    }
-
-    log_step!(
-        name,
-        "Cleanup",
-        "Inspecting and removing leftover driver files..."
-    );
-
-    let rootfs = crate::paths::machine_root(machine.as_str());
-    let mut args = vec![
-        "-D".to_string(),
-        rootfs.to_string_lossy().to_string(),
-        "--settings=no".to_string(),
-        "-q".to_string(),
-        "sh".to_string(),
-        "-c".to_string(),
-        "for path do [ -f \"$path\" ] && [ ! -s \"$path\" ] && rm -f -- \"$path\"; done"
-            .to_string(),
-        "_".to_string(),
-    ];
-    args.extend(death_list.iter().cloned());
-
-    cmd_runner.run("systemd-nspawn", args).await?;
-
-    Ok(())
-}
-
-fn validate_cleanup_path(path: &str) -> Result<()> {
-    if path.is_empty() || path.chars().any(char::is_control) || !Path::new(path).is_absolute() {
-        return Err(NspawnError::Validation(format!(
-            "Invalid NVIDIA cleanup path: {path:?}"
-        )));
-    }
-    Ok(())
-}
-
 async fn inject_persistent_device_allow(
     name: &str,
     state: &NvidiaState,
@@ -131,171 +79,40 @@ async fn inject_persistent_device_allow(
         .await
 }
 
-/// Write ld.so.conf.d entry and /etc/environment vars into the container
-/// rootfs via `systemd-nspawn -D <root> --bind <tmp>:<tmp> sh -c "cp ..."`.
-///
-/// Content is staged through a typed NVIDIA staging store so Elevated mode
-/// does not expose arbitrary host temp-file paths. Uses the supplied
-/// [`CommandRunner`] to execute nspawn (which goes through the daemon when
-/// elevated).
-///
-/// Done at creation time (not every startup) — called from provisioning.
+/// Assemble the NVIDIA-specific rootfs data and submit one typed mutation.
 pub(crate) async fn inject_env_once(
-    name: &str,
     target: &crate::nspawn::adapters::rootfs::RootfsTarget,
     state: &NvidiaState,
-    staging: &crate::nspawn::platform::nvidia::NvidiaStagingStore,
-    cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-) -> Result<()> {
-    let rootfs = target.path()?;
-    let rootfs_str = rootfs.to_string_lossy();
-
-    // ── ld.so.conf.d ──
-    let mut ld_content = String::new();
-    for folder in &state.ldcache_folders {
-        ld_content.push_str(folder);
-        ld_content.push('\n');
-    }
-    if let Some(ref prof) = state.profile {
-        if prof.mode == NvidiaPassthroughMode::Categorized {
-            use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
-            for cat in [NvidiaFileCategory::Lib64, NvidiaFileCategory::Lib32] {
-                if let Some(dest) = prof.category_destinations.get(&cat) {
-                    ld_content.push_str(dest);
-                    ld_content.push('\n');
-                }
-            }
-        }
-    }
-
-    if !ld_content.is_empty() {
-        let file = staging
-            .create_injection_file(name, NvidiaInjectionFileKind::LdConfig, &ld_content)
-            .await?;
-        let tmp = file.path.clone();
-        let copy = cmd_runner
-            .run(
-                "systemd-nspawn",
-                vec![
-                    "-D".to_string(),
-                    rootfs_str.to_string(),
-                    "--settings=no".to_string(),
-                    "--bind".to_string(),
-                    format!("{}:{}", tmp, tmp),
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "mkdir -p /etc/ld.so.conf.d && cp {} /etc/ld.so.conf.d/lasper-nvidia.conf",
-                        tmp
-                    ),
-                ],
-            )
-            .await;
-        match copy {
-            Ok(output) => {
-                log_output("nvidia ld.so.conf", &output);
-                if output.status.success() {
-                    refresh_container_ld_cache(name, &rootfs_str, cmd_runner).await;
-                } else {
-                    log::warn!("Failed to inject NVIDIA ld.so.conf into container {}", name);
-                }
-            }
-            Err(error) => {
-                log::warn!(
-                    "Failed to run NVIDIA ld.so.conf injection for container {}: {}",
-                    name,
-                    error
-                );
-            }
-        }
-        let _ = staging.remove_injection_file(name, &file).await;
-    }
-
-    // ── /etc/environment ──
-    if state.profile.as_ref().is_some_and(|p| p.inject_env) {
-        // Read existing content from the container
-        let old_env = cmd_runner
-            .run(
-                "systemd-nspawn",
-                vec![
-                    "-D".to_string(),
-                    rootfs_str.to_string(),
-                    "--settings=no".to_string(),
-                    "cat".to_string(),
-                    "/etc/environment".to_string(),
-                ],
-            )
-            .await
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| String::from_utf8_lossy(&out.stdout).to_string())
-            .unwrap_or_default();
-
-        let mut lines: Vec<String> = old_env.lines().map(|s| s.to_string()).collect();
-        for (key, val) in &state.env_vars {
-            let prefix = format!("{}=", key);
-            lines.retain(|l| !l.starts_with(&prefix));
-            lines.push(format!("{}={}", key, val));
-        }
-        let new_env = lines.join("\n") + "\n";
-
-        let file = staging
-            .create_injection_file(name, NvidiaInjectionFileKind::Environment, &new_env)
-            .await?;
-        let tmp = file.path.clone();
-        let _ = cmd_runner
-            .run(
-                "systemd-nspawn",
-                vec![
-                    "-D".to_string(),
-                    rootfs_str.to_string(),
-                    "--settings=no".to_string(),
-                    "--bind".to_string(),
-                    format!("{}:{}", tmp, tmp),
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!("cp {} /etc/environment", tmp),
-                ],
-            )
-            .await;
-        let _ = staging.remove_injection_file(name, &file).await;
-    }
-
-    Ok(())
+    rootfs: &crate::nspawn::adapters::rootfs::RootfsStore,
+) -> Result<Vec<String>> {
+    let (ld_cache_folders, environment, write_environment) = nvidia_rootfs_config(state);
+    rootfs
+        .configure_nvidia(target, ld_cache_folders, environment, write_environment)
+        .await
 }
 
-async fn refresh_container_ld_cache(
-    name: &str,
-    rootfs: &str,
-    cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-) {
-    let output = cmd_runner
-        .run(
-            "systemd-nspawn",
-            vec![
-                "-D".to_string(),
-                rootfs.to_string(),
-                "--quiet".to_string(),
-                "--settings=no".to_string(),
-                "ldconfig".to_string(),
-            ],
-        )
-        .await;
-    match output {
-        Ok(output) => {
-            log_output("ldconfig", &output);
-            if !output.status.success() {
-                log::warn!("ldconfig failed inside NVIDIA container {}", name);
+fn nvidia_rootfs_config(state: &NvidiaState) -> (Vec<String>, Vec<(String, String)>, bool) {
+    let mut folders = state.ldcache_folders.clone();
+    if let Some(profile) = &state.profile {
+        if profile.mode == NvidiaPassthroughMode::Categorized {
+            use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
+            for category in [NvidiaFileCategory::Lib64, NvidiaFileCategory::Lib32] {
+                if let Some(destination) = profile.category_destinations.get(&category) {
+                    folders.push(destination.clone());
+                }
             }
         }
-        Err(error) => {
-            log::warn!(
-                "Failed to run ldconfig inside NVIDIA container {}: {}",
-                name,
-                error
-            );
-        }
     }
+    let write_environment = state
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.inject_env);
+    let environment = if write_environment {
+        state.env_vars.clone()
+    } else {
+        Vec::new()
+    };
+    (folders, environment, write_environment)
 }
 
 pub async fn ensure_gpu_passthrough(
@@ -303,7 +120,7 @@ pub async fn ensure_gpu_passthrough(
     nspawn: &crate::nspawn::adapters::config::NspawnConfigStore,
     systemd_unit: &crate::nspawn::adapters::config::SystemdUnitStore,
     state_store: &crate::nspawn::platform::nvidia::NvidiaStateStore,
-    cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
+    rootfs: &crate::nspawn::adapters::rootfs::RootfsStore,
 ) -> Result<()> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
     let config = match nspawn.read(name).await? {
@@ -389,7 +206,9 @@ pub async fn ensure_gpu_passthrough(
     }
 
     // 4. Cleanup stale files in rootfs
-    cleanup_container_garbage(name, &death_list, cmd_runner).await?;
+    for warning in rootfs.cleanup_nvidia(name, &death_list).await? {
+        log::warn!("{}", warning);
+    }
 
     // 5. Update .nspawn config (symlinks are now synthesized as Bind entries here)
     log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
@@ -417,18 +236,6 @@ pub async fn ensure_gpu_passthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::sys::command::MockCommandRunner;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Output;
-    use std::sync::{Arc, Mutex};
-
-    fn mock_output(status: bool) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(if status { 0 } else { 256 }),
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-        }
-    }
 
     #[test]
     fn marker_match_preserves_writable_bind_destination() {
@@ -464,89 +271,33 @@ X-Lasper-Nvidia-End=true
         assert!(marker_binds_match_state(content, &state));
     }
 
-    #[tokio::test]
-    async fn cleanup_container_garbage_routes_paths_as_shell_args() {
-        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
-        {
-            let calls = calls.clone();
-            runner.expect_run().once().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args.clone());
-                Ok(mock_output(true))
-            });
-        }
+    #[test]
+    fn nvidia_rootfs_config_includes_categorized_library_paths_and_opt_in_env() {
+        use crate::nspawn::platform::nvidia::classify::NvidiaFileCategory;
+        use crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile;
 
-        cleanup_container_garbage(
-            "valid-machine",
-            &["/usr/lib/odd'path.so".into(), "/usr/lib/zero.so".into()],
-            &runner,
-        )
-        .await
-        .unwrap();
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let args = &calls[0];
-        let script_index = args
-            .iter()
-            .position(|arg| arg == "-c")
-            .expect("shell script marker")
-            + 1;
-        let script = &args[script_index];
-        assert!(script.contains("\"$path\""));
-        assert!(!script.contains("odd'path"));
-        assert!(args.iter().any(|arg| arg == "/usr/lib/odd'path.so"));
-        assert!(args.iter().any(|arg| arg == "/usr/lib/zero.so"));
-    }
-
-    #[tokio::test]
-    async fn cleanup_container_garbage_rejects_invalid_machine_name_before_nspawn() {
-        let mut runner = MockCommandRunner::new();
-        runner.expect_run().never();
-
-        let result =
-            cleanup_container_garbage("../escape", &["/usr/lib/libcuda.so".into()], &runner).await;
-
-        assert!(matches!(result, Err(NspawnError::Validation(_))));
-    }
-
-    #[tokio::test]
-    async fn inject_env_refreshes_ld_cache_after_writing_ld_config() {
-        let staging = crate::nspawn::platform::nvidia::NvidiaStagingStore::new(None);
-        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
-        {
-            let calls = calls.clone();
-            runner.expect_run().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args.clone());
-                Ok(mock_output(true))
-            });
-        }
-        let state = NvidiaState {
-            ldcache_folders: vec![
-                "/usr/lib/wsl/drivers/nvam.inf_amd64_example".into(),
-                "/usr/lib/wsl/lib".into(),
-            ],
+        let mut profile = NvidiaPassthroughProfile {
+            mode: NvidiaPassthroughMode::Categorized,
+            inject_env: true,
             ..Default::default()
         };
-        let name = format!("ldconfig-test-{}", std::process::id());
-        let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
-            &name,
-            &crate::paths::machine_root(&name),
-        )
-        .unwrap();
+        profile
+            .category_destinations
+            .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
+        let state = NvidiaState {
+            ldcache_folders: vec!["/usr/lib/wsl/lib".into()],
+            env_vars: vec![("NVIDIA_VISIBLE_DEVICES".into(), "void".into())],
+            profile: Some(profile),
+            ..Default::default()
+        };
 
-        inject_env_once(&name, &target, &state, &staging, &runner)
-            .await
-            .unwrap();
+        let (folders, environment, write_environment) = nvidia_rootfs_config(&state);
 
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[0]
-            .iter()
-            .any(|arg| arg.contains("/etc/ld.so.conf.d/lasper-nvidia.conf")));
-        assert!(calls[1].iter().any(|arg| arg == "ldconfig"));
+        assert_eq!(folders, vec!["/usr/lib/wsl/lib", "/opt/nvidia/lib64"]);
+        assert_eq!(
+            environment,
+            vec![("NVIDIA_VISIBLE_DEVICES".into(), "void".into())]
+        );
+        assert!(write_environment);
     }
 }

@@ -191,6 +191,11 @@ pub fn validate_login_shell(shell: &str) -> Result<()> {
 }
 
 pub fn validate_chpasswd_secret(label: &str, secret: &str) -> Result<()> {
+    if secret.len() > 4096 {
+        return Err(NspawnError::Validation(format!(
+            "{label} cannot exceed 4096 bytes"
+        )));
+    }
     if secret.chars().any(char::is_control) {
         return Err(NspawnError::Validation(format!(
             "{label} cannot contain control characters"
@@ -412,6 +417,7 @@ mod tests {
                 "secret should be rejected: {secret:?}"
             );
         }
+        assert!(validate_chpasswd_secret("password", &"x".repeat(4097)).is_err());
     }
 
     #[test]

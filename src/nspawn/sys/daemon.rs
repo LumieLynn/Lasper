@@ -37,9 +37,6 @@ use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
-use crate::nspawn::platform::nvidia::staging::{
-    execute_nvidia_staging_operation, NvidiaStagingOperation, NvidiaStagingResult,
-};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
@@ -564,26 +561,6 @@ impl ElevatedDaemon {
         })
     }
 
-    pub async fn read_file(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<Option<String>> {
-        let result = self
-            .rpc_call(
-                "read_file",
-                serde_json::json!({"path": path.to_string_lossy()}),
-            )
-            .await
-            .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        match result.get("content") {
-            Some(serde_json::Value::String(content)) => Ok(Some(content.clone())),
-            Some(serde_json::Value::Null) => Ok(None),
-            _ => Err(crate::nspawn::errors::NspawnError::Runtime(
-                "daemon read_file: missing or invalid content field".into(),
-            )),
-        }
-    }
-
     pub async fn write_file(
         &self,
         path: &std::path::Path,
@@ -663,17 +640,6 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("nvidia_state", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(crate) async fn nvidia_staging(
-        &self,
-        operation: NvidiaStagingOperation,
-    ) -> std::io::Result<NvidiaStagingResult> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("nvidia_staging", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -1119,37 +1085,6 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
-        "nvidia_staging" => {
-            let operation: NvidiaStagingOperation =
-                match serde_json::from_value(request.params.clone()) {
-                    Ok(operation) => operation,
-                    Err(error) => {
-                        return HandleOutcome::Sync(Err(format!(
-                            "invalid nvidia_staging request: {error}"
-                        )));
-                    }
-                };
-            let id = request.id;
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_nvidia_staging_operation(operation).await {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
         "managed_storage" => {
             let operation: ManagedStorageOperation =
                 match serde_json::from_value(request.params.clone()) {
@@ -1236,32 +1171,6 @@ async fn handle_request(
                     }}),
                     Err(e) => {
                         serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":format!("{}",e)}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "read_file" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = read_optional_file_impl(&path_str).await;
-                let response = match result {
-                    Ok(Some(content)) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":content}})
-                    }
-                    Ok(None) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":null}})
-                    }
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":format!("read {}: {}", path_str, e)}})
                     }
                 };
                 let line = serde_json::to_string(&response).unwrap();
@@ -1819,14 +1728,6 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-async fn read_optional_file_impl(path_str: &str) -> std::io::Result<Option<String>> {
-    match tokio::fs::read_to_string(path_str).await {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
-    }
-}
-
 // ── Atomic write (daemon side) ──
 
 /// Generic daemon file writes are one-shot replacements. Cross-process
@@ -1873,27 +1774,6 @@ mod tests {
         );
         assert!(!path.with_extension("lock").exists());
         assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
-    }
-
-    #[tokio::test]
-    async fn generic_read_file_distinguishes_missing_from_failure() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("missing-zshrc");
-
-        assert_eq!(
-            read_optional_file_impl(path.to_str().unwrap())
-                .await
-                .unwrap(),
-            None
-        );
-
-        tokio::fs::write(&path, "# existing\n").await.unwrap();
-        assert_eq!(
-            read_optional_file_impl(path.to_str().unwrap())
-                .await
-                .unwrap(),
-            Some("# existing\n".into())
-        );
     }
 
     #[test]

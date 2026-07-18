@@ -174,7 +174,7 @@ impl DefaultManager {
             &self.exec_ctx.nspawn,
             &self.exec_ctx.systemd_unit,
             &self.exec_ctx.nvidia_state,
-            self.exec_ctx.cmd.as_ref(),
+            &self.exec_ctx.rootfs,
         )
         .await?;
         // Reload systemd after GPU surgery — always needed when device allows change.

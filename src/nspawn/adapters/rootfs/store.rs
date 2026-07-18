@@ -1,6 +1,11 @@
 use crate::nspawn::adapters::rootfs::network::configure_network_at;
+use crate::nspawn::adapters::rootfs::nvidia::{
+    cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
+};
+use crate::nspawn::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
+use crate::nspawn::adapters::rootfs::{users, wayland};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::nspawn::models::{validate_chpasswd_secret, CreateUser, MachineName};
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::log_output;
@@ -126,6 +131,83 @@ impl RootfsStore {
         Ok(())
     }
 
+    pub(crate) async fn set_root_password(
+        &self,
+        target: &RootfsTarget,
+        password: &str,
+    ) -> Result<Vec<String>> {
+        let result = self
+            .execute(RootfsOperation::SetRootPassword(SetRootPasswordRequest {
+                target: target.clone(),
+                password: password.to_string(),
+            }))
+            .await?;
+        Ok(result.warnings)
+    }
+
+    pub(crate) async fn create_user(
+        &self,
+        target: &RootfsTarget,
+        user: &CreateUser,
+    ) -> Result<Vec<String>> {
+        let result = self
+            .execute(RootfsOperation::CreateUser(CreateUserRequest {
+                target: target.clone(),
+                username: user.username.clone(),
+                password: user.password.clone(),
+                sudoer: user.sudoer,
+                shell: user.shell.clone(),
+            }))
+            .await?;
+        Ok(result.warnings)
+    }
+
+    pub(crate) async fn configure_wayland(
+        &self,
+        target: &RootfsTarget,
+        user: &CreateUser,
+        display: &str,
+    ) -> Result<()> {
+        self.execute(RootfsOperation::ConfigureWayland(ConfigureWaylandRequest {
+            target: target.clone(),
+            username: user.username.clone(),
+            shell: user.shell.clone(),
+            display: display.to_string(),
+        }))
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn configure_nvidia(
+        &self,
+        target: &RootfsTarget,
+        ld_cache_folders: Vec<String>,
+        environment: Vec<(String, String)>,
+        write_environment: bool,
+    ) -> Result<Vec<String>> {
+        let result = self
+            .execute(RootfsOperation::ConfigureNvidia(ConfigureNvidiaRequest {
+                target: target.clone(),
+                ld_cache_folders,
+                environment,
+                write_environment,
+            }))
+            .await?;
+        Ok(result.warnings)
+    }
+
+    pub(crate) async fn cleanup_nvidia(&self, name: &str, paths: &[String]) -> Result<Vec<String>> {
+        let result = self
+            .execute(RootfsOperation::CleanupNvidia(CleanupNvidiaRequest {
+                target: RootfsTarget::Machine {
+                    machine: parse_machine_name(name)?,
+                },
+                paths: paths.to_vec(),
+            }))
+            .await?;
+        Ok(result.warnings)
+    }
+
     async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult> {
         if let Some(daemon) = &self.daemon {
             daemon
@@ -133,7 +215,12 @@ impl RootfsStore {
                 .await
                 .map_err(|error| NspawnError::Runtime(error.to_string()))
         } else {
-            execute_rootfs_operation_with_runner(operation, &DefaultCommandRunner).await
+            execute_rootfs_operation_with_runners(
+                operation,
+                &DefaultCommandRunner,
+                &DefaultRootfsProcessRunner,
+            )
+            .await
         }
     }
 }
@@ -152,7 +239,7 @@ impl Default for RootfsStore {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params", rename_all = "snake_case")]
 pub(crate) enum RootfsOperation {
     ProbeOsRelease(TargetRequest),
@@ -160,6 +247,11 @@ pub(crate) enum RootfsOperation {
     MountManagedRaw(TargetRequest),
     UnmountManagedRaw(TargetRequest),
     ConfigureNetwork(TargetRequest),
+    SetRootPassword(SetRootPasswordRequest),
+    CreateUser(CreateUserRequest),
+    ConfigureWayland(ConfigureWaylandRequest),
+    ConfigureNvidia(ConfigureNvidiaRequest),
+    CleanupNvidia(CleanupNvidiaRequest),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -168,19 +260,69 @@ pub(crate) struct TargetRequest {
     target: RootfsTarget,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SetRootPasswordRequest {
+    target: RootfsTarget,
+    password: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateUserRequest {
+    target: RootfsTarget,
+    username: String,
+    password: String,
+    sudoer: bool,
+    shell: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfigureWaylandRequest {
+    target: RootfsTarget,
+    username: String,
+    shell: String,
+    display: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfigureNvidiaRequest {
+    target: RootfsTarget,
+    ld_cache_folders: Vec<String>,
+    environment: Vec<(String, String)>,
+    write_environment: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanupNvidiaRequest {
+    target: RootfsTarget,
+    paths: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RootfsResult {
     present: Option<bool>,
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 pub(crate) async fn execute_rootfs_operation(operation: RootfsOperation) -> Result<RootfsResult> {
-    execute_rootfs_operation_with_runner(operation, &DefaultCommandRunner).await
+    execute_rootfs_operation_with_runners(
+        operation,
+        &DefaultCommandRunner,
+        &DefaultRootfsProcessRunner,
+    )
+    .await
 }
 
-async fn execute_rootfs_operation_with_runner(
+async fn execute_rootfs_operation_with_runners(
     operation: RootfsOperation,
     runner: &dyn CommandRunner,
+    rootfs_runner: &dyn RootfsProcessRunner,
 ) -> Result<RootfsResult> {
     match operation {
         RootfsOperation::ProbeOsRelease(request) => {
@@ -188,12 +330,14 @@ async fn execute_rootfs_operation_with_runner(
             if !validate_optional_rootfs_directory(&path).await? {
                 return Ok(RootfsResult {
                     present: Some(false),
+                    ..Default::default()
                 });
             }
             let present = path_exists_in_root(&path, "etc/os-release")?
                 || path_exists_in_root(&path, "usr/lib/os-release")?;
             Ok(RootfsResult {
                 present: Some(present),
+                ..Default::default()
             })
         }
         RootfsOperation::ProbeNspawnCommandSupport(request) => {
@@ -201,10 +345,12 @@ async fn execute_rootfs_operation_with_runner(
             if !validate_optional_rootfs_directory(&path).await? {
                 return Ok(RootfsResult {
                     present: Some(false),
+                    ..Default::default()
                 });
             }
             Ok(RootfsResult {
                 present: Some(path_is_directory_in_root(&path, "usr")?),
+                ..Default::default()
             })
         }
         RootfsOperation::MountManagedRaw(request) => {
@@ -212,6 +358,7 @@ async fn execute_rootfs_operation_with_runner(
             let mounted = mount_managed_raw_at(&machine, &mount_id, runner).await?;
             Ok(RootfsResult {
                 present: Some(mounted),
+                ..Default::default()
             })
         }
         RootfsOperation::UnmountManagedRaw(request) => {
@@ -224,6 +371,80 @@ async fn execute_rootfs_operation_with_runner(
             validate_required_rootfs_directory(&path).await?;
             configure_network_at(&path, runner).await?;
             Ok(RootfsResult::default())
+        }
+        RootfsOperation::SetRootPassword(request) => {
+            validate_chpasswd_secret("root password", &request.password)?;
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            let warnings =
+                users::set_root_password(&path, &request.password, rootfs_runner).await?;
+            Ok(RootfsResult {
+                warnings,
+                ..Default::default()
+            })
+        }
+        RootfsOperation::CreateUser(request) => {
+            let user = CreateUser {
+                username: request.username,
+                password: request.password,
+                sudoer: request.sudoer,
+                shell: request.shell,
+            };
+            user.validate()?;
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            let warnings = users::create_user_in_container(&path, &user, rootfs_runner).await?;
+            Ok(RootfsResult {
+                warnings,
+                ..Default::default()
+            })
+        }
+        RootfsOperation::ConfigureWayland(request) => {
+            wayland::validate_wayland_config(&request.username, &request.shell, &request.display)?;
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            wayland::setup_wayland_shell_env(
+                &path,
+                &request.username,
+                &request.shell,
+                &request.display,
+                rootfs_runner,
+            )
+            .await?;
+            Ok(RootfsResult::default())
+        }
+        RootfsOperation::ConfigureNvidia(request) => {
+            validate_nvidia_config(
+                &request.ld_cache_folders,
+                &request.environment,
+                request.write_environment,
+            )?;
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            let warnings = configure_nvidia_rootfs(
+                &path,
+                &request.ld_cache_folders,
+                &request.environment,
+                request.write_environment,
+                rootfs_runner,
+            )
+            .await?;
+            Ok(RootfsResult {
+                warnings,
+                ..Default::default()
+            })
+        }
+        RootfsOperation::CleanupNvidia(request) => {
+            validate_cleanup_paths(&request.paths)?;
+            let path = request.target.path()?;
+            if !validate_optional_rootfs_directory(&path).await? {
+                return Ok(RootfsResult::default());
+            }
+            let warnings = cleanup_nvidia_files(&path, &request.paths, rootfs_runner).await?;
+            Ok(RootfsResult {
+                warnings,
+                ..Default::default()
+            })
         }
     }
 }
@@ -490,6 +711,53 @@ mod tests {
     }
 
     #[test]
+    fn mutation_deserialization_rejects_unknown_authority_fields() {
+        let arbitrary_program = r#"{
+            "operation":"create_user",
+            "params":{
+                "target":{"kind":"machine","machine":"test"},
+                "username":"alice",
+                "password":"secret",
+                "sudoer":false,
+                "shell":"/bin/bash",
+                "program":"sh"
+            }
+        }"#;
+        assert!(serde_json::from_str::<RootfsOperation>(arbitrary_program).is_err());
+
+        let arbitrary_path = r#"{
+            "operation":"configure_wayland",
+            "params":{
+                "target":{"kind":"machine","machine":"test"},
+                "username":"alice",
+                "shell":"/bin/bash",
+                "display":":0",
+                "path":"/etc/shadow"
+            }
+        }"#;
+        assert!(serde_json::from_str::<RootfsOperation>(arbitrary_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn mutation_values_are_validated_before_rootfs_state() {
+        let operation = RootfsOperation::SetRootPassword(SetRootPasswordRequest {
+            target: RootfsTarget::Machine {
+                machine: MachineName::new("missing-test-machine").unwrap(),
+            },
+            password: "bad\npassword".into(),
+        });
+        let command_runner = crate::nspawn::sys::command::MockCommandRunner::new();
+        let mut rootfs_runner =
+            crate::nspawn::adapters::rootfs::process::MockRootfsProcessRunner::new();
+        rootfs_runner.expect_run().never();
+
+        let result =
+            execute_rootfs_operation_with_runners(operation, &command_runner, &rootfs_runner).await;
+
+        assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[test]
     fn provisioned_target_accepts_only_exact_managed_paths() {
         let machine =
             RootfsTarget::from_provisioned_path("test", &crate::paths::machine_root("test"))
@@ -523,8 +791,11 @@ mod tests {
             },
         });
         let runner = crate::nspawn::sys::command::MockCommandRunner::new();
+        let rootfs_runner =
+            crate::nspawn::adapters::rootfs::process::MockRootfsProcessRunner::new();
 
-        let result = execute_rootfs_operation_with_runner(operation, &runner).await;
+        let result =
+            execute_rootfs_operation_with_runners(operation, &runner, &rootfs_runner).await;
 
         assert!(result.is_err());
     }
