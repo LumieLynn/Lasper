@@ -40,6 +40,29 @@ impl ManagedStorageStore {
         Ok(())
     }
 
+    pub async fn create_subvolume(&self, name: &str) -> Result<PathBuf> {
+        let result = self
+            .execute(ManagedStorageOperation::CreateSubvolume(
+                CreateManagedSubvolume {
+                    machine: parse_machine_name(name)?,
+                },
+            ))
+            .await?;
+        result.path.ok_or_else(|| {
+            NspawnError::Runtime("managed subvolume operation returned no path".into())
+        })
+    }
+
+    pub async fn remove_subvolume(&self, name: &str) -> Result<()> {
+        self.execute(ManagedStorageOperation::RemoveSubvolume(
+            RemoveManagedSubvolume {
+                machine: parse_machine_name(name)?,
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
     pub async fn create_raw_image(
         &self,
         name: &str,
@@ -147,6 +170,8 @@ impl Default for ManagedStorageStore {
 pub(crate) enum ManagedStorageOperation {
     CreateDirectory(CreateManagedDirectory),
     RemoveDirectory(RemoveManagedDirectory),
+    CreateSubvolume(CreateManagedSubvolume),
+    RemoveSubvolume(RemoveManagedSubvolume),
     CreateRawImage(CreateManagedRawImage),
     MountImage(MountManagedImage),
     UnmountImage(UnmountManagedImage),
@@ -162,6 +187,18 @@ pub(crate) struct CreateManagedDirectory {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RemoveManagedDirectory {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateManagedSubvolume {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoveManagedSubvolume {
     machine: MachineName,
 }
 
@@ -269,6 +306,22 @@ pub(crate) async fn execute_managed_storage_operation_with_runner(
         }
         ManagedStorageOperation::RemoveDirectory(request) => {
             remove_directory_at(&directory_path(&request.machine)).await?;
+            Ok(ManagedStorageResult::default())
+        }
+        ManagedStorageOperation::CreateSubvolume(request) => {
+            let path = crate::nspawn::adapters::storage::subvolume_ops::create_subvolume(
+                &request.machine,
+                runner,
+            )
+            .await?;
+            Ok(ManagedStorageResult { path: Some(path) })
+        }
+        ManagedStorageOperation::RemoveSubvolume(request) => {
+            crate::nspawn::adapters::storage::subvolume_ops::remove_subvolume(
+                &request.machine,
+                runner,
+            )
+            .await?;
             Ok(ManagedStorageResult::default())
         }
         ManagedStorageOperation::CreateRawImage(request) => {
@@ -406,6 +459,12 @@ mod tests {
     fn operation_deserialization_rejects_invalid_machine_name() {
         let json = r#"{
             "operation": "create_directory",
+            "params": {"machine": "../escape"}
+        }"#;
+        assert!(serde_json::from_str::<ManagedStorageOperation>(json).is_err());
+
+        let json = r#"{
+            "operation": "create_subvolume",
             "params": {"machine": "../escape"}
         }"#;
         assert!(serde_json::from_str::<ManagedStorageOperation>(json).is_err());

@@ -4,6 +4,7 @@ pub mod backends;
 pub mod detect;
 pub(crate) mod image_ops;
 pub mod store;
+pub(crate) mod subvolume_ops;
 
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{DiskImageConfig, DiskImageSource};
@@ -26,7 +27,7 @@ impl StorageType {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Directory => "Directory",
-            Self::Subvolume => "Subvolume (Btrfs/Generic)",
+            Self::Subvolume => "Btrfs Subvolume",
             Self::DiskImage => "Disk Image (Raw/Block)",
         }
     }
@@ -139,9 +140,9 @@ pub async fn get_storage_backend_for(
         }
     }
 
-    // 3. Check if it's a subvolume (Btrfs subvolume or ZFS dataset)
+    // 3. Check if it's a Btrfs subvolume
     if detect::is_subvolume(&base).await {
-        return into_backend(SubvolumeBackend);
+        return into_backend(SubvolumeBackend::new(managed_storage.clone()));
     }
 
     // 4. Default to DirectoryBackend
