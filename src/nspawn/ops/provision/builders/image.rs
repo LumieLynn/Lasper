@@ -40,11 +40,18 @@ impl Deployer for OciDeployer {
 
 pub struct DiskImageDeployer {
     pub path: String,
+    pub format: crate::nspawn::models::ArtifactFormat,
     pub cmd_runner: Arc<dyn CommandRunner>,
 }
 
 impl DiskImageDeployer {
     fn is_tarball(&self) -> bool {
+        if matches!(self.format, crate::nspawn::models::ArtifactFormat::Tar) {
+            return true;
+        }
+        if matches!(self.format, crate::nspawn::models::ArtifactFormat::Raw) {
+            return false;
+        }
         let p = self.path.to_lowercase();
         p.ends_with(".tar")
             || p.ends_with(".tar.gz")

@@ -37,6 +37,10 @@ use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
+use crate::nspawn::ops::provision::bootstrap_operation::{
+    build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
+    validate_target as validate_bootstrap_target, BootstrapRequest,
+};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
@@ -76,6 +80,8 @@ enum FdOperation {
     Login(SpawnLoginParams),
     #[serde(rename = "spawn_shell_cmd")]
     ShellCommand(SpawnShellCmdParams),
+    #[serde(rename = "spawn_bootstrap")]
+    Bootstrap(Box<SpawnBootstrapParams>),
     #[serde(rename = "import_raw_image")]
     ImportRawImage(ImportRawImageParams),
 }
@@ -99,6 +105,13 @@ struct SpawnShellCmdParams {
     cmd_id: u64,
     program: String,
     args: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnBootstrapParams {
+    cmd_id: u64,
+    request: BootstrapRequest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -178,7 +191,7 @@ impl CommandRunner for DaemonCommandRunner {
     }
 }
 
-fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+pub(crate) fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::FromRawFd;
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -792,6 +805,34 @@ impl ElevatedDaemon {
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 128];
+            let mut fds = [0i32 as RawFd; 1];
+            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
+            if fd_count > 0 {
+                Ok(fds[0])
+            } else {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                Err(std::io::Error::other(format!(
+                    "daemon error: {}",
+                    msg.trim()
+                )))
+            }
+        })
+        .await?
+    }
+
+    pub(crate) async fn spawn_bootstrap(
+        &self,
+        cmd_id: u64,
+        request: BootstrapRequest,
+    ) -> std::io::Result<RawFd> {
+        let std_sock = self
+            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+                cmd_id,
+                request,
+            })))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
             let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
             if fd_count > 0 {
@@ -1733,6 +1774,65 @@ async fn handle_fd_connection(
             }
         }
 
+        FdOperation::Bootstrap(params) => {
+            let SpawnBootstrapParams { cmd_id, request } = *params;
+            if let Err(error) = validate_bootstrap_target(&request.target).await {
+                log::warn!("Daemon: rejected bootstrap target: {}", error);
+                let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                return;
+            }
+            let signature_style = match probe_debootstrap_signature_style_sync(&request) {
+                Ok(style) => style,
+                Err(error) => {
+                    log::warn!("Daemon: debootstrap capability probe failed: {}", error);
+                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
+            let (program, args) = match build_bootstrap_command(&request, signature_style) {
+                Ok(command) => command,
+                Err(error) => {
+                    log::warn!("Daemon: rejected bootstrap request: {}", error);
+                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
+            log::info!(
+                "[AUDIT] [Step: Bootstrap] Starting typed {} operation",
+                program
+            );
+            match crate::nspawn::sys::new_sync_command("sh")
+                .arg("-c")
+                .arg("exec \"$@\" 2>&1")
+                .arg("--")
+                .arg(&program)
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take().expect("stdout piped");
+                    let raw_fd = stdout.as_raw_fd();
+                    if let Err(error) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
+                        log::error!("Daemon: send_with_fd (spawn_bootstrap) failed: {}", error);
+                    }
+                    drop(stdout);
+
+                    tokio::task::spawn_blocking(move || {
+                        let status = child.wait();
+                        if let Ok(status) = status {
+                            SPAWN_EXIT_CODES.lock().insert(cmd_id, status.into_raw());
+                        }
+                    });
+                }
+                Err(error) => {
+                    log::error!("Daemon: typed bootstrap spawn failed: {}", error);
+                    let _ = std_stream.send_with_fd(b"bootstrap spawn failed", &[]);
+                }
+            }
+        }
+
         FdOperation::ShellCommand(SpawnShellCmdParams {
             cmd_id,
             program,
@@ -1959,6 +2059,36 @@ mod tests {
             }
             _ => panic!("expected spawn_login"),
         }
+    }
+
+    #[test]
+    fn fd_request_round_trip_uses_typed_bootstrap_parameters() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+                cmd_id: 7,
+                request: BootstrapRequest {
+                    target: crate::nspawn::adapters::rootfs::RootfsTarget::Machine {
+                        machine: MachineName::new("test-machine").unwrap(),
+                    },
+                    spec: crate::nspawn::models::BootstrapSpec::Debootstrap(
+                        crate::nspawn::models::DebootstrapSpec::default(),
+                    ),
+                    include_sudo: true,
+                },
+            })),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "spawn_bootstrap");
+        assert_eq!(json["params"]["cmd_id"], 7);
+        assert_eq!(json["params"]["request"]["target"]["kind"], "machine");
+        assert_eq!(json["params"]["request"]["spec"]["provider"], "debootstrap");
+        assert!(json["params"].get("program").is_none());
+        assert!(json["params"].get("args").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(parsed.operation, FdOperation::Bootstrap(_)));
     }
 
     #[test]

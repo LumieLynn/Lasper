@@ -84,12 +84,10 @@ pub struct PartialTheme {
     pub terminal_insert_border: Option<ColorDef>,
 }
 
-/// Load the theme: config file takes precedence, then auto-detection, then dark fallback.
-pub fn load_theme() -> Theme {
-    if let Some(cfg) = crate::config::load_config() {
-        if let Some(partial) = cfg.theme {
-            return merge(partial);
-        }
+/// Load the theme: config takes precedence, then auto-detection, then dark fallback.
+pub fn load_theme(partial: Option<&PartialTheme>) -> Theme {
+    if let Some(partial) = partial {
+        return merge(partial);
     }
 
     // No config or theme section — auto-detect terminal background.
@@ -101,7 +99,7 @@ pub fn load_theme() -> Theme {
 }
 
 /// Merge partial config over the auto-detected base theme.
-fn merge(partial: PartialTheme) -> Theme {
+fn merge(partial: &PartialTheme) -> Theme {
     let base = if is_light_background() {
         Theme::light()
     } else {

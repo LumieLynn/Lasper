@@ -44,6 +44,7 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let nspawn = exec_ctx.nspawn.clone();
             let systemd_unit = exec_ctx.systemd_unit.clone();
             let managed_storage = exec_ctx.managed_storage.clone();
+            let bootstrap = exec_ctx.bootstrap.clone();
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(
                 provision,
@@ -51,6 +52,7 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 nspawn,
                 systemd_unit,
                 managed_storage,
+                bootstrap,
                 cli_runner,
             );
             let name = built.cfg.name.clone();

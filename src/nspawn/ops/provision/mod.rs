@@ -1,7 +1,10 @@
 //! Deployment trait and orchestrator.
 
 pub mod backend;
+pub(crate) mod bootstrap_operation;
 pub mod builders;
+
+pub use bootstrap_operation::BootstrapStore;
 
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;

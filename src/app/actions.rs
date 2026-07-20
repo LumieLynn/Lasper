@@ -111,8 +111,17 @@ impl App {
     }
 
     pub fn set_status(&mut self, msg: String, level: crate::ui::StatusLevel) {
+        self.set_status_for(msg, level, Duration::from_secs(4));
+    }
+
+    pub fn set_status_for(
+        &mut self,
+        msg: String,
+        level: crate::ui::StatusLevel,
+        duration: Duration,
+    ) {
         self.ui.status_message = Some((msg, level));
-        self.ui.status_expiry = Some(Instant::now() + Duration::from_secs(4));
+        self.ui.status_expiry = Some(Instant::now() + duration);
     }
 
     pub fn select_next(&mut self) {

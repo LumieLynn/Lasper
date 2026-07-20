@@ -26,11 +26,8 @@ pub(crate) async fn setup_wayland_shell_env(
     let display = shell_single_quote(host_display);
     let script = format!(
         r#"
-export XDG_RUNTIME_DIR=/run/user/$(id -u)
-export WAYLAND_DISPLAY=wayland-socket
+export WAYLAND_DISPLAY=/mnt/wayland-socket
 export DISPLAY={display}
-mkdir -p "$XDG_RUNTIME_DIR"
-ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 if [ -d /mnt/host-x11 ] && [ -d /tmp/.X11-unix ]; then
     for sock in /mnt/host-x11/*; do
         if [ -S "$sock" ]; then
@@ -46,11 +43,8 @@ fi
         let fish_path = format!("{home}/.config/fish/conf.d/wayland-env.fish");
         let fish_script = format!(
             r#"
-set -gx XDG_RUNTIME_DIR /run/user/(id -u)
-set -gx WAYLAND_DISPLAY wayland-socket
+set -gx WAYLAND_DISPLAY /mnt/wayland-socket
 set -gx DISPLAY {display}
-mkdir -p "$XDG_RUNTIME_DIR"
-ln -sf /mnt/wayland-socket "$XDG_RUNTIME_DIR/wayland-socket"
 if test -d /mnt/host-x11; and test -d /tmp/.X11-unix
     for sock in /mnt/host-x11/*
         if test -S "$sock"
@@ -243,10 +237,45 @@ mod tests {
             .0
             .iter()
             .any(|arg| arg == "/home/alice/.wayland-env"));
-        assert!(calls[0].1.is_some());
+        let env = String::from_utf8(calls[0].1.clone().unwrap()).unwrap();
+        assert!(env.contains("WAYLAND_DISPLAY=/mnt/wayland-socket"));
+        assert!(!env.contains("XDG_RUNTIME_DIR"));
+        assert!(!env.contains("mkdir -p"));
+        assert!(!env.contains("ln -sf /mnt/wayland-socket"));
         assert!(calls[1].0.iter().any(|arg| arg == "/home/alice/.zshrc"));
         assert!(calls[1].0.iter().any(|arg| arg.contains(WAYLAND_RC_MARKER)));
         assert!(calls[1].1.is_none());
+    }
+
+    #[tokio::test]
+    async fn fish_env_uses_bound_wayland_socket_without_runtime_directory_mutation() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut runner = MockRootfsProcessRunner::new();
+        let captured = calls.clone();
+        runner
+            .expect_run()
+            .times(2)
+            .returning(move |_, command, stdin| {
+                captured.lock().unwrap().push((command, stdin));
+                Ok(success_output())
+            });
+
+        setup_wayland_shell_env(
+            Path::new("/tmp/rootfs"),
+            "alice",
+            "/usr/bin/fish",
+            ":0",
+            &runner,
+        )
+        .await
+        .unwrap();
+
+        let calls = calls.lock().unwrap();
+        let fish_env = String::from_utf8(calls[1].1.clone().unwrap()).unwrap();
+        assert!(fish_env.contains("WAYLAND_DISPLAY /mnt/wayland-socket"));
+        assert!(!fish_env.contains("XDG_RUNTIME_DIR"));
+        assert!(!fish_env.contains("mkdir -p"));
+        assert!(!fish_env.contains("ln -sf /mnt/wayland-socket"));
     }
 
     #[test]

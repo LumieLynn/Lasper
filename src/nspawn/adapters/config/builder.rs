@@ -1,32 +1,34 @@
 use crate::nspawn::adapters::config::nspawn_file::nspawn_config_content;
 use crate::nspawn::adapters::config::systemd_unit::systemd_override_content;
 use crate::nspawn::adapters::storage::{StorageBackend, StorageType};
+use crate::nspawn::models::{ArtifactSpec, BootstrapMethod, BootstrapSpec};
 use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::ops::provision::builders::{bootstrap, clone, image};
 use crate::nspawn::ops::provision::Deployer;
 
 /// The different methods available for acquiring a rootfs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SourceKind {
     Copy,
     Oci,
     Debootstrap,
     Pacstrap,
+    Dnf5,
     Pull,
     LocalFile,
+    Profile {
+        method: BootstrapMethod,
+        name: String,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct SourceConfig {
-    pub kind: SourceKind,
-    pub oci_url: String,
-    pub deboot_mirror: String,
-    pub deboot_suite: String,
-    pub bootstrap_pkgs: String,
-    pub local_path: String,
-    pub clone_source: String,
-    pub pull_url: String,
-    pub is_pull_raw: bool,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceConfig {
+    Copy { source_name: String },
+    Oci { url: String },
+    Bootstrap(BootstrapSpec),
+    Pull { url: String, is_raw: bool },
+    Artifact(ArtifactSpec),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,26 +132,20 @@ impl ContainerConfigBuilder {
             wayland_socket: passthrough.wayland_socket.clone(),
             nvidia_gpu: passthrough.nvidia_gpu,
             disk_config: storage.disk_config.clone(),
-            boot: if let Some(s) = &self.source {
-                s.kind != SourceKind::Oci
-            } else {
-                true
-            },
+            boot: !matches!(self.source, Some(SourceConfig::Oci { .. })),
         };
 
-        if let Some(source) = &self.source {
-            if source.kind == SourceKind::Copy {
-                let mut content = format!(
-                    " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n",
-                    source.clone_source, basic.name
-                );
-                content.push_str(" All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.");
-                return ContainerConfigWithPreview {
-                    cfg,
-                    preview: content,
-                    nvidia_profile: passthrough.nvidia_profile.clone(),
-                };
-            }
+        if let Some(SourceConfig::Copy { source_name }) = &self.source {
+            let mut content = format!(
+                " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n",
+                source_name, basic.name
+            );
+            content.push_str(" All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.");
+            return ContainerConfigWithPreview {
+                cfg,
+                preview: content,
+                nvidia_profile: passthrough.nvidia_profile.clone(),
+            };
         }
 
         let mut content = format!(" [DEPLOYMENT PREVIEW — {}]\n\n", basic.name);
@@ -184,6 +180,7 @@ impl ContainerConfigBuilder {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn get_deployer_and_storage(
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
@@ -191,6 +188,7 @@ impl ContainerConfigBuilder {
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
+        bootstrap: crate::nspawn::ops::provision::BootstrapStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
@@ -222,54 +220,38 @@ impl ContainerConfigBuilder {
                 )) as Box<dyn StorageBackend>,
             };
 
-        let source = self.source.as_ref().cloned().unwrap_or(SourceConfig {
-            kind: SourceKind::Oci,
-            oci_url: String::new(),
-            deboot_mirror: String::new(),
-            deboot_suite: String::new(),
-            bootstrap_pkgs: String::new(),
-            local_path: String::new(),
-            clone_source: String::new(),
-            pull_url: String::new(),
-            is_pull_raw: false,
-        });
+        let source = self
+            .source
+            .as_ref()
+            .cloned()
+            .unwrap_or(SourceConfig::Oci { url: String::new() });
 
-        let deployer: Box<dyn Deployer> = match source.kind {
-            SourceKind::Copy => Box::new(clone::CloneDeployer {
-                source_name: source.clone_source.clone(),
+        let deployer: Box<dyn Deployer> = match source {
+            SourceConfig::Copy { source_name } => Box::new(clone::CloneDeployer {
+                source_name,
                 provision: provision.clone(),
                 nspawn,
                 systemd_unit,
             }) as Box<dyn Deployer>,
-            SourceKind::Oci => Box::new(image::OciDeployer {
-                url: source.oci_url.clone(),
+            SourceConfig::Oci { url } => Box::new(image::OciDeployer {
+                url,
                 cmd_runner: cmd_runner.clone(),
                 io: io.clone(),
             }) as Box<dyn Deployer>,
-            SourceKind::LocalFile => Box::new(image::DiskImageDeployer {
-                path: source.local_path.clone(),
+            SourceConfig::Artifact(artifact) => Box::new(image::DiskImageDeployer {
+                path: artifact.path,
+                format: artifact.format,
                 cmd_runner: cmd_runner.clone(),
             }) as Box<dyn Deployer>,
-            SourceKind::Pull => Box::new(image::NetworkImageDeployer {
-                url: source.pull_url.clone(),
-                is_raw: source.is_pull_raw,
+            SourceConfig::Pull { url, is_raw } => Box::new(image::NetworkImageDeployer {
+                url,
+                is_raw,
                 cmd_runner: cmd_runner.clone(),
                 io: io.clone(),
             }) as Box<dyn Deployer>,
-            SourceKind::Debootstrap => Box::new(bootstrap::DebootstrapDeployer {
-                mirror: source.deboot_mirror.clone(),
-                suite: if source.deboot_suite.is_empty() {
-                    "bookworm".to_string()
-                } else {
-                    source.deboot_suite.clone()
-                },
-                packages: source.bootstrap_pkgs.clone(),
-                cmd_runner: cmd_runner.clone(),
-            }) as Box<dyn Deployer>,
-            SourceKind::Pacstrap => Box::new(bootstrap::PacstrapDeployer {
-                packages: source.bootstrap_pkgs.clone(),
-                cmd_runner: cmd_runner.clone(),
-            }) as Box<dyn Deployer>,
+            SourceConfig::Bootstrap(spec) => {
+                Box::new(bootstrap::BootstrapDeployer { spec, bootstrap }) as Box<dyn Deployer>
+            }
         };
 
         (deployer, storage)
@@ -300,16 +282,8 @@ mod tests {
     #[allow(clippy::field_reassign_with_default)]
     fn test_build_config_oci_disables_boot() {
         let mut builder = ContainerConfigBuilder::default();
-        builder.source = Some(SourceConfig {
-            kind: SourceKind::Oci,
-            oci_url: "ubuntu".to_string(),
-            deboot_mirror: "".to_string(),
-            deboot_suite: "".to_string(),
-            bootstrap_pkgs: "".to_string(),
-            local_path: "".to_string(),
-            clone_source: "".to_string(),
-            pull_url: "".to_string(),
-            is_pull_raw: false,
+        builder.source = Some(SourceConfig::Oci {
+            url: "ubuntu".to_string(),
         });
         let result = builder.build_config(None);
         assert!(!result.cfg.boot);

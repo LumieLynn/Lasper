@@ -4,6 +4,9 @@ pub use crate::nspawn::adapters::config::builder::{
 };
 use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
 use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::models::{
+    ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
+};
 use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
@@ -13,48 +16,200 @@ use std::sync::{atomic::AtomicBool, Arc};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ConfiguredSourceProfile {
+    pub method: BootstrapMethod,
+    pub name: String,
+    pub source: RootfsSourceSpec,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct SourceState {
     pub kind: SourceKind,
     pub oci_url: String,
     pub deboot_mirror: String,
     pub deboot_suite: String,
-    pub bootstrap_pkgs: String,
+    pub deboot_pkgs: String,
+    pub pacstrap_pkgs: String,
+    pub dnf_releasever: String,
+    pub dnf_pkgs: String,
     pub local_path: String,
     pub clone_source: String,
     pub pull_url: String,
     pub is_pull_raw: bool,
     pub copy_idx: usize,
+    pub profiles: Vec<ConfiguredSourceProfile>,
+    pub default_profiles: Vec<ConfiguredSourceProfile>,
 }
 
 impl SourceState {
     pub fn extract_config(&self) -> SourceConfig {
-        SourceConfig {
-            kind: self.kind,
-            oci_url: self.oci_url.clone(),
-            deboot_mirror: self.deboot_mirror.clone(),
-            deboot_suite: self.deboot_suite.clone(),
-            bootstrap_pkgs: self.bootstrap_pkgs.clone(),
-            local_path: self.local_path.clone(),
-            clone_source: self.clone_source.clone(),
-            pull_url: self.pull_url.clone(),
-            is_pull_raw: self.is_pull_raw,
+        match &self.kind {
+            SourceKind::Copy => SourceConfig::Copy {
+                source_name: self.clone_source.clone(),
+            },
+            SourceKind::Oci => SourceConfig::Oci {
+                url: self.oci_url.clone(),
+            },
+            SourceKind::Debootstrap => {
+                let mut spec = self
+                    .default_source(BootstrapMethod::Debootstrap)
+                    .and_then(|source| match source {
+                        RootfsSourceSpec::Debootstrap(spec) => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                spec.suite = self.deboot_suite.trim().into();
+                spec.mirror = nonempty(&self.deboot_mirror);
+                spec.packages = split_packages(&self.deboot_pkgs);
+                SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec))
+            }
+            SourceKind::Pacstrap => {
+                let mut spec = self
+                    .default_source(BootstrapMethod::Pacstrap)
+                    .and_then(|source| match source {
+                        RootfsSourceSpec::Pacstrap(spec) => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                spec.packages = split_packages(&self.pacstrap_pkgs);
+                SourceConfig::Bootstrap(BootstrapSpec::Pacstrap(spec))
+            }
+            SourceKind::Dnf5 => {
+                let mut spec = self
+                    .default_source(BootstrapMethod::Dnf5)
+                    .and_then(|source| match source {
+                        RootfsSourceSpec::Dnf5(spec) => Some(spec.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                spec.releasever = self.dnf_releasever.trim().into();
+                spec.packages = split_packages(&self.dnf_pkgs);
+                if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Unspecified {
+                    spec.repository = crate::nspawn::models::Dnf5RepositorySource::Host;
+                }
+                SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec))
+            }
+            SourceKind::Pull => SourceConfig::Pull {
+                url: self.pull_url.clone(),
+                is_raw: self.is_pull_raw,
+            },
+            SourceKind::LocalFile => SourceConfig::Artifact(self.artifact_spec()),
+            SourceKind::Profile { method, name } => self
+                .profiles
+                .iter()
+                .find(|profile| &profile.method == method && &profile.name == name)
+                .map(|profile| source_config_from_profile(&profile.source))
+                .unwrap_or_else(|| SourceConfig::Artifact(ArtifactSpec::from_path(""))),
         }
     }
 
     pub fn is_storage_managed_externally(&self) -> bool {
-        match self.kind {
+        match &self.kind {
             SourceKind::Pull => self.is_pull_raw,
-            SourceKind::LocalFile => {
-                let p = self.local_path.to_lowercase();
-                !(p.ends_with(".tar")
-                    || p.ends_with(".tar.gz")
-                    || p.ends_with(".tar.xz")
-                    || p.ends_with(".tar.zst")
-                    || p.ends_with(".tgz"))
-            }
+            SourceKind::LocalFile => self.artifact_spec().is_external_storage(),
+            SourceKind::Profile { method, name } => self
+                .profiles
+                .iter()
+                .find(|profile| &profile.method == method && &profile.name == name)
+                .is_some_and(|profile| profile.source.is_external_storage()),
             _ => false,
         }
     }
+
+    fn default_source(&self, method: BootstrapMethod) -> Option<&RootfsSourceSpec> {
+        self.default_profiles
+            .iter()
+            .find(|profile| profile.method == method)
+            .map(|profile| &profile.source)
+    }
+
+    fn artifact_spec(&self) -> ArtifactSpec {
+        let configured = self
+            .default_source(BootstrapMethod::Artifact)
+            .and_then(|source| match source {
+                RootfsSourceSpec::Artifact(spec) => Some(spec),
+                _ => None,
+            });
+        match configured {
+            Some(spec) if spec.expanded_path() == self.local_path => {
+                let mut spec = spec.clone();
+                spec.path = self.local_path.clone();
+                spec
+            }
+            _ => ArtifactSpec::from_path(self.local_path.clone()),
+        }
+    }
+}
+
+fn split_packages(value: &str) -> Vec<String> {
+    value.split_whitespace().map(str::to_string).collect()
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn source_config_from_profile(source: &RootfsSourceSpec) -> SourceConfig {
+    match source {
+        RootfsSourceSpec::Debootstrap(spec) => {
+            SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec.clone()))
+        }
+        RootfsSourceSpec::Pacstrap(spec) => {
+            SourceConfig::Bootstrap(BootstrapSpec::Pacstrap(spec.clone()))
+        }
+        RootfsSourceSpec::Dnf5(spec) => SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec.clone())),
+        RootfsSourceSpec::Artifact(spec) => SourceConfig::Artifact(ArtifactSpec {
+            path: spec.expanded_path(),
+            format: spec.format,
+        }),
+    }
+}
+
+fn source_kind_for_method(method: BootstrapMethod) -> SourceKind {
+    match method {
+        BootstrapMethod::Debootstrap => SourceKind::Debootstrap,
+        BootstrapMethod::Pacstrap => SourceKind::Pacstrap,
+        BootstrapMethod::Dnf5 => SourceKind::Dnf5,
+        BootstrapMethod::Artifact => SourceKind::LocalFile,
+    }
+}
+
+fn configured_default_source_kind(
+    profiles: &[ConfiguredSourceProfile],
+    default_method: Option<BootstrapMethod>,
+    default_profile: Option<String>,
+) -> SourceKind {
+    let Some(method) = default_method else {
+        return SourceKind::Copy;
+    };
+    let Some(name) = default_profile else {
+        return source_kind_for_method(method);
+    };
+    if profiles
+        .iter()
+        .any(|profile| profile.method == method && profile.name == name)
+    {
+        return SourceKind::Profile { method, name };
+    }
+    if name != DEFAULT_BOOTSTRAP_PROFILE {
+        log::warn!(
+            "Bootstrap default profile '{}' is missing or invalid for {:?}; using the built-in method",
+            name,
+            method
+        );
+    }
+    source_kind_for_method(method)
+}
+
+fn method_default(
+    defaults: &[ConfiguredSourceProfile],
+    method: BootstrapMethod,
+) -> Option<&RootfsSourceSpec> {
+    defaults
+        .iter()
+        .find(|profile| profile.method == method)
+        .map(|profile| &profile.source)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -319,6 +474,7 @@ impl WizardContext {
         entries: Vec<ContainerEntry>,
         permission_level: PermissionLevel,
         exec_ctx: Arc<ExecutionContext>,
+        config: Arc<crate::config::AppConfig>,
     ) -> Self {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
             .await
@@ -331,18 +487,51 @@ impl WizardContext {
         let discovered_gpus = vec![];
         let nvidia_available_devices = vec!["all".to_string()];
         let active_nvidia_categories = vec![];
+        let (profiles, default_profiles, default_method, default_profile) =
+            Self::configured_profiles(&config);
+        let default_kind =
+            configured_default_source_kind(&profiles, default_method, default_profile);
+        let deboot_prefill = method_default(&default_profiles, BootstrapMethod::Debootstrap)
+            .and_then(|source| match source {
+                RootfsSourceSpec::Debootstrap(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let pacstrap_prefill = method_default(&default_profiles, BootstrapMethod::Pacstrap)
+            .and_then(|source| match source {
+                RootfsSourceSpec::Pacstrap(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let dnf_prefill = method_default(&default_profiles, BootstrapMethod::Dnf5)
+            .and_then(|source| match source {
+                RootfsSourceSpec::Dnf5(spec) => Some(spec.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let artifact_prefill = method_default(&default_profiles, BootstrapMethod::Artifact)
+            .and_then(|source| match source {
+                RootfsSourceSpec::Artifact(spec) => Some(spec.expanded_path()),
+                _ => None,
+            })
+            .unwrap_or_default();
         Self {
             source: SourceState {
-                kind: SourceKind::Copy,
+                kind: default_kind,
                 oci_url: "".to_string(),
-                deboot_mirror: "".to_string(),
-                deboot_suite: "".to_string(),
-                bootstrap_pkgs: "".to_string(),
-                local_path: "".to_string(),
+                deboot_mirror: deboot_prefill.mirror.unwrap_or_default(),
+                deboot_suite: deboot_prefill.suite,
+                deboot_pkgs: deboot_prefill.packages.join(" "),
+                pacstrap_pkgs: pacstrap_prefill.packages.join(" "),
+                dnf_releasever: dnf_prefill.releasever,
+                dnf_pkgs: dnf_prefill.packages.join(" "),
+                local_path: artifact_prefill,
                 clone_source: entries.first().map(|e| e.name.clone()).unwrap_or_default(),
                 pull_url: "".to_string(),
                 is_pull_raw: false,
                 copy_idx: 0,
+                profiles,
+                default_profiles,
             },
             basic: BasicState {
                 name: "".to_string(),
@@ -445,6 +634,57 @@ impl WizardContext {
         self.build_config().preview
     }
 
+    fn configured_profiles(
+        config: &crate::config::AppConfig,
+    ) -> (
+        Vec<ConfiguredSourceProfile>,
+        Vec<ConfiguredSourceProfile>,
+        Option<BootstrapMethod>,
+        Option<String>,
+    ) {
+        let resolved = config.bootstrap.resolve();
+        let mut profiles = Vec::new();
+        let mut default_profiles = Vec::new();
+        for profile in resolved.profiles {
+            let crate::config::ResolvedBootstrapProfile {
+                method,
+                name,
+                source,
+            } = profile;
+            if name.trim().is_empty() || name.chars().any(char::is_control) {
+                log::warn!("Ignoring bootstrap profile with invalid name");
+                continue;
+            }
+            let is_default = name == DEFAULT_BOOTSTRAP_PROFILE;
+            let validation = if is_default {
+                source.validate_default_preset()
+            } else {
+                source.validate()
+            };
+            if let Err(error) = validation {
+                log::warn!("Ignoring invalid bootstrap profile '{}': {}", name, error);
+                continue;
+            }
+            let target = ConfiguredSourceProfile {
+                method,
+                name,
+                source,
+            };
+            if is_default {
+                default_profiles.push(target);
+            } else {
+                profiles.push(target);
+            }
+        }
+        (
+            profiles,
+            default_profiles,
+            resolved.default_method,
+            resolved.default_profile,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn get_deployer_and_storage(
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
@@ -452,6 +692,7 @@ impl WizardContext {
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
+        bootstrap: crate::nspawn::ops::provision::BootstrapStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder().get_deployer_and_storage(
@@ -460,6 +701,7 @@ impl WizardContext {
             nspawn,
             systemd_unit,
             managed_storage,
+            bootstrap,
             cmd_runner,
         )
     }
@@ -513,6 +755,26 @@ impl WizardContext {
 mod tests {
     use super::*;
 
+    fn test_source_state() -> SourceState {
+        SourceState {
+            kind: SourceKind::Copy,
+            oci_url: "".into(),
+            deboot_mirror: "".into(),
+            deboot_suite: "".into(),
+            deboot_pkgs: "".into(),
+            pacstrap_pkgs: "".into(),
+            dnf_releasever: "".into(),
+            dnf_pkgs: "".into(),
+            local_path: "".into(),
+            clone_source: "".into(),
+            pull_url: "".into(),
+            is_pull_raw: false,
+            copy_idx: 0,
+            profiles: vec![],
+            default_profiles: vec![],
+        }
+    }
+
     #[test]
     fn test_network_state_mode_mapping() {
         let mut state = NetworkState {
@@ -537,18 +799,9 @@ mod tests {
 
     #[test]
     fn test_source_state_externally_managed() {
-        let mut state = SourceState {
-            kind: SourceKind::Pull,
-            oci_url: "".into(),
-            deboot_mirror: "".into(),
-            deboot_suite: "".into(),
-            bootstrap_pkgs: "".into(),
-            local_path: "".into(),
-            clone_source: "".into(),
-            pull_url: "".into(),
-            is_pull_raw: true,
-            copy_idx: 0,
-        };
+        let mut state = test_source_state();
+        state.kind = SourceKind::Pull;
+        state.is_pull_raw = true;
         assert!(state.is_storage_managed_externally());
 
         state.kind = SourceKind::LocalFile;
@@ -557,6 +810,125 @@ mod tests {
 
         state.local_path = "test.tar.gz".into();
         assert!(!state.is_storage_managed_externally());
+    }
+
+    #[test]
+    fn bootstrap_default_methods_select_builtin_wizard_sources() {
+        assert_eq!(
+            source_kind_for_method(BootstrapMethod::Debootstrap),
+            SourceKind::Debootstrap
+        );
+        assert_eq!(
+            source_kind_for_method(BootstrapMethod::Pacstrap),
+            SourceKind::Pacstrap
+        );
+        assert_eq!(
+            source_kind_for_method(BootstrapMethod::Dnf5),
+            SourceKind::Dnf5
+        );
+        assert_eq!(
+            source_kind_for_method(BootstrapMethod::Artifact),
+            SourceKind::LocalFile
+        );
+    }
+
+    #[test]
+    fn implicit_default_profile_selects_builtin_source() {
+        assert_eq!(
+            configured_default_source_kind(
+                &[],
+                Some(BootstrapMethod::Debootstrap),
+                Some(DEFAULT_BOOTSTRAP_PROFILE.into()),
+            ),
+            SourceKind::Debootstrap
+        );
+    }
+
+    #[test]
+    fn policy_only_default_profile_is_applied_to_edited_builtin_source() {
+        let config: crate::config::AppConfig = toml::from_str(
+            r#"
+                [bootstrap]
+                default-method = "debootstrap"
+
+                [bootstrap.methods.debootstrap]
+                default-profile = "default"
+
+                [bootstrap.methods.debootstrap.profiles.default.policy]
+                release_signatures = "disabled"
+            "#,
+        )
+        .unwrap();
+        let (profiles, defaults, default_method, default_profile) =
+            WizardContext::configured_profiles(&config);
+
+        assert!(profiles.is_empty());
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(
+            configured_default_source_kind(&profiles, default_method, default_profile,),
+            SourceKind::Debootstrap
+        );
+
+        let mut state = test_source_state();
+        state.kind = SourceKind::Debootstrap;
+        state.deboot_suite = "noble".into();
+        state.deboot_pkgs = "sudo zsh".into();
+        state.default_profiles = defaults;
+        let SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec)) = state.extract_config()
+        else {
+            panic!("expected debootstrap source");
+        };
+        assert_eq!(spec.suite, "noble");
+        assert_eq!(spec.packages, ["sudo", "zsh"]);
+        assert_eq!(
+            spec.policy.release_signatures,
+            crate::nspawn::models::DebootstrapReleaseSignaturePolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn debootstrap_builtin_source_has_no_implicit_suite() {
+        let mut state = test_source_state();
+        state.kind = SourceKind::Debootstrap;
+
+        let SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec)) = state.extract_config()
+        else {
+            panic!("expected debootstrap source");
+        };
+        assert!(spec.suite.is_empty());
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn dnf5_builtin_source_uses_host_repository_without_wizard_state() {
+        let mut state = test_source_state();
+        state.kind = SourceKind::Dnf5;
+        state.dnf_releasever = "43".into();
+        state.dnf_pkgs = "systemd".into();
+
+        let SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec)) = state.extract_config() else {
+            panic!("expected dnf5 source");
+        };
+        assert_eq!(
+            spec.repository,
+            crate::nspawn::models::Dnf5RepositorySource::Host
+        );
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn incomplete_named_profile_is_not_exposed_as_a_source() {
+        let config: crate::config::AppConfig = toml::from_str(
+            r#"
+                [bootstrap.methods.dnf5.profiles.incomplete]
+                releasever = "43"
+            "#,
+        )
+        .unwrap();
+
+        let (profiles, defaults, _, _) = WizardContext::configured_profiles(&config);
+        assert!(profiles.is_empty());
+        assert!(defaults.is_empty());
     }
 
     #[test]
