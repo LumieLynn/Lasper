@@ -87,8 +87,8 @@ impl DefaultPermissionManager {
         self
     }
 
-    pub fn wants_elevation(want_elevation_flag: bool, settings: &Option<AppSettings>) -> bool {
-        want_elevation_flag || settings.as_ref().map(|s| s.elevate).unwrap_or(false)
+    pub fn wants_elevation(want_elevation_flag: bool, settings: &AppSettings) -> bool {
+        want_elevation_flag || settings.elevate
     }
 }
 
@@ -112,25 +112,25 @@ mod tests {
 
     #[test]
     fn test_wants_elevation_flag_wins() {
-        let settings = Some(AppSettings {
+        let settings = AppSettings {
             elevate: false,
             ..Default::default()
-        });
+        };
         assert!(DefaultPermissionManager::wants_elevation(true, &settings));
     }
 
     #[test]
     fn test_wants_elevation_config() {
-        let settings = Some(AppSettings {
+        let settings = AppSettings {
             elevate: true,
             ..Default::default()
-        });
+        };
         assert!(DefaultPermissionManager::wants_elevation(false, &settings));
     }
 
     #[test]
     fn test_wants_elevation_neither() {
-        let settings: Option<AppSettings> = None;
+        let settings = AppSettings::default();
         assert!(!DefaultPermissionManager::wants_elevation(false, &settings));
     }
 

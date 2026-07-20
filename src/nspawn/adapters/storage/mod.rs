@@ -2,6 +2,9 @@
 
 pub mod backends;
 pub mod detect;
+pub(crate) mod image_ops;
+pub mod store;
+pub(crate) mod subvolume_ops;
 
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{DiskImageConfig, DiskImageSource};
@@ -11,6 +14,7 @@ use std::path::PathBuf;
 pub use backends::directory::DirectoryBackend;
 pub use backends::image::DiskImageBackend;
 pub use backends::subvolume::SubvolumeBackend;
+pub use store::{ImageMountSource, ManagedImageKind, ManagedStorageStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum StorageType {
@@ -23,7 +27,7 @@ impl StorageType {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Directory => "Directory",
-            Self::Subvolume => "Subvolume (Btrfs/Generic)",
+            Self::Subvolume => "Btrfs Subvolume",
             Self::DiskImage => "Disk Image (Raw/Block)",
         }
     }
@@ -31,17 +35,7 @@ impl StorageType {
     pub fn get_path(&self, name: &str) -> PathBuf {
         match self {
             Self::Directory | Self::Subvolume => crate::paths::machine_root(name),
-            Self::DiskImage => {
-                // Only raw disk images are supported by systemd-nspawn
-                let base = crate::paths::machine_root(name);
-                for ext in ["raw", "img"] {
-                    let p = base.with_extension(ext);
-                    if p.exists() {
-                        return p;
-                    }
-                }
-                base.with_extension("raw") // Default to .raw for new
-            }
+            Self::DiskImage => crate::paths::machine_raw_image(name),
         }
     }
 }
@@ -99,22 +93,31 @@ fn into_backend<T: StorageBackend + 'static>(backend: T) -> Box<dyn StorageBacke
 
 #[allow(dead_code)] // mount/unmount paths removed; kept for future storage-aware operations
 /// Factory function to get the appropriate storage backend for an existing machine.
-pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
+pub async fn get_storage_backend_for(
+    name: &str,
+    managed_storage: ManagedStorageStore,
+) -> Box<dyn StorageBackend> {
     let base = crate::paths::machine_root(name);
 
     // 1. Check for raw disk image extensions (only raw is supported by systemd-nspawn)
-    let extensions = ["raw", "img", "iso"];
-    for ext in extensions {
+    let extensions = [
+        ("raw", ManagedImageKind::Raw),
+        ("img", ManagedImageKind::LegacyImg),
+    ];
+    for (ext, kind) in extensions {
         let path = base.with_extension(ext);
         if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-            return into_backend(DiskImageBackend {
-                config: DiskImageConfig {
+            return into_backend(DiskImageBackend::existing_managed(
+                DiskImageConfig {
                     source: DiskImageSource::ImportExisting {
                         path: path.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
+                    root_partition: None,
                 },
-            });
+                kind,
+                managed_storage.clone(),
+            ));
         }
     }
 
@@ -123,22 +126,38 @@ pub async fn get_storage_backend_for(name: &str) -> Box<dyn StorageBackend> {
     if let Ok(meta) = tokio::fs::metadata(&block_dev).await {
         use std::os::unix::fs::FileTypeExt;
         if meta.file_type().is_block_device() {
-            return into_backend(DiskImageBackend {
-                config: DiskImageConfig {
+            return into_backend(DiskImageBackend::external(
+                DiskImageConfig {
                     source: DiskImageSource::ImportExisting {
                         path: block_dev.to_string_lossy().to_string(),
                     },
                     use_partition_table: false,
+                    root_partition: None,
                 },
-            });
+                block_dev,
+                managed_storage.clone(),
+            ));
         }
     }
 
-    // 3. Check if it's a subvolume (Btrfs subvolume or ZFS dataset)
+    // 3. Check if it's a Btrfs subvolume
     if detect::is_subvolume(&base).await {
-        return into_backend(SubvolumeBackend);
+        return into_backend(SubvolumeBackend::new(managed_storage.clone()));
     }
 
     // 4. Default to DirectoryBackend
-    into_backend(DirectoryBackend)
+    into_backend(DirectoryBackend::new(managed_storage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_disk_image_paths_are_canonical_raw() {
+        assert_eq!(
+            StorageType::DiskImage.get_path("test"),
+            crate::paths::machine_raw_image("test")
+        );
+    }
 }

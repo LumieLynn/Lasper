@@ -1,35 +1,67 @@
-## FAQs
+# FAQ
 
-**Q: What is systemd-nspawn?**  
-A: `systemd-nspawn` is a lightweight container engine that uses Linux namespaces and control groups to run an entire operating system or individual applications in an isolated environment. Unlike Docker, it is primarily designed for "system containers" that behave like lightweight virtual machines. For more details, see the [official documentation](https://www.freedesktop.org/software/systemd/man/latest/systemd-nspawn.html).
+## What is `systemd-nspawn`?
 
-**Q: Why I can't creat containers via bootstraps?** 
-A: Ensure that you've installed the correct keyring for your distribution. For example, creating an Arch Linux container needs to install `archlinux-keyring` package. It's the same as creating a container via `debootstrap` on Debian/Ubuntu.
+`systemd-nspawn` is a systemd container tool for running system containers. It is closer to a lightweight VM-style operating-system container than to a Docker application container. See the upstream `systemd-nspawn(1)` documentation for the complete behavior.
 
-**Q: How should I remove the container?**
-A: Press `D` in the container list to delete a stopped container via the confirmation dialog. This removes the machine through systemd/machinectl and then asks Lasper to clean up the `.nspawn` file, its lock file, the `systemd-nspawn@<name>.service.d` override directory, and Lasper's NVIDIA state file. If you delete the machine manually with `sudo machinectl remove <container_name>`, those Lasper-managed host-side files may remain and may need manual cleanup.
+## Is Lasper a Docker or Podman replacement?
 
-**Q: Why can't the container created from an OCI image start?**  
-A: See [CAVEATS.md](CAVEATS.md) for details. In containers created by lasper via OCI images, it defaultly sets `boot=no` due to the lack of init program and systembus in OCI images. Setting passwords and users may fail when deploying due to some permission error. You can try to start the container manually with `sudo systemd-nspawn -D /var/lib/machines/<container_name>` and install a proper init program like systemd, and a systembus daemon like dbus. After doing these, don't forget to set `boot=yes` in your `.nspawn` config if you want to use the container with `machinectl`.
+No. Lasper targets `systemd-nspawn` system containers and native systemd resources. OCI support exists, but it is experimental and currently behaves like rootfs acquisition, not a full OCI runtime.
 
-**Q: Under veth or bridge mode, why does my container have no network?**  
-A: When configuring containers in these two modes, lasper enables systemd's built-in `systemd-networkd` and `systemd-resolved` to manage networking in the container. Simply enable both services on your host, and systemd will automatically configure the container's network and `/etc/resolv.conf`. Enabling them does not conflict with NetworkManager, but for ufw and firewalld users, please refer to the relevant documentation for more details. 
+## Should I run `lasper`, `lasper -e`, or `sudo lasper`?
 
-If you're desktop users, `systemd-networkd-wait-online.service` may slow down your boot time. You can disable it by running `sudo systemctl disable systemd-networkd-wait-online.service`, but don't mask it, or it will fail to automatically set up the NAT rules for your container.
+Prefer `lasper -e` for normal privileged management. It keeps the TUI unprivileged and starts a dedicated root daemon for privileged operations.
 
-If you don't plan to use `systemd-networkd` to manage your container's network, you may need to manually sets the `iptables` rules to enable NAT for your container. For example, you can use the following commands:
-```bash
-sudo iptables -t nat -A POSTROUTING -s <container_ip> -o <host_interface> -j MASQUERADE
-```
+Running plain `lasper` uses your normal user permissions and the host's systemd/polkit policy. Running `sudo lasper` is supported, but it runs the whole interface as root and has a larger attack surface.
 
-**Q: Can lasper run on non-systemd init systems?**  
-A: While it is possible to run `systemd-nspawn` containers on non-systemd init systems, you may attempt to use lasper after ensuring compatibility between `systemd-nspawn` and your init system. Note that this scenario has not been tested; use at your own risk.
+## Does each Lasper session start its own elevated daemon?
 
-**Q: Can I specify a custom container directory?**  
-A: Not yet. In current version, the container directory is hardcoded to `/var/lib/machines/<container_name>`. It's recommended that you add a symlink of your container's rootfs here. Future plans may include adding customized container directory via config file.
+Yes. Each `lasper -e` process starts its own daemon. Two shells owned by the same user get two independent daemons, and different users also get independent daemons. There is no system-wide daemon singleton.
 
-**Q: Can I specify a bootstrap installer other than `pacstrap` or `debootstrap`?**  
-A: Not yet. Future plans include supporting more bootstrap tools and custom installation scripts.
+## Why can't I create containers with bootstrap?
 
-**Q: Why can I start a program on Wayland, but not on X11?**
-A: Lasper passes both Wayland and X11 sockets directly into the container. By default, socket bind mounts use an `:idmap` suffix and `PrivateUsers` is left at systemd's default (`pick`). This remaps UIDs inside the container's user namespace, but the X server on the host checks the real UID — causing an authorization mismatch. Setting `PrivateUsers=no` resolves this (remember to change the suffix to `:noidmap` or just delete it). Be aware that disabling PrivateUsers weakens container isolation; make sure you understand the security trade-off. Alternatively, running a nested Wayland desktop inside the container sidesteps the X11 auth problem entirely.
+Check that the required bootstrap tool and distribution keyring are installed. For example, Arch bootstrap requires `pacstrap` and `archlinux-keyring`; Debian/Ubuntu bootstrap requires `debootstrap` and the appropriate archive keyring.
+
+Also check the deployment log. Some setup warnings, such as failure to enable `systemd-networkd` or `systemd-resolved` inside a minimal rootfs, may not abort the whole deployment.
+
+## How do I remove a container?
+
+Select a stopped container and press `D`. Lasper asks for confirmation, removes the machine through systemd/machinectl, and then cleans Lasper-managed host-side files such as the `.nspawn` file, its lock files, service override directory, and NVIDIA state file.
+
+If you remove a machine manually with `sudo machinectl remove <name>`, Lasper-managed configuration files may remain and may need manual cleanup.
+
+## Why can't an OCI-created container start?
+
+Most OCI images do not contain a bootable systemd userspace. Lasper defaults OCI-created containers to `Boot=no` for that reason.
+
+You can start the rootfs manually with `systemd-nspawn -D /var/lib/machines/<name>` for debugging. To make it boot with `machinectl`, install a real init system and system bus inside the container, then intentionally set `Boot=yes` in the `.nspawn` configuration.
+
+## Why does veth or bridge networking not work?
+
+Check both the container and host:
+
+- the container should have suitable network services, commonly `systemd-networkd` and `systemd-resolved`;
+- the host firewall/NAT rules must allow the traffic;
+- native systemd tools such as `networkctl`, `machinectl status <name>`, and `journalctl -M <name>` usually show the real failure.
+
+Lasper's setup tries to help, but networking behavior still depends on your host distribution and firewall.
+
+## Can Lasper run on non-systemd init systems?
+
+This is not a supported target. `systemd-nspawn` itself can sometimes be used outside a full systemd host, but Lasper relies on systemd services, DBus APIs, and `machinectl` behavior.
+
+## Can I use a custom container directory?
+
+Not as a first-class setting yet. Lasper currently assumes the systemd-machined image locations, primarily `/var/lib/machines/<name>` and `/var/lib/machines/<name>.raw`.
+
+Native systemd-compatible symlinks may work for advanced users, but custom storage roots are not a stable product contract yet.
+
+## Can I use custom post-install scripts?
+
+Not as privileged root hooks. General-purpose privileged hooks conflict with the daemon security model. Future setup customization should be represented as typed provisioning operations with validated arguments and clear audit output.
+
+## Why does Wayland work but X11 does not?
+
+Wayland and X11 have different authorization models. Lasper can bind display sockets into the container, but UID mapping, `PrivateUsers`, and host compositor policy still matter.
+
+Disabling `PrivateUsers` may make X11 access easier, but it weakens isolation. Prefer nested Wayland or carefully reviewed display passthrough when possible.

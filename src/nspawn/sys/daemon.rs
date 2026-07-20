@@ -27,7 +27,24 @@ use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::adapters::config::store::{
     execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
 };
+use crate::nspawn::adapters::config::systemd_unit::{
+    execute_systemd_unit_operation, SystemdUnitOperation, SystemdUnitResult,
+};
+use crate::nspawn::adapters::rootfs::store::{
+    execute_rootfs_operation, RootfsOperation, RootfsResult,
+};
+use crate::nspawn::adapters::storage::store::{
+    execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
+};
 use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
+use crate::nspawn::ops::provision::bootstrap_operation::{
+    build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
+    validate_target as validate_bootstrap_target, BootstrapRequest,
+};
+use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
+use crate::nspawn::platform::nvidia::state::{
+    execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
+};
 use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
@@ -40,7 +57,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 2;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct DaemonBootstrap {
@@ -64,6 +81,12 @@ enum FdOperation {
     Login(SpawnLoginParams),
     #[serde(rename = "spawn_shell_cmd")]
     ShellCommand(SpawnShellCmdParams),
+    #[serde(rename = "spawn_bootstrap")]
+    Bootstrap(Box<SpawnBootstrapParams>),
+    #[serde(rename = "import_raw_image")]
+    ImportRawImage(ImportRawImageParams),
+    #[serde(rename = "import_tar_image")]
+    ImportTarImage(ImportTarRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -85,6 +108,25 @@ struct SpawnShellCmdParams {
     cmd_id: u64,
     program: String,
     args: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnBootstrapParams {
+    cmd_id: u64,
+    request: BootstrapRequest,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRawImageParams {
+    machine: MachineName,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportImageResponse {
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,7 +194,7 @@ impl CommandRunner for DaemonCommandRunner {
     }
 }
 
-fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
+pub(crate) fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::FromRawFd;
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
@@ -549,22 +591,6 @@ impl ElevatedDaemon {
         })
     }
 
-    pub async fn read_file(&self, path: &std::path::Path) -> crate::nspawn::errors::Result<String> {
-        let result = self
-            .rpc_call(
-                "read_file",
-                serde_json::json!({"path": path.to_string_lossy()}),
-            )
-            .await
-            .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        let content = result["content"].as_str().ok_or_else(|| {
-            crate::nspawn::errors::NspawnError::Runtime(
-                "daemon read_file: missing content field".into(),
-            )
-        })?;
-        Ok(content.to_string())
-    }
-
     pub async fn write_file(
         &self,
         path: &std::path::Path,
@@ -573,16 +599,6 @@ impl ElevatedDaemon {
         self.rpc_call(
             "write_file",
             serde_json::json!({"path": path.to_string_lossy(), "content": content}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
-    pub async fn remove_file(&self, path: &std::path::Path) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "remove_file",
-            serde_json::json!({"path": path.to_string_lossy()}),
         )
         .await
         .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
@@ -622,6 +638,47 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn systemd_unit(
+        &self,
+        operation: SystemdUnitOperation,
+    ) -> std::io::Result<SystemdUnitResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("systemd_unit", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn nvidia_state(
+        &self,
+        operation: NvidiaStateOperation,
+    ) -> std::io::Result<NvidiaStateResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("nvidia_state", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn managed_storage(
+        &self,
+        operation: ManagedStorageOperation,
+    ) -> std::io::Result<ManagedStorageResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("managed_storage", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn rootfs(&self, operation: RootfsOperation) -> std::io::Result<RootfsResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("rootfs", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -680,6 +737,59 @@ impl ElevatedDaemon {
         .await?
     }
 
+    pub(crate) async fn import_raw_image(
+        &self,
+        machine: MachineName,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        self.import_image_source(
+            FdOperation::ImportRawImage(ImportRawImageParams { machine }),
+            source,
+        )
+        .await
+    }
+
+    pub(crate) async fn import_tar_image(
+        &self,
+        request: ImportTarRequest,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        self.import_image_source(FdOperation::ImportTarImage(request), source)
+            .await
+    }
+
+    async fn import_image_source(
+        &self,
+        operation: FdOperation,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        let std_sock = self.open_fd_channel(operation).await?;
+        tokio::task::spawn_blocking(move || {
+            use std::io::BufRead;
+
+            let mut reader = std::io::BufReader::new(std_sock.try_clone()?);
+            let mut line = String::new();
+            reader.read_line(&mut line)?;
+            if line.trim() != "ready" {
+                return Err(std::io::Error::other(format!(
+                    "daemon refused image source fd: {}",
+                    line.trim()
+                )));
+            }
+
+            std_sock.send_with_fd(b"source", &[source.as_raw_fd()])?;
+            line.clear();
+            reader.read_line(&mut line)?;
+            let response: ImportImageResponse = serde_json::from_str(line.trim())
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            match response.error {
+                Some(error) => Err(std::io::Error::other(error)),
+                None => Ok(()),
+            }
+        })
+        .await?
+    }
+
     // ── Generic spawn (bootstrap / image pull / …) ──
 
     /// Allocate a unique ID for a spawned command.
@@ -705,6 +815,34 @@ impl ElevatedDaemon {
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 128];
+            let mut fds = [0i32 as RawFd; 1];
+            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
+            if fd_count > 0 {
+                Ok(fds[0])
+            } else {
+                let msg = String::from_utf8_lossy(&buf[..n]);
+                Err(std::io::Error::other(format!(
+                    "daemon error: {}",
+                    msg.trim()
+                )))
+            }
+        })
+        .await?
+    }
+
+    pub(crate) async fn spawn_bootstrap(
+        &self,
+        cmd_id: u64,
+        request: BootstrapRequest,
+    ) -> std::io::Result<RawFd> {
+        let std_sock = self
+            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+                cmd_id,
+                request,
+            })))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
             let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
             if fd_count > 0 {
@@ -986,6 +1124,127 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
+        "systemd_unit" => {
+            let operation: SystemdUnitOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid systemd_unit request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_systemd_unit_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "nvidia_state" => {
+            let operation: NvidiaStateOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid nvidia_state request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_nvidia_state_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "managed_storage" => {
+            let operation: ManagedStorageOperation =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid managed_storage request: {error}"
+                        )));
+                    }
+                };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_managed_storage_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "rootfs" => {
+            let operation: RootfsOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
+                }
+            };
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match execute_rootfs_operation(operation).await {
+                    Ok(result) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                    }
+                    Err(error) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }})
+                    }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
         "run_command" => {
             let id = request.id;
             let program = match request.params["program"].as_str() {
@@ -1021,31 +1280,6 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
-        "read_file" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::read_to_string(&path_str)
-                    .await
-                    .map_err(|e| format!("read {}: {}", path_str, e));
-                let response = match result {
-                    Ok(content) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":{"content":content}})
-                    }
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
         "write_file" => {
             let id = request.id;
             let path_str = match request.params["path"].as_str() {
@@ -1059,29 +1293,6 @@ async fn handle_request(
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "remove_file" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::remove_file(&path_str)
-                    .await
-                    .map_err(|e| format!("rm {}: {}", path_str, e));
                 let response = match result {
                     Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     Err(e) => {
@@ -1469,7 +1680,7 @@ async fn handle_fd_connection(
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
     // doesn't return EAGAIN.
-    let std_stream = match stream.into_std() {
+    let mut std_stream = match stream.into_std() {
         Ok(s) => {
             let _ = s.set_nonblocking(false);
             s
@@ -1550,6 +1761,65 @@ async fn handle_fd_connection(
             }
         }
 
+        FdOperation::Bootstrap(params) => {
+            let SpawnBootstrapParams { cmd_id, request } = *params;
+            if let Err(error) = validate_bootstrap_target(&request.target).await {
+                log::warn!("Daemon: rejected bootstrap target: {}", error);
+                let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                return;
+            }
+            let signature_style = match probe_debootstrap_signature_style_sync(&request) {
+                Ok(style) => style,
+                Err(error) => {
+                    log::warn!("Daemon: debootstrap capability probe failed: {}", error);
+                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
+            let (program, args) = match build_bootstrap_command(&request, signature_style) {
+                Ok(command) => command,
+                Err(error) => {
+                    log::warn!("Daemon: rejected bootstrap request: {}", error);
+                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
+            log::info!(
+                "[AUDIT] [Step: Bootstrap] Starting typed {} operation",
+                program
+            );
+            match crate::nspawn::sys::new_sync_command("sh")
+                .arg("-c")
+                .arg("exec \"$@\" 2>&1")
+                .arg("--")
+                .arg(&program)
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let stdout = child.stdout.take().expect("stdout piped");
+                    let raw_fd = stdout.as_raw_fd();
+                    if let Err(error) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
+                        log::error!("Daemon: send_with_fd (spawn_bootstrap) failed: {}", error);
+                    }
+                    drop(stdout);
+
+                    tokio::task::spawn_blocking(move || {
+                        let status = child.wait();
+                        if let Ok(status) = status {
+                            SPAWN_EXIT_CODES.lock().insert(cmd_id, status.into_raw());
+                        }
+                    });
+                }
+                Err(error) => {
+                    log::error!("Daemon: typed bootstrap spawn failed: {}", error);
+                    let _ = std_stream.send_with_fd(b"bootstrap spawn failed", &[]);
+                }
+            }
+        }
+
         FdOperation::ShellCommand(SpawnShellCmdParams {
             cmd_id,
             program,
@@ -1588,6 +1858,72 @@ async fn handle_fd_connection(
                 }
             }
         }
+
+        FdOperation::ImportRawImage(ImportRawImageParams { machine }) => {
+            let source = match receive_image_source(&mut std_stream) {
+                Ok(source) => source,
+                Err(error) => {
+                    send_image_import_response(&mut std_stream, Err(error));
+                    return;
+                }
+            };
+
+            let result = crate::nspawn::ops::provision::image_operation::import_raw_system_image(
+                machine, source,
+            )
+            .await
+            .map_err(|error| error.to_string());
+            send_image_import_response(&mut std_stream, result);
+        }
+
+        FdOperation::ImportTarImage(request) => {
+            let source = match receive_image_source(&mut std_stream) {
+                Ok(source) => source,
+                Err(error) => {
+                    send_image_import_response(&mut std_stream, Err(error));
+                    return;
+                }
+            };
+            let result =
+                crate::nspawn::ops::provision::image_operation::import_tar_image(request, source)
+                    .await
+                    .map_err(|error| error.to_string());
+            send_image_import_response(&mut std_stream, result);
+        }
+    }
+}
+
+fn receive_image_source(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::result::Result<std::fs::File, String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    stream
+        .write_all(b"ready\n")
+        .map_err(|error| format!("failed to acknowledge image source fd: {error}"))?;
+    let mut marker = [0u8; 16];
+    let mut fds = [0i32 as RawFd; 1];
+    match stream.recv_with_fd(&mut marker, &mut fds) {
+        Ok((_, 1)) => Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) }),
+        Ok((_, count)) => Err(format!(
+            "expected exactly one image source fd, received {count}"
+        )),
+        Err(error) => Err(format!("failed to receive image source fd: {error}")),
+    }
+}
+
+fn send_image_import_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    result: std::result::Result<(), String>,
+) {
+    use std::io::Write;
+
+    let response = ImportImageResponse {
+        error: result.err(),
+    };
+    if let Ok(line) = serde_json::to_string(&response) {
+        let _ = stream.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -1726,6 +2062,73 @@ mod tests {
             }
             _ => panic!("expected spawn_login"),
         }
+    }
+
+    #[test]
+    fn fd_request_round_trip_uses_typed_bootstrap_parameters() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+                cmd_id: 7,
+                request: BootstrapRequest {
+                    target: crate::nspawn::adapters::rootfs::RootfsTarget::Machine {
+                        machine: MachineName::new("test-machine").unwrap(),
+                    },
+                    spec: crate::nspawn::models::BootstrapSpec::Debootstrap(
+                        crate::nspawn::models::DebootstrapSpec::default(),
+                    ),
+                    include_sudo: true,
+                },
+            })),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "spawn_bootstrap");
+        assert_eq!(json["params"]["cmd_id"], 7);
+        assert_eq!(json["params"]["request"]["target"]["kind"], "machine");
+        assert_eq!(json["params"]["request"]["spec"]["provider"], "debootstrap");
+        assert!(json["params"].get("program").is_none());
+        assert!(json["params"].get("args").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(parsed.operation, FdOperation::Bootstrap(_)));
+    }
+
+    #[test]
+    fn fd_request_round_trip_for_image_import_contains_no_source_path() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::ImportRawImage(ImportRawImageParams {
+                machine: MachineName::new("test-machine").unwrap(),
+            }),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "import_raw_image");
+        assert_eq!(json["params"]["machine"], "test-machine");
+        assert!(json["params"].get("path").is_none());
+        assert!(json["params"].get("source").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            parsed.operation,
+            FdOperation::ImportRawImage(ImportRawImageParams { .. })
+        ));
+
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::ImportTarImage(ImportTarRequest {
+                target: crate::nspawn::adapters::rootfs::RootfsTarget::Machine {
+                    machine: MachineName::new("test-machine").unwrap(),
+                },
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "import_tar_image");
+        assert_eq!(json["params"]["target"]["kind"], "machine");
+        assert_eq!(json["params"]["target"]["machine"], "test-machine");
+        assert!(json["params"].get("path").is_none());
+        assert!(json["params"].get("source").is_none());
     }
 
     #[test]

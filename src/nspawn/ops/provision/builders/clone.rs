@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::ContainerConfig;
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
-use crate::nspawn::ops::provision::Deployer;
+use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent, Deployer};
 
 pub struct CloneDeployer {
     pub source_name: String,
     pub provision: std::sync::Arc<dyn ProvisionBackend>,
-    pub io: crate::nspawn::sys::ElevatedIo,
     pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
+    pub systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
 }
 
 #[async_trait]
@@ -29,33 +29,34 @@ impl Deployer for CloneDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
-        let _ = logs
-            .send(format!(
-                "Cloning container {} to {}...",
-                self.source_name, name
-            ))
-            .await;
+        send_deploy_log(
+            &logs,
+            format!("Cloning container {} to {}...", self.source_name, name),
+        )
+        .await;
 
         self.provision.clone_image(&self.source_name, name).await?;
 
         // Clone configs
         if let Err(e) = self.nspawn.clone_config(&self.source_name, name).await {
-            let _ = logs
-                .send(format!("WARNING: Failed to clone .nspawn config: {}", e))
-                .await;
+            send_deploy_log(
+                &logs,
+                format!("WARNING: Failed to clone .nspawn config: {}", e),
+            )
+            .await;
         }
-        if let Err(e) = crate::nspawn::adapters::config::systemd_unit::clone_systemd_override(
-            &self.source_name,
-            name,
-            &self.io,
-        )
-        .await
+        if let Err(e) = self
+            .systemd_unit
+            .clone_override(&self.source_name, name)
+            .await
         {
-            let _ = logs
-                .send(format!("WARNING: Failed to clone systemd override: {}", e))
-                .await;
+            send_deploy_log(
+                &logs,
+                format!("WARNING: Failed to clone systemd override: {}", e),
+            )
+            .await;
         }
 
         let _ = self.provision.reload_daemon().await;

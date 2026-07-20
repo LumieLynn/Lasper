@@ -168,20 +168,19 @@ async fn main() -> Result<()> {
         .await;
     }
 
-    // 2. Load config for settings (elevation, cli_mode, log_buffer_lines)
-    let app_settings = crate::config::load_settings();
-    if let Some(ref settings) = app_settings {
-        if !want_cli_mode {
-            want_cli_mode = settings.cli_mode;
-        }
+    // 2. Parse configuration once for settings, theme, and bootstrap profiles.
+    let loaded_config = crate::config::load_config();
+    let config_diagnostic = loaded_config.diagnostic;
+    let app_config = std::sync::Arc::new(loaded_config.config);
+    let app_settings = &app_config.settings;
+    if !want_cli_mode {
+        want_cli_mode = app_settings.cli_mode;
     }
 
     // 3. Permission manager — no full-process elevation.
     //    `-e` / `elevate = true` routes privileged work through a sudo daemon.
-    let use_sudo = crate::nspawn::ops::DefaultPermissionManager::wants_elevation(
-        want_elevation,
-        &app_settings,
-    );
+    let use_sudo =
+        crate::nspawn::ops::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
     let pm: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager> = std::sync::Arc::new(
         crate::nspawn::ops::DefaultPermissionManager::new().with_elevation(use_sudo),
     );
@@ -249,13 +248,23 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
 
     // 7. Run the application
-    let log_buffer_lines = app_settings
-        .as_ref()
-        .map(|s| s.log_buffer_lines)
-        .unwrap_or(0);
-    let result = app::App::new(pm, want_cli_mode, log_buffer_lines, exec_ctx.clone())
-        .run(&mut terminal)
-        .await;
+    let log_buffer_lines = app_settings.log_buffer_lines;
+    let mut app = app::App::new(
+        pm,
+        want_cli_mode,
+        log_buffer_lines,
+        exec_ctx.clone(),
+        app_config,
+    );
+    if let Some(diagnostic) = config_diagnostic {
+        log::warn!("{}", diagnostic.detail);
+        app.set_status_for(
+            diagnostic.summary,
+            crate::ui::StatusLevel::Warn,
+            std::time::Duration::from_secs(12),
+        );
+    }
+    let result = app.run(&mut terminal).await;
 
     log::info!("[lasper] run() completed, restoring terminal...");
 

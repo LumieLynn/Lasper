@@ -415,6 +415,7 @@ impl App {
                 tx.clone(),
                 self.permissions.level(),
                 self.data.exec_ctx.clone(),
+                self.config.clone(),
             )
             .await;
 

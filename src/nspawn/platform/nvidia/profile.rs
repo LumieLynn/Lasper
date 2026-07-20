@@ -53,13 +53,11 @@ impl NvidiaPassthroughProfile {
     pub async fn save(
         &self,
         name: &str,
-        io: &crate::nspawn::sys::ElevatedIo,
+        state_store: &crate::nspawn::platform::nvidia::NvidiaStateStore,
     ) -> crate::nspawn::errors::Result<()> {
-        let mut state = super::state::get_external_state(name, io)
-            .await?
-            .unwrap_or_default();
+        let mut state = state_store.read(name).await?.unwrap_or_default();
         state.profile = Some(self.clone());
-        super::state::save_external_state(name, &state, io).await
+        state_store.write(name, &state).await
     }
 }
 

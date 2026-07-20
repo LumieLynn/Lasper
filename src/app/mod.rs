@@ -134,6 +134,7 @@ pub struct AppData {
 /// Global application state.
 pub struct App {
     pub permissions: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager>,
+    pub config: std::sync::Arc<crate::config::AppConfig>,
     pub should_quit: bool,
     pub data: AppData,
     pub ui: AppUi,
@@ -145,6 +146,7 @@ impl App {
         cli_mode: bool,
         log_buffer_lines: usize,
         exec_ctx: std::sync::Arc<ExecutionContext>,
+        config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
         let manager = std::sync::Arc::new(DefaultManager::new(
             permissions.clone(),
@@ -153,6 +155,7 @@ impl App {
         ));
         Self {
             permissions,
+            config,
             should_quit: false,
             data: AppData {
                 entries: Vec::new(),
@@ -303,6 +306,15 @@ impl App {
                 self.set_status(msg, level);
                 self.refresh().await;
             }
+            AppEvent::ContainerActionFailed {
+                name,
+                previous_state,
+                message,
+            } => {
+                self.rollback_container_transition(&name, previous_state);
+                self.set_status(message, crate::ui::StatusLevel::Error);
+                self.refresh().await;
+            }
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
@@ -313,7 +325,7 @@ impl App {
     /// Starts the main application loop.
     pub async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         // Initialize the global theme before any rendering.
-        crate::ui::theme::init_theme(crate::ui::theme::load_theme());
+        crate::ui::theme::init_theme(crate::ui::theme::load_theme(self.config.theme.as_ref()));
 
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
@@ -448,6 +460,7 @@ mod tests {
                 crate::nspawn::ops::PermissionLevel::User,
                 None,
             )),
+            std::sync::Arc::new(crate::config::AppConfig::default()),
         )
     }
 
@@ -513,6 +526,21 @@ mod tests {
 
             assert_eq!(result[0].state, ContainerState::Running);
             assert!(app.data.transitions.is_empty());
+        }
+
+        #[test]
+        fn failed_start_rolls_back_optimistic_state_immediately() {
+            let mut app = make_app();
+            app.data.entries = vec![make_entry("test", ContainerState::Starting)];
+            app.data.transitions.insert(
+                "test".to_string(),
+                (ContainerState::Starting, Instant::now()),
+            );
+
+            app.rollback_container_transition("test", Some(ContainerState::Off));
+
+            assert_eq!(app.data.entries[0].state, ContainerState::Off);
+            assert!(!app.data.transitions.contains_key("test"));
         }
     }
 

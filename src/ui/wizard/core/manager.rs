@@ -30,8 +30,9 @@ impl Wizard {
         command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
         permission_level: crate::nspawn::ops::PermissionLevel,
         exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
+        config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
-        let mut context = WizardContext::new(entries, permission_level, exec_ctx).await;
+        let mut context = WizardContext::new(entries, permission_level, exec_ctx, config).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {

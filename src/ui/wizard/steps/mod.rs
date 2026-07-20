@@ -31,9 +31,7 @@ pub trait StepComponent: Component {
 
 pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComponent> {
     match step {
-        WizardStep::Source => Box::new(source_view::SourceStepView::new(
-            &context.source.extract_config(),
-        )),
+        WizardStep::Source => Box::new(source_view::SourceStepView::new(&context.source)),
 
         WizardStep::CopySelect => Box::new(copy_select_view::CopySelectStepView::new(
             &context.entries,
@@ -42,6 +40,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
 
         WizardStep::Basic => Box::new(basic_view::BasicStepView::new(
             &context.basic.extract_config(),
+            &context.entries,
         )),
 
         WizardStep::Storage => Box::new(storage_view::StorageStepView::new(&context.storage)),

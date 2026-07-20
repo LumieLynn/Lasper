@@ -3,6 +3,31 @@ use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode}
 use ini::Ini;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
+    path.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
+    let mut fields = vec![String::new()];
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        match character {
+            '\\' => match chars.peek().copied() {
+                Some('\\' | ':') => {
+                    fields.last_mut()?.push(chars.next()?);
+                }
+                Some(_) | None => fields.last_mut()?.push('\\'),
+            },
+            ':' => fields.push(String::new()),
+            _ => fields.last_mut()?.push(character),
+        }
+    }
+
+    let source = fields.first()?.clone();
+    let destination = fields.get(1).cloned().unwrap_or_else(|| source.clone());
+    Some((source, destination))
+}
+
 /// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
 pub struct NspawnConfig {
     #[allow(dead_code)]
@@ -31,12 +56,14 @@ impl NspawnConfig {
             Ok(c) => c,
             Err(_) => return false,
         };
-        // Check both [General] and the global (None) section for compatibility
+        // Read legacy marker locations as well as the current [Files] location.
         let enabled_msg = "X-Lasper-Nvidia-Enabled";
+        let in_files = conf.get_from(Some("Files"), enabled_msg);
         let in_general = conf.get_from(Some("General"), enabled_msg);
         let in_global = conf.get_from(None::<&str>, enabled_msg);
 
-        in_general
+        in_files
+            .or(in_general)
             .or(in_global)
             .map(|v| v.to_lowercase() == "true")
             .unwrap_or(false)
@@ -112,8 +139,9 @@ impl NspawnConfig {
         if let Ok(conf) = Ini::load_from_str(&clean_content) {
             if let Some(files_section) = conf.section(Some("Files")) {
                 for (key, value) in files_section.iter() {
-                    let host_path = value.split(':').next().unwrap_or(value);
-                    let container_path = value.split(':').nth(1).unwrap_or(value);
+                    let Some((host_path, container_path)) = parse_nspawn_bind_paths(value) else {
+                        continue;
+                    };
 
                     let is_in_binds = new_state
                         .binds
@@ -145,17 +173,18 @@ impl NspawnConfig {
             let mut block = Vec::new();
             block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
             for bind in &new_state.binds {
+                let host_path = escape_nspawn_bind_path(&bind.host_path);
+                let container_path = escape_nspawn_bind_path(&bind.container_path);
                 if bind.readonly {
                     if bind.host_path == bind.container_path {
-                        block.push(format!("BindReadOnly={}", bind.host_path));
+                        block.push(format!("BindReadOnly={host_path}"));
                     } else {
-                        block.push(format!(
-                            "BindReadOnly={}:{}",
-                            bind.host_path, bind.container_path
-                        ));
+                        block.push(format!("BindReadOnly={host_path}:{container_path}"));
                     }
+                } else if bind.host_path == bind.container_path {
+                    block.push(format!("Bind={host_path}"));
                 } else {
-                    block.push(format!("Bind={}", bind.host_path));
+                    block.push(format!("Bind={host_path}:{container_path}"));
                 }
             }
             block.push("X-Lasper-Nvidia-End=true".to_string());
@@ -214,11 +243,6 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
 ) -> Result<String> {
     spec.validate()?;
     let mut conf = Ini::new();
-
-    if spec.nvidia_gpu {
-        conf.with_section(Some("General"))
-            .set("X-Lasper-Nvidia-Enabled", "true");
-    }
 
     //[Exec]
     {
@@ -302,12 +326,16 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         || !spec.bind_mounts.is_empty()
         || spec.wayland_socket.is_some()
         || spec.graphics_acceleration
+        || spec.nvidia_gpu
         || matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host));
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
         let files = conf.section_mut(Some("Files")).unwrap();
         files.remove("__ensure_files");
+        if spec.nvidia_gpu {
+            files.append("X-Lasper-Nvidia-Enabled", "true");
+        }
 
         for dev in &spec.device_binds {
             files.append("Bind", dev.clone());
@@ -653,6 +681,8 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("X-Lasper-Nvidia-Enabled=true"));
+        assert!(content.contains("[Files]"));
+        assert!(!content.contains("[General]"));
     }
 
     #[test]
@@ -675,7 +705,7 @@ mod tests {
             binds: vec![
                 PassthroughBind {
                     host_path: "/dev/nvidia0".into(),
-                    container_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/dri/by-path/nvidia-card".into(),
                     readonly: false,
                 },
                 PassthroughBind {
@@ -691,9 +721,43 @@ mod tests {
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
         assert!(updated.contains("[Files]"));
         assert!(updated.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
-        assert!(updated.contains("Bind=/dev/nvidia0"));
+        assert!(updated.contains("Bind=/dev/nvidia0:/dev/dri/by-path/nvidia-card"));
         assert!(updated.contains("BindReadOnly=/usr/lib/libcuda.so"));
         assert!(updated.contains("X-Lasper-Nvidia-End=true"));
+    }
+
+    #[test]
+    fn nspawn_bind_codec_preserves_colons_inside_paths() {
+        let path = "/dev/dri/by-path/pci-0000:01:00.0-card";
+        assert_eq!(
+            escape_nspawn_bind_path(path),
+            r"/dev/dri/by-path/pci-0000\:01\:00.0-card"
+        );
+        assert_eq!(
+            parse_nspawn_bind_paths(
+                r"/dev/dri/card0:/dev/dri/by-path/pci-0000\:01\:00.0-card:noidmap"
+            ),
+            Some(("/dev/dri/card0".into(), path.into()))
+        );
+    }
+
+    #[test]
+    fn gpu_bind_escapes_pci_colons_in_container_destination() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/dri/card0".into(),
+                container_path: "/dev/dri/by-path/pci-0000:01:00.0-card".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content("[Files]\n".into(), &state, &[])
+                .unwrap();
+        assert!(updated.contains(r"Bind=/dev/dri/card0:/dev/dri/by-path/pci-0000\:01\:00.0-card"));
     }
 
     #[test]

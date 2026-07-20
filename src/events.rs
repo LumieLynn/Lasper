@@ -14,6 +14,12 @@ pub enum AppEvent {
     BackendResult(crate::nspawn::ops::BackendResponse),
     /// Background action execution finished.
     ActionDone(String, crate::ui::StatusLevel),
+    /// A container action failed and its optimistic UI state must be rolled back.
+    ContainerActionFailed {
+        name: String,
+        previous_state: Option<crate::nspawn::models::ContainerState>,
+        message: String,
+    },
     /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
     MetricsUpdate(String, f64, f64, f64),
     /// Request a UI redraw for the terminal.

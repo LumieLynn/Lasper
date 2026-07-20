@@ -37,39 +37,6 @@ impl ElevatedIo {
         }
     }
 
-    /// Read file content, elevating via daemon when needed.
-    /// Returns `None` when the file does not exist.
-    pub async fn read_to_string(&self, path: &Path) -> Result<Option<String>> {
-        match self.level {
-            PermissionLevel::Root | PermissionLevel::User => {
-                match tokio::fs::read_to_string(path).await {
-                    Ok(c) => Ok(Some(c)),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(NspawnError::Io(path.to_path_buf(), e)),
-                }
-            }
-            PermissionLevel::Elevated => {
-                if let Some(ref daemon) = self.daemon {
-                    match daemon.read_file(path).await {
-                        Ok(c) => Ok(Some(c)),
-                        Err(NspawnError::Io(_, ref e))
-                            if e.kind() == std::io::ErrorKind::NotFound =>
-                        {
-                            Ok(None)
-                        }
-                        Err(e) => Err(e),
-                    }
-                } else {
-                    match tokio::fs::read_to_string(path).await {
-                        Ok(c) => Ok(Some(c)),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                        Err(e) => Err(NspawnError::Io(path.to_path_buf(), e)),
-                    }
-                }
-            }
-        }
-    }
-
     /// Write `content` to `path`, elevating via daemon or `sudo tee` when needed.
     pub async fn write(&self, path: &Path, content: &str) -> Result<()> {
         match self.level {
@@ -84,25 +51,6 @@ impl ElevatedIo {
             PermissionLevel::User => Self::write_direct(path, content)
                 .await
                 .map_err(|e| deny_if_permission(e, path)),
-        }
-    }
-
-    /// Remove a file, elevating via daemon or `sudo rm` when needed.
-    pub async fn remove_file(&self, path: &Path) -> Result<()> {
-        match self.level {
-            PermissionLevel::Root => tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| NspawnError::Io(path.to_path_buf(), e)),
-            PermissionLevel::Elevated => {
-                if let Some(ref daemon) = self.daemon {
-                    daemon.remove_file(path).await
-                } else {
-                    Self::remove_sudo(path).await
-                }
-            }
-            PermissionLevel::User => tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| deny_if_permission(NspawnError::Io(path.to_path_buf(), e), path)),
         }
     }
 
@@ -201,23 +149,6 @@ impl ElevatedIo {
             return Err(NspawnError::cmd_failed(
                 "sudo tee",
                 format!("sudo tee {}", path.display()),
-                &out,
-            ));
-        }
-        Ok(())
-    }
-
-    async fn remove_sudo(path: &Path) -> Result<()> {
-        let out = crate::nspawn::sys::new_command("sudo")
-            .args(["rm", &path.to_string_lossy()])
-            .output()
-            .await
-            .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
-
-        if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "sudo rm",
-                format!("sudo rm {}", path.display()),
                 &out,
             ));
         }

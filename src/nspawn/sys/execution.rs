@@ -3,11 +3,15 @@
 //! When the program starts, [`ExecutionContext::new`] inspects the
 //! [`PermissionLevel`] and optional [`ElevatedDaemon`] to construct the
 //! correct [`CommandRunner`] and [`ElevatedIo`].  After that, consumers
-//! never need to match on the daemon again — they just use `ctx.cmd`
-//! and `ctx.io`.
+//! never need to match on the daemon again — they just use typed stores
+//! or the remaining low-level `ctx.cmd`/`ctx.io` surfaces.
 
-use crate::nspawn::adapters::config::NspawnConfigStore;
+use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
+use crate::nspawn::adapters::rootfs::RootfsStore;
+use crate::nspawn::adapters::storage::ManagedStorageStore;
+use crate::nspawn::ops::provision::{BootstrapStore, ImageImportStore};
 use crate::nspawn::ops::PermissionLevel;
+use crate::nspawn::platform::nvidia::NvidiaStateStore;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::{DaemonCommandRunner, ElevatedDaemon};
 use crate::nspawn::sys::elevated_io::ElevatedIo;
@@ -21,6 +25,12 @@ pub struct ExecutionContext {
     pub cmd: Arc<dyn CommandRunner>,
     pub io: ElevatedIo,
     pub nspawn: NspawnConfigStore,
+    pub systemd_unit: SystemdUnitStore,
+    pub rootfs: RootfsStore,
+    pub bootstrap: BootstrapStore,
+    pub image_import: ImageImportStore,
+    pub managed_storage: ManagedStorageStore,
+    pub nvidia_state: NvidiaStateStore,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
 
@@ -37,10 +47,22 @@ impl ExecutionContext {
             None => ElevatedIo::new(level),
         };
         let nspawn = NspawnConfigStore::new(daemon.clone());
+        let systemd_unit = SystemdUnitStore::new(daemon.clone());
+        let rootfs = RootfsStore::new(daemon.clone());
+        let bootstrap = BootstrapStore::new(cmd.clone(), daemon.clone());
+        let image_import = ImageImportStore::new(daemon.clone());
+        let managed_storage = ManagedStorageStore::new(daemon.clone());
+        let nvidia_state = NvidiaStateStore::new(daemon.clone());
         Self {
             cmd,
             io,
             nspawn,
+            systemd_unit,
+            rootfs,
+            bootstrap,
+            image_import,
+            managed_storage,
+            nvidia_state,
             daemon,
         }
     }
@@ -64,6 +86,12 @@ impl std::fmt::Debug for ExecutionContext {
         f.debug_struct("ExecutionContext")
             .field("io", &self.io)
             .field("nspawn", &self.nspawn)
+            .field("systemd_unit", &self.systemd_unit)
+            .field("rootfs", &self.rootfs)
+            .field("bootstrap", &"BootstrapStore")
+            .field("image_import", &"ImageImportStore")
+            .field("managed_storage", &self.managed_storage)
+            .field("nvidia_state", &self.nvidia_state)
             .field("daemon", &self.daemon)
             .finish()
     }

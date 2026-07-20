@@ -42,15 +42,28 @@ async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             ));
             let io = exec_ctx.io.clone();
             let nspawn = exec_ctx.nspawn.clone();
+            let systemd_unit = exec_ctx.systemd_unit.clone();
+            let managed_storage = exec_ctx.managed_storage.clone();
+            let bootstrap = exec_ctx.bootstrap.clone();
+            let image_import = exec_ctx.image_import.clone();
             let built = ctx.build_config();
-            let (deployer, storage) =
-                ctx.get_deployer_and_storage(provision, io, nspawn, cli_runner);
+            let (deployer, storage) = ctx.get_deployer_and_storage(
+                provision,
+                io,
+                nspawn,
+                systemd_unit,
+                managed_storage,
+                bootstrap,
+                image_import,
+                cli_runner,
+            );
             let name = built.cfg.name.clone();
             let cfg = built.cfg;
             let nvidia_profile = built.nvidia_profile;
 
             // Bridge mpsc (Deployer API) → broadcast (DeployStepView)
-            let (log_mpsc_tx, mut log_mpsc_rx) = tokio::sync::mpsc::channel::<String>(100);
+            let (log_mpsc_tx, mut log_mpsc_rx) =
+                tokio::sync::mpsc::channel::<crate::nspawn::ops::provision::DeployLogEvent>(100);
             let log_bcast_tx = ctx.deploy.log_tx.clone();
             tokio::spawn(async move {
                 while let Some(msg) = log_mpsc_rx.recv().await {

@@ -12,6 +12,62 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use tokio::io::AsyncBufReadExt;
 
+const START_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const START_CONFIRM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartObservation {
+    Started,
+    Pending(String),
+    Failed(String),
+}
+
+fn systemd_property<'a>(properties: &'a MachineProperties, key: &str) -> Option<&'a str> {
+    properties
+        .groups
+        .iter()
+        .find(|group| group.name == crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+        .and_then(|group| group.properties.get(key))
+        .map(String::as_str)
+}
+
+fn describe_start_properties(properties: &MachineProperties) -> String {
+    [
+        "ActiveState",
+        "SubState",
+        "Result",
+        "ExecMainCode",
+        "ExecMainStatus",
+        "StatusText",
+    ]
+    .into_iter()
+    .filter_map(|key| systemd_property(properties, key).map(|value| format!("{key}={value}")))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+fn observe_start(properties: &MachineProperties) -> StartObservation {
+    let active_state = systemd_property(properties, "ActiveState").unwrap_or_default();
+    let service_result = systemd_property(properties, "Result").unwrap_or_default();
+    let details = describe_start_properties(properties);
+
+    if active_state == "active" {
+        return StartObservation::Started;
+    }
+    if active_state == "failed"
+        || (!service_result.is_empty()
+            && service_result != "success"
+            && service_result != "[not set]")
+    {
+        return StartObservation::Failed(details);
+    }
+    StartObservation::Pending(details)
+}
+
+fn valid_invocation_id(value: &str) -> bool {
+    value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {
@@ -112,17 +168,13 @@ impl DefaultManager {
         let _ = self.nudge_tx.send(());
     }
 
-    fn elevated_io(&self) -> crate::nspawn::sys::ElevatedIo {
-        self.exec_ctx.io.clone()
-    }
-
     async fn _ensure_gpu_passthrough(&self, name: &str) -> Result<()> {
-        let io = self.elevated_io();
         crate::nspawn::platform::nvidia::ensure_gpu_passthrough(
             name,
-            &io,
             &self.exec_ctx.nspawn,
-            self.exec_ctx.cmd.as_ref(),
+            &self.exec_ctx.systemd_unit,
+            &self.exec_ctx.nvidia_state,
+            &self.exec_ctx.rootfs,
         )
         .await?;
         // Reload systemd after GPU surgery — always needed when device allows change.
@@ -153,6 +205,141 @@ impl DefaultManager {
             log::error!("CLI reload_daemon failed: {}", e);
             e
         })
+    }
+
+    async fn wait_for_start(&self, name: &str, backend: &dyn ContainerBackend) -> Result<()> {
+        let started_at = tokio::time::Instant::now();
+        let started_epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut last_observation = "systemd unit properties unavailable".to_string();
+        let mut last_invocation_id = None;
+
+        loop {
+            match backend.get_properties(name).await {
+                Ok(properties) => {
+                    let invocation_id = systemd_property(&properties, "InvocationID")
+                        .filter(|value| valid_invocation_id(value))
+                        .map(str::to_string);
+                    if invocation_id.is_some() {
+                        last_invocation_id = invocation_id.clone();
+                    }
+                    match observe_start(&properties) {
+                        StartObservation::Started => return Ok(()),
+                        StartObservation::Pending(details) => {
+                            if !details.is_empty() {
+                                last_observation = details;
+                            }
+                        }
+                        StartObservation::Failed(details) => {
+                            return Err(self
+                                .start_failure(
+                                    name,
+                                    &details,
+                                    invocation_id.as_deref(),
+                                    started_epoch,
+                                )
+                                .await);
+                        }
+                    }
+                }
+                Err(error) => last_observation = error.to_string(),
+            }
+
+            if started_at.elapsed() >= START_CONFIRM_TIMEOUT {
+                let details = format!(
+                    "timed out after {}s; {}",
+                    START_CONFIRM_TIMEOUT.as_secs(),
+                    last_observation
+                );
+                return Err(self
+                    .start_failure(name, &details, last_invocation_id.as_deref(), started_epoch)
+                    .await);
+            }
+            tokio::time::sleep(START_CONFIRM_INTERVAL).await;
+        }
+    }
+
+    async fn start_failure(
+        &self,
+        name: &str,
+        details: &str,
+        invocation_id: Option<&str>,
+        started_epoch: u64,
+    ) -> crate::nspawn::errors::NspawnError {
+        let unit = crate::nspawn::models::MachineName::new(name)
+            .map(|machine| machine.systemd_nspawn_unit())
+            .unwrap_or_else(|_| format!("systemd-nspawn@{name}.service"));
+        let (selector, selector_display) = if let Some(invocation_id) = invocation_id {
+            (
+                vec![format!("_SYSTEMD_INVOCATION_ID={invocation_id}")],
+                format!("_SYSTEMD_INVOCATION_ID={invocation_id}"),
+            )
+        } else {
+            (
+                vec![
+                    "-u".into(),
+                    unit.clone(),
+                    "--since".into(),
+                    format!("@{started_epoch}"),
+                ],
+                format!("-u {unit} --since @{started_epoch}"),
+            )
+        };
+        let journal_command =
+            format!("journalctl {selector_display} --priority=warning --no-pager");
+
+        let mut priority_args = selector.clone();
+        priority_args.extend([
+            "--priority=warning".into(),
+            "-n".into(),
+            "20".into(),
+            "--no-pager".into(),
+            "--quiet".into(),
+            "--output=short".into(),
+        ]);
+        let journal = self.read_journal(priority_args).await;
+        let journal = if journal.is_some() {
+            journal
+        } else {
+            let mut fallback_args = selector;
+            fallback_args.extend([
+                "-n".into(),
+                "8".into(),
+                "--no-pager".into(),
+                "--quiet".into(),
+                "--output=short".into(),
+            ]);
+            self.read_journal(fallback_args).await
+        };
+
+        if let Some(journal) = journal {
+            log::error!(
+                "Container start failed for {}: {}\nRecent {} journal:\n{}",
+                name,
+                details,
+                unit,
+                journal
+            );
+        } else {
+            log::error!("Container start failed for {}: {}", name, details);
+        }
+
+        crate::nspawn::errors::NspawnError::Runtime(format!(
+            "Container '{name}' failed to start ({details}). Inspect host logs with `{journal_command}`."
+        ))
+    }
+
+    async fn read_journal(&self, args: Vec<String>) -> Option<String> {
+        self.exec_ctx
+            .cmd
+            .run("journalctl", args)
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|output| !output.is_empty())
     }
 }
 
@@ -214,7 +401,26 @@ impl NspawnManager for DefaultManager {
 
     async fn start(&self, name: &str) -> Result<()> {
         self._ensure_gpu_passthrough(name).await?;
-        fallback_to_cli!(self, start, name)
+        let backend = if !self.cli_mode && self.dbus.is_available().await {
+            match self.dbus.start(name).await {
+                Ok(()) => self.dbus.clone(),
+                Err(error) => {
+                    let reason = Self::classify_fallback(&error);
+                    log::warn!("DBus start failed ({}), falling back to CLI", reason);
+                    self.mark_fallback(&reason);
+                    self.cli.start(name).await?;
+                    self.cli.clone()
+                }
+            }
+        } else {
+            log::debug!("DBus not available for start, using CLI");
+            self.mark_fallback("DBus not available");
+            self.cli.start(name).await?;
+            self.cli.clone()
+        };
+
+        self.nudge();
+        self.wait_for_start(name, backend.as_ref()).await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
@@ -265,15 +471,9 @@ impl NspawnManager for DefaultManager {
         result?;
 
         // systemd may or may not clean these up — an extra unlink is harmless
-        let io = self.elevated_io();
         let _ = self.exec_ctx.nspawn.remove(name).await;
-        let _ = io
-            .remove_dir_all(&std::path::PathBuf::from(format!(
-                "/etc/systemd/system/systemd-nspawn@{}.service.d",
-                name
-            )))
-            .await;
-        let _ = io.remove_file(&crate::paths::state_file(name)).await;
+        let _ = self.exec_ctx.systemd_unit.remove_overrides(name).await;
+        let _ = self.exec_ctx.nvidia_state.remove(name).await;
 
         self.nudge();
         Ok(())
@@ -550,7 +750,11 @@ impl NspawnManager for DefaultManager {
             for path in paths {
                 if path.exists() {
                     if let Err(e) = watcher.watch(&path, RecursiveMode::NonRecursive) {
-                        log::error!("Failed to watch path {}: {}", path.display(), e);
+                        log::warn!(
+                            "Filesystem watcher unavailable for {} ({}); relying on DBus events and heartbeat refresh",
+                            path.display(),
+                            e
+                        );
                     }
                 } else {
                     log::warn!("Watch path does not exist: {}", path.display());
@@ -613,6 +817,18 @@ mod tests {
             address: None,
             all_addresses: vec![],
         }
+    }
+
+    fn systemd_properties(entries: &[(&str, &str)]) -> MachineProperties {
+        let mut properties = MachineProperties::default();
+        for (key, value) in entries {
+            properties.insert(
+                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                (*key).into(),
+                (*value).into(),
+            );
+        }
+        properties
     }
 
     fn test_pm() -> std::sync::Arc<dyn crate::nspawn::ops::PermissionManager> {
@@ -726,6 +942,13 @@ mod tests {
 
         let mut cli = MockContainerBackend::new();
         cli.expect_start().returning(|_| Ok(()));
+        cli.expect_get_properties().returning(|_| {
+            Ok(systemd_properties(&[
+                ("ActiveState", "active"),
+                ("SubState", "running"),
+                ("Result", "success"),
+            ]))
+        });
 
         let mgr = DefaultManager {
             pm: test_pm(),
@@ -740,6 +963,43 @@ mod tests {
 
         mgr.start("test").await.unwrap();
         assert!(mgr.did_fallback().is_some());
+    }
+
+    #[test]
+    fn start_observation_requires_active_and_reports_service_failure() {
+        let active = systemd_properties(&[
+            ("ActiveState", "active"),
+            ("SubState", "running"),
+            ("Result", "success"),
+        ]);
+        assert_eq!(observe_start(&active), StartObservation::Started);
+
+        let failed = systemd_properties(&[
+            ("ActiveState", "failed"),
+            ("SubState", "failed"),
+            ("Result", "exit-code"),
+            ("ExecMainStatus", "1"),
+        ]);
+        assert_eq!(
+            observe_start(&failed),
+            StartObservation::Failed(
+                "ActiveState=failed, SubState=failed, Result=exit-code, ExecMainStatus=1".into()
+            )
+        );
+
+        let pending = systemd_properties(&[
+            ("ActiveState", "activating"),
+            ("SubState", "start"),
+            ("Result", "success"),
+        ]);
+        assert!(matches!(
+            observe_start(&pending),
+            StartObservation::Pending(_)
+        ));
+
+        assert!(valid_invocation_id("0123456789abcdef0123456789ABCDEF"));
+        assert!(!valid_invocation_id("[not set]"));
+        assert!(!valid_invocation_id("0123456789abcdef"));
     }
 
     // enable/disable now use DBus-first fallback

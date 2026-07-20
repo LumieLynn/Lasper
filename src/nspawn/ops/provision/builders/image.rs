@@ -1,12 +1,17 @@
 //! OCI and Disk Image deployment implementations.
 
 use async_trait::async_trait;
+use std::io::{Seek, SeekFrom};
+use std::os::unix::fs::FileExt;
+use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::{send_deploy_stream_log, Deployer};
+use crate::nspawn::ops::provision::{
+    send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent, Deployer,
+};
 use crate::nspawn::sys::{log_output, CommandRunner};
 
 pub struct OciDeployer {
@@ -22,7 +27,7 @@ impl Deployer for OciDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
         import_oci_image(
             self.cmd_runner.as_ref(),
@@ -36,26 +41,38 @@ impl Deployer for OciDeployer {
     }
 }
 
-pub struct DiskImageDeployer {
-    pub path: String,
-    pub cmd_runner: Arc<dyn CommandRunner>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageSource {
+    Local(String),
+    Remote(String),
 }
 
-impl DiskImageDeployer {
-    fn is_tarball(&self) -> bool {
-        let p = self.path.to_lowercase();
-        p.ends_with(".tar")
-            || p.ends_with(".tar.gz")
-            || p.ends_with(".tar.xz")
-            || p.ends_with(".tar.zst")
-            || p.ends_with(".tgz")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    Tar,
+    Raw,
+}
+
+impl ImageFormat {
+    pub fn from_artifact(artifact: &crate::nspawn::models::ArtifactSpec) -> Self {
+        match artifact.resolved_format() {
+            crate::nspawn::models::ArtifactFormat::Tar => Self::Tar,
+            crate::nspawn::models::ArtifactFormat::Raw => Self::Raw,
+            crate::nspawn::models::ArtifactFormat::Auto => unreachable!("format was resolved"),
+        }
     }
 }
 
+pub struct ImageDeployer {
+    pub source: ImageSource,
+    pub format: ImageFormat,
+    pub image_import: crate::nspawn::ops::provision::ImageImportStore,
+}
+
 #[async_trait]
-impl Deployer for DiskImageDeployer {
+impl Deployer for ImageDeployer {
     fn is_external_storage_managed(&self) -> bool {
-        !self.is_tarball()
+        self.format == ImageFormat::Raw
     }
 
     async fn deploy(
@@ -63,202 +80,261 @@ impl Deployer for DiskImageDeployer {
         name: &str,
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
-        _logs: tokio::sync::mpsc::Sender<String>,
+        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<()> {
-        import_disk_image(self.cmd_runner.as_ref(), &self.path, name, rootfs).await
-    }
-}
-
-pub struct NetworkImageDeployer {
-    pub url: String,
-    pub is_raw: bool,
-    pub cmd_runner: Arc<dyn CommandRunner>,
-    pub io: crate::nspawn::sys::ElevatedIo,
-}
-
-#[async_trait]
-impl Deployer for NetworkImageDeployer {
-    fn is_external_storage_managed(&self) -> bool {
-        self.is_raw
-    }
-
-    async fn deploy(
-        &self,
-        name: &str,
-        _cfg: &ContainerConfig,
-        rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<String>,
-    ) -> Result<()> {
-        let clean_url = self.url.trim();
-        let cache_dir = "/var/cache/lasper/downloads";
-        let _ = self
-            .io
-            .create_dir_all(std::path::Path::new(cache_dir))
-            .await;
-        let _ = self.io.create_dir_all(&crate::paths::machines_dir()).await;
-
-        let _ = logs
-            .send(format!("Downloading container from {}...", clean_url))
-            .await;
-        check_tool("curl")?;
-
-        if self.is_raw {
-            check_tool("bash")?;
-            let _ = logs
-                .send("Streaming and provisioning RAW disk image to cache...".into())
-                .await;
-
-            let dest = crate::paths::machine_raw_image(name);
-            let cache_dest = format!("{}/{}.raw.part", cache_dir, name);
-
-            let script = "set -o pipefail; case \"$1\" in \
-                 *.xz)  curl -# -L -f -A 'Lasper/1.0' \"$1\" | xz -d > \"$2\" ;; \
-                 *.gz)  curl -# -L -f -A 'Lasper/1.0' \"$1\" | gzip -d > \"$2\" ;; \
-                 *.zst) curl -# -L -f -A 'Lasper/1.0' \"$1\" | zstd -d > \"$2\" ;; \
-                 *.bz2) curl -# -L -f -A 'Lasper/1.0' \"$1\" | bzip2 -d > \"$2\" ;; \
-                 *)     curl -# -L -f -A 'Lasper/1.0' \"$1\" -o \"$2\" ;; \
-                 esac";
-
-            {
-                let spawned = self
-                    .cmd_runner
-                    .spawn(
-                        "bash",
-                        vec![
-                            "-c".into(),
-                            script.into(),
-                            "--".into(),
-                            clean_url.into(),
-                            cache_dest.clone(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
-                stream_spawned(spawned, logs.clone()).await?;
+        let source = acquire_image_source(&self.source, &logs).await?;
+        let source = normalize_compression(source, &logs).await?;
+        match self.format {
+            ImageFormat::Raw => {
+                send_deploy_log(&logs, "Importing typed RAW machine image...").await;
+                let machine = crate::nspawn::models::MachineName::new(name)
+                    .map_err(|error| NspawnError::Validation(error.to_string()))?;
+                self.image_import.import_raw(machine, source).await
             }
-
-            let _ = logs.send("Validating disk image integrity...".into()).await;
-            let validate = self
-                .cmd_runner
-                .run(
-                    "systemd-dissect",
-                    vec!["--validate".into(), cache_dest.clone()],
-                )
-                .await
-                .map_err(|e| NspawnError::Io(std::path::PathBuf::from("systemd-dissect"), e))?;
-            log_output("systemd-dissect", &validate);
-
-            if !validate.status.success() {
-                let _ = self.io.remove_file(std::path::Path::new(&cache_dest)).await;
-                return Err(NspawnError::DeployError(
-                    "Downloaded file is not a valid disk image.".into(),
-                ));
-            }
-
-            // Move from cache to /var/lib/machines/
-            let move_out = self
-                .cmd_runner
-                .run(
-                    "mv",
-                    vec![cache_dest.clone(), dest.to_string_lossy().to_string()],
-                )
-                .await
-                .map_err(|e| NspawnError::Io(dest.clone(), e))?;
-            log_output("mv", &move_out);
-            if !move_out.status.success() {
-                return Err(NspawnError::cmd_failed(
-                    "move downloaded disk image",
-                    format!("mv {} {}", cache_dest, dest.display()),
-                    &move_out,
-                ));
-            }
-        } else {
-            check_tool("tar")?;
-            check_tool("bash")?;
-
-            let cache_tar = format!("{}/{}.tar.part", cache_dir, name);
-            let _ = logs
-                .send("Downloading compressed tarball to cache...".into())
-                .await;
-
-            let download_script = "set -o pipefail; curl -# -L -f -A 'Lasper/1.0' \"$1\" -o \"$2\"";
-            {
-                let spawned = self
-                    .cmd_runner
-                    .spawn(
-                        "bash",
-                        vec![
-                            "-c".into(),
-                            download_script.into(),
-                            "--".into(),
-                            clean_url.into(),
-                            cache_tar.clone(),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
-                stream_spawned(spawned, logs.clone()).await?;
-            }
-
-            let _ = logs
-                .send("Extracting tarball to storage backend...".into())
-                .await;
-            let extract_out = self
-                .cmd_runner
-                .run(
-                    "tar",
-                    vec![
-                        "--numeric-owner".into(),
-                        "-pxf".into(),
-                        cache_tar.clone(),
-                        "-C".into(),
-                        rootfs.to_string_lossy().to_string(),
-                    ],
-                )
-                .await
-                .map_err(|e| NspawnError::Io(rootfs.to_path_buf(), e))?;
-            log_output("tar", &extract_out);
-
-            let _ = self.io.remove_file(std::path::Path::new(&cache_tar)).await;
-            if !extract_out.status.success() {
-                return Err(NspawnError::cmd_failed(
-                    "tar -xf",
-                    format!("tar -xf {} -C {}", cache_tar, rootfs.display()),
-                    &extract_out,
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Read stdout lines from a [`SpawnedProcess`], forward to logs, then wait
-/// for exit status.  Returns an error if the process failed.
-async fn stream_spawned(
-    mut spawned: crate::nspawn::sys::SpawnedProcess,
-    logs: tokio::sync::mpsc::Sender<String>,
-) -> Result<()> {
-    {
-        let mut lines = tokio::io::BufReader::new(&mut spawned.stdout).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim().to_string();
-            if !trimmed.is_empty() {
-                send_deploy_stream_log(&logs, trimmed).await;
+            ImageFormat::Tar => {
+                send_deploy_log(&logs, "Extracting typed rootfs archive...").await;
+                let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
+                    name, rootfs,
+                )?;
+                self.image_import.import_tar(target, source).await
             }
         }
     }
-    let status = spawned
+}
+
+async fn acquire_image_source(
+    source: &ImageSource,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+) -> Result<std::fs::File> {
+    match source {
+        ImageSource::Local(path) => std::fs::File::open(path)
+            .map_err(|error| NspawnError::Io(std::path::PathBuf::from(path), error)),
+        ImageSource::Remote(url) => download_image(url, logs).await,
+    }
+}
+
+async fn download_image(
+    url: &str,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+) -> Result<std::fs::File> {
+    check_tool("curl")?;
+    let url = validate_download_url(url)?;
+    send_deploy_log(logs, "Downloading container image...").await;
+
+    let mut destination = tempfile::tempfile()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
+    let output = destination
+        .try_clone()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
+    let redirect_protocols = if url.scheme() == "https" {
+        "=https"
+    } else {
+        "=http,https"
+    };
+    let mut command = crate::nspawn::sys::new_command("curl");
+    command.kill_on_drop(true);
+    let mut child = command
+        .args([
+            "--progress-bar",
+            "--location",
+            "--fail",
+            "--show-error",
+            "--proto",
+            "=http,https",
+            "--proto-redir",
+            redirect_protocols,
+            "--user-agent",
+            "Lasper/0.3",
+            "--",
+        ])
+        .arg(url.as_str())
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+    let mut stderr = child.stderr.take().expect("curl stderr piped");
+    stream_curl_output(&mut stderr, logs).await?;
+    let status = child
         .wait()
         .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("bash"), e))?;
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
     if !status.success() {
         return Err(NspawnError::DeployError(format!(
-            "Network download failed: {}",
-            status
+            "Network download failed: {status}"
         )));
     }
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
+    Ok(destination)
+}
+
+fn validate_download_url(value: &str) -> Result<url::Url> {
+    let url = url::Url::parse(value.trim())
+        .map_err(|error| NspawnError::Validation(format!("Invalid image URL: {error}")))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(NspawnError::Validation(
+            "Image URL must use HTTP or HTTPS".into(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(NspawnError::Validation(
+            "Image URL must not contain embedded credentials".into(),
+        ));
+    }
+    Ok(url)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageCompression {
+    Gzip,
+    Xz,
+    Zstd,
+    Bzip2,
+}
+
+impl ImageCompression {
+    fn program(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::Bzip2 => "bzip2",
+        }
+    }
+}
+
+fn detect_compression(source: &std::fs::File) -> Result<Option<ImageCompression>> {
+    let mut header = [0u8; 6];
+    let count = source
+        .read_at(&mut header, 0)
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+    let header = &header[..count];
+    let compression = if header.starts_with(&[0x1f, 0x8b]) {
+        Some(ImageCompression::Gzip)
+    } else if header.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00]) {
+        Some(ImageCompression::Xz)
+    } else if header.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        Some(ImageCompression::Zstd)
+    } else if header.starts_with(b"BZh") {
+        Some(ImageCompression::Bzip2)
+    } else {
+        None
+    };
+    Ok(compression)
+}
+
+async fn normalize_compression(
+    mut source: std::fs::File,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+) -> Result<std::fs::File> {
+    let Some(compression) = detect_compression(&source)? else {
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+        return Ok(source);
+    };
+
+    let program = compression.program();
+    check_tool(program)?;
+    send_deploy_log(logs, format!("Decompressing image with {program}...")).await;
+    source
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+    let mut destination = tempfile::tempfile()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
+    let output = destination
+        .try_clone()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
+    let mut command = crate::nspawn::sys::new_command(program);
+    command.kill_on_drop(true);
+    let child = command
+        .args(["-d", "-c"])
+        .stdin(Stdio::from(source))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+    let result = child
+        .wait_with_output()
+        .await
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+    log_output(program, &result);
+    if !result.status.success() {
+        return Err(NspawnError::cmd_failed(
+            "decompress image source",
+            format!("{program} -d -c"),
+            &result,
+        ));
+    }
+    destination
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
+    Ok(destination)
+}
+
+/// Parse curl's carriage-return progress frames and forward normal output.
+async fn stream_curl_output(
+    stderr: &mut tokio::process::ChildStderr,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+) -> Result<()> {
+    const MAX_FRAME_BYTES: usize = 16 * 1024;
+    let mut chunk = [0u8; 4096];
+    let mut frame = Vec::new();
+    {
+        loop {
+            let count = stderr
+                .read(&mut chunk)
+                .await
+                .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+            if count == 0 {
+                break;
+            }
+            for byte in &chunk[..count] {
+                if *byte == b'\r' || *byte == b'\n' {
+                    forward_curl_frame(logs, &frame, *byte == b'\r').await;
+                    frame.clear();
+                } else if frame.len() < MAX_FRAME_BYTES {
+                    frame.push(*byte);
+                }
+            }
+        }
+    }
+    forward_curl_frame(logs, &frame, false).await;
     Ok(())
+}
+
+async fn forward_curl_frame(
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    frame: &[u8],
+    carriage_return: bool,
+) {
+    let text = String::from_utf8_lossy(frame);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if let Some(permille) = parse_curl_progress(trimmed) {
+        send_deploy_progress(logs, "Downloading image", permille).await;
+    } else if !carriage_return || !looks_like_curl_progress(trimmed) {
+        send_deploy_stream_log(logs, trimmed).await;
+    }
+}
+
+fn parse_curl_progress(frame: &str) -> Option<u16> {
+    let percent = frame
+        .split_ascii_whitespace()
+        .rev()
+        .find_map(|part| part.strip_suffix('%')?.parse::<f64>().ok())?;
+    percent
+        .is_finite()
+        .then(|| (percent.clamp(0.0, 100.0) * 10.0).round() as u16)
+}
+
+fn looks_like_curl_progress(frame: &str) -> bool {
+    frame
+        .bytes()
+        .all(|byte| matches!(byte, b' ' | b'#' | b'=' | b'-' | b'.' | b'0'..=b'9' | b'%'))
 }
 
 /// Normalize an OCI image reference for use with skopeo.
@@ -300,7 +376,7 @@ pub async fn import_oci_image(
     image_ref: &str,
     local_name: &str,
     dest: &std::path::Path,
-    logs: &tokio::sync::mpsc::Sender<String>,
+    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
     check_tool("skopeo")?;
     check_tool("umoci")?;
@@ -322,12 +398,11 @@ pub async fn import_oci_image(
         let import_policy = r#"{ "default": [ { "type": "insecureAcceptAnything" } ] }"#;
         io.write(&policy_path, import_policy).await?;
 
-        let _ = logs
-            .send(format!(
-                "Pulling OCI image '{}' via skopeo...",
-                normalized_ref
-            ))
-            .await;
+        send_deploy_log(
+            logs,
+            format!("Pulling OCI image '{}' via skopeo...", normalized_ref),
+        )
+        .await;
 
         // skopeo copy — streamed
         {
@@ -364,7 +439,7 @@ pub async fn import_oci_image(
             io.create_dir_all(parent).await?;
         }
 
-        let _ = logs.send("Extracting rootfs with umoci...".into()).await;
+        send_deploy_log(logs, "Extracting rootfs with umoci...").await;
 
         let umoci_raw = cmd_runner
             .run(
@@ -381,14 +456,12 @@ pub async fn import_oci_image(
         log_output("umoci", &umoci_raw);
 
         if umoci_raw.status.success() {
-            let _ = logs.send("OCI image imported via raw-unpack.".into()).await;
+            send_deploy_log(logs, "OCI image imported via raw-unpack.").await;
             return Ok(());
         }
 
         // Fallback: umoci unpack
-        let _ = logs
-            .send("umoci raw-unpack failed, falling back to unpack...".into())
-            .await;
+        send_deploy_log(logs, "umoci raw-unpack failed, falling back to unpack...").await;
         let umoci = cmd_runner
             .run(
                 "umoci",
@@ -429,7 +502,7 @@ pub async fn import_oci_image(
             ));
         }
 
-        let _ = logs.send("Copying rootfs to destination...".into()).await;
+        send_deploy_log(logs, "Copying rootfs to destination...").await;
         let copy_out = cmd_runner
             .run(
                 "cp",
@@ -451,7 +524,7 @@ pub async fn import_oci_image(
             ));
         }
 
-        let _ = logs.send("OCI image imported successfully.".into()).await;
+        send_deploy_log(logs, "OCI image imported successfully.").await;
         Ok(())
     }
     .await;
@@ -465,76 +538,6 @@ pub async fn import_oci_image(
     }
 
     import_result
-}
-
-/// Import a local disk image (.raw/.tar/.tar.gz).
-pub async fn import_disk_image(
-    cmd_runner: &dyn CommandRunner,
-    path: &str,
-    local_name: &str,
-    dest: &std::path::Path,
-) -> Result<()> {
-    let p = path.to_lowercase();
-    if p.ends_with(".tar")
-        || p.ends_with(".tar.gz")
-        || p.ends_with(".tar.xz")
-        || p.ends_with(".tar.zst")
-        || p.ends_with(".tgz")
-    {
-        return import_disk_image_tar(cmd_runner, path, dest).await;
-    }
-
-    check_tool("importctl")?;
-    let out = cmd_runner
-        .run(
-            "importctl",
-            vec!["import-raw".into(), path.into(), local_name.into()],
-        )
-        .await
-        .map_err(|e| NspawnError::Io(std::path::PathBuf::from("importctl"), e))?;
-    log_output("importctl", &out);
-
-    if !out.status.success() {
-        return Err(NspawnError::cmd_failed(
-            "importctl import-raw",
-            format!("importctl import-raw {} {}", path, local_name),
-            &out,
-        ));
-    }
-
-    Ok(())
-}
-
-async fn import_disk_image_tar(
-    cmd_runner: &dyn CommandRunner,
-    path: &str,
-    dest: &std::path::Path,
-) -> Result<()> {
-    check_tool("tar")?;
-    let out = cmd_runner
-        .run(
-            "tar",
-            vec![
-                "--numeric-owner".into(),
-                "-pxf".into(),
-                path.into(),
-                "-C".into(),
-                dest.to_string_lossy().to_string(),
-            ],
-        )
-        .await
-        .map_err(|e| NspawnError::Io(dest.to_path_buf(), e))?;
-    log_output("tar", &out);
-
-    if !out.status.success() {
-        return Err(NspawnError::cmd_failed(
-            "tar -xf",
-            format!("tar -xf {} -C {}", path, dest.display()),
-            &out,
-        ));
-    }
-
-    Ok(())
 }
 
 pub fn check_tool(name: &str) -> Result<()> {
@@ -554,6 +557,7 @@ pub fn check_tool(name: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
 
     #[test]
     fn test_normalize_oci_image_ref() {
@@ -584,5 +588,99 @@ mod tests {
         assert_eq!(args[1], "/var/cache/lasper/staging/policy.json");
         assert_eq!(args[2], "copy");
         assert!(!args.iter().any(|arg| arg == "/etc/containers/policy.json"));
+    }
+
+    #[test]
+    fn curl_progress_parser_reads_percentage_without_counting_bar_cells() {
+        assert_eq!(
+            parse_curl_progress("####################  37.4%"),
+            Some(374)
+        );
+        assert_eq!(parse_curl_progress("100.0%"), Some(1000));
+        assert_eq!(parse_curl_progress("curl: (22) HTTP error"), None);
+    }
+
+    #[test]
+    fn curl_progress_detection_does_not_hide_error_messages() {
+        assert!(looks_like_curl_progress("#######====  42.0%"));
+        assert!(!looks_like_curl_progress("curl: connection reset"));
+    }
+
+    #[test]
+    fn artifact_format_is_resolved_before_privileged_import() {
+        assert_eq!(
+            ImageFormat::from_artifact(&crate::nspawn::models::ArtifactSpec {
+                path: "rootfs.raw.xz".into(),
+                format: crate::nspawn::models::ArtifactFormat::Auto,
+            }),
+            ImageFormat::Raw
+        );
+        assert_eq!(
+            ImageFormat::from_artifact(&crate::nspawn::models::ArtifactSpec {
+                path: "rootfs.tar.xz".into(),
+                format: crate::nspawn::models::ArtifactFormat::Auto,
+            }),
+            ImageFormat::Tar
+        );
+    }
+
+    #[test]
+    fn download_urls_are_limited_to_http_without_embedded_credentials() {
+        assert!(validate_download_url("https://example.test/rootfs.tar.xz").is_ok());
+        assert!(validate_download_url("http://example.test/rootfs.raw").is_ok());
+        assert!(validate_download_url("file:///etc/shadow").is_err());
+        assert!(validate_download_url("https://user:secret@example.test/rootfs.raw").is_err());
+    }
+
+    #[test]
+    fn compression_is_detected_from_content_instead_of_source_name() {
+        let cases: &[(&[u8], Option<ImageCompression>)] = &[
+            (&[0x1f, 0x8b, 0x08], Some(ImageCompression::Gzip)),
+            (
+                &[0xfd, b'7', b'z', b'X', b'Z', 0x00],
+                Some(ImageCompression::Xz),
+            ),
+            (&[0x28, 0xb5, 0x2f, 0xfd], Some(ImageCompression::Zstd)),
+            (b"BZh9", Some(ImageCompression::Bzip2)),
+            (b"ustar", None),
+        ];
+        for (content, expected) in cases {
+            let mut source = tempfile::tempfile().unwrap();
+            source.write_all(content).unwrap();
+            assert_eq!(detect_compression(&source).unwrap(), *expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_source_is_decoded_and_rewound() {
+        let mut plain = tempfile::tempfile().unwrap();
+        plain.write_all(b"typed image payload").unwrap();
+        plain.seek(SeekFrom::Start(0)).unwrap();
+
+        let mut compressed = tempfile::tempfile().unwrap();
+        let output = crate::nspawn::sys::new_sync_command("gzip")
+            .args(["-c"])
+            .stdin(Stdio::from(plain))
+            .stdout(Stdio::from(compressed.try_clone().unwrap()))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        compressed.seek(SeekFrom::Start(0)).unwrap();
+
+        let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+        let mut decoded = normalize_compression(compressed, &logs).await.unwrap();
+        let mut payload = Vec::new();
+        decoded.read_to_end(&mut payload).unwrap();
+        assert_eq!(payload, b"typed image payload");
+    }
+
+    #[tokio::test]
+    async fn corrupt_compressed_source_is_rejected() {
+        let mut compressed = tempfile::tempfile().unwrap();
+        compressed.write_all(&[0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        compressed.seek(SeekFrom::Start(0)).unwrap();
+
+        let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+        assert!(normalize_compression(compressed, &logs).await.is_err());
     }
 }

@@ -1,39 +1,56 @@
-# Caveats & Known Issues
+# Caveats and Known Limits
 
-Read this before deploying Lasper in a production environment.
+Read this before using Lasper on a machine that contains data you care about.
 
-## 1. OCI Images & Init Systems
-Docker/Podman images typically define a specific application binary (e.g., `nginx` or `bash`) as their entrypoint. However, `systemd-nspawn` expects a proper init system (like `/sbin/init` or `systemd`) to boot the container OS. Since OCI images lack init systems, lasper defaultly just extracts the rootfs and sets `boot=no` for containers created from OCI images. 
+Lasper is alpha software. It manages host-level systemd resources and may run operations as root through the elevated daemon. The current goal is to stabilize a useful `systemd-nspawn` workflow, not to provide a production container platform yet.
 
-Due to the positioning of `systemd-nspawn` container, it is actually more appropriate to be used as a system container rather than an application container. The support of running application scripts inside OCI images still needs to be triaged after finnishing the support of customized post-install hooks. Alternatively, you can try to use `docker` or `podman` inside a `systemd-nspawn` container according to [archwiki](https://wiki.archlinux.org/title/Systemd-nspawn).
+## General Safety
 
-## 2. CLI Parsing & DBus Integration
-Lasper primarily communicates with `systemd` via DBus for state detection and machine management. 
-- **DBus Primary**: This provides structured data access and reduces the risk of parsing errors.
-- **CLI Fallback**: Lasper maintains a fallback mechanism that parses `machinectl` and `journalctl` stdout if DBus is unavailable (e.g., non-root access or environment issues). CLI parsing remains fragile to upstream format changes.
+- Prefer testing with disposable containers and backups of important host data.
+- Review bind mounts carefully. A writable bind mount can give container root write access to host files.
+- Avoid running untrusted containers with host GPU, display, or broad filesystem mounts.
+- Lasper-created resources should remain compatible with native systemd tools, but some provisioning paths are still experimental.
 
-## 3. NVIDIA GPU Passthrough
-Lasper uses `nvidia-container-toolkit` to generate CDI spec files for NVIDIA GPU passthrough. CDI provides the official mapping of devices, mounts, symlinks, and ldconfig folders for the host's driver installation.
+## Elevated Daemon
 
-**Passthrough modes:**
-- **Mirror**: Driver files are bind-mounted into the container at their original host paths. Simplest option, works when host and container share the same library layout.
-- **Categorized**: Driver files are remapped to user-configured destination directories per category (libraries, binaries, firmware, etc.). Use this when host and container have incompatible directory structures.
+`lasper -e` keeps the TUI unprivileged and starts a dedicated root daemon for that Lasper process. The FD-passing socket is protected by a private directory, `0600` permissions, exact PID/UID peer checks, and a per-session token.
 
-**GPU selection:** By default, all GPUs are passed through. A specific GPU can be selected via the wizard by its device ID (e.g. `GPU-<uuid>` or numeric index).
+This protects the FD interface from independent local processes. It does not protect against code already executing inside the Lasper TUI process. The daemon also still has generic command and file-operation RPCs while the typed-operation migration is in progress. See [SECURITY.md](SECURITY.md).
 
-## 4. Wayland Socket Passthrough
-When wayland socket passthrough is enabled, lasper will let user to choose which socket to passthrough. What you need to notice is that the socket is passed to the `/mnt ` directory inside the container with the name of `wayland-socket`. A script called `.wayland-env` will write into the home directory of the user you created. Based on the login shell you configured for each user, it adds "source" for the `.wayland-env` file (supports bash, zsh, fish). This script links the wayland socket to `$XDG_RUNTIME_DIR/wayland-socket` and sets the variable `WAYLAND_DISPLAY` and `DISPLAY`. You can run Firefox to ensure the socket is successfully passed.
+## OCI Images
 
-For the socket's file permission, lasper defaultly configures with `:idmap` to ensure that the socket's file permission works the same as the host's. However, this may not always work due to the systemd's version. If the systemd's version is lower than 248, lasper will set `PrivateUsers=no` to ensure the permission. But this may lead to some security issue, which requires you to clearly understand the security risks before using it. 
+OCI support is experimental. Most Docker/Podman images are application images, not system images. They often lack `systemd`, a system bus, a normal login setup, or a bootable init process.
 
-By the way, setting the socket's name to `wayland-socket` allows you to run nested wayland desktop with ease. For example, you can try to use kde plasma inside the container to experience a more virtual-machine-like environment. But this affects a lot by the desktop environment you're using. So, the effect of this feature is not guaranteed. You need to check it by yourself to see whether the nested wayland desktop works as you expected:).
+Lasper currently treats OCI input as a root filesystem acquisition path and defaults OCI-created containers to `Boot=no`. If you want the result to boot through `machinectl`, you must install and configure a real init system inside the container and then update the `.nspawn` configuration intentionally.
 
-## 5. Security & Bind Mounts
-Lasper just offers basic bind mounts settings. If you needs `:idmap` or other advanced settings, you need to configure it by yourself. Never do binds if you're uncertain about what you're doing.
-- **Warning**: Incorrectly mounting host directories without the "Read Only" flag can grant the container root user full write access to critical host files. Review your mounts carefully.
+Until the OCI product model is decided, do not treat OCI import as equivalent to a native `systemd-nspawn` system-container image.
 
-## 6. Elevated Daemon Security Boundary
+## Networking
 
-`lasper -e` keeps the TUI unprivileged and starts a separate root daemon. The FD-passing socket is private to the user and accepts requests only when the kernel-reported PID/UID matches the launching TUI and the request contains the per-session token delivered through the daemon's stdin bootstrap pipe.
+Veth and bridge-style networking rely on systemd networking behavior inside the container and host NAT/firewall behavior outside it. Lasper may attempt to enable `systemd-networkd` and `systemd-resolved` during setup, but service enablement warnings do not always mean the container cannot be used.
 
-This protects the root FD interface from independent local processes, including other processes running under the same UID. It does not protect against an attacker who can inspect or execute code inside the Lasper TUI process. The daemon also still exposes broad command and file-operation RPCs, so Elevated mode should be used only with a trusted Lasper binary and trusted plugins or terminal environment.
+If networking fails, check the host firewall, the container's network services, and native systemd status with tools such as `machinectl`, `networkctl`, and `journalctl`.
+
+## NVIDIA and Display Passthrough
+
+NVIDIA passthrough depends on `nvidia-container-toolkit` and the driver's CDI output. WSL and non-standard driver layouts often require host-mirror mode and explicit library-cache refresh inside the container.
+
+Wayland/X11 passthrough exposes host display sockets to the container. Lasper writes helper environment files such as `.wayland-env` and uses bind mounts to make sockets visible inside the container. UID mapping, `PrivateUsers`, and host compositor policy can still prevent GUI applications from working.
+
+Disabling `PrivateUsers` may make display access easier, but it weakens container isolation. Use it only when you understand the trade-off.
+
+## Storage and Image Paths
+
+Lasper's normal managed image location is `/var/lib/machines/<name>` or `/var/lib/machines/<name>.raw`. Disk-image handling is being tightened around raw images and content validation. Treat unusual image formats and direct image imports as experimental until the storage model is fully typed and validated in the daemon.
+
+## Native Tools Remain Useful
+
+Lasper is meant to make systemd-nspawn easier to operate, not to hide systemd from you. When debugging, the native tools are still the best source of truth:
+
+```bash
+machinectl list
+machinectl list-images
+machinectl status <name>
+journalctl -M <name>
+systemctl status systemd-nspawn@<name>.service
+```

@@ -10,4 +10,4 @@ pub mod state;
 
 pub use discovery::{get_nvidia_state, nvidia_ctk_available};
 pub use lifecycle::ensure_gpu_passthrough;
-pub use state::NvidiaState;
+pub use state::{NvidiaState, NvidiaStateStore};

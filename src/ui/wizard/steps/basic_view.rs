@@ -7,6 +7,7 @@ use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 use crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::Frame;
+use std::collections::HashSet;
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -24,25 +25,17 @@ pub struct BasicStepView {
 }
 
 impl BasicStepView {
-    pub fn new(initial_data: &BasicConfig) -> Self {
+    pub fn new(
+        initial_data: &BasicConfig,
+        existing_entries: &[crate::nspawn::models::ContainerEntry],
+    ) -> Self {
+        let existing_names: HashSet<String> = existing_entries
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect();
         let mut view = Self {
             name: TextBox::new(" Container name (required) ", initial_data.name.clone())
-                .with_validator(|v| {
-                    let s = v.trim();
-                    if s.is_empty() {
-                        return Err("Name cannot be empty".to_string());
-                    }
-                    if !s
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                    {
-                        return Err("Invalid characters: use [a-zA-Z0-9_-]".to_string());
-                    }
-                    if s.len() > 64 {
-                        return Err("Name too long (max 64)".to_string());
-                    }
-                    Ok(())
-                }),
+                .with_validator(move |value| validate_container_name(value, &existing_names)),
             hostname: TextBox::new(
                 " Hostname (optional, defaults to name) ",
                 initial_data.hostname.clone(),
@@ -65,6 +58,26 @@ impl BasicStepView {
         view.update_focus();
         view
     }
+}
+
+fn validate_container_name(value: &str, existing_names: &HashSet<String>) -> Result<(), String> {
+    let name = value.trim();
+    if name.is_empty() {
+        return Err("Name cannot be empty".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("Invalid characters: use [a-zA-Z0-9_-]".to_string());
+    }
+    if name.len() > 64 {
+        return Err("Name too long (max 64)".to_string());
+    }
+    if existing_names.contains(name) {
+        return Err(format!("Container '{}' already exists", name));
+    }
+    Ok(())
 }
 
 impl Component for BasicStepView {
@@ -102,5 +115,26 @@ impl StepComponent for BasicStepView {
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
         self.render(f, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn container_name_rejects_existing_machine() {
+        let existing = ["arch-test".to_string()].into_iter().collect();
+
+        let result = validate_container_name("arch-test", &existing);
+
+        assert_eq!(result, Err("Container 'arch-test' already exists".into()));
+    }
+
+    #[test]
+    fn container_name_accepts_unique_machine() {
+        let existing = ["arch-test".to_string()].into_iter().collect();
+
+        assert!(validate_container_name("new-container", &existing).is_ok());
     }
 }

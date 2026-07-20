@@ -246,6 +246,7 @@ async fn write_generated_at(
     invoking_uid: u32,
 ) -> Result<()> {
     spec.validate()?;
+    validate_custom_bind_sources(spec).await?;
     let wayland_socket = validate_wayland_runtime(spec, xdg_runtime, invoking_uid).await?;
     if let Some(state) = nvidia_state {
         validate_nvidia_update(state, &[])?;
@@ -261,6 +262,23 @@ async fn write_generated_at(
     }
     validate_content_size(&content)?;
     write_content(path, content).await
+}
+
+async fn validate_custom_bind_sources(spec: &NspawnConfigSpec) -> Result<()> {
+    for bind in &spec.bind_mounts {
+        let source = PathBuf::from(&bind.source);
+        match tokio::fs::metadata(&source).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(NspawnError::Validation(format!(
+                    "Bind source does not exist: {}",
+                    source.display()
+                )));
+            }
+            Err(error) => return Err(NspawnError::Io(source, error)),
+        }
+    }
+    Ok(())
 }
 
 async fn update_gpu_at(
@@ -400,6 +418,7 @@ fn invoking_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nspawn::models::IdmapSuffix;
 
     #[test]
     fn operation_deserialization_rejects_invalid_machine_name() {
@@ -446,6 +465,68 @@ mod tests {
         assert!(content.contains("Boot=yes"));
         assert!(content.contains("Hostname=test-host"));
         assert!(crate::nspawn::sys::io::lock_path_for(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn generated_write_rejects_missing_custom_bind_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("test.nspawn");
+        let missing = directory.path().join("missing");
+        let config = ContainerConfig {
+            name: "test".into(),
+            bind_mounts: vec![crate::nspawn::models::BindMount {
+                source: missing.to_string_lossy().into_owned(),
+                target: "/srv/data".into(),
+                readonly: false,
+                suffix: IdmapSuffix::None,
+            }],
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        let error = write_generated_at(&output, &spec, None, None, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("Bind source does not exist")
+                    && message.contains(missing.to_str().unwrap())
+        ));
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn generated_write_allows_custom_bind_source_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let symlink = directory.path().join("source-link");
+        let output = directory.path().join("test.nspawn");
+        tokio::fs::write(&source, "data").await.unwrap();
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        let config = ContainerConfig {
+            name: "test".into(),
+            private_users: Some("yes".into()),
+            bind_mounts: vec![crate::nspawn::models::BindMount {
+                source: symlink.to_string_lossy().into_owned(),
+                target: "/srv/data".into(),
+                readonly: true,
+                suffix: IdmapSuffix::Noidmap,
+            }],
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        write_generated_at(&output, &spec, None, None, uzers::get_current_uid())
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&output).await.unwrap();
+        assert!(content.contains(&format!(
+            "BindReadOnly={}:/srv/data:noidmap",
+            symlink.display()
+        )));
     }
 
     #[tokio::test]

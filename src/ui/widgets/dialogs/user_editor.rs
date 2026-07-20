@@ -1,4 +1,7 @@
-use crate::nspawn::models::CreateUser;
+use crate::nspawn::errors::{NspawnError, Result as NspawnResult};
+use crate::nspawn::models::{
+    validate_chpasswd_secret, validate_login_shell, validate_login_username, CreateUser,
+};
 use crate::ui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::ui::widgets::inputs::button::Button;
@@ -32,35 +35,32 @@ pub struct UserEditor {
     on_submit: Box<dyn Fn(CreateUser) -> AppMessage>,
 }
 
+fn validation_message(result: NspawnResult<()>) -> Result<(), String> {
+    result.map_err(|error| match error {
+        NspawnError::Validation(message) => message,
+        other => other.to_string(),
+    })
+}
+
 fn validate_username(name: &str) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Username cannot be empty".into());
-    }
-    if name.len() > 32 {
-        return Err("Username is too long".into());
-    }
-    let bytes = name.as_bytes();
-    let first = bytes[0];
-    if !first.is_ascii_alphabetic() && first != b'_' {
-        return Err("Must start with a letter or '_'".into());
-    }
-    for (i, &b) in bytes.iter().enumerate().skip(1) {
-        if !b.is_ascii_alphanumeric() && b != b'_' && b != b'-' {
-            if i == bytes.len() - 1 && b == b'$' {
-                continue;
-            }
-            return Err("Contains invalid characters".into());
-        }
-    }
-    Ok(())
+    validation_message(validate_login_username(name))
+}
+
+fn validate_password(password: &str) -> Result<(), String> {
+    validation_message(validate_chpasswd_secret("Password", password))
+}
+
+fn validate_shell(shell: &str) -> Result<(), String> {
+    validation_message(validate_login_shell(shell))
 }
 
 impl UserEditor {
     pub fn new(on_submit: impl Fn(CreateUser) -> AppMessage + 'static) -> Self {
         let mut editor = Self {
             username: TextBox::new(" Username ", String::new()).with_validator(validate_username),
-            password: PasswordBox::new(" Password (optional) ", String::new()),
-            shell: TextBox::new(" Shell ", "/bin/bash".to_string()),
+            password: PasswordBox::new(" Password (optional) ", String::new())
+                .with_validator(validate_password),
+            shell: TextBox::new(" Shell ", "/bin/bash".to_string()).with_validator(validate_shell),
 
             sudoer: Checkbox::new(" Add to sudo/wheel group ", false),
             btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
@@ -76,8 +76,9 @@ impl UserEditor {
     pub fn with_user(mut self, user: &CreateUser) -> Self {
         self.username =
             TextBox::new(" Username ", user.username.clone()).with_validator(validate_username);
-        self.password = PasswordBox::new(" Password (optional) ", user.password.clone());
-        self.shell = TextBox::new(" Shell ", user.shell.clone());
+        self.password = PasswordBox::new(" Password (optional) ", user.password.clone())
+            .with_validator(validate_password);
+        self.shell = TextBox::new(" Shell ", user.shell.clone()).with_validator(validate_shell);
 
         self.sudoer = Checkbox::new(" Add to sudo/wheel group ", user.sudoer);
         self.update_focus();

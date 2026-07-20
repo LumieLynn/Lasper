@@ -1,11 +1,26 @@
 //! Simple directory-based storage backend.
 
-use super::super::{StorageBackend, StorageType};
-use crate::nspawn::errors::{NspawnError, Result};
+use super::super::{ManagedStorageStore, StorageBackend, StorageType};
+use crate::nspawn::errors::Result;
 use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
-pub struct DirectoryBackend;
+#[derive(Clone, Debug)]
+pub struct DirectoryBackend {
+    store: ManagedStorageStore,
+}
+
+impl DirectoryBackend {
+    pub fn new(store: ManagedStorageStore) -> Self {
+        Self { store }
+    }
+}
+
+impl Default for DirectoryBackend {
+    fn default() -> Self {
+        Self::new(ManagedStorageStore::default())
+    }
+}
 
 #[async_trait::async_trait]
 impl StorageBackend for DirectoryBackend {
@@ -20,11 +35,9 @@ impl StorageBackend for DirectoryBackend {
         &self,
         name: &str,
         _cmd_runner: &dyn CommandRunner,
-        io: &ElevatedIo,
+        _io: &ElevatedIo,
     ) -> Result<PathBuf> {
-        let path = self.get_path(name);
-        io.create_dir_all(&path).await?;
-        Ok(path)
+        self.store.create_directory(name).await
     }
 
     async fn mount(
@@ -49,21 +62,9 @@ impl StorageBackend for DirectoryBackend {
         &self,
         name: &str,
         _cmd_runner: &dyn CommandRunner,
-        io: &ElevatedIo,
+        _io: &ElevatedIo,
     ) -> Result<()> {
-        let path = self.get_path(name);
-        if let Err(e) = io.remove_dir_all(&path).await {
-            if matches!(
-                e,
-                NspawnError::Io(_, ref io_err)
-                    if io_err.kind() == std::io::ErrorKind::NotFound
-            ) {
-                log::warn!("Directory already missing for deletion: {}", path.display());
-            } else {
-                return Err(e);
-            }
-        }
-        Ok(())
+        self.store.remove_directory(name).await
     }
 
     async fn exists(&self, name: &str) -> bool {

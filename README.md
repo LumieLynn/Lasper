@@ -1,6 +1,8 @@
 # Lasper
 
-A terminal user interface (TUI) for managing `systemd-nspawn` containers, written in Rust. Inspired by [lazydocker](https://github.com/jesseduffield/lazydocker), Lasper brings an interactive experience to systemd-nspawn container management.
+A terminal user interface (TUI) for managing `systemd-nspawn` system containers, written in Rust. Inspired by [lazydocker](https://github.com/jesseduffield/lazydocker), Lasper provides a guided interface over native systemd resources instead of replacing `machinectl`, `systemd-nspawn`, or `importctl`.
+
+Lasper is currently alpha software. It is suitable for testing and personal workflows where you understand the caveats, but it is not yet a production-stable container platform.
 
 ![demo.gif](demo.gif)
 
@@ -8,9 +10,9 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 
 - **Container Management**: Start, stop, restart, enable/disable, and terminate systemd-nspawn containers. View properties, full details, and journal logs directly in the terminal via a unified dashboard.
 - **Integrated Terminal**: Seamlessly jump into container shells via `machinectl login`. Features a modal interface (Normal/Insert modes) for easy scrolling and multi-session management without leaving the dashboard.
-- **Creation Wizard**: Interactively generate `.nspawn` configurations with background task execution for image provisioning and deployment.
+- **Creation Wizard**: Interactively generate `.nspawn` configurations and run provisioning tasks.
 - **Image Provisioning**:
-  - Pull and extract OCI (Docker/Podman) images via `skopeo` and `umoci`.
+  - Pull and extract OCI (Docker/Podman) root filesystems via `skopeo` and `umoci` as an experimental provider.
   - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
 - **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
 - **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
@@ -29,8 +31,7 @@ A terminal user interface (TUI) for managing `systemd-nspawn` containers, writte
 ## ⚠️ Before You Begin – Must Read
 
 Lasper is in **early development**. **All users must read [CAVEATS.md](CAVEATS.md) before using Lasper.**
-The elevated daemon trust model and current dependency exceptions are documented
-in [SECURITY.md](SECURITY.md).
+The elevated daemon trust model, remaining root-daemon authority, and current dependency exceptions are documented in [SECURITY.md](SECURITY.md).
 Failure to review these caveats may lead to unexpected behavior or data loss.  
 For common questions, see [FAQ.md](FAQ.md).
 
@@ -63,7 +64,7 @@ Pass `--version` or `--help` for version info and usage.
 
 You can add a container via the creation wizard. Tap `a` or `n` to open the wizard.
 
-It's recommended to use `machinectl` to connect to the container after creation and starting. For example: `sudo machinectl shell <user_name>@<container_name>`. Ensure that you installed systembus and an init program inside your container.
+You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user_name>@<container_name>`. Containers intended to boot through `machinectl` need an init system and a working system bus inside the root filesystem.
 
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
@@ -82,17 +83,19 @@ It's recommended to use `machinectl` to connect to the container after creation 
 - `q` : Quit
 - `Esc` : Back / Close Overlays
 
-## Roadmap / TODO
+## Current Direction
 
-- [x] Component-based TUI architecture & Responsive layout.
-- [x] DBus integration via `zbus` (with automatic CLI fallback for legacy systems).
-- [x] Asynchronous background task scheduling for long-running deployments.
-- [x] Resource monitoring (CPU/Memory usage).
-- [ ] Interactive .nspawn configuration editor.
-- [ ] Global `config.toml` for overriding default settings.
-- [ ] Better OCI import support.
-- [ ] Customizable post-deployment hooks and scripts.
-- [ ] Customizable deployment scripts.
+The next stable milestone is `0.3.0`. The release is not defined by adding more providers or wizard switches. It should mark the point where the alpha feature set has a clearer security boundary and fewer surprising host-side side effects.
+
+Before `0.3.0` stable, the project should:
+
+- continue migrating elevated-daemon authority from generic command/path RPCs to typed operations;
+- keep OCI support clearly experimental until its product model is decided;
+- preserve unknown `.nspawn` settings instead of rewriting files from only the fields Lasper understands;
+- make long-running provisioning and image operations observable and recoverable enough for normal use;
+- fail closed on unsafe storage/image conflicts instead of overwriting host resources.
+
+Feature work that requires general-purpose root hooks or arbitrary daemon commands is intentionally deferred.
 
 ## Credits
 
