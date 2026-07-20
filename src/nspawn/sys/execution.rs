@@ -9,7 +9,7 @@
 use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::nspawn::adapters::rootfs::RootfsStore;
 use crate::nspawn::adapters::storage::ManagedStorageStore;
-use crate::nspawn::ops::provision::BootstrapStore;
+use crate::nspawn::ops::provision::{BootstrapStore, ImageImportStore};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::platform::nvidia::NvidiaStateStore;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
@@ -28,6 +28,7 @@ pub struct ExecutionContext {
     pub systemd_unit: SystemdUnitStore,
     pub rootfs: RootfsStore,
     pub bootstrap: BootstrapStore,
+    pub image_import: ImageImportStore,
     pub managed_storage: ManagedStorageStore,
     pub nvidia_state: NvidiaStateStore,
     daemon: Option<Arc<ElevatedDaemon>>,
@@ -49,6 +50,7 @@ impl ExecutionContext {
         let systemd_unit = SystemdUnitStore::new(daemon.clone());
         let rootfs = RootfsStore::new(daemon.clone());
         let bootstrap = BootstrapStore::new(cmd.clone(), daemon.clone());
+        let image_import = ImageImportStore::new(daemon.clone());
         let managed_storage = ManagedStorageStore::new(daemon.clone());
         let nvidia_state = NvidiaStateStore::new(daemon.clone());
         Self {
@@ -58,6 +60,7 @@ impl ExecutionContext {
             systemd_unit,
             rootfs,
             bootstrap,
+            image_import,
             managed_storage,
             nvidia_state,
             daemon,
@@ -86,6 +89,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("systemd_unit", &self.systemd_unit)
             .field("rootfs", &self.rootfs)
             .field("bootstrap", &"BootstrapStore")
+            .field("image_import", &"ImageImportStore")
             .field("managed_storage", &self.managed_storage)
             .field("nvidia_state", &self.nvidia_state)
             .field("daemon", &self.daemon)

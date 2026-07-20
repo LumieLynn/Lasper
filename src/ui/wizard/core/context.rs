@@ -693,6 +693,7 @@ impl WizardContext {
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
         bootstrap: crate::nspawn::ops::provision::BootstrapStore,
+        image_import: crate::nspawn::ops::provision::ImageImportStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder().get_deployer_and_storage(
@@ -702,6 +703,7 @@ impl WizardContext {
             systemd_unit,
             managed_storage,
             bootstrap,
+            image_import,
             cmd_runner,
         )
     }

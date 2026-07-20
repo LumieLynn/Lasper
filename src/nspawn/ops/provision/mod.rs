@@ -3,8 +3,10 @@
 pub mod backend;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
+pub(crate) mod image_operation;
 
 pub use bootstrap_operation::BootstrapStore;
+pub use image_operation::ImageImportStore;
 
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;

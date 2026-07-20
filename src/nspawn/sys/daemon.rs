@@ -41,6 +41,7 @@ use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
 };
+use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
@@ -56,7 +57,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 2;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct DaemonBootstrap {
@@ -84,6 +85,8 @@ enum FdOperation {
     Bootstrap(Box<SpawnBootstrapParams>),
     #[serde(rename = "import_raw_image")]
     ImportRawImage(ImportRawImageParams),
+    #[serde(rename = "import_tar_image")]
+    ImportTarImage(ImportTarRequest),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -122,7 +125,7 @@ struct ImportRawImageParams {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ImportRawImageResponse {
+struct ImportImageResponse {
     error: Option<String>,
 }
 
@@ -602,16 +605,6 @@ impl ElevatedDaemon {
         Ok(())
     }
 
-    pub async fn remove_file(&self, path: &std::path::Path) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "remove_file",
-            serde_json::json!({"path": path.to_string_lossy()}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
     pub async fn create_dir_all(
         &self,
         path: &std::path::Path,
@@ -749,11 +742,28 @@ impl ElevatedDaemon {
         machine: MachineName,
         source: std::fs::File,
     ) -> std::io::Result<()> {
-        let std_sock = self
-            .open_fd_channel(FdOperation::ImportRawImage(ImportRawImageParams {
-                machine,
-            }))
-            .await?;
+        self.import_image_source(
+            FdOperation::ImportRawImage(ImportRawImageParams { machine }),
+            source,
+        )
+        .await
+    }
+
+    pub(crate) async fn import_tar_image(
+        &self,
+        request: ImportTarRequest,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        self.import_image_source(FdOperation::ImportTarImage(request), source)
+            .await
+    }
+
+    async fn import_image_source(
+        &self,
+        operation: FdOperation,
+        source: std::fs::File,
+    ) -> std::io::Result<()> {
+        let std_sock = self.open_fd_channel(operation).await?;
         tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
 
@@ -770,7 +780,7 @@ impl ElevatedDaemon {
             std_sock.send_with_fd(b"source", &[source.as_raw_fd()])?;
             line.clear();
             reader.read_line(&mut line)?;
-            let response: ImportRawImageResponse = serde_json::from_str(line.trim())
+            let response: ImportImageResponse = serde_json::from_str(line.trim())
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             match response.error {
                 Some(error) => Err(std::io::Error::other(error)),
@@ -1283,29 +1293,6 @@ async fn handle_request(
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "remove_file" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::remove_file(&path_str)
-                    .await
-                    .map_err(|e| format!("rm {}: {}", path_str, e));
                 let response = match result {
                     Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
                     Err(e) => {
@@ -1873,54 +1860,70 @@ async fn handle_fd_connection(
         }
 
         FdOperation::ImportRawImage(ImportRawImageParams { machine }) => {
-            use std::io::Write;
-            use std::os::fd::FromRawFd;
-
-            if let Err(error) = std_stream.write_all(b"ready\n") {
-                log::error!("Daemon: failed to acknowledge image import fd: {}", error);
-                return;
-            }
-
-            let mut marker = [0u8; 16];
-            let mut fds = [0i32 as RawFd; 1];
-            let source = match std_stream.recv_with_fd(&mut marker, &mut fds) {
-                Ok((_, 1)) => unsafe { std::fs::File::from_raw_fd(fds[0]) },
-                Ok((_, count)) => {
-                    let response = ImportRawImageResponse {
-                        error: Some(format!(
-                            "expected exactly one image source fd, received {count}"
-                        )),
-                    };
-                    if let Ok(line) = serde_json::to_string(&response) {
-                        let _ = std_stream.write_all(format!("{line}\n").as_bytes());
-                    }
-                    return;
-                }
+            let source = match receive_image_source(&mut std_stream) {
+                Ok(source) => source,
                 Err(error) => {
-                    let response = ImportRawImageResponse {
-                        error: Some(format!("failed to receive image source fd: {error}")),
-                    };
-                    if let Ok(line) = serde_json::to_string(&response) {
-                        let _ = std_stream.write_all(format!("{line}\n").as_bytes());
-                    }
+                    send_image_import_response(&mut std_stream, Err(error));
                     return;
                 }
             };
 
-            let response = match crate::nspawn::adapters::storage::image_ops::import_raw_image(
-                &machine, source,
+            let result = crate::nspawn::ops::provision::image_operation::import_raw_system_image(
+                machine, source,
             )
             .await
-            {
-                Ok(_) => ImportRawImageResponse { error: None },
-                Err(error) => ImportRawImageResponse {
-                    error: Some(error.to_string()),
-                },
-            };
-            if let Ok(line) = serde_json::to_string(&response) {
-                let _ = std_stream.write_all(format!("{line}\n").as_bytes());
-            }
+            .map_err(|error| error.to_string());
+            send_image_import_response(&mut std_stream, result);
         }
+
+        FdOperation::ImportTarImage(request) => {
+            let source = match receive_image_source(&mut std_stream) {
+                Ok(source) => source,
+                Err(error) => {
+                    send_image_import_response(&mut std_stream, Err(error));
+                    return;
+                }
+            };
+            let result =
+                crate::nspawn::ops::provision::image_operation::import_tar_image(request, source)
+                    .await
+                    .map_err(|error| error.to_string());
+            send_image_import_response(&mut std_stream, result);
+        }
+    }
+}
+
+fn receive_image_source(
+    stream: &mut std::os::unix::net::UnixStream,
+) -> std::result::Result<std::fs::File, String> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+
+    stream
+        .write_all(b"ready\n")
+        .map_err(|error| format!("failed to acknowledge image source fd: {error}"))?;
+    let mut marker = [0u8; 16];
+    let mut fds = [0i32 as RawFd; 1];
+    match stream.recv_with_fd(&mut marker, &mut fds) {
+        Ok((_, 1)) => Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) }),
+        Ok((_, count)) => Err(format!(
+            "expected exactly one image source fd, received {count}"
+        )),
+        Err(error) => Err(format!("failed to receive image source fd: {error}")),
+    }
+}
+
+fn send_image_import_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    result: std::result::Result<(), String>,
+) {
+    use std::io::Write;
+
+    let response = ImportImageResponse {
+        error: result.err(),
+    };
+    if let Ok(line) = serde_json::to_string(&response) {
+        let _ = stream.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -2111,6 +2114,21 @@ mod tests {
             parsed.operation,
             FdOperation::ImportRawImage(ImportRawImageParams { .. })
         ));
+
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::ImportTarImage(ImportTarRequest {
+                target: crate::nspawn::adapters::rootfs::RootfsTarget::Machine {
+                    machine: MachineName::new("test-machine").unwrap(),
+                },
+            }),
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "import_tar_image");
+        assert_eq!(json["params"]["target"]["kind"], "machine");
+        assert_eq!(json["params"]["target"]["machine"], "test-machine");
+        assert!(json["params"].get("path").is_none());
+        assert!(json["params"].get("source").is_none());
     }
 
     #[test]

@@ -189,6 +189,7 @@ impl ContainerConfigBuilder {
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
         bootstrap: crate::nspawn::ops::provision::BootstrapStore,
+        image_import: crate::nspawn::ops::provision::ImageImportStore,
         cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
@@ -238,16 +239,19 @@ impl ContainerConfigBuilder {
                 cmd_runner: cmd_runner.clone(),
                 io: io.clone(),
             }) as Box<dyn Deployer>,
-            SourceConfig::Artifact(artifact) => Box::new(image::DiskImageDeployer {
-                path: artifact.path,
-                format: artifact.format,
-                cmd_runner: cmd_runner.clone(),
+            SourceConfig::Artifact(artifact) => Box::new(image::ImageDeployer {
+                source: image::ImageSource::Local(artifact.path.clone()),
+                format: image::ImageFormat::from_artifact(&artifact),
+                image_import: image_import.clone(),
             }) as Box<dyn Deployer>,
-            SourceConfig::Pull { url, is_raw } => Box::new(image::NetworkImageDeployer {
-                url,
-                is_raw,
-                cmd_runner: cmd_runner.clone(),
-                io: io.clone(),
+            SourceConfig::Pull { url, is_raw } => Box::new(image::ImageDeployer {
+                source: image::ImageSource::Remote(url),
+                format: if is_raw {
+                    image::ImageFormat::Raw
+                } else {
+                    image::ImageFormat::Tar
+                },
+                image_import,
             }) as Box<dyn Deployer>,
             SourceConfig::Bootstrap(spec) => {
                 Box::new(bootstrap::BootstrapDeployer { spec, bootstrap }) as Box<dyn Deployer>

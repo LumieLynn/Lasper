@@ -317,8 +317,7 @@ pub struct ArtifactSpec {
 impl ArtifactSpec {
     pub fn from_path(path: impl Into<String>) -> Self {
         let path = path.into();
-        let lower = path.to_ascii_lowercase();
-        let format = if lower.ends_with(".raw") || lower.ends_with(".img") {
+        let format = if looks_like_raw_artifact(&path) {
             ArtifactFormat::Raw
         } else {
             ArtifactFormat::Tar
@@ -333,13 +332,8 @@ impl ArtifactSpec {
         if self.path.chars().any(char::is_control) {
             return Err(validation("Artifact path contains control characters"));
         }
-        let lower = self.path.to_ascii_lowercase();
-        let looks_raw = lower.ends_with(".raw") || lower.ends_with(".img");
-        let looks_tar = lower.ends_with(".tar")
-            || lower.ends_with(".tar.gz")
-            || lower.ends_with(".tar.xz")
-            || lower.ends_with(".tar.zst")
-            || lower.ends_with(".tgz");
+        let looks_raw = looks_like_raw_artifact(&self.path);
+        let looks_tar = looks_like_tar_artifact(&self.path);
         if (self.format == ArtifactFormat::Raw && looks_tar)
             || (self.format == ArtifactFormat::Tar && looks_raw)
         {
@@ -364,15 +358,34 @@ impl ArtifactSpec {
     }
 
     pub fn is_external_storage(&self) -> bool {
+        self.resolved_format() == ArtifactFormat::Raw
+    }
+
+    pub fn resolved_format(&self) -> ArtifactFormat {
         match self.format {
-            ArtifactFormat::Raw => true,
-            ArtifactFormat::Tar => false,
-            ArtifactFormat::Auto => {
-                let lower = self.path.to_ascii_lowercase();
-                lower.ends_with(".raw") || lower.ends_with(".img")
-            }
+            ArtifactFormat::Auto if looks_like_raw_artifact(&self.path) => ArtifactFormat::Raw,
+            ArtifactFormat::Auto => ArtifactFormat::Tar,
+            explicit => explicit,
         }
     }
+}
+
+fn artifact_basename_without_compression(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    [".gz", ".xz", ".zst", ".bz2"]
+        .iter()
+        .find_map(|suffix| lower.strip_suffix(suffix).map(str::to_string))
+        .unwrap_or(lower)
+}
+
+fn looks_like_raw_artifact(path: &str) -> bool {
+    let base = artifact_basename_without_compression(path);
+    base.ends_with(".raw") || base.ends_with(".img")
+}
+
+fn looks_like_tar_artifact(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    artifact_basename_without_compression(path).ends_with(".tar") || lower.ends_with(".tgz")
 }
 
 /// A source that can be selected as a configured profile in `lasper.toml`.
@@ -1021,6 +1034,11 @@ mod tests {
     fn artifact_auto_format_keeps_raw_images_external() {
         assert!(ArtifactSpec::from_path("/tmp/rootfs.raw").is_external_storage());
         assert!(ArtifactSpec::from_path("/tmp/rootfs.img").is_external_storage());
+        assert!(ArtifactSpec {
+            path: "/tmp/rootfs.raw.xz".into(),
+            format: ArtifactFormat::Auto,
+        }
+        .is_external_storage());
         assert!(!ArtifactSpec::from_path("/tmp/rootfs.tar.xz").is_external_storage());
     }
 

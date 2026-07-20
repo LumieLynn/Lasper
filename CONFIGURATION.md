@@ -274,7 +274,7 @@ format = "tar"
 | `path` | string | required | Local tarball or raw image path. `~` and `~/...` are supported. |
 | `format` | `auto`, `tar`, `raw` | `auto` | Selects how the artifact is handled. |
 
-With `auto`, `.raw` and `.img` are treated as raw images and archive-like extensions are treated as tar archives. Explicit `tar` and `raw` values must match the corresponding file extension when the extension is recognizable. Raw artifacts use externally managed storage; tar archives are extracted into the selected Lasper storage backend.
+With `auto`, `.raw`, `.img`, and their gzip, xz, zstd, or bzip2-compressed forms are treated as raw images; archive-like extensions are treated as tar archives. Explicit `tar` and `raw` values must match the corresponding file extension when the extension is recognizable. Compression is confirmed from the file content before decoding. Raw artifacts use externally managed storage; tar archives are extracted into the selected Lasper storage backend.
 
 ## Theme
 

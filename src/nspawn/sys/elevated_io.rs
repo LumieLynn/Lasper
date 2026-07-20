@@ -54,25 +54,6 @@ impl ElevatedIo {
         }
     }
 
-    /// Remove a file, elevating via daemon or `sudo rm` when needed.
-    pub async fn remove_file(&self, path: &Path) -> Result<()> {
-        match self.level {
-            PermissionLevel::Root => tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| NspawnError::Io(path.to_path_buf(), e)),
-            PermissionLevel::Elevated => {
-                if let Some(ref daemon) = self.daemon {
-                    daemon.remove_file(path).await
-                } else {
-                    Self::remove_sudo(path).await
-                }
-            }
-            PermissionLevel::User => tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| deny_if_permission(NspawnError::Io(path.to_path_buf(), e), path)),
-        }
-    }
-
     /// Remove a directory tree, elevating via daemon or `sudo rm -rf` when needed.
     pub async fn remove_dir_all(&self, path: &Path) -> Result<()> {
         match self.level {
@@ -168,23 +149,6 @@ impl ElevatedIo {
             return Err(NspawnError::cmd_failed(
                 "sudo tee",
                 format!("sudo tee {}", path.display()),
-                &out,
-            ));
-        }
-        Ok(())
-    }
-
-    async fn remove_sudo(path: &Path) -> Result<()> {
-        let out = crate::nspawn::sys::new_command("sudo")
-            .args(["rm", &path.to_string_lossy()])
-            .output()
-            .await
-            .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
-
-        if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "sudo rm",
-                format!("sudo rm {}", path.display()),
                 &out,
             ));
         }
