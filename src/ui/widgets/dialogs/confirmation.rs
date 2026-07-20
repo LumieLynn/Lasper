@@ -1,4 +1,5 @@
 use crate::ui::core::{Component, EventResult};
+use crate::ui::soft_wrap_text;
 use crate::ui::theme;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -25,8 +26,13 @@ impl ConfirmationDialog {
 impl Component for ConfirmationDialog {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let t = theme::theme();
-        let width = 50;
-        let height = 8;
+        let width = 60.min(area.width);
+        let message_width = usize::from(width.saturating_sub(2)).max(1);
+        let message_lines = soft_wrap_text(&self.message, message_width);
+        let height = (message_lines.len() as u16)
+            .saturating_add(4)
+            .max(8)
+            .min(area.height);
 
         let x = area.x + (area.width.saturating_sub(width)) / 2;
         let y = area.y + (area.height.saturating_sub(height)) / 2;
@@ -49,7 +55,11 @@ impl Component for ConfirmationDialog {
             .constraints([Constraint::Min(1), Constraint::Length(2)])
             .split(inner);
 
-        let msg_para = Paragraph::new(self.message.as_str())
+        let message_lines = message_lines
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        let msg_para = Paragraph::new(message_lines)
             .alignment(Alignment::Center)
             .style(Style::default().fg(t.dialog_text));
 
@@ -78,5 +88,47 @@ impl Component for ConfirmationDialog {
 
     fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> EventResult {
         EventResult::Ignored
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn long_messages_are_wrapped_before_rendering() {
+        let message = "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis OCI backing layer may still be referenced by an mstack image.";
+        let lines = soft_wrap_text(message, 30);
+
+        assert!(lines.len() > 2);
+        assert!(lines
+            .iter()
+            .all(|line| { unicode_width::UnicodeWidthStr::width(line.as_str()) <= 30 }));
+    }
+
+    #[test]
+    fn render_keeps_long_confirmation_content_visible() {
+        crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
+        let mut dialog = ConfirmationDialog::new(
+            "Delete Image",
+            "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis OCI backing layer may still be referenced by an mstack image.",
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area()))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("This OCI backing layer may still"));
+        assert!(rendered.contains("mstack image."));
     }
 }

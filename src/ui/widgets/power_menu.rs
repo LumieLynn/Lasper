@@ -4,6 +4,7 @@ use ratatui::{layout::Rect, Frame};
 
 pub struct PowerMenu {
     list: SelectableList<String>,
+    image_mode: bool,
 }
 
 impl PowerMenu {
@@ -16,25 +17,44 @@ impl PowerMenu {
             "  ☠  Kill (SIGKILL)".to_string(),
             "  ⬆  Enable at Boot".to_string(),
             "  ⬇  Disable at Boot".to_string(),
-            "  ✕  Delete Container".to_string(),
         ];
 
         let mut list = SelectableList::new(" [ Power Actions ] ", items, |s| s.clone());
         list.select(selected);
 
-        Self { list }
+        Self {
+            list,
+            image_mode: false,
+        }
+    }
+
+    pub fn new_for_images(selected: usize) -> Self {
+        let items = vec![
+            "  ▶  Start Image".to_string(),
+            "  ✕  Delete Image".to_string(),
+        ];
+        let mut list = SelectableList::new(" [ Image Actions ] ", items, |s| s.clone());
+        list.select(selected);
+        Self {
+            list,
+            image_mode: true,
+        }
     }
 
     pub fn get_selected(&self) -> usize {
         self.list.selected_idx().unwrap_or(0)
+    }
+
+    pub fn is_image_menu(&self) -> bool {
+        self.image_mode
     }
 }
 
 impl Component for PowerMenu {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         // Use fixed height for 7 items + borders + title
-        let menu_height = 10;
-        let menu_width = 32;
+        let menu_height = if self.image_mode { 4 } else { 9 };
+        let menu_width = if self.image_mode { 28 } else { 32 };
 
         // Manual centering
         let x = area.x + (area.width.saturating_sub(menu_width)) / 2;

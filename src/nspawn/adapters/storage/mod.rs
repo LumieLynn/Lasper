@@ -55,7 +55,6 @@ pub trait StorageBackend: Send + Sync {
         &self,
         name: &str,
         cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
     ) -> Result<PathBuf>;
 
     /// Mount the storage and return the path to the rootfs.
@@ -63,7 +62,6 @@ pub trait StorageBackend: Send + Sync {
         &self,
         name: &str,
         cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
     ) -> Result<PathBuf>;
 
     /// Unmount the storage.
@@ -71,14 +69,12 @@ pub trait StorageBackend: Send + Sync {
         &self,
         name: &str,
         cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
     ) -> Result<()>;
 
     async fn delete(
         &self,
         name: &str,
         cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
     ) -> Result<()>;
     #[allow(dead_code)]
     async fn exists(&self, name: &str) -> bool;

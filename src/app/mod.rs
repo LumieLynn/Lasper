@@ -9,13 +9,14 @@ use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    models::{ContainerEntry, ContainerMetrics, CpuRepresentation},
+    models::{ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry},
     ops::{DefaultManager, NspawnManager},
     sys::ExecutionContext,
 };
 use crate::ui::core::{Component, FocusTracker};
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
+use crate::ui::views::image_list::ImageListComponent;
 use crate::ui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io::Stdout;
@@ -33,11 +34,17 @@ pub const CONTAINER_LIST_PCT_MIN: u16 = 15;
 pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
 pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
+pub const LEFT_MACHINES_PCT_MIN: u16 = 20;
+pub const LEFT_MACHINES_PCT_MAX: u16 = 80;
+pub const IMAGE_INFO_HEIGHT_MIN: u16 = 5;
+pub const IMAGE_INFO_HEIGHT_MAX: u16 = 30;
 
 /// Screen-area rects for mouse hit-testing, populated on each render.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PanelLayout {
-    pub list: Rect,
+    pub machines: Rect,
+    pub images: Rect,
+    pub image_info: Rect,
     pub detail: Rect,
     pub terminal: Option<Rect>,
 }
@@ -46,6 +53,7 @@ pub struct AppUi {
     pub focus: FocusTracker,
     pub prev_active_idx: usize,
     pub container_list: ContainerListComponent,
+    pub image_list: ImageListComponent,
     pub detail_panel: DetailPanel,
 
     pub show_wizard: bool,
@@ -65,6 +73,10 @@ pub struct AppUi {
 
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
+    pub left_machines_pct: u16,
+    pub image_info_height: u16,
+    pub image_info_scroll: u16,
+    pub image_info_max_scroll: u16,
     pub detail_pct: u16,
 
     /// Current panel screen rects for mouse hit-testing.
@@ -82,6 +94,7 @@ impl AppUi {
             focus: FocusTracker::new(),
             prev_active_idx: 0,
             container_list: ContainerListComponent::new(),
+            image_list: ImageListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
@@ -97,6 +110,10 @@ impl AppUi {
             active_dialog: None,
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
+            left_machines_pct: 50,
+            image_info_height: 9,
+            image_info_scroll: 0,
+            image_info_max_scroll: 0,
             detail_pct: 60,
             panel_layout: PanelLayout::default(),
             quit_tx: None,
@@ -107,7 +124,13 @@ impl AppUi {
 // App
 
 pub struct AppData {
+    /// Running systemd-machined instances. Persistent images live in `images`.
     pub entries: Vec<ContainerEntry>,
+    /// Normally visible images. Hidden dot-prefixed images are kept separate.
+    pub images: Vec<ImageEntry>,
+    pub internal_images: Vec<ImageEntry>,
+    pub image_selected: usize,
+    pub internal_image_selected: usize,
     pub selected: usize,
     pub properties: Result<crate::nspawn::models::MachineProperties, String>,
     pub log_manager: crate::ui::views::detail_panel::log_manager::LogManager,
@@ -159,6 +182,10 @@ impl App {
             should_quit: false,
             data: AppData {
                 entries: Vec::new(),
+                images: Vec::new(),
+                internal_images: Vec::new(),
+                image_selected: 0,
+                internal_image_selected: 0,
                 selected: 0,
                 properties: Ok(crate::nspawn::models::MachineProperties::default()),
                 log_manager: crate::ui::views::detail_panel::log_manager::LogManager::new(
@@ -243,6 +270,7 @@ impl App {
             .get(self.data.selected)
             .map(|e| e.name.clone());
         self.data.entries = self.merge_transitional_states(entries);
+        self.data.entries.sort();
         let active_names: std::collections::HashSet<&String> =
             self.data.entries.iter().map(|e| &e.name).collect();
         self.data
@@ -259,6 +287,12 @@ impl App {
 
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.entries = self.data.entries.clone();
+            wizard.context.image_names = self
+                .data
+                .images
+                .iter()
+                .map(|image| image.name.clone())
+                .collect();
         }
 
         // Check if any DBus call fell back to CLI during this background refresh
@@ -268,6 +302,59 @@ impl App {
                     format!("DBus fallback: {}", reason),
                     crate::ui::StatusLevel::Warn,
                 );
+            }
+        }
+    }
+
+    /// Apply the independent machine/image snapshot returned by the backend.
+    async fn sync_snapshot(
+        &mut self,
+        machines: Vec<ContainerEntry>,
+        images: Option<Vec<ImageEntry>>,
+    ) {
+        let running: Vec<_> = machines
+            .into_iter()
+            .filter(|e| e.state.is_running())
+            .collect();
+        self.sync_entries(running).await;
+
+        if let Some(images) = images {
+            let previous_name = self
+                .data
+                .images
+                .get(self.data.image_selected)
+                .map(|image| image.name.clone());
+            let previous_internal_name = self
+                .data
+                .internal_images
+                .get(self.data.internal_image_selected)
+                .map(|image| image.name.clone());
+            let (mut visible, mut internal): (Vec<_>, Vec<_>) =
+                images.into_iter().partition(|image| !image.is_hidden());
+            visible.sort();
+            internal.sort();
+            self.data.images = visible;
+            self.data.internal_images = internal;
+            self.data.image_selected = previous_name
+                .and_then(|name| self.data.images.iter().position(|image| image.name == name))
+                .unwrap_or(0)
+                .min(self.data.images.len().saturating_sub(1));
+            self.data.internal_image_selected = previous_internal_name
+                .and_then(|name| {
+                    self.data
+                        .internal_images
+                        .iter()
+                        .position(|image| image.name == name)
+                })
+                .unwrap_or(0)
+                .min(self.data.internal_images.len().saturating_sub(1));
+            if let Some(wizard) = &mut self.ui.wizard {
+                wizard.context.image_names = self
+                    .data
+                    .images
+                    .iter()
+                    .map(|image| image.name.clone())
+                    .collect();
             }
         }
     }
@@ -328,7 +415,8 @@ impl App {
         crate::ui::theme::init_theme(crate::ui::theme::load_theme(self.config.theme.as_ref()));
 
         let mut events = EventHandler::new(100);
-        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<Vec<ContainerEntry>>(1);
+        let (refresh_tx, mut refresh_rx) =
+            tokio::sync::mpsc::channel::<(Vec<ContainerEntry>, Option<Vec<ImageEntry>>)>(1);
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::nspawn::ops::BackendCommand>(100);
 
@@ -357,9 +445,16 @@ impl App {
         let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
             while dirty_rx.recv().await.is_some() {
-                log::debug!("Refresh: dirty_rx nudge, running list_all...");
-                if let Ok(entries) = manager_clone.list_all().await {
-                    let _ = refresh_tx_clone.send(entries).await;
+                log::debug!("Refresh: dirty_rx nudge, running machine/image discovery...");
+                if let Ok(machines) = manager_clone.list_machines().await {
+                    let images = match manager_clone.list_images().await {
+                        Ok(images) => Some(images),
+                        Err(error) => {
+                            log::warn!("Image discovery failed: {}", error);
+                            None
+                        }
+                    };
+                    let _ = refresh_tx_clone.send((machines, images)).await;
                 }
             }
         });
@@ -372,7 +467,7 @@ impl App {
             // updates can't starve user-input events from the select! below.
             for _ in 0..3 {
                 match refresh_rx.try_recv() {
-                    Ok(entries) => self.sync_entries(entries).await,
+                    Ok((machines, images)) => self.sync_snapshot(machines, images).await,
                     Err(_) => break,
                 }
             }
@@ -436,19 +531,30 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerEntry, ContainerState};
+    use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry};
     use std::time::{Duration, Instant};
 
     fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
         ContainerEntry {
             name: name.to_string(),
             state,
-            image_type: None,
-            readonly: false,
-            usage: None,
             address: None,
             all_addresses: vec![],
         }
+    }
+
+    fn make_image(name: &str) -> ImageEntry {
+        ImageEntry {
+            name: name.to_string(),
+            image_type: "directory".to_string(),
+            readonly: false,
+            usage: None,
+            object_path: None,
+        }
+    }
+
+    fn make_internal_image(name: &str) -> ImageEntry {
+        make_image(name)
     }
 
     fn make_app() -> App {
@@ -592,6 +698,82 @@ mod tests {
 
             app.select_prev();
         }
+
+        #[test]
+        fn image_navigation_is_independent_from_machine_selection() {
+            let mut app = make_app();
+            app.data.entries = vec![make_entry("machine", ContainerState::Running)];
+            app.data.images = vec![make_image("a"), make_image("b")];
+            app.ui.focus.active_idx = 1;
+
+            app.select_next();
+
+            assert_eq!(app.data.image_selected, 1);
+            assert_eq!(app.data.selected, 0);
+        }
+
+        #[test]
+        fn internal_image_navigation_has_an_independent_selection() {
+            let mut app = make_app();
+            app.data.images = vec![make_image("regular")];
+            app.data.internal_images = vec![
+                make_internal_image(".internal-a"),
+                make_internal_image(".internal-b"),
+            ];
+            app.ui.focus.active_idx = 1;
+            let _ = app.ui.image_list.handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(']'),
+                    crossterm::event::KeyModifiers::NONE,
+                ),
+                app.data.images.len(),
+            );
+
+            app.select_next();
+
+            assert_eq!(app.data.internal_image_selected, 1);
+            assert_eq!(app.data.image_selected, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn image_refresh_sorts_by_name_and_preserves_selection() {
+        let mut app = make_app();
+        app.data.images = vec![make_image("selected")];
+        app.data.internal_images = vec![make_internal_image(".selected-internal")];
+
+        app.sync_snapshot(
+            vec![],
+            Some(vec![
+                make_image("z-image"),
+                make_image("selected"),
+                make_image("a-image"),
+                make_internal_image(".z-internal"),
+                make_internal_image(".selected-internal"),
+                make_internal_image(".a-internal"),
+            ]),
+        )
+        .await;
+
+        let names: Vec<_> = app
+            .data
+            .images
+            .iter()
+            .map(|image| image.name.as_str())
+            .collect();
+        assert_eq!(names, ["a-image", "selected", "z-image"]);
+        assert_eq!(app.data.image_selected, 1);
+        let internal_names: Vec<_> = app
+            .data
+            .internal_images
+            .iter()
+            .map(|image| image.name.as_str())
+            .collect();
+        assert_eq!(
+            internal_names,
+            [".a-internal", ".selected-internal", ".z-internal"]
+        );
+        assert_eq!(app.data.internal_image_selected, 1);
     }
 
     mod action_cooldown {

@@ -20,7 +20,10 @@ macro_rules! active_comps {
         let selected_kind = $self.selected_kind();
         let mut comps: Vec<&mut dyn Component> = vec![&mut $self.kind_list];
         match selected_kind {
-            SourceKind::Oci => comps.push(&mut $self.oci_url),
+            SourceKind::Oci => {
+                comps.push(&mut $self.oci_url);
+                comps.push(&mut $self.oci_mode);
+            }
             SourceKind::Debootstrap => {
                 comps.push(&mut $self.deboot_mirror);
                 comps.push(&mut $self.deboot_suite);
@@ -47,6 +50,7 @@ impl_wizard_nav!(SourceStepView, active_comps);
 pub struct SourceStepView {
     kind_list: SelectableList<SourceKind>,
     oci_url: TextBox,
+    oci_mode: crate::ui::widgets::selectors::radio_group::RadioGroup,
     deboot_mirror: TextBox,
     deboot_suite: TextBox,
     deboot_pkgs: TextBox,
@@ -94,43 +98,20 @@ impl SourceStepView {
         let mut view = Self {
             kind_list,
             oci_url: TextBox::new(
-                " OCI URL (e.g. alpine, docker://ubuntu) ",
+                " OCI registry reference (e.g. docker.io/library/nginx:latest) ",
                 initial_data.oci_url.clone(),
             )
             .with_validator(|v| {
                 let v = v.trim();
-                if v.is_empty() {
-                    return Err("URL required".into());
-                }
-                if v.chars().any(|c| c.is_control() || "$`!\\\"'".contains(c)) {
-                    return Err("Invalid characters in image reference".into());
-                }
-                if let Some(pos) = v.find("://") {
-                    let prefix = &v[..pos];
-                    if !matches!(prefix, "docker" | "docker-archive" | "docker-daemon") {
-                        return Err(format!("Unknown transport prefix: {}://", prefix));
-                    }
-                    let remainder = &v[pos + 3..];
-                    if remainder.is_empty() {
-                        return Err("URL required".into());
-                    }
-                    if remainder
-                        .chars()
-                        .all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/')
-                    {
-                        Ok(())
-                    } else {
-                        Err("Invalid characters in image reference".into())
-                    }
-                } else if v
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || ".-_:@".contains(c) || c == '/')
-                {
-                    Ok(())
-                } else {
-                    Err("Invalid characters in image reference".into())
-                }
+                crate::nspawn::models::OciReference::new(v)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
             }),
+            oci_mode: crate::ui::widgets::selectors::radio_group::RadioGroup::new(
+                " OCI Storage ",
+                vec!["Writable overlay".into(), "Read-only layers".into()],
+                usize::from(initial_data.oci_read_only),
+            ),
             deboot_mirror: TextBox::new(
                 " Mirror (leave blank for default) ",
                 initial_data.deboot_mirror.clone(),
@@ -254,7 +235,11 @@ impl Component for SourceStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let kind = self.selected_kind();
         let constraints = match kind {
-            SourceKind::Oci => vec![Constraint::Min(0), Constraint::Length(3)],
+            SourceKind::Oci => vec![
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ],
             SourceKind::Debootstrap => vec![
                 Constraint::Min(0),
                 Constraint::Length(3),
@@ -288,7 +273,10 @@ impl Component for SourceStepView {
         self.update_focus();
         self.kind_list.render(f, chunks[0]);
         match kind {
-            SourceKind::Oci => self.oci_url.render(f, chunks[1]),
+            SourceKind::Oci => {
+                self.oci_url.render(f, chunks[1]);
+                self.oci_mode.render(f, chunks[2]);
+            }
             SourceKind::Debootstrap => {
                 self.deboot_mirror.render(f, chunks[1]);
                 self.deboot_suite.render(f, chunks[2]);
@@ -326,10 +314,8 @@ impl Component for SourceStepView {
     fn validate(&mut self) -> Result<(), String> {
         match self.selected_kind() {
             SourceKind::Oci => {
-                crate::nspawn::ops::provision::builders::image::check_tool("skopeo")
-                    .map_err(|_| "Missing dependency: skopeo".to_string())?;
-                crate::nspawn::ops::provision::builders::image::check_tool("umoci")
-                    .map_err(|_| "Missing dependency: umoci".to_string())?;
+                crate::nspawn::ops::provision::oci_operation::ensure_pull_oci_available()
+                    .map_err(|error| error.to_string())?;
                 self.oci_url.validate()?;
             }
             SourceKind::Debootstrap => {
@@ -377,6 +363,7 @@ impl StepComponent for SourceStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.source.kind = self.selected_kind();
         ctx.source.oci_url = self.oci_url.value().to_string();
+        ctx.source.oci_read_only = self.oci_mode.selected_idx() == 1;
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
         ctx.source.deboot_pkgs = self.deboot_pkgs.value().to_string();
@@ -399,7 +386,7 @@ impl StepComponent for SourceStepView {
 fn source_kind_name(kind: &SourceKind) -> String {
     match kind {
         SourceKind::Copy => "copy / clone".into(),
-        SourceKind::Oci => "OCI".into(),
+        SourceKind::Oci => "OCI application".into(),
         SourceKind::Debootstrap => "debootstrap / default".into(),
         SourceKind::Pacstrap => "pacstrap / default".into(),
         SourceKind::Dnf5 => "dnf5 / default".into(),
@@ -423,7 +410,7 @@ fn source_kind_column_width(kinds: &[SourceKind]) -> usize {
 fn source_kind_description(kind: &SourceKind) -> &'static str {
     match kind {
         SourceKind::Copy => "existing container",
-        SourceKind::Oci => "registry rootfs import",
+        SourceKind::Oci => "systemd 260+ experimental",
         SourceKind::Debootstrap => "Debian or Ubuntu",
         SourceKind::Pacstrap => "Arch Linux",
         SourceKind::Dnf5 => "Fedora or RPM",

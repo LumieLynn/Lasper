@@ -22,30 +22,117 @@ impl ContainerState {
     }
 }
 
-/// A container known to machinectl — either running, poweroff, or both.
+/// A machine registered with systemd-machined.
+///
+/// Images are deliberately modeled separately as [`ImageEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContainerEntry {
     /// The name used by machinectl
     pub name: String,
     /// Current lifecycle state
     pub state: ContainerState,
-    /// Image type ("directory", "raw", "tar", …) — from list-images, None if only seen running
-    pub image_type: Option<String>,
-    /// Whether the image is read-only (from list-images)
-    pub readonly: bool,
-    /// Disk usage string (from list-images)
-    pub usage: Option<String>,
     /// Network address (from list, only when running)
     pub address: Option<String>,
     /// All network addresses
     pub all_addresses: Vec<String>,
 }
 
+/// A persistent machine image known to systemd-machined.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageEntry {
+    pub name: String,
+    pub image_type: String,
+    pub readonly: bool,
+    pub usage: Option<String>,
+    pub object_path: Option<String>,
+}
+
+/// The visibility used by systemd's image discovery.
+///
+/// `machinectl list-images` hides dot-prefixed entries unless `--all` is
+/// supplied. Visibility is the only internal/public distinction machined
+/// exposes in its image listing; an image's origin or mstack references are
+/// not part of that data and must not be inferred from its type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageVisibility {
+    Regular,
+    Hidden,
+}
+
+impl ImageVisibility {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Hidden => "hidden",
+        }
+    }
+}
+
+impl ImageEntry {
+    pub fn is_hidden_name(name: &str) -> bool {
+        name.starts_with('.')
+    }
+
+    pub fn visibility(&self) -> ImageVisibility {
+        if Self::is_hidden_name(&self.name) {
+            ImageVisibility::Hidden
+        } else {
+            ImageVisibility::Regular
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.visibility() == ImageVisibility::Hidden
+    }
+
+    pub fn removal_label(&self) -> &'static str {
+        if self.name == ".host" {
+            "blocked: host image"
+        } else {
+            "available"
+        }
+    }
+
+    /// Image names are path components, not necessarily machine names. Keep
+    /// this in sync with systemd's `image_name_is_valid()`: a valid
+    /// filename component, free of control characters and temporary `.#`
+    /// names. Image names are not machine names, so spaces and Unicode are
+    /// valid here.
+    pub fn is_valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 255
+            && name != "."
+            && name != ".."
+            && !name.starts_with(".#")
+            && !name.contains('/')
+            && !name.bytes().any(|byte| byte < b' ' || byte == 0x7f)
+    }
+}
+
+impl Ord for ImageEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name
+            .cmp(&other.name)
+            .then(self.image_type.cmp(&other.image_type))
+            .then(self.readonly.cmp(&other.readonly))
+            .then(self.usage.cmp(&other.usage))
+            .then(self.object_path.cmp(&other.object_path))
+    }
+}
+
+impl PartialOrd for ImageEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 impl Ord for ContainerEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.state
-            .cmp(&other.state)
-            .then(self.name.cmp(&other.name))
+        self.name
+            .cmp(&other.name)
+            .then(self.state.cmp(&other.state))
+            .then(self.address.cmp(&other.address))
+            .then(self.all_addresses.cmp(&other.all_addresses))
     }
 }
 
@@ -182,6 +269,58 @@ mod tests {
     }
 
     #[test]
+    fn image_names_match_systemd_hidden_image_rule() {
+        assert!(ImageEntry::is_hidden_name(".oci-sha256:abc"));
+        assert!(ImageEntry::is_hidden_name(".download"));
+        assert!(!ImageEntry::is_hidden_name("ubuntu-resolute"));
+    }
+
+    #[test]
+    fn image_names_follow_systemd_filename_rules() {
+        assert!(ImageEntry::is_valid_name(".oci-sha256:a3679419"));
+        assert!(ImageEntry::is_valid_name("ubuntu-resolute"));
+        assert!(!ImageEntry::is_valid_name("../host"));
+        assert!(!ImageEntry::is_valid_name("image/name"));
+        assert!(ImageEntry::is_valid_name("Ubuntu Resolute 镜像"));
+        assert!(ImageEntry::is_valid_name(&"x".repeat(255)));
+        assert!(!ImageEntry::is_valid_name(&"x".repeat(256)));
+        assert!(!ImageEntry::is_valid_name(""));
+        assert!(!ImageEntry::is_valid_name("."));
+        assert!(!ImageEntry::is_valid_name(".."));
+        assert!(!ImageEntry::is_valid_name(".#temporary"));
+        assert!(!ImageEntry::is_valid_name("name\nwith-control"));
+        assert!(!ImageEntry::is_valid_name("name\u{7f}"));
+    }
+
+    #[test]
+    fn image_visibility_does_not_infer_image_origin() {
+        let image = |name: &str, image_type: &str, readonly: bool| ImageEntry {
+            name: name.into(),
+            image_type: image_type.into(),
+            readonly,
+            usage: None,
+            object_path: None,
+        };
+
+        assert_eq!(
+            image("ubuntu", "directory", false).visibility(),
+            ImageVisibility::Regular
+        );
+        assert_eq!(
+            image(".download", "subvolume", true).visibility(),
+            ImageVisibility::Hidden
+        );
+        assert_eq!(
+            image(".oci-sha256:abc", "subvolume", true).visibility(),
+            ImageVisibility::Hidden
+        );
+        assert_eq!(
+            image(".unrecognized", "mstack", false).visibility(),
+            ImageVisibility::Hidden
+        );
+    }
+
+    #[test]
     fn test_container_state_is_running() {
         assert!(ContainerState::Running.is_running());
         assert!(ContainerState::Starting.is_running());
@@ -193,9 +332,6 @@ mod tests {
         ContainerEntry {
             name: name.to_string(),
             state,
-            image_type: None,
-            readonly: false,
-            usage: None,
             address: None,
             all_addresses: vec![],
         }
@@ -210,8 +346,8 @@ mod tests {
         ];
         entries.sort();
         assert_eq!(entries[0].name, "a");
-        assert_eq!(entries[1].name, "z");
-        assert_eq!(entries[2].name, "b");
+        assert_eq!(entries[1].name, "b");
+        assert_eq!(entries[2].name, "z");
     }
 
     #[test]
@@ -223,11 +359,33 @@ mod tests {
             make_entry("b", ContainerState::Starting),
         ];
         entries.sort();
-        // Ord is derived enum order: Running(0) < Starting(1) < Exiting(2) < Off(3)
-        assert_eq!(entries[0].name, "a"); // Running
-        assert_eq!(entries[1].name, "b"); // Starting
-        assert_eq!(entries[2].name, "c"); // Exiting
-        assert_eq!(entries[3].name, "d"); // Off
+        assert_eq!(entries[0].name, "a");
+        assert_eq!(entries[1].name, "b");
+        assert_eq!(entries[2].name, "c");
+        assert_eq!(entries[3].name, "d");
+    }
+
+    #[test]
+    fn image_entry_ordering_is_name_based() {
+        let mut images = [
+            ImageEntry {
+                name: "z-image".into(),
+                image_type: "directory".into(),
+                readonly: false,
+                usage: None,
+                object_path: None,
+            },
+            ImageEntry {
+                name: "a-image".into(),
+                image_type: "subvolume".into(),
+                readonly: true,
+                usage: None,
+                object_path: None,
+            },
+        ];
+        images.sort();
+        assert_eq!(images[0].name, "a-image");
+        assert_eq!(images[1].name, "z-image");
     }
 
     #[test]

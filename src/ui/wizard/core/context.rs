@@ -26,6 +26,7 @@ pub struct ConfiguredSourceProfile {
 pub struct SourceState {
     pub kind: SourceKind,
     pub oci_url: String,
+    pub oci_read_only: bool,
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub deboot_pkgs: String,
@@ -48,7 +49,8 @@ impl SourceState {
                 source_name: self.clone_source.clone(),
             },
             SourceKind::Oci => SourceConfig::Oci {
-                url: self.oci_url.clone(),
+                reference: self.oci_url.trim().into(),
+                read_only: self.oci_read_only,
             },
             SourceKind::Debootstrap => {
                 let mut spec = self
@@ -105,6 +107,7 @@ impl SourceState {
 
     pub fn is_storage_managed_externally(&self) -> bool {
         match &self.kind {
+            SourceKind::Oci => true,
             SourceKind::Pull => self.is_pull_raw,
             SourceKind::LocalFile => self.artifact_spec().is_external_storage(),
             SourceKind::Profile { method, name } => self
@@ -464,6 +467,7 @@ pub struct WizardContext {
     pub review: ReviewState,
     pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
+    pub image_names: Vec<String>,
     pub xdg_runtime: Option<String>,
     pub permission_level: PermissionLevel,
     pub exec_ctx: Arc<ExecutionContext>,
@@ -472,6 +476,7 @@ pub struct WizardContext {
 impl WizardContext {
     pub async fn new(
         entries: Vec<ContainerEntry>,
+        image_names: Vec<String>,
         permission_level: PermissionLevel,
         exec_ctx: Arc<ExecutionContext>,
         config: Arc<crate::config::AppConfig>,
@@ -519,6 +524,7 @@ impl WizardContext {
             source: SourceState {
                 kind: default_kind,
                 oci_url: "".to_string(),
+                oci_read_only: false,
                 deboot_mirror: deboot_prefill.mirror.unwrap_or_default(),
                 deboot_suite: deboot_prefill.suite,
                 deboot_pkgs: deboot_prefill.packages.join(" "),
@@ -609,6 +615,7 @@ impl WizardContext {
                 }
             },
             entries,
+            image_names,
             xdg_runtime,
             permission_level,
             exec_ctx,
@@ -688,23 +695,21 @@ impl WizardContext {
     pub fn get_deployer_and_storage(
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
-        io: crate::nspawn::sys::ElevatedIo,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
         bootstrap: crate::nspawn::ops::provision::BootstrapStore,
         image_import: crate::nspawn::ops::provision::ImageImportStore,
-        cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
+        oci_pull: crate::nspawn::ops::provision::OciPullStore,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder().get_deployer_and_storage(
             provision,
-            io,
             nspawn,
             systemd_unit,
             managed_storage,
             bootstrap,
             image_import,
-            cmd_runner,
+            oci_pull,
         )
     }
 
@@ -761,6 +766,7 @@ mod tests {
         SourceState {
             kind: SourceKind::Copy,
             oci_url: "".into(),
+            oci_read_only: false,
             deboot_mirror: "".into(),
             deboot_suite: "".into(),
             deboot_pkgs: "".into(),
@@ -802,6 +808,9 @@ mod tests {
     #[test]
     fn test_source_state_externally_managed() {
         let mut state = test_source_state();
+        state.kind = SourceKind::Oci;
+        assert!(state.is_storage_managed_externally());
+
         state.kind = SourceKind::Pull;
         state.is_pull_raw = true;
         assert!(state.is_storage_managed_externally());
@@ -812,6 +821,22 @@ mod tests {
 
         state.local_path = "test.tar.gz".into();
         assert!(!state.is_storage_managed_externally());
+    }
+
+    #[test]
+    fn oci_source_preserves_systemd_storage_mode() {
+        let mut state = test_source_state();
+        state.kind = SourceKind::Oci;
+        state.oci_url = " docker.io/library/nginx:latest ".into();
+        state.oci_read_only = true;
+
+        assert_eq!(
+            state.extract_config(),
+            SourceConfig::Oci {
+                reference: "docker.io/library/nginx:latest".into(),
+                read_only: true,
+            }
+        );
     }
 
     #[test]

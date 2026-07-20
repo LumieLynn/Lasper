@@ -42,6 +42,9 @@ use crate::nspawn::ops::provision::bootstrap_operation::{
     validate_target as validate_bootstrap_target, BootstrapRequest,
 };
 use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
+use crate::nspawn::ops::provision::oci_operation::{
+    build_command as build_oci_pull_command, OciPullRequest,
+};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
@@ -51,13 +54,13 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Output};
+use std::process::Output;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 3;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct DaemonBootstrap {
@@ -79,10 +82,10 @@ enum FdOperation {
     Journalctl(SpawnJournalctlParams),
     #[serde(rename = "spawn_login")]
     Login(SpawnLoginParams),
-    #[serde(rename = "spawn_shell_cmd")]
-    ShellCommand(SpawnShellCmdParams),
     #[serde(rename = "spawn_bootstrap")]
     Bootstrap(Box<SpawnBootstrapParams>),
+    #[serde(rename = "spawn_oci_pull")]
+    OciPull(Box<SpawnOciPullParams>),
     #[serde(rename = "import_raw_image")]
     ImportRawImage(ImportRawImageParams),
     #[serde(rename = "import_tar_image")]
@@ -104,17 +107,16 @@ struct SpawnLoginParams {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnShellCmdParams {
+struct SpawnBootstrapParams {
     cmd_id: u64,
-    program: String,
-    args: Vec<String>,
+    request: BootstrapRequest,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnBootstrapParams {
+struct SpawnOciPullParams {
     cmd_id: u64,
-    request: BootstrapRequest,
+    request: OciPullRequest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -181,16 +183,11 @@ impl CommandRunner for DaemonCommandRunner {
     }
 
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
-        let cmd_id = self.daemon.reserve_spawn_id();
-        let stdout_fd = self.daemon.spawn_shell_cmd(cmd_id, program, &args).await?;
-        let receiver = pipe_reader(stdout_fd)?;
-        Ok(SpawnedProcess::new(Box::new(receiver), {
-            let daemon = self.daemon.clone();
-            async move {
-                let code = daemon.wait_command(cmd_id).await?;
-                Ok(ExitStatus::from_raw(code))
-            }
-        }))
+        let _ = (program, args);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "generic elevated streaming commands are disabled; use a typed operation",
+        ))
     }
 }
 
@@ -591,46 +588,6 @@ impl ElevatedDaemon {
         })
     }
 
-    pub async fn write_file(
-        &self,
-        path: &std::path::Path,
-        content: &str,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "write_file",
-            serde_json::json!({"path": path.to_string_lossy(), "content": content}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
-    pub async fn create_dir_all(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "create_dir_all",
-            serde_json::json!({"path": path.to_string_lossy()}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
-    pub async fn remove_dir_all(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "remove_dir_all",
-            serde_json::json!({"path": path.to_string_lossy()}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
     pub(crate) async fn nspawn_config(
         &self,
         operation: NspawnConfigOperation,
@@ -790,7 +747,7 @@ impl ElevatedDaemon {
         .await?
     }
 
-    // ── Generic spawn (bootstrap / image pull / …) ──
+    // ── Typed streaming operations ──
 
     /// Allocate a unique ID for a spawned command.
     pub fn reserve_spawn_id(&self) -> u64 {
@@ -798,23 +755,19 @@ impl ElevatedDaemon {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Spawn `sh -c 'exec "$@" 2>&1' -- program args…` as root, return
-    /// the stdout fd.
-    pub async fn spawn_shell_cmd(
+    pub(crate) async fn spawn_bootstrap(
         &self,
         cmd_id: u64,
-        program: &str,
-        args: &[String],
+        request: BootstrapRequest,
     ) -> std::io::Result<RawFd> {
         let std_sock = self
-            .open_fd_channel(FdOperation::ShellCommand(SpawnShellCmdParams {
+            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
                 cmd_id,
-                program: program.to_string(),
-                args: args.to_vec(),
-            }))
+                request,
+            })))
             .await?;
         tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
             let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
             if fd_count > 0 {
@@ -830,13 +783,13 @@ impl ElevatedDaemon {
         .await?
     }
 
-    pub(crate) async fn spawn_bootstrap(
+    pub(crate) async fn spawn_oci_pull(
         &self,
         cmd_id: u64,
-        request: BootstrapRequest,
+        request: OciPullRequest,
     ) -> std::io::Result<RawFd> {
         let std_sock = self
-            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+            .open_fd_channel(FdOperation::OciPull(Box::new(SpawnOciPullParams {
                 cmd_id,
                 request,
             })))
@@ -1280,84 +1233,27 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
-        "write_file" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let content = match request.params["content"].as_str() {
-                Some(c) => c.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing content".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "create_dir_all" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::create_dir_all(&path_str)
-                    .await
-                    .map_err(|e| format!("mkdir -p {}: {}", path_str, e));
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "remove_dir_all" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::remove_dir_all(&path_str)
-                    .await
-                    .map_err(|e| format!("rm -rf {}: {}", path_str, e));
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "dbus_list_all" => {
+        "dbus_list_machines" => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            match dbus.list_all().await {
-                Ok(entries) => match serde_json::to_value(entries) {
+            match dbus.list_machines().await {
+                Ok(machines) => match serde_json::to_value(machines) {
+                    Ok(v) => HandleOutcome::Sync(Ok(v)),
+                    Err(e) => HandleOutcome::Sync(Err(e.to_string())),
+                },
+                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
+            }
+        }
+
+        "dbus_list_images" => {
+            let dbus = match dbus.as_ref() {
+                Some(d) => d,
+                None => return HandleOutcome::Sync(Err("DBus not available".into())),
+            };
+            match dbus.list_images().await {
+                Ok(images) => match serde_json::to_value(images) {
                     Ok(v) => HandleOutcome::Sync(Ok(v)),
                     Err(e) => HandleOutcome::Sync(Err(e.to_string())),
                 },
@@ -1402,10 +1298,18 @@ async fn handle_request(
             .await
         }
         "dbus_remove" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.remove(&name).await.map_err(|e| e.to_string())
-            })
-            .await
+            let dbus = match dbus.as_ref() {
+                Some(d) => d,
+                None => return HandleOutcome::Sync(Err("DBus not available".into())),
+            };
+            let name = match request_image_name(request) {
+                Ok(name) => name,
+                Err(error) => return HandleOutcome::Sync(Err(error)),
+            };
+            match dbus.remove(&name).await {
+                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
+            }
         }
 
         "dbus_kill" => {
@@ -1528,6 +1432,17 @@ fn request_machine_name(request: &RpcRequest) -> Result<MachineName, String> {
         .as_str()
         .ok_or_else(|| "missing name".to_string())?;
     MachineName::try_from(name).map_err(|error| error.to_string())
+}
+
+fn request_image_name(request: &RpcRequest) -> Result<String, String> {
+    let name = request.params["name"]
+        .as_str()
+        .ok_or_else(|| "missing name".to_string())?;
+    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
+        Ok(name.to_string())
+    } else {
+        Err(format!("invalid image name {:?}", name))
+    }
 }
 
 // ── Peer credential verification ──
@@ -1820,16 +1735,18 @@ async fn handle_fd_connection(
             }
         }
 
-        FdOperation::ShellCommand(SpawnShellCmdParams {
-            cmd_id,
-            program,
-            args,
-        }) => {
+        FdOperation::OciPull(params) => {
+            let SpawnOciPullParams { cmd_id, request } = *params;
+            let (program, args) = build_oci_pull_command(&request);
+            log::info!(
+                "[AUDIT] [Step: OCI] Starting typed importctl pull-oci operation for {}",
+                request.machine
+            );
             match crate::nspawn::sys::new_sync_command("sh")
                 .arg("-c")
                 .arg("exec \"$@\" 2>&1")
                 .arg("--")
-                .arg(&program)
+                .arg(program)
                 .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -1840,7 +1757,7 @@ async fn handle_fd_connection(
                     let raw_fd = stdout.as_raw_fd();
 
                     if let Err(e) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
-                        log::error!("Daemon: send_with_fd (spawn_shell_cmd) failed: {}", e);
+                        log::error!("Daemon: send_with_fd (spawn_oci_pull) failed: {}", e);
                     }
                     drop(stdout);
 
@@ -1853,8 +1770,8 @@ async fn handle_fd_connection(
                     });
                 }
                 Err(e) => {
-                    log::error!("Daemon: spawn shell cmd failed: {}", e);
-                    let _ = std_stream.send_with_fd(b"spawn failed", &[]);
+                    log::error!("Daemon: typed OCI pull spawn failed: {}", e);
+                    let _ = std_stream.send_with_fd(b"OCI pull spawn failed", &[]);
                 }
             }
         }
@@ -1931,17 +1848,6 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-// ── Atomic write (daemon side) ──
-
-/// Generic daemon file writes are one-shot replacements. Cross-process
-/// read-modify-write paths must use a typed operation with its own lock.
-async fn write_atomic_impl(path_str: &str, content: &str) -> Result<(), String> {
-    let path = std::path::Path::new(path_str);
-    crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(path, content)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,23 +1866,6 @@ mod tests {
         assert_eq!(json["stdout"], "hello");
         let parsed: CommandResult = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.status, 0);
-    }
-
-    #[tokio::test]
-    async fn generic_write_file_is_atomic_without_persistent_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(".wayland-env");
-
-        write_atomic_impl(path.to_str().unwrap(), "WAYLAND_DISPLAY=wayland-0\n")
-            .await
-            .unwrap();
-
-        assert_eq!(
-            tokio::fs::read_to_string(&path).await.unwrap(),
-            "WAYLAND_DISPLAY=wayland-0\n"
-        );
-        assert!(!path.with_extension("lock").exists());
-        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[test]
@@ -2034,7 +1923,7 @@ mod tests {
 
     #[test]
     fn fd_request_without_authentication_is_rejected_by_parser() {
-        let request = r#"{"method":"spawn_shell_cmd","params":{"program":"id","args":[]}}"#;
+        let request = r#"{"method":"spawn_oci_pull","params":{"cmd_id":1,"request":{"reference":"nginx","machine":"test","read_only":false}}}"#;
         assert!(serde_json::from_str::<FdRequest>(request).is_err());
     }
 
@@ -2092,6 +1981,39 @@ mod tests {
 
         let parsed: FdRequest = serde_json::from_value(json).unwrap();
         assert!(matches!(parsed.operation, FdOperation::Bootstrap(_)));
+    }
+
+    #[test]
+    fn fd_request_round_trip_uses_typed_oci_parameters() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::OciPull(Box::new(SpawnOciPullParams {
+                cmd_id: 9,
+                request: OciPullRequest {
+                    reference: crate::nspawn::models::OciReference::new(
+                        "docker.io/library/nginx:latest",
+                    )
+                    .unwrap(),
+                    machine: MachineName::new("web-app").unwrap(),
+                    read_only: true,
+                },
+            })),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "spawn_oci_pull");
+        assert_eq!(json["params"]["cmd_id"], 9);
+        assert_eq!(
+            json["params"]["request"]["reference"],
+            "docker.io/library/nginx:latest"
+        );
+        assert_eq!(json["params"]["request"]["machine"], "web-app");
+        assert_eq!(json["params"]["request"]["read_only"], true);
+        assert!(json["params"].get("program").is_none());
+        assert!(json["params"].get("args").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(parsed.operation, FdOperation::OciPull(_)));
     }
 
     #[test]
@@ -2172,6 +2094,34 @@ mod tests {
             ..valid
         };
         assert!(request_machine_name(&invalid).is_err());
+    }
+
+    #[test]
+    fn rpc_image_name_validation_allows_hidden_systemd_images_but_not_paths() {
+        let valid = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "dbus_remove".into(),
+            params: serde_json::json!({"name": ".oci-sha256:abc"}),
+        };
+        assert_eq!(request_image_name(&valid).unwrap(), ".oci-sha256:abc");
+
+        let unicode = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 2,
+            method: "dbus_remove".into(),
+            params: serde_json::json!({"name": "Ubuntu Resolute 镜像"}),
+        };
+        assert_eq!(
+            request_image_name(&unicode).unwrap(),
+            "Ubuntu Resolute 镜像"
+        );
+
+        let invalid = RpcRequest {
+            params: serde_json::json!({"name": "../escape"}),
+            ..valid
+        };
+        assert!(request_image_name(&invalid).is_err());
     }
 
     #[tokio::test]

@@ -3,7 +3,7 @@ use crate::nspawn::adapters::comm::cli::CliBackend;
 use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{AllowedSignal, ContainerEntry, MachineProperties};
+use crate::nspawn::models::{AllowedSignal, ContainerEntry, ImageEntry, MachineProperties};
 use crate::nspawn::ops::{PermissionLevel, PermissionManager};
 use crate::nspawn::sys::ExecutionContext;
 use async_trait::async_trait;
@@ -71,7 +71,8 @@ fn valid_invocation_id(value: &str) -> bool {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
+    async fn list_images(&self) -> Result<Vec<ImageEntry>>;
     async fn start(&self, name: &str) -> Result<()>;
     async fn terminate(&self, name: &str) -> Result<()>;
     fn spawn_log_stream(
@@ -379,22 +380,45 @@ macro_rules! fallback_to_cli {
 
 #[async_trait]
 impl NspawnManager for DefaultManager {
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
         if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus.list_all().await {
+            match self.dbus.list_machines().await {
                 Ok(entries) => return Ok(entries),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
-                    log::warn!("DBus list_all failed ({}), falling back to CLI", reason);
+                    log::warn!(
+                        "DBus list_machines failed ({}), falling back to CLI",
+                        reason
+                    );
                     self.mark_fallback(&reason);
                 }
             }
         } else {
-            log::debug!("DBus not available for list_all, using CLI");
+            log::debug!("DBus not available for list_machines, using CLI");
             self.mark_fallback("DBus not available");
         }
-        self.cli.list_all().await.map_err(|e| {
-            log::error!("CLI list_all failed: {}", e);
+        self.cli.list_machines().await.map_err(|e| {
+            log::error!("CLI list_machines failed: {}", e);
+            e
+        })
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+        if !self.cli_mode && self.dbus.is_available().await {
+            match self.dbus.list_images().await {
+                Ok(images) => return Ok(images),
+                Err(e) => {
+                    let reason = Self::classify_fallback(&e);
+                    log::warn!("DBus list_images failed ({}), falling back to CLI", reason);
+                    self.mark_fallback(&reason);
+                }
+            }
+        } else {
+            log::debug!("DBus not available for list_images, using CLI");
+            self.mark_fallback("DBus not available");
+        }
+        self.cli.list_images().await.map_err(|e| {
+            log::error!("CLI list_images failed: {}", e);
             e
         })
     }
@@ -448,6 +472,46 @@ impl NspawnManager for DefaultManager {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
+        if name == ".host" {
+            return Err(crate::nspawn::errors::NspawnError::Validation(
+                "the .host image cannot be removed".into(),
+            ));
+        }
+        if !ImageEntry::is_valid_name(name) {
+            return Err(crate::nspawn::errors::NspawnError::Validation(format!(
+                "invalid image name {:?}",
+                name
+            )));
+        }
+        if self
+            .list_machines()
+            .await?
+            .iter()
+            .any(|machine| machine.name == name && machine.state.is_running())
+        {
+            return Err(crate::nspawn::errors::NspawnError::ContainerAlreadyRunning(
+                name.to_string(),
+            ));
+        }
+
+        let hidden = ImageEntry::is_hidden_name(name);
+        let managed_machine_name = crate::nspawn::models::MachineName::new(name).is_ok();
+        if hidden {
+            log::warn!(
+                "Removing hidden image {} through machined without inferring its origin or references",
+                name
+            );
+        }
+
+        // Keep a removed regular image from leaving an enabled nspawn unit
+        // behind. Hidden images and regular images whose names cannot identify
+        // an nspawn machine have no Lasper-managed unit sidecars.
+        if !hidden && managed_machine_name {
+            if let Err(error) = self.disable(name).await {
+                log::warn!("Failed to disable {} before image removal: {}", name, error);
+            }
+        }
+
         let result = if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.remove(name).await {
                 Ok(()) => Ok(()),
@@ -470,13 +534,33 @@ impl NspawnManager for DefaultManager {
 
         result?;
 
-        // systemd may or may not clean these up — an extra unlink is harmless
-        let _ = self.exec_ctx.nspawn.remove(name).await;
-        let _ = self.exec_ctx.systemd_unit.remove_overrides(name).await;
-        let _ = self.exec_ctx.nvidia_state.remove(name).await;
+        if hidden || !managed_machine_name {
+            self.nudge();
+            return Ok(());
+        }
 
+        let mut cleanup_errors = Vec::new();
+        if let Err(error) = self.exec_ctx.nspawn.remove(name).await {
+            cleanup_errors.push(format!("nspawn config: {}", error));
+        }
+        if let Err(error) = self.exec_ctx.systemd_unit.remove_overrides(name).await {
+            cleanup_errors.push(format!("systemd override: {}", error));
+        }
+        if let Err(error) = self.exec_ctx.nvidia_state.remove(name).await {
+            cleanup_errors.push(format!("NVIDIA state: {}", error));
+        }
+        if let Err(error) = self.reload_daemon_fallback().await {
+            cleanup_errors.push(format!("systemd daemon reload: {}", error));
+        }
         self.nudge();
-        Ok(())
+        if cleanup_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(crate::nspawn::errors::NspawnError::Runtime(format!(
+                "image was removed, but managed cleanup was incomplete: {}",
+                cleanup_errors.join("; ")
+            )))
+        }
     }
 
     fn spawn_log_stream(
@@ -631,43 +715,6 @@ impl NspawnManager for DefaultManager {
                 ufs,
             );
         }
-        if let Some(image_type) = &entry.image_type {
-            if let Some(machine_type) = props
-                .get_group_mut(crate::nspawn::models::GROUP_MACHINE)
-                .remove("Type")
-            {
-                props.insert(
-                    crate::nspawn::models::GROUP_MACHINE,
-                    "Class".into(),
-                    machine_type,
-                );
-            }
-            props.insert(
-                crate::nspawn::models::GROUP_MACHINE,
-                "Type".into(),
-                image_type.clone(),
-            );
-        }
-        if !entry.state.is_running() {
-            props.insert(
-                crate::nspawn::models::GROUP_MACHINE,
-                "ReadOnly".into(),
-                entry.readonly.to_string(),
-            );
-            if let Some(u) = &entry.usage {
-                props.insert(
-                    crate::nspawn::models::GROUP_MACHINE,
-                    "Usage".into(),
-                    u.clone(),
-                );
-            }
-            props.insert(
-                crate::nspawn::models::GROUP_MACHINE,
-                "State".into(),
-                entry.state.label().into(),
-            );
-        }
-
         Ok(props)
     }
 
@@ -810,10 +857,7 @@ mod tests {
     fn dummy_entry(name: &str) -> ContainerEntry {
         ContainerEntry {
             name: name.to_string(),
-            state: ContainerState::Off,
-            image_type: None,
-            readonly: false,
-            usage: None,
+            state: ContainerState::Running,
             address: None,
             all_addresses: vec![],
         }
@@ -854,12 +898,80 @@ mod tests {
         backend
     }
 
-    // list_all
+    #[tokio::test]
+    async fn remove_allows_hidden_images_without_origin_classification() {
+        let dbus = mock_dbus_unavailable();
+        let mut cli = MockContainerBackend::new();
+        cli.expect_list_machines().returning(|| Ok(vec![]));
+        cli.expect_remove().returning(|_| Ok(()));
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        let result = mgr.remove(".download").await;
+
+        assert!(result.is_ok());
+    }
 
     #[tokio::test]
-    async fn test_list_all_uses_dbus_when_available() {
+    async fn remove_allows_hidden_images_of_unknown_type() {
+        let dbus = mock_dbus_unavailable();
+        let mut cli = MockContainerBackend::new();
+        cli.expect_list_machines().returning(|| Ok(vec![]));
+        cli.expect_remove().returning(|_| Ok(()));
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        let result = mgr.remove(".unclassified-image").await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_rechecks_running_machine_state() {
         let mut dbus = mock_dbus_available();
-        dbus.expect_list_all()
+        dbus.expect_list_machines().returning(|| {
+            let mut entry = dummy_entry("active");
+            entry.state = ContainerState::Running;
+            Ok(vec![entry])
+        });
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(MockContainerBackend::new()),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        let error = mgr.remove("active").await.unwrap_err();
+
+        assert!(matches!(error, NspawnError::ContainerAlreadyRunning(_)));
+    }
+
+    // list_machines
+
+    #[tokio::test]
+    async fn test_list_machines_uses_dbus_when_available() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("dbus-entry")]));
 
         let cli = MockContainerBackend::new();
@@ -875,20 +987,20 @@ mod tests {
             nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
-        let entries = mgr.list_all().await.unwrap();
+        let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "dbus-entry");
         assert!(mgr.did_fallback().is_none());
     }
 
     #[tokio::test]
-    async fn test_list_all_falls_back_to_cli_when_dbus_fails() {
+    async fn test_list_machines_falls_back_to_cli_when_dbus_fails() {
         let mut dbus = mock_dbus_available();
-        dbus.expect_list_all()
+        dbus.expect_list_machines()
             .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("dbus down".into()))));
 
         let mut cli = MockContainerBackend::new();
-        cli.expect_list_all()
+        cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("cli-entry")]));
 
         let mgr = DefaultManager {
@@ -902,17 +1014,17 @@ mod tests {
             nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
-        let entries = mgr.list_all().await.unwrap();
+        let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries[0].name, "cli-entry");
         assert!(mgr.did_fallback().is_some());
     }
 
     #[tokio::test]
-    async fn test_list_all_uses_cli_when_dbus_unavailable() {
+    async fn test_list_machines_uses_cli_when_dbus_unavailable() {
         let dbus = mock_dbus_unavailable();
 
         let mut cli = MockContainerBackend::new();
-        cli.expect_list_all()
+        cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("cli-only")]));
 
         let mgr = DefaultManager {
@@ -926,7 +1038,7 @@ mod tests {
             nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
-        let entries = mgr.list_all().await.unwrap();
+        let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries[0].name, "cli-only");
         assert!(mgr.did_fallback().is_some());
     }
@@ -1059,11 +1171,11 @@ mod tests {
     #[tokio::test]
     async fn test_did_fallback_clears_after_read() {
         let mut dbus = mock_dbus_available();
-        dbus.expect_list_all()
+        dbus.expect_list_machines()
             .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("fail".into()))));
 
         let mut cli = MockContainerBackend::new();
-        cli.expect_list_all()
+        cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("test")]));
 
         let mgr = DefaultManager {
@@ -1077,7 +1189,7 @@ mod tests {
             nudge_tx: tokio::sync::watch::channel(()).0,
         };
 
-        mgr.list_all().await.unwrap();
+        mgr.list_machines().await.unwrap();
         assert!(mgr.did_fallback().is_some());
         assert!(mgr.did_fallback().is_none());
     }

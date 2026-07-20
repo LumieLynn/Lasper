@@ -16,7 +16,7 @@ pub struct ReviewStepView {
 impl ReviewStepView {
     pub fn new(content: String) -> Self {
         Self {
-            preview: TextBlock::new(" Preview .nspawn configuration ", content),
+            preview: TextBlock::new(" Deployment Preview ", content),
         }
     }
 }

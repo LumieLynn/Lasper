@@ -36,7 +36,7 @@ impl App {
         }
 
         // Layer 2 – terminal panel when it owns focus
-        if self.ui.focus.active_idx == 2 && self.handle_terminal_focused_key(key).await {
+        if self.ui.focus.active_idx == 3 && self.handle_terminal_focused_key(key).await {
             return;
         }
 
@@ -66,12 +66,14 @@ impl App {
 
         let maximized = self.data.terminal.is_showing() && self.data.terminal.maximized;
 
-        let hit = if in_rect(col, row, layout.list) {
+        let hit = if in_rect(col, row, layout.machines) {
             Some(0usize)
-        } else if !maximized && in_rect(col, row, layout.detail) {
+        } else if in_rect(col, row, layout.images) || in_rect(col, row, layout.image_info) {
             Some(1usize)
-        } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
+        } else if !maximized && in_rect(col, row, layout.detail) {
             Some(2usize)
+        } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
+            Some(3usize)
         } else {
             None
         };
@@ -79,21 +81,37 @@ impl App {
         // Click-to-focus on button press.
         if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
             let n = if self.data.terminal.is_showing() {
-                3
+                4
             } else {
-                2
+                3
             };
             if panel_idx < n
                 && !(self.data.terminal.maximized
                     && self.data.terminal.is_showing()
-                    && panel_idx == 1)
+                    && panel_idx == 2)
             {
                 self.ui.focus.active_idx = panel_idx;
             }
         }
 
+        if in_rect(col, row, layout.image_info) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.ui.image_info_scroll = self.ui.image_info_scroll.saturating_sub(1);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.ui.image_info_scroll = self
+                        .ui
+                        .image_info_scroll
+                        .saturating_add(1)
+                        .min(self.ui.image_info_max_scroll);
+                }
+                _ => {}
+            }
+        }
+
         // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
-        if self.ui.focus.active_idx == 2 && self.data.terminal.is_showing() {
+        if self.ui.focus.active_idx == 3 && self.data.terminal.is_showing() {
             self.data.terminal.handle_mouse(mouse);
         }
     }
@@ -157,8 +175,8 @@ impl App {
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
 
         // If closing a tab emptied the terminal panel, restore focus to a valid panel.
-        if self.ui.focus.active_idx == 2 && !self.data.terminal.is_showing() {
-            self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+        if self.ui.focus.active_idx == 3 && !self.data.terminal.is_showing() {
+            self.ui.focus.active_idx = if self.ui.prev_active_idx == 3 {
                 0
             } else {
                 self.ui.prev_active_idx
@@ -218,17 +236,25 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => self.ui.power_menu = None,
                 KeyCode::Enter => {
                     let idx = pm.get_selected();
+                    let image_menu = pm.is_image_menu();
                     self.ui.power_menu = None;
-                    match idx {
-                        0 => self.action_start(),
-                        1 => self.action_poweroff(),
-                        2 => self.action_reboot(),
-                        3 => self.action_terminate(),
-                        4 => self.action_kill(),
-                        5 => self.action_enable(),
-                        6 => self.action_disable(),
-                        7 => self.show_delete_dialog(),
-                        _ => {}
+                    if image_menu {
+                        match idx {
+                            0 => self.action_start(),
+                            1 => self.show_delete_dialog(),
+                            _ => {}
+                        }
+                    } else {
+                        match idx {
+                            0 => self.action_start(),
+                            1 => self.action_poweroff(),
+                            2 => self.action_reboot(),
+                            3 => self.action_terminate(),
+                            4 => self.action_kill(),
+                            5 => self.action_enable(),
+                            6 => self.action_disable(),
+                            _ => {}
+                        }
                     }
                 }
                 _ => {
@@ -265,14 +291,14 @@ impl App {
             }
             KeyCode::Tab => {
                 let n = if self.data.terminal.is_showing() {
-                    3
+                    4
                 } else {
-                    2
+                    3
                 };
                 self.ui.focus.cycle_forward(n);
                 if self.data.terminal.is_showing()
                     && self.data.terminal.maximized
-                    && self.ui.focus.active_idx == 1
+                    && self.ui.focus.active_idx == 2
                 {
                     self.ui.focus.cycle_forward(n);
                 }
@@ -280,14 +306,14 @@ impl App {
             }
             KeyCode::BackTab => {
                 let n = if self.data.terminal.is_showing() {
-                    3
+                    4
                 } else {
-                    2
+                    3
                 };
                 self.ui.focus.cycle_backward(n);
                 if self.data.terminal.is_showing()
                     && self.data.terminal.maximized
-                    && self.ui.focus.active_idx == 1
+                    && self.ui.focus.active_idx == 2
                 {
                     self.ui.focus.cycle_backward(n);
                 }
@@ -304,8 +330,24 @@ impl App {
             KeyCode::Char('x') | KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if !self.data.entries.is_empty() {
-                    self.ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
+                if self.image_is_focused() && self.ui.image_list.shows_internal() {
+                    self.set_status(
+                        "Internal images do not expose a start/action menu.".into(),
+                        crate::ui::StatusLevel::Info,
+                    );
+                    return true;
+                }
+                let has_selection = if self.image_is_focused() {
+                    !self.active_images().0.is_empty()
+                } else {
+                    !self.data.entries.is_empty()
+                };
+                if has_selection {
+                    self.ui.power_menu = Some(if self.image_is_focused() {
+                        crate::ui::widgets::power_menu::PowerMenu::new_for_images(0)
+                    } else {
+                        crate::ui::widgets::power_menu::PowerMenu::new(0)
+                    });
                 }
                 true
             }
@@ -332,8 +374,8 @@ impl App {
             KeyCode::Char('T') => {
                 if self.data.terminal.is_showing() {
                     self.data.terminal.maximized = !self.data.terminal.maximized;
-                    if self.data.terminal.maximized && self.ui.focus.active_idx == 1 {
-                        self.ui.focus.active_idx = 2;
+                    if self.data.terminal.maximized && self.ui.focus.active_idx == 2 {
+                        self.ui.focus.active_idx = 3;
                     }
                 }
                 true
@@ -357,10 +399,36 @@ impl App {
                 self.handle_container_list_result(result).await;
             }
             1 => {
+                let page_step = (self.ui.image_info_height / 2).max(1);
+                match key.code {
+                    KeyCode::PageUp => {
+                        self.ui.image_info_scroll =
+                            self.ui.image_info_scroll.saturating_sub(page_step);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        self.ui.image_info_scroll = self
+                            .ui
+                            .image_info_scroll
+                            .saturating_add(page_step)
+                            .min(self.ui.image_info_max_scroll);
+                        return;
+                    }
+                    _ => {}
+                }
+                let was_internal = self.ui.image_list.shows_internal();
+                let image_count = self.active_images().0.len();
+                let result = self.ui.image_list.handle_key(key, image_count);
+                if was_internal != self.ui.image_list.shows_internal() {
+                    self.ui.image_info_scroll = 0;
+                }
+                self.handle_container_list_result(result).await;
+            }
+            2 => {
                 let result = self.ui.detail_panel.handle_key(key);
                 self.handle_detail_panel_result(result).await;
             }
-            2 => {
+            3 => {
                 // Already handled in layer 2; only reached when there are
                 // no active sessions (empty terminal panel).
             }
@@ -372,13 +440,21 @@ impl App {
         match result {
             EventResult::Message(AppMessage::List(ListMessage::Next)) => {
                 self.select_next();
-                self.sync_terminal_to_selected();
-                self.refresh_detail().await;
+                if self.image_is_focused() {
+                    self.ui.image_info_scroll = 0;
+                } else {
+                    self.sync_terminal_to_selected();
+                    self.refresh_detail().await;
+                }
             }
             EventResult::Message(AppMessage::List(ListMessage::Prev)) => {
                 self.select_prev();
-                self.sync_terminal_to_selected();
-                self.refresh_detail().await;
+                if self.image_is_focused() {
+                    self.ui.image_info_scroll = 0;
+                } else {
+                    self.sync_terminal_to_selected();
+                    self.refresh_detail().await;
+                }
             }
             _ => {}
         }
@@ -411,6 +487,11 @@ impl App {
         if let Some(tx) = &self.ui.backend_tx {
             let mut wizard = crate::ui::wizard::Wizard::new(
                 self.data.entries.clone(),
+                self.data
+                    .images
+                    .iter()
+                    .map(|image| image.name.clone())
+                    .collect(),
                 nvidia_installed,
                 tx.clone(),
                 self.permissions.level(),
@@ -433,8 +514,8 @@ impl App {
     async fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            if self.ui.focus.active_idx == 2 {
-                self.ui.focus.active_idx = if self.ui.prev_active_idx == 2 {
+            if self.ui.focus.active_idx == 3 {
+                self.ui.focus.active_idx = if self.ui.prev_active_idx == 3 {
                     0
                 } else {
                     self.ui.prev_active_idx
@@ -446,25 +527,48 @@ impl App {
     }
 
     fn show_delete_dialog(&mut self) {
-        let entry = match self.data.entries.get(self.data.selected) {
-            Some(e) => e,
-            None => return,
-        };
-        if entry.state.is_running() {
-            self.set_status(
-                format!("Stop '{}' before deleting it.", entry.name),
-                crate::ui::StatusLevel::Warn,
+        if self.image_is_focused() {
+            let image = match self.selected_image() {
+                Some(image) => image,
+                None => return,
+            };
+            if image.name == ".host" {
+                self.set_status(
+                    "The .host image cannot be removed.".into(),
+                    crate::ui::StatusLevel::Warn,
+                );
+                return;
+            }
+            if self
+                .data
+                .entries
+                .iter()
+                .any(|machine| machine.name == image.name && machine.state.is_running())
+            {
+                self.set_status(
+                    format!("Stop machine '{}' before deleting its image.", image.name),
+                    crate::ui::StatusLevel::Warn,
+                );
+                return;
+            }
+            let detail = if image.is_hidden() {
+                "This hidden image will be removed from systemd. Individual image removal does not verify whether an .mstack image references it."
+            } else if image.readonly {
+                "This read-only image and its local data will be removed."
+            } else {
+                "This image and its local data will be removed."
+            };
+            self.ui.delete_dialog = Some(
+                crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                    "Delete Image",
+                    format!("Delete '{}' ?\n{}", image.name, detail),
+                ),
             );
             return;
         }
-        self.ui.delete_dialog = Some(
-            crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
-                "Delete Container",
-                format!(
-                    "Delete '{}' and all its data?\nThis cannot be undone.",
-                    entry.name
-                ),
-            ),
+        self.set_status(
+            "Focus Images to remove a machine image.".into(),
+            crate::ui::StatusLevel::Info,
         );
     }
 }
@@ -473,7 +577,7 @@ impl App {
 
 impl App {
     fn is_terminal_insert_mode(&self) -> bool {
-        self.ui.focus.active_idx == 2
+        self.ui.focus.active_idx == 3
             && self
                 .data
                 .terminal
@@ -483,7 +587,7 @@ impl App {
     }
 
     fn handle_resize_key(&mut self, key: KeyEvent) -> bool {
-        let step = 5u16;
+        let percentage_step = 5u16;
 
         match key.code {
             KeyCode::Esc | KeyCode::Char('R') | KeyCode::Char('q') => {
@@ -494,7 +598,7 @@ impl App {
                 self.ui.container_list_pct = self
                     .ui
                     .container_list_pct
-                    .saturating_sub(step)
+                    .saturating_sub(percentage_step)
                     .max(super::CONTAINER_LIST_PCT_MIN);
                 true
             }
@@ -502,27 +606,63 @@ impl App {
                 self.ui.container_list_pct = self
                     .ui
                     .container_list_pct
-                    .saturating_add(step)
+                    .saturating_add(percentage_step)
                     .min(super::CONTAINER_LIST_PCT_MAX);
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down if self.data.terminal.is_showing() => {
+            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx == 0 => {
+                self.ui.left_machines_pct = self
+                    .ui
+                    .left_machines_pct
+                    .saturating_add(percentage_step)
+                    .min(super::LEFT_MACHINES_PCT_MAX);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx == 0 => {
+                self.ui.left_machines_pct = self
+                    .ui
+                    .left_machines_pct
+                    .saturating_sub(percentage_step)
+                    .max(super::LEFT_MACHINES_PCT_MIN);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx == 1 => {
+                self.ui.image_info_height = self
+                    .ui
+                    .image_info_height
+                    .saturating_sub(1)
+                    .max(super::IMAGE_INFO_HEIGHT_MIN);
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx == 1 => {
+                self.ui.image_info_height = self
+                    .ui
+                    .image_info_height
+                    .saturating_add(1)
+                    .min(super::IMAGE_INFO_HEIGHT_MAX);
+                true
+            }
+            KeyCode::Char('j') | KeyCode::Down
+                if self.ui.focus.active_idx >= 2 && self.data.terminal.is_showing() =>
+            {
                 self.ui.detail_pct = self
                     .ui
                     .detail_pct
-                    .saturating_add(step)
+                    .saturating_add(percentage_step)
                     .min(super::DETAIL_PCT_MAX);
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up if self.data.terminal.is_showing() => {
+            KeyCode::Char('k') | KeyCode::Up
+                if self.ui.focus.active_idx >= 2 && self.data.terminal.is_showing() =>
+            {
                 self.ui.detail_pct = self
                     .ui
                     .detail_pct
-                    .saturating_sub(step)
+                    .saturating_sub(percentage_step)
                     .max(super::DETAIL_PCT_MIN);
                 true
             }
-            KeyCode::Tab => false,
+            KeyCode::Tab | KeyCode::BackTab => false,
             _ => true,
         }
     }

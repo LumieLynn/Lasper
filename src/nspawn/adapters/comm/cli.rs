@@ -1,6 +1,8 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ContainerState, MachineName, MachineProperties};
+use crate::nspawn::models::{
+    ContainerEntry, ContainerState, ImageEntry, MachineName, MachineProperties,
+};
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::sys::CommandRunner;
 use std::collections::{HashMap, HashSet};
@@ -120,9 +122,23 @@ impl ContainerBackend for CliBackend {
         which::which("machinectl").is_ok()
     }
 
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
         let running = self.running_map().await?;
+        let mut entries = running
+            .into_iter()
+            .filter(|(name, _)| name != ".host")
+            .map(|(name, all_addresses)| ContainerEntry {
+                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
+                name,
+                state: ContainerState::Running,
+                all_addresses,
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        Ok(entries)
+    }
 
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
         let out = self
             .cmd_runner
             .run(
@@ -132,6 +148,7 @@ impl ContainerBackend for CliBackend {
                     "-l".to_string(),
                     "--no-legend".to_string(),
                     "--no-pager".to_string(),
+                    "--all".to_string(),
                 ],
             )
             .await
@@ -140,61 +157,28 @@ impl ContainerBackend for CliBackend {
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
                 "machinectl list-images",
-                "machinectl list-images -l --no-legend --no-pager",
+                "machinectl list-images -l --no-legend --no-pager --all",
                 &out,
             ));
         }
 
-        let mut entries: Vec<ContainerEntry> = Vec::new();
-
+        let mut images = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
+            if parts.len() < 3 || parts[0] == ".host" {
                 continue;
             }
             let name = parts[0].to_string();
-            if name == ".host" {
-                continue;
-            }
-            let addrs = running.get(&name).cloned().unwrap_or_default();
-            let addr = addrs.first().cloned();
-            let state = if running.contains_key(&name) {
-                ContainerState::Running
-            } else {
-                ContainerState::Off
-            };
-
-            entries.push(ContainerEntry {
-                state,
+            images.push(ImageEntry {
                 name,
-                image_type: Some(parts[1].to_string()),
+                image_type: parts[1].to_string(),
                 readonly: parts[2] == "yes",
                 usage: parts.get(3).map(|s| s.to_string()),
-                address: addr.filter(|s| !s.is_empty()),
-                all_addresses: addrs,
+                object_path: None,
             });
         }
-
-        for (name, addrs) in &running {
-            if name == ".host" {
-                continue;
-            }
-            if !entries.iter().any(|e| &e.name == name) {
-                entries.push(ContainerEntry {
-                    name: name.clone(),
-                    state: ContainerState::Running,
-                    image_type: None,
-                    readonly: false,
-                    usage: None,
-                    address: addrs.first().cloned().filter(|s| !s.is_empty()),
-                    all_addresses: addrs.clone(),
-                });
-            }
-        }
-
-        entries.sort();
-
-        Ok(entries)
+        images.sort();
+        Ok(images)
     }
 
     async fn start(&self, name: &str) -> Result<()> {
@@ -234,8 +218,8 @@ impl ContainerBackend for CliBackend {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["remove", name.as_str()]).await
+        let name = parse_image_name(name)?;
+        self.run_machinectl(&["remove", name]).await
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
@@ -343,7 +327,7 @@ impl ContainerBackend for CliBackend {
                 _ = nudge_rx.changed() => {}
             }
 
-            match self.list_all().await {
+            match self.list_machines().await {
                 Ok(entries) => {
                     let current: HashSet<_> = entries.into_iter().map(|e| e.name).collect();
                     if current != prev {
@@ -352,7 +336,7 @@ impl ContainerBackend for CliBackend {
                     }
                 }
                 Err(e) => {
-                    log::warn!("CLI watch_events: list_all failed: {}", e);
+                    log::warn!("CLI watch_events: list_machines failed: {}", e);
                 }
             }
         }
@@ -376,6 +360,17 @@ impl ProvisionBackend for CliBackend {
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn parse_image_name(name: &str) -> Result<&str> {
+    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
+        Ok(name)
+    } else {
+        Err(NspawnError::Validation(format!(
+            "invalid image name {:?}",
+            name
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -450,64 +445,54 @@ mod tests {
         assert!(!map.contains_key(".host"));
     }
 
-    // list_all
+    #[tokio::test]
+    async fn list_machines_contains_only_registered_runtime_instances() {
+        let runner = std::sync::Arc::new({
+            let mut r = MockCommandRunner::new();
+            r.expect_run()
+                .withf(|program, args| {
+                    program == "machinectl" && args.first().is_some_and(|a| a == "list")
+                })
+                .returning(|_, _| {
+                    Ok(mock_output(
+                        true,
+                        "active container systemd-nspawn running - 10.0.0.2\n",
+                        "",
+                    ))
+                });
+            r
+        });
+        let provider = CliBackend::with_runner(runner);
+
+        let machines = provider.list_machines().await.unwrap();
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "active");
+        assert_eq!(machines[0].state, ContainerState::Running);
+    }
 
     #[tokio::test]
-    async fn test_list_all_merges_images_and_running() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+    async fn list_images_preserves_names_used_for_hidden_visibility() {
+        let runner = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run().returning(|_, args| {
-                if args.iter().any(|a| a == "list-images") {
-                    Ok(mock_output(
-                        true,
-                        "my-ctr directory no 123456 -\n\
-                             other   directory no 789012 -\n",
-                        "",
-                    ))
-                } else {
-                    Ok(mock_output(
-                        true,
-                        "my-ctr container systemd-nspawn running - 10.0.0.1\n",
-                        "",
-                    ))
-                }
+            r.expect_run().returning(|_, _| {
+                Ok(mock_output(
+                    true,
+                    ".oci-sha256:abc subvolume yes 10M /var/lib/machines/.oci-sha256:abc\n\
+                     ubuntu mstack no 20M /var/lib/machines/ubuntu.mstack\n",
+                    "",
+                ))
             });
             r
         });
         let provider = CliBackend::with_runner(runner);
 
-        let entries = provider.list_all().await.unwrap();
+        let images = provider.list_images().await.unwrap();
 
-        assert_eq!(entries.len(), 2);
-        let my_ctr = entries.iter().find(|e| e.name == "my-ctr").unwrap();
-        assert_eq!(my_ctr.state, ContainerState::Running);
-        assert_eq!(my_ctr.address.as_deref(), Some("10.0.0.1"));
-
-        let other = entries.iter().find(|e| e.name == "other").unwrap();
-        assert_eq!(other.state, ContainerState::Off);
-        assert!(other.address.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_list_all_non_root_only_running() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            let out_list = mock_output(
-                true,
-                "ctr1 container systemd-nspawn running - 10.0.0.1\n",
-                "",
-            );
-            r.expect_run().returning(move |_, _| Ok(out_list.clone()));
-            r
-        });
-        let provider = CliBackend::with_runner(runner);
-
-        let entries = provider.list_all().await.unwrap();
-
-        // Full merge: list-images returns "container" as image type
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].state, ContainerState::Running);
-        assert_eq!(entries[0].image_type.as_deref(), Some("container"));
+        assert_eq!(images.len(), 2);
+        assert!(images[0].is_hidden());
+        assert!(!images[1].is_hidden());
+        assert_eq!(images[1].image_type, "mstack");
     }
 
     // get_properties

@@ -3,7 +3,7 @@ use crate::nspawn::adapters::config::systemd_unit::systemd_override_content;
 use crate::nspawn::adapters::storage::{StorageBackend, StorageType};
 use crate::nspawn::models::{ArtifactSpec, BootstrapMethod, BootstrapSpec};
 use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
-use crate::nspawn::ops::provision::builders::{bootstrap, clone, image};
+use crate::nspawn::ops::provision::builders::{bootstrap, clone, image, oci};
 use crate::nspawn::ops::provision::Deployer;
 
 /// The different methods available for acquiring a rootfs.
@@ -25,7 +25,7 @@ pub enum SourceKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceConfig {
     Copy { source_name: String },
-    Oci { url: String },
+    Oci { reference: String, read_only: bool },
     Bootstrap(BootstrapSpec),
     Pull { url: String, is_raw: bool },
     Artifact(ArtifactSpec),
@@ -135,6 +135,27 @@ impl ContainerConfigBuilder {
             boot: !matches!(self.source, Some(SourceConfig::Oci { .. })),
         };
 
+        if let Some(SourceConfig::Oci {
+            reference,
+            read_only,
+        }) = &self.source
+        {
+            let mode = if *read_only {
+                "read-only layers"
+            } else {
+                "writable overlay"
+            };
+            let preview = format!(
+                " [SYSTEMD OCI APPLICATION]\n\n Reference: {reference}\n Name: {}\n Storage: /var/lib/machines/{}.mstack\n Mode: {mode}\n Runtime config: preserved from OCI image\n Verification: HTTPS transport authentication; no publisher signature verification\n",
+                basic.name, basic.name
+            );
+            return ContainerConfigWithPreview {
+                cfg,
+                preview,
+                nvidia_profile: None,
+            };
+        }
+
         if let Some(SourceConfig::Copy { source_name }) = &self.source {
             let mut content = format!(
                 " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n",
@@ -184,13 +205,12 @@ impl ContainerConfigBuilder {
     pub fn get_deployer_and_storage(
         &self,
         provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
-        io: crate::nspawn::sys::ElevatedIo,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
         bootstrap: crate::nspawn::ops::provision::BootstrapStore,
         image_import: crate::nspawn::ops::provision::ImageImportStore,
-        cmd_runner: std::sync::Arc<dyn crate::nspawn::sys::CommandRunner>,
+        oci_pull: crate::nspawn::ops::provision::OciPullStore,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
         use crate::nspawn::ops::provision::*;
@@ -225,7 +245,7 @@ impl ContainerConfigBuilder {
             .source
             .as_ref()
             .cloned()
-            .unwrap_or(SourceConfig::Oci { url: String::new() });
+            .expect("deployment source must be configured");
 
         let deployer: Box<dyn Deployer> = match source {
             SourceConfig::Copy { source_name } => Box::new(clone::CloneDeployer {
@@ -234,10 +254,13 @@ impl ContainerConfigBuilder {
                 nspawn,
                 systemd_unit,
             }) as Box<dyn Deployer>,
-            SourceConfig::Oci { url } => Box::new(image::OciDeployer {
-                url,
-                cmd_runner: cmd_runner.clone(),
-                io: io.clone(),
+            SourceConfig::Oci {
+                reference,
+                read_only,
+            } => Box::new(oci::OciDeployer {
+                reference,
+                read_only,
+                oci_pull,
             }) as Box<dyn Deployer>,
             SourceConfig::Artifact(artifact) => Box::new(image::ImageDeployer {
                 source: image::ImageSource::Local(artifact.path.clone()),
@@ -287,10 +310,13 @@ mod tests {
     fn test_build_config_oci_disables_boot() {
         let mut builder = ContainerConfigBuilder::default();
         builder.source = Some(SourceConfig::Oci {
-            url: "ubuntu".to_string(),
+            reference: "docker.io/library/ubuntu".to_string(),
+            read_only: false,
         });
         let result = builder.build_config(None);
         assert!(!result.cfg.boot);
+        assert!(result.preview.contains("/var/lib/machines/unknown.mstack"));
+        assert!(!result.preview.contains("[Exec]"));
     }
 
     #[test]

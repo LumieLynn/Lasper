@@ -4,9 +4,11 @@ pub mod backend;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 pub(crate) mod image_operation;
+pub(crate) mod oci_operation;
 
 pub use bootstrap_operation::BootstrapStore;
 pub use image_operation::ImageImportStore;
+pub use oci_operation::OciPullStore;
 
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;
@@ -85,7 +87,9 @@ pub(crate) async fn send_deploy_stream_log(
     if is_high_signal_deploy_stream(&message) {
         log::warn!("[DEPLOY stream] {}", message);
     } else {
-        log::debug!("[DEPLOY stream] {}", message);
+        // Deployment output must survive the wizard and be available in the
+        // normal per-run log without requiring RUST_LOG=debug.
+        log::info!("[DEPLOY stream] {}", message);
     }
     let _ = logs.send(DeployLogEvent::Line(message)).await;
 }
@@ -185,7 +189,6 @@ async fn run_deploy_internal(
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
-    let io = exec_ctx.io.clone();
     let cli_runner = exec_ctx.cmd.clone();
     let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
         std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
@@ -212,7 +215,7 @@ async fn run_deploy_internal(
             "Creating storage (type: {:?})...",
             storage.get_type()
         ));
-        storage.create(&name, cli_runner.as_ref(), &io).await?;
+        storage.create(&name, cli_runner.as_ref()).await?;
     }
 
     // 2. Deployment & Configuration scoping
@@ -226,7 +229,7 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Mounting storage...".to_string());
-            storage.mount(&name, cli_runner.as_ref(), &io).await?
+            storage.mount(&name, cli_runner.as_ref()).await?
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
             crate::paths::machine_root(&name)
@@ -447,7 +450,7 @@ async fn run_deploy_internal(
     // 2. Unmount Lasper storage
     if !is_ext {
         push_log!("Unmounting storage...".to_string());
-        let _ = storage.unmount(&name, cli_runner.as_ref(), &io).await;
+        let _ = storage.unmount(&name, cli_runner.as_ref()).await;
     }
 
     // 3. Transactional Rollback
@@ -466,7 +469,7 @@ async fn run_deploy_internal(
                 .await;
         } else {
             // Cleanup Lasper-managed storage
-            let _ = storage.delete(&name, cli_runner.as_ref(), &io).await;
+            let _ = storage.delete(&name, cli_runner.as_ref()).await;
         }
         return Err(e);
     }
@@ -496,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_stream_keeps_normal_progress_at_debug_level() {
+    fn deploy_stream_distinguishes_normal_output_from_warnings() {
         for message in [
             "I: Retrieving base-files",
             "I: Extracting base-passwd",

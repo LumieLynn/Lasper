@@ -1,5 +1,5 @@
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{AllowedSignal, ContainerEntry, MachineProperties};
+use crate::nspawn::models::{AllowedSignal, ContainerEntry, ImageEntry, MachineProperties};
 
 /// Unified backend for communicating with systemd-machined.
 ///
@@ -10,7 +10,9 @@ use crate::nspawn::models::{AllowedSignal, ContainerEntry, MachineProperties};
 #[async_trait::async_trait]
 pub trait ContainerBackend: Send + Sync + 'static {
     async fn is_available(&self) -> bool;
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>>;
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
+    /// Return persistent machine images independently from running machines.
+    async fn list_images(&self) -> Result<Vec<ImageEntry>>;
     async fn start(&self, name: &str) -> Result<()>;
     async fn terminate(&self, name: &str) -> Result<()>;
     async fn poweroff(&self, name: &str) -> Result<()>;

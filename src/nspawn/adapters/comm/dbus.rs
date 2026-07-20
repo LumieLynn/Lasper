@@ -2,7 +2,9 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ContainerState, MachineName, MachineProperties};
+use crate::nspawn::models::{
+    ContainerEntry, ContainerState, ImageEntry, MachineName, MachineProperties,
+};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -110,79 +112,57 @@ impl ContainerBackend for DbusBackend {
         self.connection().await.is_some()
     }
 
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
         let machines = proxy.list_machines().await.map_err(NspawnError::Dbus)?;
-        let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
-
         let mut entries = Vec::new();
-        let mut running_names = HashMap::new();
-
         for (name, _class, _service, _path) in machines {
             if name == ".host" {
                 continue;
             }
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
-            let formatted: Vec<String> = addrs
+            let all_addresses: Vec<String> = addrs
                 .into_iter()
                 .map(|(family, data)| {
                     crate::nspawn::adapters::comm::formatting::format_ip_address(family, &data)
                 })
                 .collect();
-            running_names.insert(name, formatted);
-        }
-
-        for (name, img_type, readonly, _cr, _mod, usage, _path) in images {
-            if name == ".host" {
-                continue;
-            }
-            let addrs = running_names.get(&name).cloned().unwrap_or_default();
-            let state = if running_names.contains_key(&name) {
-                ContainerState::Running
-            } else {
-                ContainerState::Off
-            };
-
             entries.push(ContainerEntry {
                 name,
-                state,
-                image_type: Some(img_type),
-                readonly,
-                usage: if usage == u64::MAX {
-                    None
-                } else {
-                    Some(crate::nspawn::adapters::comm::formatting::format_size(
-                        usage,
-                    ))
-                },
-                address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
-                all_addresses: addrs,
+                state: ContainerState::Running,
+                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
+                all_addresses,
             });
         }
-
-        for (name, addrs) in running_names {
-            if name == ".host" {
-                continue;
-            }
-            if !entries.iter().any(|e: &ContainerEntry| e.name == name) {
-                entries.push(ContainerEntry {
-                    name: name.clone(),
-                    state: ContainerState::Running,
-                    image_type: None,
-                    readonly: false,
-                    usage: None,
-                    address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
-                    all_addresses: addrs,
-                });
-            }
-        }
-
         entries.sort();
-
         Ok(entries)
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
+        let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
+        let mut images = images
+            .into_iter()
+            .filter(|(name, ..)| name != ".host")
+            .map(
+                |(name, image_type, readonly, _crtime, _mtime, usage, object_path)| ImageEntry {
+                    name,
+                    image_type,
+                    readonly,
+                    usage: (usage != u64::MAX)
+                        .then(|| crate::nspawn::adapters::comm::formatting::format_size(usage)),
+                    object_path: Some(object_path.to_string()),
+                },
+            )
+            .collect::<Vec<_>>();
+        images.sort();
+        Ok(images)
     }
 
     async fn start(&self, name: &str) -> Result<()> {
@@ -265,15 +245,12 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
+        let name = parse_image_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .remove_image(name.as_str())
-            .await
-            .map_err(NspawnError::Dbus)?;
+        proxy.remove_image(name).await.map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
@@ -347,6 +324,17 @@ impl ContainerBackend for DbusBackend {
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn parse_image_name(name: &str) -> Result<&str> {
+    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
+        Ok(name)
+    } else {
+        Err(NspawnError::Validation(format!(
+            "invalid image name {:?}",
+            name
+        )))
+    }
 }
 
 async fn get_machine1_properties(

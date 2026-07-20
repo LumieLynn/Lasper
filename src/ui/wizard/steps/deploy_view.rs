@@ -115,7 +115,7 @@ impl Component for DeployStepView {
         let status = if !done {
             "Deploying... please wait.".to_string()
         } else if success {
-            "SUCCESS: Container deployed and started!".to_string()
+            "SUCCESS: Deployment completed.".to_string()
         } else {
             "FAILED: Deployment encountered an error.".to_string()
         };

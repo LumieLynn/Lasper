@@ -8,7 +8,7 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
 
@@ -39,11 +39,23 @@ impl ContainerBackend for DaemonBackend {
             .unwrap_or(false)
     }
 
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
-        let json = self.call("dbus_list_all", serde_json::json!({})).await?;
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+        let json = self
+            .call("dbus_list_machines", serde_json::json!({}))
+            .await?;
         serde_json::from_value(json).map_err(|e| {
             NspawnError::Dbus(zbus::Error::Failure(format!(
-                "failed to deserialize list_all response: {}",
+                "failed to deserialize list_machines response: {}",
+                e
+            )))
+        })
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+        let json = self.call("dbus_list_images", serde_json::json!({})).await?;
+        serde_json::from_value(json).map_err(|e| {
+            NspawnError::Dbus(zbus::Error::Failure(format!(
+                "failed to deserialize list_images response: {}",
                 e
             )))
         })
