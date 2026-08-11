@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn long_messages_are_wrapped_before_rendering() {
-        let message = "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis OCI backing layer may still be referenced by an mstack image.";
+        let message = "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis hidden image will be removed through systemd's image management path.";
         let lines = soft_wrap_text(message, 30);
 
         assert!(lines.len() > 2);
@@ -112,7 +112,7 @@ mod tests {
         crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
         let mut dialog = ConfirmationDialog::new(
             "Delete Image",
-            "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis OCI backing layer may still be referenced by an mstack image.",
+            "Delete '.oci-sha256:a3679419df184857c0d317d7cdaad6187f6c0f0b68dd2ed58becf174e28f4c1b' ?\nThis hidden image will be removed through systemd's image management path.",
         );
         let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
         terminal
@@ -128,7 +128,7 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(rendered.contains("This OCI backing layer may still"));
-        assert!(rendered.contains("mstack image."));
+        assert!(rendered.contains("This hidden image will be removed"));
+        assert!(rendered.contains("management path."));
     }
 }

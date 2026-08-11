@@ -21,9 +21,21 @@ const DEFAULT_STATE_DIR: &str = match option_env!("LASPER_STATE_DIR") {
     None => "/var/lib/lasper",
 };
 
+const SYSTEMD_RUNTIME_MACHINES_DIR: &str = "/run/systemd/machines";
+
 /// Base directory for systemd-machined containers.
 pub fn machines_dir() -> PathBuf {
     PathBuf::from(MACHINES_DIR)
+}
+
+/// Runtime registration state maintained by systemd-machined.
+pub fn runtime_machines_dir() -> PathBuf {
+    PathBuf::from(SYSTEMD_RUNTIME_MACHINES_DIR)
+}
+
+/// Runtime registration state for one validated machine name.
+pub fn runtime_machine_state(name: &str) -> PathBuf {
+    runtime_machines_dir().join(name)
 }
 
 /// Root path for a container: `/var/lib/machines/<name>`

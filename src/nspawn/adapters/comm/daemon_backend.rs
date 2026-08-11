@@ -8,7 +8,7 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties};
+use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties, StatusUpdate};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
 
@@ -130,19 +130,19 @@ impl ContainerBackend for DaemonBackend {
         Ok(())
     }
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         let mut event_rx = self.daemon.subscribe_events();
         loop {
             match event_rx.recv().await {
                 Ok(()) => {
-                    if tx.send(()).await.is_err() {
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
                         break; // receiver dropped
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     log::warn!("DaemonBackend event receiver lagged by {} messages", n);
                     // Still nudge — something changed
-                    let _ = tx.send(()).await;
+                    let _ = tx.send(StatusUpdate::Dirty).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::error!("DaemonBackend event channel closed");

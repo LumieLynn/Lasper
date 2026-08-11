@@ -2,7 +2,6 @@
 
 use super::super::{ManagedStorageStore, StorageBackend, StorageType};
 use crate::nspawn::errors::Result;
-use crate::nspawn::sys::CommandRunner;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -31,19 +30,19 @@ impl StorageBackend for DirectoryBackend {
         crate::paths::machine_root(name)
     }
 
-    async fn create(&self, name: &str, _cmd_runner: &dyn CommandRunner) -> Result<PathBuf> {
+    async fn create(&self, name: &str) -> Result<PathBuf> {
         self.store.create_directory(name).await
     }
 
-    async fn mount(&self, name: &str, _cmd_runner: &dyn CommandRunner) -> Result<PathBuf> {
+    async fn mount(&self, name: &str) -> Result<PathBuf> {
         Ok(self.get_path(name))
     }
 
-    async fn unmount(&self, _name: &str, _cmd_runner: &dyn CommandRunner) -> Result<()> {
+    async fn unmount(&self, _name: &str) -> Result<()> {
         Ok(())
     }
 
-    async fn delete(&self, name: &str, _cmd_runner: &dyn CommandRunner) -> Result<()> {
+    async fn delete(&self, name: &str) -> Result<()> {
         self.store.remove_directory(name).await
     }
 

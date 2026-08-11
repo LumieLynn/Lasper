@@ -61,8 +61,8 @@ fn print_help() {
     println!(
         "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
          USAGE:\n    lasper [FLAGS]\n\n\
-         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use an isolated sudo daemon for privileged operations\n    -c, --cli-mode   Force CLI-only mode (skip DBus)\n\n\
-         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use the isolated sudo daemon.\n    [settings] cli-mode = true         Force CLI-only mode.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
+         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use an isolated sudo daemon for privileged operations\n    -c, --cli-mode   Use runtime-state and systemd command backends\n\n\
+         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use the isolated sudo daemon.\n    [settings] cli-mode = true         Disable Lasper's direct DBus backend.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
     //     password prompt (if any) appears on the clean terminal.
     let daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>> =
         if pm.level() == crate::nspawn::ops::PermissionLevel::Elevated {
-            match crate::nspawn::sys::daemon::ElevatedDaemon::spawn().await {
+            match crate::nspawn::sys::daemon::ElevatedDaemon::spawn(!want_cli_mode).await {
                 Ok(d) => Some(std::sync::Arc::new(d)),
                 Err(e) => {
                     eprintln!("Failed to start elevated daemon: {}", e);

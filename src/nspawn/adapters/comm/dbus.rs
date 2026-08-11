@@ -3,7 +3,8 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, ContainerState, ImageEntry, MachineName, MachineProperties,
+    ContainerEntry, ContainerState, ImageEntry, ImageName, MachineName, MachineProperties,
+    StatusUpdate,
 };
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
@@ -149,7 +150,6 @@ impl ContainerBackend for DbusBackend {
         let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
         let mut images = images
             .into_iter()
-            .filter(|(name, ..)| name != ".host")
             .map(
                 |(name, image_type, readonly, _crtime, _mtime, usage, object_path)| ImageEntry {
                     name,
@@ -245,12 +245,20 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
+        if ImageEntry::is_protected_name(name) {
+            return Err(NspawnError::Validation(
+                "the .host image cannot be removed".into(),
+            ));
+        }
         let name = parse_image_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy.remove_image(name).await.map_err(NspawnError::Dbus)?;
+        proxy
+            .remove_image(name.as_str())
+            .await
+            .map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
@@ -293,7 +301,7 @@ impl ContainerBackend for DbusBackend {
         self.call_systemd1::<_, ()>("Reload", &()).await
     }
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         use futures_util::StreamExt;
         let proxy = self
             .manager_proxy()
@@ -311,11 +319,25 @@ impl ContainerBackend for DbusBackend {
 
         loop {
             tokio::select! {
-                Some(_) = new_stream.next() => {
-                    let _ = tx.send(()).await;
+                event = new_stream.next() => {
+                    if event.is_none() {
+                        return Err(NspawnError::Dbus(zbus::Error::Failure(
+                            "machine-new signal stream closed".into(),
+                        )));
+                    }
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                Some(_) = rm_stream.next() => {
-                    let _ = tx.send(()).await;
+                event = rm_stream.next() => {
+                    if event.is_none() {
+                        return Err(NspawnError::Dbus(zbus::Error::Failure(
+                            "machine-removed signal stream closed".into(),
+                        )));
+                    }
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -326,15 +348,8 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
-fn parse_image_name(name: &str) -> Result<&str> {
-    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
-        Ok(name)
-    } else {
-        Err(NspawnError::Validation(format!(
-            "invalid image name {:?}",
-            name
-        )))
-    }
+fn parse_image_name(name: &str) -> Result<ImageName> {
+    ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 async fn get_machine1_properties(
@@ -399,4 +414,23 @@ async fn get_systemd1_properties(
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_names_are_not_validated_as_machine_names() {
+        assert_eq!(
+            parse_image_name(".oci-sha256:abc").unwrap().as_str(),
+            ".oci-sha256:abc"
+        );
+        assert_eq!(
+            parse_image_name("Ubuntu Resolute 镜像").unwrap().as_str(),
+            "Ubuntu Resolute 镜像"
+        );
+        assert!(parse_image_name(".#temporary").is_err());
+        assert!(parse_image_name("../escape").is_err());
+    }
 }

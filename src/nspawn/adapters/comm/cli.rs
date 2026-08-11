@@ -1,25 +1,65 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, ContainerState, ImageEntry, MachineName, MachineProperties,
+    ContainerEntry, ImageEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 use crate::nspawn::ops::provision::backend::ProvisionBackend;
+use crate::nspawn::ops::SystemOperationStore;
 use crate::nspawn::sys::CommandRunner;
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+fn snapshot_update(
+    previous: &mut Option<RuntimeSnapshot>,
+    consecutive_failures: &mut u32,
+    result: Result<RuntimeSnapshot>,
+) -> Option<StatusUpdate> {
+    match result {
+        Ok(snapshot) => {
+            let recovered = *consecutive_failures > 0;
+            *consecutive_failures = 0;
+            let changed = previous.as_ref() != Some(&snapshot);
+            if changed || recovered {
+                *previous = Some(snapshot.clone());
+                Some(StatusUpdate::Snapshot(snapshot))
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            Some(StatusUpdate::BackendFailure {
+                message: error.to_string(),
+                consecutive_failures: *consecutive_failures,
+            })
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CliBackend {
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
+    system_operations: SystemOperationStore,
+    runtime_machines_dir: std::path::PathBuf,
     nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
 impl CliBackend {
+    #[cfg(test)]
     pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
+        let system_operations = SystemOperationStore::new(runner.clone(), None);
+        Self::with_system_operations(runner, system_operations)
+    }
+
+    pub fn with_system_operations(
+        runner: std::sync::Arc<dyn CommandRunner>,
+        system_operations: SystemOperationStore,
+    ) -> Self {
         Self {
             cmd_runner: runner,
+            system_operations,
+            runtime_machines_dir: crate::paths::runtime_machines_dir(),
             nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
@@ -33,86 +73,10 @@ impl CliBackend {
         Self::new(runner)
     }
 
-    async fn run_machinectl(&self, args: &[&str]) -> Result<()> {
-        let out = self
-            .cmd_runner
-            .run("machinectl", args.iter().map(|s| s.to_string()).collect())
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-
-        crate::nspawn::sys::log_output("machinectl", &out);
-
-        if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "machinectl execution",
-                format!("machinectl {}", args.join(" ")),
-                &out,
-            ));
-        }
-        Ok(())
-    }
-
-    /// Returns a map of running machine names to their IP addresses.
-    pub(crate) async fn running_map(&self) -> Result<HashMap<String, Vec<String>>> {
-        let out = self
-            .cmd_runner
-            .run(
-                "machinectl",
-                vec![
-                    "list".to_string(),
-                    "-l".to_string(),
-                    "--no-legend".to_string(),
-                    "--no-pager".to_string(),
-                ],
-            )
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
-
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if !stderr.is_empty() && !stderr.contains("No machines") {
-                return Err(NspawnError::cmd_failed(
-                    "machinectl list",
-                    "machinectl list -l --no-legend --no-pager",
-                    &out,
-                ));
-            }
-            return Ok(HashMap::new());
-        }
-
-        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-        let mut current_machine = String::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if line.starts_with(|c: char| c.is_whitespace()) {
-                let ip = line.trim();
-                if !current_machine.is_empty() && !ip.is_empty() {
-                    if let Some(ips) = map.get_mut(&current_machine) {
-                        ips.push(ip.to_string());
-                    }
-                }
-                continue;
-            }
-
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.is_empty() {
-                continue;
-            }
-            current_machine = parts[0].to_string();
-            if current_machine == ".host" {
-                continue;
-            }
-            let mut ips = Vec::new();
-            if let Some(addr) = parts.get(5).copied() {
-                if !addr.is_empty() && addr != "-" {
-                    ips.push(addr.to_string());
-                }
-            }
-            map.insert(current_machine.clone(), ips);
-        }
-        Ok(map)
+    #[cfg(test)]
+    fn with_runtime_machines_dir(mut self, path: std::path::PathBuf) -> Self {
+        self.runtime_machines_dir = path;
+        self
     }
 }
 
@@ -123,19 +87,10 @@ impl ContainerBackend for CliBackend {
     }
 
     async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
-        let running = self.running_map().await?;
-        let mut entries = running
-            .into_iter()
-            .filter(|(name, _)| name != ".host")
-            .map(|(name, all_addresses)| ContainerEntry {
-                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
-                name,
-                state: ContainerState::Running,
-                all_addresses,
-            })
-            .collect::<Vec<_>>();
-        entries.sort();
-        Ok(entries)
+        crate::nspawn::adapters::comm::runtime_state::list_machines_at(
+            self.runtime_machines_dir.clone(),
+        )
+        .await
     }
 
     async fn list_images(&self) -> Result<Vec<ImageEntry>> {
@@ -144,6 +99,7 @@ impl ContainerBackend for CliBackend {
             .run(
                 "machinectl",
                 vec![
+                    "--no-ask-password".to_string(),
                     "list-images".to_string(),
                     "-l".to_string(),
                     "--no-legend".to_string(),
@@ -157,7 +113,7 @@ impl ContainerBackend for CliBackend {
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
                 "machinectl list-images",
-                "machinectl list-images -l --no-legend --no-pager --all",
+                "machinectl --no-ask-password list-images -l --no-legend --no-pager --all",
                 &out,
             ));
         }
@@ -165,7 +121,7 @@ impl ContainerBackend for CliBackend {
         let mut images = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 || parts[0] == ".host" {
+            if parts.len() < 3 {
                 continue;
             }
             let name = parts[0].to_string();
@@ -182,174 +138,176 @@ impl ContainerBackend for CliBackend {
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["start", name.as_str()]).await
+        self.system_operations.start(name).await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["terminate", name.as_str()]).await
+        self.system_operations.terminate(name).await
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["poweroff", name.as_str()]).await
+        self.system_operations.poweroff(name).await
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["reboot", name.as_str()]).await
+        self.system_operations.reboot(name).await
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["enable", name.as_str()]).await
+        self.system_operations.enable(name).await
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["disable", name.as_str()]).await
+        self.system_operations.disable(name).await
     }
 
     async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        self.run_machinectl(&["kill", "-s", signal.as_name(), name.as_str()])
-            .await
+        self.system_operations.kill(name, signal).await
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        let name = parse_image_name(name)?;
-        self.run_machinectl(&["remove", name]).await
+        self.system_operations.remove_image(name).await
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        let name = parse_machine_name(name)?;
-        let mut props = MachineProperties::default();
-
-        let machine_out = self
-            .cmd_runner
-            .run(
-                "machinectl",
-                vec!["show".to_string(), name.as_str().to_string()],
-            )
-            .await;
-
-        if let Ok(out) = machine_out {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        let key = k.trim();
-                        let val = v.trim();
-                        let formatted = crate::nspawn::adapters::comm::formatting::format_property(
-                            key,
-                            &zbus::zvariant::Value::Str(val.into()),
-                        );
-                        props.insert(
-                            crate::nspawn::models::GROUP_MACHINE,
-                            key.to_string(),
-                            formatted,
-                        );
-                    }
-                }
-            }
-        }
-
-        let system_out = self
-            .cmd_runner
-            .run(
-                "systemctl",
-                vec!["show".to_string(), name.systemd_nspawn_unit()],
-            )
-            .await;
-
-        if let Ok(out) = system_out {
-            if out.status.success() {
-                for line in String::from_utf8_lossy(&out.stdout).lines() {
-                    if let Some((k, v)) = line.split_once('=') {
-                        let key = k.trim();
-                        let val = v.trim();
-                        let formatted = crate::nspawn::adapters::comm::formatting::format_property(
-                            key,
-                            &zbus::zvariant::Value::Str(val.into()),
-                        );
-                        crate::nspawn::adapters::comm::formatting::insert_systemd_property(
-                            &mut props,
-                            key.to_string(),
-                            formatted,
-                        );
-                    }
-                }
-            }
-        }
-
-        if props.groups.is_empty() {
-            return Err(NspawnError::CommandFailed(
-                format!("machinectl/systemctl show {}", name.as_str()),
-                "No properties found".to_string(),
-                "The target machine might not exist or systemd-nspawn is not managing it."
-                    .to_string(),
-            ));
-        }
-
-        Ok(props)
+        get_properties_with_runner(name, self.cmd_runner.as_ref()).await
     }
 
     async fn reload_daemon(&self) -> Result<()> {
-        let out = self
-            .cmd_runner
-            .run("systemctl", vec!["daemon-reload".to_string()])
-            .await
-            .map_err(|e| NspawnError::Io(std::path::PathBuf::from("systemctl"), e))?;
-
-        crate::nspawn::sys::log_output("systemctl", &out);
-
-        if !out.status.success() {
-            return Err(NspawnError::cmd_failed(
-                "systemctl daemon-reload",
-                "systemctl daemon-reload",
-                &out,
-            ));
-        }
-        Ok(())
+        self.system_operations.reload_daemon().await
     }
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         let mut nudge_rx = self.nudge_rx.lock().take().ok_or_else(|| {
             NspawnError::Dbus(zbus::Error::Failure(
                 "watch_events: no nudge channel set on CliBackend".into(),
             ))
         })?;
 
-        let mut prev: HashSet<String> = HashSet::new();
+        let mut previous = None;
+        let mut consecutive_failures = 0;
+        let mut nudge_open = true;
+        let mut interval = tokio::time::interval(WATCH_POLL_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(WATCH_POLL_INTERVAL) => {}
-                _ = nudge_rx.changed() => {}
-            }
-
-            match self.list_machines().await {
-                Ok(entries) => {
-                    let current: HashSet<_> = entries.into_iter().map(|e| e.name).collect();
-                    if current != prev {
-                        let _ = tx.send(()).await;
-                        prev = current;
+            if nudge_open {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    changed = nudge_rx.changed() => {
+                        if changed.is_err() {
+                            nudge_open = false;
+                        }
                     }
                 }
-                Err(e) => {
-                    log::warn!("CLI watch_events: list_machines failed: {}", e);
+            } else {
+                interval.tick().await;
+            }
+            if nudge_open {
+                // Coalesce a nudge that arrived with the interval tick. A
+                // nudge arriving during the snapshot remains pending and
+                // triggers the next pass.
+                let _ = nudge_rx.borrow_and_update();
+            }
+
+            if let Some(update) = snapshot_update(
+                &mut previous,
+                &mut consecutive_failures,
+                self.snapshot().await,
+            ) {
+                if tx.send(update).await.is_err() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Fixed, non-interactive CLI inspection shared with the elevated daemon.
+pub(crate) async fn get_properties_with_runner(
+    name: &str,
+    cmd_runner: &dyn CommandRunner,
+) -> Result<MachineProperties> {
+    let name = parse_machine_name(name)?;
+    let mut props = MachineProperties::default();
+
+    let machine_out = cmd_runner
+        .run(
+            "machinectl",
+            vec![
+                "--no-ask-password".to_string(),
+                "show".to_string(),
+                name.as_str().to_string(),
+            ],
+        )
+        .await;
+
+    if let Ok(out) = machine_out {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    let formatted = crate::nspawn::adapters::comm::formatting::format_property(
+                        key,
+                        &zbus::zvariant::Value::Str(val.into()),
+                    );
+                    props.insert(
+                        crate::nspawn::models::GROUP_MACHINE,
+                        key.to_string(),
+                        formatted,
+                    );
                 }
             }
         }
     }
+
+    let system_out = cmd_runner
+        .run(
+            "systemctl",
+            vec![
+                "--no-ask-password".to_string(),
+                "show".to_string(),
+                name.systemd_nspawn_unit(),
+            ],
+        )
+        .await;
+
+    if let Ok(out) = system_out {
+        if out.status.success() {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    let key = k.trim();
+                    let val = v.trim();
+                    let formatted = crate::nspawn::adapters::comm::formatting::format_property(
+                        key,
+                        &zbus::zvariant::Value::Str(val.into()),
+                    );
+                    crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                        &mut props,
+                        key.to_string(),
+                        formatted,
+                    );
+                }
+            }
+        }
+    }
+
+    if props.groups.is_empty() {
+        return Err(NspawnError::CommandFailed(
+            format!("machinectl/systemctl show {}", name.as_str()),
+            "No properties found".to_string(),
+            "The target machine might not exist or systemd-nspawn is not managing it.".to_string(),
+        ));
+    }
+
+    Ok(props)
 }
 
 #[async_trait::async_trait]
 impl ProvisionBackend for CliBackend {
     async fn clone_image(&self, source: &str, dest: &str) -> Result<()> {
-        let source = parse_machine_name(source)?;
-        let dest = parse_machine_name(dest)?;
-        self.run_machinectl(&["clone", source.as_str(), dest.as_str()])
-            .await
+        self.system_operations.clone_image(source, dest).await
     }
 
     async fn reload_daemon(&self) -> Result<()> {
@@ -362,20 +320,10 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
-fn parse_image_name(name: &str) -> Result<&str> {
-    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
-        Ok(name)
-    } else {
-        Err(NspawnError::Validation(format!(
-            "invalid image name {:?}",
-            name
-        )))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nspawn::models::ContainerState;
     use crate::nspawn::sys::command::MockCommandRunner;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
@@ -388,75 +336,92 @@ mod tests {
         }
     }
 
-    // running_map
+    fn observer_snapshot() -> RuntimeSnapshot {
+        RuntimeSnapshot::new(
+            vec![ContainerEntry {
+                name: "active".into(),
+                state: ContainerState::Running,
+                address: None,
+                all_addresses: vec![],
+            }],
+            vec![ImageEntry {
+                name: "active".into(),
+                image_type: "directory".into(),
+                readonly: false,
+                usage: None,
+                object_path: None,
+            }],
+        )
+    }
+
+    #[test]
+    fn snapshot_observer_publishes_changes_failures_and_recovery() {
+        let snapshot = observer_snapshot();
+        let mut previous = None;
+        let mut failures = 0;
+
+        assert!(matches!(
+            snapshot_update(&mut previous, &mut failures, Ok(snapshot.clone())),
+            Some(StatusUpdate::Snapshot(_))
+        ));
+        assert!(snapshot_update(&mut previous, &mut failures, Ok(snapshot.clone())).is_none());
+
+        let failure = snapshot_update(
+            &mut previous,
+            &mut failures,
+            Err(NspawnError::Runtime("temporary failure".into())),
+        );
+        assert!(matches!(
+            failure,
+            Some(StatusUpdate::BackendFailure {
+                consecutive_failures: 1,
+                ..
+            })
+        ));
+
+        assert!(matches!(
+            snapshot_update(&mut previous, &mut failures, Ok(snapshot)),
+            Some(StatusUpdate::Snapshot(_))
+        ));
+        assert_eq!(failures, 0);
+    }
 
     #[tokio::test]
-    async fn test_running_map_parses_list_output() {
-        let stdout = "machine1  container systemd-nspawn running -  1.2.3.4\n\
-                       machine2  container systemd-nspawn running -  10.0.0.1\n";
-        let out = mock_output(true, stdout, "");
-
+    async fn list_machines_uses_runtime_registrations_without_commands() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run().returning(move |_, _| Ok(out.clone()));
+            r.expect_run().never();
             r
         });
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        let provider =
+            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
-        let provider = CliBackend::with_runner(runner);
-        let map = provider.running_map().await.unwrap();
+        let machines = provider.list_machines().await.unwrap();
 
-        assert_eq!(map.len(), 2);
-        assert_eq!(map.get("machine1").unwrap(), &vec!["1.2.3.4"]);
-        assert_eq!(map.get("machine2").unwrap(), &vec!["10.0.0.1"]);
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0].name, "active");
+        assert_eq!(machines[0].state, ContainerState::Running);
+        assert!(machines[0].all_addresses.is_empty());
     }
 
     #[tokio::test]
-    async fn test_running_map_no_machines_returns_empty() {
-        let out = mock_output(false, "", "No machines.");
-
-        let runner = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            r.expect_run().returning(move |_, _| Ok(out.clone()));
-            r
-        });
-
-        let provider = CliBackend::with_runner(runner);
-        let map = provider.running_map().await.unwrap();
-        assert!(map.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_running_map_skips_host() {
-        let stdout = ".host       container systemd-nspawn running -  -\n\
-                       my-ctr      container systemd-nspawn running -  192.168.1.1\n";
-        let out = mock_output(true, stdout, "");
-
-        let runner = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            r.expect_run().returning(move |_, _| Ok(out.clone()));
-            r
-        });
-
-        let provider = CliBackend::with_runner(runner);
-        let map = provider.running_map().await.unwrap();
-
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key("my-ctr"));
-        assert!(!map.contains_key(".host"));
-    }
-
-    #[tokio::test]
-    async fn list_machines_contains_only_registered_runtime_instances() {
+    async fn list_images_preserves_names_used_for_hidden_visibility() {
         let runner = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
             r.expect_run()
                 .withf(|program, args| {
-                    program == "machinectl" && args.first().is_some_and(|a| a == "list")
+                    program == "machinectl"
+                        && args.first().is_some_and(|arg| arg == "--no-ask-password")
+                        && args.get(1).is_some_and(|arg| arg == "list-images")
                 })
                 .returning(|_, _| {
                     Ok(mock_output(
                         true,
-                        "active container systemd-nspawn running - 10.0.0.2\n",
+                        ".host subvolume yes 1G /\n\
+                     .oci-sha256:abc subvolume yes 10M /var/lib/machines/.oci-sha256:abc\n\
+                     ubuntu mstack no 20M /var/lib/machines/ubuntu.mstack\n",
                         "",
                     ))
                 });
@@ -464,35 +429,54 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let machines = provider.list_machines().await.unwrap();
+        let images = provider.list_images().await.unwrap();
 
-        assert_eq!(machines.len(), 1);
-        assert_eq!(machines[0].name, "active");
-        assert_eq!(machines[0].state, ContainerState::Running);
+        assert_eq!(images.len(), 3);
+        assert!(
+            images
+                .iter()
+                .all(|image| image.name == ".host"
+                    || image.is_hidden() == image.name.starts_with('.'))
+        );
+        assert!(images.iter().any(|image| image.name == ".host"));
+        let ubuntu = images.iter().find(|image| image.name == "ubuntu").unwrap();
+        assert!(!ubuntu.is_hidden());
+        assert_eq!(ubuntu.image_type, "mstack");
     }
 
     #[tokio::test]
-    async fn list_images_preserves_names_used_for_hidden_visibility() {
-        let runner = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            r.expect_run().returning(|_, _| {
-                Ok(mock_output(
-                    true,
-                    ".oci-sha256:abc subvolume yes 10M /var/lib/machines/.oci-sha256:abc\n\
-                     ubuntu mstack no 20M /var/lib/machines/ubuntu.mstack\n",
-                    "",
-                ))
-            });
-            r
+    async fn automatic_snapshot_runs_only_the_noninteractive_image_query() {
+        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
+            let mut runner = MockCommandRunner::new();
+            runner
+                .expect_run()
+                .times(1)
+                .withf(|program, args| {
+                    program == "machinectl"
+                        && args
+                            == &[
+                                "--no-ask-password".to_string(),
+                                "list-images".to_string(),
+                                "-l".to_string(),
+                                "--no-legend".to_string(),
+                                "--no-pager".to_string(),
+                                "--all".to_string(),
+                            ]
+                })
+                .returning(|_, _| Ok(mock_output(true, "active directory no 20M\n", "")));
+            runner
         });
-        let provider = CliBackend::with_runner(runner);
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        let provider =
+            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
-        let images = provider.list_images().await.unwrap();
+        let snapshot = provider.snapshot().await.unwrap();
 
-        assert_eq!(images.len(), 2);
-        assert!(images[0].is_hidden());
-        assert!(!images[1].is_hidden());
-        assert_eq!(images[1].image_type, "mstack");
+        assert_eq!(snapshot.machines.len(), 1);
+        assert_eq!(snapshot.machines[0].name, "active");
+        assert_eq!(snapshot.images.len(), 1);
+        assert_eq!(snapshot.images[0].name, "active");
     }
 
     // get_properties
@@ -501,17 +485,23 @@ mod tests {
     async fn test_get_properties_parses_machinectl_and_systemctl_output() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run().returning(|program, _args| {
-                if program == "systemctl" {
-                    Ok(mock_output(
-                        true,
-                        "ActiveState=active\nLoadState=loaded\n",
-                        "",
-                    ))
-                } else {
-                    Ok(mock_output(true, "State=running\nLeader=12345\n", ""))
-                }
-            });
+            r.expect_run()
+                .withf(|program, args| {
+                    matches!(program, "machinectl" | "systemctl")
+                        && args.first().is_some_and(|arg| arg == "--no-ask-password")
+                        && args.get(1).is_some_and(|arg| arg == "show")
+                })
+                .returning(|program, _args| {
+                    if program == "systemctl" {
+                        Ok(mock_output(
+                            true,
+                            "ActiveState=active\nLoadState=loaded\n",
+                            "",
+                        ))
+                    } else {
+                        Ok(mock_output(true, "State=running\nLeader=12345\n", ""))
+                    }
+                });
             r
         });
         let provider = CliBackend::with_runner(runner);

@@ -3,9 +3,11 @@ pub mod inspect;
 pub mod manager;
 pub mod permission;
 pub mod provision;
+pub mod system_operation;
 
 pub use manager::{DefaultManager, NspawnManager};
 pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
+pub use system_operation::SystemOperationStore;
 
 #[derive(Clone)]
 pub enum BackendCommand {

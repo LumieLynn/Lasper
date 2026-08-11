@@ -47,6 +47,86 @@ pub struct ImageEntry {
     pub object_path: Option<String>,
 }
 
+/// A validated systemd machine-image name.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ImageName(String);
+
+impl ImageName {
+    pub fn new(name: impl Into<String>) -> Result<Self, ImageNameError> {
+        let name = name.into();
+        if ImageEntry::is_valid_name(&name) {
+            Ok(Self(name))
+        } else {
+            Err(ImageNameError(name))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImageNameError(String);
+
+impl std::fmt::Display for ImageNameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid image name {:?}", self.0)
+    }
+}
+
+impl std::error::Error for ImageNameError {}
+
+/// A point-in-time view of the machine manager's persistent state.
+///
+/// Backends normalize their individual lists before constructing a snapshot so
+/// consumers can compare snapshots without depending on command output order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeSnapshot {
+    pub machines: Vec<ContainerEntry>,
+    pub images: Vec<ImageEntry>,
+}
+
+impl RuntimeSnapshot {
+    pub fn new(mut machines: Vec<ContainerEntry>, mut images: Vec<ImageEntry>) -> Self {
+        for machine in &mut machines {
+            machine.all_addresses.retain(|address| !address.is_empty());
+            machine.all_addresses.sort();
+            machine.all_addresses.dedup();
+            machine.address = machine.all_addresses.first().cloned();
+        }
+        machines.sort();
+        images.sort();
+        Self { machines, images }
+    }
+}
+
+/// Notification emitted by a status observer.
+///
+/// `Dirty` is intentionally only a hint for DBus and filesystem observers. A
+/// CLI observer can publish the completed snapshot directly, avoiding a second
+/// command round-trip in the application refresh worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusUpdate {
+    Snapshot(RuntimeSnapshot),
+    Dirty,
+    BackendFailure {
+        message: String,
+        consecutive_failures: u32,
+    },
+}
+
 /// The visibility used by systemd's image discovery.
 ///
 /// `machinectl list-images` hides dot-prefixed entries unless `--all` is
@@ -69,6 +149,10 @@ impl ImageVisibility {
 }
 
 impl ImageEntry {
+    pub fn is_protected_name(name: &str) -> bool {
+        name == ".host"
+    }
+
     pub fn is_hidden_name(name: &str) -> bool {
         name.starts_with('.')
     }
@@ -86,7 +170,7 @@ impl ImageEntry {
     }
 
     pub fn removal_label(&self) -> &'static str {
-        if self.name == ".host" {
+        if Self::is_protected_name(&self.name) {
             "blocked: host image"
         } else {
             "available"
@@ -94,10 +178,11 @@ impl ImageEntry {
     }
 
     /// Image names are path components, not necessarily machine names. Keep
-    /// this in sync with systemd's `image_name_is_valid()`: a valid
-    /// filename component, free of control characters and temporary `.#`
-    /// names. Image names are not machine names, so spaces and Unicode are
-    /// valid here.
+    /// this in sync with systemd's `image_name_is_valid()`: a valid UTF-8
+    /// filename component, free of ASCII control characters, path separators,
+    /// and the `.#` prefix reserved for temporary files. Image names are not
+    /// machine names, so spaces, Unicode, and systemd's dot-prefixed cache
+    /// names are valid here.
     pub fn is_valid_name(name: &str) -> bool {
         !name.is_empty()
             && name.len() <= 255
@@ -270,6 +355,8 @@ mod tests {
 
     #[test]
     fn image_names_match_systemd_hidden_image_rule() {
+        assert!(ImageEntry::is_protected_name(".host"));
+        assert!(!ImageEntry::is_protected_name(".oci-sha256:abc"));
         assert!(ImageEntry::is_hidden_name(".oci-sha256:abc"));
         assert!(ImageEntry::is_hidden_name(".download"));
         assert!(!ImageEntry::is_hidden_name("ubuntu-resolute"));
@@ -290,6 +377,16 @@ mod tests {
         assert!(!ImageEntry::is_valid_name(".#temporary"));
         assert!(!ImageEntry::is_valid_name("name\nwith-control"));
         assert!(!ImageEntry::is_valid_name("name\u{7f}"));
+        assert!(ImageEntry::is_valid_name("name\u{85}"));
+    }
+
+    #[test]
+    fn image_name_deserialization_revalidates_the_filename_component() {
+        let hidden: ImageName = serde_json::from_str(r#"".oci-sha256:abc""#).unwrap();
+        assert_eq!(hidden.as_str(), ".oci-sha256:abc");
+        assert!(serde_json::from_str::<ImageName>(r#""../host""#).is_err());
+        assert!(serde_json::from_str::<ImageName>(r#""image/name""#).is_err());
+        assert!(serde_json::from_str::<ImageName>(r#"".#temporary""#).is_err());
     }
 
     #[test]
@@ -318,6 +415,36 @@ mod tests {
             image(".unrecognized", "mstack", false).visibility(),
             ImageVisibility::Hidden
         );
+    }
+
+    #[test]
+    fn runtime_snapshot_normalizes_backend_output_order() {
+        let machine = |name: &str, addresses: Vec<&str>| ContainerEntry {
+            name: name.into(),
+            state: ContainerState::Running,
+            address: addresses.first().map(|address| (*address).into()),
+            all_addresses: addresses.into_iter().map(str::to_string).collect(),
+        };
+        let image = |name: &str| ImageEntry {
+            name: name.into(),
+            image_type: "directory".into(),
+            readonly: false,
+            usage: None,
+            object_path: None,
+        };
+
+        let snapshot = RuntimeSnapshot::new(
+            vec![
+                machine("zeta", vec![]),
+                machine("alpha", vec!["fd00::2", "10.0.0.2", "10.0.0.2"]),
+            ],
+            vec![image("zeta"), image("alpha")],
+        );
+
+        assert_eq!(snapshot.machines[0].name, "alpha");
+        assert_eq!(snapshot.machines[0].address.as_deref(), Some("10.0.0.2"));
+        assert_eq!(snapshot.machines[0].all_addresses, ["10.0.0.2", "fd00::2"]);
+        assert_eq!(snapshot.images[0].name, "alpha");
     }
 
     #[test]

@@ -3,13 +3,15 @@ use crate::nspawn::adapters::comm::cli::CliBackend;
 use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{AllowedSignal, ContainerEntry, ImageEntry, MachineProperties};
+use crate::nspawn::models::{
+    AllowedSignal, ContainerEntry, ImageEntry, MachineProperties, RuntimeSnapshot, StatusUpdate,
+};
 use crate::nspawn::ops::{PermissionLevel, PermissionManager};
 use crate::nspawn::sys::ExecutionContext;
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::AsyncBufReadExt;
 
 const START_CONFIRM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -72,7 +74,7 @@ fn valid_invocation_id(value: &str) -> bool {
 #[async_trait]
 pub trait NspawnManager: Send + Sync + 'static {
     async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
-    async fn list_images(&self) -> Result<Vec<ImageEntry>>;
+    async fn snapshot(&self) -> Result<RuntimeSnapshot>;
     async fn start(&self, name: &str) -> Result<()>;
     async fn terminate(&self, name: &str) -> Result<()>;
     fn spawn_log_stream(
@@ -91,7 +93,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn remove(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
-    async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>);
+    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>);
     fn get_watch_paths(&self) -> Vec<PathBuf>;
 }
 
@@ -114,12 +116,17 @@ impl DefaultManager {
         exec_ctx: std::sync::Arc<ExecutionContext>,
     ) -> Self {
         if cli_mode {
-            log::info!("CLI mode active — DBus backend disabled");
+            log::info!("CLI mode active — Lasper DBus backend disabled");
+            if pm.level() == PermissionLevel::Elevated {
+                log::info!("Elevated CLI inspection routed through the root daemon");
+            }
         }
 
         let dbus_backend: std::sync::Arc<dyn ContainerBackend> = match pm.level() {
             PermissionLevel::Elevated => {
-                log::info!("Elevated mode — DBus operations proxied through daemon");
+                if !cli_mode {
+                    log::info!("Elevated mode — DBus operations proxied through daemon");
+                }
                 std::sync::Arc::new(DaemonBackend::new(
                     exec_ctx
                         .daemon_ref()
@@ -130,7 +137,10 @@ impl DefaultManager {
             _ => std::sync::Arc::new(DbusBackend::new()),
         };
 
-        let cli_backend = CliBackend::new(exec_ctx.cmd.clone());
+        let cli_backend = CliBackend::with_system_operations(
+            exec_ctx.local_cmd.clone(),
+            exec_ctx.system_operations.clone(),
+        );
         let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
         cli_backend.set_nudge(nudge_rx);
         Self {
@@ -140,7 +150,10 @@ impl DefaultManager {
             cli: std::sync::Arc::new(cli_backend),
             exec_ctx,
             last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![crate::paths::machines_dir()],
+            watch_paths: vec![
+                crate::paths::machines_dir(),
+                crate::paths::runtime_machines_dir(),
+            ],
             nudge_tx,
         }
     }
@@ -334,7 +347,7 @@ impl DefaultManager {
 
     async fn read_journal(&self, args: Vec<String>) -> Option<String> {
         self.exec_ctx
-            .cmd
+            .local_cmd
             .run("journalctl", args)
             .await
             .ok()
@@ -403,23 +416,23 @@ impl NspawnManager for DefaultManager {
         })
     }
 
-    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+    async fn snapshot(&self) -> Result<RuntimeSnapshot> {
         if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus.list_images().await {
-                Ok(images) => return Ok(images),
-                Err(e) => {
-                    let reason = Self::classify_fallback(&e);
-                    log::warn!("DBus list_images failed ({}), falling back to CLI", reason);
+            match self.dbus.snapshot().await {
+                Ok(snapshot) => return Ok(snapshot),
+                Err(error) => {
+                    let reason = Self::classify_fallback(&error);
+                    log::warn!("DBus snapshot failed ({}), falling back to CLI", reason);
                     self.mark_fallback(&reason);
                 }
             }
-        } else {
-            log::debug!("DBus not available for list_images, using CLI");
+        } else if !self.cli_mode {
             self.mark_fallback("DBus not available");
         }
-        self.cli.list_images().await.map_err(|e| {
-            log::error!("CLI list_images failed: {}", e);
-            e
+
+        self.cli.snapshot().await.map_err(|error| {
+            log::error!("CLI snapshot failed: {}", error);
+            error
         })
     }
 
@@ -472,7 +485,7 @@ impl NspawnManager for DefaultManager {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        if name == ".host" {
+        if ImageEntry::is_protected_name(name) {
             return Err(crate::nspawn::errors::NspawnError::Validation(
                 "the .host image cannot be removed".into(),
             ));
@@ -496,13 +509,6 @@ impl NspawnManager for DefaultManager {
 
         let hidden = ImageEntry::is_hidden_name(name);
         let managed_machine_name = crate::nspawn::models::MachineName::new(name).is_ok();
-        if hidden {
-            log::warn!(
-                "Removing hidden image {} through machined without inferring its origin or references",
-                name
-            );
-        }
-
         // Keep a removed regular image from leaving an enabled nspawn unit
         // behind. Hidden images and regular images whose names cannot identify
         // an nspawn machine have no Lasper-managed unit sidecars.
@@ -512,6 +518,10 @@ impl NspawnManager for DefaultManager {
             }
         }
 
+        // systemd's `RemoveImage` operation accepts image names rather than
+        // machine names, including dot-prefixed hidden images. The CLI uses
+        // the same D-Bus method, so both paths share the same validation and
+        // deletion semantics.
         let result = if !self.cli_mode && self.dbus.is_available().await {
             match self.dbus.remove(name).await {
                 Ok(()) => Ok(()),
@@ -677,7 +687,18 @@ impl NspawnManager for DefaultManager {
         name: &str,
         entry: &ContainerEntry,
     ) -> Result<MachineProperties> {
-        let mut props = if !self.cli_mode && self.dbus.is_available().await {
+        let mut props = if self.cli_mode {
+            if let Some(daemon) = self.exec_ctx.daemon_ref() {
+                daemon.cli_inspect_machine(name).await.map_err(|error| {
+                    crate::nspawn::errors::NspawnError::Io(
+                        std::path::PathBuf::from("elevated CLI inspection"),
+                        error,
+                    )
+                })?
+            } else {
+                crate::nspawn::adapters::comm::runtime_state::inspect(name, entry).await?
+            }
+        } else if self.dbus.is_available().await {
             match self.dbus.get_properties(name).await {
                 Ok(p) => p,
                 Err(e) => {
@@ -730,17 +751,23 @@ impl NspawnManager for DefaultManager {
         self.last_fallback_reason.lock().take()
     }
 
-    async fn watch(&self, tx: tokio::sync::mpsc::Sender<()>) {
-        let dbus_available = self.dbus.is_available().await;
+    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) {
+        let dbus_available = if self.cli_mode {
+            false
+        } else {
+            self.dbus.is_available().await
+        };
+        let cli_observer_active = std::sync::Arc::new(AtomicBool::new(!dbus_available));
 
         // 1. DBus Engine: Instant lifecycle updates via signals.
-        //    Falls back to CLI polling when watch_events is unsupported
-        //    (e.g. DaemonBackend without streaming RPC) or DBus is down.
+        //    Falls back to CLI polling if the signal stream closes or DBus is
+        //    unavailable.
         if dbus_available {
             let dbus_clone = self.dbus.clone();
             let cli_clone = self.cli.clone();
             let tx_dbus = tx.clone();
             let tx_cli = tx.clone();
+            let cli_active = cli_observer_active.clone();
             tokio::spawn(async move {
                 match dbus_clone.watch_events(tx_dbus).await {
                     Ok(()) => {}
@@ -749,8 +776,10 @@ impl NspawnManager for DefaultManager {
                             "DBus watcher unavailable ({}), falling back to CLI polling",
                             e
                         );
+                        cli_active.store(true, Ordering::Release);
                         if let Err(e2) = cli_clone.watch_events(tx_cli).await {
                             log::error!("CLI watcher crashed: {}", e2);
+                            cli_active.store(false, Ordering::Release);
                         }
                     }
                 }
@@ -759,9 +788,11 @@ impl NspawnManager for DefaultManager {
             // CLI watcher: poll-based lifecycle detection with action nudging
             let cli_clone = self.cli.clone();
             let tx_cli = tx.clone();
+            let cli_active = cli_observer_active.clone();
             tokio::spawn(async move {
                 if let Err(e) = cli_clone.watch_events(tx_cli).await {
                     log::error!("CLI watcher crashed: {}", e);
+                    cli_active.store(false, Ordering::Release);
                 }
             });
         }
@@ -769,17 +800,23 @@ impl NspawnManager for DefaultManager {
         // 2. FS Engine: Inotify for images/storage changes
         let tx_fs = tx.clone();
         let paths = self.get_watch_paths();
+        let cli_active = cli_observer_active.clone();
+        let nudge_fs = self.nudge_tx.clone();
         tokio::spawn(async move {
             let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel();
 
             let mut watcher = match RecommendedWatcher::new(
                 move |res: std::result::Result<Event, notify::Error>| {
                     if let Ok(event) = &res {
-                        // Only react to files appearing or disappearing;
-                        // ignore Modify events from container disk writes.
+                        // Creation/removal and atomic renames change image or
+                        // runtime-registration membership. Ordinary content
+                        // writes below machine roots remain ignored because
+                        // these watches are non-recursive.
                         if matches!(
                             event.kind,
-                            notify::EventKind::Create(_) | notify::EventKind::Remove(_)
+                            notify::EventKind::Create(_)
+                                | notify::EventKind::Remove(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
                         ) {
                             let _ = notify_tx.send(());
                         }
@@ -813,21 +850,35 @@ impl NspawnManager for DefaultManager {
                     // Wait 200ms to consolidate burst events
                     tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
                     while notify_rx.try_recv().is_ok() {}
-                    let _ = tx_fs.send(()).await;
+                    if cli_active.load(Ordering::Acquire) {
+                        let _ = nudge_fs.send(());
+                    } else if tx_fs.send(StatusUpdate::Dirty).await.is_err() {
+                        break;
+                    }
                 }
             }
         });
 
-        // 3. Heartbeat Engine: Safety net (15s)
+        // 3. Heartbeat Engine: DBus safety net. The CLI observer performs its
+        // own five-second snapshot polling and needs no second timer.
         let tx_hb = tx.clone();
+        let cli_active = cli_observer_active.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(15));
+            interval.tick().await;
             loop {
                 interval.tick().await;
-                log::debug!("Heartbeat nudge");
-                let _ = tx_hb.send(()).await;
+                if !cli_active.load(Ordering::Acquire)
+                    && tx_hb.send(StatusUpdate::Dirty).await.is_err()
+                {
+                    break;
+                }
             }
         });
+
+        if dbus_available {
+            let _ = tx.send(StatusUpdate::Dirty).await;
+        }
     }
 
     fn get_watch_paths(&self) -> Vec<PathBuf> {
@@ -861,6 +912,10 @@ mod tests {
             address: None,
             all_addresses: vec![],
         }
+    }
+
+    fn dummy_snapshot(name: &str) -> RuntimeSnapshot {
+        RuntimeSnapshot::new(vec![dummy_entry(name)], vec![])
     }
 
     fn systemd_properties(entries: &[(&str, &str)]) -> MachineProperties {
@@ -940,6 +995,82 @@ mod tests {
         let result = mgr.remove(".unclassified-image").await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn remove_hidden_image_uses_dbus_image_name_validation() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_machines().returning(|| Ok(vec![]));
+        dbus.expect_remove()
+            .withf(|name| name == ".oci-sha256:abc")
+            .returning(|_| Ok(()));
+
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(MockContainerBackend::new()),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        mgr.remove(".oci-sha256:abc").await.unwrap();
+        assert!(mgr.did_fallback().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_hidden_image_falls_back_only_after_a_real_dbus_failure() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_list_machines().returning(|| Ok(vec![]));
+        dbus.expect_remove().returning(|_| {
+            Err(NspawnError::Dbus(zbus::Error::Failure(
+                "machined unavailable".into(),
+            )))
+        });
+
+        let mut cli = MockContainerBackend::new();
+        cli.expect_remove()
+            .withf(|name| name == ".oci-sha256:abc")
+            .returning(|_| Ok(()));
+
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        mgr.remove(".oci-sha256:abc").await.unwrap();
+        assert!(mgr.did_fallback().is_some());
+    }
+
+    #[tokio::test]
+    async fn remove_rejects_protected_and_temporary_image_names_before_routing() {
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(MockContainerBackend::new()),
+            cli: std::sync::Arc::new(MockContainerBackend::new()),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        assert!(matches!(
+            mgr.remove(".host").await.unwrap_err(),
+            NspawnError::Validation(_)
+        ));
+        assert!(matches!(
+            mgr.remove(".#temporary").await.unwrap_err(),
+            NspawnError::Validation(_)
+        ));
     }
 
     #[tokio::test]
@@ -1041,6 +1172,113 @@ mod tests {
         let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries[0].name, "cli-only");
         assert!(mgr.did_fallback().is_some());
+    }
+
+    #[tokio::test]
+    async fn snapshot_falls_back_as_one_backend_unit() {
+        let mut dbus = mock_dbus_available();
+        dbus.expect_snapshot()
+            .returning(|| Err(NspawnError::Dbus(zbus::Error::Failure("dbus down".into()))));
+
+        let mut cli = MockContainerBackend::new();
+        cli.expect_snapshot()
+            .returning(|| Ok(dummy_snapshot("cli-snapshot")));
+
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: false,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        let snapshot = mgr.snapshot().await.unwrap();
+        assert_eq!(snapshot.machines[0].name, "cli-snapshot");
+        assert!(mgr.did_fallback().is_some());
+    }
+
+    #[tokio::test]
+    async fn cli_mode_snapshot_does_not_probe_dbus() {
+        let dbus = MockContainerBackend::new();
+        let mut cli = MockContainerBackend::new();
+        cli.expect_snapshot()
+            .returning(|| Ok(dummy_snapshot("cli-only")));
+
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+
+        let snapshot = mgr.snapshot().await.unwrap();
+        assert_eq!(snapshot.machines[0].name, "cli-only");
+        assert!(mgr.did_fallback().is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_mode_inspect_does_not_call_either_transport_backend() {
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: true,
+            dbus: std::sync::Arc::new(MockContainerBackend::new()),
+            cli: std::sync::Arc::new(MockContainerBackend::new()),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+        let entry = dummy_entry("lasper-cli-inspect-test");
+
+        let properties = mgr
+            .get_properties("lasper-cli-inspect-test", &entry)
+            .await
+            .unwrap();
+
+        assert_eq!(properties.get_summary()[0].0, "Name");
+        assert_eq!(properties.get_summary()[0].1, "lasper-cli-inspect-test");
+        assert!(mgr.did_fallback().is_none());
+    }
+
+    #[tokio::test]
+    async fn cli_mode_watcher_does_not_probe_dbus() {
+        let dbus = MockContainerBackend::new();
+        let mut cli = MockContainerBackend::new();
+        cli.expect_watch_events().returning(|tx| {
+            tx.try_send(StatusUpdate::BackendFailure {
+                message: "observer started".into(),
+                consecutive_failures: 1,
+            })
+            .unwrap();
+            Ok(())
+        });
+
+        let mgr = DefaultManager {
+            pm: test_pm(),
+            cli_mode: true,
+            dbus: std::sync::Arc::new(dbus),
+            cli: std::sync::Arc::new(cli),
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+
+        mgr.watch(tx).await;
+
+        let update = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(update, StatusUpdate::BackendFailure { .. }));
     }
 
     // fallback paths

@@ -5,8 +5,8 @@
 //! The [`AuditScope`] wraps each privileged call with audit logging.
 //!
 //! In Elevated mode, privileged operations are dispatched through the
-//! elevated daemon which spawns one-shot workers for command execution
-//! and file I/O while keeping its main loop responsive for DBus queries.
+//! elevated daemon through closed, typed operations while keeping its main
+//! loop responsive for DBus queries.
 
 use crate::config::AppSettings;
 use crate::nspawn::errors::Result;
@@ -36,7 +36,7 @@ impl PermissionLevel {
 ///
 /// Consumed on [`run`](Self::run) — cannot be reused. Carries the
 /// operation name for audit logging. The actual privilege elevation
-/// happens in the daemon's one-shot workers or at the backend level.
+/// happens in typed daemon workers or at the backend level.
 pub struct AuditScope {
     operation: String,
     _private: (),

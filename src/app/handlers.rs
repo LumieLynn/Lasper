@@ -532,7 +532,7 @@ impl App {
                 Some(image) => image,
                 None => return,
             };
-            if image.name == ".host" {
+            if crate::nspawn::models::ImageEntry::is_protected_name(&image.name) {
                 self.set_status(
                     "The .host image cannot be removed.".into(),
                     crate::ui::StatusLevel::Warn,
@@ -552,7 +552,7 @@ impl App {
                 return;
             }
             let detail = if image.is_hidden() {
-                "This hidden image will be removed from systemd. Individual image removal does not verify whether an .mstack image references it."
+                "This hidden image will be removed through systemd's image management path."
             } else if image.readonly {
                 "This read-only image and its local data will be removed."
             } else {

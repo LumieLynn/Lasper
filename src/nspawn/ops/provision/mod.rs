@@ -189,11 +189,13 @@ async fn run_deploy_internal(
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
-    let cli_runner = exec_ctx.cmd.clone();
     let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
-        std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
-            cli_runner.clone(),
-        ));
+        std::sync::Arc::new(
+            crate::nspawn::adapters::comm::cli::CliBackend::with_system_operations(
+                exec_ctx.local_cmd.clone(),
+                exec_ctx.system_operations.clone(),
+            ),
+        );
 
     macro_rules! push_log {
         ($msg:expr) => {
@@ -215,7 +217,7 @@ async fn run_deploy_internal(
             "Creating storage (type: {:?})...",
             storage.get_type()
         ));
-        storage.create(&name, cli_runner.as_ref()).await?;
+        storage.create(&name).await?;
     }
 
     // 2. Deployment & Configuration scoping
@@ -229,7 +231,7 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Mounting storage...".to_string());
-            storage.mount(&name, cli_runner.as_ref()).await?
+            storage.mount(&name).await?
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
             crate::paths::machine_root(&name)
@@ -450,7 +452,7 @@ async fn run_deploy_internal(
     // 2. Unmount Lasper storage
     if !is_ext {
         push_log!("Unmounting storage...".to_string());
-        let _ = storage.unmount(&name, cli_runner.as_ref()).await;
+        let _ = storage.unmount(&name).await;
     }
 
     // 3. Transactional Rollback
@@ -464,12 +466,10 @@ async fn run_deploy_internal(
 
         if is_ext {
             // Cleanup systemd-managed storage (downloaded/imported junk)
-            let _ = cli_runner
-                .run("machinectl", vec!["remove".into(), name.clone()])
-                .await;
+            let _ = exec_ctx.system_operations.remove_image(&name).await;
         } else {
             // Cleanup Lasper-managed storage
-            let _ = storage.delete(&name, cli_runner.as_ref()).await;
+            let _ = storage.delete(&name).await;
         }
         return Err(e);
     }

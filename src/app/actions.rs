@@ -9,69 +9,14 @@ impl App {
             return;
         }
         self.data.dbus_active = self.data.manager.is_dbus_available().await;
-        match self.data.manager.list_machines().await {
-            Ok(entries) => {
-                let prev_name = self
-                    .data
-                    .entries
-                    .get(self.data.selected)
-                    .map(|e| e.name.clone());
-                self.data.entries = self
-                    .merge_transitional_states(entries)
-                    .into_iter()
-                    .filter(|entry| entry.state.is_running())
-                    .collect();
-                self.data.entries.sort();
-                self.data.properties_dirty = true;
-                self.data.details_dirty = true;
-                self.data.selected = prev_name
-                    .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
-                    .unwrap_or(0)
-                    .min(self.data.entries.len().saturating_sub(1));
+        match self.data.manager.snapshot().await {
+            Ok(snapshot) => {
+                self.sync_snapshot(snapshot).await;
             }
-            Err(e) => log::error!("list_machines: {}", e),
-        }
-        match self.data.manager.list_images().await {
-            Ok(images) => {
-                let previous_name = self
-                    .data
-                    .images
-                    .get(self.data.image_selected)
-                    .map(|image| image.name.clone());
-                let previous_internal_name = self
-                    .data
-                    .internal_images
-                    .get(self.data.internal_image_selected)
-                    .map(|image| image.name.clone());
-                let (mut visible, mut internal): (Vec<ImageEntry>, Vec<ImageEntry>) =
-                    images.into_iter().partition(|image| !image.is_hidden());
-                visible.sort();
-                internal.sort();
-                self.data.images = visible;
-                self.data.internal_images = internal;
-                self.data.image_selected = previous_name
-                    .and_then(|name| self.data.images.iter().position(|image| image.name == name))
-                    .unwrap_or(0)
-                    .min(self.data.images.len().saturating_sub(1));
-                self.data.internal_image_selected = previous_internal_name
-                    .and_then(|name| {
-                        self.data
-                            .internal_images
-                            .iter()
-                            .position(|image| image.name == name)
-                    })
-                    .unwrap_or(0)
-                    .min(self.data.internal_images.len().saturating_sub(1));
-            }
-            Err(e) => log::error!("list_images: {}", e),
-        }
-        self.refresh_detail().await;
-
-        // Check if any DBus call fell back to CLI during this refresh
-        if self.data.dbus_active {
-            if let Some(reason) = self.data.manager.did_fallback() {
+            Err(error) => {
+                log::error!("runtime snapshot: {}", error);
                 self.set_status(
-                    format!("⚡ DBus fallback: {}", reason),
+                    format!("Status refresh failed: {}", error),
                     crate::ui::StatusLevel::Warn,
                 );
             }

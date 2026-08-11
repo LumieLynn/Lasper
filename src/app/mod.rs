@@ -9,7 +9,10 @@ use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
-    models::{ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry},
+    models::{
+        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, RuntimeSnapshot,
+        StatusUpdate,
+    },
     ops::{DefaultManager, NspawnManager},
     sys::ExecutionContext,
 };
@@ -307,55 +310,50 @@ impl App {
     }
 
     /// Apply the independent machine/image snapshot returned by the backend.
-    async fn sync_snapshot(
-        &mut self,
-        machines: Vec<ContainerEntry>,
-        images: Option<Vec<ImageEntry>>,
-    ) {
+    async fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
+        let RuntimeSnapshot { machines, images } = snapshot;
         let running: Vec<_> = machines
             .into_iter()
             .filter(|e| e.state.is_running())
             .collect();
         self.sync_entries(running).await;
 
-        if let Some(images) = images {
-            let previous_name = self
+        let previous_name = self
+            .data
+            .images
+            .get(self.data.image_selected)
+            .map(|image| image.name.clone());
+        let previous_internal_name = self
+            .data
+            .internal_images
+            .get(self.data.internal_image_selected)
+            .map(|image| image.name.clone());
+        let (mut visible, mut internal): (Vec<_>, Vec<_>) =
+            images.into_iter().partition(|image| !image.is_hidden());
+        visible.sort();
+        internal.sort();
+        self.data.images = visible;
+        self.data.internal_images = internal;
+        self.data.image_selected = previous_name
+            .and_then(|name| self.data.images.iter().position(|image| image.name == name))
+            .unwrap_or(0)
+            .min(self.data.images.len().saturating_sub(1));
+        self.data.internal_image_selected = previous_internal_name
+            .and_then(|name| {
+                self.data
+                    .internal_images
+                    .iter()
+                    .position(|image| image.name == name)
+            })
+            .unwrap_or(0)
+            .min(self.data.internal_images.len().saturating_sub(1));
+        if let Some(wizard) = &mut self.ui.wizard {
+            wizard.context.image_names = self
                 .data
                 .images
-                .get(self.data.image_selected)
-                .map(|image| image.name.clone());
-            let previous_internal_name = self
-                .data
-                .internal_images
-                .get(self.data.internal_image_selected)
-                .map(|image| image.name.clone());
-            let (mut visible, mut internal): (Vec<_>, Vec<_>) =
-                images.into_iter().partition(|image| !image.is_hidden());
-            visible.sort();
-            internal.sort();
-            self.data.images = visible;
-            self.data.internal_images = internal;
-            self.data.image_selected = previous_name
-                .and_then(|name| self.data.images.iter().position(|image| image.name == name))
-                .unwrap_or(0)
-                .min(self.data.images.len().saturating_sub(1));
-            self.data.internal_image_selected = previous_internal_name
-                .and_then(|name| {
-                    self.data
-                        .internal_images
-                        .iter()
-                        .position(|image| image.name == name)
-                })
-                .unwrap_or(0)
-                .min(self.data.internal_images.len().saturating_sub(1));
-            if let Some(wizard) = &mut self.ui.wizard {
-                wizard.context.image_names = self
-                    .data
-                    .images
-                    .iter()
-                    .map(|image| image.name.clone())
-                    .collect();
-            }
+                .iter()
+                .map(|image| image.name.clone())
+                .collect();
         }
     }
 
@@ -415,8 +413,7 @@ impl App {
         crate::ui::theme::init_theme(crate::ui::theme::load_theme(self.config.theme.as_ref()));
 
         let mut events = EventHandler::new(100);
-        let (refresh_tx, mut refresh_rx) =
-            tokio::sync::mpsc::channel::<(Vec<ContainerEntry>, Option<Vec<ImageEntry>>)>(1);
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(4);
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::nspawn::ops::BackendCommand>(100);
 
@@ -436,38 +433,70 @@ impl App {
             self.data.cpu_representation,
         );
 
-        // Start data monitoring engine (DBus + Inotify)
-        let (dirty_tx, mut dirty_rx) = tokio::sync::mpsc::channel::<()>(2);
-        self.data.manager.watch(dirty_tx.clone()).await;
+        // Start data monitoring engine. CLI observers publish complete
+        // snapshots; DBus and filesystem observers publish dirty hints.
+        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(4);
+        self.data.manager.watch(status_tx).await;
 
-        // Start background refresh thread
+        // Resolve dirty hints off the UI task. Snapshot updates from the CLI
+        // observer pass through without repeating the machinectl queries.
         let manager_clone = self.data.manager.clone();
         let refresh_tx_clone = refresh_tx.clone();
         tokio::spawn(async move {
-            while dirty_rx.recv().await.is_some() {
-                log::debug!("Refresh: dirty_rx nudge, running machine/image discovery...");
-                if let Ok(machines) = manager_clone.list_machines().await {
-                    let images = match manager_clone.list_images().await {
-                        Ok(images) => Some(images),
-                        Err(error) => {
-                            log::warn!("Image discovery failed: {}", error);
-                            None
+            let mut dirty_failures = 0u32;
+            while let Some(update) = status_rx.recv().await {
+                let resolved = match update {
+                    StatusUpdate::Dirty => match manager_clone.snapshot().await {
+                        Ok(snapshot) => {
+                            dirty_failures = 0;
+                            StatusUpdate::Snapshot(snapshot)
                         }
-                    };
-                    let _ = refresh_tx_clone.send((machines, images)).await;
+                        Err(error) => {
+                            dirty_failures = dirty_failures.saturating_add(1);
+                            StatusUpdate::BackendFailure {
+                                message: error.to_string(),
+                                consecutive_failures: dirty_failures,
+                            }
+                        }
+                    },
+                    StatusUpdate::Snapshot(snapshot) => {
+                        dirty_failures = 0;
+                        StatusUpdate::Snapshot(snapshot)
+                    }
+                    failure @ StatusUpdate::BackendFailure { .. } => failure,
+                };
+                if refresh_tx_clone.send(resolved).await.is_err() {
+                    break;
                 }
             }
         });
-
-        log::debug!("Refresh: initial nudge");
-        let _ = dirty_tx.send(()).await;
 
         loop {
             // Drain at most 3 refresh batches per frame so rapid background
             // updates can't starve user-input events from the select! below.
             for _ in 0..3 {
                 match refresh_rx.try_recv() {
-                    Ok((machines, images)) => self.sync_snapshot(machines, images).await,
+                    Ok(StatusUpdate::Snapshot(snapshot)) => {
+                        self.sync_snapshot(snapshot).await;
+                    }
+                    Ok(StatusUpdate::BackendFailure {
+                        message,
+                        consecutive_failures,
+                    }) => {
+                        log::warn!(
+                            "Status observer failure #{}: {}",
+                            consecutive_failures,
+                            message
+                        );
+                        if consecutive_failures == 1 || consecutive_failures % 12 == 0 {
+                            self.set_status_for(
+                                format!("Status observer unavailable: {}", message),
+                                crate::ui::StatusLevel::Warn,
+                                std::time::Duration::from_secs(6),
+                            );
+                        }
+                    }
+                    Ok(StatusUpdate::Dirty) => {}
                     Err(_) => break,
                 }
             }
@@ -742,17 +771,17 @@ mod tests {
         app.data.images = vec![make_image("selected")];
         app.data.internal_images = vec![make_internal_image(".selected-internal")];
 
-        app.sync_snapshot(
+        app.sync_snapshot(RuntimeSnapshot::new(
             vec![],
-            Some(vec![
+            vec![
                 make_image("z-image"),
                 make_image("selected"),
                 make_image("a-image"),
                 make_internal_image(".z-internal"),
                 make_internal_image(".selected-internal"),
                 make_internal_image(".a-internal"),
-            ]),
-        )
+            ],
+        ))
         .await;
 
         let names: Vec<_> = app

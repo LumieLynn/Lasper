@@ -1,5 +1,5 @@
-//! Elevated daemon — a long-running root child process that executes
-//! privileged commands and file I/O on behalf of the unprivileged TUI.
+//! Elevated daemon — a long-running root child process that executes closed,
+//! typed privileged operations on behalf of the unprivileged TUI.
 //!
 //! Communication is JSON-RPC 2.0 over stdin/stdout (one JSON object per
 //! line). The daemon is spawned via `sudo <self> --daemon` before the
@@ -36,7 +36,9 @@ use crate::nspawn::adapters::rootfs::store::{
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
-use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
+use crate::nspawn::models::{
+    AllowedSignal, ImageEntry, ImageName, MachineName, MachineProperties, TerminalSize,
+};
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
@@ -45,27 +47,34 @@ use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
 use crate::nspawn::ops::provision::oci_operation::{
     build_command as build_oci_pull_command, OciPullRequest,
 };
+use crate::nspawn::ops::system_operation::{execute_system_operation, SystemOperation};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
-use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 4;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DaemonBootstrap {
     protocol_version: u32,
     fd_auth_token: String,
+    dbus_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliInspectMachineRequest {
+    machine: MachineName,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -156,41 +165,6 @@ struct RpcError {
     message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CommandResult {
-    status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-// ── DaemonCommandRunner — adapts ElevatedDaemon to CommandRunner ──
-
-/// Routes commands through the elevated daemon (root child process).
-pub struct DaemonCommandRunner {
-    daemon: Arc<ElevatedDaemon>,
-}
-
-impl DaemonCommandRunner {
-    pub fn new(daemon: Arc<ElevatedDaemon>) -> Self {
-        Self { daemon }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandRunner for DaemonCommandRunner {
-    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
-        self.daemon.run_command(program, &args).await
-    }
-
-    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
-        let _ = (program, args);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "generic elevated streaming commands are disabled; use a typed operation",
-        ))
-    }
-}
-
 pub(crate) fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::FromRawFd;
@@ -203,6 +177,17 @@ type RpcCall = (RpcRequest, tokio::sync::oneshot::Sender<RpcResponse>);
 enum HandleOutcome {
     Spawned,
     Sync(Result<serde_json::Value, String>),
+}
+
+async fn initialize_dbus_backend(
+    enabled: bool,
+) -> Option<crate::nspawn::adapters::comm::dbus::DbusBackend> {
+    if !enabled {
+        return None;
+    }
+
+    let dbus = crate::nspawn::adapters::comm::dbus::DbusBackend::new();
+    dbus.is_available().await.then_some(dbus)
 }
 
 // ── Parent-side handle ──
@@ -314,7 +299,7 @@ fn configure_fd_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
 }
 
 impl ElevatedDaemon {
-    pub async fn spawn() -> std::io::Result<Self> {
+    pub async fn spawn(dbus_enabled: bool) -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let user_uid = uzers::get_current_uid();
         let parent_pid = std::process::id();
@@ -363,6 +348,7 @@ impl ElevatedDaemon {
             let bootstrap = DaemonBootstrap {
                 protocol_version: DAEMON_BOOTSTRAP_VERSION,
                 fd_auth_token: bootstrap_token.to_string(),
+                dbus_enabled,
             };
             let mut bootstrap_line = match serde_json::to_vec(&bootstrap) {
                 Ok(line) => line,
@@ -572,22 +558,6 @@ impl ElevatedDaemon {
         log::info!("[lasper] daemon::exit() RPC returned");
     }
 
-    pub async fn run_command(&self, program: &str, args: &[String]) -> std::io::Result<Output> {
-        let result = self
-            .rpc_call(
-                "run_command",
-                serde_json::json!({"program": program, "args": args}),
-            )
-            .await?;
-        let cmd_result: CommandResult = serde_json::from_value(result)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(cmd_result.status),
-            stdout: cmd_result.stdout.into_bytes(),
-            stderr: cmd_result.stderr.into_bytes(),
-        })
-    }
-
     pub(crate) async fn nspawn_config(
         &self,
         operation: NspawnConfigOperation,
@@ -595,6 +565,28 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.rpc_call("system_operation", params).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cli_inspect_machine(
+        &self,
+        name: &str,
+    ) -> std::io::Result<MachineProperties> {
+        let request = CliInspectMachineRequest {
+            machine: MachineName::new(name)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        };
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("cli_inspect_machine", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -902,21 +894,14 @@ pub async fn daemon_main(
         std::process::exit(0);
     });
 
-    let dbus: Option<crate::nspawn::adapters::comm::dbus::DbusBackend> =
-        if crate::nspawn::adapters::comm::dbus::DbusBackend::new()
-            .is_available()
-            .await
-        {
-            Some(crate::nspawn::adapters::comm::dbus::DbusBackend::new())
-        } else {
-            None
-        };
+    let dbus = initialize_dbus_backend(bootstrap.dbus_enabled).await;
 
     if let Some(ref dbus) = dbus {
         let out_tx_bg = out_tx.clone();
         let dbus_bg = dbus.clone();
         tokio::spawn(async move {
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<()>(16);
+            let (ev_tx, mut ev_rx) =
+                tokio::sync::mpsc::channel::<crate::nspawn::models::StatusUpdate>(16);
             tokio::spawn(async move {
                 if let Err(e) = dbus_bg.watch_events(ev_tx).await {
                     log::error!("Daemon DBus watcher exited: {}", e);
@@ -1198,37 +1183,66 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
-        "run_command" => {
+        "system_operation" => {
+            let operation: SystemOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid system_operation request: {error}"
+                    )));
+                }
+            };
             let id = request.id;
-            let program = match request.params["program"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing program".into())),
-            };
-            let args: Vec<String> = match request.params["args"].as_array() {
-                Some(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-                None => return HandleOutcome::Sync(Err("missing args".into())),
-            };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let output = crate::nspawn::sys::new_command(&program)
-                    .args(&args)
-                    .output()
-                    .await;
-                let response = match output {
-                    Ok(out) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
-                        "status": out.status.into_raw(),
-                        "stdout": String::from_utf8_lossy(&out.stdout),
-                        "stderr": String::from_utf8_lossy(&out.stderr),
+                let response = match execute_system_operation(operation).await {
+                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
+                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":error.to_string(),
                     }}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":format!("{}",e)}})
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "cli_inspect_machine" => {
+            let inspection: CliInspectMachineRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid cli_inspect_machine request: {error}"
+                        )));
                     }
                 };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let response = match crate::nspawn::adapters::comm::cli::get_properties_with_runner(
+                    inspection.machine.as_str(),
+                    &crate::nspawn::sys::command::DefaultCommandRunner,
+                )
+                .await
+                {
+                    Ok(properties) => match serde_json::to_value(properties) {
+                        Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }}),
+                    },
+                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":error.to_string(),
+                    }}),
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
             });
             HandleOutcome::Spawned
         }
@@ -1306,7 +1320,7 @@ async fn handle_request(
                 Ok(name) => name,
                 Err(error) => return HandleOutcome::Sync(Err(error)),
             };
-            match dbus.remove(&name).await {
+            match dbus.remove(name.as_str()).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
@@ -1434,15 +1448,14 @@ fn request_machine_name(request: &RpcRequest) -> Result<MachineName, String> {
     MachineName::try_from(name).map_err(|error| error.to_string())
 }
 
-fn request_image_name(request: &RpcRequest) -> Result<String, String> {
+fn request_image_name(request: &RpcRequest) -> Result<ImageName, String> {
     let name = request.params["name"]
         .as_str()
         .ok_or_else(|| "missing name".to_string())?;
-    if crate::nspawn::models::ImageEntry::is_valid_name(name) {
-        Ok(name.to_string())
-    } else {
-        Err(format!("invalid image name {:?}", name))
+    if ImageEntry::is_protected_name(name) {
+        return Err("the .host image cannot be removed".into());
     }
+    ImageName::new(name).map_err(|error| error.to_string())
 }
 
 // ── Peer credential verification ──
@@ -1855,17 +1868,57 @@ mod tests {
     const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
     #[test]
-    fn test_command_result_serde() {
-        let cr = CommandResult {
-            status: 0,
-            stdout: "hello".into(),
-            stderr: String::new(),
+    fn daemon_bootstrap_carries_the_selected_transport_mode() {
+        let bootstrap = DaemonBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            fd_auth_token: TEST_TOKEN.to_string(),
+            dbus_enabled: false,
         };
-        let json = serde_json::to_value(&cr).unwrap();
-        assert_eq!(json["status"], 0);
-        assert_eq!(json["stdout"], "hello");
-        let parsed: CommandResult = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.status, 0);
+
+        let json = serde_json::to_value(&bootstrap).unwrap();
+        assert_eq!(json["dbus_enabled"], false);
+
+        let parsed: DaemonBootstrap = serde_json::from_value(json).unwrap();
+        assert!(!parsed.dbus_enabled);
+        assert_eq!(parsed.protocol_version, DAEMON_BOOTSTRAP_VERSION);
+    }
+
+    #[test]
+    fn daemon_bootstrap_rejects_missing_or_unknown_transport_fields() {
+        let missing_mode = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "fd_auth_token": TEST_TOKEN,
+        });
+        assert!(serde_json::from_value::<DaemonBootstrap>(missing_mode).is_err());
+
+        let unknown_field = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "fd_auth_token": TEST_TOKEN,
+            "dbus_enabled": false,
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<DaemonBootstrap>(unknown_field).is_err());
+    }
+
+    #[tokio::test]
+    async fn cli_mode_skips_daemon_dbus_initialization() {
+        assert!(initialize_dbus_backend(false).await.is_none());
+    }
+
+    #[test]
+    fn cli_inspection_rpc_accepts_only_a_typed_machine_name() {
+        let valid: CliInspectMachineRequest =
+            serde_json::from_value(serde_json::json!({"machine": "test-machine"})).unwrap();
+        assert_eq!(valid.machine.as_str(), "test-machine");
+
+        assert!(serde_json::from_value::<CliInspectMachineRequest>(
+            serde_json::json!({"machine": "../escape"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<CliInspectMachineRequest>(
+            serde_json::json!({"machine": "test-machine", "unexpected": true})
+        )
+        .is_err());
     }
 
     #[test]
@@ -2104,7 +2157,10 @@ mod tests {
             method: "dbus_remove".into(),
             params: serde_json::json!({"name": ".oci-sha256:abc"}),
         };
-        assert_eq!(request_image_name(&valid).unwrap(), ".oci-sha256:abc");
+        assert_eq!(
+            request_image_name(&valid).unwrap().as_str(),
+            ".oci-sha256:abc"
+        );
 
         let unicode = RpcRequest {
             jsonrpc: "2.0".into(),
@@ -2113,7 +2169,7 @@ mod tests {
             params: serde_json::json!({"name": "Ubuntu Resolute 镜像"}),
         };
         assert_eq!(
-            request_image_name(&unicode).unwrap(),
+            request_image_name(&unicode).unwrap().as_str(),
             "Ubuntu Resolute 镜像"
         );
 
@@ -2122,6 +2178,18 @@ mod tests {
             ..valid
         };
         assert!(request_image_name(&invalid).is_err());
+
+        let temporary = RpcRequest {
+            params: serde_json::json!({"name": ".#temporary"}),
+            ..invalid
+        };
+        assert!(request_image_name(&temporary).is_err());
+
+        let host = RpcRequest {
+            params: serde_json::json!({"name": ".host"}),
+            ..temporary
+        };
+        assert!(request_image_name(&host).is_err());
     }
 
     #[tokio::test]

@@ -9,17 +9,18 @@ use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::nspawn::adapters::rootfs::RootfsStore;
 use crate::nspawn::adapters::storage::ManagedStorageStore;
 use crate::nspawn::ops::provision::{BootstrapStore, ImageImportStore, OciPullStore};
-use crate::nspawn::ops::PermissionLevel;
+use crate::nspawn::ops::{PermissionLevel, SystemOperationStore};
 use crate::nspawn::platform::nvidia::NvidiaStateStore;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
-use crate::nspawn::sys::daemon::{DaemonCommandRunner, ElevatedDaemon};
+use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
 
-/// Bundled execution context. Privileged mutations use typed stores; the
-/// remaining command runner is retained only for operations not yet migrated.
+/// Bundled execution context. Generic commands always execute in the caller;
+/// privileged mutations are available only through typed stores.
 #[derive(Clone)]
 pub struct ExecutionContext {
-    pub cmd: Arc<dyn CommandRunner>,
+    pub local_cmd: Arc<dyn CommandRunner>,
+    pub system_operations: SystemOperationStore,
     pub nspawn: NspawnConfigStore,
     pub systemd_unit: SystemdUnitStore,
     pub rootfs: RootfsStore,
@@ -35,20 +36,19 @@ impl ExecutionContext {
     /// One-time routing.  `level` determines whether the daemon paths
     /// are used; `daemon` must be `Some` when `level` is `Elevated`.
     pub fn new(_level: PermissionLevel, daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        let cmd: Arc<dyn CommandRunner> = match &daemon {
-            Some(d) => Arc::new(DaemonCommandRunner::new(d.clone())),
-            None => Arc::new(DefaultCommandRunner),
-        };
+        let local_cmd: Arc<dyn CommandRunner> = Arc::new(DefaultCommandRunner);
+        let system_operations = SystemOperationStore::new(local_cmd.clone(), daemon.clone());
         let nspawn = NspawnConfigStore::new(daemon.clone());
         let systemd_unit = SystemdUnitStore::new(daemon.clone());
         let rootfs = RootfsStore::new(daemon.clone());
-        let bootstrap = BootstrapStore::new(cmd.clone(), daemon.clone());
+        let bootstrap = BootstrapStore::new(local_cmd.clone(), daemon.clone());
         let image_import = ImageImportStore::new(daemon.clone());
-        let oci_pull = OciPullStore::new(cmd.clone(), daemon.clone());
+        let oci_pull = OciPullStore::new(local_cmd.clone(), daemon.clone());
         let managed_storage = ManagedStorageStore::new(daemon.clone());
         let nvidia_state = NvidiaStateStore::new(daemon.clone());
         Self {
-            cmd,
+            local_cmd,
+            system_operations,
             nspawn,
             systemd_unit,
             rootfs,
@@ -79,6 +79,7 @@ impl std::fmt::Debug for ExecutionContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecutionContext")
             .field("nspawn", &self.nspawn)
+            .field("system_operations", &self.system_operations)
             .field("systemd_unit", &self.systemd_unit)
             .field("rootfs", &self.rootfs)
             .field("bootstrap", &"BootstrapStore")
