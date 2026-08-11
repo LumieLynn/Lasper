@@ -36,9 +36,7 @@ use crate::nspawn::adapters::rootfs::store::{
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
-use crate::nspawn::models::{
-    AllowedSignal, ImageEntry, ImageName, MachineName, MachineProperties, TerminalSize,
-};
+use crate::nspawn::models::{MachineName, MachineProperties, TerminalSize};
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
@@ -47,7 +45,9 @@ use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
 use crate::nspawn::ops::provision::oci_operation::{
     build_command as build_oci_pull_command, OciPullRequest,
 };
-use crate::nspawn::ops::system_operation::{execute_system_operation, SystemOperation};
+use crate::nspawn::ops::system_operation::{
+    execute_dbus_system_operation, execute_system_operation, SystemOperation,
+};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
@@ -1275,74 +1275,20 @@ async fn handle_request(
             }
         }
 
-        "dbus_start" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.start(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_terminate" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.terminate(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_poweroff" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.poweroff(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_reboot" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.reboot(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_enable" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.enable(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_disable" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.disable(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_remove" => {
+        "dbus_system_operation" => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let name = match request_image_name(request) {
-                Ok(name) => name,
-                Err(error) => return HandleOutcome::Sync(Err(error)),
+            let operation: SystemOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid dbus_system_operation request: {error}"
+                    )));
+                }
             };
-            match dbus.remove(name.as_str()).await {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        "dbus_kill" => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            let name = match request_machine_name(request) {
-                Ok(name) => name,
-                Err(error) => return HandleOutcome::Sync(Err(error)),
-            };
-            let signal: AllowedSignal =
-                match serde_json::from_value(request.params["signal"].clone()) {
-                    Ok(signal) => signal,
-                    Err(error) => {
-                        return HandleOutcome::Sync(Err(format!("invalid signal: {error}")));
-                    }
-                };
-            match dbus.kill(name.as_str(), signal).await {
+            match execute_dbus_system_operation(dbus, operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
@@ -1362,17 +1308,6 @@ async fn handle_request(
                     Ok(v) => HandleOutcome::Sync(Ok(v)),
                     Err(e) => HandleOutcome::Sync(Err(e.to_string())),
                 },
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        "dbus_reload_daemon" => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            match dbus.reload_daemon().await {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
         }
@@ -1418,44 +1353,11 @@ async fn handle_request(
     }
 }
 
-async fn sync_dbus_op<F, Fut>(
-    dbus: &Option<crate::nspawn::adapters::comm::dbus::DbusBackend>,
-    request: &RpcRequest,
-    f: F,
-) -> HandleOutcome
-where
-    F: FnOnce(crate::nspawn::adapters::comm::dbus::DbusBackend, String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
-    let dbus = match dbus.as_ref() {
-        Some(d) => d,
-        None => return HandleOutcome::Sync(Err("DBus not available".into())),
-    };
-    let name = match request_machine_name(request) {
-        Ok(name) => name,
-        Err(error) => return HandleOutcome::Sync(Err(error)),
-    };
-    match f(dbus.clone(), name.into_string()).await {
-        Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-        Err(e) => HandleOutcome::Sync(Err(e)),
-    }
-}
-
 fn request_machine_name(request: &RpcRequest) -> Result<MachineName, String> {
     let name = request.params["name"]
         .as_str()
         .ok_or_else(|| "missing name".to_string())?;
     MachineName::try_from(name).map_err(|error| error.to_string())
-}
-
-fn request_image_name(request: &RpcRequest) -> Result<ImageName, String> {
-    let name = request.params["name"]
-        .as_str()
-        .ok_or_else(|| "missing name".to_string())?;
-    if ImageEntry::is_protected_name(name) {
-        return Err("the .host image cannot be removed".into());
-    }
-    ImageName::new(name).map_err(|error| error.to_string())
 }
 
 // ── Peer credential verification ──
@@ -2134,7 +2036,7 @@ mod tests {
         let valid = RpcRequest {
             jsonrpc: "2.0".into(),
             id: 1,
-            method: "dbus_start".into(),
+            method: "dbus_system_operation".into(),
             params: serde_json::json!({"name": "valid-machine"}),
         };
         assert_eq!(
@@ -2147,49 +2049,6 @@ mod tests {
             ..valid
         };
         assert!(request_machine_name(&invalid).is_err());
-    }
-
-    #[test]
-    fn rpc_image_name_validation_allows_hidden_systemd_images_but_not_paths() {
-        let valid = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 1,
-            method: "dbus_remove".into(),
-            params: serde_json::json!({"name": ".oci-sha256:abc"}),
-        };
-        assert_eq!(
-            request_image_name(&valid).unwrap().as_str(),
-            ".oci-sha256:abc"
-        );
-
-        let unicode = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id: 2,
-            method: "dbus_remove".into(),
-            params: serde_json::json!({"name": "Ubuntu Resolute 镜像"}),
-        };
-        assert_eq!(
-            request_image_name(&unicode).unwrap().as_str(),
-            "Ubuntu Resolute 镜像"
-        );
-
-        let invalid = RpcRequest {
-            params: serde_json::json!({"name": "../escape"}),
-            ..valid
-        };
-        assert!(request_image_name(&invalid).is_err());
-
-        let temporary = RpcRequest {
-            params: serde_json::json!({"name": ".#temporary"}),
-            ..invalid
-        };
-        assert!(request_image_name(&temporary).is_err());
-
-        let host = RpcRequest {
-            params: serde_json::json!({"name": ".host"}),
-            ..temporary
-        };
-        assert!(request_image_name(&host).is_err());
     }
 
     #[tokio::test]

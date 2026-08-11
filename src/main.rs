@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
     let exec_ctx = std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
         pm.level(),
         daemon,
-    ));
+    )?);
 
     // 4. Setup logging — always owned by the current user.
     let log_dir = get_log_dir();

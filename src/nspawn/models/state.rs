@@ -264,8 +264,31 @@ pub const IMPORTANT_KEYS: &[&str] = &[
 ];
 
 /// Strongly-typed properties for a machine/container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectionSource {
+    #[default]
+    Unknown,
+    Dbus,
+    Cli,
+    RuntimeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectionCompleteness {
+    #[default]
+    Unknown,
+    Full,
+    RuntimeOnly,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MachineProperties {
+    #[serde(default)]
+    pub source: InspectionSource,
+    #[serde(default)]
+    pub completeness: InspectionCompleteness,
     /// Grouped properties (e.g., GROUP_MACHINE, GROUP_SYSTEMD_UNIT, GROUP_DEPENDENCIES).
     pub groups: Vec<PropertyGroup>,
     // Placeholders for future metrics
@@ -276,6 +299,14 @@ pub struct MachineProperties {
 }
 
 impl MachineProperties {
+    pub fn from_inspection(source: InspectionSource, completeness: InspectionCompleteness) -> Self {
+        Self {
+            source,
+            completeness,
+            ..Self::default()
+        }
+    }
+
     pub fn get_group_mut(&mut self, name: &str) -> &mut std::collections::HashMap<String, String> {
         if let Some(pos) = self.groups.iter().position(|g| g.name == name) {
             &mut self.groups[pos].properties
@@ -286,6 +317,13 @@ impl MachineProperties {
             });
             &mut self.groups.last_mut().unwrap().properties
         }
+    }
+
+    pub fn get_group(&self, name: &str) -> Option<&std::collections::HashMap<String, String>> {
+        self.groups
+            .iter()
+            .find(|group| group.name == name)
+            .map(|group| &group.properties)
     }
 
     pub fn insert(&mut self, group: &str, key: String, value: String) {

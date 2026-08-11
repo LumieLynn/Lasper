@@ -204,7 +204,7 @@ impl ContainerConfigBuilder {
     #[allow(clippy::too_many_arguments)]
     pub fn get_deployer_and_storage(
         &self,
-        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+        system_operations: crate::nspawn::ops::SystemOperationStore,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
@@ -250,7 +250,7 @@ impl ContainerConfigBuilder {
         let deployer: Box<dyn Deployer> = match source {
             SourceConfig::Copy { source_name } => Box::new(clone::CloneDeployer {
                 source_name,
-                provision: provision.clone(),
+                system_operations,
                 nspawn,
                 systemd_unit,
             }) as Box<dyn Deployer>,

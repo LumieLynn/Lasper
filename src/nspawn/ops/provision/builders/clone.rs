@@ -4,12 +4,11 @@ use async_trait::async_trait;
 
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent, Deployer};
 
 pub struct CloneDeployer {
     pub source_name: String,
-    pub provision: std::sync::Arc<dyn ProvisionBackend>,
+    pub system_operations: crate::nspawn::ops::SystemOperationStore,
     pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
     pub systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
 }
@@ -37,7 +36,9 @@ impl Deployer for CloneDeployer {
         )
         .await;
 
-        self.provision.clone_image(&self.source_name, name).await?;
+        self.system_operations
+            .clone_image(&self.source_name, name)
+            .await?;
 
         // Clone configs
         if let Err(e) = self.nspawn.clone_config(&self.source_name, name).await {
@@ -59,7 +60,7 @@ impl Deployer for CloneDeployer {
             .await;
         }
 
-        let _ = self.provision.reload_daemon().await;
+        let _ = self.system_operations.reload_daemon().await;
 
         Ok(())
     }

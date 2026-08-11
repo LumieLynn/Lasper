@@ -6,7 +6,10 @@
 //! client indirectly through `machinectl show` or `systemctl show`.
 
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, MachineName, MachineProperties, GROUP_MACHINE};
+use crate::nspawn::models::{
+    ContainerEntry, InspectionCompleteness, InspectionSource, MachineName, MachineProperties,
+    GROUP_MACHINE,
+};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -119,7 +122,10 @@ async fn inspect_at(
 }
 
 fn entry_properties(entry: &ContainerEntry) -> MachineProperties {
-    let mut properties = MachineProperties::default();
+    let mut properties = MachineProperties::from_inspection(
+        InspectionSource::RuntimeState,
+        InspectionCompleteness::RuntimeOnly,
+    );
     properties.insert(GROUP_MACHINE, "Name".into(), entry.name.clone());
     properties.insert(
         GROUP_MACHINE,
@@ -344,6 +350,8 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(properties.source, InspectionSource::RuntimeState);
+        assert_eq!(properties.completeness, InspectionCompleteness::RuntimeOnly);
         assert_eq!(machine_value(&properties, "State"), Some("running"));
         assert_eq!(machine_value(&properties, "Leader"), Some("4242"));
         assert_eq!(machine_value(&properties, "Class"), Some("container"));

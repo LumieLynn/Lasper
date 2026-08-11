@@ -1,9 +1,9 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, ImageEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
+    ContainerEntry, ImageEntry, InspectionCompleteness, InspectionSource, MachineName,
+    MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
-use crate::nspawn::ops::provision::backend::ProvisionBackend;
 use crate::nspawn::ops::SystemOperationStore;
 use crate::nspawn::sys::CommandRunner;
 use std::time::Duration;
@@ -229,7 +229,8 @@ pub(crate) async fn get_properties_with_runner(
     cmd_runner: &dyn CommandRunner,
 ) -> Result<MachineProperties> {
     let name = parse_machine_name(name)?;
-    let mut props = MachineProperties::default();
+    let mut props =
+        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
 
     let machine_out = cmd_runner
         .run(
@@ -302,18 +303,6 @@ pub(crate) async fn get_properties_with_runner(
     }
 
     Ok(props)
-}
-
-#[async_trait::async_trait]
-impl ProvisionBackend for CliBackend {
-    async fn clone_image(&self, source: &str, dest: &str) -> Result<()> {
-        self.system_operations.clone_image(source, dest).await
-    }
-
-    async fn reload_daemon(&self) -> Result<()> {
-        // Delegates to the same `systemctl daemon-reload` used by the runtime backend.
-        ContainerBackend::reload_daemon(self).await
-    }
 }
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
@@ -508,6 +497,8 @@ mod tests {
 
         let props = provider.get_properties("test-ctr").await.unwrap();
 
+        assert_eq!(props.source, InspectionSource::Cli);
+        assert_eq!(props.completeness, InspectionCompleteness::Full);
         assert!(props.groups.iter().any(|g| g.name == "Machine"));
         assert!(props.groups.iter().any(|g| g.name == "Systemd"));
     }
@@ -593,7 +584,10 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let result = provider.clone_image("source", "bad/name").await;
+        let result = provider
+            .system_operations
+            .clone_image("source", "bad/name")
+            .await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
     }

@@ -1,6 +1,5 @@
 //! Deployment trait and orchestrator.
 
-pub mod backend;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 pub(crate) mod image_operation;
@@ -189,13 +188,7 @@ async fn run_deploy_internal(
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
-    let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
-        std::sync::Arc::new(
-            crate::nspawn::adapters::comm::cli::CliBackend::with_system_operations(
-                exec_ctx.local_cmd.clone(),
-                exec_ctx.system_operations.clone(),
-            ),
-        );
+    let system_operations = exec_ctx.system_operations.clone();
 
     macro_rules! push_log {
         ($msg:expr) => {
@@ -416,7 +409,7 @@ async fn run_deploy_internal(
                 cfg.wayland_socket.is_some(),
             ).await?;
 
-            let _ = provision.reload_daemon().await;
+            let _ = system_operations.reload_daemon().await;
         }
 
         if supports_offline_commands {

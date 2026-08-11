@@ -694,7 +694,7 @@ impl WizardContext {
     #[allow(clippy::too_many_arguments)]
     pub fn get_deployer_and_storage(
         &self,
-        provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend>,
+        system_operations: crate::nspawn::ops::SystemOperationStore,
         nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
         systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
         managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
@@ -703,7 +703,7 @@ impl WizardContext {
         oci_pull: crate::nspawn::ops::provision::OciPullStore,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         self.builder().get_deployer_and_storage(
-            provision,
+            system_operations,
             nspawn,
             systemd_unit,
             managed_storage,

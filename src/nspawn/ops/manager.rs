@@ -1,4 +1,6 @@
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::backend::{
+    ControlAdapter, MachineControl, RuntimeAdapter, RuntimeSource,
+};
 use crate::nspawn::adapters::comm::cli::CliBackend;
 use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
@@ -101,8 +103,10 @@ pub struct DefaultManager {
     #[allow(dead_code)] // used in constructor and tests via struct literals
     pm: std::sync::Arc<dyn PermissionManager>,
     cli_mode: bool,
-    dbus: std::sync::Arc<dyn ContainerBackend>,
-    cli: std::sync::Arc<dyn ContainerBackend>,
+    dbus: std::sync::Arc<dyn RuntimeSource>,
+    cli: std::sync::Arc<dyn RuntimeSource>,
+    dbus_control: std::sync::Arc<dyn MachineControl>,
+    cli_control: std::sync::Arc<dyn MachineControl>,
     exec_ctx: std::sync::Arc<ExecutionContext>,
     last_fallback_reason: parking_lot::Mutex<Option<String>>,
     watch_paths: Vec<PathBuf>,
@@ -122,32 +126,49 @@ impl DefaultManager {
             }
         }
 
-        let dbus_backend: std::sync::Arc<dyn ContainerBackend> = match pm.level() {
+        let (dbus_backend, dbus_control): (
+            std::sync::Arc<dyn RuntimeSource>,
+            std::sync::Arc<dyn MachineControl>,
+        ) = match pm.level() {
             PermissionLevel::Elevated => {
                 if !cli_mode {
                     log::info!("Elevated mode — DBus operations proxied through daemon");
                 }
-                std::sync::Arc::new(DaemonBackend::new(
+                let backend = DaemonBackend::new(
                     exec_ctx
                         .daemon_ref()
                         .cloned()
                         .expect("daemon required for Elevated mode"),
-                ))
+                );
+                (
+                    std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
+                    std::sync::Arc::new(ControlAdapter::new(backend)),
+                )
             }
-            _ => std::sync::Arc::new(DbusBackend::new()),
+            _ => {
+                let backend = DbusBackend::new();
+                (
+                    std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
+                    std::sync::Arc::new(ControlAdapter::new(backend)),
+                )
+            }
         };
 
         let cli_backend = CliBackend::with_system_operations(
             exec_ctx.local_cmd.clone(),
             exec_ctx.system_operations.clone(),
         );
+        let cli_control: std::sync::Arc<dyn MachineControl> =
+            std::sync::Arc::new(exec_ctx.system_operations.clone());
         let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
         cli_backend.set_nudge(nudge_rx);
         Self {
             pm,
             cli_mode,
             dbus: dbus_backend,
-            cli: std::sync::Arc::new(cli_backend),
+            cli: std::sync::Arc::new(RuntimeAdapter::new(cli_backend)),
+            dbus_control,
+            cli_control,
             exec_ctx,
             last_fallback_reason: parking_lot::Mutex::new(None),
             watch_paths: vec![
@@ -200,7 +221,7 @@ impl DefaultManager {
     /// DBus-first / CLI-fallback for `reload_daemon` (takes no name, doesn't fit the macro).
     async fn reload_daemon_fallback(&self) -> Result<()> {
         if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus.reload_daemon().await {
+            match self.dbus_control.reload_daemon().await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
@@ -215,13 +236,13 @@ impl DefaultManager {
             log::debug!("DBus not available for reload_daemon, using CLI");
             self.mark_fallback("DBus not available");
         }
-        self.cli.reload_daemon().await.map_err(|e| {
+        self.cli_control.reload_daemon().await.map_err(|e| {
             log::error!("CLI reload_daemon failed: {}", e);
             e
         })
     }
 
-    async fn wait_for_start(&self, name: &str, backend: &dyn ContainerBackend) -> Result<()> {
+    async fn wait_for_start(&self, name: &str, backend: &dyn RuntimeSource) -> Result<()> {
         let started_at = tokio::time::Instant::now();
         let started_epoch = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -363,7 +384,7 @@ impl DefaultManager {
 macro_rules! fallback_to_cli {
     ($self:ident, $method:ident, $name:expr $(, $arg:expr)*) => {{
         let result = if !$self.cli_mode && $self.dbus.is_available().await {
-            match $self.dbus.$method($name, $($arg),*).await {
+            match $self.dbus_control.$method($name, $($arg),*).await {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
@@ -373,13 +394,13 @@ macro_rules! fallback_to_cli {
                         reason
                     );
                     $self.mark_fallback(&reason);
-                    $self.cli.$method($name, $($arg),*).await
+                    $self.cli_control.$method($name, $($arg),*).await
                 }
             }
         } else {
             log::debug!("DBus not available for {}, using CLI", stringify!($method));
             $self.mark_fallback("DBus not available");
-            $self.cli.$method($name, $($arg),*).await
+            $self.cli_control.$method($name, $($arg),*).await
         };
         if result.is_ok() {
             $self.nudge();
@@ -439,20 +460,20 @@ impl NspawnManager for DefaultManager {
     async fn start(&self, name: &str) -> Result<()> {
         self._ensure_gpu_passthrough(name).await?;
         let backend = if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus.start(name).await {
+            match self.dbus_control.start(name).await {
                 Ok(()) => self.dbus.clone(),
                 Err(error) => {
                     let reason = Self::classify_fallback(&error);
                     log::warn!("DBus start failed ({}), falling back to CLI", reason);
                     self.mark_fallback(&reason);
-                    self.cli.start(name).await?;
+                    self.cli_control.start(name).await?;
                     self.cli.clone()
                 }
             }
         } else {
             log::debug!("DBus not available for start, using CLI");
             self.mark_fallback("DBus not available");
-            self.cli.start(name).await?;
+            self.cli_control.start(name).await?;
             self.cli.clone()
         };
 
@@ -523,20 +544,20 @@ impl NspawnManager for DefaultManager {
         // the same D-Bus method, so both paths share the same validation and
         // deletion semantics.
         let result = if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus.remove(name).await {
+            match self.dbus_control.remove(name).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     let reason = Self::classify_fallback(&e);
                     log::warn!("DBus remove failed ({}), falling back to CLI", reason);
                     self.mark_fallback(&reason);
-                    self.cli.remove(name).await.map_err(|e| {
+                    self.cli_control.remove(name).await.map_err(|e| {
                         log::error!("CLI remove failed for {}: {}", name, e);
                         e
                     })
                 }
             }
         } else {
-            self.cli.remove(name).await.map_err(|e| {
+            self.cli_control.remove(name).await.map_err(|e| {
                 log::error!("CLI remove failed for {}: {}", name, e);
                 e
             })
@@ -688,16 +709,10 @@ impl NspawnManager for DefaultManager {
         entry: &ContainerEntry,
     ) -> Result<MachineProperties> {
         let mut props = if self.cli_mode {
-            if let Some(daemon) = self.exec_ctx.daemon_ref() {
-                daemon.cli_inspect_machine(name).await.map_err(|error| {
-                    crate::nspawn::errors::NspawnError::Io(
-                        std::path::PathBuf::from("elevated CLI inspection"),
-                        error,
-                    )
-                })?
-            } else {
-                crate::nspawn::adapters::comm::runtime_state::inspect(name, entry).await?
-            }
+            self.exec_ctx
+                .machine_inspection
+                .inspect(name, entry)
+                .await?
         } else if self.dbus.is_available().await {
             match self.dbus.get_properties(name).await {
                 Ok(p) => p,
@@ -726,8 +741,8 @@ impl NspawnManager for DefaultManager {
             );
         }
         if let Some(ufs) = props
-            .get_group_mut(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
-            .get("UnitFileState")
+            .get_group(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+            .and_then(|group| group.get("UnitFileState"))
         {
             let ufs = ufs.clone();
             props.insert(
@@ -901,7 +916,9 @@ fn pipe_reader(fd: std::os::unix::io::RawFd) -> std::io::Result<tokio::net::unix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::adapters::comm::backend::MockContainerBackend;
+    use crate::nspawn::adapters::comm::backend::{
+        ContainerBackend, MachineControl, MockContainerBackend, RuntimeSource,
+    };
     use crate::nspawn::errors::NspawnError;
     use crate::nspawn::models::ContainerState;
     use crate::nspawn::ops::DefaultPermissionManager;
@@ -935,10 +952,13 @@ mod tests {
     }
 
     fn test_exec_ctx() -> std::sync::Arc<crate::nspawn::sys::ExecutionContext> {
-        std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
-            crate::nspawn::ops::PermissionLevel::User,
-            None,
-        ))
+        std::sync::Arc::new(
+            crate::nspawn::sys::ExecutionContext::new(
+                crate::nspawn::ops::PermissionLevel::User,
+                None,
+            )
+            .unwrap(),
+        )
     }
 
     fn mock_dbus_available() -> MockContainerBackend {
@@ -953,22 +973,114 @@ mod tests {
         backend
     }
 
+    struct SharedMockBackend(std::sync::Arc<MockContainerBackend>);
+
+    #[async_trait::async_trait]
+    impl RuntimeSource for SharedMockBackend {
+        async fn is_available(&self) -> bool {
+            self.0.is_available().await
+        }
+
+        async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+            self.0.list_machines().await
+        }
+
+        async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+            self.0.list_images().await
+        }
+
+        async fn snapshot(&self) -> Result<RuntimeSnapshot> {
+            self.0.snapshot().await
+        }
+
+        async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+            self.0.get_properties(name).await
+        }
+
+        async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
+            self.0.watch_events(tx).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MachineControl for SharedMockBackend {
+        async fn start(&self, name: &str) -> Result<()> {
+            self.0.start(name).await
+        }
+
+        async fn terminate(&self, name: &str) -> Result<()> {
+            self.0.terminate(name).await
+        }
+
+        async fn poweroff(&self, name: &str) -> Result<()> {
+            self.0.poweroff(name).await
+        }
+
+        async fn reboot(&self, name: &str) -> Result<()> {
+            self.0.reboot(name).await
+        }
+
+        async fn enable(&self, name: &str) -> Result<()> {
+            self.0.enable(name).await
+        }
+
+        async fn disable(&self, name: &str) -> Result<()> {
+            self.0.disable(name).await
+        }
+
+        async fn kill(
+            &self,
+            name: &str,
+            signal: crate::nspawn::models::AllowedSignal,
+        ) -> Result<()> {
+            self.0.kill(name, signal).await
+        }
+
+        async fn remove(&self, name: &str) -> Result<()> {
+            self.0.remove(name).await
+        }
+
+        async fn reload_daemon(&self) -> Result<()> {
+            self.0.reload_daemon().await
+        }
+    }
+
+    fn test_manager(
+        dbus: MockContainerBackend,
+        cli: MockContainerBackend,
+        cli_mode: bool,
+    ) -> DefaultManager {
+        let dbus = std::sync::Arc::new(dbus);
+        let cli = std::sync::Arc::new(cli);
+        let dbus_runtime: std::sync::Arc<dyn RuntimeSource> =
+            std::sync::Arc::new(SharedMockBackend(dbus.clone()));
+        let dbus_control: std::sync::Arc<dyn MachineControl> =
+            std::sync::Arc::new(SharedMockBackend(dbus));
+        let cli_runtime: std::sync::Arc<dyn RuntimeSource> =
+            std::sync::Arc::new(SharedMockBackend(cli.clone()));
+        let cli_control: std::sync::Arc<dyn MachineControl> =
+            std::sync::Arc::new(SharedMockBackend(cli));
+        DefaultManager {
+            pm: test_pm(),
+            cli_mode,
+            dbus: dbus_runtime,
+            cli: cli_runtime,
+            dbus_control,
+            cli_control,
+            exec_ctx: test_exec_ctx(),
+            last_fallback_reason: parking_lot::Mutex::new(None),
+            watch_paths: vec![],
+            nudge_tx: tokio::sync::watch::channel(()).0,
+        }
+    }
+
     #[tokio::test]
     async fn remove_allows_hidden_images_without_origin_classification() {
         let dbus = mock_dbus_unavailable();
         let mut cli = MockContainerBackend::new();
         cli.expect_list_machines().returning(|| Ok(vec![]));
         cli.expect_remove().returning(|_| Ok(()));
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let result = mgr.remove(".download").await;
 
@@ -981,16 +1093,7 @@ mod tests {
         let mut cli = MockContainerBackend::new();
         cli.expect_list_machines().returning(|| Ok(vec![]));
         cli.expect_remove().returning(|_| Ok(()));
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let result = mgr.remove(".unclassified-image").await;
 
@@ -1005,16 +1108,7 @@ mod tests {
             .withf(|name| name == ".oci-sha256:abc")
             .returning(|_| Ok(()));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(MockContainerBackend::new()),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, MockContainerBackend::new(), false);
 
         mgr.remove(".oci-sha256:abc").await.unwrap();
         assert!(mgr.did_fallback().is_none());
@@ -1035,16 +1129,7 @@ mod tests {
             .withf(|name| name == ".oci-sha256:abc")
             .returning(|_| Ok(()));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         mgr.remove(".oci-sha256:abc").await.unwrap();
         assert!(mgr.did_fallback().is_some());
@@ -1052,16 +1137,11 @@ mod tests {
 
     #[tokio::test]
     async fn remove_rejects_protected_and_temporary_image_names_before_routing() {
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(MockContainerBackend::new()),
-            cli: std::sync::Arc::new(MockContainerBackend::new()),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(
+            MockContainerBackend::new(),
+            MockContainerBackend::new(),
+            false,
+        );
 
         assert!(matches!(
             mgr.remove(".host").await.unwrap_err(),
@@ -1081,16 +1161,7 @@ mod tests {
             entry.state = ContainerState::Running;
             Ok(vec![entry])
         });
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(MockContainerBackend::new()),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, MockContainerBackend::new(), false);
 
         let error = mgr.remove("active").await.unwrap_err();
 
@@ -1107,16 +1178,7 @@ mod tests {
 
         let cli = MockContainerBackend::new();
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries.len(), 1);
@@ -1134,16 +1196,7 @@ mod tests {
         cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("cli-entry")]));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries[0].name, "cli-entry");
@@ -1158,16 +1211,7 @@ mod tests {
         cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("cli-only")]));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let entries = mgr.list_machines().await.unwrap();
         assert_eq!(entries[0].name, "cli-only");
@@ -1184,16 +1228,7 @@ mod tests {
         cli.expect_snapshot()
             .returning(|| Ok(dummy_snapshot("cli-snapshot")));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         let snapshot = mgr.snapshot().await.unwrap();
         assert_eq!(snapshot.machines[0].name, "cli-snapshot");
@@ -1207,16 +1242,7 @@ mod tests {
         cli.expect_snapshot()
             .returning(|| Ok(dummy_snapshot("cli-only")));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: true,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, true);
 
         let snapshot = mgr.snapshot().await.unwrap();
         assert_eq!(snapshot.machines[0].name, "cli-only");
@@ -1225,16 +1251,11 @@ mod tests {
 
     #[tokio::test]
     async fn cli_mode_inspect_does_not_call_either_transport_backend() {
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: true,
-            dbus: std::sync::Arc::new(MockContainerBackend::new()),
-            cli: std::sync::Arc::new(MockContainerBackend::new()),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(
+            MockContainerBackend::new(),
+            MockContainerBackend::new(),
+            true,
+        );
         let entry = dummy_entry("lasper-cli-inspect-test");
 
         let properties = mgr
@@ -1260,16 +1281,7 @@ mod tests {
             Ok(())
         });
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: true,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, true);
         let (tx, mut rx) = tokio::sync::mpsc::channel(2);
 
         mgr.watch(tx).await;
@@ -1300,16 +1312,7 @@ mod tests {
             ]))
         });
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         mgr.start("test").await.unwrap();
         assert!(mgr.did_fallback().is_some());
@@ -1363,16 +1366,7 @@ mod tests {
 
         let cli = MockContainerBackend::new();
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         mgr.enable("test-ctr").await.unwrap();
         assert!(mgr.did_fallback().is_none());
@@ -1389,16 +1383,7 @@ mod tests {
             .with(mockall::predicate::eq("test-ctr"))
             .returning(|_| Ok(()));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         mgr.disable("test-ctr").await.unwrap();
         assert!(mgr.did_fallback().is_some());
@@ -1416,16 +1401,7 @@ mod tests {
         cli.expect_list_machines()
             .returning(|| Ok(vec![dummy_entry("test")]));
 
-        let mgr = DefaultManager {
-            pm: test_pm(),
-            cli_mode: false,
-            dbus: std::sync::Arc::new(dbus),
-            cli: std::sync::Arc::new(cli),
-            exec_ctx: test_exec_ctx(),
-            last_fallback_reason: parking_lot::Mutex::new(None),
-            watch_paths: vec![],
-            nudge_tx: tokio::sync::watch::channel(()).0,
-        };
+        let mgr = test_manager(dbus, cli, false);
 
         mgr.list_machines().await.unwrap();
         assert!(mgr.did_fallback().is_some());

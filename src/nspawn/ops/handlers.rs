@@ -34,14 +34,7 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     match cmd {
         BackendCommand::SubmitConfig(ctx) => {
             let exec_ctx = ctx.exec_ctx.clone();
-            let provision: std::sync::Arc<
-                dyn crate::nspawn::ops::provision::backend::ProvisionBackend,
-            > = std::sync::Arc::new(
-                crate::nspawn::adapters::comm::cli::CliBackend::with_system_operations(
-                    exec_ctx.local_cmd.clone(),
-                    exec_ctx.system_operations.clone(),
-                ),
-            );
+            let system_operations = exec_ctx.system_operations.clone();
             let nspawn = exec_ctx.nspawn.clone();
             let systemd_unit = exec_ctx.systemd_unit.clone();
             let managed_storage = exec_ctx.managed_storage.clone();
@@ -50,7 +43,7 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let oci_pull = exec_ctx.oci_pull.clone();
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(
-                provision,
+                system_operations,
                 nspawn,
                 systemd_unit,
                 managed_storage,

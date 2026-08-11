@@ -591,10 +591,13 @@ mod tests {
             std::sync::Arc::new(crate::nspawn::ops::DefaultPermissionManager::new()),
             false, // cli_mode
             0,
-            std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
-                crate::nspawn::ops::PermissionLevel::User,
-                None,
-            )),
+            std::sync::Arc::new(
+                crate::nspawn::sys::ExecutionContext::new(
+                    crate::nspawn::ops::PermissionLevel::User,
+                    None,
+                )
+                .unwrap(),
+            ),
             std::sync::Arc::new(crate::config::AppConfig::default()),
         )
     }

@@ -3,8 +3,8 @@
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, ContainerState, ImageEntry, ImageName, MachineName, MachineProperties,
-    StatusUpdate,
+    ContainerEntry, ContainerState, ImageEntry, ImageName, InspectionCompleteness,
+    InspectionSource, MachineName, MachineProperties, StatusUpdate,
 };
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
@@ -269,7 +269,10 @@ impl ContainerBackend for DbusBackend {
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
 
-        let mut props = MachineProperties::default();
+        let mut props = MachineProperties::from_inspection(
+            InspectionSource::Dbus,
+            InspectionCompleteness::Full,
+        );
 
         // 1) Try machine1 properties (only works for running/registered machines)
         if let Ok(m1_props) = get_machine1_properties(&conn, &name).await {
