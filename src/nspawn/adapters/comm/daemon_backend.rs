@@ -8,10 +8,15 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{
+    AllowedSignal, ContainerEntry, ImageEntry, ImageName, MachineName, MachineProperties,
+    StatusUpdate,
+};
+use crate::nspawn::ops::system_operation::SystemOperation;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
 
+#[derive(Clone)]
 pub struct DaemonBackend {
     daemon: Arc<ElevatedDaemon>,
 }
@@ -27,6 +32,13 @@ impl DaemonBackend {
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("daemon"), e))
     }
+
+    async fn call_system_operation(&self, operation: SystemOperation) -> Result<()> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+        self.call("dbus_system_operation", params).await?;
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -39,65 +51,83 @@ impl ContainerBackend for DaemonBackend {
             .unwrap_or(false)
     }
 
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
-        let json = self.call("dbus_list_all", serde_json::json!({})).await?;
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+        let json = self
+            .call("dbus_list_machines", serde_json::json!({}))
+            .await?;
         serde_json::from_value(json).map_err(|e| {
             NspawnError::Dbus(zbus::Error::Failure(format!(
-                "failed to deserialize list_all response: {}",
+                "failed to deserialize list_machines response: {}",
+                e
+            )))
+        })
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+        let json = self.call("dbus_list_images", serde_json::json!({})).await?;
+        serde_json::from_value(json).map_err(|e| {
+            NspawnError::Dbus(zbus::Error::Failure(format!(
+                "failed to deserialize list_images response: {}",
                 e
             )))
         })
     }
 
     async fn start(&self, name: &str) -> Result<()> {
-        self.call("dbus_start", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Start {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
     async fn terminate(&self, name: &str) -> Result<()> {
-        self.call("dbus_terminate", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Terminate {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
     async fn poweroff(&self, name: &str) -> Result<()> {
-        self.call("dbus_poweroff", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Poweroff {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
     async fn reboot(&self, name: &str) -> Result<()> {
-        self.call("dbus_reboot", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Reboot {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
     async fn enable(&self, name: &str) -> Result<()> {
-        self.call("dbus_enable", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Enable {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
     async fn disable(&self, name: &str) -> Result<()> {
-        self.call("dbus_disable", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::Disable {
+            machine: machine_name(name)?,
+        })
+        .await
     }
 
-    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
-        self.call(
-            "dbus_kill",
-            serde_json::json!({"name": name, "signal": signal}),
-        )
-        .await?;
-        Ok(())
+    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
+        self.call_system_operation(SystemOperation::Kill {
+            machine: machine_name(name)?,
+            signal,
+        })
+        .await
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        self.call("dbus_remove", serde_json::json!({"name": name}))
-            .await?;
-        Ok(())
+        let image =
+            ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
+        self.call_system_operation(SystemOperation::RemoveImage { image })
+            .await
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
@@ -113,31 +143,36 @@ impl ContainerBackend for DaemonBackend {
     }
 
     async fn reload_daemon(&self) -> Result<()> {
-        self.call("dbus_reload_daemon", serde_json::json!({}))
-            .await?;
-        Ok(())
+        self.call_system_operation(SystemOperation::ReloadDaemon)
+            .await
     }
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         let mut event_rx = self.daemon.subscribe_events();
         loop {
             match event_rx.recv().await {
                 Ok(()) => {
-                    if tx.send(()).await.is_err() {
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
                         break; // receiver dropped
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     log::warn!("DaemonBackend event receiver lagged by {} messages", n);
                     // Still nudge — something changed
-                    let _ = tx.send(()).await;
+                    let _ = tx.send(StatusUpdate::Dirty).await;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::error!("DaemonBackend event channel closed");
-                    break;
+                    return Err(NspawnError::Runtime(
+                        "elevated daemon event channel closed".into(),
+                    ));
                 }
             }
         }
         Ok(())
     }
+}
+
+fn machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }

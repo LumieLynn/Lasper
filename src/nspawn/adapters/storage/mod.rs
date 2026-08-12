@@ -51,35 +51,15 @@ pub struct StorageInfo {
 pub trait StorageBackend: Send + Sync {
     fn get_type(&self) -> StorageType;
     fn get_path(&self, name: &str) -> PathBuf;
-    async fn create(
-        &self,
-        name: &str,
-        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
-    ) -> Result<PathBuf>;
+    async fn create(&self, name: &str) -> Result<PathBuf>;
 
     /// Mount the storage and return the path to the rootfs.
-    async fn mount(
-        &self,
-        name: &str,
-        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
-    ) -> Result<PathBuf>;
+    async fn mount(&self, name: &str) -> Result<PathBuf>;
 
     /// Unmount the storage.
-    async fn unmount(
-        &self,
-        name: &str,
-        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
-    ) -> Result<()>;
+    async fn unmount(&self, name: &str) -> Result<()>;
 
-    async fn delete(
-        &self,
-        name: &str,
-        cmd_runner: &dyn crate::nspawn::sys::CommandRunner,
-        io: &crate::nspawn::sys::ElevatedIo,
-    ) -> Result<()>;
+    async fn delete(&self, name: &str) -> Result<()>;
     #[allow(dead_code)]
     async fn exists(&self, name: &str) -> bool;
 }

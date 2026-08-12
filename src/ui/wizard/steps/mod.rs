@@ -41,6 +41,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         WizardStep::Basic => Box::new(basic_view::BasicStepView::new(
             &context.basic.extract_config(),
             &context.entries,
+            context.source.kind != crate::ui::wizard::context::SourceKind::Oci,
         )),
 
         WizardStep::Storage => Box::new(storage_view::StorageStepView::new(&context.storage)),

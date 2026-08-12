@@ -4,7 +4,6 @@ use super::super::{StorageBackend, StorageType};
 use crate::nspawn::adapters::storage::ManagedStorageStore;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::MachineName;
-use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 pub struct SubvolumeBackend {
@@ -27,39 +26,19 @@ impl StorageBackend for SubvolumeBackend {
         crate::paths::machine_root(name)
     }
 
-    async fn create(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<PathBuf> {
+    async fn create(&self, name: &str) -> Result<PathBuf> {
         self.store.create_subvolume(name).await
     }
 
-    async fn mount(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<PathBuf> {
+    async fn mount(&self, name: &str) -> Result<PathBuf> {
         Ok(machine_path(&parse_machine_name(name)?))
     }
 
-    async fn unmount(
-        &self,
-        _name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<()> {
+    async fn unmount(&self, _name: &str) -> Result<()> {
         Ok(())
     }
 
-    async fn delete(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<()> {
+    async fn delete(&self, name: &str) -> Result<()> {
         self.store.remove_subvolume(name).await
     }
 
@@ -82,16 +61,10 @@ fn machine_path(machine: &MachineName) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::sys::command::MockCommandRunner;
-
     #[tokio::test]
     async fn create_rejects_invalid_machine_name_before_external_detection() {
         let backend = SubvolumeBackend::new(ManagedStorageStore::default());
-        let mut runner = MockCommandRunner::new();
-        runner.expect_run().never();
-        let io = ElevatedIo::new(crate::nspawn::ops::PermissionLevel::Root);
-
-        let result = backend.create("../escape", &runner, &io).await;
+        let result = backend.create("../escape").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
@@ -99,11 +72,7 @@ mod tests {
     #[tokio::test]
     async fn delete_rejects_invalid_machine_name_before_external_detection() {
         let backend = SubvolumeBackend::new(ManagedStorageStore::default());
-        let mut runner = MockCommandRunner::new();
-        runner.expect_run().never();
-        let io = ElevatedIo::new(crate::nspawn::ops::PermissionLevel::Root);
-
-        let result = backend.delete("bad/name", &runner, &io).await;
+        let result = backend.delete("bad/name").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
@@ -111,10 +80,7 @@ mod tests {
     #[tokio::test]
     async fn mount_rejects_invalid_machine_name() {
         let backend = SubvolumeBackend::new(ManagedStorageStore::default());
-        let runner = MockCommandRunner::new();
-        let io = ElevatedIo::new(crate::nspawn::ops::PermissionLevel::Root);
-
-        let result = backend.mount(".hidden", &runner, &io).await;
+        let result = backend.mount(".hidden").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
     }

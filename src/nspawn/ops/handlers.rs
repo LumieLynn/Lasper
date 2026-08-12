@@ -9,7 +9,7 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     let tx_panic = tx.clone();
     tokio::spawn(async move {
         let result = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-            run_command(cmd, tx),
+            dispatch_command(cmd, tx),
         ))
         .await;
 
@@ -30,32 +30,26 @@ pub fn handle_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     });
 }
 
-async fn run_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
+async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
     match cmd {
         BackendCommand::SubmitConfig(ctx) => {
             let exec_ctx = ctx.exec_ctx.clone();
-            let cli_runner = exec_ctx.cmd.clone();
-            let provision: std::sync::Arc<
-                dyn crate::nspawn::ops::provision::backend::ProvisionBackend,
-            > = std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
-                cli_runner.clone(),
-            ));
-            let io = exec_ctx.io.clone();
+            let system_operations = exec_ctx.system_operations.clone();
             let nspawn = exec_ctx.nspawn.clone();
             let systemd_unit = exec_ctx.systemd_unit.clone();
             let managed_storage = exec_ctx.managed_storage.clone();
             let bootstrap = exec_ctx.bootstrap.clone();
             let image_import = exec_ctx.image_import.clone();
+            let oci_pull = exec_ctx.oci_pull.clone();
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(
-                provision,
-                io,
+                system_operations,
                 nspawn,
                 systemd_unit,
                 managed_storage,
                 bootstrap,
                 image_import,
-                cli_runner,
+                oci_pull,
             );
             let name = built.cfg.name.clone();
             let cfg = built.cfg;

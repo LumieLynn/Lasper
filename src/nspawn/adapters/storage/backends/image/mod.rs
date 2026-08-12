@@ -8,7 +8,6 @@ use super::super::{
 };
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::DiskImageConfig;
-use crate::nspawn::sys::{CommandRunner, ElevatedIo};
 use std::path::PathBuf;
 
 pub struct DiskImageBackend {
@@ -95,39 +94,19 @@ impl StorageBackend for DiskImageBackend {
         }
     }
 
-    async fn create(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<PathBuf> {
+    async fn create(&self, name: &str) -> Result<PathBuf> {
         self.create_impl(name).await
     }
 
-    async fn mount(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<PathBuf> {
+    async fn mount(&self, name: &str) -> Result<PathBuf> {
         self.mount_impl(name).await
     }
 
-    async fn unmount(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<()> {
+    async fn unmount(&self, name: &str) -> Result<()> {
         self.unmount_impl(name).await
     }
 
-    async fn delete(
-        &self,
-        name: &str,
-        _cmd_runner: &dyn CommandRunner,
-        _io: &ElevatedIo,
-    ) -> Result<()> {
+    async fn delete(&self, name: &str) -> Result<()> {
         let Some(kind) = self.managed_kind() else {
             return Err(NspawnError::Validation(format!(
                 "Refusing to delete externally managed image path: {}",

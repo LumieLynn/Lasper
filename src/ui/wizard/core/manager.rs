@@ -4,7 +4,7 @@ use crate::ui::wizard::core::context::{SourceKind, WizardContext};
 use crate::ui::wizard::steps::{self, StepComponent};
 use crate::ui::wizard::{StepAction, WizardStep};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::{Block, BorderType, Borders, Clear},
@@ -26,13 +26,15 @@ pub struct Wizard {
 impl Wizard {
     pub async fn new(
         entries: Vec<ContainerEntry>,
+        image_names: Vec<String>,
         nvidia_toolkit_installed: bool,
         command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
         permission_level: crate::nspawn::ops::PermissionLevel,
         exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
-        let mut context = WizardContext::new(entries, permission_level, exec_ctx, config).await;
+        let mut context =
+            WizardContext::new(entries, image_names, permission_level, exec_ctx, config).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {
@@ -101,11 +103,19 @@ impl Wizard {
 
     pub fn active_flow(&self) -> Vec<WizardStep> {
         let is_copy = self.context.source.kind == SourceKind::Copy;
+        let is_oci = self.context.source.kind == SourceKind::Oci;
 
         if is_copy {
             vec![
                 WizardStep::Source,
                 WizardStep::CopySelect,
+                WizardStep::Basic,
+                WizardStep::Review,
+                WizardStep::Deploy,
+            ]
+        } else if is_oci {
+            vec![
+                WizardStep::Source,
                 WizardStep::Basic,
                 WizardStep::Review,
                 WizardStep::Deploy,
@@ -182,6 +192,19 @@ impl Wizard {
         }
     }
 
+    /// Route mouse input only to the active wizard step.  The parent App
+    /// treats the wizard as modal, so an ignored event is still prevented
+    /// from reaching the main panels.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.loading {
+            return;
+        }
+        if let Some(view) = &mut self.active_view {
+            let _ = view.handle_mouse(mouse);
+            view.commit_to_context(&mut self.context);
+        }
+    }
+
     pub fn process_message(&mut self, msg: AppMessage) -> StepAction {
         match msg {
             AppMessage::Wizard(ref wiz_msg) => match wiz_msg {
@@ -200,7 +223,13 @@ impl Wizard {
                         }
                     }
                     let target_name = self.context.basic.name.clone();
-                    if self.context.entries.iter().any(|e| e.name == target_name) {
+                    if self.context.entries.iter().any(|e| e.name == target_name)
+                        || self
+                            .context
+                            .image_names
+                            .iter()
+                            .any(|name| name == &target_name)
+                    {
                         return StepAction::Status(
                             format!(
                                 "Validation Error: Container '{}' already exists",

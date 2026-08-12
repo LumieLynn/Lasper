@@ -7,4 +7,4 @@ pub mod ops;
 pub mod platform;
 pub mod sys;
 
-pub use models::{ContainerEntry, ContainerState};
+pub use models::{ContainerEntry, ContainerState, ImageEntry};

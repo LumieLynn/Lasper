@@ -26,7 +26,7 @@ impl AsyncLockedWriter {
     /// 1. Uses a sidecar `.lock` file to avoid inode-switch race conditions.
     /// 2. Uses an async backoff loop to acquire the lock without blocking the Tokio executor.
     /// 3. Performs an atomic write via rename.
-    #[allow(dead_code)] // kept for Root-mode atomic write path, currently all writes go through ElevatedIo
+    #[allow(dead_code)] // kept for direct atomic write paths used by typed stores
     pub async fn write_locked<F>(path: &Path, content_generator: F) -> Result<()>
     where
         F: FnOnce(Option<String>) -> Result<String>,

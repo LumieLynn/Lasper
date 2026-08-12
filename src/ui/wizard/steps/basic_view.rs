@@ -11,7 +11,10 @@ use std::collections::HashSet;
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let comps: Vec<&mut dyn Component> = vec![&mut $self.name, &mut $self.hostname];
+        let mut comps: Vec<&mut dyn Component> = vec![&mut $self.name];
+        if $self.show_hostname {
+            comps.push(&mut $self.hostname);
+        }
         comps
     }};
 }
@@ -21,6 +24,7 @@ impl_wizard_nav!(BasicStepView, active_comps);
 pub struct BasicStepView {
     name: TextBox,
     hostname: TextBox,
+    show_hostname: bool,
     focus: FocusTracker,
 }
 
@@ -28,6 +32,7 @@ impl BasicStepView {
     pub fn new(
         initial_data: &BasicConfig,
         existing_entries: &[crate::nspawn::models::ContainerEntry],
+        show_hostname: bool,
     ) -> Self {
         let existing_names: HashSet<String> = existing_entries
             .iter()
@@ -53,6 +58,7 @@ impl BasicStepView {
                 }
                 Ok(())
             }),
+            show_hostname,
             focus: FocusTracker::new(),
         };
         view.update_focus();
@@ -75,21 +81,28 @@ fn validate_container_name(value: &str, existing_names: &HashSet<String>) -> Res
         return Err("Name too long (max 64)".to_string());
     }
     if existing_names.contains(name) {
-        return Err(format!("Container '{}' already exists", name));
+        return Err(format!("Machine image '{}' already exists", name));
     }
     Ok(())
 }
 
 impl Component for BasicStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
+        let constraints = if self.show_hostname {
+            vec![Constraint::Length(3), Constraint::Length(3)]
+        } else {
+            vec![Constraint::Length(3)]
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
-            .constraints([Constraint::Length(3), Constraint::Length(3)])
+            .constraints(constraints)
             .split(area);
 
         self.name.render(f, chunks[0]);
-        self.hostname.render(f, chunks[1]);
+        if self.show_hostname {
+            self.hostname.render(f, chunks[1]);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
@@ -102,7 +115,9 @@ impl Component for BasicStepView {
 
     fn validate(&mut self) -> Result<(), String> {
         self.name.validate()?;
-        self.hostname.validate()?;
+        if self.show_hostname {
+            self.hostname.validate()?;
+        }
         Ok(())
     }
 }
@@ -110,7 +125,11 @@ impl Component for BasicStepView {
 impl StepComponent for BasicStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.basic.name = self.name.value().to_string();
-        ctx.basic.hostname = self.hostname.value().to_string();
+        if self.show_hostname {
+            ctx.basic.hostname = self.hostname.value().to_string();
+        } else {
+            ctx.basic.hostname.clear();
+        }
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
@@ -128,7 +147,10 @@ mod tests {
 
         let result = validate_container_name("arch-test", &existing);
 
-        assert_eq!(result, Err("Container 'arch-test' already exists".into()));
+        assert_eq!(
+            result,
+            Err("Machine image 'arch-test' already exists".into())
+        );
     }
 
     #[test]

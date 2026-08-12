@@ -28,9 +28,8 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
     Some((source, destination))
 }
 
-/// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
+/// Raw content of a `.nspawn` file and the path it was read from.
 pub struct NspawnConfig {
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub content: String,
 }
@@ -418,7 +417,7 @@ mod tests {
     #[test]
     fn test_validate_machine_name_valid() {
         assert!(validate_machine_name("my-container").is_ok());
-        assert!(validate_machine_name("test_01").is_ok());
+        assert!(validate_machine_name("test-01").is_ok());
         assert!(validate_machine_name("a.b").is_ok());
     }
 

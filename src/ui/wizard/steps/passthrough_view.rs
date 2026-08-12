@@ -8,7 +8,7 @@ use crate::ui::widgets::selectors::radio_group::RadioGroup;
 use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{layout::Rect, Frame};
 
 /// Single source of truth: returns (component, height, is_focusable) for every visible item.
@@ -84,6 +84,8 @@ pub struct PassthroughStepView {
     scanning_indicator: TextBlock,
     focus: FocusTracker,
     scroll_offset: u16,
+    scroll_area: Rect,
+    scroll_max: u16,
     hardware_scanning: bool,
 }
 
@@ -189,6 +191,8 @@ impl PassthroughStepView {
             ),
             focus: FocusTracker::new(),
             scroll_offset: 0,
+            scroll_area: Rect::default(),
+            scroll_max: 0,
             hardware_scanning,
         };
 
@@ -212,6 +216,7 @@ impl Component for PassthroughStepView {
             area.width.saturating_sub(2),
             area.height.saturating_sub(2),
         );
+        self.scroll_area = area;
 
         let items = layout_items!(self);
 
@@ -252,6 +257,7 @@ impl Component for PassthroughStepView {
         }
 
         let max_scroll = total_height.saturating_sub(area.height);
+        self.scroll_max = max_scroll;
         self.scroll_offset = self.scroll_offset.min(max_scroll);
 
         let inner_width = if total_height > area.height {
@@ -276,8 +282,9 @@ impl Component for PassthroughStepView {
         // Scrollbar
         if total_height > area.height {
             use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-            let mut state =
-                ScrollbarState::new(max_scroll as usize).position(self.scroll_offset as usize);
+            let mut state = ScrollbarState::new(total_height as usize)
+                .position(self.scroll_offset as usize)
+                .viewport_content_length(usize::from(area.height));
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
@@ -308,6 +315,27 @@ impl Component for PassthroughStepView {
         }
 
         res
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> EventResult {
+        if mouse.column < self.scroll_area.x
+            || mouse.column >= self.scroll_area.x.saturating_add(self.scroll_area.width)
+            || mouse.row < self.scroll_area.y
+            || mouse.row >= self.scroll_area.y.saturating_add(self.scroll_area.height)
+        {
+            return EventResult::Ignored;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                EventResult::Consumed
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3).min(self.scroll_max);
+                EventResult::Consumed
+            }
+            _ => EventResult::Ignored,
+        }
     }
 
     fn validate(&mut self) -> Result<(), String> {

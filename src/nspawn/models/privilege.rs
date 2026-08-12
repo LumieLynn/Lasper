@@ -10,14 +10,19 @@ pub struct MachineName(String);
 impl MachineName {
     pub fn new(name: impl Into<String>) -> Result<Self, MachineNameError> {
         let name = name.into();
-        if name.is_empty()
-            || name.len() > 64
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
-            || name.starts_with('.')
-            || name.contains("..")
-        {
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && !name.starts_with('.')
+            && !name.ends_with('.')
+            && name.split('.').all(|label| {
+                !label.is_empty()
+                    && !label.starts_with('-')
+                    && !label.ends_with('-')
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            });
+        if !valid {
             return Err(MachineNameError(name));
         }
         Ok(Self(name))
@@ -75,7 +80,7 @@ impl fmt::Display for MachineNameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "invalid machine name {:?}: expected 1-64 ASCII characters from [a-zA-Z0-9_.-], no leading dot or '..'",
+            "invalid machine name {:?}: expected 1-64 ASCII hostname labels (letters, digits, '-' and '.', with no empty labels or label-edge '-')",
             self.0
         )
     }
@@ -173,24 +178,37 @@ mod tests {
 
     #[test]
     fn machine_name_rejects_traversal_and_invalid_characters() {
-        for invalid in ["", ".hidden", "a..b", "with/slash", "contains space"] {
+        for invalid in [
+            "",
+            ".hidden",
+            "hidden.",
+            "a..b",
+            "with/slash",
+            "contains space",
+            "with_under_score",
+            "-leading",
+            "trailing-",
+            "a.-b",
+            "a.b-",
+        ] {
             assert!(MachineName::new(invalid).is_err(), "{invalid}");
         }
     }
 
     #[test]
     fn machine_name_deserialization_validates_the_value() {
-        assert!(serde_json::from_str::<MachineName>(r#""valid-machine_1""#).is_ok());
+        assert!(serde_json::from_str::<MachineName>(r#""valid-machine-1""#).is_ok());
+        assert!(serde_json::from_str::<MachineName>(r#""web.frontend""#).is_ok());
         assert!(serde_json::from_str::<MachineName>(r#""../invalid""#).is_err());
     }
 
     #[test]
     fn machine_name_builds_systemd_nspawn_unit_name() {
-        let machine = MachineName::new("valid-machine_1").unwrap();
+        let machine = MachineName::new("valid-machine-1").unwrap();
 
         assert_eq!(
             machine.systemd_nspawn_unit(),
-            "systemd-nspawn@valid-machine_1.service"
+            "systemd-nspawn@valid-machine-1.service"
         );
     }
 

@@ -18,7 +18,7 @@ pub struct ContainerListComponent {
 impl ContainerListComponent {
     pub fn new() -> Self {
         Self {
-            list: SharedContainerList::new(" Containers ", 0),
+            list: SharedContainerList::new(" Machines ", 0),
         }
     }
 
@@ -41,7 +41,7 @@ impl ContainerListComponent {
 
         if entries.is_empty() {
             // Hint logic (simplified for now but preserving the spirit)
-            let hint = "  No containers found";
+            let hint = "  No running machines found";
             f.render_widget(
                 Paragraph::new(vec![
                     Line::from(""),

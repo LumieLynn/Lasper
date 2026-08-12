@@ -1,6 +1,6 @@
 use super::App;
-use crate::nspawn::models::{ContainerEntry, ContainerState};
-use crate::ui::views::detail_panel::DetailPane;
+use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry, MachineProperties};
+use crate::ui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
 
 impl App {
@@ -9,30 +9,14 @@ impl App {
             return;
         }
         self.data.dbus_active = self.data.manager.is_dbus_available().await;
-        match self.data.manager.list_all().await {
-            Ok(entries) => {
-                let prev_name = self
-                    .data
-                    .entries
-                    .get(self.data.selected)
-                    .map(|e| e.name.clone());
-                self.data.entries = self.merge_transitional_states(entries);
-                self.data.properties_dirty = true;
-                self.data.details_dirty = true;
-                self.data.selected = prev_name
-                    .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
-                    .unwrap_or(0)
-                    .min(self.data.entries.len().saturating_sub(1));
+        match self.data.manager.snapshot().await {
+            Ok(snapshot) => {
+                self.sync_snapshot(snapshot).await;
             }
-            Err(e) => log::error!("list_all: {}", e),
-        }
-        self.refresh_detail().await;
-
-        // Check if any DBus call fell back to CLI during this refresh
-        if self.data.dbus_active {
-            if let Some(reason) = self.data.manager.did_fallback() {
+            Err(error) => {
+                log::error!("runtime snapshot: {}", error);
                 self.set_status(
-                    format!("⚡ DBus fallback: {}", reason),
+                    format!("Status refresh failed: {}", error),
                     crate::ui::StatusLevel::Warn,
                 );
             }
@@ -40,74 +24,170 @@ impl App {
     }
 
     pub async fn refresh_detail(&mut self) {
-        let entry: ContainerEntry = match self.data.entries.get(self.data.selected) {
-            Some(e) => e.clone(),
-            Option::None => {
-                self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
-                self.data.properties_dirty = true;
-                self.data.log_manager.cleanup_all();
-                self.data.config_content = Option::None;
-                self.data.config_dirty = true;
+        self.update_detail_target();
+        let target = self.data.detail_target.clone();
+        let Some(name) = target.name().map(str::to_string) else {
+            if !matches!(target, DetailTarget::Empty) {
                 return;
             }
+            self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
+            self.data.properties_dirty = true;
+            self.data.log_manager.cleanup_all();
+            self.data.config_content = Option::None;
+            self.data.config_path = Option::None;
+            self.data.config_dirty = true;
+            self.data.unit_name = None;
+            self.data.unit_drop_ins.clear();
+            self.data.unit_dirty = true;
+            return;
         };
 
-        match self.ui.detail_panel.active_pane {
-            DetailPane::Properties | DetailPane::Details => {
-                match self.data.manager.get_properties(&entry.name, &entry).await {
-                    Ok(p) => {
-                        self.data.properties = Ok(p);
-                        self.data.properties_dirty = true;
-                        self.data.details_dirty = true;
-                    }
-                    Err(e) => {
-                        log::debug!("{e}");
-                        self.data.properties = Err(e.to_string());
-                        self.data.properties_dirty = true;
-                        self.data.details_dirty = true;
-                    }
-                }
-            }
-            DetailPane::Logs => {
-                self.data.log_manager.get_or_create(&entry.name);
-
-                if entry.state.is_running() {
-                    if !self.data.log_manager.stream_is_active(&entry.name) {
-                        if let Some((tx, fatal)) = self.data.log_manager.start_stream(&entry.name) {
-                            let handle = self.data.manager.spawn_log_stream(&entry.name, tx, fatal);
-                            self.data
-                                .log_manager
-                                .attach_stream_handle(&entry.name, handle);
+        match target {
+            DetailTarget::Machine(_) => {
+                let entry = self
+                    .data
+                    .entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .cloned()
+                    .unwrap_or(ContainerEntry {
+                        name: name.clone(),
+                        state: ContainerState::Off,
+                        address: None,
+                        all_addresses: Vec::new(),
+                    });
+                match self.ui.detail_panel.active_pane {
+                    DetailPane::Properties | DetailPane::Details => {
+                        match self.data.manager.get_properties(&name, &entry).await {
+                            Ok(p) => {
+                                self.data.properties = Ok(p);
+                                self.data.properties_dirty = true;
+                                self.data.details_dirty = true;
+                            }
+                            Err(e) => {
+                                log::debug!("{e}");
+                                self.data.properties = Err(e.to_string());
+                                self.data.properties_dirty = true;
+                                self.data.details_dirty = true;
+                            }
                         }
                     }
-                } else if self.data.log_manager.stop_stream(&entry.name) {
-                    self.data
-                        .log_manager
-                        .push_line(&entry.name, "[CONTAINER STOPPED]");
-                }
-            }
-            DetailPane::Config => {
-                let new_content = match self.data.exec_ctx.nspawn.read(&entry.name).await {
-                    Ok(config) => config.map(|config| config.content),
-                    Err(error) => {
-                        log::warn!(
-                            "Failed to read .nspawn config for {}: {}",
-                            entry.name,
-                            error
-                        );
-                        None
+                    DetailPane::Logs => {
+                        self.data.log_manager.get_or_create(&name);
+                        if entry.state == ContainerState::Running {
+                            if !self.data.log_manager.stream_is_active(&name) {
+                                if let Some((tx, fatal)) = self.data.log_manager.start_stream(&name)
+                                {
+                                    let handle =
+                                        self.data.manager.spawn_log_stream(&name, tx, fatal);
+                                    self.data.log_manager.attach_stream_handle(&name, handle);
+                                }
+                            }
+                        } else if self.data.log_manager.stop_stream(&name) {
+                            self.data
+                                .log_manager
+                                .push_line(&name, "[CONTAINER STOPPED]");
+                        }
                     }
-                };
-                if self.data.config_content != new_content {
-                    self.ui.detail_panel.config_scroll = 0;
-                    self.data.config_dirty = true;
+                    DetailPane::Config => {
+                        self.read_nspawn_config(&name).await;
+                    }
+                    DetailPane::Metrics => {}
+                    _ => {}
                 }
-                self.data.config_content = new_content;
             }
-            DetailPane::Metrics => {
-                // Metrics are updated via AppEvent::MetricsUpdate
+            DetailTarget::Image { .. } => match self.ui.detail_panel.active_pane {
+                DetailPane::ImageOverview => {
+                    self.data.properties = Ok(self.image_properties(&name));
+                    self.data.properties_dirty = true;
+                    self.data.details_dirty = true;
+                }
+                DetailPane::ImageConfig => self.read_nspawn_config(&name).await,
+                DetailPane::ImageUnit => {
+                    match self
+                        .data
+                        .exec_ctx
+                        .machine_inspection
+                        .inspect_static(&name)
+                        .await
+                    {
+                        Ok(properties) => {
+                            self.data.properties = Ok(properties);
+                            self.data.properties_dirty = true;
+                            self.data.details_dirty = true;
+                        }
+                        Err(error) => {
+                            self.data.properties = Err(error.to_string());
+                            self.data.properties_dirty = true;
+                            self.data.details_dirty = true;
+                        }
+                    }
+                    match self.data.exec_ctx.systemd_unit.read(&name).await {
+                        Ok(unit) => {
+                            self.data.unit_name = Some(unit.unit);
+                            self.data.unit_drop_ins = unit.drop_ins;
+                        }
+                        Err(error) => {
+                            log::debug!("Failed to read unit drop-ins for {name}: {error}");
+                            self.data.unit_name = crate::nspawn::models::MachineName::new(&name)
+                                .ok()
+                                .map(|name| name.systemd_nspawn_unit());
+                            self.data.unit_drop_ins.clear();
+                        }
+                    }
+                    self.data.unit_dirty = true;
+                }
+                _ => {}
+            },
+            DetailTarget::Empty => {}
+        }
+    }
+
+    async fn read_nspawn_config(&mut self, name: &str) {
+        let new_config = match self.data.exec_ctx.nspawn.inspect(name).await {
+            Ok(config) => config,
+            Err(error) => {
+                log::warn!("Failed to read .nspawn config for {}: {}", name, error);
+                None
+            }
+        };
+        let new_path = new_config.as_ref().map(|config| config.path.clone());
+        let new_content = new_config.map(|config| config.content);
+        if self.data.config_content != new_content {
+            self.ui.detail_panel.config_scroll = 0;
+            self.data.config_dirty = true;
+        }
+        self.data.config_path = new_path;
+        self.data.config_content = new_content;
+    }
+
+    fn image_properties(&self, name: &str) -> MachineProperties {
+        let mut properties = MachineProperties::from_inspection(
+            crate::nspawn::models::InspectionSource::RuntimeState,
+            crate::nspawn::models::InspectionCompleteness::RuntimeOnly,
+        );
+        let image = self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .find(|image| image.name == name);
+        if let Some(image) = image {
+            properties.insert("Image", "Name".into(), image.name.clone());
+            properties.insert("Image", "Type".into(), image.image_type.clone());
+            properties.insert(
+                "Image",
+                "ReadOnly".into(),
+                if image.readonly { "yes" } else { "no" }.into(),
+            );
+            if let Some(usage) = &image.usage {
+                properties.insert("Image", "Usage".into(), usage.clone());
+            }
+            if let Some(path) = &image.dbus_object_path {
+                properties.insert("Image", "D-BusPath".into(), path.clone());
             }
         }
+        properties
     }
 
     pub fn set_status(&mut self, msg: String, level: crate::ui::StatusLevel) {
@@ -125,19 +205,88 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if !self.data.entries.is_empty() {
+        if self.image_is_focused() {
+            if self.ui.image_list.shows_internal() {
+                if !self.data.internal_images.is_empty() {
+                    self.data.internal_image_selected =
+                        (self.data.internal_image_selected + 1) % self.data.internal_images.len();
+                }
+            } else if !self.data.images.is_empty() {
+                self.data.image_selected = (self.data.image_selected + 1) % self.data.images.len();
+            }
+        } else if !self.data.entries.is_empty() {
             self.data.selected = (self.data.selected + 1) % self.data.entries.len();
         }
     }
 
     pub fn select_prev(&mut self) {
-        if !self.data.entries.is_empty() {
+        if self.image_is_focused() {
+            if self.ui.image_list.shows_internal() && !self.data.internal_images.is_empty() {
+                self.data.internal_image_selected = if self.data.internal_image_selected == 0 {
+                    self.data.internal_images.len() - 1
+                } else {
+                    self.data.internal_image_selected - 1
+                };
+            } else if !self.ui.image_list.shows_internal() && !self.data.images.is_empty() {
+                self.data.image_selected = if self.data.image_selected == 0 {
+                    self.data.images.len() - 1
+                } else {
+                    self.data.image_selected - 1
+                };
+            }
+        } else if !self.data.entries.is_empty() {
             self.data.selected = if self.data.selected == 0 {
                 self.data.entries.len() - 1
             } else {
                 self.data.selected - 1
             };
         }
+    }
+
+    pub(crate) fn image_is_focused(&self) -> bool {
+        self.ui.focus.active_idx == 1
+    }
+
+    pub(crate) fn active_images(&self) -> (&[ImageEntry], usize) {
+        if self.ui.image_list.shows_internal() {
+            (
+                &self.data.internal_images,
+                self.data.internal_image_selected,
+            )
+        } else {
+            (&self.data.images, self.data.image_selected)
+        }
+    }
+
+    pub(crate) fn selected_image(&self) -> Option<&ImageEntry> {
+        let (images, selected) = self.active_images();
+        images.get(selected)
+    }
+
+    pub(crate) fn focused_image_resource(&self) -> Option<&ImageEntry> {
+        if self.image_is_focused() {
+            return self.selected_image();
+        }
+        if self.ui.focus.active_idx != 2 {
+            return None;
+        }
+        let DetailTarget::Image { name, .. } = &self.data.detail_target else {
+            return None;
+        };
+        self.data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .find(|image| &image.name == name)
+    }
+
+    pub(crate) fn image_has_running_machine(&self, image: &ImageEntry) -> bool {
+        !image.is_hidden()
+            && self
+                .data
+                .entries
+                .iter()
+                .any(|entry| entry.name == image.name && entry.state == ContainerState::Running)
     }
 
     pub fn check_action_cooldown(&mut self) -> bool {
@@ -251,9 +400,7 @@ impl App {
         name: &str,
         previous_state: Option<ContainerState>,
     ) {
-        if previous_state.is_some() {
-            self.data.transitions.remove(name);
-        }
+        let transition = self.data.transitions.remove(name);
         if let Some(previous_state) = previous_state {
             if let Some(entry) = self
                 .data
@@ -263,10 +410,75 @@ impl App {
             {
                 entry.state = previous_state;
             }
+        } else if matches!(transition, Some((ContainerState::Starting, _))) {
+            let selected_name = self
+                .data
+                .entries
+                .get(self.data.selected)
+                .map(|entry| entry.name.clone());
+            self.data
+                .entries
+                .retain(|entry| entry.name != name || entry.state != ContainerState::Starting);
+            self.data.selected = selected_name
+                .and_then(|selected| {
+                    self.data
+                        .entries
+                        .iter()
+                        .position(|entry| entry.name == selected)
+                })
+                .unwrap_or(0)
+                .min(self.data.entries.len().saturating_sub(1));
         }
     }
 
+    fn begin_image_start_transition(&mut self, name: &str) {
+        let selected_name = self
+            .data
+            .entries
+            .get(self.data.selected)
+            .map(|entry| entry.name.clone());
+        self.data
+            .transitions
+            .insert(name.to_string(), (ContainerState::Starting, Instant::now()));
+
+        if let Some(entry) = self
+            .data
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name)
+        {
+            entry.state = ContainerState::Starting;
+        } else {
+            self.data.entries.push(ContainerEntry {
+                name: name.to_string(),
+                state: ContainerState::Starting,
+                address: None,
+                all_addresses: Vec::new(),
+            });
+        }
+
+        self.data.entries.sort();
+        self.data.selected = selected_name
+            .and_then(|selected| {
+                self.data
+                    .entries
+                    .iter()
+                    .position(|entry| entry.name == selected)
+            })
+            .or_else(|| {
+                self.data
+                    .entries
+                    .iter()
+                    .position(|entry| entry.name == name)
+            })
+            .unwrap_or(0);
+    }
+
     pub fn action_start(&mut self) {
+        if self.image_is_focused() {
+            self.action_start_image();
+            return;
+        }
         self.perform_container_action(
             "Started",
             Some(ContainerState::Starting),
@@ -276,6 +488,9 @@ impl App {
     }
 
     pub fn action_poweroff(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Powered off",
             Some(ContainerState::Exiting),
@@ -285,6 +500,9 @@ impl App {
     }
 
     pub fn action_terminate(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Terminated",
             Some(ContainerState::Exiting),
@@ -294,6 +512,9 @@ impl App {
     }
 
     pub fn action_reboot(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Rebooting",
             Some(ContainerState::Exiting),
@@ -303,6 +524,9 @@ impl App {
     }
 
     pub fn action_kill(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Sent SIGKILL to",
             None,
@@ -316,6 +540,10 @@ impl App {
     }
 
     pub fn action_remove(&mut self) {
+        if self.image_is_focused() {
+            self.action_remove_image();
+            return;
+        }
         self.ui.delete_dialog = None;
         self.perform_container_action(
             "Removed",
@@ -325,7 +553,120 @@ impl App {
         );
     }
 
+    fn action_start_image(&mut self) {
+        if self.ui.image_list.shows_internal() {
+            self.set_status(
+                "Internal images cannot be started directly.".into(),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
+        if !self.check_action_cooldown() {
+            return;
+        }
+        let image = match self.data.images.get(self.data.image_selected) {
+            Some(image) => image,
+            None => return,
+        };
+        let name = image.name.clone();
+        if let Some(state) = self
+            .data
+            .entries
+            .iter()
+            .find(|entry| entry.name == name && entry.state.is_running())
+            .map(|entry| entry.state.label())
+        {
+            self.set_status(
+                format!("{} is already {}.", name, state),
+                crate::ui::StatusLevel::Info,
+            );
+            return;
+        }
+        let manager = self.data.manager.clone();
+        let tx = match &self.ui.app_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        self.begin_image_start_transition(&name);
+        let pm = self.permissions.clone();
+        tokio::spawn(async move {
+            let audit = match pm.request_elevation(format!("Start {}", name)).await {
+                Ok(audit) => audit,
+                Err(error) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ContainerActionFailed {
+                            name,
+                            previous_state: None,
+                            message: format!("Start failed: {}", error),
+                        })
+                        .await;
+                    return;
+                }
+            };
+            let result = audit.run(manager.start(&name)).await;
+            let event = match result {
+                Ok(()) => crate::events::AppEvent::ActionDone(
+                    format!("Started {}", name),
+                    crate::ui::StatusLevel::Success,
+                ),
+                Err(error) => crate::events::AppEvent::ContainerActionFailed {
+                    name,
+                    previous_state: None,
+                    message: format!("Start failed: {}", error),
+                },
+            };
+            let _ = tx.send(event).await;
+        });
+    }
+
+    fn action_remove_image(&mut self) {
+        self.ui.delete_dialog = None;
+        if !self.check_action_cooldown() {
+            return;
+        }
+        let image = match self.selected_image() {
+            Some(image) => image,
+            None => return,
+        };
+        let name = image.name.clone();
+        let manager = self.data.manager.clone();
+        let tx = match &self.ui.app_tx {
+            Some(tx) => tx.clone(),
+            None => return,
+        };
+        let pm = self.permissions.clone();
+        tokio::spawn(async move {
+            let audit = match pm.request_elevation(format!("Remove image {}", name)).await {
+                Ok(audit) => audit,
+                Err(error) => {
+                    let _ = tx
+                        .send(crate::events::AppEvent::ActionDone(
+                            format!("Remove failed: {}", error),
+                            crate::ui::StatusLevel::Error,
+                        ))
+                        .await;
+                    return;
+                }
+            };
+            let result = audit.run(manager.remove(&name)).await;
+            let event = match result {
+                Ok(()) => crate::events::AppEvent::ActionDone(
+                    format!("Removed image {}", name),
+                    crate::ui::StatusLevel::Success,
+                ),
+                Err(error) => crate::events::AppEvent::ActionDone(
+                    format!("Remove failed: {}", error),
+                    crate::ui::StatusLevel::Error,
+                ),
+            };
+            let _ = tx.send(event).await;
+        });
+    }
+
     pub fn action_enable(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Enabled",
             None,
@@ -335,6 +676,9 @@ impl App {
     }
 
     pub fn action_disable(&mut self) {
+        if self.image_is_focused() {
+            return;
+        }
         self.perform_container_action(
             "Disabled",
             None,
@@ -344,12 +688,66 @@ impl App {
     }
 
     pub async fn spawn_terminal(&mut self) {
-        self.ui.prev_active_idx = self.ui.focus.active_idx;
-        let rows = self.ui.pane_height.max(10);
-        let entry = match self.data.entries.get(self.data.selected) {
-            Some(e) => e.clone(),
-            None => return,
+        let entry = if self.focused_image_resource().is_some() {
+            let Some(image) = self.focused_image_resource().cloned() else {
+                self.set_status("No image selected.".into(), crate::ui::StatusLevel::Warn);
+                return;
+            };
+            if image.is_hidden() {
+                self.set_status(
+                    "Internal images do not provide terminal sessions.".into(),
+                    crate::ui::StatusLevel::Info,
+                );
+                return;
+            }
+            let Some(machine_idx) = self
+                .data
+                .entries
+                .iter()
+                .position(|entry| entry.name == image.name)
+            else {
+                if self
+                    .data
+                    .transitions
+                    .get(&image.name)
+                    .is_some_and(|(state, _)| *state == ContainerState::Starting)
+                {
+                    self.set_status(
+                        format!("{} is still starting.", image.name),
+                        crate::ui::StatusLevel::Info,
+                    );
+                } else {
+                    self.set_status(
+                        format!("{} is not running.", image.name),
+                        crate::ui::StatusLevel::Info,
+                    );
+                }
+                return;
+            };
+            let machine = self.data.entries[machine_idx].clone();
+            if machine.state != ContainerState::Running {
+                self.set_status(
+                    format!(
+                        "{} is {} and cannot accept a terminal.",
+                        image.name,
+                        machine.state.label()
+                    ),
+                    crate::ui::StatusLevel::Info,
+                );
+                return;
+            }
+            self.data.selected = machine_idx;
+            machine
+        } else {
+            let Some(entry) = self.data.entries.get(self.data.selected).cloned() else {
+                return;
+            };
+            entry
         };
+        if self.ui.focus.active_idx != 3 {
+            self.ui.prev_active_idx = self.ui.focus.active_idx.min(2);
+        }
+        let rows = self.ui.pane_height.max(10);
 
         match self
             .data
@@ -358,7 +756,8 @@ impl App {
             .await
         {
             Ok(_idx) => {
-                self.ui.focus.active_idx = 2;
+                self.set_focus_idx(3);
+                self.refresh_detail().await;
                 self.set_status(
                     format!("Logged into {}", entry.name),
                     crate::ui::StatusLevel::Info,
@@ -371,10 +770,14 @@ impl App {
     }
 
     pub fn sync_terminal_to_selected(&mut self) {
+        let was_focused = self.ui.focus.active_idx == 3;
         let entry = match self.data.entries.get(self.data.selected) {
             Some(e) => e,
             None => return,
         };
         self.data.terminal.sync_to_entry(&entry.name);
+        if was_focused && !self.data.terminal.is_showing() {
+            self.restore_non_terminal_focus();
+        }
     }
 }

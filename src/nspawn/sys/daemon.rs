@@ -1,5 +1,5 @@
-//! Elevated daemon — a long-running root child process that executes
-//! privileged commands and file I/O on behalf of the unprivileged TUI.
+//! Elevated daemon — a long-running root child process that executes closed,
+//! typed privileged operations on behalf of the unprivileged TUI.
 //!
 //! Communication is JSON-RPC 2.0 over stdin/stdout (one JSON object per
 //! line). The daemon is spawned via `sudo <self> --daemon` before the
@@ -36,33 +36,45 @@ use crate::nspawn::adapters::rootfs::store::{
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
-use crate::nspawn::models::{AllowedSignal, MachineName, TerminalSize};
+use crate::nspawn::models::{MachineName, MachineProperties, TerminalSize};
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
 };
 use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
+use crate::nspawn::ops::provision::oci_operation::{
+    build_command as build_oci_pull_command, OciPullRequest,
+};
+use crate::nspawn::ops::system_operation::{
+    execute_dbus_system_operation, execute_system_operation, SystemOperation,
+};
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
-use crate::nspawn::sys::command::{CommandRunner, SpawnedProcess};
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Output};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 3;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 6;
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DaemonBootstrap {
     protocol_version: u32,
     fd_auth_token: String,
+    dbus_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CliInspectMachineRequest {
+    machine: MachineName,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -79,10 +91,10 @@ enum FdOperation {
     Journalctl(SpawnJournalctlParams),
     #[serde(rename = "spawn_login")]
     Login(SpawnLoginParams),
-    #[serde(rename = "spawn_shell_cmd")]
-    ShellCommand(SpawnShellCmdParams),
     #[serde(rename = "spawn_bootstrap")]
     Bootstrap(Box<SpawnBootstrapParams>),
+    #[serde(rename = "spawn_oci_pull")]
+    OciPull(Box<SpawnOciPullParams>),
     #[serde(rename = "import_raw_image")]
     ImportRawImage(ImportRawImageParams),
     #[serde(rename = "import_tar_image")]
@@ -104,17 +116,16 @@ struct SpawnLoginParams {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnShellCmdParams {
+struct SpawnBootstrapParams {
     cmd_id: u64,
-    program: String,
-    args: Vec<String>,
+    request: BootstrapRequest,
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnBootstrapParams {
+struct SpawnOciPullParams {
     cmd_id: u64,
-    request: BootstrapRequest,
+    request: OciPullRequest,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -154,46 +165,6 @@ struct RpcError {
     message: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct CommandResult {
-    status: i32,
-    stdout: String,
-    stderr: String,
-}
-
-// ── DaemonCommandRunner — adapts ElevatedDaemon to CommandRunner ──
-
-/// Routes commands through the elevated daemon (root child process).
-pub struct DaemonCommandRunner {
-    daemon: Arc<ElevatedDaemon>,
-}
-
-impl DaemonCommandRunner {
-    pub fn new(daemon: Arc<ElevatedDaemon>) -> Self {
-        Self { daemon }
-    }
-}
-
-#[async_trait::async_trait]
-impl CommandRunner for DaemonCommandRunner {
-    async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
-        self.daemon.run_command(program, &args).await
-    }
-
-    async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
-        let cmd_id = self.daemon.reserve_spawn_id();
-        let stdout_fd = self.daemon.spawn_shell_cmd(cmd_id, program, &args).await?;
-        let receiver = pipe_reader(stdout_fd)?;
-        Ok(SpawnedProcess::new(Box::new(receiver), {
-            let daemon = self.daemon.clone();
-            async move {
-                let code = daemon.wait_command(cmd_id).await?;
-                Ok(ExitStatus::from_raw(code))
-            }
-        }))
-    }
-}
-
 pub(crate) fn pipe_reader(fd: RawFd) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
     use std::os::fd::OwnedFd;
     use std::os::unix::io::FromRawFd;
@@ -206,6 +177,17 @@ type RpcCall = (RpcRequest, tokio::sync::oneshot::Sender<RpcResponse>);
 enum HandleOutcome {
     Spawned,
     Sync(Result<serde_json::Value, String>),
+}
+
+async fn initialize_dbus_backend(
+    enabled: bool,
+) -> Option<crate::nspawn::adapters::comm::dbus::DbusBackend> {
+    if !enabled {
+        return None;
+    }
+
+    let dbus = crate::nspawn::adapters::comm::dbus::DbusBackend::new();
+    dbus.is_available().await.then_some(dbus)
 }
 
 // ── Parent-side handle ──
@@ -317,7 +299,7 @@ fn configure_fd_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
 }
 
 impl ElevatedDaemon {
-    pub async fn spawn() -> std::io::Result<Self> {
+    pub async fn spawn(dbus_enabled: bool) -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let user_uid = uzers::get_current_uid();
         let parent_pid = std::process::id();
@@ -366,6 +348,7 @@ impl ElevatedDaemon {
             let bootstrap = DaemonBootstrap {
                 protocol_version: DAEMON_BOOTSTRAP_VERSION,
                 fd_auth_token: bootstrap_token.to_string(),
+                dbus_enabled,
             };
             let mut bootstrap_line = match serde_json::to_vec(&bootstrap) {
                 Ok(line) => line,
@@ -575,62 +558,6 @@ impl ElevatedDaemon {
         log::info!("[lasper] daemon::exit() RPC returned");
     }
 
-    pub async fn run_command(&self, program: &str, args: &[String]) -> std::io::Result<Output> {
-        let result = self
-            .rpc_call(
-                "run_command",
-                serde_json::json!({"program": program, "args": args}),
-            )
-            .await?;
-        let cmd_result: CommandResult = serde_json::from_value(result)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        Ok(Output {
-            status: std::process::ExitStatus::from_raw(cmd_result.status),
-            stdout: cmd_result.stdout.into_bytes(),
-            stderr: cmd_result.stderr.into_bytes(),
-        })
-    }
-
-    pub async fn write_file(
-        &self,
-        path: &std::path::Path,
-        content: &str,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "write_file",
-            serde_json::json!({"path": path.to_string_lossy(), "content": content}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
-    pub async fn create_dir_all(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "create_dir_all",
-            serde_json::json!({"path": path.to_string_lossy()}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
-    pub async fn remove_dir_all(
-        &self,
-        path: &std::path::Path,
-    ) -> crate::nspawn::errors::Result<()> {
-        self.rpc_call(
-            "remove_dir_all",
-            serde_json::json!({"path": path.to_string_lossy()}),
-        )
-        .await
-        .map_err(|e| crate::nspawn::errors::NspawnError::Io(path.to_path_buf(), e))?;
-        Ok(())
-    }
-
     pub(crate) async fn nspawn_config(
         &self,
         operation: NspawnConfigOperation,
@@ -638,6 +565,28 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.rpc_call("system_operation", params).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cli_inspect_machine(
+        &self,
+        name: &str,
+    ) -> std::io::Result<MachineProperties> {
+        let request = CliInspectMachineRequest {
+            machine: MachineName::new(name)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+        };
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("cli_inspect_machine", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -790,7 +739,7 @@ impl ElevatedDaemon {
         .await?
     }
 
-    // ── Generic spawn (bootstrap / image pull / …) ──
+    // ── Typed streaming operations ──
 
     /// Allocate a unique ID for a spawned command.
     pub fn reserve_spawn_id(&self) -> u64 {
@@ -798,23 +747,19 @@ impl ElevatedDaemon {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Spawn `sh -c 'exec "$@" 2>&1' -- program args…` as root, return
-    /// the stdout fd.
-    pub async fn spawn_shell_cmd(
+    pub(crate) async fn spawn_bootstrap(
         &self,
         cmd_id: u64,
-        program: &str,
-        args: &[String],
+        request: BootstrapRequest,
     ) -> std::io::Result<RawFd> {
         let std_sock = self
-            .open_fd_channel(FdOperation::ShellCommand(SpawnShellCmdParams {
+            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
                 cmd_id,
-                program: program.to_string(),
-                args: args.to_vec(),
-            }))
+                request,
+            })))
             .await?;
         tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 128];
+            let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
             let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
             if fd_count > 0 {
@@ -830,13 +775,13 @@ impl ElevatedDaemon {
         .await?
     }
 
-    pub(crate) async fn spawn_bootstrap(
+    pub(crate) async fn spawn_oci_pull(
         &self,
         cmd_id: u64,
-        request: BootstrapRequest,
+        request: OciPullRequest,
     ) -> std::io::Result<RawFd> {
         let std_sock = self
-            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
+            .open_fd_channel(FdOperation::OciPull(Box::new(SpawnOciPullParams {
                 cmd_id,
                 request,
             })))
@@ -949,21 +894,14 @@ pub async fn daemon_main(
         std::process::exit(0);
     });
 
-    let dbus: Option<crate::nspawn::adapters::comm::dbus::DbusBackend> =
-        if crate::nspawn::adapters::comm::dbus::DbusBackend::new()
-            .is_available()
-            .await
-        {
-            Some(crate::nspawn::adapters::comm::dbus::DbusBackend::new())
-        } else {
-            None
-        };
+    let dbus = initialize_dbus_backend(bootstrap.dbus_enabled).await;
 
     if let Some(ref dbus) = dbus {
         let out_tx_bg = out_tx.clone();
         let dbus_bg = dbus.clone();
         tokio::spawn(async move {
-            let (ev_tx, mut ev_rx) = tokio::sync::mpsc::channel::<()>(16);
+            let (ev_tx, mut ev_rx) =
+                tokio::sync::mpsc::channel::<crate::nspawn::models::StatusUpdate>(16);
             tokio::spawn(async move {
                 if let Err(e) = dbus_bg.watch_events(ev_tx).await {
                     log::error!("Daemon DBus watcher exited: {}", e);
@@ -1245,119 +1183,77 @@ async fn handle_request(
             HandleOutcome::Spawned
         }
 
-        "run_command" => {
+        "system_operation" => {
+            let operation: SystemOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid system_operation request: {error}"
+                    )));
+                }
+            };
             let id = request.id;
-            let program = match request.params["program"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing program".into())),
-            };
-            let args: Vec<String> = match request.params["args"].as_array() {
-                Some(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-                None => return HandleOutcome::Sync(Err("missing args".into())),
-            };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let output = crate::nspawn::sys::new_command(&program)
-                    .args(&args)
-                    .output()
-                    .await;
-                let response = match output {
-                    Ok(out) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
-                        "status": out.status.into_raw(),
-                        "stdout": String::from_utf8_lossy(&out.stdout),
-                        "stderr": String::from_utf8_lossy(&out.stderr),
+                let response = match execute_system_operation(operation).await {
+                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
+                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":error.to_string(),
                     }}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":format!("{}",e)}})
-                    }
                 };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
             });
             HandleOutcome::Spawned
         }
 
-        "write_file" => {
+        "cli_inspect_machine" => {
+            let inspection: CliInspectMachineRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid cli_inspect_machine request: {error}"
+                        )));
+                    }
+                };
             let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let content = match request.params["content"].as_str() {
-                Some(c) => c.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing content".into())),
-            };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let result: Result<(), String> = write_atomic_impl(&path_str, &content).await;
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
+                let response = match crate::nspawn::adapters::comm::cli::get_properties_with_runner(
+                    inspection.machine.as_str(),
+                    &crate::nspawn::sys::command::DefaultCommandRunner,
+                )
+                .await
+                {
+                    Ok(properties) => match serde_json::to_value(properties) {
+                        Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                            "code":-1,
+                            "message":error.to_string(),
+                        }}),
+                    },
+                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":error.to_string(),
+                    }}),
                 };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
             });
             HandleOutcome::Spawned
         }
 
-        "create_dir_all" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::create_dir_all(&path_str)
-                    .await
-                    .map_err(|e| format!("mkdir -p {}: {}", path_str, e));
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "remove_dir_all" => {
-            let id = request.id;
-            let path_str = match request.params["path"].as_str() {
-                Some(p) => p.to_owned(),
-                None => return HandleOutcome::Sync(Err("missing path".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::fs::remove_dir_all(&path_str)
-                    .await
-                    .map_err(|e| format!("rm -rf {}: {}", path_str, e));
-                let response = match result {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(e) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-1,"message":e}})
-                    }
-                };
-                let line = serde_json::to_string(&response).unwrap();
-                let _ = out_tx.send(line).await;
-            });
-            HandleOutcome::Spawned
-        }
-
-        "dbus_list_all" => {
+        "dbus_list_machines" => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            match dbus.list_all().await {
-                Ok(entries) => match serde_json::to_value(entries) {
+            match dbus.list_machines().await {
+                Ok(machines) => match serde_json::to_value(machines) {
                     Ok(v) => HandleOutcome::Sync(Ok(v)),
                     Err(e) => HandleOutcome::Sync(Err(e.to_string())),
                 },
@@ -1365,66 +1261,34 @@ async fn handle_request(
             }
         }
 
-        "dbus_start" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.start(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_terminate" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.terminate(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_poweroff" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.poweroff(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_reboot" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.reboot(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_enable" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.enable(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_disable" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.disable(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-        "dbus_remove" => {
-            sync_dbus_op(dbus, request, |dbus, name| async move {
-                dbus.remove(&name).await.map_err(|e| e.to_string())
-            })
-            .await
-        }
-
-        "dbus_kill" => {
+        "dbus_list_images" => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let name = match request_machine_name(request) {
-                Ok(name) => name,
-                Err(error) => return HandleOutcome::Sync(Err(error)),
+            match dbus.list_images().await {
+                Ok(images) => match serde_json::to_value(images) {
+                    Ok(v) => HandleOutcome::Sync(Ok(v)),
+                    Err(e) => HandleOutcome::Sync(Err(e.to_string())),
+                },
+                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
+            }
+        }
+
+        "dbus_system_operation" => {
+            let dbus = match dbus.as_ref() {
+                Some(d) => d,
+                None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let signal: AllowedSignal =
-                match serde_json::from_value(request.params["signal"].clone()) {
-                    Ok(signal) => signal,
-                    Err(error) => {
-                        return HandleOutcome::Sync(Err(format!("invalid signal: {error}")));
-                    }
-                };
-            match dbus.kill(name.as_str(), signal).await {
+            let operation: SystemOperation = match serde_json::from_value(request.params.clone()) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid dbus_system_operation request: {error}"
+                    )));
+                }
+            };
+            match execute_dbus_system_operation(dbus, operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
@@ -1444,17 +1308,6 @@ async fn handle_request(
                     Ok(v) => HandleOutcome::Sync(Ok(v)),
                     Err(e) => HandleOutcome::Sync(Err(e.to_string())),
                 },
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        "dbus_reload_daemon" => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            match dbus.reload_daemon().await {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
         }
@@ -1497,29 +1350,6 @@ async fn handle_request(
         }
 
         _ => HandleOutcome::Sync(Err(format!("unknown method: {}", request.method))),
-    }
-}
-
-async fn sync_dbus_op<F, Fut>(
-    dbus: &Option<crate::nspawn::adapters::comm::dbus::DbusBackend>,
-    request: &RpcRequest,
-    f: F,
-) -> HandleOutcome
-where
-    F: FnOnce(crate::nspawn::adapters::comm::dbus::DbusBackend, String) -> Fut,
-    Fut: std::future::Future<Output = Result<(), String>>,
-{
-    let dbus = match dbus.as_ref() {
-        Some(d) => d,
-        None => return HandleOutcome::Sync(Err("DBus not available".into())),
-    };
-    let name = match request_machine_name(request) {
-        Ok(name) => name,
-        Err(error) => return HandleOutcome::Sync(Err(error)),
-    };
-    match f(dbus.clone(), name.into_string()).await {
-        Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-        Err(e) => HandleOutcome::Sync(Err(e)),
     }
 }
 
@@ -1741,7 +1571,7 @@ async fn handle_fd_connection(
             };
 
             let mut cmd = CommandBuilder::new("machinectl");
-            cmd.args(["login", name.as_str()]);
+            cmd.args(["--", "login", name.as_str()]);
             match pair.slave.spawn_command(cmd) {
                 Ok(mut child) => {
                     drop(pair.slave);
@@ -1820,16 +1650,18 @@ async fn handle_fd_connection(
             }
         }
 
-        FdOperation::ShellCommand(SpawnShellCmdParams {
-            cmd_id,
-            program,
-            args,
-        }) => {
+        FdOperation::OciPull(params) => {
+            let SpawnOciPullParams { cmd_id, request } = *params;
+            let (program, args) = build_oci_pull_command(&request);
+            log::info!(
+                "[AUDIT] [Step: OCI] Starting typed importctl pull-oci operation for {}",
+                request.machine
+            );
             match crate::nspawn::sys::new_sync_command("sh")
                 .arg("-c")
                 .arg("exec \"$@\" 2>&1")
                 .arg("--")
-                .arg(&program)
+                .arg(program)
                 .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
@@ -1840,7 +1672,7 @@ async fn handle_fd_connection(
                     let raw_fd = stdout.as_raw_fd();
 
                     if let Err(e) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
-                        log::error!("Daemon: send_with_fd (spawn_shell_cmd) failed: {}", e);
+                        log::error!("Daemon: send_with_fd (spawn_oci_pull) failed: {}", e);
                     }
                     drop(stdout);
 
@@ -1853,8 +1685,8 @@ async fn handle_fd_connection(
                     });
                 }
                 Err(e) => {
-                    log::error!("Daemon: spawn shell cmd failed: {}", e);
-                    let _ = std_stream.send_with_fd(b"spawn failed", &[]);
+                    log::error!("Daemon: typed OCI pull spawn failed: {}", e);
+                    let _ = std_stream.send_with_fd(b"OCI pull spawn failed", &[]);
                 }
             }
         }
@@ -1931,17 +1763,6 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-// ── Atomic write (daemon side) ──
-
-/// Generic daemon file writes are one-shot replacements. Cross-process
-/// read-modify-write paths must use a typed operation with its own lock.
-async fn write_atomic_impl(path_str: &str, content: &str) -> Result<(), String> {
-    let path = std::path::Path::new(path_str);
-    crate::nspawn::sys::io::AsyncLockedWriter::write_atomic(path, content)
-        .await
-        .map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1949,34 +1770,57 @@ mod tests {
     const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
     #[test]
-    fn test_command_result_serde() {
-        let cr = CommandResult {
-            status: 0,
-            stdout: "hello".into(),
-            stderr: String::new(),
+    fn daemon_bootstrap_carries_the_selected_transport_mode() {
+        let bootstrap = DaemonBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            fd_auth_token: TEST_TOKEN.to_string(),
+            dbus_enabled: false,
         };
-        let json = serde_json::to_value(&cr).unwrap();
-        assert_eq!(json["status"], 0);
-        assert_eq!(json["stdout"], "hello");
-        let parsed: CommandResult = serde_json::from_value(json).unwrap();
-        assert_eq!(parsed.status, 0);
+
+        let json = serde_json::to_value(&bootstrap).unwrap();
+        assert_eq!(json["dbus_enabled"], false);
+
+        let parsed: DaemonBootstrap = serde_json::from_value(json).unwrap();
+        assert!(!parsed.dbus_enabled);
+        assert_eq!(parsed.protocol_version, DAEMON_BOOTSTRAP_VERSION);
+    }
+
+    #[test]
+    fn daemon_bootstrap_rejects_missing_or_unknown_transport_fields() {
+        let missing_mode = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "fd_auth_token": TEST_TOKEN,
+        });
+        assert!(serde_json::from_value::<DaemonBootstrap>(missing_mode).is_err());
+
+        let unknown_field = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "fd_auth_token": TEST_TOKEN,
+            "dbus_enabled": false,
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<DaemonBootstrap>(unknown_field).is_err());
     }
 
     #[tokio::test]
-    async fn generic_write_file_is_atomic_without_persistent_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join(".wayland-env");
+    async fn cli_mode_skips_daemon_dbus_initialization() {
+        assert!(initialize_dbus_backend(false).await.is_none());
+    }
 
-        write_atomic_impl(path.to_str().unwrap(), "WAYLAND_DISPLAY=wayland-0\n")
-            .await
-            .unwrap();
+    #[test]
+    fn cli_inspection_rpc_accepts_only_a_typed_machine_name() {
+        let valid: CliInspectMachineRequest =
+            serde_json::from_value(serde_json::json!({"machine": "test-machine"})).unwrap();
+        assert_eq!(valid.machine.as_str(), "test-machine");
 
-        assert_eq!(
-            tokio::fs::read_to_string(&path).await.unwrap(),
-            "WAYLAND_DISPLAY=wayland-0\n"
-        );
-        assert!(!path.with_extension("lock").exists());
-        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
+        assert!(serde_json::from_value::<CliInspectMachineRequest>(
+            serde_json::json!({"machine": "../escape"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<CliInspectMachineRequest>(
+            serde_json::json!({"machine": "test-machine", "unexpected": true})
+        )
+        .is_err());
     }
 
     #[test]
@@ -2034,7 +1878,7 @@ mod tests {
 
     #[test]
     fn fd_request_without_authentication_is_rejected_by_parser() {
-        let request = r#"{"method":"spawn_shell_cmd","params":{"program":"id","args":[]}}"#;
+        let request = r#"{"method":"spawn_oci_pull","params":{"cmd_id":1,"request":{"reference":"nginx","machine":"test","read_only":false}}}"#;
         assert!(serde_json::from_str::<FdRequest>(request).is_err());
     }
 
@@ -2092,6 +1936,39 @@ mod tests {
 
         let parsed: FdRequest = serde_json::from_value(json).unwrap();
         assert!(matches!(parsed.operation, FdOperation::Bootstrap(_)));
+    }
+
+    #[test]
+    fn fd_request_round_trip_uses_typed_oci_parameters() {
+        let request = FdRequest {
+            auth_token: TEST_TOKEN.to_string(),
+            operation: FdOperation::OciPull(Box::new(SpawnOciPullParams {
+                cmd_id: 9,
+                request: OciPullRequest {
+                    reference: crate::nspawn::models::OciReference::new(
+                        "docker.io/library/nginx:latest",
+                    )
+                    .unwrap(),
+                    machine: MachineName::new("web-app").unwrap(),
+                    read_only: true,
+                },
+            })),
+        };
+
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["method"], "spawn_oci_pull");
+        assert_eq!(json["params"]["cmd_id"], 9);
+        assert_eq!(
+            json["params"]["request"]["reference"],
+            "docker.io/library/nginx:latest"
+        );
+        assert_eq!(json["params"]["request"]["machine"], "web-app");
+        assert_eq!(json["params"]["request"]["read_only"], true);
+        assert!(json["params"].get("program").is_none());
+        assert!(json["params"].get("args").is_none());
+
+        let parsed: FdRequest = serde_json::from_value(json).unwrap();
+        assert!(matches!(parsed.operation, FdOperation::OciPull(_)));
     }
 
     #[test]
@@ -2159,7 +2036,7 @@ mod tests {
         let valid = RpcRequest {
             jsonrpc: "2.0".into(),
             id: 1,
-            method: "dbus_start".into(),
+            method: "dbus_system_operation".into(),
             params: serde_json::json!({"name": "valid-machine"}),
         };
         assert_eq!(

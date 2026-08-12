@@ -2,7 +2,10 @@
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ContainerState, MachineName, MachineProperties};
+use crate::nspawn::models::{
+    ContainerEntry, ContainerState, ImageEntry, ImageName, InspectionCompleteness,
+    InspectionSource, MachineName, MachineProperties, StatusUpdate,
+};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -110,79 +113,56 @@ impl ContainerBackend for DbusBackend {
         self.connection().await.is_some()
     }
 
-    async fn list_all(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
         let proxy = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
         let machines = proxy.list_machines().await.map_err(NspawnError::Dbus)?;
-        let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
-
         let mut entries = Vec::new();
-        let mut running_names = HashMap::new();
-
         for (name, _class, _service, _path) in machines {
             if name == ".host" {
                 continue;
             }
             let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
-            let formatted: Vec<String> = addrs
+            let all_addresses: Vec<String> = addrs
                 .into_iter()
                 .map(|(family, data)| {
                     crate::nspawn::adapters::comm::formatting::format_ip_address(family, &data)
                 })
                 .collect();
-            running_names.insert(name, formatted);
-        }
-
-        for (name, img_type, readonly, _cr, _mod, usage, _path) in images {
-            if name == ".host" {
-                continue;
-            }
-            let addrs = running_names.get(&name).cloned().unwrap_or_default();
-            let state = if running_names.contains_key(&name) {
-                ContainerState::Running
-            } else {
-                ContainerState::Off
-            };
-
             entries.push(ContainerEntry {
                 name,
-                state,
-                image_type: Some(img_type),
-                readonly,
-                usage: if usage == u64::MAX {
-                    None
-                } else {
-                    Some(crate::nspawn::adapters::comm::formatting::format_size(
-                        usage,
-                    ))
-                },
-                address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
-                all_addresses: addrs,
+                state: ContainerState::Running,
+                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
+                all_addresses,
             });
         }
-
-        for (name, addrs) in running_names {
-            if name == ".host" {
-                continue;
-            }
-            if !entries.iter().any(|e: &ContainerEntry| e.name == name) {
-                entries.push(ContainerEntry {
-                    name: name.clone(),
-                    state: ContainerState::Running,
-                    image_type: None,
-                    readonly: false,
-                    usage: None,
-                    address: addrs.first().cloned().filter(|s: &String| !s.is_empty()),
-                    all_addresses: addrs,
-                });
-            }
-        }
-
         entries.sort();
-
         Ok(entries)
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageEntry>> {
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
+        let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
+        let mut images = images
+            .into_iter()
+            .map(
+                |(name, image_type, readonly, _crtime, _mtime, usage, object_path)| ImageEntry {
+                    name,
+                    image_type,
+                    readonly,
+                    usage: (usage != u64::MAX)
+                        .then(|| crate::nspawn::adapters::comm::formatting::format_size(usage)),
+                    dbus_object_path: Some(object_path.to_string()),
+                },
+            )
+            .collect::<Vec<_>>();
+        images.sort();
+        Ok(images)
     }
 
     async fn start(&self, name: &str) -> Result<()> {
@@ -265,7 +245,12 @@ impl ContainerBackend for DbusBackend {
     }
 
     async fn remove(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
+        if ImageEntry::is_protected_name(name) {
+            return Err(NspawnError::Validation(
+                "the .host image cannot be removed".into(),
+            ));
+        }
+        let name = parse_image_name(name)?;
         let proxy = self
             .manager_proxy()
             .await
@@ -284,7 +269,10 @@ impl ContainerBackend for DbusBackend {
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
 
-        let mut props = MachineProperties::default();
+        let mut props = MachineProperties::from_inspection(
+            InspectionSource::Dbus,
+            InspectionCompleteness::Full,
+        );
 
         // 1) Try machine1 properties (only works for running/registered machines)
         if let Ok(m1_props) = get_machine1_properties(&conn, &name).await {
@@ -316,7 +304,7 @@ impl ContainerBackend for DbusBackend {
         self.call_systemd1::<_, ()>("Reload", &()).await
     }
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<()>) -> Result<()> {
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         use futures_util::StreamExt;
         let proxy = self
             .manager_proxy()
@@ -334,11 +322,25 @@ impl ContainerBackend for DbusBackend {
 
         loop {
             tokio::select! {
-                Some(_) = new_stream.next() => {
-                    let _ = tx.send(()).await;
+                event = new_stream.next() => {
+                    if event.is_none() {
+                        return Err(NspawnError::Dbus(zbus::Error::Failure(
+                            "machine-new signal stream closed".into(),
+                        )));
+                    }
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                        return Ok(());
+                    }
                 }
-                Some(_) = rm_stream.next() => {
-                    let _ = tx.send(()).await;
+                event = rm_stream.next() => {
+                    if event.is_none() {
+                        return Err(NspawnError::Dbus(zbus::Error::Failure(
+                            "machine-removed signal stream closed".into(),
+                        )));
+                    }
+                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -347,6 +349,10 @@ impl ContainerBackend for DbusBackend {
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn parse_image_name(name: &str) -> Result<ImageName> {
+    ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 async fn get_machine1_properties(
@@ -411,4 +417,23 @@ async fn get_systemd1_properties(
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_names_are_not_validated_as_machine_names() {
+        assert_eq!(
+            parse_image_name(".oci-sha256:abc").unwrap().as_str(),
+            ".oci-sha256:abc"
+        );
+        assert_eq!(
+            parse_image_name("Ubuntu Resolute 镜像").unwrap().as_str(),
+            "Ubuntu Resolute 镜像"
+        );
+        assert!(parse_image_name(".#temporary").is_err());
+        assert!(parse_image_name("../escape").is_err());
+    }
 }

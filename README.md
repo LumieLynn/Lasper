@@ -8,11 +8,11 @@ Lasper is currently alpha software. It is suitable for testing and personal work
 
 ## Features
 
-- **Container Management**: Start, stop, restart, enable/disable, and terminate systemd-nspawn containers. View properties, full details, and journal logs directly in the terminal via a unified dashboard.
+- **Machine and Image Management**: Running machines and persistent systemd images are shown as separate resources. Start images, control machine lifecycles, and inspect properties, journal logs, and image metadata without treating cached backing layers as stopped containers.
 - **Integrated Terminal**: Seamlessly jump into container shells via `machinectl login`. Features a modal interface (Normal/Insert modes) for easy scrolling and multi-session management without leaving the dashboard.
 - **Creation Wizard**: Interactively generate `.nspawn` configurations and run provisioning tasks.
 - **Image Provisioning**:
-  - Pull and extract OCI (Docker/Podman) root filesystems via `skopeo` and `umoci` as an experimental provider.
+  - Pull OCI registry images through systemd 260+'s `importctl pull-oci` as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
   - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
 - **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
 - **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
@@ -24,7 +24,7 @@ Lasper is currently alpha software. It is suitable for testing and personal work
   is `lasper -e`: the TUI stays unprivileged and starts a separate root daemon
   through `sudo`. Running the entire TUI with `sudo lasper` remains supported
   for compatibility but has a larger root attack surface.
-- *Optional*: `skopeo` and `umoci` (for OCI image support)
+- *Optional*: systemd 260+ (for OCI application images via `importctl pull-oci`)
 - *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
 - *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
@@ -68,17 +68,19 @@ You can use Lasper's integrated terminal or native systemd tools after creation.
 
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
-- `Enter` / `x` : Open Action Power Menu (Start, Poweroff, Reboot, Terminate, Kill, Enable, Disable)
-- `Tab` : Toggle Focus (Container List ↔ Detail Panel ↔ Terminal)
+- `[` / `]` or `Alt + 1-2` while Images is focused: Switch Regular/Internal images
+- `PageUp` / `PageDown` while an Inspector is focused: Scroll the active pane
+- `Enter` / `x` : Open the resource-appropriate action menu
+- `Tab` / `Shift+Tab` : Cycle focus (Machines → Machine Inspector → Images → Image Inspector → Terminal)
 - `n` / `a` : Create a new container (Creation Wizard)
-- `s` : Start selected container
-- `S` : Poweroff selected container
-- `D` : Delete selected container
-- `t` : Open shell terminal (machinectl login)
+- `s` : Start the selected machine or image
+- `S` : Poweroff the selected machine
+- `D` : Delete the selected image (while Images is focused)
+- `t` : Open a terminal for the selected running machine or a regular image's same-name running machine
 - `T` : Maximize terminal (when terminal is focused)
 - `r` : Manual refresh
 - `R` : Toggle panel resize mode
-- `[` / `]` or `Alt + 1-5` : Switch view panes (Properties / Details / Logs / Config / Metrics)
+- `[` / `]` or `Alt + 1-5` while an Inspector is focused: Switch its available panes
 - `?` : Show help
 - `q` : Quit
 - `Esc` : Back / Close Overlays
@@ -90,7 +92,7 @@ The next stable milestone is `0.3.0`. The release is not defined by adding more 
 Before `0.3.0` stable, the project should:
 
 - continue migrating elevated-daemon authority from generic command/path RPCs to typed operations;
-- keep OCI support clearly experimental until its product model is decided;
+- keep the systemd-native OCI application provider clearly experimental; it does not turn arbitrary OCI images into bootable system containers;
 - preserve unknown `.nspawn` settings instead of rewriting files from only the fields Lasper understands;
 - make long-running provisioning and image operations observable and recoverable enough for normal use;
 - fail closed on unsafe storage/image conflicts instead of overwriting host resources.

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 pub struct AppSettings {
     /// Always request root elevation on startup (equivalent to -e / --elevate).
     pub elevate: bool,
-    /// Force CLI-only mode — skip DBus entirely. Useful for debugging.
+    /// Use runtime-state and systemd command backends instead of Lasper's DBus backend.
     #[serde(rename = "cli-mode")]
     pub cli_mode: bool,
     /// Maximum log lines retained per container buffer.

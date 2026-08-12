@@ -24,22 +24,15 @@ The daemon exits when Lasper shuts it down normally. A crashed or forcibly termi
 
 The authentication above isolates independent local processes and Lasper sessions. It does not protect against code already executing inside the launching Lasper process.
 
-The daemon currently still exposes broad command and path-based file RPCs. A compromised TUI process can therefore exercise a large part of the daemon's root authority.
+The elevated daemon no longer exposes arbitrary `program + argv` execution or unrestricted absolute-path file operations as normal RPCs. Machine lifecycle, storage, configuration, provisioning, inspection, and terminal setup use typed requests with validated names, bounded paths, fixed executables, and explicit operation results. The daemon still carries broad host authority by design, so a compromised TUI process can request any typed operation that Lasper itself is allowed to perform; the migration is a boundary hardening measure, not a trust boundary against compromised application code.
 
-The intended fix is an incremental migration to typed daemon operations:
-
-- machine operations such as start, poweroff, enable, remove, and journal/login;
-- managed host-configuration operations such as `.nspawn`, service overrides, and Lasper state;
-- storage operations that derive `/var/lib/machines` paths inside the daemon;
-- provisioning operations with fixed executables, validated arguments, staging, and explicit results.
-
-Simple executable allowlists or path-prefix checks can be useful as temporary guardrails, but they are not the final security model. The stable `0.3.0` line should not depend on arbitrary root `program + argv` execution or unrestricted absolute-path file operations as normal product APIs.
+The remaining security work is about ownership and failure semantics: long operations need durable progress and recovery reporting, and every rollback must distinguish resources created by Lasper from resources that pre-dated the operation. Native systemd tools remain the source of truth for resources that Lasper did not create.
 
 Prefer `lasper -e` over running the complete interface with `sudo lasper`. Running the whole TUI as root also elevates terminal parsing, clipboard integration, configuration parsing, and all UI code.
 
 ## OCI Image Policy
 
-OCI imports currently accept unsigned images for the individual `skopeo copy` operation. Lasper writes the permissive policy into the operation's private staging directory and passes it explicitly to `skopeo`; it does not create or replace `/etc/containers/policy.json`.
+OCI application imports use systemd's typed `importctl pull-oci` operation (systemd 260 or newer). Registry transport and authentication are provided by HTTPS, but publisher signatures are not verified by Lasper yet. systemd owns the resulting `.mstack` image under `/var/lib/machines`; Lasper does not treat it as a bootable root filesystem or rewrite it through a generic extraction path.
 
 Users should select trusted registries and immutable image digests when image provenance matters.
 

@@ -1,12 +1,13 @@
 //! Deployment trait and orchestrator.
 
-pub mod backend;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 pub(crate) mod image_operation;
+pub(crate) mod oci_operation;
 
 pub use bootstrap_operation::BootstrapStore;
 pub use image_operation::ImageImportStore;
+pub use oci_operation::OciPullStore;
 
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;
@@ -37,6 +38,51 @@ pub enum DeployLogEvent {
     Progress(DeployProgress),
 }
 
+/// Side effects that a provider successfully created during deployment.
+///
+/// A receipt is deliberately returned only after the provider operation has
+/// completed successfully.  If an operation fails part-way through, the
+/// ownership is unknown and rollback must not destroy a pre-existing image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DeploymentReceipt {
+    owns_external_image: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StorageRollback {
+    Local,
+    ExternalOwned,
+    ExternalUnknown,
+}
+
+impl DeploymentReceipt {
+    pub const fn none() -> Self {
+        Self {
+            owns_external_image: false,
+        }
+    }
+
+    pub const fn external_image() -> Self {
+        Self {
+            owns_external_image: true,
+        }
+    }
+
+    pub const fn owns_external_image(self) -> bool {
+        self.owns_external_image
+    }
+}
+
+fn storage_rollback(is_external: bool, receipt: DeploymentReceipt) -> StorageRollback {
+    if !is_external {
+        StorageRollback::Local
+    } else if receipt.owns_external_image() {
+        StorageRollback::ExternalOwned
+    } else {
+        StorageRollback::ExternalUnknown
+    }
+}
+
 /// RAII guard to ensure the 'done' flag is always set, even on panic or early return.
 struct DoneGuard {
     done: Arc<AtomicBool>,
@@ -57,7 +103,7 @@ pub trait Deployer: Send + Sync {
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<()>;
+    ) -> Result<DeploymentReceipt>;
 
     /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
     fn is_external_storage_managed(&self) -> bool {
@@ -85,7 +131,9 @@ pub(crate) async fn send_deploy_stream_log(
     if is_high_signal_deploy_stream(&message) {
         log::warn!("[DEPLOY stream] {}", message);
     } else {
-        log::debug!("[DEPLOY stream] {}", message);
+        // Deployment output must survive the wizard and be available in the
+        // normal per-run log without requiring RUST_LOG=debug.
+        log::info!("[DEPLOY stream] {}", message);
     }
     let _ = logs.send(DeployLogEvent::Line(message)).await;
 }
@@ -185,12 +233,7 @@ async fn run_deploy_internal(
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
-    let io = exec_ctx.io.clone();
-    let cli_runner = exec_ctx.cmd.clone();
-    let provision: std::sync::Arc<dyn crate::nspawn::ops::provision::backend::ProvisionBackend> =
-        std::sync::Arc::new(crate::nspawn::adapters::comm::cli::CliBackend::new(
-            cli_runner.clone(),
-        ));
+    let system_operations = exec_ctx.system_operations.clone();
 
     macro_rules! push_log {
         ($msg:expr) => {
@@ -202,6 +245,7 @@ async fn run_deploy_internal(
 
     // 1. Create storage
     let is_ext = deployer.is_external_storage_managed();
+    let mut receipt = DeploymentReceipt::none();
     if !is_ext {
         log::info!(
             "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
@@ -212,7 +256,7 @@ async fn run_deploy_internal(
             "Creating storage (type: {:?})...",
             storage.get_type()
         ));
-        storage.create(&name, cli_runner.as_ref(), &io).await?;
+        storage.create(&name).await?;
     }
 
     // 2. Deployment & Configuration scoping
@@ -226,7 +270,7 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Mounting storage...".to_string());
-            storage.mount(&name, cli_runner.as_ref(), &io).await?
+            storage.mount(&name).await?
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
             crate::paths::machine_root(&name)
@@ -237,7 +281,7 @@ async fn run_deploy_internal(
             "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
             name
         );
-        deployer.deploy(&name, &cfg, &rootfs, logs.clone()).await?;
+        receipt = deployer.deploy(&name, &cfg, &rootfs, logs.clone()).await?;
 
         // 4. Post-deployment configuration
         if !deployer.requires_post_config() {
@@ -411,7 +455,7 @@ async fn run_deploy_internal(
                 cfg.wayland_socket.is_some(),
             ).await?;
 
-            let _ = provision.reload_daemon().await;
+            let _ = system_operations.reload_daemon().await;
         }
 
         if supports_offline_commands {
@@ -447,7 +491,7 @@ async fn run_deploy_internal(
     // 2. Unmount Lasper storage
     if !is_ext {
         push_log!("Unmounting storage...".to_string());
-        let _ = storage.unmount(&name, cli_runner.as_ref(), &io).await;
+        let _ = storage.unmount(&name).await;
     }
 
     // 3. Transactional Rollback
@@ -459,14 +503,24 @@ async fn run_deploy_internal(
         let _ = exec_ctx.nspawn.remove(&name).await;
         let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
 
-        if is_ext {
-            // Cleanup systemd-managed storage (downloaded/imported junk)
-            let _ = cli_runner
-                .run("machinectl", vec!["remove".into(), name.clone()])
-                .await;
-        } else {
-            // Cleanup Lasper-managed storage
-            let _ = storage.delete(&name, cli_runner.as_ref(), &io).await;
+        match storage_rollback(is_ext, receipt) {
+            StorageRollback::ExternalOwned => {
+                // Cleanup only systemd-managed storage that this deployment
+                // successfully created and explicitly acknowledged.
+                let _ = exec_ctx.system_operations.remove_image(&name).await;
+            }
+            StorageRollback::ExternalUnknown => {
+                // The provider failed before ownership was established.  Do
+                // not call either image removal or local storage deletion.
+                log::warn!(
+                    "External deployment for {} failed before ownership was confirmed; leaving storage untouched",
+                    name
+                );
+            }
+            StorageRollback::Local => {
+                // Cleanup Lasper-managed storage
+                let _ = storage.delete(&name).await;
+            }
         }
         return Err(e);
     }
@@ -478,7 +532,9 @@ async fn run_deploy_internal(
 
 #[cfg(test)]
 mod tests {
-    use super::is_high_signal_deploy_stream;
+    use super::{
+        is_high_signal_deploy_stream, storage_rollback, DeploymentReceipt, StorageRollback,
+    };
 
     #[test]
     fn deploy_stream_classifies_recoverable_bootstrap_diagnostics() {
@@ -496,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn deploy_stream_keeps_normal_progress_at_debug_level() {
+    fn deploy_stream_distinguishes_normal_output_from_warnings() {
         for message in [
             "I: Retrieving base-files",
             "I: Extracting base-passwd",
@@ -507,5 +563,29 @@ mod tests {
                 "misclassified {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn external_rollback_is_allowed_only_with_an_ownership_receipt() {
+        assert_eq!(
+            storage_rollback(true, DeploymentReceipt::none()),
+            StorageRollback::ExternalUnknown
+        );
+        assert_eq!(
+            storage_rollback(true, DeploymentReceipt::external_image()),
+            StorageRollback::ExternalOwned
+        );
+    }
+
+    #[test]
+    fn external_failure_never_falls_back_to_local_storage_cleanup() {
+        assert_eq!(
+            storage_rollback(true, DeploymentReceipt::none()),
+            StorageRollback::ExternalUnknown
+        );
+        assert_eq!(
+            storage_rollback(false, DeploymentReceipt::none()),
+            StorageRollback::Local
+        );
     }
 }
