@@ -3,12 +3,73 @@ use parking_lot::Mutex;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
 use std::os::unix::io::RawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 pub enum PtyMessage {
     Data(Vec<u8>),
     Resize { cols: u16, rows: u16 },
+}
+
+/// Coalesces terminal output notifications while one redraw is queued.
+///
+/// PTY output can arrive much faster than a terminal frame can be rendered.
+/// Keeping at most one notification prevents the shared app event queue from
+/// being flooded while preserving a redraw after the current frame.
+#[derive(Clone, Debug)]
+pub struct RedrawGate {
+    pending: Arc<AtomicBool>,
+}
+
+/// Reports resize/ioctl failures back to the UI-side session.  The next
+/// render retries the latest desired dimensions instead of silently accepting
+/// a stale child window size.
+#[derive(Clone, Debug)]
+pub struct ResizeState {
+    failed: Arc<AtomicBool>,
+}
+
+impl ResizeState {
+    pub fn new() -> Self {
+        Self {
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    pub fn take_failure(&self) -> bool {
+        self.failed.swap(false, Ordering::AcqRel)
+    }
+}
+
+impl RedrawGate {
+    pub fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn clear(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
+    fn notify(&self, tx: &mpsc::Sender<crate::events::AppEvent>) {
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && tx
+                .try_send(crate::events::AppEvent::TerminalRedraw)
+                .is_err()
+        {
+            // A full or closed queue must not leave the gate permanently set.
+            self.clear();
+        }
+    }
 }
 
 pub struct TerminalHandle {
@@ -44,10 +105,12 @@ pub fn spawn_terminal(
     cols: u16,
     rows: u16,
     app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    redraw_gate: RedrawGate,
 ) -> Result<(
     Arc<Mutex<crate::term::Parser>>,
     mpsc::Sender<PtyMessage>,
     TerminalHandle,
+    ResizeState,
 )> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -67,12 +130,14 @@ pub fn spawn_terminal(
     let mut writer = pair.master.take_writer()?;
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
+    let resize_state = ResizeState::new();
 
     // 10,000 lines of scrollback
     let parser = Arc::new(Mutex::new(crate::term::Parser::new(rows, cols, 10000)));
 
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
+    let redraw_gate_clone = redraw_gate.clone();
 
     // Reading thread
     let reader_handle = tokio::task::spawn_blocking(move || {
@@ -86,12 +151,13 @@ pub fn spawn_terminal(
                 let mut events = Vec::new();
                 p.screen.process(&buf[..n], &mut events);
             }
-            let _ = app_tx_clone.try_send(crate::events::AppEvent::TerminalRedraw);
+            redraw_gate_clone.notify(&app_tx_clone);
         }
     });
 
     let parser_for_write = parser.clone();
     let master_for_write = pair.master;
+    let resize_state_for_write = resize_state.clone();
 
     // Writing/Resize thread
     let writer_handle = tokio::task::spawn_blocking(move || {
@@ -102,12 +168,15 @@ pub fn spawn_terminal(
                     let _ = writer.flush();
                 }
                 PtyMessage::Resize { cols, rows } => {
-                    let _ = master_for_write.resize(PtySize {
+                    if let Err(error) = master_for_write.resize(PtySize {
                         rows,
                         cols,
                         pixel_width: 0,
                         pixel_height: 0,
-                    });
+                    }) {
+                        resize_state_for_write.mark_failed();
+                        log::warn!("failed to resize terminal PTY to {cols}x{rows}: {error}");
+                    }
                     let mut p = parser_for_write.lock();
                     p.set_size(rows, cols);
                 }
@@ -124,6 +193,7 @@ pub fn spawn_terminal(
             child: Some(child),
             elevated_fds: None,
         },
+        resize_state,
     ))
 }
 
@@ -133,10 +203,12 @@ pub fn spawn_terminal_with_fd(
     cols: u16,
     rows: u16,
     app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    redraw_gate: RedrawGate,
 ) -> Result<(
     Arc<Mutex<crate::term::Parser>>,
     mpsc::Sender<PtyMessage>,
     TerminalHandle,
+    ResizeState,
 )> {
     use std::io::{Read, Write};
     use std::os::unix::io::FromRawFd;
@@ -159,11 +231,13 @@ pub fn spawn_terminal_with_fd(
     let mut writer = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(writer_fd) });
 
     let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
+    let resize_state = ResizeState::new();
 
     let parser = Arc::new(Mutex::new(crate::term::Parser::new(rows, cols, 10000)));
 
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
+    let redraw_gate_clone = redraw_gate.clone();
 
     // Reading thread
     let reader_handle = tokio::task::spawn_blocking(move || {
@@ -175,7 +249,7 @@ pub fn spawn_terminal_with_fd(
                     let mut p = parser_clone.lock();
                     let mut events = Vec::new();
                     p.screen.process(&buf[..n], &mut events);
-                    let _ = app_tx_clone.try_send(crate::events::AppEvent::TerminalRedraw);
+                    redraw_gate_clone.notify(&app_tx_clone);
                 }
                 Err(_) => break,
             }
@@ -184,6 +258,7 @@ pub fn spawn_terminal_with_fd(
 
     let parser_for_write = parser.clone();
     let resize_fd = master_fd; // original fd, still valid (we dup'd for writer)
+    let resize_state_for_write = resize_state.clone();
 
     // Writing/Resize thread
     let writer_handle = tokio::task::spawn_blocking(move || {
@@ -200,8 +275,13 @@ pub fn spawn_terminal_with_fd(
                         ws_xpixel: 0,
                         ws_ypixel: 0,
                     };
-                    unsafe {
-                        libc::ioctl(resize_fd, libc::TIOCSWINSZ, &ws);
+                    let result = unsafe { libc::ioctl(resize_fd, libc::TIOCSWINSZ, &ws) };
+                    if result < 0 {
+                        resize_state_for_write.mark_failed();
+                        log::warn!(
+                            "failed to resize elevated terminal PTY to {cols}x{rows}: {}",
+                            std::io::Error::last_os_error()
+                        );
                     }
                     let mut p = parser_for_write.lock();
                     p.set_size(rows, cols);
@@ -219,5 +299,27 @@ pub fn spawn_terminal_with_fd(
             child: None,
             elevated_fds,
         },
+        resize_state,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RedrawGate;
+    use crate::events::AppEvent;
+
+    #[test]
+    fn redraw_notifications_are_coalesced_until_consumed() {
+        let gate = RedrawGate::new();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+
+        gate.notify(&tx);
+        gate.notify(&tx);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::TerminalRedraw)));
+        assert!(rx.try_recv().is_err());
+
+        gate.clear();
+        gate.notify(&tx);
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::TerminalRedraw)));
+    }
 }

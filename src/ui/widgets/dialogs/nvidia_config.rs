@@ -6,7 +6,7 @@ use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
@@ -47,6 +47,8 @@ pub struct NvidiaConfigDialog {
     btn_cancel: Button,
     focus: FocusTracker,
     scroll_offset: u16,
+    scroll_area: Rect,
+    scroll_max: u16,
     on_submit: Box<dyn Fn(NvidiaConfigResult) -> AppMessage>,
 }
 
@@ -102,6 +104,8 @@ impl NvidiaConfigDialog {
             btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
             focus: FocusTracker::new(),
             scroll_offset: 0,
+            scroll_area: Rect::default(),
+            scroll_max: 0,
             on_submit: Box::new(on_submit),
         }
     }
@@ -253,10 +257,13 @@ impl Component for NvidiaConfigDialog {
         self.mode.render(f, chunks[1]);
 
         // Scrollable dest_inputs (chunks[2])
+        self.scroll_area = chunks[2];
+        self.scroll_max = 0;
         if dest_count > 0 {
             let dest_area = chunks[2];
             let total_height = dest_count as u16 * 3;
             let max_scroll = total_height.saturating_sub(dest_area.height);
+            self.scroll_max = max_scroll;
 
             // Auto-scroll to keep focused dest_input visible
             // dest_inputs occupy focus indices 2..2+dest_count
@@ -300,8 +307,9 @@ impl Component for NvidiaConfigDialog {
 
             if max_scroll > 0 {
                 use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-                let mut state =
-                    ScrollbarState::new(max_scroll as usize).position(self.scroll_offset as usize);
+                let mut state = ScrollbarState::new(total_height as usize)
+                    .position(self.scroll_offset as usize)
+                    .viewport_content_length(usize::from(dest_area.height));
                 let scrollbar = Scrollbar::default()
                     .orientation(ScrollbarOrientation::VerticalRight)
                     .begin_symbol(Some("▲"))
@@ -373,6 +381,27 @@ impl Component for NvidiaConfigDialog {
                 EventResult::Consumed
             }
             _ => res,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> EventResult {
+        if mouse.column < self.scroll_area.x
+            || mouse.column >= self.scroll_area.x.saturating_add(self.scroll_area.width)
+            || mouse.row < self.scroll_area.y
+            || mouse.row >= self.scroll_area.y.saturating_add(self.scroll_area.height)
+        {
+            return EventResult::Ignored;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.scroll_offset = self.scroll_offset.saturating_sub(3);
+                EventResult::Consumed
+            }
+            MouseEventKind::ScrollDown => {
+                self.scroll_offset = self.scroll_offset.saturating_add(3).min(self.scroll_max);
+                EventResult::Consumed
+            }
+            _ => EventResult::Ignored,
         }
     }
 

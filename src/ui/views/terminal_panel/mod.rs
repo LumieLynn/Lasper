@@ -49,7 +49,10 @@ impl TerminalPanel {
         let tabs_line = Line::from(tab_spans);
 
         let session = &mut sessions[active_idx];
-        let mut term = session.terminal.lock();
+        // Clone the Arc before locking so the guard does not hold an
+        // immutable borrow of the whole session while resize state changes.
+        let terminal = session.terminal.clone();
+        let mut term = terminal.lock();
 
         let border_color = if resize_mode {
             crate::ui::panel_border_color(true, is_focused, false)
@@ -90,19 +93,10 @@ impl TerminalPanel {
         // Store for mouse coordinate conversion.
         manager.term_area = term_area;
 
-        // Resize: the new Grid handles reflow internally, so no debounce needed.
+        // Resize the local parser immediately, and keep retrying the latest
+        // PTY request until the bounded writer queue accepts it.
         if term_area.width > 0 && term_area.height > 0 {
-            let size = term.screen().size();
-            if term_area.width != size.width || term_area.height != size.height {
-                term.set_size(term_area.height, term_area.width);
-                session.selection = TextSelection::default();
-                let _ = session.pty_tx.try_send(
-                    crate::nspawn::adapters::comm::pty::PtyMessage::Resize {
-                        cols: term_area.width,
-                        rows: term_area.height,
-                    },
-                );
-            }
+            session.request_resize(&mut term, term_area.width, term_area.height);
         }
 
         // Render directly from the live Screen — temporarily set scrollback
@@ -177,7 +171,11 @@ impl TerminalPanel {
                 }
             }
 
-            if is_focused && session.insert_mode && session.scroll_offset == 0 {
+            if is_focused
+                && session.insert_mode
+                && session.scroll_offset == 0
+                && !screen.hide_cursor()
+            {
                 Some(screen.cursor_position())
             } else {
                 None
@@ -233,15 +231,28 @@ impl TerminalPanel {
     }
 }
 
-/// Encode a crossterm `MouseEvent` as an SGR (1006) mouse escape sequence
-/// suitable for forwarding to a PTY.  Coordinates must be terminal-relative
-/// (0-based, top-left of terminal content area).
+/// Encode a mouse event using the protocol selected by the terminal.
+/// Coordinates are terminal-relative (0-based, top-left of the content area).
+#[allow(dead_code)]
 pub fn encode_mouse(mouse: crossterm::event::MouseEvent) -> Option<Vec<u8>> {
+    encode_mouse_for_protocol(
+        mouse,
+        crate::term::screen::MouseProtocolMode::AnyMotion,
+        crate::term::screen::MouseProtocolEncoding::Sgr,
+    )
+}
+
+pub fn encode_mouse_for_protocol(
+    mouse: crossterm::event::MouseEvent,
+    mode: crate::term::screen::MouseProtocolMode,
+    encoding: crate::term::screen::MouseProtocolEncoding,
+) -> Option<Vec<u8>> {
     use crossterm::event::{MouseButton, MouseEventKind};
 
-    // SGR protocol uses 1-based coordinates.
-    let col = mouse.column.saturating_add(1);
-    let row = mouse.row.saturating_add(1);
+    if mode == crate::term::screen::MouseProtocolMode::None || !mouse_kind_allowed(mouse.kind, mode)
+    {
+        return None;
+    }
 
     // Encode the button + modifier bits.
     let mut cb: u16 = match mouse.kind {
@@ -278,49 +289,255 @@ pub fn encode_mouse(mouse: crossterm::event::MouseEvent) -> Option<Vec<u8>> {
         cb |= 16;
     }
 
-    let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
-        b'm'
-    } else {
-        b'M'
-    };
+    match encoding {
+        crate::term::screen::MouseProtocolEncoding::Sgr => {
+            // SGR protocol uses 1-based coordinates and supports large values.
+            let col = mouse.column.saturating_add(1);
+            let row = mouse.row.saturating_add(1);
+            let suffix = if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                'm'
+            } else {
+                'M'
+            };
+            Some(format!("\x1b[<{};{};{}{}", cb, col, row, suffix).into_bytes())
+        }
+        crate::term::screen::MouseProtocolEncoding::Default
+        | crate::term::screen::MouseProtocolEncoding::Utf8 => {
+            // Legacy encodings use 1-based coordinates offset by 32.  The
+            // default byte form is limited to 223 cells; UTF-8 extends it.
+            let col = mouse.column.saturating_add(33);
+            let row = mouse.row.saturating_add(33);
+            if encoding == crate::term::screen::MouseProtocolEncoding::Default
+                && (col > 255 || row > 255)
+            {
+                return None;
+            }
 
-    Some(format!("\x1b[<{};{};{}{}", cb, col, row, suffix as char).into_bytes())
+            let mut sequence = vec![b'\x1b', b'[', b'M'];
+            if encoding == crate::term::screen::MouseProtocolEncoding::Default {
+                sequence.extend([cb.saturating_add(32) as u8, col as u8, row as u8]);
+            } else {
+                append_utf8_mouse_value(&mut sequence, cb.saturating_add(32));
+                append_utf8_mouse_value(&mut sequence, col);
+                append_utf8_mouse_value(&mut sequence, row);
+            }
+            Some(sequence)
+        }
+    }
 }
 
+fn mouse_kind_allowed(
+    kind: crossterm::event::MouseEventKind,
+    mode: crate::term::screen::MouseProtocolMode,
+) -> bool {
+    use crossterm::event::MouseEventKind;
+    match mode {
+        crate::term::screen::MouseProtocolMode::None => false,
+        crate::term::screen::MouseProtocolMode::Press => {
+            matches!(
+                kind,
+                MouseEventKind::Down(_)
+                    | MouseEventKind::ScrollUp
+                    | MouseEventKind::ScrollDown
+                    | MouseEventKind::ScrollLeft
+                    | MouseEventKind::ScrollRight
+            )
+        }
+        crate::term::screen::MouseProtocolMode::PressRelease => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        crate::term::screen::MouseProtocolMode::ButtonMotion => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        crate::term::screen::MouseProtocolMode::AnyMotion => true,
+    }
+}
+
+fn append_utf8_mouse_value(sequence: &mut Vec<u8>, value: u16) {
+    if let Some(character) = char::from_u32(u32::from(value)) {
+        let mut encoded = [0u8; 4];
+        sequence.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+    }
+}
+
+#[allow(dead_code)]
 pub fn encode_key(key: crossterm::event::KeyEvent) -> Vec<u8> {
-    use crossterm::event::KeyModifiers;
+    encode_key_for_mode(key, false)
+}
+
+pub fn encode_key_for_mode(key: crossterm::event::KeyEvent, application_cursor: bool) -> Vec<u8> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let modifiers = key.modifiers;
+    let modifier_param = xterm_modifier_param(modifiers);
+
     match key.code {
-        crossterm::event::KeyCode::Char(c) => {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match c {
-                    'a'..='z' => vec![(c as u8) - b'a' + 1],
+        KeyCode::Char(c) => {
+            if modifiers.contains(KeyModifiers::CONTROL) {
+                match c.to_ascii_lowercase() {
+                    'a'..='z' => vec![(c.to_ascii_lowercase() as u8) - b'a' + 1],
                     '[' => vec![27],
                     '\\' => vec![28],
                     ']' => vec![29],
                     '^' => vec![30],
                     '_' => vec![31],
-                    _ => vec![c as u8],
+                    _ => c.encode_utf8(&mut [0u8; 4]).as_bytes().to_vec(),
                 }
-            } else if key.modifiers.contains(KeyModifiers::ALT) {
-                vec![27, c as u8]
+            } else if modifiers.contains(KeyModifiers::ALT) {
+                let mut bytes = vec![27];
+                let mut encoded = [0u8; 4];
+                bytes.extend_from_slice(c.encode_utf8(&mut encoded).as_bytes());
+                bytes
             } else {
                 let mut buf = [0u8; 4];
                 c.encode_utf8(&mut buf).as_bytes().to_vec()
             }
         }
-        crossterm::event::KeyCode::Enter => vec![b'\r'],
-        crossterm::event::KeyCode::Esc => vec![27],
-        crossterm::event::KeyCode::Backspace => vec![127],
-        crossterm::event::KeyCode::Tab => vec![9],
-        crossterm::event::KeyCode::Up => vec![27, b'[', b'A'],
-        crossterm::event::KeyCode::Down => vec![27, b'[', b'B'],
-        crossterm::event::KeyCode::Right => vec![27, b'[', b'C'],
-        crossterm::event::KeyCode::Left => vec![27, b'[', b'D'],
-        crossterm::event::KeyCode::Home => vec![27, b'[', b'H'],
-        crossterm::event::KeyCode::End => vec![27, b'[', b'F'],
-        crossterm::event::KeyCode::PageUp => vec![27, b'[', b'5', b'~'],
-        crossterm::event::KeyCode::PageDown => vec![27, b'[', b'6', b'~'],
-        crossterm::event::KeyCode::Delete => vec![27, b'[', b'3', b'~'],
-        _ => vec![],
+        KeyCode::Enter => vec![b'\r'],
+        KeyCode::Esc => vec![27],
+        KeyCode::Backspace => vec![127],
+        KeyCode::Tab => vec![9],
+        KeyCode::BackTab => b"\x1b[Z".to_vec(),
+        KeyCode::Up => encode_cursor_key(b'A', application_cursor, modifier_param),
+        KeyCode::Down => encode_cursor_key(b'B', application_cursor, modifier_param),
+        KeyCode::Right => encode_cursor_key(b'C', application_cursor, modifier_param),
+        KeyCode::Left => encode_cursor_key(b'D', application_cursor, modifier_param),
+        KeyCode::Home => encode_csi_tilde_or_final(b'H', None, modifier_param),
+        KeyCode::End => encode_csi_tilde_or_final(b'F', None, modifier_param),
+        KeyCode::Insert => encode_csi_tilde_or_final(b'~', Some(2), modifier_param),
+        KeyCode::Delete => encode_csi_tilde_or_final(b'~', Some(3), modifier_param),
+        KeyCode::PageUp => encode_csi_tilde_or_final(b'~', Some(5), modifier_param),
+        KeyCode::PageDown => encode_csi_tilde_or_final(b'~', Some(6), modifier_param),
+        KeyCode::F(number) => encode_function_key(number, modifier_param),
+        _ => Vec::new(),
+    }
+}
+
+fn xterm_modifier_param(modifiers: crossterm::event::KeyModifiers) -> u8 {
+    let mut value = 1u8;
+    if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+        value += 1;
+    }
+    if modifiers.contains(crossterm::event::KeyModifiers::ALT) {
+        value += 2;
+    }
+    if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
+        value += 4;
+    }
+    value
+}
+
+fn encode_cursor_key(final_byte: u8, application_cursor: bool, modifier: u8) -> Vec<u8> {
+    if modifier == 1 && application_cursor {
+        vec![27, b'O', final_byte]
+    } else if modifier == 1 {
+        vec![27, b'[', final_byte]
+    } else {
+        format!("\x1b[1;{}{}", modifier, final_byte as char).into_bytes()
+    }
+}
+
+fn encode_csi_tilde_or_final(final_byte: u8, number: Option<u8>, modifier: u8) -> Vec<u8> {
+    match (number, modifier) {
+        (None, 1) => vec![27, b'[', final_byte],
+        (Some(number), 1) => format!("\x1b[{}~", number).into_bytes(),
+        (Some(number), modifier) => format!("\x1b[{};{}~", number, modifier).into_bytes(),
+        (None, modifier) => format!("\x1b[1;{}{}", modifier, final_byte as char).into_bytes(),
+    }
+}
+
+fn encode_function_key(number: u8, modifier: u8) -> Vec<u8> {
+    let (base, final_byte) = match number {
+        1 => (None, b'P'),
+        2 => (None, b'Q'),
+        3 => (None, b'R'),
+        4 => (None, b'S'),
+        5 => (Some(15), b'~'),
+        6 => (Some(17), b'~'),
+        7 => (Some(18), b'~'),
+        8 => (Some(19), b'~'),
+        9 => (Some(20), b'~'),
+        10 => (Some(21), b'~'),
+        11 => (Some(23), b'~'),
+        12 => (Some(24), b'~'),
+        _ => return Vec::new(),
+    };
+    match (base, modifier) {
+        (None, 1) => vec![27, b'O', final_byte],
+        (None, modifier) => format!("\x1b[1;{}{}", modifier, final_byte as char).into_bytes(),
+        (Some(number), 1) => format!("\x1b[{}~", number).into_bytes(),
+        (Some(number), modifier) => format!("\x1b[{};{}~", number, modifier).into_bytes(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn mouse(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 4,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn mouse_encoding_obeys_screen_mode_and_encoding() {
+        assert!(encode_mouse_for_protocol(
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+            crate::term::screen::MouseProtocolMode::Press,
+            crate::term::screen::MouseProtocolEncoding::Sgr,
+        )
+        .is_none());
+        assert_eq!(
+            encode_mouse_for_protocol(
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                crate::term::screen::MouseProtocolMode::PressRelease,
+                crate::term::screen::MouseProtocolEncoding::Sgr,
+            )
+            .unwrap(),
+            b"\x1b[<0;5;3M"
+        );
+        assert_eq!(
+            encode_mouse_for_protocol(
+                mouse(MouseEventKind::Down(MouseButton::Left)),
+                crate::term::screen::MouseProtocolMode::Press,
+                crate::term::screen::MouseProtocolEncoding::Default,
+            )
+            .unwrap(),
+            vec![27, b'[', b'M', 32, 37, 35]
+        );
+    }
+
+    #[test]
+    fn key_encoding_respects_application_cursor_and_backtab() {
+        let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(encode_key_for_mode(up, false), b"\x1b[A");
+        assert_eq!(encode_key_for_mode(up, true), b"\x1bOA");
+        assert_eq!(
+            encode_key_for_mode(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), false,),
+            b"\x1b[Z"
+        );
+        assert!(
+            !encode_key_for_mode(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE), false)
+                .is_empty()
+        );
     }
 }

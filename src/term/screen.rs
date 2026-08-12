@@ -234,6 +234,12 @@ impl Screen {
         self.mouse_protocol_mode
     }
 
+    /// Returns the encoding selected for the active mouse protocol.
+    #[must_use]
+    pub fn mouse_protocol_encoding(&self) -> MouseProtocolEncoding {
+        self.mouse_protocol_encoding
+    }
+
     fn grid(&self) -> &super::grid::Grid {
         if self.mode(MODE_ALTERNATE_SCREEN) {
             &self.alternate_grid
@@ -1349,5 +1355,35 @@ fn utf8_char_len(first_byte: u8) -> usize {
         (0xE0..=0xEF) => 3, // 1110xxxx 10xxxxxx 10xxxxxx
         (0xF0..=0xF7) => 4, // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
         (0x80..=0xBF) | (0xF8..=0xFF) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+    use crate::term::common::Size;
+
+    #[test]
+    fn parser_exposes_mouse_protocol_state_to_input_encoding() {
+        let mut screen = Screen::new(
+            Size {
+                width: 80,
+                height: 24,
+            },
+            32,
+        );
+        let mut events = Vec::new();
+        screen.process(b"\x1b[?1002h\x1b[?1005h\x1b[?1h\x1b[?25l", &mut events);
+
+        assert_eq!(
+            screen.mouse_protocol_mode(),
+            MouseProtocolMode::ButtonMotion
+        );
+        assert_eq!(
+            screen.mouse_protocol_encoding(),
+            MouseProtocolEncoding::Utf8
+        );
+        assert!(screen.application_cursor());
+        assert!(screen.hide_cursor());
     }
 }

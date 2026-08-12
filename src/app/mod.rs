@@ -55,6 +55,7 @@ pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
 pub const LEFT_MACHINES_PCT_MIN: u16 = 20;
 pub const LEFT_MACHINES_PCT_MAX: u16 = 80;
+const MAX_EVENTS_PER_FRAME: usize = 64;
 const STARTING_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -615,7 +616,7 @@ impl App {
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
-            AppEvent::TerminalRedraw => {}
+            AppEvent::TerminalRedraw => self.data.terminal.clear_redraw_pending(),
         }
     }
 
@@ -722,8 +723,10 @@ impl App {
             tokio::select! {
                 Some(event) = events.rx.recv() => {
                     self.handle_event(event).await;
-                    // Drain all pending events to batch UI updates
-                    while let Ok(event) = events.rx.try_recv() {
+                    // Batch a bounded number of events so a busy PTY cannot
+                    // starve rendering, keyboard input, or the quit signal.
+                    for _ in 1..MAX_EVENTS_PER_FRAME {
+                        let Ok(event) = events.rx.try_recv() else { break };
                         self.handle_event(event).await;
                     }
                 }

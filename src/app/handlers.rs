@@ -111,7 +111,8 @@ impl App {
         // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
         if self.ui.focus.active_idx == 3
             && self.data.terminal.is_showing()
-            && layout.terminal.is_some_and(|r| in_rect(col, row, r))
+            && (layout.terminal.is_some_and(|r| in_rect(col, row, r))
+                || self.data.terminal.wants_mouse_capture())
         {
             self.data.terminal.handle_mouse(mouse);
         }
