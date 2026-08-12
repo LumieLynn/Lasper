@@ -6,9 +6,8 @@ use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Routes explicit CLI inspection without exposing the daemon transport to the
-/// application service. Elevated mode asks the root daemon for the complete
-/// fixed command view; direct mode stays on readable runtime registration data.
+/// Routes explicit machine inspection without exposing the daemon transport to
+/// the application service.
 #[derive(Clone)]
 pub struct MachineInspectionStore {
     daemon: Option<Arc<ElevatedDaemon>>,
@@ -27,6 +26,23 @@ impl MachineInspectionStore {
                 .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
         } else {
             crate::nspawn::adapters::comm::runtime_state::inspect(name, entry).await
+        }
+    }
+
+    /// Inspect systemd properties without requiring a machined runtime
+    /// registration. This is used by the image inspector.
+    pub async fn inspect_static(&self, name: &str) -> Result<MachineProperties> {
+        if let Some(daemon) = &self.daemon {
+            daemon
+                .cli_inspect_machine(name)
+                .await
+                .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
+        } else {
+            crate::nspawn::adapters::comm::cli::get_properties_with_runner(
+                name,
+                &crate::nspawn::sys::command::DefaultCommandRunner,
+            )
+            .await
         }
     }
 }

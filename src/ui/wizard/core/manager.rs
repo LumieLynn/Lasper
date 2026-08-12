@@ -4,7 +4,7 @@ use crate::ui::wizard::core::context::{SourceKind, WizardContext};
 use crate::ui::wizard::steps::{self, StepComponent};
 use crate::ui::wizard::{StepAction, WizardStep};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     widgets::{Block, BorderType, Borders, Clear},
@@ -189,6 +189,19 @@ impl Wizard {
                 KeyCode::Enter => self.handle_action(StepAction::Next),
                 _ => StepAction::None,
             },
+        }
+    }
+
+    /// Route mouse input only to the active wizard step.  The parent App
+    /// treats the wizard as modal, so an ignored event is still prevented
+    /// from reaching the main panels.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.loading {
+            return;
+        }
+        if let Some(view) = &mut self.active_view {
+            let _ = view.handle_mouse(mouse);
+            view.commit_to_context(&mut self.context);
         }
     }
 

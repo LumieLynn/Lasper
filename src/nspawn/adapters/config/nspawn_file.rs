@@ -28,9 +28,8 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
     Some((source, destination))
 }
 
-/// Raw content of a `.nspawn` config file from `/etc/systemd/nspawn/`.
+/// Raw content of a `.nspawn` file and the path it was read from.
 pub struct NspawnConfig {
-    #[allow(dead_code)]
     pub path: PathBuf,
     pub content: String,
 }

@@ -15,6 +15,7 @@ pub enum AppEvent {
     /// Background action execution finished.
     ActionDone(String, crate::ui::StatusLevel),
     /// A container action failed and its optimistic UI state must be rolled back.
+    /// `previous_state == None` removes a synthetic `Starting` machine row.
     ContainerActionFailed {
         name: String,
         previous_state: Option<crate::nspawn::models::ContainerState>,

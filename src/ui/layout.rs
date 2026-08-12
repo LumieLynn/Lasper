@@ -124,14 +124,9 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     let left_area = cols[0];
     let right_area = cols[1];
-    let left_chunks = split_left_column(
-        left_area,
-        app.ui.left_machines_pct,
-        app.ui.image_info_height,
-    );
+    let left_chunks = split_left_column(left_area, app.ui.left_machines_pct);
     let machines_area = left_chunks[0];
     let images_area = left_chunks[1];
-    let image_info_area = left_chunks[2];
 
     let maximized = app.data.terminal.is_showing() && app.data.terminal.maximized;
     let detail_pct = app.ui.detail_pct;
@@ -154,7 +149,6 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     // Store panel rects for mouse hit-testing.
     app.ui.panel_layout.machines = machines_area;
     app.ui.panel_layout.images = images_area;
-    app.ui.panel_layout.image_info = image_info_area;
     app.ui.panel_layout.detail = detail_area;
 
     let terminal_area = if app.data.terminal.is_showing() {
@@ -204,7 +198,6 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     app.ui
         .image_list
         .render(f, images_area, images, image_selected, resize_mode);
-    render_image_detail(f, app, image_info_area, resize_mode);
 
     if !maximized {
         app.ui
@@ -213,141 +206,14 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-fn split_left_column(
-    area: Rect,
-    machines_pct: u16,
-    requested_info_height: u16,
-) -> std::rc::Rc<[Rect]> {
-    let constraints = if area.height >= 15 {
-        let info_height = requested_info_height.clamp(5, area.height.saturating_sub(6));
-        let flexible_height = area.height.saturating_sub(info_height);
-        let machines_height = ((u32::from(flexible_height) * u32::from(machines_pct)) / 100)
-            .clamp(3, u32::from(flexible_height.saturating_sub(3)))
-            as u16;
-        vec![
-            Constraint::Length(machines_height),
-            Constraint::Length(flexible_height.saturating_sub(machines_height)),
-            Constraint::Length(info_height),
-        ]
-    } else {
-        vec![
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-            Constraint::Percentage(33),
-        ]
-    };
+fn split_left_column(area: Rect, machines_pct: u16) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints([
+            Constraint::Percentage(machines_pct),
+            Constraint::Percentage(100u16.saturating_sub(machines_pct)),
+        ])
         .split(area)
-}
-
-fn render_image_detail(f: &mut Frame, app: &mut App, area: Rect, resize_mode: bool) {
-    let border_color =
-        crate::ui::panel_border_color(resize_mode, app.ui.focus.active_idx == 1, false);
-    let block = ratatui::widgets::Block::default()
-        .title(" Image Information ")
-        .borders(ratatui::widgets::Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    let Some(image) = app.selected_image() else {
-        app.ui.image_info_scroll = 0;
-        app.ui.image_info_max_scroll = 0;
-        f.render_widget(
-            Paragraph::new("  No image selected")
-                .style(Style::default().fg(theme::theme().text_secondary)),
-            inner,
-        );
-        return;
-    };
-    let lines = image_information_lines(image, inner.width);
-    let content_height = lines.len();
-    let viewport_height = usize::from(inner.height);
-    let max_scroll = content_height.saturating_sub(viewport_height);
-    app.ui.image_info_max_scroll = max_scroll.min(u16::MAX as usize) as u16;
-    app.ui.image_info_scroll = app.ui.image_info_scroll.min(app.ui.image_info_max_scroll);
-    f.render_widget(
-        Paragraph::new(lines).scroll((app.ui.image_info_scroll, 0)),
-        inner,
-    );
-
-    if max_scroll > 0 {
-        // Ratatui maps positions from 0 through content_length - 1. Our
-        // position is a viewport offset, so the state length is the number of
-        // valid offsets rather than the number of rendered content rows.
-        let mut state = ratatui::widgets::ScrollbarState::new(max_scroll.saturating_add(1))
-            .position(usize::from(app.ui.image_info_scroll))
-            .viewport_content_length(viewport_height);
-        let scrollbar = ratatui::widgets::Scrollbar::default()
-            .orientation(ratatui::widgets::ScrollbarOrientation::VerticalRight)
-            .begin_symbol(Some("▲"))
-            .end_symbol(Some("▼"));
-        let scrollbar_area = Rect {
-            x: area.x,
-            y: area.y.saturating_add(1),
-            width: area.width,
-            height: area.height.saturating_sub(2),
-        };
-        f.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
-    }
-}
-
-fn image_information_lines(image: &crate::nspawn::ImageEntry, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for (label, value) in [
-        ("Name", image.name.as_str()),
-        ("Type", image.image_type.as_str()),
-        ("Visibility", image.visibility().label()),
-        ("Removal", image.removal_label()),
-        ("Read-only", if image.readonly { "yes" } else { "no" }),
-        ("Usage", image.usage.as_deref().unwrap_or("unknown")),
-        (
-            "D-Bus path",
-            image.object_path.as_deref().unwrap_or("unavailable"),
-        ),
-    ] {
-        push_information_field(&mut lines, label, value, width);
-    }
-    lines
-}
-
-fn push_information_field(
-    lines: &mut Vec<Line<'static>>,
-    label: &'static str,
-    value: &str,
-    width: u16,
-) {
-    const LABEL_WIDTH: usize = 10;
-    const GAP: usize = 2;
-    let width = usize::from(width);
-    let label_style = Style::default().fg(theme::theme().text_secondary);
-
-    if width > LABEL_WIDTH + GAP {
-        let value_width = width - LABEL_WIDTH - GAP;
-        for (index, value_line) in crate::ui::soft_wrap_text(value, value_width)
-            .into_iter()
-            .enumerate()
-        {
-            let label = if index == 0 {
-                format!("{label:<width$}", width = LABEL_WIDTH)
-            } else {
-                " ".repeat(LABEL_WIDTH)
-            };
-            lines.push(Line::from(vec![
-                Span::styled(label, label_style),
-                Span::raw(" ".repeat(GAP)),
-                Span::raw(value_line),
-            ]));
-        }
-    } else {
-        lines.push(Line::from(Span::styled(label, label_style)));
-        let value_width = width.saturating_sub(2).max(1);
-        for value_line in crate::ui::soft_wrap_text(value, value_width) {
-            lines.push(Line::from(format!("  {value_line}")));
-        }
-    }
 }
 
 // Status bar
@@ -362,8 +228,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
         ])
     } else if app.ui.resize_mode == crate::app::ResizeMode::Active {
         let vertical_hint = match app.ui.focus.active_idx {
-            0 => " machines taller/shorter",
-            1 => " image info shorter/taller",
+            0 | 1 => " machine/image split",
             _ if app.data.terminal.is_showing() => " detail taller/shorter",
             _ => " no vertical split",
         };
@@ -403,8 +268,6 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 spans.extend([
                     kspan("[[/]]"),
                     hspan(" image tabs "),
-                    kspan("[PgUp/Dn]"),
-                    hspan(" info "),
                     kspan("[r]"),
                     hspan(" refresh "),
                     kspan("[Tab/⇧Tab]"),
@@ -414,42 +277,69 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ]);
                 Line::from(spans)
             }
-            1 => Line::from(vec![
-                kspan("[j/k]"),
-                hspan(" nav "),
-                kspan("[s]"),
-                hspan(" start "),
-                kspan("[x/⏎]"),
-                hspan(" actions "),
-                kspan("[D]"),
-                hspan(" delete "),
-                kspan("[r]"),
-                hspan(" refresh "),
-                kspan("[[/]]"),
-                hspan(" image tabs "),
-                kspan("[PgUp/Dn]"),
-                hspan(" info "),
-                kspan("[Tab/⇧Tab]"),
-                hspan(" panels"),
-            ]),
-            2 => Line::from(vec![
-                kspan("[Alt+1..5]"),
-                hspan(" panes "),
-                kspan("[[/]]"),
-                hspan(" cycle "),
-                kspan("[↑/↓ | j/k]"),
-                hspan(" scroll "),
-                kspan("[PgUp/Dn]"),
-                hspan(" page "),
-                kspan("[Tab/⇧Tab]"),
-                hspan(" panels "),
-                kspan("[t]"),
-                hspan(" terminal "),
-                kspan("[?]"),
-                hspan(" help "),
-                kspan("[q]"),
-                hspan(" quit"),
-            ]),
+            1 => {
+                let mut spans = vec![
+                    kspan("[j/k]"),
+                    hspan(" nav "),
+                    kspan("[s]"),
+                    hspan(" start "),
+                    kspan("[x/⏎]"),
+                    hspan(" actions "),
+                    kspan("[D]"),
+                    hspan(" delete "),
+                    kspan("[r]"),
+                    hspan(" refresh "),
+                ];
+                if app
+                    .focused_image_resource()
+                    .is_some_and(|image| app.image_has_running_machine(image))
+                {
+                    spans.extend([kspan("[t]"), hspan(" terminal ")]);
+                }
+                spans.extend([
+                    kspan("[[/]]"),
+                    hspan(" image tabs "),
+                    kspan("[Tab/⇧Tab]"),
+                    hspan(" panels"),
+                ]);
+                Line::from(spans)
+            }
+            2 => {
+                let pane_hint = match crate::ui::views::detail_panel::DetailPane::tabs_for(
+                    &app.data.detail_target,
+                )
+                .len()
+                {
+                    1 => "[Alt+1]",
+                    2 => "[Alt+1..2]",
+                    3 => "[Alt+1..3]",
+                    4 => "[Alt+1..4]",
+                    _ => "[Alt+1..5]",
+                };
+                let mut spans = vec![
+                    kspan(pane_hint),
+                    hspan(" panes "),
+                    kspan("[[/]]"),
+                    hspan(" cycle "),
+                    kspan("[↑/↓ | j/k]"),
+                    hspan(" scroll "),
+                    kspan("[PgUp/Dn]"),
+                    hspan(" page "),
+                    kspan("[Tab/⇧Tab]"),
+                    hspan(" panels "),
+                ];
+                let terminal_available = if app.data.detail_target.is_image() {
+                    app.focused_image_resource()
+                        .is_some_and(|image| app.image_has_running_machine(image))
+                } else {
+                    true
+                };
+                if terminal_available {
+                    spans.extend([kspan("[t]"), hspan(" terminal ")]);
+                }
+                spans.extend([kspan("[?]"), hspan(" help "), kspan("[q]"), hspan(" quit")]);
+                Line::from(spans)
+            }
             3 => {
                 let insert_mode = app
                     .data
@@ -509,14 +399,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn left_column_keeps_compact_image_information_panel() {
+    fn left_column_is_split_between_machine_and_image_lists() {
         let area = Rect::new(2, 3, 40, 30);
-        let chunks = split_left_column(area, 50, 9);
+        let chunks = split_left_column(area, 50);
 
-        assert_eq!(chunks.len(), 3);
-        assert_eq!(chunks[2].height, 9);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].height, 15);
+        assert_eq!(chunks[1].height, 15);
         assert_eq!(chunks[0].x, area.x);
-        assert_eq!(chunks[2].y + chunks[2].height, area.y + area.height);
+        assert_eq!(chunks[1].y + chunks[1].height, area.y + area.height);
         assert_eq!(
             chunks.iter().map(|chunk| chunk.height).sum::<u16>(),
             area.height
@@ -524,62 +415,15 @@ mod tests {
     }
 
     #[test]
-    fn left_column_shrinks_all_panels_in_small_terminals() {
+    fn left_column_keeps_both_lists_in_small_terminals() {
         let area = Rect::new(0, 0, 20, 12);
-        let chunks = split_left_column(area, 50, 9);
+        let chunks = split_left_column(area, 50);
 
-        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks.len(), 2);
         assert!(chunks.iter().all(|chunk| chunk.height > 0));
         assert_eq!(
             chunks.iter().map(|chunk| chunk.height).sum::<u16>(),
             area.height
         );
-    }
-
-    #[test]
-    fn long_values_wrap_without_losing_content() {
-        use unicode_width::UnicodeWidthStr;
-
-        let value = "/org/freedesktop/machine1/image/_2eoci_2dsha256_3averylongdigest";
-        let wrapped = crate::ui::soft_wrap_text(value, 12);
-
-        assert!(wrapped.len() > 1);
-        assert!(wrapped
-            .iter()
-            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 12));
-        assert_eq!(wrapped.concat(), value);
-    }
-
-    #[test]
-    fn unicode_wrapping_uses_terminal_cell_width() {
-        use unicode_width::UnicodeWidthStr;
-
-        let value = "路径/very-long-value";
-        let wrapped = crate::ui::soft_wrap_text(value, 8);
-
-        assert!(wrapped
-            .iter()
-            .all(|line| UnicodeWidthStr::width(line.as_str()) <= 8));
-        assert_eq!(wrapped.concat(), value);
-    }
-
-    #[test]
-    fn image_information_rows_include_soft_wrapped_dbus_path() {
-        crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
-        let image = crate::nspawn::ImageEntry {
-            name: "fedora-44".into(),
-            image_type: "directory".into(),
-            readonly: false,
-            usage: None,
-            object_path: Some(
-                "/org/freedesktop/machine1/image/_2eoci_2dsha256_3averylongdigest".into(),
-            ),
-        };
-
-        let lines = image_information_lines(&image, 24);
-
-        // Seven fields are rendered at minimum; the long object path must add
-        // physical rows instead of remaining one clipped logical line.
-        assert!(lines.len() > 7);
     }
 }

@@ -100,11 +100,12 @@ impl ContainerBackend for CliBackend {
                 "machinectl",
                 vec![
                     "--no-ask-password".to_string(),
-                    "list-images".to_string(),
                     "-l".to_string(),
                     "--no-legend".to_string(),
                     "--no-pager".to_string(),
                     "--all".to_string(),
+                    "--".to_string(),
+                    "list-images".to_string(),
                 ],
             )
             .await
@@ -113,7 +114,7 @@ impl ContainerBackend for CliBackend {
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
                 "machinectl list-images",
-                "machinectl --no-ask-password list-images -l --no-legend --no-pager --all",
+                "machinectl --no-ask-password -l --no-legend --no-pager --all -- list-images",
                 &out,
             ));
         }
@@ -130,7 +131,7 @@ impl ContainerBackend for CliBackend {
                 image_type: parts[1].to_string(),
                 readonly: parts[2] == "yes",
                 usage: parts.get(3).map(|s| s.to_string()),
-                object_path: None,
+                dbus_object_path: None,
             });
         }
         images.sort();
@@ -237,6 +238,7 @@ pub(crate) async fn get_properties_with_runner(
             "machinectl",
             vec![
                 "--no-ask-password".to_string(),
+                "--".to_string(),
                 "show".to_string(),
                 name.as_str().to_string(),
             ],
@@ -268,6 +270,7 @@ pub(crate) async fn get_properties_with_runner(
             "systemctl",
             vec![
                 "--no-ask-password".to_string(),
+                "--".to_string(),
                 "show".to_string(),
                 name.systemd_nspawn_unit(),
             ],
@@ -338,7 +341,7 @@ mod tests {
                 image_type: "directory".into(),
                 readonly: false,
                 usage: None,
-                object_path: None,
+                dbus_object_path: None,
             }],
         )
     }
@@ -403,7 +406,8 @@ mod tests {
                 .withf(|program, args| {
                     program == "machinectl"
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
-                        && args.get(1).is_some_and(|arg| arg == "list-images")
+                        && args.get(5).is_some_and(|arg| arg == "--")
+                        && args.get(6).is_some_and(|arg| arg == "list-images")
                 })
                 .returning(|_, _| {
                     Ok(mock_output(
@@ -445,11 +449,12 @@ mod tests {
                         && args
                             == &[
                                 "--no-ask-password".to_string(),
-                                "list-images".to_string(),
                                 "-l".to_string(),
                                 "--no-legend".to_string(),
                                 "--no-pager".to_string(),
                                 "--all".to_string(),
+                                "--".to_string(),
+                                "list-images".to_string(),
                             ]
                 })
                 .returning(|_, _| Ok(mock_output(true, "active directory no 20M\n", "")));
@@ -478,7 +483,8 @@ mod tests {
                 .withf(|program, args| {
                     matches!(program, "machinectl" | "systemctl")
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
-                        && args.get(1).is_some_and(|arg| arg == "show")
+                        && args.get(1).is_some_and(|arg| arg == "--")
+                        && args.get(2).is_some_and(|arg| arg == "show")
                 })
                 .returning(|program, _args| {
                     if program == "systemctl" {
@@ -558,9 +564,10 @@ mod tests {
                     program == "machinectl"
                         && args
                             == &[
-                                "kill".to_string(),
                                 "-s".to_string(),
                                 "SIGTERM".to_string(),
+                                "--".to_string(),
+                                "kill".to_string(),
                                 "my-ctr".to_string(),
                             ]
                 })

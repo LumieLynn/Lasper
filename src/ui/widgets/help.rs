@@ -42,12 +42,6 @@ impl Component for HelpOverlay {
                 key_style,
                 desc_style,
             ),
-            key_row(
-                "PgUp / PgDn",
-                "Scroll image information",
-                key_style,
-                desc_style,
-            ),
             spacer_row(),
             category_row(" Detail Panes ", header_style),
             key_row("Alt+1..5", "Switch detail pane", key_style, desc_style),

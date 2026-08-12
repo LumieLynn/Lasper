@@ -12,13 +12,23 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKi
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
-        // Layer 0 – delete confirmation (modal)
+        // Modal stack, topmost layer first.  This order mirrors layout.rs.
+        if self.handle_dialog_key(key).await {
+            return;
+        }
+
         if self.handle_delete_confirm_key(key) {
             return;
         }
 
-        // Layer 1 – quit confirmation dialog (modal)
         if self.handle_quit_confirm_key(key) {
+            return;
+        }
+
+        // Layer 3 – overlays (wizard / help / power menu).  Overlays must
+        // receive keys before the terminal, even when terminal focus was
+        // active when the overlay opened.
+        if self.handle_overlay_key(key).await {
             return;
         }
 
@@ -30,18 +40,8 @@ impl App {
             return;
         }
 
-        // Layer 2.5 – active dialog (modal, blocks everything below)
-        if self.handle_dialog_key(key).await {
-            return;
-        }
-
         // Layer 2 – terminal panel when it owns focus
         if self.ui.focus.active_idx == 3 && self.handle_terminal_focused_key(key).await {
-            return;
-        }
-
-        // Layer 3 – overlays (wizard / help / power menu)
-        if self.handle_overlay_key(key).await {
             return;
         }
 
@@ -59,8 +59,12 @@ impl App {
 
 impl App {
     pub async fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.handle_modal_mouse(mouse) {
+            return;
+        }
+
         // Hit-test: which panel is the mouse over?
-        let layout = &self.ui.panel_layout;
+        let layout = self.ui.panel_layout;
         let col = mouse.column;
         let row = mouse.row;
 
@@ -68,7 +72,7 @@ impl App {
 
         let hit = if in_rect(col, row, layout.machines) {
             Some(0usize)
-        } else if in_rect(col, row, layout.images) || in_rect(col, row, layout.image_info) {
+        } else if in_rect(col, row, layout.images) {
             Some(1usize)
         } else if !maximized && in_rect(col, row, layout.detail) {
             Some(2usize)
@@ -79,6 +83,7 @@ impl App {
         };
 
         // Click-to-focus on button press.
+        let mut focus_changed = false;
         if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
             let n = if self.data.terminal.is_showing() {
                 4
@@ -90,35 +95,34 @@ impl App {
                     && self.data.terminal.is_showing()
                     && panel_idx == 2)
             {
-                self.ui.focus.active_idx = panel_idx;
+                focus_changed = self.ui.focus.active_idx != panel_idx;
+                self.set_focus_idx(panel_idx);
             }
         }
 
-        if in_rect(col, row, layout.image_info) {
-            match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.ui.image_info_scroll = self.ui.image_info_scroll.saturating_sub(1);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.ui.image_info_scroll = self
-                        .ui
-                        .image_info_scroll
-                        .saturating_add(1)
-                        .min(self.ui.image_info_max_scroll);
-                }
-                _ => {}
-            }
+        if !maximized && in_rect(col, row, layout.detail) {
+            let _ = self.ui.detail_panel.handle_mouse(mouse);
+        }
+
+        if focus_changed {
+            self.refresh_detail().await;
         }
 
         // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
-        if self.ui.focus.active_idx == 3 && self.data.terminal.is_showing() {
+        if self.ui.focus.active_idx == 3
+            && self.data.terminal.is_showing()
+            && layout.terminal.is_some_and(|r| in_rect(col, row, r))
+        {
             self.data.terminal.handle_mouse(mouse);
         }
     }
 }
 
 fn in_rect(col: u16, row: u16, r: ratatui::layout::Rect) -> bool {
-    col >= r.x && col < r.x + r.width && row >= r.y && row < r.y + r.height
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
 }
 
 // Layer 0: delete confirmation
@@ -176,11 +180,7 @@ impl App {
 
         // If closing a tab emptied the terminal panel, restore focus to a valid panel.
         if self.ui.focus.active_idx == 3 && !self.data.terminal.is_showing() {
-            self.ui.focus.active_idx = if self.ui.prev_active_idx == 3 {
-                0
-            } else {
-                self.ui.prev_active_idx
-            };
+            self.restore_non_terminal_focus();
         }
 
         match outcome {
@@ -290,33 +290,13 @@ impl App {
                 true
             }
             KeyCode::Tab => {
-                let n = if self.data.terminal.is_showing() {
-                    4
-                } else {
-                    3
-                };
-                self.ui.focus.cycle_forward(n);
-                if self.data.terminal.is_showing()
-                    && self.data.terminal.maximized
-                    && self.ui.focus.active_idx == 2
-                {
-                    self.ui.focus.cycle_forward(n);
-                }
+                self.cycle_main_focus(true);
+                self.refresh_detail().await;
                 true
             }
             KeyCode::BackTab => {
-                let n = if self.data.terminal.is_showing() {
-                    4
-                } else {
-                    3
-                };
-                self.ui.focus.cycle_backward(n);
-                if self.data.terminal.is_showing()
-                    && self.data.terminal.maximized
-                    && self.ui.focus.active_idx == 2
-                {
-                    self.ui.focus.cycle_backward(n);
-                }
+                self.cycle_main_focus(false);
+                self.refresh_detail().await;
                 true
             }
             KeyCode::Char('s') => {
@@ -375,7 +355,7 @@ impl App {
                 if self.data.terminal.is_showing() {
                     self.data.terminal.maximized = !self.data.terminal.maximized;
                     if self.data.terminal.maximized && self.ui.focus.active_idx == 2 {
-                        self.ui.focus.active_idx = 3;
+                        self.set_focus_idx(3);
                     }
                 }
                 true
@@ -399,33 +379,18 @@ impl App {
                 self.handle_container_list_result(result).await;
             }
             1 => {
-                let page_step = (self.ui.image_info_height / 2).max(1);
-                match key.code {
-                    KeyCode::PageUp => {
-                        self.ui.image_info_scroll =
-                            self.ui.image_info_scroll.saturating_sub(page_step);
-                        return;
-                    }
-                    KeyCode::PageDown => {
-                        self.ui.image_info_scroll = self
-                            .ui
-                            .image_info_scroll
-                            .saturating_add(page_step)
-                            .min(self.ui.image_info_max_scroll);
-                        return;
-                    }
-                    _ => {}
-                }
                 let was_internal = self.ui.image_list.shows_internal();
                 let image_count = self.active_images().0.len();
                 let result = self.ui.image_list.handle_key(key, image_count);
                 if was_internal != self.ui.image_list.shows_internal() {
-                    self.ui.image_info_scroll = 0;
+                    self.update_detail_target();
+                    self.refresh_detail().await;
                 }
                 self.handle_container_list_result(result).await;
             }
             2 => {
-                let result = self.ui.detail_panel.handle_key(key);
+                let target = self.data.detail_target.clone();
+                let result = self.ui.detail_panel.handle_key(key, &target);
                 self.handle_detail_panel_result(result).await;
             }
             3 => {
@@ -441,7 +406,8 @@ impl App {
             EventResult::Message(AppMessage::List(ListMessage::Next)) => {
                 self.select_next();
                 if self.image_is_focused() {
-                    self.ui.image_info_scroll = 0;
+                    self.update_detail_target();
+                    self.refresh_detail().await;
                 } else {
                     self.sync_terminal_to_selected();
                     self.refresh_detail().await;
@@ -450,7 +416,8 @@ impl App {
             EventResult::Message(AppMessage::List(ListMessage::Prev)) => {
                 self.select_prev();
                 if self.image_is_focused() {
-                    self.ui.image_info_scroll = 0;
+                    self.update_detail_target();
+                    self.refresh_detail().await;
                 } else {
                     self.sync_terminal_to_selected();
                     self.refresh_detail().await;
@@ -476,10 +443,7 @@ impl App {
 impl App {
     async fn begin_wizard(&mut self) {
         if !self.permissions.level().is_elevated() {
-            self.set_status(
-                "Root required — run: sudo lasper".into(),
-                StatusLevel::Error,
-            );
+            self.set_status("Root required - run: lasper -e".into(), StatusLevel::Error);
             return;
         }
 
@@ -515,12 +479,9 @@ impl App {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
             if self.ui.focus.active_idx == 3 {
-                self.ui.focus.active_idx = if self.ui.prev_active_idx == 3 {
-                    0
-                } else {
-                    self.ui.prev_active_idx
-                };
+                self.restore_non_terminal_focus();
             }
+            self.refresh_detail().await;
         } else {
             self.spawn_terminal().await;
         }
@@ -610,7 +571,7 @@ impl App {
                     .min(super::CONTAINER_LIST_PCT_MAX);
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx == 0 => {
+            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx <= 1 => {
                 self.ui.left_machines_pct = self
                     .ui
                     .left_machines_pct
@@ -618,28 +579,12 @@ impl App {
                     .min(super::LEFT_MACHINES_PCT_MAX);
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx == 0 => {
+            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx <= 1 => {
                 self.ui.left_machines_pct = self
                     .ui
                     .left_machines_pct
                     .saturating_sub(percentage_step)
                     .max(super::LEFT_MACHINES_PCT_MIN);
-                true
-            }
-            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx == 1 => {
-                self.ui.image_info_height = self
-                    .ui
-                    .image_info_height
-                    .saturating_sub(1)
-                    .max(super::IMAGE_INFO_HEIGHT_MIN);
-                true
-            }
-            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx == 1 => {
-                self.ui.image_info_height = self
-                    .ui
-                    .image_info_height
-                    .saturating_add(1)
-                    .min(super::IMAGE_INFO_HEIGHT_MAX);
                 true
             }
             KeyCode::Char('j') | KeyCode::Down
@@ -700,5 +645,25 @@ impl App {
                 }
             }
         }
+    }
+
+    fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
+        // Keep this order aligned with layout.rs, where the highest layer is
+        // rendered last.  A visible modal always consumes the event even if
+        // its component has no mouse behavior.
+        if let Some(dialog) = &mut self.ui.active_dialog {
+            let _ = dialog.handle_mouse(mouse);
+            return true;
+        }
+        if self.ui.delete_dialog.is_some() || self.ui.quit_dialog.is_some() || self.ui.show_help {
+            return true;
+        }
+        if self.ui.show_wizard {
+            if let Some(wizard) = &mut self.ui.wizard {
+                wizard.handle_mouse(mouse);
+            }
+            return true;
+        }
+        self.ui.power_menu.is_some()
     }
 }

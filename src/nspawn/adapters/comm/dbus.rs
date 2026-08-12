@@ -157,7 +157,7 @@ impl ContainerBackend for DbusBackend {
                     readonly,
                     usage: (usage != u64::MAX)
                         .then(|| crate::nspawn::adapters::comm::formatting::format_size(usage)),
-                    object_path: Some(object_path.to_string()),
+                    dbus_object_path: Some(object_path.to_string()),
                 },
             )
             .collect::<Vec<_>>();

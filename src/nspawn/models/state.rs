@@ -44,7 +44,9 @@ pub struct ImageEntry {
     pub image_type: String,
     pub readonly: bool,
     pub usage: Option<String>,
-    pub object_path: Option<String>,
+    /// The object returned by `org.freedesktop.machine1.Manager.ListImages`.
+    /// This is a D-Bus address, not the image's backing filesystem path.
+    pub dbus_object_path: Option<String>,
 }
 
 /// A validated systemd machine-image name.
@@ -201,7 +203,7 @@ impl Ord for ImageEntry {
             .then(self.image_type.cmp(&other.image_type))
             .then(self.readonly.cmp(&other.readonly))
             .then(self.usage.cmp(&other.usage))
-            .then(self.object_path.cmp(&other.object_path))
+            .then(self.dbus_object_path.cmp(&other.dbus_object_path))
     }
 }
 
@@ -434,7 +436,7 @@ mod tests {
             image_type: image_type.into(),
             readonly,
             usage: None,
-            object_path: None,
+            dbus_object_path: None,
         };
 
         assert_eq!(
@@ -468,7 +470,7 @@ mod tests {
             image_type: "directory".into(),
             readonly: false,
             usage: None,
-            object_path: None,
+            dbus_object_path: None,
         };
 
         let snapshot = RuntimeSnapshot::new(
@@ -538,14 +540,14 @@ mod tests {
                 image_type: "directory".into(),
                 readonly: false,
                 usage: None,
-                object_path: None,
+                dbus_object_path: None,
             },
             ImageEntry {
                 name: "a-image".into(),
                 image_type: "subvolume".into(),
                 readonly: true,
                 usage: None,
-                object_path: None,
+                dbus_object_path: None,
             },
         ];
         images.sort();

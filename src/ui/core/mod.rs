@@ -63,6 +63,14 @@ pub trait Component {
     fn render(&mut self, f: &mut ratatui::Frame, area: ratatui::layout::Rect);
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> EventResult;
 
+    /// Handle a mouse event in the component's last rendered area.  Widgets
+    /// that do not expose mouse interaction keep the default no-op; parents
+    /// still consume the event when they are modal so it cannot bubble into
+    /// the background UI.
+    fn handle_mouse(&mut self, _mouse: crossterm::event::MouseEvent) -> EventResult {
+        EventResult::Ignored
+    }
+
     fn set_focus(&mut self, _focused: bool) {}
     fn is_focused(&self) -> bool {
         false
@@ -118,19 +126,6 @@ impl FocusTracker {
     pub fn update_focus(&self, components: &mut [&mut dyn Component], parent_focused: bool) {
         for (i, child) in components.iter_mut().enumerate() {
             child.set_focus(parent_focused && i == self.active_idx && child.is_focusable());
-        }
-    }
-
-    /// Simple index cycling for non-Component panels (main UI).
-    pub fn cycle_forward(&mut self, count: usize) {
-        if count > 0 {
-            self.active_idx = (self.active_idx + 1) % count;
-        }
-    }
-
-    pub fn cycle_backward(&mut self, count: usize) {
-        if count > 0 {
-            self.active_idx = (self.active_idx + count - 1) % count;
         }
     }
 }

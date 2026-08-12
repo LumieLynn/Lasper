@@ -108,9 +108,15 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         data.details_dirty = false;
     }
 
+    panel.image_overview_len = if data.detail_target.is_image() {
+        crate::ui::views::detail_panel::panes::image::overview_line_count(data, width)
+    } else {
+        0
+    };
+
     // 3. Config
     if data.config_dirty || width_changed {
-        panel.config_len = data
+        let content_len = data
             .config_content
             .as_ref()
             .map(|c| {
@@ -126,7 +132,24 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                     .sum()
             })
             .unwrap_or(0);
+        panel.config_len =
+            content_len.saturating_add(if data.config_path.is_some() { 2 } else { 1 });
         data.config_dirty = false;
+    }
+
+    if data.unit_dirty || width_changed {
+        let unit_header_len = usize::from(data.unit_name.is_some()).saturating_mul(2);
+        let unit_properties_len = panel.details_len;
+        let unit_drop_ins_len = data
+            .unit_drop_ins
+            .iter()
+            .map(|drop_in| drop_in.content.lines().count().saturating_add(2))
+            .sum::<usize>();
+        panel.unit_len = unit_header_len
+            .saturating_add(unit_properties_len)
+            .saturating_add(unit_drop_ins_len)
+            .max(if data.detail_target.is_image() { 1 } else { 0 });
+        data.unit_dirty = false;
     }
 
     // 4. Logs — compute render cache from raw strings
@@ -162,7 +185,17 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
         .config_scroll
         .min(cfg_max.min(u16::MAX as usize) as u16);
 
-    let det_max = panel.details_len.saturating_sub(panel.pane_height as usize);
+    let unit_max = panel.unit_len.saturating_sub(panel.pane_height as usize);
+    panel.unit_scroll = panel
+        .unit_scroll
+        .min(unit_max.min(u16::MAX as usize) as u16);
+
+    let active_details_len = if panel.active_pane == DetailPane::ImageOverview {
+        panel.image_overview_len
+    } else {
+        panel.details_len
+    };
+    let det_max = active_details_len.saturating_sub(panel.pane_height as usize);
     panel.details_scroll = panel
         .details_scroll
         .min(det_max.min(u16::MAX as usize) as u16);
@@ -223,6 +256,20 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
             panel.config_len.saturating_sub(panel.pane_height as usize),
             panel.config_scroll as usize,
         ),
+        DetailPane::ImageConfig if panel.config_len > panel.pane_height as usize => (
+            panel.config_len.saturating_sub(panel.pane_height as usize),
+            panel.config_scroll as usize,
+        ),
+        DetailPane::ImageUnit if panel.unit_len > panel.pane_height as usize => (
+            panel.unit_len.saturating_sub(panel.pane_height as usize),
+            panel.unit_scroll as usize,
+        ),
+        DetailPane::ImageOverview if panel.image_overview_len > panel.pane_height as usize => (
+            panel
+                .image_overview_len
+                .saturating_sub(panel.pane_height as usize),
+            panel.details_scroll as usize,
+        ),
         DetailPane::Details if panel.details_len > panel.pane_height as usize => (
             panel.details_len.saturating_sub(panel.pane_height as usize),
             panel.details_scroll as usize,
@@ -236,7 +283,9 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
         _ => return,
     };
 
-    let mut state = ScrollbarState::new(max_scroll).position(position);
+    let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
+        .position(position)
+        .viewport_content_length(usize::from(panel.pane_height));
 
     let scrollbar = Scrollbar::default()
         .orientation(ScrollbarOrientation::VerticalRight)

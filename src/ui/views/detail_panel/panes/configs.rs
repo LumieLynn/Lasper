@@ -11,27 +11,25 @@ use crate::app::AppData;
 use crate::ui::theme;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
-    if data.entries.is_empty() {
+    if data.detail_target.name().is_none() {
         f.render_widget(empty_block(" Config "), area);
         return;
     }
 
     let t = theme::theme();
-    let text = match &data.config_content {
-        Some(c) => c.clone(),
-        None => {
-            let name = data
-                .entries
-                .get(data.selected)
-                .map(|e| e.name.as_str())
-                .unwrap_or("?");
-            format!("No .nspawn config file found for machine '{}'.", name)
-        }
-    };
-
-    let lines: Vec<Line> = text
-        .lines()
-        .map(|l| {
+    let mut lines = Vec::new();
+    if let Some(path) = &data.config_path {
+        lines.push(Line::from(vec![
+            Span::styled("Source = ", Style::default().fg(t.config_key)),
+            Span::styled(
+                path.display().to_string(),
+                Style::default().fg(t.config_value),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+    if let Some(text) = &data.config_content {
+        lines.extend(text.lines().map(|l| {
             if l.starts_with('[') && l.ends_with(']') {
                 Line::from(Span::styled(
                     l.to_owned(),
@@ -51,8 +49,14 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                     Style::default().fg(t.text_secondary),
                 ))
             }
-        })
-        .collect();
+        }));
+    } else {
+        let name = data.detail_target.name().unwrap_or("?");
+        lines.push(Line::from(format!(
+            "No .nspawn config file found for machine '{}'.",
+            name
+        )));
+    }
 
     f.render_widget(
         Paragraph::new(lines)

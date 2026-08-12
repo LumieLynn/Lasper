@@ -10,6 +10,19 @@ use std::sync::Arc;
 const MAX_OVERRIDE_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_DEVICE_ALLOW_ENTRIES: usize = 4096;
 
+/// Read-only view of the host unit drop-ins associated with a machine.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemdUnitInspection {
+    pub unit: String,
+    pub drop_ins: Vec<SystemdDropIn>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemdDropIn {
+    pub path: String,
+    pub content: String,
+}
+
 /// Typed access to Lasper-managed `systemd-nspawn@.service` overrides.
 #[derive(Clone)]
 pub struct SystemdUnitStore {
@@ -80,6 +93,18 @@ impl SystemdUnitStore {
         Ok(())
     }
 
+    pub async fn read(&self, name: &str) -> Result<SystemdUnitInspection> {
+        let machine = parse_machine_name(name)?;
+        let unit = machine.systemd_nspawn_unit();
+        let result = self
+            .execute(SystemdUnitOperation::Read(ReadServiceOverrides { machine }))
+            .await?;
+        Ok(SystemdUnitInspection {
+            unit,
+            drop_ins: result.drop_ins,
+        })
+    }
+
     async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
         if let Some(daemon) = &self.daemon {
             daemon
@@ -103,10 +128,17 @@ impl std::fmt::Debug for SystemdUnitStore {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params", rename_all = "snake_case")]
 pub(crate) enum SystemdUnitOperation {
+    Read(ReadServiceOverrides),
     WriteOverride(WriteServiceOverride),
     CloneOverride(CloneServiceOverride),
     WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
     RemoveOverrides(RemoveServiceOverrides),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadServiceOverrides {
+    machine: MachineName,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -147,12 +179,23 @@ pub(crate) struct ServiceOverrideSpec {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SystemdUnitResult;
+pub(crate) struct SystemdUnitResult {
+    #[serde(default)]
+    drop_ins: Vec<SystemdDropIn>,
+}
 
 pub(crate) async fn execute_systemd_unit_operation(
     operation: SystemdUnitOperation,
 ) -> Result<SystemdUnitResult> {
     match operation {
+        SystemdUnitOperation::Read(request) => {
+            let mut drop_ins = Vec::new();
+            drop_ins.extend(read_drop_ins(&service_override_dir(&request.machine)).await?);
+            drop_ins
+                .extend(read_drop_ins(&transient_service_override_dir(&request.machine)).await?);
+            drop_ins.sort_by(|left, right| left.path.cmp(&right.path));
+            return Ok(SystemdUnitResult { drop_ins });
+        }
         SystemdUnitOperation::WriteOverride(request) => {
             validate_override_spec(&request.spec)?;
             let content = systemd_override_content(
@@ -186,7 +229,7 @@ pub(crate) async fn execute_systemd_unit_operation(
             remove_overrides_at(&service_override_dir(&request.machine)).await?;
         }
     }
-    Ok(SystemdUnitResult)
+    Ok(SystemdUnitResult::default())
 }
 
 /// Generate the content for a systemd service override.
@@ -315,6 +358,38 @@ async fn read_optional(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
     }
+}
+
+async fn read_drop_ins(dir: &Path) -> Result<Vec<SystemdDropIn>> {
+    let mut reader = match tokio::fs::read_dir(dir).await {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(NspawnError::Io(dir.to_path_buf(), error)),
+    };
+    let mut drop_ins = Vec::new();
+    while let Some(entry) = reader
+        .next_entry()
+        .await
+        .map_err(|error| NspawnError::Io(dir.to_path_buf(), error))?
+    {
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .await
+            .map_err(|error| NspawnError::Io(path.clone(), error))?;
+        if !file_type.is_file() {
+            continue;
+        }
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|error| NspawnError::Io(path.clone(), error))?;
+        validate_content_size(&content)?;
+        drop_ins.push(SystemdDropIn {
+            path: path.display().to_string(),
+            content,
+        });
+    }
+    Ok(drop_ins)
 }
 
 async fn write_override_at(path: &Path, content: &str) -> Result<()> {
@@ -479,5 +554,30 @@ mod tests {
         remove_overrides_at(&override_dir).await.unwrap();
 
         assert!(!override_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn read_drop_ins_returns_regular_files_and_skips_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let override_dir = directory.path().join("systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&override_dir).await.unwrap();
+        tokio::fs::write(override_dir.join("override.conf"), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(override_dir.join("nested"))
+            .await
+            .unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            override_dir.join("override.conf"),
+            override_dir.join("link.conf"),
+        )
+        .unwrap();
+
+        let result = read_drop_ins(&override_dir).await.unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert!(result[0].path.ends_with("override.conf"));
+        assert_eq!(result[0].content, "[Service]\n");
     }
 }
