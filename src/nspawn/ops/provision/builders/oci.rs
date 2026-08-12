@@ -7,7 +7,8 @@ use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, MachineName, OciReference};
 use crate::nspawn::ops::provision::oci_operation::{ensure_pull_oci_available, OciPullRequest};
 use crate::nspawn::ops::provision::{
-    send_deploy_log, send_deploy_stream_log, DeployLogEvent, Deployer, OciPullStore,
+    send_deploy_log, send_deploy_stream_log, DeployLogEvent, Deployer, DeploymentReceipt,
+    OciPullStore,
 };
 
 pub struct OciDeployer {
@@ -32,7 +33,7 @@ impl Deployer for OciDeployer {
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<()> {
+    ) -> Result<DeploymentReceipt> {
         ensure_pull_oci_available()?;
         let request = OciPullRequest {
             reference: OciReference::new(self.reference.trim())
@@ -75,7 +76,7 @@ impl Deployer for OciDeployer {
             format!("OCI application installed as /var/lib/machines/{name}.mstack"),
         )
         .await;
-        Ok(())
+        Ok(DeploymentReceipt::external_image())
     }
 }
 

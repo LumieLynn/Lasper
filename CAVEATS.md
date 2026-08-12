@@ -15,15 +15,13 @@ Lasper is alpha software. It manages host-level systemd resources and may run op
 
 `lasper -e` keeps the TUI unprivileged and starts a dedicated root daemon for that Lasper process. The FD-passing socket is protected by a private directory, `0600` permissions, exact PID/UID peer checks, and a per-session token.
 
-This protects the FD interface from independent local processes. It does not protect against code already executing inside the Lasper TUI process. The daemon also still has generic command and file-operation RPCs while the typed-operation migration is in progress. See [SECURITY.md](SECURITY.md).
+This protects the FD interface from independent local processes. It does not protect against code already executing inside the Lasper TUI process. The daemon's normal interface is now typed rather than a generic command/file RPC, but those typed operations still carry the host authority needed to manage containers. See [SECURITY.md](SECURITY.md).
 
 ## OCI Images
 
 OCI support is experimental. Most Docker/Podman images are application images, not system images. They often lack `systemd`, a system bus, a normal login setup, or a bootable init process.
 
-Lasper currently treats OCI input as a root filesystem acquisition path and defaults OCI-created containers to `Boot=no`. If you want the result to boot through `machinectl`, you must install and configure a real init system inside the container and then update the `.nspawn` configuration intentionally.
-
-Until the OCI product model is decided, do not treat OCI import as equivalent to a native `systemd-nspawn` system-container image.
+Lasper pulls OCI input through systemd 260+'s `importctl pull-oci` and stores it as a systemd-managed `.mstack` application image. This is intentionally not a root filesystem acquisition path: application images may not contain a system manager, login setup, or bootable init process, and they should not be treated as native `systemd-nspawn` system-container images. Registry publisher signatures are not verified yet, so use trusted registries and immutable digests when provenance matters.
 
 ## Networking
 

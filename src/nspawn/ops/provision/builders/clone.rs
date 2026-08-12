@@ -4,7 +4,7 @@ use async_trait::async_trait;
 
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent, Deployer};
+use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent, Deployer, DeploymentReceipt};
 
 pub struct CloneDeployer {
     pub source_name: String,
@@ -29,7 +29,7 @@ impl Deployer for CloneDeployer {
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<()> {
+    ) -> Result<DeploymentReceipt> {
         send_deploy_log(
             &logs,
             format!("Cloning container {} to {}...", self.source_name, name),
@@ -62,6 +62,6 @@ impl Deployer for CloneDeployer {
 
         let _ = self.system_operations.reload_daemon().await;
 
-        Ok(())
+        Ok(DeploymentReceipt::external_image())
     }
 }

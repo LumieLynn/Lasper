@@ -247,17 +247,25 @@ async fn execute_system_operation_with_runner(
 
 fn command(operation: &SystemOperation) -> Result<(&'static str, Vec<String>)> {
     let command = match operation {
-        SystemOperation::Start { machine } => ("machinectl", vec!["start", machine.as_str()]),
+        SystemOperation::Start { machine } => ("machinectl", vec!["--", "start", machine.as_str()]),
         SystemOperation::Terminate { machine } => {
-            ("machinectl", vec!["terminate", machine.as_str()])
+            ("machinectl", vec!["--", "terminate", machine.as_str()])
         }
-        SystemOperation::Poweroff { machine } => ("machinectl", vec!["poweroff", machine.as_str()]),
-        SystemOperation::Reboot { machine } => ("machinectl", vec!["reboot", machine.as_str()]),
-        SystemOperation::Enable { machine } => ("machinectl", vec!["enable", machine.as_str()]),
-        SystemOperation::Disable { machine } => ("machinectl", vec!["disable", machine.as_str()]),
+        SystemOperation::Poweroff { machine } => {
+            ("machinectl", vec!["--", "poweroff", machine.as_str()])
+        }
+        SystemOperation::Reboot { machine } => {
+            ("machinectl", vec!["--", "reboot", machine.as_str()])
+        }
+        SystemOperation::Enable { machine } => {
+            ("machinectl", vec!["--", "enable", machine.as_str()])
+        }
+        SystemOperation::Disable { machine } => {
+            ("machinectl", vec!["--", "disable", machine.as_str()])
+        }
         SystemOperation::Kill { machine, signal } => (
             "machinectl",
-            vec!["kill", "-s", signal.as_name(), machine.as_str()],
+            vec!["-s", signal.as_name(), "--", "kill", machine.as_str()],
         ),
         SystemOperation::RemoveImage { image } => {
             if ImageEntry::is_protected_name(image.as_str()) {
@@ -265,16 +273,16 @@ fn command(operation: &SystemOperation) -> Result<(&'static str, Vec<String>)> {
                     "the .host image cannot be removed".into(),
                 ));
             }
-            ("machinectl", vec!["remove", image.as_str()])
+            ("machinectl", vec!["--", "remove", image.as_str()])
         }
         SystemOperation::CloneImage {
             source,
             destination,
         } => (
             "machinectl",
-            vec!["clone", source.as_str(), destination.as_str()],
+            vec!["--", "clone", source.as_str(), destination.as_str()],
         ),
-        SystemOperation::ReloadDaemon => ("systemctl", vec!["daemon-reload"]),
+        SystemOperation::ReloadDaemon => ("systemctl", vec!["--", "daemon-reload"]),
     };
     Ok((
         command.0,
@@ -328,9 +336,10 @@ mod tests {
             .expect_run()
             .withf(|program, args| {
                 program == "machinectl"
-                    && args.len() == 2
-                    && args[0] == "remove"
-                    && args[1] == ".oci-sha256:abc"
+                    && args.len() == 3
+                    && args[0] == "--"
+                    && args[1] == "remove"
+                    && args[2] == ".oci-sha256:abc"
             })
             .returning(|_, _| Ok(success()));
 

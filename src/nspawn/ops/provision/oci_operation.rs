@@ -72,6 +72,7 @@ pub(crate) fn build_command(request: &OciPullRequest) -> (&'static str, Vec<Stri
         args.push("--read-only".into());
     }
     args.extend([
+        "--".into(),
         "pull-oci".into(),
         request.reference.as_str().into(),
         request.machine.as_str().into(),
@@ -125,6 +126,7 @@ mod tests {
                 "--system",
                 "--class=machine",
                 "--no-pager",
+                "--",
                 "pull-oci",
                 "docker.io/library/nginx:latest",
                 "web-app",

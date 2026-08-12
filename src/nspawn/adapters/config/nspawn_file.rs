@@ -418,7 +418,7 @@ mod tests {
     #[test]
     fn test_validate_machine_name_valid() {
         assert!(validate_machine_name("my-container").is_ok());
-        assert!(validate_machine_name("test_01").is_ok());
+        assert!(validate_machine_name("test-01").is_ok());
         assert!(validate_machine_name("a.b").is_ok());
     }
 

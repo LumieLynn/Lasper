@@ -10,6 +10,7 @@ use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
 use crate::nspawn::ops::provision::{
     send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent, Deployer,
+    DeploymentReceipt,
 };
 use crate::nspawn::sys::log_output;
 
@@ -53,7 +54,7 @@ impl Deployer for ImageDeployer {
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<()> {
+    ) -> Result<DeploymentReceipt> {
         let source = acquire_image_source(&self.source, &logs).await?;
         let source = normalize_compression(source, &logs).await?;
         match self.format {
@@ -61,14 +62,16 @@ impl Deployer for ImageDeployer {
                 send_deploy_log(&logs, "Importing typed RAW machine image...").await;
                 let machine = crate::nspawn::models::MachineName::new(name)
                     .map_err(|error| NspawnError::Validation(error.to_string()))?;
-                self.image_import.import_raw(machine, source).await
+                self.image_import.import_raw(machine, source).await?;
+                Ok(DeploymentReceipt::external_image())
             }
             ImageFormat::Tar => {
                 send_deploy_log(&logs, "Extracting typed rootfs archive...").await;
                 let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
                     name, rootfs,
                 )?;
-                self.image_import.import_tar(target, source).await
+                self.image_import.import_tar(target, source).await?;
+                Ok(DeploymentReceipt::none())
             }
         }
     }

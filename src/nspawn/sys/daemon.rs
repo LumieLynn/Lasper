@@ -1571,7 +1571,7 @@ async fn handle_fd_connection(
             };
 
             let mut cmd = CommandBuilder::new("machinectl");
-            cmd.args(["login", name.as_str()]);
+            cmd.args(["--", "login", name.as_str()]);
             match pair.slave.spawn_command(cmd) {
                 Ok(mut child) => {
                     drop(pair.slave);
