@@ -22,7 +22,7 @@ Yes. Each `lasper -e` process starts its own daemon. Two shells owned by the sam
 
 Check that the required bootstrap tool and distribution keyring are installed. For example, Arch bootstrap requires `pacstrap` and `archlinux-keyring`; Debian/Ubuntu bootstrap requires `debootstrap` and the appropriate archive keyring.
 
-Also check the deployment log. Some setup warnings, such as failure to enable `systemd-networkd` or `systemd-resolved` inside a minimal rootfs, may not abort the whole deployment.
+Also check the deployment log. Some setup warnings, such as failure to enable `systemd-networkd` inside a minimal rootfs, may not abort the whole deployment.
 
 ## How do I remove a container?
 
@@ -40,7 +40,7 @@ You can start the rootfs manually with `systemd-nspawn -D /var/lib/machines/<nam
 
 Check both the container and host:
 
-- the container should have suitable network services, commonly `systemd-networkd` and `systemd-resolved`;
+- the container should have suitable network and resolver services for its own image configuration, commonly `systemd-networkd` and optionally `systemd-resolved`;
 - the host firewall/NAT rules must allow the traffic;
 - native systemd tools such as `networkctl`, `machinectl status <name>`, and `journalctl -M <name>` usually show the real failure.
 

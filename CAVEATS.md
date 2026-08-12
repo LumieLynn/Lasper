@@ -25,7 +25,7 @@ Lasper pulls OCI input through systemd 260+'s `importctl pull-oci` and stores it
 
 ## Networking
 
-Veth and bridge-style networking rely on systemd networking behavior inside the container and host NAT/firewall behavior outside it. Lasper may attempt to enable `systemd-networkd` and `systemd-resolved` during setup, but service enablement warnings do not always mean the container cannot be used.
+Veth and bridge-style networking rely on systemd networking behavior inside the container and host NAT/firewall behavior outside it. Lasper may attempt to enable `systemd-networkd` during setup, while DNS integration is delegated to systemd-nspawn's `ResolvConf=` policy: host networking binds the host resolver configuration and private networking preserves the image's resolver setup.
 
 If networking fails, check the host firewall, the container's network services, and native systemd status with tools such as `machinectl`, `networkctl`, and `journalctl`.
 

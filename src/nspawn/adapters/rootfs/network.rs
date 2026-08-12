@@ -3,7 +3,7 @@ use crate::nspawn::sys::{log_output, CommandRunner};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-/// Enable systemd-networkd and systemd-resolved inside the container.
+/// Enable systemd-networkd inside the container.
 pub(crate) async fn configure_network_at(
     rootfs: &Path,
     cmd_runner: &dyn CommandRunner,
@@ -41,17 +41,6 @@ pub(crate) async fn configure_network_at(
         ));
     }
 
-    let resolved = enable_systemd_unit(rootfs, &rootfs_s, "systemd-resolved", cmd_runner).await?;
-    if !resolved.status.success() {
-        log::warn!(
-            "systemd-resolved could not be enabled inside {}. Leaving /etc/resolv.conf unchanged.",
-            rootfs.display()
-        );
-        return Ok(());
-    }
-
-    update_resolv_conf(rootfs, &rootfs_s, cmd_runner).await;
-
     Ok(())
 }
 
@@ -83,67 +72,6 @@ async fn enable_systemd_unit(
     Ok(out)
 }
 
-async fn update_resolv_conf(rootfs: &Path, rootfs_s: &str, cmd_runner: &dyn CommandRunner) {
-    let rm = cmd_runner
-        .run(
-            "systemd-nspawn",
-            vec![
-                "-D".into(),
-                rootfs_s.to_string(),
-                "--quiet".into(),
-                "--settings=no".into(),
-                "rm".into(),
-                "-f".into(),
-                "/etc/resolv.conf".into(),
-            ],
-        )
-        .await;
-    match rm {
-        Ok(output) => {
-            log_output("resolv.conf rm", &output);
-            if !output.status.success() {
-                log::warn!(
-                    "Failed to remove container resolv.conf inside {}.",
-                    rootfs.display()
-                );
-                return;
-            }
-        }
-        Err(error) => {
-            log::warn!(
-                "Failed to remove container resolv.conf inside {}: {}",
-                rootfs.display(),
-                error
-            );
-            return;
-        }
-    }
-
-    let link = cmd_runner
-        .run(
-            "systemd-nspawn",
-            vec![
-                "-D".into(),
-                rootfs_s.to_string(),
-                "--quiet".into(),
-                "--settings=no".into(),
-                "ln".into(),
-                "-sf".into(),
-                "../run/systemd/resolve/stub-resolv.conf".into(),
-                "/etc/resolv.conf".into(),
-            ],
-        )
-        .await;
-    match link {
-        Ok(output) => log_output("resolv.conf link", &output),
-        Err(error) => log::warn!(
-            "Failed to update container resolv.conf inside {}: {}",
-            rootfs.display(),
-            error
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,36 +96,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_failure_does_not_fail_networkd_enable() {
-        let rootfs = rootfs_with_systemctl();
-        let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
-        {
-            let calls = calls.clone();
-            runner.expect_run().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args.clone());
-                if args.iter().any(|arg| arg == "systemd-resolved") {
-                    Ok(mock_output(
-                        false,
-                        "Unit systemd-resolved.service does not exist",
-                    ))
-                } else {
-                    Ok(mock_output(true, ""))
-                }
-            });
-        }
-
-        configure_network_at(rootfs.path(), &runner).await.unwrap();
-
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 3);
-        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
-        assert!(calls[2].iter().any(|arg| arg == "systemd-resolved"));
-    }
-
-    #[tokio::test]
-    async fn resolved_success_updates_resolv_conf_without_shell() {
+    async fn networkd_success_does_not_mutate_resolver_configuration() {
         let rootfs = rootfs_with_systemctl();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
@@ -213,22 +112,14 @@ mod tests {
         configure_network_at(rootfs.path(), &runner).await.unwrap();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 5);
+        assert_eq!(calls.len(), 2);
         assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
-        assert!(calls[2].iter().any(|arg| arg == "systemd-resolved"));
-        assert!(calls[3].windows(2).any(|pair| pair == ["rm", "-f"]));
-        assert!(calls[3].iter().any(|arg| arg == "/etc/resolv.conf"));
-        assert!(calls[4].windows(2).any(|pair| pair == ["ln", "-sf"]));
-        assert!(calls[4]
-            .iter()
-            .any(|arg| arg == "../run/systemd/resolve/stub-resolv.conf"));
-        assert!(calls[4].iter().any(|arg| arg == "/etc/resolv.conf"));
         assert!(calls
             .iter()
-            .all(|args| !args.iter().any(|arg| arg == "sh" || arg == "-c")));
-        assert!(calls
+            .all(|args| !args.iter().any(|arg| arg == "systemd-resolved")));
+        assert!(calls.iter().all(|args| !args
             .iter()
-            .all(|args| args.iter().any(|arg| arg == "--settings=no")));
+            .any(|arg| arg == "/etc/resolv.conf" || arg.contains("stub-resolv.conf"))));
     }
 
     #[tokio::test]

@@ -16,6 +16,7 @@ pub struct NspawnConfigSpec {
     pub machine: MachineName,
     pub hostname: String,
     pub network: Option<NetworkMode>,
+    pub resolv_conf: Option<ResolvConfMode>,
     pub port_forwards: Vec<NspawnPortForward>,
     pub bind_mounts: Vec<BindMount>,
     pub device_binds: Vec<String>,
@@ -31,6 +32,14 @@ pub struct NspawnConfigSpec {
 impl NspawnConfigSpec {
     pub fn validate(&self) -> Result<()> {
         validate_text("hostname", &self.hostname, true)?;
+
+        let expected_resolv_conf = ResolvConfMode::for_network(self.network.as_ref());
+        if self.resolv_conf != expected_resolv_conf {
+            return Err(NspawnError::Validation(format!(
+                "Resolver policy {:?} does not match network mode {:?}",
+                self.resolv_conf, self.network
+            )));
+        }
 
         if self.port_forwards.len() > MAX_CONFIG_ITEMS
             || self.bind_mounts.len() > MAX_CONFIG_ITEMS
@@ -85,6 +94,7 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
     type Error = NspawnError;
 
     fn try_from(config: &ContainerConfig) -> Result<Self> {
+        let resolv_conf = ResolvConfMode::for_network(config.network.as_ref());
         let private_users = match config.private_users.as_deref() {
             None => None,
             Some("yes") => Some(PrivateUsersMode::Yes),
@@ -102,6 +112,7 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
                 .map_err(|error| NspawnError::Validation(error.to_string()))?,
             hostname: config.hostname.clone(),
             network: config.network.clone(),
+            resolv_conf,
             port_forwards: config
                 .port_forwards
                 .iter()
@@ -119,6 +130,30 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
         };
         spec.validate()?;
         Ok(spec)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResolvConfMode {
+    Off,
+    BindHost,
+}
+
+impl ResolvConfMode {
+    fn for_network(network: Option<&NetworkMode>) -> Option<Self> {
+        match network {
+            Some(NetworkMode::Host) => Some(Self::BindHost),
+            Some(_) => Some(Self::Off),
+            None => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::BindHost => "bind-host",
+        }
     }
 }
 
@@ -269,5 +304,27 @@ mod tests {
             ..Default::default()
         };
         assert!(NspawnConfigSpec::try_from(&bad_bind).is_err());
+    }
+
+    #[test]
+    fn config_spec_derives_and_validates_resolver_policy() {
+        let host = ContainerConfig {
+            name: "host-network".into(),
+            network: Some(NetworkMode::Host),
+            ..Default::default()
+        };
+        let host_spec = NspawnConfigSpec::try_from(&host).unwrap();
+        assert_eq!(host_spec.resolv_conf, Some(ResolvConfMode::BindHost));
+
+        let private = ContainerConfig {
+            name: "private-network".into(),
+            network: Some(NetworkMode::Veth),
+            ..Default::default()
+        };
+        let mut private_spec = NspawnConfigSpec::try_from(&private).unwrap();
+        assert_eq!(private_spec.resolv_conf, Some(ResolvConfMode::Off));
+
+        private_spec.resolv_conf = Some(ResolvConfMode::BindHost);
+        assert!(private_spec.validate().is_err());
     }
 }

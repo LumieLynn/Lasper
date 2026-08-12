@@ -256,6 +256,10 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
             exec.set("PrivateUsers", mode.as_str());
         }
 
+        if let Some(mode) = spec.resolv_conf {
+            exec.set("ResolvConf", mode.as_str());
+        }
+
         if spec.privileged {
             exec.set("Capability", "all");
         }
@@ -325,8 +329,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         || !spec.bind_mounts.is_empty()
         || spec.wayland_socket.is_some()
         || spec.graphics_acceleration
-        || spec.nvidia_gpu
-        || matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host));
+        || spec.nvidia_gpu;
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
@@ -358,13 +361,6 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         } else {
             ":idmap"
         };
-
-        if matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host)) {
-            files.append(
-                "BindReadOnly",
-                format!("/etc/resolv.conf:/etc/resolv.conf{}", suffix),
-            );
-        }
 
         if let Some(socket_name) = &spec.wayland_socket {
             let socket_path = verified_wayland_socket
@@ -588,7 +584,8 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=no"));
-        assert!(content.contains("BindReadOnly=/etc/resolv.conf:/etc/resolv.conf"));
+        assert!(content.contains("ResolvConf=bind-host"));
+        assert!(!content.contains("BindReadOnly=/etc/resolv.conf"));
     }
 
     #[test]
@@ -612,6 +609,7 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=yes"));
+        assert!(content.contains("ResolvConf=off"));
         assert!(content.contains("Port=tcp:8080:80"));
         assert!(content.contains("Port=tcp:4443:443"));
     }
