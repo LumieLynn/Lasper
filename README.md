@@ -69,18 +69,18 @@ You can use Lasper's integrated terminal or native systemd tools after creation.
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
 - `[` / `]` or `Alt + 1-2` while Images is focused: Switch Regular/Internal images
-- `PageUp` / `PageDown` while Images is focused: Scroll wrapped image information
-- `Enter` / `x` : Open Action Power Menu (Start, Poweroff, Reboot, Terminate, Kill, Enable, Disable)
-- `Tab` / `Shift+Tab` : Cycle focus (Machines → Images → Detail → Terminal)
+- `PageUp` / `PageDown` while an Inspector is focused: Scroll the active pane
+- `Enter` / `x` : Open the resource-appropriate action menu
+- `Tab` / `Shift+Tab` : Cycle focus (Machines → Machine Inspector → Images → Image Inspector → Terminal)
 - `n` / `a` : Create a new container (Creation Wizard)
-- `s` : Start the selected image
+- `s` : Start the selected machine or image
 - `S` : Poweroff the selected machine
 - `D` : Delete the selected image (while Images is focused)
-- `t` : Open shell terminal (machinectl login)
+- `t` : Open a terminal for the selected running machine or a regular image's same-name running machine
 - `T` : Maximize terminal (when terminal is focused)
 - `r` : Manual refresh
 - `R` : Toggle panel resize mode
-- `[` / `]` or `Alt + 1-5` : Switch view panes (Properties / Details / Logs / Config / Metrics)
+- `[` / `]` or `Alt + 1-5` while an Inspector is focused: Switch its available panes
 - `?` : Show help
 - `q` : Quit
 - `Esc` : Back / Close Overlays
