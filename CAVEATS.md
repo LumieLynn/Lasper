@@ -41,6 +41,8 @@ Disabling `PrivateUsers` may make display access easier, but it weakens containe
 
 Lasper's normal managed image location is `/var/lib/machines/<name>` or `/var/lib/machines/<name>.raw`. Disk-image handling is being tightened around raw images and content validation. Treat unusual image formats and direct image imports as experimental until the storage model is fully typed and validated in the daemon.
 
+Tar rootfs imports are extracted by the host's `tar` implementation with `TAR_OPTIONS` ignored. GNU tar 1.35 or newer is recommended: releases before 1.34 lack protection against archive-created symbolic-link traversal, while 1.34 lacks the hard-link confinement added in 1.35. Lasper warns when it detects an older or unrecognized implementation but continues for distribution compatibility. Do not import untrusted Tar archives on those hosts.
+
 ## Native Tools Remain Useful
 
 Lasper is meant to make systemd-nspawn easier to operate, not to hide systemd from you. When debugging, the native tools are still the best source of truth:

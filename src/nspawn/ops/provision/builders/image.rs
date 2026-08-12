@@ -70,7 +70,10 @@ impl Deployer for ImageDeployer {
                 let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
                     name, rootfs,
                 )?;
-                self.image_import.import_tar(target, source).await?;
+                let report = self.image_import.import_tar(target, source).await?;
+                for warning in report.warnings {
+                    send_deploy_log(&logs, format!("WARNING: {warning}")).await;
+                }
                 Ok(DeploymentReceipt::none())
             }
         }

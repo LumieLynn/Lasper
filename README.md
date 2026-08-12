@@ -26,6 +26,7 @@ Lasper is currently alpha software. It is suitable for testing and personal work
   for compatibility but has a larger root attack surface.
 - *Optional*: systemd 260+ (for OCI application images via `importctl pull-oci`)
 - *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
+- *Optional*: GNU tar 1.35+ (recommended for Tar rootfs imports; older versions remain usable with a security warning)
 - *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
 ## ⚠️ Before You Begin – Must Read

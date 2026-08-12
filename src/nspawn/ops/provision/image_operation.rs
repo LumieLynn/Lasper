@@ -15,6 +15,11 @@ pub(crate) struct ImportTarRequest {
     pub(crate) target: RootfsTarget,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImageImportReport {
+    pub(crate) warnings: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct ImageImportStore {
     daemon: Option<Arc<ElevatedDaemon>>,
@@ -45,7 +50,7 @@ impl ImageImportStore {
         &self,
         target: RootfsTarget,
         source: std::fs::File,
-    ) -> Result<()> {
+    ) -> Result<ImageImportReport> {
         validate_source(&source)?;
         let request = ImportTarRequest { target };
         if let Some(daemon) = &self.daemon {
@@ -115,7 +120,7 @@ fn validate_source(source: &std::fs::File) -> Result<()> {
 pub(crate) async fn import_tar_image(
     request: ImportTarRequest,
     source: std::fs::File,
-) -> Result<()> {
+) -> Result<ImageImportReport> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
     let target = request.target.path()?;
@@ -123,12 +128,16 @@ pub(crate) async fn import_tar_image(
 
     tokio::task::spawn_blocking(move || extract_tar_at(&operation_target, source))
         .await
-        .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))??;
-    Ok(())
+        .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))?
 }
 
-fn extract_tar_at(target: &std::path::Path, source: std::fs::File) -> Result<()> {
-    let output = crate::nspawn::sys::new_sync_command("tar")
+fn extract_tar_at(target: &std::path::Path, source: std::fs::File) -> Result<ImageImportReport> {
+    let report = inspect_tar_runtime()?;
+    for warning in &report.warnings {
+        log::warn!("[AUDIT] [Tar import] {warning}");
+    }
+
+    let output = tar_command()
         .args(["--numeric-owner", "-pxf", "-", "-C"])
         .arg(target)
         .stdin(Stdio::from(source))
@@ -136,13 +145,71 @@ fn extract_tar_at(target: &std::path::Path, source: std::fs::File) -> Result<()>
         .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
     crate::nspawn::sys::log_output("typed tar import", &output);
     if output.status.success() {
-        Ok(())
+        Ok(report)
     } else {
         Err(NspawnError::cmd_failed(
             "extract rootfs archive",
             format!("tar --numeric-owner -pxf - -C {}", target.display()),
             &output,
         ))
+    }
+}
+
+fn tar_command() -> std::process::Command {
+    let mut command = crate::nspawn::sys::new_sync_command("tar");
+    // GNU tar reads additional extraction flags from this environment variable.
+    // Ignore it so callers cannot silently enable unsafe link-following behavior.
+    command.env_remove("TAR_OPTIONS");
+    command
+}
+
+fn inspect_tar_runtime() -> Result<ImageImportReport> {
+    let output = tar_command()
+        .arg("--version")
+        .output()
+        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+    crate::nspawn::sys::log_output("tar --version", &output);
+
+    let version = output
+        .status
+        .success()
+        .then(|| parse_gnu_tar_version(&String::from_utf8_lossy(&output.stdout)))
+        .flatten();
+    let warnings = tar_version_warning(version).into_iter().collect();
+    Ok(ImageImportReport { warnings })
+}
+
+fn parse_gnu_tar_version(output: &str) -> Option<(u32, u32)> {
+    let line = output.lines().next()?.trim();
+    if !line.contains("(GNU tar)") {
+        return None;
+    }
+
+    line.split_ascii_whitespace().rev().find_map(|word| {
+        let version =
+            word.trim_matches(|character: char| !character.is_ascii_digit() && character != '.');
+        let mut components = version.split('.');
+        let major = components.next()?.parse().ok()?;
+        let minor = components.next()?.parse().ok()?;
+        Some((major, minor))
+    })
+}
+
+fn tar_version_warning(version: Option<(u32, u32)>) -> Option<String> {
+    match version {
+        Some(version) if version < (1, 34) => Some(format!(
+            "GNU tar {}.{} predates 1.34 and may follow archive-created symbolic links outside the target. Continuing for compatibility; import only trusted archives or upgrade to GNU tar 1.35+.",
+            version.0, version.1
+        )),
+        Some(version) if version < (1, 35) => Some(format!(
+            "GNU tar {}.{} lacks the hard-link confinement added in 1.35. Continuing for compatibility; import only trusted archives or upgrade to GNU tar 1.35+.",
+            version.0, version.1
+        )),
+        Some(_) => None,
+        None => Some(
+            "Could not verify GNU tar 1.35+ extraction protections. Continuing with the host tar implementation; import only trusted archives."
+                .into(),
+        ),
     }
 }
 
@@ -200,6 +267,35 @@ mod tests {
     }
 
     #[test]
+    fn gnu_tar_versions_are_parsed_and_risk_classified() {
+        assert_eq!(parse_gnu_tar_version("tar (GNU tar) 1.35\n"), Some((1, 35)));
+        assert_eq!(
+            parse_gnu_tar_version("tar (GNU tar) 1.35.90\n"),
+            Some((1, 35))
+        );
+        assert_eq!(parse_gnu_tar_version("bsdtar 3.7.7\n"), None);
+
+        assert!(tar_version_warning(Some((1, 33)))
+            .unwrap()
+            .contains("symbolic links"));
+        assert!(tar_version_warning(Some((1, 34)))
+            .unwrap()
+            .contains("hard-link"));
+        assert!(tar_version_warning(Some((1, 35))).is_none());
+        assert!(tar_version_warning(None)
+            .unwrap()
+            .contains("Could not verify"));
+    }
+
+    #[test]
+    fn tar_commands_ignore_environment_options() {
+        let command = tar_command();
+        assert!(command
+            .get_envs()
+            .any(|(name, value)| name == "TAR_OPTIONS" && value.is_none()));
+    }
+
+    #[test]
     fn typed_tar_import_reads_archive_from_fd() {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -208,7 +304,7 @@ mod tests {
 
         let mut archive = tempfile::tempfile().unwrap();
         let archive_output = archive.try_clone().unwrap();
-        let output = crate::nspawn::sys::new_sync_command("tar")
+        let output = tar_command()
             .args(["-cf", "-", "-C"])
             .arg(source.path())
             .arg(".")

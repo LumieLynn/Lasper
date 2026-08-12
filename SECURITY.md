@@ -36,6 +36,10 @@ OCI application imports use systemd's typed `importctl pull-oci` operation (syst
 
 Users should select trusted registries and immutable image digests when image provenance matters.
 
+## Tar Image Policy
+
+Tar rootfs extraction runs with the authority required to populate a managed container root. Lasper ignores `TAR_OPTIONS` and reports when the executing host does not provide verified GNU tar 1.35+ extraction protections, but older or unrecognized implementations remain allowed for distribution compatibility. Treat such imports as trusted-input operations; use GNU tar 1.35+, a Raw image, or a native bootstrap provider when the archive is not fully trusted.
+
 ## RustSec Exceptions
 
 CI fails on RustSec vulnerabilities except for the following temporary, documented exceptions:

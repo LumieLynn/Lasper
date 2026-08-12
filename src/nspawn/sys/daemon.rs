@@ -41,7 +41,7 @@ use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
 };
-use crate::nspawn::ops::provision::image_operation::ImportTarRequest;
+use crate::nspawn::ops::provision::image_operation::{ImageImportReport, ImportTarRequest};
 use crate::nspawn::ops::provision::oci_operation::{
     build_command as build_oci_pull_command, OciPullRequest,
 };
@@ -137,6 +137,8 @@ struct ImportRawImageParams {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ImportImageResponse {
+    #[serde(default)]
+    warnings: Vec<String>,
     error: Option<String>,
 }
 
@@ -696,22 +698,25 @@ impl ElevatedDaemon {
             source,
         )
         .await
+        .map(|_| ())
     }
 
     pub(crate) async fn import_tar_image(
         &self,
         request: ImportTarRequest,
         source: std::fs::File,
-    ) -> std::io::Result<()> {
-        self.import_image_source(FdOperation::ImportTarImage(request), source)
-            .await
+    ) -> std::io::Result<ImageImportReport> {
+        let warnings = self
+            .import_image_source(FdOperation::ImportTarImage(request), source)
+            .await?;
+        Ok(ImageImportReport { warnings })
     }
 
     async fn import_image_source(
         &self,
         operation: FdOperation,
         source: std::fs::File,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<Vec<String>> {
         let std_sock = self.open_fd_channel(operation).await?;
         tokio::task::spawn_blocking(move || {
             use std::io::BufRead;
@@ -733,7 +738,7 @@ impl ElevatedDaemon {
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
             match response.error {
                 Some(error) => Err(std::io::Error::other(error)),
-                None => Ok(()),
+                None => Ok(response.warnings),
             }
         })
         .await?
@@ -1704,6 +1709,7 @@ async fn handle_fd_connection(
                 machine, source,
             )
             .await
+            .map(|_| ImageImportReport::default())
             .map_err(|error| error.to_string());
             send_image_import_response(&mut std_stream, result);
         }
@@ -1747,15 +1753,28 @@ fn receive_image_source(
 
 fn send_image_import_response(
     stream: &mut std::os::unix::net::UnixStream,
-    result: std::result::Result<(), String>,
+    result: std::result::Result<ImageImportReport, String>,
 ) {
     use std::io::Write;
 
-    let response = ImportImageResponse {
-        error: result.err(),
-    };
+    let response = image_import_response(result);
     if let Ok(line) = serde_json::to_string(&response) {
         let _ = stream.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+fn image_import_response(
+    result: std::result::Result<ImageImportReport, String>,
+) -> ImportImageResponse {
+    match result {
+        Ok(report) => ImportImageResponse {
+            warnings: report.warnings,
+            error: None,
+        },
+        Err(error) => ImportImageResponse {
+            warnings: Vec::new(),
+            error: Some(error),
+        },
     }
 }
 
@@ -2006,6 +2025,27 @@ mod tests {
         assert_eq!(json["params"]["target"]["machine"], "test-machine");
         assert!(json["params"].get("path").is_none());
         assert!(json["params"].get("source").is_none());
+    }
+
+    #[test]
+    fn image_import_response_round_trip_preserves_warnings() {
+        let response = image_import_response(Ok(ImageImportReport {
+            warnings: vec!["upgrade tar before importing untrusted archives".into()],
+        }));
+        let json = serde_json::to_string(&response).unwrap();
+        let response: ImportImageResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            response.warnings,
+            ["upgrade tar before importing untrusted archives"]
+        );
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn image_import_response_defaults_missing_warnings_to_empty() {
+        let response: ImportImageResponse = serde_json::from_str(r#"{"error":null}"#).unwrap();
+        assert!(response.warnings.is_empty());
+        assert!(response.error.is_none());
     }
 
     #[test]
