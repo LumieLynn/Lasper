@@ -22,6 +22,67 @@ pub enum NetworkMode {
     Interface(String),
 }
 
+impl NetworkMode {
+    /// Whether this mode creates or joins a network namespace separate from the host.
+    pub fn is_private(&self) -> bool {
+        !matches!(self, Self::Host)
+    }
+}
+
+/// Network modes exposed for system-scoped OCI application imports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OciNetworkMode {
+    /// Share the host network namespace.
+    #[default]
+    Host,
+    /// Create a private network namespace with loopback only.
+    Isolated,
+    /// Create a veth pair connected to a private network namespace.
+    Veth,
+}
+
+impl OciNetworkMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Isolated => "isolated",
+            Self::Veth => "veth",
+        }
+    }
+
+    pub fn into_network_mode(self) -> NetworkMode {
+        match self {
+            Self::Host => NetworkMode::Host,
+            Self::Isolated => NetworkMode::None,
+            Self::Veth => NetworkMode::Veth,
+        }
+    }
+}
+
+/// User namespace modes accepted by systemd-nspawn's `PrivateUsers=` setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivateUsersMode {
+    Yes,
+    No,
+    Pick,
+    Identity,
+    Managed,
+}
+
+impl PrivateUsersMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Pick => "pick",
+            Self::Identity => "identity",
+            Self::Managed => "managed",
+        }
+    }
+}
+
 /// A port forwarding rule (host -> container).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortForward {
@@ -384,8 +445,8 @@ pub struct ContainerConfig {
     pub readonly_binds: Vec<String>,
     /// Whether to grant all capabilities (privileged mode).
     pub privileged: bool,
-    /// Explicit PrivateUsers setting. None = auto-detect, Some(true) = yes, Some(false) = no.
-    pub private_users: Option<String>,
+    /// Explicit `PrivateUsers=` setting. `None` keeps systemd's default policy.
+    pub private_users: Option<PrivateUsersMode>,
     /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
     pub graphics_acceleration: bool,
     pub root_password: Option<String>,
@@ -539,11 +600,22 @@ mod tests {
         let cfg = ContainerConfig {
             name: "test".into(),
             nvidia_gpu: true,
+            private_users: Some(PrivateUsersMode::Managed),
             ..Default::default()
         };
 
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, cfg2);
+    }
+
+    #[test]
+    fn oci_network_mode_maps_to_supported_nspawn_modes() {
+        assert_eq!(OciNetworkMode::Host.into_network_mode(), NetworkMode::Host);
+        assert_eq!(
+            OciNetworkMode::Isolated.into_network_mode(),
+            NetworkMode::None
+        );
+        assert_eq!(OciNetworkMode::Veth.into_network_mode(), NetworkMode::Veth);
     }
 }

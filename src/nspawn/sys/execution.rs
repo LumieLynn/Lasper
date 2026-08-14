@@ -31,6 +31,7 @@ pub struct ExecutionContext {
     pub oci_pull: OciPullStore,
     pub managed_storage: ManagedStorageStore,
     pub nvidia_state: NvidiaStateStore,
+    permission_level: PermissionLevel,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
 
@@ -66,8 +67,13 @@ impl ExecutionContext {
             oci_pull,
             managed_storage,
             nvidia_state,
+            permission_level: level,
             daemon,
         })
+    }
+
+    pub fn permission_level(&self) -> PermissionLevel {
+        self.permission_level
     }
 
     /// Expose the daemon reference for callers that need daemon-specific
@@ -110,6 +116,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("oci_pull", &"OciPullStore")
             .field("managed_storage", &self.managed_storage)
             .field("nvidia_state", &self.nvidia_state)
+            .field("permission_level", &self.permission_level)
             .field("daemon", &self.daemon)
             .finish()
     }

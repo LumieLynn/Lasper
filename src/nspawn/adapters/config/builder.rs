@@ -2,7 +2,10 @@ use crate::nspawn::adapters::config::nspawn_file::nspawn_config_content;
 use crate::nspawn::adapters::config::systemd_unit::systemd_override_content;
 use crate::nspawn::adapters::storage::{StorageBackend, StorageType};
 use crate::nspawn::models::{ArtifactSpec, BootstrapMethod, BootstrapSpec};
-use crate::nspawn::models::{BindMount, ContainerConfig, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::models::{
+    BindMount, ContainerConfig, CreateUser, NetworkMode, OciNetworkMode, PortForward,
+    PrivateUsersMode,
+};
 use crate::nspawn::ops::provision::builders::{bootstrap, clone, image, oci};
 use crate::nspawn::ops::provision::Deployer;
 
@@ -24,10 +27,19 @@ pub enum SourceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceConfig {
-    Copy { source_name: String },
-    Oci { reference: String, read_only: bool },
+    Copy {
+        source_name: String,
+    },
+    Oci {
+        reference: String,
+        read_only: bool,
+        network: OciNetworkMode,
+    },
     Bootstrap(BootstrapSpec),
-    Pull { url: String, is_raw: bool },
+    Pull {
+        url: String,
+        is_raw: bool,
+    },
     Artifact(ArtifactSpec),
 }
 
@@ -60,7 +72,7 @@ pub struct PassthroughConfig {
     pub bind_mounts: Vec<BindMount>,
     pub device_binds: Vec<String>,
     pub privileged: bool,
-    pub private_users: Option<String>,
+    pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
@@ -116,16 +128,24 @@ impl ContainerConfigBuilder {
 
         let device_binds = passthrough.device_binds.clone();
 
+        let (network, private_users) = match &self.source {
+            Some(SourceConfig::Oci { network, .. }) => (
+                Some(network.into_network_mode()),
+                Some(PrivateUsersMode::No),
+            ),
+            _ => (nw.mode.clone(), passthrough.private_users),
+        };
+
         let cfg = ContainerConfig {
             name: basic.name.clone(),
             hostname: basic.hostname.clone(),
-            network: nw.mode.clone(),
+            network,
             port_forwards: nw.port_forwards.clone(),
             bind_mounts: passthrough.bind_mounts.clone(),
             device_binds,
             readonly_binds: vec![],
             privileged: passthrough.privileged,
-            private_users: passthrough.private_users,
+            private_users,
             graphics_acceleration: passthrough.graphics_acceleration,
             root_password: user.root_password.clone(),
             users: user.users.clone(),
@@ -138,6 +158,7 @@ impl ContainerConfigBuilder {
         if let Some(SourceConfig::Oci {
             reference,
             read_only,
+            network,
         }) = &self.source
         {
             let mode = if *read_only {
@@ -146,8 +167,10 @@ impl ContainerConfigBuilder {
                 "writable overlay"
             };
             let preview = format!(
-                " [SYSTEMD OCI APPLICATION]\n\n Reference: {reference}\n Name: {}\n Storage: /var/lib/machines/{}.mstack\n Mode: {mode}\n Runtime config: preserved from OCI image\n Verification: HTTPS transport authentication; no publisher signature verification\n",
-                basic.name, basic.name
+                " [SYSTEMD OCI APPLICATION]\n\n Reference: {reference}\n Name: {}\n Storage: /var/lib/machines/{}.mstack\n Mode: {mode}\n Network: {}\n PrivateUsers: no (system-scope import)\n Runtime config: OCI settings preserved in trusted host config\n Verification: HTTPS transport authentication; no publisher signature verification\n",
+                basic.name,
+                basic.name,
+                network.as_str(),
             );
             return ContainerConfigWithPreview {
                 cfg,
@@ -257,10 +280,13 @@ impl ContainerConfigBuilder {
             SourceConfig::Oci {
                 reference,
                 read_only,
+                network,
             } => Box::new(oci::OciDeployer {
                 reference,
                 read_only,
+                network,
                 oci_pull,
+                nspawn,
             }) as Box<dyn Deployer>,
             SourceConfig::Artifact(artifact) => Box::new(image::ImageDeployer {
                 source: image::ImageSource::Local(artifact.path.clone()),
@@ -312,10 +338,13 @@ mod tests {
         builder.source = Some(SourceConfig::Oci {
             reference: "docker.io/library/ubuntu".to_string(),
             read_only: false,
+            network: OciNetworkMode::Host,
         });
         let result = builder.build_config(None);
         assert!(!result.cfg.boot);
         assert!(result.preview.contains("/var/lib/machines/unknown.mstack"));
+        assert!(result.preview.contains("Network: host"));
+        assert!(result.preview.contains("PrivateUsers: no"));
         assert!(!result.preview.contains("[Exec]"));
     }
 

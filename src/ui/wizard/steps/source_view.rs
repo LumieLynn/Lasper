@@ -1,4 +1,4 @@
-use crate::nspawn::models::RootfsSourceSpec;
+use crate::nspawn::models::{OciNetworkMode, RootfsSourceSpec};
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::path_box::expand_user_path;
@@ -23,6 +23,7 @@ macro_rules! active_comps {
             SourceKind::Oci => {
                 comps.push(&mut $self.oci_url);
                 comps.push(&mut $self.oci_mode);
+                comps.push(&mut $self.oci_network);
             }
             SourceKind::Debootstrap => {
                 comps.push(&mut $self.deboot_mirror);
@@ -51,6 +52,7 @@ pub struct SourceStepView {
     kind_list: SelectableList<SourceKind>,
     oci_url: TextBox,
     oci_mode: crate::ui::widgets::selectors::radio_group::RadioGroup,
+    oci_network: crate::ui::widgets::selectors::radio_group::RadioGroup,
     deboot_mirror: TextBox,
     deboot_suite: TextBox,
     deboot_pkgs: TextBox,
@@ -111,6 +113,15 @@ impl SourceStepView {
                 " OCI Storage ",
                 vec!["Writable overlay".into(), "Read-only layers".into()],
                 usize::from(initial_data.oci_read_only),
+            ),
+            oci_network: crate::ui::widgets::selectors::radio_group::RadioGroup::new(
+                " OCI Network ",
+                vec!["Host".into(), "Isolated".into(), "Veth".into()],
+                match initial_data.oci_network {
+                    OciNetworkMode::Host => 0,
+                    OciNetworkMode::Isolated => 1,
+                    OciNetworkMode::Veth => 2,
+                },
             ),
             deboot_mirror: TextBox::new(
                 " Mirror (leave blank for default) ",
@@ -239,6 +250,7 @@ impl Component for SourceStepView {
                 Constraint::Min(0),
                 Constraint::Length(3),
                 Constraint::Length(3),
+                Constraint::Length(3),
             ],
             SourceKind::Debootstrap => vec![
                 Constraint::Min(0),
@@ -276,6 +288,7 @@ impl Component for SourceStepView {
             SourceKind::Oci => {
                 self.oci_url.render(f, chunks[1]);
                 self.oci_mode.render(f, chunks[2]);
+                self.oci_network.render(f, chunks[3]);
             }
             SourceKind::Debootstrap => {
                 self.deboot_mirror.render(f, chunks[1]);
@@ -364,6 +377,11 @@ impl StepComponent for SourceStepView {
         ctx.source.kind = self.selected_kind();
         ctx.source.oci_url = self.oci_url.value().to_string();
         ctx.source.oci_read_only = self.oci_mode.selected_idx() == 1;
+        ctx.source.oci_network = match self.oci_network.selected_idx() {
+            1 => OciNetworkMode::Isolated,
+            2 => OciNetworkMode::Veth,
+            _ => OciNetworkMode::Host,
+        };
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
         ctx.source.deboot_pkgs = self.deboot_pkgs.value().to_string();

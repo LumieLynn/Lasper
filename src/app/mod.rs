@@ -1052,6 +1052,39 @@ mod tests {
                 Some("test is already starting.")
             );
         }
+
+        #[tokio::test]
+        async fn mstack_start_warns_but_still_dispatches_to_systemd() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_start()
+                .withf(|name| name == "test")
+                .once()
+                .returning(|_| Ok(()));
+            let (mut app, mut rx) = prepare_image_start(manager);
+            app.data.images[0].image_type = "mstack".into();
+
+            app.action_start();
+
+            assert_eq!(app.data.entries[0].state, ContainerState::Starting);
+            assert_eq!(app.data.transitions.len(), 1);
+            assert_eq!(
+                app.ui
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some(
+                    "test is an OCI application and may not be bootable; systemd will still try to start it."
+                )
+            );
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("mstack start should finish")
+                    .expect("mstack start should report a result"),
+                AppEvent::ActionDone(..)
+            ));
+        }
     }
 
     mod select_next_prev {

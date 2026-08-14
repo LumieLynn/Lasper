@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use fs2::FileExt;
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -28,6 +29,28 @@ impl AsyncLockedWriter {
     /// 3. Performs an atomic write via rename.
     #[allow(dead_code)] // kept for direct atomic write paths used by typed stores
     pub async fn write_locked<F>(path: &Path, content_generator: F) -> Result<()>
+    where
+        F: FnOnce(Option<String>) -> Result<String>,
+    {
+        Self::write_locked_inner(path, None, content_generator).await
+    }
+
+    pub async fn write_locked_with_mode<F>(
+        path: &Path,
+        mode: u32,
+        content_generator: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(Option<String>) -> Result<String>,
+    {
+        Self::write_locked_inner(path, Some(mode), content_generator).await
+    }
+
+    async fn write_locked_inner<F>(
+        path: &Path,
+        mode: Option<u32>,
+        content_generator: F,
+    ) -> Result<()>
     where
         F: FnOnce(Option<String>) -> Result<String>,
     {
@@ -81,9 +104,20 @@ impl AsyncLockedWriter {
 
         // Atomic update with durability
         {
-            let mut f = fs::File::create(&tmp_path)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            if let Some(mode) = mode {
+                options.mode(mode);
+            }
+            let mut f = options
+                .open(&tmp_path)
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            if let Some(mode) = mode {
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            }
             f.write_all(new_content.as_bytes())
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;

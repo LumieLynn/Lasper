@@ -7,7 +7,9 @@ use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::models::{
+    BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
+};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
 use crate::nspawn::ops::PermissionLevel;
@@ -27,6 +29,7 @@ pub struct SourceState {
     pub kind: SourceKind,
     pub oci_url: String,
     pub oci_read_only: bool,
+    pub oci_network: OciNetworkMode,
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub deboot_pkgs: String,
@@ -51,6 +54,7 @@ impl SourceState {
             SourceKind::Oci => SourceConfig::Oci {
                 reference: self.oci_url.trim().into(),
                 read_only: self.oci_read_only,
+                network: self.oci_network,
             },
             SourceKind::Debootstrap => {
                 let mut spec = self
@@ -338,7 +342,7 @@ pub struct UnclassifiedFile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
     pub privileged: bool,
-    pub private_users: Option<String>,
+    pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub discovered_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
@@ -370,7 +374,7 @@ impl PassthroughState {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: self.selected_gpu_nodes.clone(),
             privileged: self.privileged,
-            private_users: self.private_users.clone(),
+            private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
             wayland_socket: if is_host_nw {
                 self.wayland_socket.clone()
@@ -525,6 +529,7 @@ impl WizardContext {
                 kind: default_kind,
                 oci_url: "".to_string(),
                 oci_read_only: false,
+                oci_network: OciNetworkMode::Host,
                 deboot_mirror: deboot_prefill.mirror.unwrap_or_default(),
                 deboot_suite: deboot_prefill.suite,
                 deboot_pkgs: deboot_prefill.packages.join(" "),
@@ -767,6 +772,7 @@ mod tests {
             kind: SourceKind::Copy,
             oci_url: "".into(),
             oci_read_only: false,
+            oci_network: OciNetworkMode::Host,
             deboot_mirror: "".into(),
             deboot_suite: "".into(),
             deboot_pkgs: "".into(),
@@ -835,6 +841,7 @@ mod tests {
             SourceConfig::Oci {
                 reference: "docker.io/library/nginx:latest".into(),
                 read_only: true,
+                network: OciNetworkMode::Host,
             }
         );
     }

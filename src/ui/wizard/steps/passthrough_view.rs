@@ -1,4 +1,4 @@
-use crate::nspawn::models::NetworkMode;
+use crate::nspawn::models::{NetworkMode, PrivateUsersMode};
 use crate::nspawn::platform::gpu::GpuDevice;
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::display::text_block::TextBlock;
@@ -87,6 +87,7 @@ pub struct PassthroughStepView {
     scroll_area: Rect,
     scroll_max: u16,
     hardware_scanning: bool,
+    private_network: bool,
 }
 
 impl PassthroughStepView {
@@ -171,16 +172,18 @@ impl PassthroughStepView {
             private_users: RadioGroup::new(
                 "PrivateUsers (User Namespace)",
                 vec![
-                    "Default (systemd)".to_string(),
+                    "Default".to_string(),
                     "pick".to_string(),
-                    "Enabled (yes)".to_string(),
-                    "Disabled (no)".to_string(),
+                    "managed".to_string(),
+                    "yes".to_string(),
+                    "no".to_string(),
                 ],
-                match &initial_data.private_users {
+                match initial_data.private_users {
                     None => 0,
-                    Some(v) if v == "pick" => 1,
-                    Some(v) if v == "yes" => 2,
-                    Some(v) if v == "no" => 3,
+                    Some(PrivateUsersMode::Pick) => 1,
+                    Some(PrivateUsersMode::Managed) => 2,
+                    Some(PrivateUsersMode::Yes) => 3,
+                    Some(PrivateUsersMode::No) => 4,
                     _ => 0,
                 },
             ),
@@ -194,6 +197,7 @@ impl PassthroughStepView {
             scroll_area: Rect::default(),
             scroll_max: 0,
             hardware_scanning,
+            private_network: nw_mode.as_ref().is_some_and(NetworkMode::is_private),
         };
 
         view.update_wayland_state();
@@ -339,6 +343,9 @@ impl Component for PassthroughStepView {
     }
 
     fn validate(&mut self) -> Result<(), String> {
+        if self.private_users.selected_idx() == 2 && !self.private_network {
+            return Err("PrivateUsers=managed requires a private network mode".into());
+        }
         Ok(())
     }
 
@@ -353,9 +360,10 @@ impl StepComponent for PassthroughStepView {
         ctx.passthrough.privileged = self.privileged.checked();
         ctx.passthrough.private_users = match self.private_users.selected_idx() {
             0 => None,
-            1 => Some("pick".into()),
-            2 => Some("yes".into()),
-            3 => Some("no".into()),
+            1 => Some(PrivateUsersMode::Pick),
+            2 => Some(PrivateUsersMode::Managed),
+            3 => Some(PrivateUsersMode::Yes),
+            4 => Some(PrivateUsersMode::No),
             _ => None,
         };
 

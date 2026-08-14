@@ -16,7 +16,7 @@
 //!
 //! ## FD passing
 //!
-//! Long-running commands (journalctl -f, machinectl login) are spawned by
+//! Long-running commands (journalctl -f, terminal attachment) are spawned by
 //! the daemon as root. The daemon passes the resulting fd back to the parent
 //! over a Unix domain socket using the [`sendfd`] crate. The socket is scoped
 //! to a private per-session directory, owned by the launching user, and each
@@ -51,6 +51,7 @@ use crate::nspawn::ops::system_operation::{
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
+use crate::nspawn::sys::terminal_attach::TerminalAttachKind;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -61,7 +62,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 6;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 7;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -89,8 +90,8 @@ struct FdRequest {
 enum FdOperation {
     #[serde(rename = "spawn_journalctl")]
     Journalctl(SpawnJournalctlParams),
-    #[serde(rename = "spawn_login")]
-    Login(SpawnLoginParams),
+    #[serde(rename = "spawn_terminal")]
+    Terminal(SpawnTerminalParams),
     #[serde(rename = "spawn_bootstrap")]
     Bootstrap(Box<SpawnBootstrapParams>),
     #[serde(rename = "spawn_oci_pull")]
@@ -109,9 +110,20 @@ struct SpawnJournalctlParams {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SpawnLoginParams {
+struct SpawnTerminalParams {
     name: MachineName,
     size: TerminalSize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SpawnTerminalResponse {
+    attach_kind: TerminalAttachKind,
+}
+
+pub(crate) struct SpawnedTerminalPty {
+    pub master_fd: RawFd,
+    pub attach_kind: TerminalAttachKind,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -663,20 +675,36 @@ impl ElevatedDaemon {
         .await?
     }
 
-    pub async fn spawn_login(&self, name: &str, cols: u16, rows: u16) -> std::io::Result<RawFd> {
+    pub async fn spawn_terminal(
+        &self,
+        name: &str,
+        cols: u16,
+        rows: u16,
+    ) -> std::io::Result<SpawnedTerminalPty> {
         let name = MachineName::try_from(name)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let size = TerminalSize::new(cols, rows)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
         let std_sock = self
-            .open_fd_channel(FdOperation::Login(SpawnLoginParams { name, size }))
+            .open_fd_channel(FdOperation::Terminal(SpawnTerminalParams { name, size }))
             .await?;
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 256];
             let mut fds = [0i32 as RawFd; 1];
             let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
             if fd_count > 0 {
-                Ok(fds[0])
+                match serde_json::from_slice::<SpawnTerminalResponse>(&buf[..n]) {
+                    Ok(response) => Ok(SpawnedTerminalPty {
+                        master_fd: fds[0],
+                        attach_kind: response.attach_kind,
+                    }),
+                    Err(error) => {
+                        unsafe {
+                            libc::close(fds[0]);
+                        }
+                        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+                    }
+                }
             } else {
                 let msg = String::from_utf8_lossy(&buf[..n]);
                 Err(std::io::Error::other(format!(
@@ -1559,8 +1587,8 @@ async fn handle_fd_connection(
             }
         }
 
-        FdOperation::Login(SpawnLoginParams { name, size }) => {
-            use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        FdOperation::Terminal(SpawnTerminalParams { name, size }) => {
+            use portable_pty::{native_pty_system, PtySize};
             let pty_system = native_pty_system();
             let pair = match pty_system.openpty(PtySize {
                 rows: size.rows(),
@@ -1571,27 +1599,58 @@ async fn handle_fd_connection(
                 Ok(p) => p,
                 Err(e) => {
                     log::error!("Daemon: openpty failed: {}", e);
+                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
                     return;
                 }
             };
 
-            let mut cmd = CommandBuilder::new("machinectl");
-            cmd.args(["--", "login", name.as_str()]);
+            let attach = match crate::nspawn::sys::terminal_attach::select(&name) {
+                Ok(attach) => attach,
+                Err(e) => {
+                    log::error!("Daemon: terminal attach planning failed: {}", e);
+                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
+            let attach_kind = attach.kind();
+            let cmd = attach.into_pty_command();
+            let terminal_name = name.to_string();
             match pair.slave.spawn_command(cmd) {
                 Ok(mut child) => {
                     drop(pair.slave);
                     let master_fd = pair.master.as_raw_fd().expect("master has fd");
+                    let response = serde_json::to_vec(&SpawnTerminalResponse { attach_kind })
+                        .expect("terminal response is serializable");
 
-                    if let Err(e) = std_stream.send_with_fd(b"ok", &[master_fd]) {
-                        log::error!("Daemon: send_with_fd (login) failed: {}", e);
+                    if let Err(e) = std_stream.send_with_fd(&response, &[master_fd]) {
+                        log::error!("Daemon: send_with_fd (terminal) failed: {}", e);
+                        let _ = child.kill();
                     }
                     drop(pair.master);
-                    tokio::task::spawn_blocking(move || {
-                        let _ = child.wait();
+                    tokio::task::spawn_blocking(move || match child.wait() {
+                        Ok(status) if status.success() => log::info!(
+                            "Terminal attachment for {} ({:?}) exited normally",
+                            terminal_name,
+                            attach_kind
+                        ),
+                        Ok(status) => log::warn!(
+                            "Terminal attachment for {} ({:?}) exited with code {} signal {:?}",
+                            terminal_name,
+                            attach_kind,
+                            status.exit_code(),
+                            status.signal()
+                        ),
+                        Err(error) => log::warn!(
+                            "Failed to wait for terminal attachment to {} ({:?}): {}",
+                            terminal_name,
+                            attach_kind,
+                            error
+                        ),
                     });
                 }
                 Err(e) => {
-                    log::error!("Daemon: spawn login failed: {}", e);
+                    log::error!("Daemon: spawn terminal attachment failed: {}", e);
+                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
                 }
             }
         }
@@ -1902,28 +1961,28 @@ mod tests {
     }
 
     #[test]
-    fn fd_request_round_trip_uses_typed_login_parameters() {
+    fn fd_request_round_trip_uses_typed_terminal_parameters() {
         let request = FdRequest {
             auth_token: TEST_TOKEN.to_string(),
-            operation: FdOperation::Login(SpawnLoginParams {
+            operation: FdOperation::Terminal(SpawnTerminalParams {
                 name: MachineName::new("test-machine").unwrap(),
                 size: TerminalSize::new(120, 40).unwrap(),
             }),
         };
 
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["method"], "spawn_login");
+        assert_eq!(json["method"], "spawn_terminal");
         assert_eq!(json["params"]["name"], "test-machine");
         assert_eq!(json["params"]["size"]["cols"], 120);
         assert_eq!(json["params"]["size"]["rows"], 40);
 
         let parsed: FdRequest = serde_json::from_value(json).unwrap();
         match parsed.operation {
-            FdOperation::Login(params) => {
+            FdOperation::Terminal(params) => {
                 assert_eq!(params.name.as_str(), "test-machine");
                 assert_eq!(params.size, TerminalSize::new(120, 40).unwrap());
             }
-            _ => panic!("expected spawn_login"),
+            _ => panic!("expected spawn_terminal"),
         }
     }
 
@@ -2056,12 +2115,12 @@ mod tests {
         assert!(serde_json::from_str::<FdRequest>(&invalid_name).is_err());
 
         let zero_size = format!(
-            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_login","params":{{"name":"test","size":{{"cols":80,"rows":0}}}}}}"#
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_terminal","params":{{"name":"test","size":{{"cols":80,"rows":0}}}}}}"#
         );
         assert!(serde_json::from_str::<FdRequest>(&zero_size).is_err());
 
         let out_of_range = format!(
-            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_login","params":{{"name":"test","size":{{"cols":65536,"rows":24}}}}}}"#
+            r#"{{"auth_token":"{TEST_TOKEN}","method":"spawn_terminal","params":{{"name":"test","size":{{"cols":65536,"rows":24}}}}}}"#
         );
         assert!(serde_json::from_str::<FdRequest>(&out_of_range).is_err());
 

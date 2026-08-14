@@ -112,6 +112,24 @@ pub fn spawn_terminal(
     TerminalHandle,
     ResizeState,
 )> {
+    let mut command = CommandBuilder::new(cmd_name);
+    command.args(args);
+    spawn_terminal_command(command, cols, rows, app_tx, redraw_gate)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn spawn_terminal_command(
+    command: CommandBuilder,
+    cols: u16,
+    rows: u16,
+    app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    redraw_gate: RedrawGate,
+) -> Result<(
+    Arc<Mutex<crate::term::Parser>>,
+    mpsc::Sender<PtyMessage>,
+    TerminalHandle,
+    ResizeState,
+)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
@@ -120,10 +138,7 @@ pub fn spawn_terminal(
         pixel_height: 0,
     })?;
 
-    let mut cmd = CommandBuilder::new(cmd_name);
-    cmd.args(args);
-
-    let child = pair.slave.spawn_command(cmd)?;
+    let child = pair.slave.spawn_command(command)?;
 
     // Master handles
     let mut reader = pair.master.try_clone_reader()?;

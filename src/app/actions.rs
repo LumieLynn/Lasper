@@ -569,6 +569,7 @@ impl App {
             None => return,
         };
         let name = image.name.clone();
+        let is_mstack = image.image_type == "mstack";
         if let Some(state) = self
             .data
             .entries
@@ -588,6 +589,15 @@ impl App {
             None => return,
         };
         self.begin_image_start_transition(&name);
+        if is_mstack {
+            self.set_status(
+                format!(
+                    "{} is an OCI application and may not be bootable; systemd will still try to start it.",
+                    name
+                ),
+                crate::ui::StatusLevel::Warn,
+            );
+        }
         let pm = self.permissions.clone();
         tokio::spawn(async move {
             let audit = match pm.request_elevation(format!("Start {}", name)).await {
@@ -755,13 +765,18 @@ impl App {
             .spawn(&entry, rows, &self.ui.app_tx, &self.data.exec_ctx)
             .await
         {
-            Ok(_idx) => {
+            Ok(session) => {
                 self.set_focus_idx(3);
                 self.refresh_detail().await;
-                self.set_status(
-                    format!("Logged into {}", entry.name),
-                    crate::ui::StatusLevel::Info,
-                );
+                let message = match session.attach_kind {
+                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Login => {
+                        format!("Logged into {}", entry.name)
+                    }
+                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Namespace => {
+                        format!("Attached to {} through its namespaces", entry.name)
+                    }
+                };
+                self.set_status(message, crate::ui::StatusLevel::Info);
             }
             Err(msg) => {
                 self.set_status(msg, crate::ui::StatusLevel::Error);

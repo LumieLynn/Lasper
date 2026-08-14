@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, MachineName, OciReference};
+use crate::nspawn::models::{ContainerConfig, MachineName, OciNetworkMode, OciReference};
 use crate::nspawn::ops::provision::oci_operation::{ensure_pull_oci_available, OciPullRequest};
 use crate::nspawn::ops::provision::{
     send_deploy_log, send_deploy_stream_log, DeployLogEvent, Deployer, DeploymentReceipt,
@@ -14,7 +14,9 @@ use crate::nspawn::ops::provision::{
 pub struct OciDeployer {
     pub reference: String,
     pub read_only: bool,
+    pub network: OciNetworkMode,
     pub oci_pull: OciPullStore,
+    pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
 }
 
 #[async_trait]
@@ -35,6 +37,7 @@ impl Deployer for OciDeployer {
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     ) -> Result<DeploymentReceipt> {
         ensure_pull_oci_available()?;
+        self.nspawn.prepare_oci_promotion(name).await?;
         let request = OciPullRequest {
             reference: OciReference::new(self.reference.trim())
                 .map_err(|error| NspawnError::Validation(error.to_string()))?,
@@ -73,6 +76,29 @@ impl Deployer for OciDeployer {
 
         send_deploy_log(
             &logs,
+            format!(
+                "Preserving OCI runtime configuration with PrivateUsers=no and network={}",
+                self.network.as_str()
+            ),
+        )
+        .await;
+        log::warn!(
+            "[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled for system-scoped OCI application.",
+            name
+        );
+        send_deploy_log(
+            &logs,
+            "WARNING: PrivateUsers=no disables user namespace isolation for this OCI application.",
+        )
+        .await;
+        if let Err(error) = self.nspawn.promote_oci(name, self.network).await {
+            return Err(NspawnError::Runtime(format!(
+                "Failed to configure OCI application after import: {error}. The new systemd image was retained because removing it could also remove administrator-owned .nspawn settings; inspect and clean it up manually."
+            )));
+        }
+
+        send_deploy_log(
+            &logs,
             format!("OCI application installed as /var/lib/machines/{name}.mstack"),
         )
         .await;
@@ -87,11 +113,13 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn oci_deployer_leaves_storage_and_runtime_configuration_to_systemd() {
+    fn oci_deployer_uses_external_storage_and_skips_rootfs_post_config() {
         let deployer = OciDeployer {
             reference: "docker.io/library/nginx:latest".into(),
             read_only: false,
+            network: OciNetworkMode::Host,
             oci_pull: OciPullStore::new(Arc::new(DefaultCommandRunner), None),
+            nspawn: crate::nspawn::adapters::config::NspawnConfigStore::new(None),
         };
 
         assert!(deployer.is_external_storage_managed());

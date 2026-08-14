@@ -233,6 +233,7 @@ async fn run_deploy_internal(
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
 ) -> Result<()> {
+    crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
     let system_operations = exec_ctx.system_operations.clone();
 
     macro_rules! push_log {
@@ -421,7 +422,7 @@ async fn run_deploy_internal(
             }
         }
 
-        if cfg.private_users.as_deref() == Some("no") {
+        if cfg.private_users == Some(crate::nspawn::models::PrivateUsersMode::No) {
             log::warn!("[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled.", name);
             push_log!("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
         }
@@ -499,14 +500,12 @@ async fn run_deploy_internal(
         push_log!(format!("Deployment failed: {}", e));
         push_log!("Rolling back broken container...".to_string());
 
-        // Clean up host-side configurations to prevent "ghost configs"
-        let _ = exec_ctx.nspawn.remove(&name).await;
-        let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
-
         match storage_rollback(is_ext, receipt) {
             StorageRollback::ExternalOwned => {
                 // Cleanup only systemd-managed storage that this deployment
                 // successfully created and explicitly acknowledged.
+                let _ = exec_ctx.nspawn.remove(&name).await;
+                let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
                 let _ = exec_ctx.system_operations.remove_image(&name).await;
             }
             StorageRollback::ExternalUnknown => {
@@ -518,7 +517,10 @@ async fn run_deploy_internal(
                 );
             }
             StorageRollback::Local => {
-                // Cleanup Lasper-managed storage
+                // Local storage was created by this deployment, so its
+                // generated host configuration is owned by the same attempt.
+                let _ = exec_ctx.nspawn.remove(&name).await;
+                let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
                 let _ = storage.delete(&name).await;
             }
         }

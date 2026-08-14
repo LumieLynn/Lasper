@@ -2,17 +2,23 @@ use crate::nspawn::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_path, NspawnConfig,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, ImageName, MachineName, NspawnConfigSpec};
+use crate::nspawn::models::{
+    ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
+};
 use crate::nspawn::platform::nvidia::NvidiaState;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_NSPAWN_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_BINDS: usize = 16384;
+const LASPER_OCI_CONFIG_MARKER: &str =
+    "# Managed by Lasper: promoted systemd OCI runtime configuration";
 
 /// Typed read/write access to `.nspawn` configuration files.
 #[derive(Clone)]
@@ -69,6 +75,25 @@ impl NspawnConfigStore {
         Ok(())
     }
 
+    pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<()> {
+        self.execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
+            machine: parse_machine_name(name)?,
+            network,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn prepare_oci_promotion(&self, name: &str) -> Result<()> {
+        self.execute(NspawnConfigOperation::PrepareOciPromotion(
+            PrepareOciPromotion {
+                machine: parse_machine_name(name)?,
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
     pub async fn update_gpu(
         &self,
         name: &str,
@@ -118,6 +143,8 @@ pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
     Write(WriteNspawnConfig),
+    PrepareOciPromotion(PrepareOciPromotion),
+    PromoteOci(PromoteOciConfig),
     Clone(CloneNspawnConfig),
     UpdateGpu(UpdateNspawnGpu),
     Remove(RemoveNspawnConfig),
@@ -141,6 +168,19 @@ pub(crate) struct WriteNspawnConfig {
     spec: NspawnConfigSpec,
     xdg_runtime: Option<String>,
     nvidia_state: Option<NvidiaState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromoteOciConfig {
+    machine: MachineName,
+    network: OciNetworkMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrepareOciPromotion {
+    machine: MachineName,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -207,6 +247,26 @@ pub(crate) async fn execute_nspawn_config_operation(
                 request.xdg_runtime.as_deref(),
                 request.nvidia_state.as_ref(),
                 invoking_uid,
+            )
+            .await?;
+            Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::PromoteOci(request) => {
+            promote_oci_config(
+                &request.machine,
+                request.network,
+                &crate::paths::machines_dir(),
+                Path::new("/etc/systemd/nspawn"),
+                Path::new("/run/systemd/nspawn"),
+            )
+            .await?;
+            Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::PrepareOciPromotion(request) => {
+            validate_oci_promotion_target(
+                &request.machine,
+                Path::new("/etc/systemd/nspawn"),
+                Path::new("/run/systemd/nspawn"),
             )
             .await?;
             Ok(NspawnConfigResult::default())
@@ -327,6 +387,267 @@ async fn remove_config_at(path: &Path) -> Result<()> {
 
 async fn write_content(path: &Path, content: String) -> Result<()> {
     AsyncLockedWriter::write_locked(path, move |_| Ok(content)).await
+}
+
+async fn promote_oci_config(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<()> {
+    validate_oci_promotion_target(machine, admin_dir, runtime_dir).await?;
+    let filename = format!("{}.nspawn", machine.as_str());
+    let source = machines_dir.join(&filename);
+    let destination = admin_dir.join(filename);
+    let source_content = read_trusted_oci_config(&source).await?;
+
+    if let Some(existing) = read_optional(&destination).await? {
+        validate_content_size(&existing)?;
+        if existing.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
+            return Err(NspawnError::Validation(format!(
+                "Refusing to replace existing administrator configuration: {}",
+                destination.display()
+            )));
+        }
+    }
+
+    let destination_display = destination.display().to_string();
+    AsyncLockedWriter::write_locked_with_mode(&destination, 0o640, move |existing| {
+        match existing {
+            Some(existing) if existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) => {}
+            Some(_) => {
+                return Err(NspawnError::Validation(format!(
+                    "Refusing to replace existing administrator configuration: {}",
+                    destination_display
+                )))
+            }
+            None => {}
+        }
+        promote_oci_content(&source_content, network)
+    })
+    .await
+}
+
+async fn validate_oci_promotion_target(
+    machine: &MachineName,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<()> {
+    let filename = format!("{}.nspawn", machine.as_str());
+    let admin = admin_dir.join(&filename);
+    if let Some(metadata) = optional_symlink_metadata(&admin).await? {
+        if !metadata.file_type().is_file() {
+            return Err(NspawnError::Validation(format!(
+                "Refusing to replace non-regular administrator configuration: {}",
+                admin.display()
+            )));
+        }
+        let existing = tokio::fs::read_to_string(&admin)
+            .await
+            .map_err(|error| NspawnError::Io(admin.clone(), error))?;
+        validate_content_size(&existing)?;
+        if existing.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
+            return Err(NspawnError::Validation(format!(
+                "Refusing to replace existing administrator configuration: {}",
+                admin.display()
+            )));
+        }
+    }
+
+    let runtime = runtime_dir.join(filename);
+    if optional_symlink_metadata(&runtime).await?.is_some() {
+        return Err(NspawnError::Validation(format!(
+            "Refusing to mask existing runtime configuration: {}",
+            runtime.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn optional_symlink_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn read_trusted_oci_config(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_trusted_oci_config_blocking(&path))
+        .await
+        .map_err(|error| NspawnError::Runtime(format!("OCI config reader failed: {error}")))?
+}
+
+fn read_trusted_oci_config_blocking(path: &Path) -> Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                NspawnError::Validation(format!(
+                    "OCI runtime configuration is not a regular file: {}",
+                    path.display()
+                ))
+            } else {
+                NspawnError::Io(path.to_path_buf(), error)
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    if !metadata.file_type().is_file() {
+        return Err(NspawnError::Validation(format!(
+            "OCI runtime configuration is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != uzers::get_current_uid() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(NspawnError::Validation(format!(
+            "OCI runtime configuration is not owned exclusively by the privileged executor: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_NSPAWN_CONTENT_BYTES as u64 {
+        return Err(NspawnError::Validation(format!(
+            ".nspawn content exceeds {} bytes",
+            MAX_NSPAWN_CONTENT_BYTES
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_NSPAWN_CONTENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    if bytes.len() > MAX_NSPAWN_CONTENT_BYTES {
+        return Err(NspawnError::Validation(format!(
+            ".nspawn content exceeds {} bytes",
+            MAX_NSPAWN_CONTENT_BYTES
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        NspawnError::Validation(format!(
+            "OCI runtime configuration is not valid UTF-8: {error}"
+        ))
+    })
+}
+
+fn promote_oci_content(content: &str, network: OciNetworkMode) -> Result<String> {
+    let had_trailing_newline = content.ends_with('\n');
+    let mut result = Vec::new();
+    let mut in_exec = false;
+    let mut in_network = false;
+    let mut found_exec = false;
+    let mut found_network = false;
+
+    if content.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
+        result.push(LASPER_OCI_CONFIG_MARKER.to_string());
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_network {
+                append_oci_network_policy(&mut result, network);
+            }
+            in_exec = trimmed == "[Exec]";
+            in_network = trimmed == "[Network]";
+            if in_exec {
+                found_exec = true;
+            }
+            if in_network {
+                found_network = true;
+            }
+            result.push(line.to_string());
+            if in_exec {
+                result.push("PrivateUsers=no".to_string());
+                result.push(format!("ResolvConf={}", oci_resolv_conf(network)));
+            }
+            continue;
+        }
+
+        let is_private_users = in_exec
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "PrivateUsers");
+        let is_resolv_conf = in_exec
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "ResolvConf");
+        let is_managed_network_key = in_network
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| oci_managed_network_key(key.trim()));
+        if !is_private_users && !is_resolv_conf && !is_managed_network_key {
+            result.push(line.to_string());
+        }
+    }
+
+    if !found_exec {
+        return Err(NspawnError::Validation(
+            "OCI runtime configuration has no [Exec] section".into(),
+        ));
+    }
+
+    if in_network {
+        append_oci_network_policy(&mut result, network);
+    }
+    if !found_network {
+        if result.last().is_some_and(|line| !line.is_empty()) {
+            result.push(String::new());
+        }
+        result.push("[Network]".to_string());
+        append_oci_network_policy(&mut result, network);
+    }
+
+    let mut promoted = result.join("\n");
+    if had_trailing_newline {
+        promoted.push('\n');
+    }
+    validate_content_size(&promoted)?;
+    Ok(promoted)
+}
+
+fn oci_resolv_conf(network: OciNetworkMode) -> &'static str {
+    match network {
+        OciNetworkMode::Host => "bind-host",
+        OciNetworkMode::Isolated | OciNetworkMode::Veth => "off",
+    }
+}
+
+fn append_oci_network_policy(result: &mut Vec<String>, network: OciNetworkMode) {
+    match network {
+        OciNetworkMode::Host => {
+            result.push("Private=no".to_string());
+            result.push("VirtualEthernet=no".to_string());
+        }
+        OciNetworkMode::Isolated => {
+            result.push("Private=yes".to_string());
+            result.push("VirtualEthernet=no".to_string());
+        }
+        OciNetworkMode::Veth => {
+            result.push("Private=yes".to_string());
+            result.push("VirtualEthernet=yes".to_string());
+        }
+    }
+}
+
+fn oci_managed_network_key(key: &str) -> bool {
+    matches!(
+        key,
+        "Private"
+            | "VirtualEthernet"
+            | "VirtualEthernetExtra"
+            | "Interface"
+            | "MACVLAN"
+            | "IPVLAN"
+            | "Bridge"
+            | "Zone"
+            | "NamespacePath"
+            | "Port"
+    )
 }
 
 async fn write_generated_at(
@@ -551,6 +872,322 @@ mod tests {
         assert!(!json.contains("root_password"));
     }
 
+    #[test]
+    fn oci_promotion_operation_accepts_only_supported_network_modes() {
+        let host = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "host"}
+        }"#;
+        let isolated = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "isolated"}
+        }"#;
+        let veth = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "veth"}
+        }"#;
+        let caller_selected_userns = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "host", "private_users": "managed"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(host).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(isolated).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(veth).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(caller_selected_userns).is_err());
+    }
+
+    #[test]
+    fn oci_content_promotion_preserves_runtime_fields_and_unknown_content() {
+        let source = "# Generated from OCI configuration object\n\
+[Exec]\n\
+Boot=no\n\
+KillSignal=TERM\n\
+User=1000\n\
+WorkingDirectory=/srv/app\n\
+Environment=ONE=1\n\
+Environment=TWO=two words\n\
+Parameters=/usr/bin/example --serve\n\
+PrivateUsers=pick\n\
+\n\
+[Vendor]\n\
+Unknown=preserve-me\n";
+
+        let promoted = promote_oci_content(source, OciNetworkMode::Host).unwrap();
+
+        assert!(promoted.starts_with(&format!("{LASPER_OCI_CONFIG_MARKER}\n")));
+        assert_eq!(promoted.matches("PrivateUsers=no").count(), 1);
+        assert_eq!(promoted.matches("ResolvConf=bind-host").count(), 1);
+        assert!(!promoted.contains("PrivateUsers=pick"));
+        assert!(promoted.contains("[Network]"));
+        assert!(promoted.contains("Private=no"));
+        assert!(promoted.contains("VirtualEthernet=no"));
+        for preserved in [
+            "# Generated from OCI configuration object",
+            "Boot=no",
+            "KillSignal=TERM",
+            "User=1000",
+            "WorkingDirectory=/srv/app",
+            "Environment=ONE=1",
+            "Environment=TWO=two words",
+            "Parameters=/usr/bin/example --serve",
+            "[Vendor]",
+            "Unknown=preserve-me",
+        ] {
+            assert!(promoted.contains(preserved), "missing {preserved:?}");
+        }
+        assert!(promoted.ends_with('\n'));
+    }
+
+    #[test]
+    fn oci_content_promotion_rejects_missing_exec_section() {
+        let error = promote_oci_content(
+            "# Generated from OCI configuration object\n[Network]\nVirtualEthernet=no\n",
+            OciNetworkMode::Host,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("no [Exec] section")
+        ));
+    }
+
+    #[test]
+    fn oci_content_promotion_maps_network_modes_to_systemd_settings() {
+        let source = "[Exec]\nBoot=no\n\n[Network]\nBridge=br0\nPrivate=no\n";
+        for (mode, resolv_conf, private, veth) in [
+            (OciNetworkMode::Host, "bind-host", "no", "no"),
+            (OciNetworkMode::Isolated, "off", "yes", "no"),
+            (OciNetworkMode::Veth, "off", "yes", "yes"),
+        ] {
+            let promoted = promote_oci_content(source, mode).unwrap();
+            let parsed = ini::Ini::load_from_str(&promoted).unwrap();
+            assert_eq!(parsed.get_from(Some("Exec"), "PrivateUsers"), Some("no"));
+            assert_eq!(
+                parsed.get_from(Some("Exec"), "ResolvConf"),
+                Some(resolv_conf)
+            );
+            assert_eq!(parsed.get_from(Some("Network"), "Private"), Some(private));
+            assert_eq!(
+                parsed.get_from(Some("Network"), "VirtualEthernet"),
+                Some(veth)
+            );
+            assert_eq!(parsed.get_from(Some("Network"), "Bridge"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_writes_trusted_copy_and_refreshes_owned_copy() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(
+            &source,
+            "[Exec]\nBoot=no\nEnvironment=VERSION=one\nParameters=/bin/app\n",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        let first = tokio::fs::read_to_string(&destination).await.unwrap();
+        assert!(first.contains("PrivateUsers=no"));
+        assert!(first.contains("ResolvConf=bind-host"));
+        assert!(first.contains("Private=no"));
+        assert!(first.contains("VirtualEthernet=no"));
+        assert!(first.contains("Environment=VERSION=one"));
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert!(crate::nspawn::sys::io::lock_path_for(&destination).exists());
+
+        tokio::fs::write(
+            &source,
+            "[Exec]\nBoot=no\nEnvironment=VERSION=two\nParameters=/bin/app\n",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        promote_oci_config(
+            &machine,
+            OciNetworkMode::Veth,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        let second = tokio::fs::read_to_string(&destination).await.unwrap();
+        assert!(second.contains("PrivateUsers=no"));
+        assert!(second.contains("ResolvConf=off"));
+        assert!(second.contains("Private=yes"));
+        assert!(second.contains("VirtualEthernet=yes"));
+        assert!(second.contains("Environment=VERSION=two"));
+        assert!(!second.contains("VERSION=one"));
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_refuses_existing_administrator_config() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        tokio::fs::write(&destination, "[Exec]\nPrivateUsers=no\n")
+            .await
+            .unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("Refusing to replace existing administrator configuration")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&destination).await.unwrap(),
+            "[Exec]\nPrivateUsers=no\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_does_not_accept_marker_outside_first_line() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let existing = format!("# administrator file\n{LASPER_OCI_CONFIG_MARKER}\n[Exec]\n");
+        tokio::fs::write(&destination, &existing).await.unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, NspawnError::Validation(_)));
+        assert_eq!(
+            tokio::fs::read_to_string(&destination).await.unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_rejects_symlink_source() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let target = machines.path().join("target.nspawn");
+        let source = machines.path().join("web-app.nspawn");
+        tokio::fs::write(&target, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("not a regular file")
+        ));
+        assert!(!admin.path().join("web-app.nspawn").exists());
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_rejects_group_writable_source() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("not owned exclusively by the privileged executor")
+        ));
+        assert!(!admin.path().join("web-app.nspawn").exists());
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_preflight_rejects_runtime_config() {
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let machine = MachineName::new("web-app").unwrap();
+        let runtime_config = runtime.path().join("web-app.nspawn");
+        tokio::fs::write(&runtime_config, "[Exec]\nPrivateUsers=no\n")
+            .await
+            .unwrap();
+
+        let error = validate_oci_promotion_target(&machine, admin.path(), runtime.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("existing runtime configuration")
+        ));
+    }
+
     #[tokio::test]
     async fn generated_write_is_typed_atomic_and_uses_persistent_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -647,7 +1284,7 @@ mod tests {
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
         let config = ContainerConfig {
             name: "test".into(),
-            private_users: Some("yes".into()),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Yes),
             bind_mounts: vec![crate::nspawn::models::BindMount {
                 source: symlink.to_string_lossy().into_owned(),
                 target: "/srv/data".into(),

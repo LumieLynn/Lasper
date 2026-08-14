@@ -1,5 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{BindMount, ContainerConfig, MachineName, NetworkMode, PortForward};
+use crate::nspawn::models::{
+    BindMount, ContainerConfig, MachineName, NetworkMode, PortForward, PrivateUsersMode,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -39,6 +41,14 @@ impl NspawnConfigSpec {
                 "Resolver policy {:?} does not match network mode {:?}",
                 self.resolv_conf, self.network
             )));
+        }
+
+        if self.private_users == Some(PrivateUsersMode::Managed)
+            && !self.network.as_ref().is_some_and(NetworkMode::is_private)
+        {
+            return Err(NspawnError::Validation(
+                "PrivateUsers=managed requires an explicit private network mode".into(),
+            ));
         }
 
         if self.port_forwards.len() > MAX_CONFIG_ITEMS
@@ -95,18 +105,6 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
 
     fn try_from(config: &ContainerConfig) -> Result<Self> {
         let resolv_conf = ResolvConfMode::for_network(config.network.as_ref());
-        let private_users = match config.private_users.as_deref() {
-            None => None,
-            Some("yes") => Some(PrivateUsersMode::Yes),
-            Some("no") => Some(PrivateUsersMode::No),
-            Some("pick") => Some(PrivateUsersMode::Pick),
-            Some(value) => {
-                return Err(NspawnError::Validation(format!(
-                    "Invalid PrivateUsers mode: {value:?}"
-                )));
-            }
-        };
-
         let spec = Self {
             machine: MachineName::new(config.name.clone())
                 .map_err(|error| NspawnError::Validation(error.to_string()))?,
@@ -122,7 +120,7 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
             device_binds: config.device_binds.clone(),
             readonly_binds: config.readonly_binds.clone(),
             privileged: config.privileged,
-            private_users,
+            private_users: config.private_users,
             graphics_acceleration: config.graphics_acceleration,
             wayland_socket: config.wayland_socket.clone(),
             nvidia_gpu: config.nvidia_gpu,
@@ -153,24 +151,6 @@ impl ResolvConfMode {
         match self {
             Self::Off => "off",
             Self::BindHost => "bind-host",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PrivateUsersMode {
-    Yes,
-    No,
-    Pick,
-}
-
-impl PrivateUsersMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Yes => "yes",
-            Self::No => "no",
-            Self::Pick => "pick",
         }
     }
 }
@@ -326,5 +306,39 @@ mod tests {
 
         private_spec.resolv_conf = Some(ResolvConfMode::BindHost);
         assert!(private_spec.validate().is_err());
+    }
+
+    #[test]
+    fn managed_private_users_requires_systemd_private_networking() {
+        for network in [None, Some(NetworkMode::Host)] {
+            let config = ContainerConfig {
+                name: "managed-host".into(),
+                network,
+                private_users: Some(PrivateUsersMode::Managed),
+                ..Default::default()
+            };
+            assert!(matches!(
+                NspawnConfigSpec::try_from(&config),
+                Err(NspawnError::Validation(message))
+                    if message.contains("requires an explicit private network mode")
+            ));
+        }
+
+        for network in [
+            NetworkMode::None,
+            NetworkMode::Veth,
+            NetworkMode::Bridge("br0".into()),
+            NetworkMode::MacVlan("eth0".into()),
+            NetworkMode::IpVlan("eth0".into()),
+            NetworkMode::Interface("eth1".into()),
+        ] {
+            let config = ContainerConfig {
+                name: "managed-private".into(),
+                network: Some(network),
+                private_users: Some(PrivateUsersMode::Managed),
+                ..Default::default()
+            };
+            NspawnConfigSpec::try_from(&config).unwrap();
+        }
     }
 }

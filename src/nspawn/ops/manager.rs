@@ -322,32 +322,20 @@ impl DefaultManager {
                 format!("-u {unit} --since @{started_epoch}"),
             )
         };
-        let journal_command =
-            format!("journalctl {selector_display} --priority=warning --no-pager");
+        let journal_command = format!("journalctl {selector_display} --no-pager");
 
-        let mut priority_args = selector.clone();
-        priority_args.extend([
-            "--priority=warning".into(),
+        // nspawn emits some fatal setup diagnostics below warning priority. A
+        // priority filter can therefore retain an unrelated warning while
+        // hiding the line that explains why the process exited.
+        let mut journal_args = selector;
+        journal_args.extend([
             "-n".into(),
-            "20".into(),
+            "40".into(),
             "--no-pager".into(),
             "--quiet".into(),
             "--output=short".into(),
         ]);
-        let journal = self.read_journal(priority_args).await;
-        let journal = if journal.is_some() {
-            journal
-        } else {
-            let mut fallback_args = selector;
-            fallback_args.extend([
-                "-n".into(),
-                "8".into(),
-                "--no-pager".into(),
-                "--quiet".into(),
-                "--output=short".into(),
-            ]);
-            self.read_journal(fallback_args).await
-        };
+        let journal = self.read_journal(journal_args).await;
 
         if let Some(journal) = journal {
             log::error!(

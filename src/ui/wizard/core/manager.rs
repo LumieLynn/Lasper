@@ -210,6 +210,15 @@ impl Wizard {
             AppMessage::Wizard(ref wiz_msg) => match wiz_msg {
                 WizardMessage::Close => StepAction::Close,
                 WizardMessage::Submit => {
+                    if let Some(error) = source_permission_error(
+                        &self.context.source.kind,
+                        self.context.permission_level,
+                    ) {
+                        return StepAction::Status(
+                            format!("Validation Error: {error}"),
+                            crate::ui::StatusLevel::Error,
+                        );
+                    }
                     if self.context.source.kind == SourceKind::Copy {
                         let source_cfg = self.context.source.clone_source.clone();
                         if !self.context.entries.iter().any(|e| e.name == source_cfg) {
@@ -508,5 +517,38 @@ impl Wizard {
             self.step = prev_step;
             self.active_view = None;
         }
+    }
+}
+
+fn source_permission_error(
+    source: &SourceKind,
+    permission: crate::nspawn::ops::PermissionLevel,
+) -> Option<&'static str> {
+    if matches!(source, SourceKind::Oci) && !permission.is_elevated() {
+        Some(
+            "OCI imports require root or lasper -e so the generated runtime configuration can be preserved under /etc/systemd/nspawn",
+        )
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_permission_error;
+    use crate::nspawn::ops::PermissionLevel;
+    use crate::ui::wizard::core::context::SourceKind;
+
+    #[test]
+    fn oci_submission_requires_root_or_elevated_daemon() {
+        assert!(source_permission_error(&SourceKind::Oci, PermissionLevel::User).is_some());
+        assert!(source_permission_error(&SourceKind::Oci, PermissionLevel::Elevated).is_none());
+        assert!(source_permission_error(&SourceKind::Oci, PermissionLevel::Root).is_none());
+    }
+
+    #[test]
+    fn regular_sources_keep_existing_permission_policy() {
+        assert!(source_permission_error(&SourceKind::Pacstrap, PermissionLevel::User).is_none());
+        assert!(source_permission_error(&SourceKind::Copy, PermissionLevel::User).is_none());
     }
 }

@@ -640,7 +640,7 @@ mod tests {
     fn test_nspawn_config_content_private_users_explicit_no() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("no".into()),
+            private_users: Some(PrivateUsersMode::No),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
@@ -651,7 +651,7 @@ mod tests {
     fn test_nspawn_config_content_private_users_explicit_yes() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("yes".into()),
+            private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
@@ -662,11 +662,34 @@ mod tests {
     fn test_nspawn_config_content_private_users_pick() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("pick".into()),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("PrivateUsers=pick"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_managed() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            network: Some(crate::nspawn::models::NetworkMode::None),
+            private_users: Some(PrivateUsersMode::Managed),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=managed"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_identity() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            private_users: Some(PrivateUsersMode::Identity),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=identity"));
     }
 
     #[test]
