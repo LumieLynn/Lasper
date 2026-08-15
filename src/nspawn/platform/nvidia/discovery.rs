@@ -31,18 +31,11 @@ pub async fn get_host_driver_version() -> Result<String> {
 /// Refresh NVIDIA hardware from one current CDI snapshot.
 pub async fn discover_hardware() -> Result<(Vec<String>, NvidiaState)> {
     let driver_version = get_host_driver_version().await.unwrap_or_default();
-    let Some(spec) = generate_cdi_spec("all").await? else {
-        return Ok((
-            vec!["all".to_string()],
-            NvidiaState {
-                driver_version,
-                ..Default::default()
-            },
-        ));
-    };
+    let spec = generate_cdi_spec("all").await?;
 
     let devices = devices_from_spec(&spec);
     let state = build_nvidia_state(&spec, driver_version, None).await?;
+    validate_authoritative_state(&state, "all")?;
     Ok((devices, state))
 }
 
@@ -53,7 +46,7 @@ pub(crate) fn dedup(mut v: Vec<String>) -> Vec<String> {
 }
 
 fn devices_from_spec(spec: &CdiSpec) -> Vec<String> {
-    let mut devices = spec
+    let devices = spec
         .devices
         .as_deref()
         .unwrap_or_default()
@@ -61,7 +54,6 @@ fn devices_from_spec(spec: &CdiSpec) -> Vec<String> {
         .map(|device| device.name.clone())
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
-    devices.push("all".to_string());
     let mut devices = dedup(devices);
     if let Some(index) = devices.iter().position(|device| device == "all") {
         let all = devices.remove(index);
@@ -361,7 +353,7 @@ fn extract_classified_entries(binds: &[PassthroughBind]) -> Vec<ClassifiedEntry>
         .collect()
 }
 
-async fn generate_cdi_spec(gpu_device: &str) -> Result<Option<CdiSpec>> {
+async fn generate_cdi_spec(gpu_device: &str) -> Result<CdiSpec> {
     let mut cmd = new_command("nvidia-ctk");
     // Keep CDI hooks in the snapshot: the state builder translates their
     // symlink and ld-cache edits into nspawn bind configuration.
@@ -400,11 +392,15 @@ async fn generate_cdi_spec(gpu_device: &str) -> Result<Option<CdiSpec>> {
     }
 
     if out.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
-        log::warn!("nvidia-ctk generated empty CDI JSON. Assuming no NVIDIA devices are present.");
-        return Ok(None);
+        return Err(NspawnError::Runtime(
+            "nvidia-ctk generated empty CDI JSON; refusing to replace the current NVIDIA state"
+                .into(),
+        ));
     }
 
-    parse_generated_cdi_json(&out.stdout).map(Some)
+    let spec = parse_generated_cdi_json(&out.stdout)?;
+    validate_cdi_selection(&spec, gpu_device)?;
+    Ok(spec)
 }
 
 fn parse_generated_cdi_json(content: &[u8]) -> Result<CdiSpec> {
@@ -421,18 +417,40 @@ fn parse_generated_cdi_json(content: &[u8]) -> Result<CdiSpec> {
     Ok(first)
 }
 
+fn validate_cdi_selection(spec: &CdiSpec, gpu_device: &str) -> Result<()> {
+    let devices = spec.devices.as_deref().unwrap_or_default();
+    if devices.is_empty() {
+        return Err(NspawnError::Runtime(
+            "NVIDIA CDI JSON contains no devices; refusing to replace the current NVIDIA state"
+                .into(),
+        ));
+    }
+    if !devices.iter().any(|device| device.name == gpu_device) {
+        return Err(NspawnError::Runtime(format!(
+            "NVIDIA CDI JSON does not contain requested device {gpu_device:?}; refusing to replace the current NVIDIA state"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_authoritative_state(state: &NvidiaState, gpu_device: &str) -> Result<()> {
+    if state.binds.is_empty() {
+        return Err(NspawnError::Runtime(format!(
+            "NVIDIA CDI device {gpu_device:?} produced no usable bind mounts; refusing to replace the current NVIDIA state"
+        )));
+    }
+    Ok(())
+}
+
 /// Perform a comprehensive scan of the host using the official NVIDIA CDI standard.
 pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Result<NvidiaState> {
     let driver_version = get_host_driver_version().await.unwrap_or_default();
     let gpu_device = profile.map(|p| p.gpu_device.as_str()).unwrap_or("all");
-    let Some(spec) = generate_cdi_spec(gpu_device).await? else {
-        return Ok(NvidiaState {
-            driver_version,
-            ..Default::default()
-        });
-    };
+    let spec = generate_cdi_spec(gpu_device).await?;
 
-    build_nvidia_state(&spec, driver_version, profile).await
+    let state = build_nvidia_state(&spec, driver_version, profile).await?;
+    validate_authoritative_state(&state, gpu_device)?;
+    Ok(state)
 }
 
 async fn build_nvidia_state(
@@ -565,6 +583,49 @@ mod tests {
         .unwrap();
 
         assert_eq!(devices_from_spec(&spec), vec!["all", "0", "gpu-uuid"]);
+    }
+
+    #[test]
+    fn cdi_device_names_do_not_invent_an_all_selector() {
+        let spec: CdiSpec = serde_json::from_str(r#"{"devices":[{"name":"0"}]}"#).unwrap();
+
+        assert_eq!(devices_from_spec(&spec), vec!["0"]);
+    }
+
+    #[test]
+    fn cdi_selection_must_exist_in_the_generated_snapshot() {
+        let spec: CdiSpec = serde_json::from_str(
+            r#"{"devices":[{"name":"all"},{"name":"0"},{"name":"GPU-uuid"}]}"#,
+        )
+        .unwrap();
+        assert!(validate_cdi_selection(&spec, "all").is_ok());
+        assert!(validate_cdi_selection(&spec, "0").is_ok());
+        assert!(validate_cdi_selection(&spec, "GPU-uuid").is_ok());
+
+        let error = validate_cdi_selection(&spec, "missing").unwrap_err();
+        assert!(error.to_string().contains("requested device \"missing\""));
+
+        let empty: CdiSpec = serde_json::from_str(r#"{"devices":[]}"#).unwrap();
+        assert!(validate_cdi_selection(&empty, "all").is_err());
+        let absent: CdiSpec = serde_json::from_str("{}").unwrap();
+        assert!(validate_cdi_selection(&absent, "all").is_err());
+    }
+
+    #[test]
+    fn authoritative_nvidia_state_requires_usable_binds() {
+        let empty = NvidiaState::default();
+        let error = validate_authoritative_state(&empty, "all").unwrap_err();
+        assert!(error.to_string().contains("no usable bind mounts"));
+
+        let state = NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        assert!(validate_authoritative_state(&state, "0").is_ok());
     }
 
     #[test]

@@ -143,7 +143,8 @@ pub async fn ensure_gpu_passthrough(
     let external_cache = state_store.read(name).await?.unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
 
-    // Remapping already happens inside get_nvidia_state
+    // Discovery and snapshot validation are fail-closed. No rootfs, config,
+    // unit, or state mutation may move above this boundary.
     let host_state = get_nvidia_state(Some(&profile)).await?;
 
     log_step!(

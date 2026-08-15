@@ -372,54 +372,47 @@ async fn run_deploy_internal(
         if cfg.nvidia_gpu {
             push_log!("Assembling initial NVIDIA GPU configuration...".to_string());
 
-            // Save profile so lifecycle.rs can reload it on container start
-            if let Some(prof) = &nvidia_profile {
-                let _ = prof.save(&name, &exec_ctx.nvidia_state).await;
-            }
-
             // Run initial CDI discovery to seed the .nspawn config and state.
             // Remapping is applied inside get_nvidia_state after CDI + ldconfig collection.
-            if let Ok(state) = crate::nspawn::platform::nvidia::get_nvidia_state(
+            let state = crate::nspawn::platform::nvidia::get_nvidia_state(
                 nvidia_profile.as_ref(),
             )
             .await
-            {
-                // Persist initial state for lifecycle diffing
-                if let Err(e) = exec_ctx.nvidia_state.write(&name, &state).await {
-                    push_log!(format!("WARNING: Failed to save NVIDIA state: {}", e));
-                }
+            .map_err(|error| {
+                NspawnError::Runtime(format!("NVIDIA CDI discovery failed: {error}"))
+            })?;
 
-                // Write ld.so.conf.d and env vars into rootfs (one-time setup)
-                if supports_offline_commands {
-                    match crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
-                        &actual_rootfs_target,
-                        &state,
-                        &exec_ctx.rootfs,
-                    )
-                    .await
-                    {
-                        Ok(warnings) => {
-                            for warning in warnings {
-                                log::warn!("{}", warning);
-                                push_log!(warning);
-                            }
-                        }
-                        Err(error) => {
-                            push_log!(format!(
-                                "WARNING: Failed to inject NVIDIA env/ldconfig: {}",
-                                error
-                            ));
+            // Persist the validated snapshot and its profile for lifecycle diffing.
+            exec_ctx.nvidia_state.write(&name, &state).await?;
+
+            // Write ld.so.conf.d and env vars into rootfs (one-time setup)
+            if supports_offline_commands {
+                match crate::nspawn::platform::nvidia::lifecycle::inject_env_once(
+                    &actual_rootfs_target,
+                    &state,
+                    &exec_ctx.rootfs,
+                )
+                .await
+                {
+                    Ok(warnings) => {
+                        for warning in warnings {
+                            log::warn!("{}", warning);
+                            push_log!(warning);
                         }
                     }
-                } else if has_os_layout {
-                    push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
-                } else {
-                    push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
+                    Err(error) => {
+                        push_log!(format!(
+                            "WARNING: Failed to inject NVIDIA env/ldconfig: {}",
+                            error
+                        ));
+                    }
                 }
-                initial_nvidia_state = Some(state);
+            } else if has_os_layout {
+                push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
             } else {
-                push_log!("WARNING: NVIDIA CDI discovery failed. GPU passthrough will be retried on container start.".to_string());
+                push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
             }
+            initial_nvidia_state = Some(state);
         }
 
         if cfg.private_users == Some(crate::nspawn::models::PrivateUsersMode::No) {
