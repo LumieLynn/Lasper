@@ -142,13 +142,12 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 .send(AppEvent::BackendResult(BackendResponse::DiscoveryStarted))
                 .await;
 
-            let devices_res = crate::nspawn::platform::nvidia::discovery::list_devices().await;
-            let state_res =
-                crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await;
+            let discovery_res =
+                crate::nspawn::platform::nvidia::discovery::discover_hardware().await;
             let gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
 
-            match (devices_res, state_res) {
-                (Ok(nvidia_devices), Ok(nvidia_state)) => {
+            match discovery_res {
+                Ok((nvidia_devices, nvidia_state)) => {
                     let _ = tx
                         .send(AppEvent::BackendResult(
                             BackendResponse::HardwareDiscovered {
@@ -159,7 +158,7 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                         ))
                         .await;
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Err(e) => {
                     log::error!("Hardware discovery failed: {}", e);
                     let _ = tx
                         .send(AppEvent::BackendResult(BackendResponse::DiscoveryFailed(

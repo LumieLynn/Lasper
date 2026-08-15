@@ -1,6 +1,7 @@
 use crate::ui::core::{Component, EventResult};
 use crate::ui::soft_wrap_text;
 use crate::ui::theme;
+use crate::ui::widgets::selectors::checkbox::Checkbox;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
@@ -12,6 +13,7 @@ use ratatui::{
 pub struct ConfirmationDialog {
     title: String,
     message: String,
+    checkbox: Option<Checkbox>,
 }
 
 impl ConfirmationDialog {
@@ -19,7 +21,19 @@ impl ConfirmationDialog {
         Self {
             title: title.into(),
             message: message.into(),
+            checkbox: None,
         }
+    }
+
+    pub fn with_checkbox(mut self, label: impl Into<String>, checked: bool) -> Self {
+        let mut checkbox = Checkbox::new(label, checked);
+        checkbox.set_focus(true);
+        self.checkbox = Some(checkbox);
+        self
+    }
+
+    pub fn checkbox_checked(&self) -> Option<bool> {
+        self.checkbox.as_ref().map(Checkbox::checked)
     }
 }
 
@@ -29,9 +43,10 @@ impl Component for ConfirmationDialog {
         let width = 60.min(area.width);
         let message_width = usize::from(width.saturating_sub(2)).max(1);
         let message_lines = soft_wrap_text(&self.message, message_width);
+        let has_checkbox = self.checkbox.is_some();
         let height = (message_lines.len() as u16)
-            .saturating_add(4)
-            .max(8)
+            .saturating_add(if has_checkbox { 7 } else { 4 })
+            .max(if has_checkbox { 9 } else { 8 })
             .min(area.height);
 
         let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -50,9 +65,14 @@ impl Component for ConfirmationDialog {
         let inner = block.inner(dialog_area);
         f.render_widget(block, dialog_area);
 
+        let mut constraints = vec![Constraint::Min(1)];
+        if has_checkbox {
+            constraints.push(Constraint::Length(3));
+        }
+        constraints.push(Constraint::Length(2));
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(2)])
+            .constraints(constraints)
             .split(inner);
 
         let message_lines = message_lines
@@ -83,11 +103,17 @@ impl Component for ConfirmationDialog {
         let hint_para = Paragraph::new(hint).alignment(Alignment::Center);
 
         f.render_widget(msg_para, chunks[0]);
-        f.render_widget(hint_para, chunks[1]);
+        if let Some(checkbox) = &mut self.checkbox {
+            checkbox.render(f, chunks[1]);
+        }
+        f.render_widget(hint_para, chunks[chunks.len() - 1]);
     }
 
-    fn handle_key(&mut self, _key: crossterm::event::KeyEvent) -> EventResult {
-        EventResult::Ignored
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> EventResult {
+        self.checkbox
+            .as_mut()
+            .map(|checkbox| checkbox.handle_key(key))
+            .unwrap_or(EventResult::Ignored)
     }
 }
 
@@ -130,5 +156,35 @@ mod tests {
             .join("\n");
         assert!(rendered.contains("This hidden image will be removed"));
         assert!(rendered.contains("management path."));
+    }
+
+    #[test]
+    fn optional_checkbox_is_rendered_and_toggled_with_space() {
+        crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
+        let mut dialog = ConfirmationDialog::new("Delete Image", "Delete 'test'?")
+            .with_checkbox("Remove Lasper NVIDIA state and unit drop-ins", true);
+        assert_eq!(dialog.checkbox_checked(), Some(true));
+
+        let result = dialog.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(result, EventResult::Consumed));
+        assert_eq!(dialog.checkbox_checked(), Some(false));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[ ] Remove Lasper NVIDIA state and unit drop-ins"));
     }
 }

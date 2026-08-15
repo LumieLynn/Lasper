@@ -140,7 +140,11 @@ impl App {
             KeyCode::Char('n') | KeyCode::Esc => {
                 self.ui.delete_dialog = None;
             }
-            _ => {}
+            _ => {
+                if let Some(dialog) = &mut self.ui.delete_dialog {
+                    let _ = dialog.handle_key(key);
+                }
+            }
         }
         true
     }
@@ -488,7 +492,7 @@ impl App {
         }
     }
 
-    fn show_delete_dialog(&mut self) {
+    pub(super) fn show_delete_dialog(&mut self) {
         if self.image_is_focused() {
             let image = match self.selected_image() {
                 Some(image) => image,
@@ -520,12 +524,26 @@ impl App {
             } else {
                 "This image and its local data will be removed."
             };
-            self.ui.delete_dialog = Some(
-                crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
-                    "Delete Image",
-                    format!("Delete '{}' ?\n{}", image.name, detail),
+            let target = match crate::nspawn::models::ImageName::new(image.name.clone()) {
+                Ok(target) => target,
+                Err(error) => {
+                    self.set_status(error.to_string(), crate::ui::StatusLevel::Error);
+                    return;
+                }
+            };
+            let cleanup_supported =
+                !image.is_hidden() && crate::nspawn::models::MachineName::new(&image.name).is_ok();
+            let mut dialog = crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                "Delete Image",
+                format!(
+                    "Delete '{}'?\n{}\nsystemd also attempts to remove all same-name .nspawn settings.",
+                    image.name, detail
                 ),
             );
+            if cleanup_supported {
+                dialog = dialog.with_checkbox("Remove Lasper NVIDIA state and unit drop-ins", true);
+            }
+            self.ui.delete_dialog = Some(super::PendingImageRemoval::new(target, dialog));
             return;
         }
         self.set_status(

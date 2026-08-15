@@ -10,6 +10,7 @@ Lasper is alpha software. It manages host-level systemd resources and may run op
 - Review bind mounts carefully. A writable bind mount can give container root write access to host files.
 - Avoid running untrusted containers with host GPU, display, or broad filesystem mounts.
 - Lasper-created resources should remain compatible with native systemd tools, but some provisioning paths are still experimental.
+- Removing an image through systemd's `RemoveImage` operation also attempts to delete every same-name `.nspawn` settings file in the applicable systemd search paths, including `/etc/systemd/nspawn/`, regardless of who created it. Lasper's confirmation states this separately from its optional cleanup of NVIDIA state and known unit drop-ins.
 
 ## Elevated Daemon
 

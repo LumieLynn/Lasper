@@ -11,7 +11,6 @@ pub(crate) struct CdiSpec {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiDevice {
-    #[allow(dead_code)]
     pub(crate) name: String,
     pub(crate) container_edits: Option<CdiEdits>,
 }

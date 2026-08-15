@@ -540,7 +540,7 @@ impl App {
     }
 
     pub fn action_remove(&mut self) {
-        if self.image_is_focused() {
+        if self.ui.delete_dialog.is_some() || self.image_is_focused() {
             self.action_remove_image();
             return;
         }
@@ -630,15 +630,43 @@ impl App {
     }
 
     fn action_remove_image(&mut self) {
-        self.ui.delete_dialog = None;
         if !self.check_action_cooldown() {
             return;
         }
-        let image = match self.selected_image() {
-            Some(image) => image,
+        let pending = match self.ui.delete_dialog.take() {
+            Some(pending) => pending,
             None => return,
         };
-        let name = image.name.clone();
+        let name = pending.target().as_str().to_string();
+        let cleanup_artifacts = pending.cleanup_artifacts();
+        let image_still_exists = self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .any(|image| image.name == name);
+        if !image_still_exists {
+            self.set_status(
+                format!(
+                    "Image {} changed before confirmation; refresh and try again.",
+                    name
+                ),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
+        if self
+            .data
+            .entries
+            .iter()
+            .any(|machine| machine.name == name && machine.state.is_running())
+        {
+            self.set_status(
+                format!("Stop machine '{}' before deleting its image.", name),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
         let manager = self.data.manager.clone();
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
@@ -660,14 +688,33 @@ impl App {
             };
             let result = audit.run(manager.remove(&name)).await;
             let event = match result {
-                Ok(()) => crate::events::AppEvent::ActionDone(
-                    format!("Removed image {}", name),
-                    crate::ui::StatusLevel::Success,
-                ),
                 Err(error) => crate::events::AppEvent::ActionDone(
                     format!("Remove failed: {}", error),
                     crate::ui::StatusLevel::Error,
                 ),
+                Ok(()) if !cleanup_artifacts => crate::events::AppEvent::ActionDone(
+                    format!("Removed image {}", name),
+                    crate::ui::StatusLevel::Success,
+                ),
+                Ok(()) => {
+                    let cleanup_result = match pm
+                        .request_elevation(format!("Clean Lasper artifacts for {}", name))
+                        .await
+                    {
+                        Ok(audit) => audit.run(manager.cleanup_image_artifacts(&name)).await,
+                        Err(error) => Err(error),
+                    };
+                    match cleanup_result {
+                        Ok(()) => crate::events::AppEvent::ActionDone(
+                            format!("Removed image {} and Lasper artifacts", name),
+                            crate::ui::StatusLevel::Success,
+                        ),
+                        Err(error) => crate::events::AppEvent::ActionDone(
+                            format!("Removed image {}; cleanup warning: {}", name, error),
+                            crate::ui::StatusLevel::Warn,
+                        ),
+                    }
+                }
             };
             let _ = tx.send(event).await;
         });

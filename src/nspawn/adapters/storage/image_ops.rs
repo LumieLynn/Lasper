@@ -5,6 +5,7 @@ use crate::nspawn::sys::{log_output, CommandRunner};
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -57,6 +58,17 @@ struct SfdiskPartition {
     node: String,
     #[serde(rename = "type", default)]
     type_id: String,
+}
+
+#[derive(Deserialize)]
+struct LosetupJson {
+    #[serde(default)]
+    loopdevices: Vec<LosetupDevice>,
+}
+
+#[derive(Deserialize)]
+struct LosetupDevice {
+    name: String,
 }
 
 pub(crate) async fn create_raw_image(
@@ -266,9 +278,9 @@ pub(crate) async fn unmount_image(
     let mount_exists = validate_optional_mount_point(&mount_point).await?;
     let mut unmount_error = None;
 
-    if mount_exists {
+    if mount_exists && is_mount_point(&mount_point).await? {
         let mount_string = mount_point.to_string_lossy().to_string();
-        let needs_fallback = match runner
+        let mut unmount_attempt_error = match runner
             .run(
                 "systemd-dissect",
                 vec!["--umount".into(), mount_string.clone()],
@@ -277,29 +289,45 @@ pub(crate) async fn unmount_image(
         {
             Ok(dissect) => {
                 log_output("systemd-dissect --umount", &dissect);
-                !dissect.status.success() && !command_reports_not_mounted(&dissect)
+                (!dissect.status.success()).then(|| {
+                    NspawnError::cmd_failed(
+                        "unmount managed image",
+                        format!("systemd-dissect --umount {}", mount_point.display()),
+                        &dissect,
+                    )
+                })
             }
             Err(error) => {
                 log::warn!("systemd-dissect --umount unavailable: {}", error);
-                true
+                Some(NspawnError::Io(PathBuf::from("systemd-dissect"), error))
             }
         };
-        if needs_fallback {
+
+        if is_mount_point(&mount_point).await? {
             match runner.run("umount", vec![mount_string]).await {
                 Ok(fallback) => {
                     log_output("umount", &fallback);
-                    if !fallback.status.success() && !command_reports_not_mounted(&fallback) {
-                        unmount_error = Some(NspawnError::cmd_failed(
+                    unmount_attempt_error = (!fallback.status.success()).then(|| {
+                        NspawnError::cmd_failed(
                             "unmount managed image",
                             format!("umount {}", mount_point.display()),
                             &fallback,
-                        ));
-                    }
+                        )
+                    });
                 }
                 Err(error) => {
-                    unmount_error = Some(NspawnError::Io(PathBuf::from("umount"), error));
+                    unmount_attempt_error = Some(NspawnError::Io(PathBuf::from("umount"), error));
                 }
             }
+        }
+
+        if is_mount_point(&mount_point).await? {
+            unmount_error = Some(unmount_attempt_error.unwrap_or_else(|| {
+                NspawnError::Runtime(format!(
+                    "Mount point remains mounted after unmount: {}",
+                    mount_point.display()
+                ))
+            }));
         }
     }
 
@@ -962,23 +990,36 @@ async fn detach_image_loops(image: &Path, runner: &dyn CommandRunner) -> Result<
     let output = runner
         .run(
             "losetup",
-            vec!["-j".into(), image.to_string_lossy().to_string()],
+            vec![
+                "--json".into(),
+                "--list".into(),
+                "--associated".into(),
+                image.to_string_lossy().to_string(),
+                "--output".into(),
+                "NAME".into(),
+            ],
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("losetup"), error))?;
-    log_output("losetup -j", &output);
+    log_output("losetup --json --list --associated", &output);
     if !output.status.success() {
         return Ok(());
     }
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some(device) = line.split(':').next() else {
-            continue;
-        };
-        let device = parse_loop_device(device.trim())?;
+    for device in parse_losetup_devices(&output.stdout)? {
         detach_loop(&device, runner).await?;
     }
     Ok(())
+}
+
+fn parse_losetup_devices(content: &[u8]) -> Result<Vec<PathBuf>> {
+    let parsed: LosetupJson = serde_json::from_slice(content)
+        .map_err(|error| NspawnError::Runtime(format!("Failed to parse losetup JSON: {error}")))?;
+    parsed
+        .loopdevices
+        .into_iter()
+        .map(|device| parse_loop_device(&device.name))
+        .collect()
 }
 
 async fn settle_udev(runner: &dyn CommandRunner) -> Result<()> {
@@ -1144,11 +1185,54 @@ async fn remove_reserved_image(path: &Path) {
     }
 }
 
-fn command_reports_not_mounted(output: &std::process::Output) -> bool {
-    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
-    stderr.contains("not mounted")
-        || stderr.contains("no such file")
-        || stderr.contains("not found")
+async fn is_mount_point(path: &Path) -> Result<bool> {
+    let mountinfo_path = Path::new("/proc/self/mountinfo");
+    let content = tokio::fs::read(mountinfo_path)
+        .await
+        .map_err(|error| NspawnError::Io(mountinfo_path.to_path_buf(), error))?;
+    Ok(mountinfo_contains_path(&content, path))
+}
+
+fn mountinfo_contains_path(content: &[u8], path: &Path) -> bool {
+    let expected = path.as_os_str().as_bytes();
+    content.split(|byte| *byte == b'\n').any(|line| {
+        let Some(encoded) = line
+            .split(|byte| byte.is_ascii_whitespace())
+            .filter(|field| !field.is_empty())
+            .nth(4)
+        else {
+            return false;
+        };
+        decode_mountinfo_field(encoded).is_some_and(|decoded| decoded == expected)
+    })
+}
+
+fn decode_mountinfo_field(encoded: &[u8]) -> Option<Vec<u8>> {
+    let mut decoded = Vec::with_capacity(encoded.len());
+    let mut index = 0;
+    while index < encoded.len() {
+        if encoded[index] != b'\\' {
+            decoded.push(encoded[index]);
+            index += 1;
+            continue;
+        }
+        if index + 3 >= encoded.len() {
+            return None;
+        }
+        let digits = &encoded[index + 1..=index + 3];
+        if !digits.iter().all(|digit| matches!(digit, b'0'..=b'7')) {
+            return None;
+        }
+        let value = (digits[0] - b'0') as u16 * 64
+            + (digits[1] - b'0') as u16 * 8
+            + (digits[2] - b'0') as u16;
+        if value > u8::MAX as u16 {
+            return None;
+        }
+        decoded.push(value as u8);
+        index += 4;
+    }
+    Some(decoded)
 }
 
 fn raw_image_path(machine: &MachineName) -> PathBuf {
@@ -1243,6 +1327,85 @@ mod tests {
         ] {
             assert!(parse_loop_device(value).is_err(), "accepted {value:?}");
         }
+    }
+
+    #[test]
+    fn losetup_json_parser_extracts_and_validates_loop_devices() {
+        let content = br#"{
+            "loopdevices": [
+                {"name": "/dev/loop7"},
+                {"name": "/dev/loop12"}
+            ]
+        }"#;
+        assert_eq!(
+            parse_losetup_devices(content).unwrap(),
+            vec![PathBuf::from("/dev/loop7"), PathBuf::from("/dev/loop12")]
+        );
+
+        let injected = br#"{
+            "loopdevices": [{"name": "/dev/loop0;touch /tmp/pwned"}]
+        }"#;
+        assert!(parse_losetup_devices(injected).is_err());
+        assert!(parse_losetup_devices(br"{}").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn detach_image_loops_requests_json_name_output() {
+        let image = Path::new("/var/lib/machines/test.raw");
+        let mut runner = crate::nspawn::sys::command::MockCommandRunner::new();
+        let mut sequence = mockall::Sequence::new();
+        runner
+            .expect_run()
+            .withf(|program, args| {
+                program == "losetup"
+                    && args.iter().map(String::as_str).eq([
+                        "--json",
+                        "--list",
+                        "--associated",
+                        "/var/lib/machines/test.raw",
+                        "--output",
+                        "NAME",
+                    ])
+            })
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _| {
+                Ok(successful_output(
+                    r#"{"loopdevices":[{"name":"/dev/loop7"}]}"#,
+                ))
+            });
+        runner
+            .expect_run()
+            .withf(|program, args| {
+                program == "losetup" && args.iter().map(String::as_str).eq(["-d", "/dev/loop7"])
+            })
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_once(|_, _| Ok(successful_output("")));
+
+        detach_image_loops(image, &runner).await.unwrap();
+    }
+
+    #[test]
+    fn mountinfo_parser_decodes_escaped_mount_points() {
+        let content = b"42 1 0:42 / /run/lasper/mounts/with\\040space\\134suffix rw,relatime - tmpfs tmpfs rw\n43 1 0:43 / /run/lasper/mounts/other rw,relatime - tmpfs tmpfs rw\n";
+        assert!(mountinfo_contains_path(
+            content,
+            Path::new("/run/lasper/mounts/with space\\suffix")
+        ));
+        assert!(!mountinfo_contains_path(
+            content,
+            Path::new("/run/lasper/mounts/missing")
+        ));
+    }
+
+    #[test]
+    fn mountinfo_parser_ignores_malformed_fields() {
+        let content = b"42 1 0:42 / /run/lasper/mounts/bad\\04 rw,relatime - tmpfs tmpfs rw\n";
+        assert!(!mountinfo_contains_path(
+            content,
+            Path::new("/run/lasper/mounts/bad")
+        ));
     }
 
     #[test]

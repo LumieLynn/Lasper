@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{
-        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, RuntimeSnapshot,
-        StatusUpdate,
+        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName,
+        RuntimeSnapshot, StatusUpdate,
     },
     ops::{DefaultManager, NspawnManager},
     sys::ExecutionContext,
@@ -68,6 +68,38 @@ pub struct PanelLayout {
     pub terminal: Option<Rect>,
 }
 
+pub struct PendingImageRemoval {
+    target: ImageName,
+    dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog,
+}
+
+impl PendingImageRemoval {
+    fn new(
+        target: ImageName,
+        dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog,
+    ) -> Self {
+        Self { target, dialog }
+    }
+
+    fn target(&self) -> &ImageName {
+        &self.target
+    }
+
+    fn cleanup_artifacts(&self) -> bool {
+        self.dialog.checkbox_checked().unwrap_or(false)
+    }
+}
+
+impl Component for PendingImageRemoval {
+    fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        self.dialog.render(f, area);
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> crate::ui::core::EventResult {
+        self.dialog.handle_key(key)
+    }
+}
+
 pub struct AppUi {
     pub focus: FocusTracker,
     pub prev_active_idx: usize,
@@ -88,7 +120,7 @@ pub struct AppUi {
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
-    pub delete_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
+    pub delete_dialog: Option<PendingImageRemoval>,
     pub active_dialog: Option<Box<dyn Component>>,
 
     pub resize_mode: ResizeMode,
@@ -1084,6 +1116,139 @@ mod tests {
                     .expect("mstack start should report a result"),
                 AppEvent::ActionDone(..)
             ));
+        }
+    }
+
+    mod image_removal {
+        use super::*;
+        use crate::events::AppEvent;
+        use crate::nspawn::ops::manager::MockNspawnManager;
+
+        fn prepare_image_removal(
+            manager: MockNspawnManager,
+        ) -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let mut app = make_app();
+            app.data.manager = std::sync::Arc::new(manager);
+            app.data.images = vec![make_image("first"), make_image("second")];
+            app.ui.focus.active_idx = 1;
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            app.ui.app_tx = Some(tx);
+            (app, rx)
+        }
+
+        #[tokio::test]
+        async fn confirmation_binds_target_across_selection_and_focus_changes() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_remove()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            manager
+                .expect_cleanup_image_artifacts()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.data.image_selected = 1;
+            app.ui.focus.active_idx = 0;
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
+                    if message == "Removed image first and Lasper artifacts"
+            ));
+        }
+
+        #[tokio::test]
+        async fn confirmation_can_skip_lasper_artifact_cleanup() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_remove()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            manager.expect_cleanup_image_artifacts().never();
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            let result = app
+                .ui
+                .delete_dialog
+                .as_mut()
+                .expect("delete dialog")
+                .handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            assert!(matches!(result, crate::ui::core::EventResult::Consumed));
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
+                    if message == "Removed image first"
+            ));
+        }
+
+        #[tokio::test]
+        async fn cleanup_failure_preserves_successful_removal_result() {
+            let mut manager = MockNspawnManager::new();
+            manager.expect_remove().once().returning(|_| Ok(()));
+            manager
+                .expect_cleanup_image_artifacts()
+                .once()
+                .returning(|_| {
+                    Err(crate::nspawn::errors::NspawnError::Runtime(
+                        "cleanup failed".into(),
+                    ))
+                });
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Warn)
+                    if message.contains("Removed image first")
+                        && message.contains("cleanup failed")
+            ));
+        }
+
+        #[test]
+        fn confirmation_rejects_a_target_that_disappeared() {
+            let mut manager = MockNspawnManager::new();
+            manager.expect_remove().never();
+            manager.expect_cleanup_image_artifacts().never();
+            let (mut app, _rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.data.images.clear();
+            app.action_remove();
+
+            assert_eq!(
+                app.ui
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some("Image first changed before confirmation; refresh and try again.")
+            );
         }
     }
 

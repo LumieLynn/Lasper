@@ -4,7 +4,7 @@ use super::profile::{NvidiaPassthroughMode, NvidiaPassthroughProfile};
 use super::resolve::{get_ldconfig_cache, resolve_so_aliases};
 use super::state::{NvidiaState, PassthroughBind};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::sys::{new_command, CommandLogged};
+use crate::nspawn::sys::new_command;
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
@@ -28,33 +28,46 @@ pub async fn get_host_driver_version() -> Result<String> {
     }
 }
 
-/// List available NVIDIA CDI devices.
-pub async fn list_devices() -> Result<Vec<String>> {
-    let out = new_command("nvidia-ctk")
-        .args(["cdi", "list"])
-        .logged_output("nvidia-ctk")
-        .await
-        .map_err(|e| NspawnError::Runtime(format!("Failed to execute 'nvidia-ctk': {}", e)))?;
+/// Refresh NVIDIA hardware from one current CDI snapshot.
+pub async fn discover_hardware() -> Result<(Vec<String>, NvidiaState)> {
+    let driver_version = get_host_driver_version().await.unwrap_or_default();
+    let Some(spec) = generate_cdi_spec("all").await? else {
+        return Ok((
+            vec!["all".to_string()],
+            NvidiaState {
+                driver_version,
+                ..Default::default()
+            },
+        ));
+    };
 
-    if !out.status.success() {
-        return Ok(vec!["all".to_string()]);
-    }
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut devices = vec!["all".to_string()];
-    for line in stdout.lines() {
-        if let Some(id) = line.split_whitespace().last() {
-            let clean_id = id.split('=').next_back().unwrap_or(id);
-            devices.push(clean_id.to_string());
-        }
-    }
-    Ok(dedup(devices))
+    let devices = devices_from_spec(&spec);
+    let state = build_nvidia_state(&spec, driver_version, None).await?;
+    Ok((devices, state))
 }
 
 pub(crate) fn dedup(mut v: Vec<String>) -> Vec<String> {
     v.sort();
     v.dedup();
     v
+}
+
+fn devices_from_spec(spec: &CdiSpec) -> Vec<String> {
+    let mut devices = spec
+        .devices
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|device| device.name.clone())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    devices.push("all".to_string());
+    let mut devices = dedup(devices);
+    if let Some(index) = devices.iter().position(|device| device == "all") {
+        let all = devices.remove(index);
+        devices.insert(0, all);
+    }
+    devices
 }
 
 /// Container paths that conflict with distribution-provided libraries
@@ -348,91 +361,89 @@ fn extract_classified_entries(binds: &[PassthroughBind]) -> Vec<ClassifiedEntry>
         .collect()
 }
 
-/// Perform a comprehensive scan of the host using the official NVIDIA CDI standard.
-pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Result<NvidiaState> {
-    let driver_version = get_host_driver_version().await.unwrap_or_default();
-    let gpu_device = profile.map(|p| p.gpu_device.as_str()).unwrap_or("all");
-
-    // 1. CDI Discovery: Call nvidia-ctk to get the official mapping JSON
-    let tmp_dir = tempfile::tempdir().map_err(|e| {
-        NspawnError::Runtime(format!(
-            "Failed to create temporary directory for CDI discovery: {}",
-            e
-        ))
-    })?;
-    let tmp_path = tmp_dir.path().join("nvidia-cdi.json");
-    let tmp_path_str = tmp_path.to_string_lossy();
-
+async fn generate_cdi_spec(gpu_device: &str) -> Result<Option<CdiSpec>> {
     let mut cmd = new_command("nvidia-ctk");
-    cmd.args([
-        "cdi",
-        "generate",
-        "--format=json",
-        "--output",
-        &tmp_path_str,
-    ]);
+    // Keep CDI hooks in the snapshot: the state builder translates their
+    // symlink and ld-cache edits into nspawn bind configuration.
+    cmd.args(["cdi", "generate", "--format=json"]);
     if gpu_device != "all" {
         cmd.args(["--device-id", gpu_device]);
     }
 
-    let out = cmd.logged_output("nvidia-ctk").await.map_err(|e| {
+    let out = cmd.output().await.map_err(|e| {
         NspawnError::Runtime(format!(
             "Failed to execute 'nvidia-ctk': {}. Please ensure nvidia-container-toolkit is installed.",
             e
         ))
     })?;
 
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    for line in stderr.lines().filter(|line| !line.trim().is_empty()) {
+        if out.status.success() {
+            log::debug!("[nvidia-ctk stderr] {}", line);
+        } else {
+            log::warn!("[nvidia-ctk stderr] {}", line);
+        }
+    }
+
     if !out.status.success() {
+        let device_arg = if gpu_device == "all" {
+            String::new()
+        } else {
+            format!(" --device-id={gpu_device}")
+        };
         return Err(NspawnError::cmd_failed(
             "NVIDIA CDI Discovery",
-            format!(
-                "nvidia-ctk cdi generate --format=json --output={} --device-id={}",
-                tmp_path_str, gpu_device
-            ),
+            format!("nvidia-ctk cdi generate --format=json{device_arg}"),
             &out,
         ));
     }
 
-    if !tokio::fs::try_exists(&tmp_path).await.unwrap_or(false) {
-        return Err(NspawnError::Runtime(format!(
-            "nvidia-ctk reported success but no CDI file was created at {}",
-            tmp_path_str
-        )));
+    if out.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
+        log::warn!("nvidia-ctk generated empty CDI JSON. Assuming no NVIDIA devices are present.");
+        return Ok(None);
     }
 
-    let content = tokio::fs::read(&tmp_path)
-        .await
-        .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+    parse_generated_cdi_json(&out.stdout).map(Some)
+}
 
-    if content.is_empty() {
-        log::warn!(
-            "nvidia-ctk generated an empty CDI file. Assuming no NVIDIA devices are present."
-        );
+fn parse_generated_cdi_json(content: &[u8]) -> Result<CdiSpec> {
+    let mut documents = serde_json::Deserializer::from_slice(content).into_iter::<CdiSpec>();
+    let first = documents
+        .next()
+        .transpose()
+        .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?
+        .ok_or_else(|| NspawnError::Runtime("nvidia-ctk generated empty CDI JSON".into()))?;
+    for document in documents {
+        document
+            .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?;
+    }
+    Ok(first)
+}
+
+/// Perform a comprehensive scan of the host using the official NVIDIA CDI standard.
+pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Result<NvidiaState> {
+    let driver_version = get_host_driver_version().await.unwrap_or_default();
+    let gpu_device = profile.map(|p| p.gpu_device.as_str()).unwrap_or("all");
+    let Some(spec) = generate_cdi_spec(gpu_device).await? else {
         return Ok(NvidiaState {
             driver_version,
             ..Default::default()
         });
-    }
-
-    let spec: CdiSpec = match serde_json::from_slice(&content) {
-        Ok(s) => s,
-        Err(e) => {
-            log::error!(
-                "CDI Raw Output (saved at {}): {}",
-                tmp_path_str,
-                String::from_utf8_lossy(&content)
-            );
-            return Err(NspawnError::Runtime(format!(
-                "Failed to parse CDI JSON: {}",
-                e
-            )));
-        }
     };
 
-    let (_, all_hooks, _) = collect_cdi_edits(&spec);
+    build_nvidia_state(&spec, driver_version, profile).await
+}
+
+async fn build_nvidia_state(
+    spec: &CdiSpec,
+    driver_version: String,
+    profile: Option<&NvidiaPassthroughProfile>,
+) -> Result<NvidiaState> {
+    let (_, all_hooks, _) = collect_cdi_edits(spec);
 
     // 2. Core transform: CDI -> mirror-mode PassthroughBind (no remapping yet)
-    let mut binds = cdi_to_raw_binds(&spec);
+    let mut binds = cdi_to_raw_binds(spec);
 
     // 3. ldconfig alias resolution - add genuinely new .so files not already
     // covered by CDI mounts or symlink hooks. Runs BEFORE remapping so
@@ -537,6 +548,37 @@ mod tests {
         let input = vec!["a".to_string(), "b".to_string(), "c".to_string()];
         let result = dedup(input.clone());
         assert_eq!(result, input);
+    }
+
+    #[test]
+    fn cdi_device_names_are_derived_from_the_generated_snapshot() {
+        let spec: CdiSpec = serde_json::from_str(
+            r#"{
+                "devices": [
+                    {"name": "0"},
+                    {"name": "all"},
+                    {"name": "0"},
+                    {"name": "gpu-uuid"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(devices_from_spec(&spec), vec!["all", "0", "gpu-uuid"]);
+    }
+
+    #[test]
+    fn generated_cdi_json_parser_accepts_multiple_specs_and_uses_the_full_spec() {
+        let content = br#"{"devices":[{"name":"all"}]} {"devices":[{"name":"stale"}]}"#;
+        let spec = parse_generated_cdi_json(content).unwrap();
+        assert_eq!(spec.devices.unwrap()[0].name, "all");
+    }
+
+    #[test]
+    fn generated_cdi_json_parser_rejects_invalid_content() {
+        assert!(parse_generated_cdi_json(br"not-json").is_err());
+        assert!(parse_generated_cdi_json(b" ").is_err());
+        assert!(parse_generated_cdi_json(br#"{"devices":[]} trailing"#).is_err());
     }
 
     #[test]

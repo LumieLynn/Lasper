@@ -26,9 +26,9 @@ Also check the deployment log. Some setup warnings, such as failure to enable `s
 
 ## How do I remove a container?
 
-Select a stopped container and press `D`. Lasper asks for confirmation, removes the machine through systemd/machinectl, and then cleans Lasper-managed host-side files such as the `.nspawn` file, its lock files, service override directory, and NVIDIA state file.
+Select a stopped image and press `D`. The confirmation is bound to that image even if the list refreshes. Lasper first removes the image through systemd/machinectl; systemd's `RemoveImage` operation also attempts to remove every same-name `.nspawn` settings file from its system search paths and beside the image. The confirmation provides a separate, default-enabled option to remove Lasper's NVIDIA state and known systemd unit drop-ins after the image has been removed.
 
-If you remove a machine manually with `sudo machinectl remove <name>`, Lasper-managed configuration files may remain and may need manual cleanup.
+Lasper removes only its known unit drop-in filenames and removes their directories only when they are empty, so unrelated administrator drop-ins remain. If you run `sudo machinectl remove <name>` manually, systemd still removes the same-name `.nspawn` settings, while Lasper's NVIDIA state and unit drop-ins may remain and require manual cleanup.
 
 ## Why can't an OCI-created container start?
 

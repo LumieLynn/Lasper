@@ -92,7 +92,10 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
+    /// Remove the systemd-managed image and its settings through `RemoveImage`.
     async fn remove(&self, name: &str) -> Result<()>;
+    /// Remove Lasper's NVIDIA state and known systemd unit drop-ins.
+    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>);
@@ -552,31 +555,30 @@ impl NspawnManager for DefaultManager {
         };
 
         result?;
+        self.nudge();
+        Ok(())
+    }
 
-        if hidden || !managed_machine_name {
-            self.nudge();
-            return Ok(());
-        }
+    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()> {
+        crate::nspawn::models::MachineName::new(name)
+            .map_err(|error| crate::nspawn::errors::NspawnError::Validation(error.to_string()))?;
 
         let mut cleanup_errors = Vec::new();
-        if let Err(error) = self.exec_ctx.nspawn.remove(name).await {
-            cleanup_errors.push(format!("nspawn config: {}", error));
-        }
         if let Err(error) = self.exec_ctx.systemd_unit.remove_overrides(name).await {
-            cleanup_errors.push(format!("systemd override: {}", error));
+            cleanup_errors.push(format!("systemd unit drop-ins: {error}"));
         }
         if let Err(error) = self.exec_ctx.nvidia_state.remove(name).await {
-            cleanup_errors.push(format!("NVIDIA state: {}", error));
+            cleanup_errors.push(format!("NVIDIA state: {error}"));
         }
         if let Err(error) = self.reload_daemon_fallback().await {
-            cleanup_errors.push(format!("systemd daemon reload: {}", error));
+            cleanup_errors.push(format!("systemd daemon reload: {error}"));
         }
-        self.nudge();
+
         if cleanup_errors.is_empty() {
             Ok(())
         } else {
             Err(crate::nspawn::errors::NspawnError::Runtime(format!(
-                "image was removed, but managed cleanup was incomplete: {}",
+                "Lasper artifact cleanup was incomplete: {}",
                 cleanup_errors.join("; ")
             )))
         }

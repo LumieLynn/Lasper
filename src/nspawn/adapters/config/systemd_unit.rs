@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 const MAX_OVERRIDE_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_DEVICE_ALLOW_ENTRIES: usize = 4096;
+const LASPER_OVERRIDE_FILE: &str = "override.conf";
+const LASPER_NVIDIA_OVERRIDE_FILE: &str = "10-lasper-nvidia.conf";
 
 /// Read-only view of the host unit drop-ins associated with a machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +228,11 @@ pub(crate) async fn execute_systemd_unit_operation(
             .await?;
         }
         SystemdUnitOperation::RemoveOverrides(request) => {
-            remove_overrides_at(&service_override_dir(&request.machine)).await?;
+            remove_lasper_overrides_at(
+                &service_override_dir(&request.machine),
+                &transient_service_override_dir(&request.machine),
+            )
+            .await?;
         }
     }
     Ok(SystemdUnitResult::default())
@@ -277,7 +283,7 @@ fn service_override_dir(machine: &MachineName) -> PathBuf {
 }
 
 fn service_override_path(machine: &MachineName) -> PathBuf {
-    service_override_dir(machine).join("override.conf")
+    service_override_dir(machine).join(LASPER_OVERRIDE_FILE)
 }
 
 fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
@@ -288,11 +294,11 @@ fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
 }
 
 fn persistent_nvidia_override_path(machine: &MachineName) -> PathBuf {
-    service_override_dir(machine).join("10-lasper-nvidia.conf")
+    service_override_dir(machine).join(LASPER_NVIDIA_OVERRIDE_FILE)
 }
 
 fn transient_nvidia_override_path(machine: &MachineName) -> PathBuf {
-    transient_service_override_dir(machine).join("10-lasper-nvidia.conf")
+    transient_service_override_dir(machine).join(LASPER_NVIDIA_OVERRIDE_FILE)
 }
 
 fn validate_override_spec(spec: &ServiceOverrideSpec) -> Result<()> {
@@ -420,11 +426,47 @@ async fn remove_optional_file(path: &Path) -> Result<()> {
     }
 }
 
-async fn remove_overrides_at(path: &Path) -> Result<()> {
-    match tokio::fs::remove_dir_all(path).await {
+async fn remove_empty_dir(path: &Path) -> Result<()> {
+    match tokio::fs::remove_dir(path).await {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn remove_lasper_overrides_at(persistent_dir: &Path, transient_dir: &Path) -> Result<()> {
+    let managed_files = [
+        persistent_dir.join(LASPER_OVERRIDE_FILE),
+        persistent_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+        transient_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+    ];
+    let mut errors = Vec::new();
+
+    for path in managed_files {
+        if let Err(error) = remove_optional_file(&path).await {
+            errors.push(error.to_string());
+        }
+    }
+    for directory in [persistent_dir, transient_dir] {
+        if let Err(error) = remove_empty_dir(directory).await {
+            errors.push(error.to_string());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(NspawnError::Runtime(format!(
+            "failed to remove one or more Lasper unit drop-ins: {}",
+            errors.join("; ")
+        )))
     }
 }
 
@@ -543,17 +585,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_overrides_deletes_directory() {
+    async fn remove_overrides_removes_known_files_and_empty_directories() {
         let directory = tempfile::tempdir().unwrap();
-        let override_dir = directory.path().join("systemd-nspawn@test.service.d");
-        tokio::fs::create_dir_all(&override_dir).await.unwrap();
-        tokio::fs::write(override_dir.join("override.conf"), "[Service]\n")
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        tokio::fs::create_dir_all(&transient).await.unwrap();
+        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(persistent.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
             .await
             .unwrap();
 
-        remove_overrides_at(&override_dir).await.unwrap();
+        remove_lasper_overrides_at(&persistent, &transient)
+            .await
+            .unwrap();
 
-        assert!(!override_dir.exists());
+        assert!(!persistent.exists());
+        assert!(!transient.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_overrides_preserves_unknown_drop_ins_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        tokio::fs::create_dir_all(&transient).await.unwrap();
+        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(persistent.join("90-administrator.conf"), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(transient.join("unknown-directory"))
+            .await
+            .unwrap();
+
+        remove_lasper_overrides_at(&persistent, &transient)
+            .await
+            .unwrap();
+
+        assert!(!persistent.join(LASPER_OVERRIDE_FILE).exists());
+        assert!(persistent.join("90-administrator.conf").exists());
+        assert!(persistent.exists());
+        assert!(!transient.join(LASPER_NVIDIA_OVERRIDE_FILE).exists());
+        assert!(transient.join("unknown-directory").exists());
+        assert!(transient.exists());
     }
 
     #[tokio::test]
