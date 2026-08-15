@@ -37,8 +37,8 @@ pub(crate) enum SystemOperation {
         image: ImageName,
     },
     CloneImage {
-        source: MachineName,
-        destination: MachineName,
+        source: ImageName,
+        destination: ImageName,
     },
     ReloadDaemon,
 }
@@ -132,8 +132,8 @@ impl SystemOperationStore {
 
     pub async fn clone_image(&self, source: &str, destination: &str) -> Result<()> {
         self.execute(SystemOperation::CloneImage {
-            source: machine_name(source)?,
-            destination: machine_name(destination)?,
+            source: image_name(source)?,
+            destination: image_name(destination)?,
         })
         .await
     }
@@ -367,5 +367,32 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(error, NspawnError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn clone_source_uses_image_name_semantics() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .withf(|program, args| {
+                program == "machinectl"
+                    && args.iter().map(String::as_str).eq([
+                        "--",
+                        "clone",
+                        "Base Image",
+                        "clone-target",
+                    ])
+            })
+            .returning(|_, _| Ok(success()));
+
+        execute_system_operation_with_runner(
+            SystemOperation::CloneImage {
+                source: ImageName::new("Base Image").unwrap(),
+                destination: ImageName::new("clone-target").unwrap(),
+            },
+            &runner,
+        )
+        .await
+        .unwrap();
     }
 }

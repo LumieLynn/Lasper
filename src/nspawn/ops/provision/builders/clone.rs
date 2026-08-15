@@ -2,15 +2,56 @@
 
 use async_trait::async_trait;
 
-use crate::nspawn::errors::Result;
-use crate::nspawn::models::ContainerConfig;
-use crate::nspawn::ops::provision::{send_deploy_log, DeployLogEvent, Deployer, DeploymentReceipt};
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::{ApplyStatus, ContainerConfig, MachineName};
+use crate::nspawn::ops::provision::{
+    send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
+};
 
 pub struct CloneDeployer {
     pub source_name: String,
     pub system_operations: crate::nspawn::ops::SystemOperationStore,
     pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
     pub systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClonedConfigStatus {
+    ClonedBySystemd,
+    ClonedAfterSourceChange,
+    NotPresent,
+}
+
+impl ClonedConfigStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::ClonedBySystemd => "cloned by systemd",
+            Self::ClonedAfterSourceChange => "cloned by systemd after the source changed",
+            Self::NotPresent => "not present",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CloneApplyResult {
+    config: ClonedConfigStatus,
+    service_override: Option<ApplyStatus>,
+}
+
+impl CloneApplyResult {
+    fn summary(self) -> String {
+        let service_override = match self.service_override {
+            Some(ApplyStatus::Created) => "cloned",
+            Some(ApplyStatus::Unchanged) => "already identical",
+            Some(ApplyStatus::ReplacedOwned) => "replaced",
+            Some(ApplyStatus::ConflictUnknownOwner) => "conflict",
+            None => "not present",
+        };
+        format!(
+            "image cloned; .nspawn settings {}; Lasper service override {service_override}",
+            self.config.label()
+        )
+    }
 }
 
 #[async_trait]
@@ -29,39 +70,141 @@ impl Deployer for CloneDeployer {
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<DeploymentReceipt> {
+        cancellation: &DeploymentCancellation,
+        report: &mut ApplyReport,
+    ) -> Result<()> {
+        cancellation.checkpoint()?;
+        let source_config = self.nspawn.inspect(&self.source_name).await?;
+        let source_has_override = if MachineName::new(&self.source_name).is_ok() {
+            let source_unit = self.systemd_unit.read(&self.source_name).await?;
+            source_unit.drop_ins.iter().any(|drop_in| {
+                std::path::Path::new(&drop_in.path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    == Some("override.conf")
+            })
+        } else {
+            false
+        };
+        cancellation.checkpoint()?;
+
         send_deploy_log(
             &logs,
-            format!("Cloning container {} to {}...", self.source_name, name),
+            format!("Cloning image {} to {}...", self.source_name, name),
         )
         .await;
 
         self.system_operations
             .clone_image(&self.source_name, name)
             .await?;
+        report.record_created(AppliedResource::ExternalImage);
+        cancellation.checkpoint()?;
 
-        // Clone configs
-        if let Err(e) = self.nspawn.clone_config(&self.source_name, name).await {
-            send_deploy_log(
-                &logs,
-                format!("WARNING: Failed to clone .nspawn config: {}", e),
-            )
-            .await;
-        }
-        if let Err(e) = self
-            .systemd_unit
-            .clone_override(&self.source_name, name)
+        let config_result = verify_systemd_cloned_config(
+            &self.nspawn,
+            &self.source_name,
+            name,
+            source_config.as_ref(),
+            report,
+        )
+        .await?;
+        cancellation.checkpoint()?;
+
+        let override_apply = if source_has_override {
+            let apply = self
+                .systemd_unit
+                .clone_override(&self.source_name, name)
+                .await?;
+            report.record_apply(AppliedResource::SystemdOverride, apply)?;
+            cancellation.checkpoint()?;
+            Some(apply)
+        } else {
+            None
+        };
+
+        self.system_operations
+            .reload_daemon()
             .await
-        {
-            send_deploy_log(
-                &logs,
-                format!("WARNING: Failed to clone systemd override: {}", e),
-            )
-            .await;
+            .map_err(|error| {
+                NspawnError::Runtime(format!("Failed to reload systemd after clone: {error}"))
+            })?;
+        cancellation.checkpoint()?;
+
+        let result = CloneApplyResult {
+            config: config_result,
+            service_override: override_apply,
+        };
+        send_deploy_log(&logs, format!("Clone result: {}.", result.summary())).await;
+
+        Ok(())
+    }
+}
+
+async fn verify_systemd_cloned_config(
+    nspawn: &crate::nspawn::adapters::config::NspawnConfigStore,
+    source_name: &str,
+    destination: &str,
+    source_before: Option<&crate::nspawn::adapters::config::nspawn_file::NspawnConfig>,
+    report: &mut ApplyReport,
+) -> Result<ClonedConfigStatus> {
+    let destination_config = nspawn.inspect(destination).await?;
+    match (source_before, destination_config.as_ref()) {
+        (Some(source), Some(destination)) if source.content == destination.content => {
+            Ok(ClonedConfigStatus::ClonedBySystemd)
         }
+        (Some(_), None) => Err(NspawnError::Runtime(
+            "machinectl clone completed without copying the source .nspawn settings".into(),
+        )),
+        (Some(_), Some(_)) => {
+            report.block_external_image_removal(
+                "the cloned .nspawn settings do not match the source snapshot",
+            );
+            Err(NspawnError::Runtime(
+                "machinectl clone produced .nspawn settings that do not match the source".into(),
+            ))
+        }
+        (None, None) => Ok(ClonedConfigStatus::NotPresent),
+        (None, Some(destination)) => {
+            let source_after = nspawn.inspect(source_name).await?;
+            if source_after
+                .as_ref()
+                .is_some_and(|source| source.content == destination.content)
+            {
+                Ok(ClonedConfigStatus::ClonedAfterSourceChange)
+            } else {
+                report.block_external_image_removal(
+                    "unexpected .nspawn settings appeared while cloning",
+                );
+                Err(NspawnError::Runtime(
+                    "unexpected .nspawn settings appeared while cloning the image".into(),
+                ))
+            }
+        }
+    }
+}
 
-        let _ = self.system_operations.reload_daemon().await;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        Ok(DeploymentReceipt::external_image())
+    #[test]
+    fn clone_result_distinguishes_provider_and_lasper_artifacts() {
+        let complete = CloneApplyResult {
+            config: ClonedConfigStatus::ClonedBySystemd,
+            service_override: Some(ApplyStatus::Created),
+        };
+        assert_eq!(
+            complete.summary(),
+            "image cloned; .nspawn settings cloned by systemd; Lasper service override cloned"
+        );
+
+        let image_only = CloneApplyResult {
+            config: ClonedConfigStatus::NotPresent,
+            service_override: None,
+        };
+        assert_eq!(
+            image_only.summary(),
+            "image cloned; .nspawn settings not present; Lasper service override not present"
+        );
     }
 }

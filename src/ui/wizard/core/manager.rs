@@ -1,4 +1,4 @@
-use crate::nspawn::ContainerEntry;
+use crate::nspawn::{ContainerEntry, ImageEntry};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::wizard::core::context::{SourceKind, WizardContext};
 use crate::ui::wizard::steps::{self, StepComponent};
@@ -26,7 +26,7 @@ pub struct Wizard {
 impl Wizard {
     pub async fn new(
         entries: Vec<ContainerEntry>,
-        image_names: Vec<String>,
+        images: Vec<ImageEntry>,
         nvidia_toolkit_installed: bool,
         command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
         permission_level: crate::nspawn::ops::PermissionLevel,
@@ -34,7 +34,7 @@ impl Wizard {
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
         let mut context =
-            WizardContext::new(entries, image_names, permission_level, exec_ctx, config).await;
+            WizardContext::new(entries, images, permission_level, exec_ctx, config).await;
         context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {
@@ -171,6 +171,11 @@ impl Wizard {
             return StepAction::None;
         }
 
+        // Input can arrive before the first frame after a step transition.
+        // Build the view here as well so Deploy always applies its confirmation
+        // semantics instead of falling through to wizard-global shortcuts.
+        self.sync_view();
+
         let res = if let Some(view) = &mut self.active_view {
             let result = view.handle_key(key);
             view.commit_to_context(&mut self.context);
@@ -221,10 +226,15 @@ impl Wizard {
                     }
                     if self.context.source.kind == SourceKind::Copy {
                         let source_cfg = self.context.source.clone_source.clone();
-                        if !self.context.entries.iter().any(|e| e.name == source_cfg) {
+                        if !self
+                            .context
+                            .images
+                            .iter()
+                            .any(|image| image.name == source_cfg)
+                        {
                             return StepAction::Status(
                                 format!(
-                                    "Validation Error: Source container '{}' no longer exists",
+                                    "Validation Error: Source image '{}' no longer exists",
                                     source_cfg
                                 ),
                                 crate::ui::StatusLevel::Error,
@@ -235,9 +245,9 @@ impl Wizard {
                     if self.context.entries.iter().any(|e| e.name == target_name)
                         || self
                             .context
-                            .image_names
+                            .images
                             .iter()
-                            .any(|name| name == &target_name)
+                            .any(|image| image.name == target_name)
                     {
                         return StepAction::Status(
                             format!(
@@ -417,6 +427,9 @@ impl Wizard {
                         format!("Deploy Failed: {}", e),
                         crate::ui::StatusLevel::Error,
                     ),
+                    crate::nspawn::ops::BackendResponse::DeployCancelled(message) => {
+                        StepAction::Status(message, crate::ui::StatusLevel::Warn)
+                    }
                     crate::nspawn::ops::BackendResponse::HardwareDiscovered {
                         nvidia_state,
                         nvidia_devices,

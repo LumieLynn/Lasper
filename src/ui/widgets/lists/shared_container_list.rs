@@ -1,6 +1,5 @@
 use crate::nspawn::{ContainerEntry, ContainerState};
 use crate::ui::theme;
-use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -28,10 +27,6 @@ impl SharedContainerList {
 
     pub fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
-    }
-
-    pub fn selected_idx(&self) -> Option<usize> {
-        self.state.selected()
     }
 
     pub fn select(&mut self, idx: usize) {
@@ -138,34 +133,5 @@ impl SharedContainerList {
             .highlight_style(Style::default());
 
         f.render_stateful_widget(list, area, &mut self.state);
-    }
-
-    /// Generic list navigation logic.
-    pub fn handle_key(&mut self, key: KeyEvent, items_len: usize) -> bool {
-        if items_len == 0 {
-            return false;
-        }
-
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                let i = self.state.selected().unwrap_or(0);
-                self.state.select(Some(if i >= items_len.saturating_sub(1) {
-                    0
-                } else {
-                    i + 1
-                }));
-                true
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                let i = self.state.selected().unwrap_or(0);
-                self.state.select(Some(if i == 0 {
-                    items_len.saturating_sub(1)
-                } else {
-                    i - 1
-                }));
-                true
-            }
-            _ => false,
-        }
     }
 }

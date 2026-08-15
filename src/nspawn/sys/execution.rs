@@ -10,7 +10,7 @@ use crate::nspawn::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::nspawn::adapters::rootfs::RootfsStore;
 use crate::nspawn::adapters::storage::ManagedStorageStore;
 use crate::nspawn::ops::provision::{BootstrapStore, ImageImportStore, OciPullStore};
-use crate::nspawn::ops::{PermissionLevel, SystemOperationStore};
+use crate::nspawn::ops::{HostOperationTracker, PermissionLevel, SystemOperationStore};
 use crate::nspawn::platform::nvidia::NvidiaStateStore;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
@@ -31,6 +31,7 @@ pub struct ExecutionContext {
     pub oci_pull: OciPullStore,
     pub managed_storage: ManagedStorageStore,
     pub nvidia_state: NvidiaStateStore,
+    pub host_operations: HostOperationTracker,
     permission_level: PermissionLevel,
     daemon: Option<Arc<ElevatedDaemon>>,
 }
@@ -52,7 +53,7 @@ impl ExecutionContext {
         let rootfs = RootfsStore::new(daemon.clone());
         let bootstrap = BootstrapStore::new(local_cmd.clone(), daemon.clone());
         let image_import = ImageImportStore::new(daemon.clone());
-        let oci_pull = OciPullStore::new(local_cmd.clone(), daemon.clone());
+        let oci_pull = OciPullStore::new(daemon.clone());
         let managed_storage = ManagedStorageStore::new(daemon.clone());
         let nvidia_state = NvidiaStateStore::new(daemon.clone());
         Ok(Self {
@@ -67,6 +68,7 @@ impl ExecutionContext {
             oci_pull,
             managed_storage,
             nvidia_state,
+            host_operations: HostOperationTracker::default(),
             permission_level: level,
             daemon,
         })
@@ -116,6 +118,7 @@ impl std::fmt::Debug for ExecutionContext {
             .field("oci_pull", &"OciPullStore")
             .field("managed_storage", &self.managed_storage)
             .field("nvidia_state", &self.nvidia_state)
+            .field("host_operations", &self.host_operations)
             .field("permission_level", &self.permission_level)
             .field("daemon", &self.daemon)
             .finish()

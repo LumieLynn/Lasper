@@ -43,7 +43,7 @@ use crate::nspawn::ops::provision::bootstrap_operation::{
 };
 use crate::nspawn::ops::provision::image_operation::{ImageImportReport, ImportTarRequest};
 use crate::nspawn::ops::provision::oci_operation::{
-    build_command as build_oci_pull_command, OciPullRequest,
+    run_oci_transfer, OciPullRequest, OciTransferCancellation, OciTransferOutcome,
 };
 use crate::nspawn::ops::system_operation::{
     execute_dbus_system_operation, execute_system_operation, SystemOperation,
@@ -55,7 +55,7 @@ use crate::nspawn::sys::terminal_attach::TerminalAttachKind;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -869,6 +869,25 @@ impl ElevatedDaemon {
                 std::io::Error::other("daemon: missing exit_code in wait_command response")
             })
     }
+
+    pub async fn signal_command(&self, cmd_id: u64, signal: i32) -> std::io::Result<()> {
+        let signal = match signal {
+            libc::SIGTERM => "terminate",
+            libc::SIGKILL => "kill",
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unsupported command signal",
+                ))
+            }
+        };
+        self.rpc_call(
+            "signal_command",
+            serde_json::json!({"cmd_id": cmd_id, "signal": signal}),
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 // ── Daemon main loop (child side) ──
@@ -1361,6 +1380,17 @@ async fn handle_request(
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 loop {
+                    let error = SPAWN_WAIT_ERRORS.lock().remove(&cmd_id);
+                    if let Some(error) = error {
+                        let response = serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": {"code": -1, "message": error},
+                        });
+                        let line = serde_json::to_string(&response).unwrap();
+                        let _ = out_tx.send(line).await;
+                        return;
+                    }
                     let code = SPAWN_EXIT_CODES.lock().remove(&cmd_id);
                     if let Some(code) = code {
                         let response = serde_json::json!({
@@ -1376,6 +1406,36 @@ async fn handle_request(
                 }
             });
             HandleOutcome::Spawned
+        }
+
+        "signal_command" => {
+            let Some(cmd_id) = request.params["cmd_id"].as_u64() else {
+                return HandleOutcome::Sync(Err("missing cmd_id".into()));
+            };
+            let signal = match request.params["signal"].as_str() {
+                Some("terminate") => libc::SIGTERM,
+                Some("kill") => libc::SIGKILL,
+                _ => return HandleOutcome::Sync(Err("unsupported command signal".into())),
+            };
+            if let Some(cancellation) = OCI_TRANSFER_CANCELLATIONS.lock().get(&cmd_id).cloned() {
+                cancellation.request();
+                return HandleOutcome::Sync(Ok(serde_json::Value::Null));
+            }
+            let Some(pid) = SPAWN_PIDS.lock().get(&cmd_id).copied() else {
+                return HandleOutcome::Sync(Ok(serde_json::Value::Null));
+            };
+            let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+            let error = (result != 0).then(std::io::Error::last_os_error);
+            if result == 0
+                || error.as_ref().and_then(std::io::Error::raw_os_error) == Some(libc::ESRCH)
+            {
+                HandleOutcome::Sync(Ok(serde_json::Value::Null))
+            } else {
+                HandleOutcome::Sync(Err(format!(
+                    "failed to signal command {cmd_id}: {}",
+                    error.expect("failed kill has an OS error")
+                )))
+            }
         }
 
         "exit" => {
@@ -1682,7 +1742,8 @@ async fn handle_fd_connection(
                 "[AUDIT] [Step: Bootstrap] Starting typed {} operation",
                 program
             );
-            match crate::nspawn::sys::new_sync_command("sh")
+            let mut command = crate::nspawn::sys::new_sync_command("sh");
+            command
                 .arg("-c")
                 .arg("exec \"$@\" 2>&1")
                 .arg("--")
@@ -1690,18 +1751,23 @@ async fn handle_fd_connection(
                 .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
-                .spawn()
-            {
+                .process_group(0);
+            match command.spawn() {
                 Ok(mut child) => {
+                    SPAWN_PIDS.lock().insert(cmd_id, child.id());
                     let stdout = child.stdout.take().expect("stdout piped");
                     let raw_fd = stdout.as_raw_fd();
                     if let Err(error) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
                         log::error!("Daemon: send_with_fd (spawn_bootstrap) failed: {}", error);
+                        drop(stdout);
+                        stop_unhanded_command(&mut child, cmd_id, "bootstrap");
+                        return;
                     }
                     drop(stdout);
 
                     tokio::task::spawn_blocking(move || {
                         let status = child.wait();
+                        SPAWN_PIDS.lock().remove(&cmd_id);
                         if let Ok(status) = status {
                             SPAWN_EXIT_CODES.lock().insert(cmd_id, status.into_raw());
                         }
@@ -1716,43 +1782,49 @@ async fn handle_fd_connection(
 
         FdOperation::OciPull(params) => {
             let SpawnOciPullParams { cmd_id, request } = *params;
-            let (program, args) = build_oci_pull_command(&request);
             log::info!(
-                "[AUDIT] [Step: OCI] Starting typed importctl pull-oci operation for {}",
+                "[AUDIT] [Step: OCI] Starting typed systemd-importd PullOci transfer for {}",
                 request.machine
             );
-            match crate::nspawn::sys::new_sync_command("sh")
-                .arg("-c")
-                .arg("exec \"$@\" 2>&1")
-                .arg("--")
-                .arg(program)
-                .args(&args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let stdout = child.stdout.take().expect("stdout piped");
-                    let raw_fd = stdout.as_raw_fd();
-
-                    if let Err(e) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
-                        log::error!("Daemon: send_with_fd (spawn_oci_pull) failed: {}", e);
-                    }
-                    drop(stdout);
-
-                    tokio::task::spawn_blocking(move || {
-                        let status = child.wait();
-                        if let Ok(s) = status {
-                            let raw = s.into_raw();
-                            SPAWN_EXIT_CODES.lock().insert(cmd_id, raw);
-                        }
-                    });
+            let (writer, reader) = match tokio::net::unix::pipe::pipe() {
+                Ok(pipe) => pipe,
+                Err(error) => {
+                    log::error!("Daemon: OCI transfer pipe creation failed: {error}");
+                    let _ = std_stream.send_with_fd(b"OCI transfer pipe failed", &[]);
+                    return;
                 }
-                Err(e) => {
-                    log::error!("Daemon: typed OCI pull spawn failed: {}", e);
-                    let _ = std_stream.send_with_fd(b"OCI pull spawn failed", &[]);
-                }
+            };
+            let cancellation = OciTransferCancellation::default();
+            OCI_TRANSFER_CANCELLATIONS
+                .lock()
+                .insert(cmd_id, cancellation.clone());
+            if let Err(error) = std_stream.send_with_fd(b"ok", &[reader.as_raw_fd()]) {
+                log::error!("Daemon: send_with_fd (spawn_oci_pull) failed: {error}");
+                OCI_TRANSFER_CANCELLATIONS.lock().remove(&cmd_id);
+                return;
             }
+            drop(reader);
+
+            tokio::spawn(async move {
+                let result = run_oci_transfer(request, writer, cancellation).await;
+                OCI_TRANSFER_CANCELLATIONS.lock().remove(&cmd_id);
+                match result {
+                    Ok(outcome) => {
+                        if let OciTransferOutcome::Failed(reason) = &outcome {
+                            log::error!("systemd-importd OCI transfer failed: {reason}");
+                        }
+                        SPAWN_EXIT_CODES
+                            .lock()
+                            .insert(cmd_id, outcome.exit_code() << 8);
+                    }
+                    Err(error) => {
+                        SPAWN_WAIT_ERRORS.lock().insert(
+                            cmd_id,
+                            format!("could not confirm systemd-importd transfer state: {error}"),
+                        );
+                    }
+                }
+            });
         }
 
         FdOperation::ImportRawImage(ImportRawImageParams { machine }) => {
@@ -1841,11 +1913,47 @@ static SPAWN_EXIT_CODES: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, i32>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+static SPAWN_WAIT_ERRORS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u64, String>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+static SPAWN_PIDS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<u64, u32>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+static OCI_TRANSFER_CANCELLATIONS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<u64, OciTransferCancellation>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn stop_unhanded_command(child: &mut std::process::Child, cmd_id: u64, label: &str) {
+    let pid = child.id();
+    if let Err(error) = crate::nspawn::sys::command::signal_process_group(pid, libc::SIGKILL) {
+        log::error!("Daemon: failed to stop unhanded {label} command {cmd_id}: {error}");
+    }
+    if let Err(error) = child.wait() {
+        log::error!("Daemon: failed to wait for unhanded {label} command {cmd_id}: {error}");
+    }
+    SPAWN_PIDS.lock().remove(&cmd_id);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
+
+    #[test]
+    fn unhanded_command_is_stopped_and_reaped() {
+        let cmd_id = u64::MAX;
+        let mut command = crate::nspawn::sys::new_sync_command("sh");
+        command.args(["-c", "exec sleep 30"]).process_group(0);
+        let mut child = command.spawn().unwrap();
+        SPAWN_PIDS.lock().insert(cmd_id, child.id());
+
+        stop_unhanded_command(&mut child, cmd_id, "test");
+
+        assert!(child.try_wait().unwrap().is_some());
+        assert!(!SPAWN_PIDS.lock().contains_key(&cmd_id));
+    }
 
     #[test]
     fn daemon_bootstrap_carries_the_selected_transport_mode() {

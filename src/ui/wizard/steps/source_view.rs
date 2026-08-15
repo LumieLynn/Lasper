@@ -427,7 +427,7 @@ fn source_kind_column_width(kinds: &[SourceKind]) -> usize {
 
 fn source_kind_description(kind: &SourceKind) -> &'static str {
     match kind {
-        SourceKind::Copy => "existing container",
+        SourceKind::Copy => "existing image",
         SourceKind::Oci => "systemd 260+ experimental",
         SourceKind::Debootstrap => "Debian or Ubuntu",
         SourceKind::Pacstrap => "Arch Linux",

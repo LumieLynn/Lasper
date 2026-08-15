@@ -3,15 +3,15 @@ pub use crate::nspawn::adapters::config::builder::{
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };
 use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
-use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
 use crate::nspawn::models::{
     BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
 };
+use crate::nspawn::models::{ContainerEntry, ImageEntry};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
-use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
+use crate::nspawn::ops::provision::{DeployLogEvent, Deployer, DeploymentCancellation};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::ExecutionContext;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -431,6 +431,9 @@ pub struct DeployState {
     pub log_rx: RefCell<Option<broadcast::Receiver<DeployLogEvent>>>,
     pub done: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
+    pub cancelled: Arc<AtomicBool>,
+    pub rolling_back: Arc<AtomicBool>,
+    pub cancellation: DeploymentCancellation,
 }
 
 impl Clone for DeployState {
@@ -440,6 +443,9 @@ impl Clone for DeployState {
             log_rx: RefCell::new(Some(self.log_tx.subscribe())),
             done: self.done.clone(),
             success: self.success.clone(),
+            cancelled: self.cancelled.clone(),
+            rolling_back: self.rolling_back.clone(),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -455,6 +461,8 @@ impl std::fmt::Debug for DeployState {
         f.debug_struct("DeployState")
             .field("done", &self.done)
             .field("success", &self.success)
+            .field("cancelled", &self.cancelled)
+            .field("rolling_back", &self.rolling_back)
             .finish_non_exhaustive()
     }
 }
@@ -471,7 +479,7 @@ pub struct WizardContext {
     pub review: ReviewState,
     pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
-    pub image_names: Vec<String>,
+    pub images: Vec<ImageEntry>,
     pub xdg_runtime: Option<String>,
     pub permission_level: PermissionLevel,
     pub exec_ctx: Arc<ExecutionContext>,
@@ -480,7 +488,7 @@ pub struct WizardContext {
 impl WizardContext {
     pub async fn new(
         entries: Vec<ContainerEntry>,
-        image_names: Vec<String>,
+        images: Vec<ImageEntry>,
         permission_level: PermissionLevel,
         exec_ctx: Arc<ExecutionContext>,
         config: Arc<crate::config::AppConfig>,
@@ -537,7 +545,10 @@ impl WizardContext {
                 dnf_releasever: dnf_prefill.releasever,
                 dnf_pkgs: dnf_prefill.packages.join(" "),
                 local_path: artifact_prefill,
-                clone_source: entries.first().map(|e| e.name.clone()).unwrap_or_default(),
+                clone_source: images
+                    .first()
+                    .map(|image| image.name.clone())
+                    .unwrap_or_default(),
                 pull_url: "".to_string(),
                 is_pull_raw: false,
                 copy_idx: 0,
@@ -617,10 +628,13 @@ impl WizardContext {
                     log_rx: RefCell::new(Some(log_rx)),
                     done: Arc::new(AtomicBool::new(false)),
                     success: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    rolling_back: Arc::new(AtomicBool::new(false)),
+                    cancellation: DeploymentCancellation::default(),
                 }
             },
             entries,
-            image_names,
+            images,
             xdg_runtime,
             permission_level,
             exec_ctx,

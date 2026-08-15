@@ -4,6 +4,29 @@ use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+fn quit_confirmation_message(terminal_sessions: usize, host_operations: usize) -> Option<String> {
+    if terminal_sessions == 0 && host_operations == 0 {
+        return None;
+    }
+
+    let mut warnings = Vec::new();
+    if terminal_sessions > 0 {
+        warnings.push(format!(
+            "{terminal_sessions} active terminal session{} will be terminated.",
+            if terminal_sessions == 1 { "" } else { "s" }
+        ));
+    }
+    if host_operations > 0 {
+        warnings.push(format!(
+            "{host_operations} host operation{} still running. Quitting now may interrupt {} and leave partial host changes.",
+            if host_operations == 1 { " is" } else { "s are" },
+            if host_operations == 1 { "it" } else { "them" }
+        ));
+    }
+    warnings.push("Quit anyway?".to_string());
+    Some(warnings.join("\n"))
+}
+
 // Top-level dispatch
 //
 // handle_key is now a thin chain of mode-specific handlers.  Each handler
@@ -276,18 +299,27 @@ impl App {
 // Layer 4: global shortcuts
 
 impl App {
+    fn request_quit(&mut self) {
+        let message = quit_confirmation_message(
+            self.data.terminal.sessions.len(),
+            self.data.exec_ctx.host_operations.active_count(),
+        );
+        if let Some(message) = message {
+            self.ui.quit_dialog = Some(
+                crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                    "Quit Lasper?",
+                    message,
+                ),
+            );
+        } else {
+            self.signal_quit();
+        }
+    }
+
     async fn handle_global_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
             KeyCode::Char('q') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if !self.data.terminal.sessions.is_empty() {
-                    self.ui.quit_dialog =
-                        Some(crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
-                            "Quit Lasper?",
-                            "Active terminal sessions are still running.\nQuit and terminate all logins?",
-                        ));
-                } else {
-                    self.signal_quit();
-                }
+                self.request_quit();
                 true
             }
             KeyCode::Char('?') => {
@@ -456,11 +488,7 @@ impl App {
         if let Some(tx) = &self.ui.backend_tx {
             let mut wizard = crate::ui::wizard::Wizard::new(
                 self.data.entries.clone(),
-                self.data
-                    .images
-                    .iter()
-                    .map(|image| image.name.clone())
-                    .collect(),
+                self.data.images.clone(),
                 nvidia_installed,
                 tx.clone(),
                 self.permissions.level(),
@@ -684,5 +712,25 @@ impl App {
             return true;
         }
         self.ui.power_menu.is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quit_confirmation_message;
+
+    #[test]
+    fn quit_without_live_resources_needs_no_confirmation() {
+        assert_eq!(quit_confirmation_message(0, 0), None);
+    }
+
+    #[test]
+    fn quit_warning_combines_terminals_and_host_operations() {
+        let message = quit_confirmation_message(2, 1).unwrap();
+
+        assert!(message.contains("2 active terminal sessions will be terminated."));
+        assert!(message.contains("1 host operation is still running."));
+        assert!(message.contains("leave partial host changes"));
+        assert!(message.ends_with("Quit anyway?"));
     }
 }

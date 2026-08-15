@@ -32,27 +32,39 @@ impl AsyncLockedWriter {
     where
         F: FnOnce(Option<String>) -> Result<String>,
     {
-        Self::write_locked_inner(path, None, content_generator).await
+        Self::apply_locked_inner(path, None, move |existing| {
+            content_generator(existing).map(|content| (Some(content), ()))
+        })
+        .await
     }
 
-    pub async fn write_locked_with_mode<F>(
+    /// Applies a locked update and returns a typed result. `None` keeps the
+    /// existing file byte-for-byte without an atomic rewrite.
+    pub async fn apply_locked<T, F>(path: &Path, content_generator: F) -> Result<T>
+    where
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
+    {
+        Self::apply_locked_inner(path, None, content_generator).await
+    }
+
+    pub async fn apply_locked_with_mode<T, F>(
         path: &Path,
         mode: u32,
         content_generator: F,
-    ) -> Result<()>
+    ) -> Result<T>
     where
-        F: FnOnce(Option<String>) -> Result<String>,
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
     {
-        Self::write_locked_inner(path, Some(mode), content_generator).await
+        Self::apply_locked_inner(path, Some(mode), content_generator).await
     }
 
-    async fn write_locked_inner<F>(
+    async fn apply_locked_inner<T, F>(
         path: &Path,
         mode: Option<u32>,
         content_generator: F,
-    ) -> Result<()>
+    ) -> Result<T>
     where
-        F: FnOnce(Option<String>) -> Result<String>,
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
     {
         let path_buf = path.to_path_buf();
         let lock_path = lock_path_for(path);
@@ -100,7 +112,11 @@ impl AsyncLockedWriter {
         };
 
         // Mutate
-        let new_content = content_generator(existing_content)?;
+        let (new_content, result) = content_generator(existing_content)?;
+
+        let Some(new_content) = new_content else {
+            return Ok(result);
+        };
 
         // Atomic update with durability
         {
@@ -141,7 +157,7 @@ impl AsyncLockedWriter {
         // concurrent process to open a new inode while another process still
         // holds a lock on the old, unlinked inode.
 
-        Ok(())
+        Ok(result)
     }
 
     /// Safely writes content to a file using atomic rename and fsync to ensure durability.

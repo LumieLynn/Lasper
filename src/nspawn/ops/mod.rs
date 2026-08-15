@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod handlers;
 pub mod inspect;
 pub mod manager;
@@ -5,6 +6,7 @@ pub mod permission;
 pub mod provision;
 pub mod system_operation;
 
+pub use activity::HostOperationTracker;
 pub use manager::{DefaultManager, NspawnManager};
 pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
 pub use system_operation::SystemOperationStore;
@@ -24,6 +26,7 @@ pub enum BackendResponse {
     ValidationWarning(String),
     DeployStarted,
     DeployFailed(String),
+    DeployCancelled(String),
     HardwareDiscovered {
         nvidia_state: crate::nspawn::platform::nvidia::state::NvidiaState,
         nvidia_devices: Vec<String>,

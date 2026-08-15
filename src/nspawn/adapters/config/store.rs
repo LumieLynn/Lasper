@@ -3,7 +3,7 @@ use crate::nspawn::adapters::config::nspawn_file::{
 };
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
+    ApplyStatus, ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
 };
 use crate::nspawn::platform::nvidia::NvidiaState;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
@@ -55,33 +55,30 @@ impl NspawnConfigStore {
         config: &ContainerConfig,
         xdg_runtime: Option<&str>,
         nvidia_state: Option<&NvidiaState>,
-    ) -> Result<()> {
+    ) -> Result<ApplyStatus> {
         let spec = NspawnConfigSpec::try_from(config)?;
-        self.execute(NspawnConfigOperation::Write(WriteNspawnConfig {
-            spec,
-            xdg_runtime: xdg_runtime.map(str::to_string),
-            nvidia_state: nvidia_state.cloned(),
-        }))
-        .await?;
-        Ok(())
+        let result = self
+            .execute(NspawnConfigOperation::Write(WriteNspawnConfig {
+                spec,
+                xdg_runtime: xdg_runtime.map(str::to_string),
+                nvidia_state: nvidia_state.cloned(),
+            }))
+            .await?;
+        result
+            .apply
+            .ok_or_else(|| NspawnError::Runtime("nspawn write returned no apply status".into()))
     }
 
-    pub async fn clone_config(&self, source: &str, destination: &str) -> Result<()> {
-        self.execute(NspawnConfigOperation::Clone(CloneNspawnConfig {
-            source: parse_machine_name(source)?,
-            destination: parse_machine_name(destination)?,
-        }))
-        .await?;
-        Ok(())
-    }
-
-    pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<()> {
-        self.execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
-            machine: parse_machine_name(name)?,
-            network,
-        }))
-        .await?;
-        Ok(())
+    pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<ApplyStatus> {
+        let result = self
+            .execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
+                machine: parse_machine_name(name)?,
+                network,
+            }))
+            .await?;
+        result
+            .apply
+            .ok_or_else(|| NspawnError::Runtime("OCI promotion returned no apply status".into()))
     }
 
     pub async fn prepare_oci_promotion(&self, name: &str) -> Result<()> {
@@ -145,7 +142,6 @@ pub(crate) enum NspawnConfigOperation {
     Write(WriteNspawnConfig),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
-    Clone(CloneNspawnConfig),
     UpdateGpu(UpdateNspawnGpu),
     Remove(RemoveNspawnConfig),
 }
@@ -185,13 +181,6 @@ pub(crate) struct PrepareOciPromotion {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CloneNspawnConfig {
-    source: MachineName,
-    destination: MachineName,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(crate) struct UpdateNspawnGpu {
     machine: MachineName,
     state: NvidiaState,
@@ -202,6 +191,8 @@ pub(crate) struct UpdateNspawnGpu {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NspawnConfigResult {
     content: Option<NspawnConfigInspection>,
+    #[serde(default)]
+    apply: Option<ApplyStatus>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -235,13 +226,15 @@ pub(crate) async fn execute_nspawn_config_operation(
             let path = nspawn_path(&request.machine);
             Ok(NspawnConfigResult {
                 content: read_config_at(&path).await?,
+                ..Default::default()
             })
         }
         NspawnConfigOperation::Inspect(request) => Ok(NspawnConfigResult {
             content: read_discovered_config(&request.image).await?,
+            ..Default::default()
         }),
         NspawnConfigOperation::Write(request) => {
-            write_generated_at(
+            let apply = write_generated_at(
                 &nspawn_path(&request.spec.machine),
                 &request.spec,
                 request.xdg_runtime.as_deref(),
@@ -249,10 +242,13 @@ pub(crate) async fn execute_nspawn_config_operation(
                 invoking_uid,
             )
             .await?;
-            Ok(NspawnConfigResult::default())
+            Ok(NspawnConfigResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
         }
         NspawnConfigOperation::PromoteOci(request) => {
-            promote_oci_config(
+            let apply = promote_new_oci_config(
                 &request.machine,
                 request.network,
                 &crate::paths::machines_dir(),
@@ -260,7 +256,10 @@ pub(crate) async fn execute_nspawn_config_operation(
                 Path::new("/run/systemd/nspawn"),
             )
             .await?;
-            Ok(NspawnConfigResult::default())
+            Ok(NspawnConfigResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
         }
         NspawnConfigOperation::PrepareOciPromotion(request) => {
             validate_oci_promotion_target(
@@ -269,14 +268,6 @@ pub(crate) async fn execute_nspawn_config_operation(
                 Path::new("/run/systemd/nspawn"),
             )
             .await?;
-            Ok(NspawnConfigResult::default())
-        }
-        NspawnConfigOperation::Clone(request) => {
-            let source = nspawn_path(&request.source);
-            if let Some(content) = read_optional(&source).await? {
-                validate_content_size(&content)?;
-                write_content(&nspawn_path(&request.destination), content).await?;
-            }
             Ok(NspawnConfigResult::default())
         }
         NspawnConfigOperation::UpdateGpu(request) => {
@@ -385,46 +376,80 @@ async fn remove_config_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn write_content(path: &Path, content: String) -> Result<()> {
-    AsyncLockedWriter::write_locked(path, move |_| Ok(content)).await
+async fn apply_new_content_at(
+    path: &Path,
+    content: String,
+    mode: Option<u32>,
+) -> Result<ApplyStatus> {
+    let apply = move |existing: Option<String>| {
+        Ok(match existing {
+            None => (Some(content), ApplyStatus::Created),
+            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+        })
+    };
+    match mode {
+        Some(mode) => AsyncLockedWriter::apply_locked_with_mode(path, mode, apply).await,
+        None => AsyncLockedWriter::apply_locked(path, apply).await,
+    }
 }
 
+#[cfg(test)]
 async fn promote_oci_config(
     machine: &MachineName,
     network: OciNetworkMode,
     machines_dir: &Path,
     admin_dir: &Path,
     runtime_dir: &Path,
-) -> Result<()> {
+) -> Result<ApplyStatus> {
+    promote_oci_config_inner(machine, network, machines_dir, admin_dir, runtime_dir, true).await
+}
+
+async fn promote_new_oci_config(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<ApplyStatus> {
+    promote_oci_config_inner(
+        machine,
+        network,
+        machines_dir,
+        admin_dir,
+        runtime_dir,
+        false,
+    )
+    .await
+}
+
+async fn promote_oci_config_inner(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+    replace_owned: bool,
+) -> Result<ApplyStatus> {
     validate_oci_promotion_target(machine, admin_dir, runtime_dir).await?;
     let filename = format!("{}.nspawn", machine.as_str());
     let source = machines_dir.join(&filename);
     let destination = admin_dir.join(filename);
     let source_content = read_trusted_oci_config(&source).await?;
 
-    if let Some(existing) = read_optional(&destination).await? {
-        validate_content_size(&existing)?;
-        if existing.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
-            return Err(NspawnError::Validation(format!(
-                "Refusing to replace existing administrator configuration: {}",
-                destination.display()
-            )));
-        }
-    }
-
-    let destination_display = destination.display().to_string();
-    AsyncLockedWriter::write_locked_with_mode(&destination, 0o640, move |existing| {
-        match existing {
-            Some(existing) if existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) => {}
-            Some(_) => {
-                return Err(NspawnError::Validation(format!(
-                    "Refusing to replace existing administrator configuration: {}",
-                    destination_display
-                )))
+    let content = promote_oci_content(&source_content, network)?;
+    validate_content_size(&content)?;
+    AsyncLockedWriter::apply_locked_with_mode(&destination, 0o640, move |existing| {
+        Ok(match existing {
+            None => (Some(content), ApplyStatus::Created),
+            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(existing)
+                if replace_owned && existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) =>
+            {
+                (Some(content), ApplyStatus::ReplacedOwned)
             }
-            None => {}
-        }
-        promote_oci_content(&source_content, network)
+            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+        })
     })
     .await
 }
@@ -656,7 +681,7 @@ async fn write_generated_at(
     xdg_runtime: Option<&str>,
     nvidia_state: Option<&NvidiaState>,
     invoking_uid: u32,
-) -> Result<()> {
+) -> Result<ApplyStatus> {
     spec.validate()?;
     validate_custom_bind_sources(spec).await?;
     let wayland_socket = validate_wayland_runtime(spec, xdg_runtime, invoking_uid).await?;
@@ -673,7 +698,7 @@ async fn write_generated_at(
         content = NspawnConfig::apply_gpu_passthrough_to_content(content, state, &[])?;
     }
     validate_content_size(&content)?;
-    write_content(path, content).await
+    apply_new_content_at(path, content, None).await
 }
 
 async fn validate_custom_bind_sources(spec: &NspawnConfigSpec) -> Result<()> {
@@ -991,7 +1016,7 @@ Unknown=preserve-me\n";
         .unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
 
-        promote_oci_config(
+        let first_apply = promote_oci_config(
             &machine,
             OciNetworkMode::Host,
             machines.path(),
@@ -1000,6 +1025,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
+        assert_eq!(first_apply, ApplyStatus::Created);
         let first = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(first.contains("PrivateUsers=no"));
         assert!(first.contains("ResolvConf=bind-host"));
@@ -1023,7 +1049,7 @@ Unknown=preserve-me\n";
         .await
         .unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
-        promote_oci_config(
+        let second_apply = promote_oci_config(
             &machine,
             OciNetworkMode::Veth,
             machines.path(),
@@ -1032,6 +1058,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
+        assert_eq!(second_apply, ApplyStatus::ReplacedOwned);
         let second = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(second.contains("PrivateUsers=no"));
         assert!(second.contains("ResolvConf=off"));
@@ -1199,14 +1226,32 @@ Unknown=preserve-me\n";
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
 
-        write_generated_at(&path, &spec, None, None, uzers::get_current_uid())
+        let created = write_generated_at(&path, &spec, None, None, uzers::get_current_uid())
             .await
             .unwrap();
+        assert_eq!(created, ApplyStatus::Created);
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Boot=yes"));
         assert!(content.contains("Hostname=test-host"));
         assert!(crate::nspawn::sys::io::lock_path_for(&path).exists());
+
+        let unchanged = write_generated_at(&path, &spec, None, None, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(unchanged, ApplyStatus::Unchanged);
+
+        let different = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "test".into(),
+            hostname: "different".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let conflict = write_generated_at(&path, &different, None, None, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(conflict, ApplyStatus::ConflictUnknownOwner);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
     }
 
     #[tokio::test]

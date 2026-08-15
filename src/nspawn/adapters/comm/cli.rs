@@ -628,7 +628,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clone_rejects_invalid_machine_name_before_machinectl() {
+    async fn test_clone_rejects_invalid_image_name_before_machinectl() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
             r.expect_run().never();

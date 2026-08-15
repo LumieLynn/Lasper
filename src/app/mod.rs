@@ -531,12 +531,7 @@ impl App {
 
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.entries = self.data.entries.clone();
-            wizard.context.image_names = self
-                .data
-                .images
-                .iter()
-                .map(|image| image.name.clone())
-                .collect();
+            wizard.context.images = self.data.images.clone();
         }
 
         // Check if any DBus call fell back to CLI during this background refresh
@@ -593,12 +588,7 @@ impl App {
             self.refresh_detail().await;
         }
         if let Some(wizard) = &mut self.ui.wizard {
-            wizard.context.image_names = self
-                .data
-                .images
-                .iter()
-                .map(|image| image.name.clone())
-                .collect();
+            wizard.context.images = self.data.images.clone();
         }
     }
 
@@ -1008,11 +998,14 @@ mod tests {
                 vec![make_entry("test", ContainerState::Starting)]
             );
             assert!(app.data.transitions.contains_key("test"));
+            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 1);
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("start task should finish")
                 .expect("start task should report a result");
+            tokio::task::yield_now().await;
+            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
                 AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)

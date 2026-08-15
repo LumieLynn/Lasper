@@ -67,11 +67,16 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 
             let done = ctx.deploy.done.clone();
             let success = ctx.deploy.success.clone();
+            let cancelled = ctx.deploy.cancelled.clone();
+            let rolling_back = ctx.deploy.rolling_back.clone();
+            let cancellation = ctx.deploy.cancellation.clone();
 
             // Run the real deployment
             let tx_panic = tx.clone();
             let tx_deploy = tx.clone();
+            let operation = exec_ctx.host_operations.begin();
             let deploy_handle = tokio::spawn(async move {
+                let _operation = operation;
                 crate::nspawn::ops::provision::run_deploy_task(
                     deployer,
                     storage,
@@ -82,6 +87,9 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     log_mpsc_tx,
                     done,
                     success,
+                    cancelled,
+                    rolling_back,
+                    cancellation,
                     tx_deploy,
                 )
                 .await;

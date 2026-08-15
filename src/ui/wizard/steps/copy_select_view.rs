@@ -1,6 +1,6 @@
-use crate::nspawn::ContainerEntry;
+use crate::nspawn::ImageEntry;
 use crate::ui::core::{Component, EventResult};
-use crate::ui::widgets::lists::shared_container_list::SharedContainerList;
+use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::wizard::context::WizardContext;
 use crate::ui::wizard::steps::StepComponent;
 
@@ -8,16 +8,28 @@ use crossterm::event::KeyEvent;
 use ratatui::{layout::Rect, Frame};
 
 pub struct CopySelectStepView {
-    list: SharedContainerList,
-    items_len: usize,
+    list: SelectableList<ImageEntry>,
     focused: bool,
 }
 
 impl CopySelectStepView {
-    pub fn new(entries: &[ContainerEntry], initial_cursor: usize) -> Self {
+    pub fn new(images: &[ImageEntry], initial_cursor: usize) -> Self {
+        let mut list = SelectableList::new(
+            " Select image to clone ",
+            images.to_vec(),
+            |image: &ImageEntry| {
+                format!(
+                    "◆ {} ({}){}",
+                    image.name,
+                    image.image_type,
+                    if image.readonly { " [ro]" } else { "" }
+                )
+            },
+        );
+        list.select(initial_cursor.min(images.len().saturating_sub(1)));
+        list.set_focus(true);
         Self {
-            list: SharedContainerList::new(" Select container to clone ", initial_cursor),
-            items_len: entries.len(),
+            list,
             focused: true,
         }
     }
@@ -29,11 +41,7 @@ impl Component for CopySelectStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        if self.list.handle_key(key, self.items_len) {
-            EventResult::Consumed
-        } else {
-            EventResult::Ignored
-        }
+        self.list.handle_key(key)
     }
 
     fn set_focus(&mut self, focused: bool) {
@@ -46,11 +54,11 @@ impl Component for CopySelectStepView {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        if self.items_len == 0 {
-            return Err("No containers available to clone".to_string());
+        if self.list.items().is_empty() {
+            return Err("No images available to clone".to_string());
         }
-        if self.list.selected_idx().is_none() {
-            return Err("Please select a container".to_string());
+        if self.list.selected_item().is_none() {
+            return Err("Please select an image".to_string());
         }
         Ok(())
     }
@@ -60,22 +68,19 @@ impl StepComponent for CopySelectStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         if let Some(idx) = self.list.selected_idx() {
             ctx.source.copy_idx = idx;
-            if let Some(entry) = ctx.entries.get(idx) {
-                ctx.source.clone_source = entry.name.clone();
+            if let Some(image) = self.list.selected_item() {
+                ctx.source.clone_source = image.name.clone();
             }
         }
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
-        self.items_len = context.entries.len();
-
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .margin(1)
             .constraints([ratatui::layout::Constraint::Min(0)])
             .split(area);
 
-        // Zero-copy rendering!
-        self.list.render(f, chunks[0], &context.entries, false);
+        self.list.render(f, chunks[0]);
     }
 }

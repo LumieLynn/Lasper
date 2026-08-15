@@ -1,6 +1,7 @@
 //! Command builder helpers.
 
 use std::future::Future;
+use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
 
@@ -9,17 +10,40 @@ use std::process::{ExitStatus, Output, Stdio};
 pub struct SpawnedProcess {
     pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
     wait_fn: Option<Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send>>>,
+    signal_fn: Option<SignalFn>,
+    completion_wins_cancellation: bool,
 }
 
+type SignalFn = std::sync::Arc<
+    dyn Fn(i32) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> + Send + Sync,
+>;
+
 impl SpawnedProcess {
-    pub fn new(
+    pub fn new_cancellable(
         stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
         wait_fn: impl Future<Output = std::io::Result<ExitStatus>> + Send + 'static,
+        signal_fn: impl Fn(i32) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
         Self {
             stdout,
             wait_fn: Some(Box::pin(wait_fn)),
+            signal_fn: Some(std::sync::Arc::new(signal_fn)),
+            completion_wins_cancellation: false,
         }
+    }
+
+    /// Marks operations whose authoritative backend may complete while a
+    /// cancellation request is racing with its final completion signal.
+    pub(crate) fn with_completion_wins_cancellation(mut self) -> Self {
+        self.completion_wins_cancellation = true;
+        self
+    }
+
+    pub(crate) fn completion_wins_cancellation(&self) -> bool {
+        self.completion_wins_cancellation
     }
 
     pub async fn wait(mut self) -> std::io::Result<ExitStatus> {
@@ -30,6 +54,61 @@ impl SpawnedProcess {
         drop(self.stdout);
 
         self.wait_fn.take().unwrap().await
+    }
+
+    pub async fn terminate_and_wait(self) -> std::io::Result<ExitStatus> {
+        const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+        let signal = self.signal_fn.clone().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "spawned command does not support cancellation",
+            )
+        })?;
+        if let Err(signal_error) = signal(libc::SIGTERM).await {
+            // A failed signal request does not prove that the child is still
+            // running. Waiting is the only safe way to establish its state.
+            return tokio::time::timeout(STOP_TIMEOUT, self.wait())
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "termination request failed ({signal_error}) and process exit was not confirmed"
+                        ),
+                    )
+                })?;
+        }
+
+        let mut wait = Box::pin(self.wait());
+        match tokio::time::timeout(STOP_TIMEOUT, &mut wait).await {
+            Ok(status) => status,
+            Err(_) => {
+                signal(libc::SIGKILL).await?;
+                tokio::time::timeout(STOP_TIMEOUT, wait)
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "process exit was not confirmed after SIGKILL",
+                        )
+                    })?
+            }
+        }
+    }
+}
+
+pub(crate) fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()> {
+    let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 }
 
@@ -58,18 +137,24 @@ impl CommandRunner for DefaultCommandRunner {
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
         let mut argv = vec![program.to_string()];
         argv.extend(args);
-        let mut child = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg("exec \"$@\" 2>&1")
             .arg("--")
             .args(&argv)
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()?;
+            .kill_on_drop(true);
+        command.as_std_mut().process_group(0);
+        let mut child = command.spawn()?;
+        let pid = child.id().expect("spawned command has pid");
         let stdout = Box::new(child.stdout.take().expect("stdout piped"));
-        Ok(SpawnedProcess::new(stdout, async move {
-            child.wait_with_output().await.map(|o| o.status)
-        }))
+        Ok(SpawnedProcess::new_cancellable(
+            stdout,
+            async move { child.wait_with_output().await.map(|o| o.status) },
+            move |signal| Box::pin(async move { signal_process_group(pid, signal) }),
+        ))
     }
 }
 
@@ -137,5 +222,49 @@ impl CommandLogged for tokio::process::Command {
         let output = self.output().await?;
         log_output(label, &output);
         Ok(output)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[tokio::test]
+    async fn cancellable_process_waits_for_its_process_group_to_exit() {
+        let spawned = DefaultCommandRunner
+            .spawn("sh", vec!["-c".into(), "echo ready; sleep 30".into()])
+            .await
+            .unwrap();
+
+        let status = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            spawned.terminate_and_wait(),
+        )
+        .await
+        .expect("cancelled process did not exit")
+        .unwrap();
+
+        assert!(!status.success());
+    }
+
+    #[tokio::test]
+    async fn failed_termination_request_still_waits_for_a_confirmed_exit() {
+        let spawned = SpawnedProcess::new_cancellable(
+            Box::new(tokio::io::empty()),
+            async { Ok(ExitStatus::from_raw(0)) },
+            |_| {
+                Box::pin(async {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "signal rejected",
+                    ))
+                })
+            },
+        );
+
+        let status = spawned.terminate_and_wait().await.unwrap();
+
+        assert!(status.success());
     }
 }

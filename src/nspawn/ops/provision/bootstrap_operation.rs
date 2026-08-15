@@ -41,14 +41,22 @@ impl BootstrapStore {
                 .map_err(|error| NspawnError::Io(PathBuf::from("bootstrap"), error))?;
             let receiver = crate::nspawn::sys::daemon::pipe_reader(stdout_fd)
                 .map_err(|error| NspawnError::Io(PathBuf::from("bootstrap"), error))?;
-            let daemon = daemon.clone();
-            Ok(SpawnedProcess::new(Box::new(receiver), async move {
-                let code = daemon
-                    .wait_command(cmd_id)
-                    .await
-                    .map_err(|error| std::io::Error::other(error.to_string()))?;
-                Ok(std::os::unix::process::ExitStatusExt::from_raw(code))
-            }))
+            let wait_daemon = daemon.clone();
+            let signal_daemon = daemon.clone();
+            Ok(SpawnedProcess::new_cancellable(
+                Box::new(receiver),
+                async move {
+                    let code = wait_daemon
+                        .wait_command(cmd_id)
+                        .await
+                        .map_err(|error| std::io::Error::other(error.to_string()))?;
+                    Ok(std::os::unix::process::ExitStatusExt::from_raw(code))
+                },
+                move |signal| {
+                    let daemon = signal_daemon.clone();
+                    Box::pin(async move { daemon.signal_command(cmd_id, signal).await })
+                },
+            ))
         } else {
             let signature_style = self.probe_debootstrap_signature_style(&request).await?;
             let (program, args) = build_command(&request, signature_style)?;

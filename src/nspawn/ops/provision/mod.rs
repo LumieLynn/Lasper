@@ -12,7 +12,7 @@ pub use oci_operation::OciPullStore;
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, NetworkMode};
+use crate::nspawn::models::{ApplyStatus, ContainerConfig, NetworkMode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -38,48 +38,140 @@ pub enum DeployLogEvent {
     Progress(DeployProgress),
 }
 
-/// Side effects that a provider successfully created during deployment.
-///
-/// A receipt is deliberately returned only after the provider operation has
-/// completed successfully.  If an operation fails part-way through, the
-/// ownership is unknown and rollback must not destroy a pre-existing image.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct DeploymentReceipt {
-    owns_external_image: bool,
+#[derive(Clone, Debug, Default)]
+pub struct DeploymentCancellation {
+    requested: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl DeploymentCancellation {
+    pub fn request(&self) {
+        if !self.requested.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub fn checkpoint(&self) -> Result<()> {
+        if self.is_requested() {
+            Err(NspawnError::DeploymentCancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.is_requested() {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StorageRollback {
-    Local,
-    ExternalOwned,
-    ExternalUnknown,
+pub(crate) enum AppliedResource {
+    LocalStorage,
+    ExternalImage,
+    NvidiaState,
+    NspawnConfig,
+    SystemdOverride,
 }
 
-impl DeploymentReceipt {
-    pub const fn none() -> Self {
-        Self {
-            owns_external_image: false,
+impl AppliedResource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LocalStorage => "local storage",
+            Self::ExternalImage => "external image",
+            Self::NvidiaState => "NVIDIA state",
+            Self::NspawnConfig => ".nspawn configuration",
+            Self::SystemdOverride => "systemd service override",
         }
-    }
-
-    pub const fn external_image() -> Self {
-        Self {
-            owns_external_image: true,
-        }
-    }
-
-    pub const fn owns_external_image(self) -> bool {
-        self.owns_external_image
     }
 }
 
-fn storage_rollback(is_external: bool, receipt: DeploymentReceipt) -> StorageRollback {
-    if !is_external {
-        StorageRollback::Local
-    } else if receipt.owns_external_image() {
-        StorageRollback::ExternalOwned
-    } else {
-        StorageRollback::ExternalUnknown
+#[derive(Debug, Default)]
+pub(crate) struct ApplyReport {
+    resources: Vec<AppliedResource>,
+    external_image_blockers: Vec<String>,
+    storage_removal_blockers: Vec<String>,
+}
+
+impl ApplyReport {
+    pub(crate) fn record_created(&mut self, resource: AppliedResource) {
+        if !self.resources.contains(&resource) {
+            self.resources.push(resource);
+        }
+    }
+
+    pub(crate) fn record_apply(
+        &mut self,
+        resource: AppliedResource,
+        status: ApplyStatus,
+    ) -> Result<()> {
+        match status {
+            ApplyStatus::Created => {
+                self.record_created(resource);
+                Ok(())
+            }
+            ApplyStatus::Unchanged => {
+                if resource == AppliedResource::NspawnConfig {
+                    self.external_image_blockers
+                        .push("an unchanged .nspawn configuration predates this deployment".into());
+                }
+                Ok(())
+            }
+            ApplyStatus::ReplacedOwned => {
+                if resource == AppliedResource::NspawnConfig {
+                    self.external_image_blockers
+                        .push("a replaced .nspawn configuration cannot be restored".into());
+                }
+                Err(NspawnError::Runtime(format!(
+                    "Deployment cannot roll back replaced {} without its previous content",
+                    resource.label()
+                )))
+            }
+            ApplyStatus::ConflictUnknownOwner => {
+                if resource == AppliedResource::NspawnConfig {
+                    self.external_image_blockers
+                        .push("an existing .nspawn configuration has unknown ownership".into());
+                }
+                Err(NspawnError::Validation(format!(
+                    "Refusing to replace existing {} with unknown ownership",
+                    resource.label()
+                )))
+            }
+        }
+    }
+
+    fn owns(&self, resource: AppliedResource) -> bool {
+        self.resources.contains(&resource)
+    }
+
+    fn block_storage_removal(&mut self, reason: impl Into<String>) {
+        self.storage_removal_blockers.push(reason.into());
+    }
+
+    pub(crate) fn block_external_image_removal(&mut self, reason: impl Into<String>) {
+        self.external_image_blockers.push(reason.into());
+    }
+
+    fn removal_blockers(&self, resource: AppliedResource) -> Vec<&str> {
+        let external = if resource == AppliedResource::ExternalImage {
+            self.external_image_blockers.as_slice()
+        } else {
+            &[]
+        };
+        external
+            .iter()
+            .chain(&self.storage_removal_blockers)
+            .map(String::as_str)
+            .collect()
     }
 }
 
@@ -103,7 +195,9 @@ pub trait Deployer: Send + Sync {
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<DeploymentReceipt>;
+        cancellation: &DeploymentCancellation,
+        report: &mut ApplyReport,
+    ) -> Result<()>;
 
     /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
     fn is_external_storage_managed(&self) -> bool {
@@ -168,6 +262,76 @@ pub(crate) async fn send_deploy_progress(
     let _ = logs.send(DeployLogEvent::Progress(progress)).await;
 }
 
+pub(crate) async fn stream_deploy_command(
+    mut spawned: crate::nspawn::sys::command::SpawnedProcess,
+    logs: &Sender<DeployLogEvent>,
+    cancellation: &DeploymentCancellation,
+    label: &str,
+) -> Result<std::process::ExitStatus> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut cancelled = false;
+    let mut stream_error = None;
+    {
+        let mut lines = tokio::io::BufReader::new(&mut spawned.stdout).lines();
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    cancelled = true;
+                    break;
+                }
+                line = lines.next_line() => {
+                    match line {
+                        Ok(Some(line)) => send_deploy_stream_log(logs, line).await,
+                        Ok(None) => break,
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if cancelled || cancellation.is_requested() {
+        send_deploy_log(logs, format!("Stopping {label}...")).await;
+        let completion_wins = spawned.completion_wins_cancellation();
+        let status = spawned
+            .terminate_and_wait()
+            .await
+            .map_err(|error| process_state_unknown(label, error))?;
+        if completion_wins && status.success() {
+            return Ok(status);
+        }
+        return Err(NspawnError::DeploymentCancelled);
+    }
+
+    if let Some(error) = stream_error {
+        send_deploy_log(
+            logs,
+            format!("Stopping {label} after its output stream failed..."),
+        )
+        .await;
+        spawned
+            .terminate_and_wait()
+            .await
+            .map_err(|wait_error| process_state_unknown(label, wait_error))?;
+        return Err(NspawnError::Io(std::path::PathBuf::from(label), error));
+    }
+
+    spawned
+        .wait()
+        .await
+        .map_err(|error| process_state_unknown(label, error))
+}
+
+pub(crate) fn process_state_unknown(label: &str, error: std::io::Error) -> NspawnError {
+    NspawnError::DeploymentProcessStateUnknown(format!(
+        "could not confirm that {label} exited: {error}"
+    ))
+}
+
 /// Orchestrates the asynchronous deployment of a new container.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_deploy_task(
@@ -180,6 +344,9 @@ pub async fn run_deploy_task(
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    rolling_back: Arc<AtomicBool>,
+    cancellation: DeploymentCancellation,
     tx: tokio::sync::mpsc::Sender<AppEvent>,
 ) {
     // 1. Initialize the guard. When this is dropped (at end of function or on panic),
@@ -195,9 +362,12 @@ pub async fn run_deploy_task(
         nvidia_profile,
         exec_ctx,
         logs.clone(),
+        cancellation.clone(),
+        rolling_back,
     )
     .await
     {
+        let was_cancelled = is_cancelled_outcome(&e);
         // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
         // if the log channel happens to be full.
         let err_msg = format!("FATAL ERROR: {}", e);
@@ -213,14 +383,23 @@ pub async fn run_deploy_task(
             }
         }
         success.store(false, Ordering::SeqCst);
-        let _ = tx
-            .send(AppEvent::BackendResult(
-                crate::nspawn::ops::BackendResponse::DeployFailed(e.to_string()),
-            ))
-            .await;
+        cancelled.store(was_cancelled, Ordering::SeqCst);
+        let response = if was_cancelled {
+            crate::nspawn::ops::BackendResponse::DeployCancelled(e.to_string())
+        } else {
+            crate::nspawn::ops::BackendResponse::DeployFailed(e.to_string())
+        };
+        let _ = tx.send(AppEvent::BackendResult(response)).await;
     } else {
         success.store(true, Ordering::SeqCst);
     }
+}
+
+fn is_cancelled_outcome(error: &NspawnError) -> bool {
+    matches!(
+        error,
+        NspawnError::DeploymentCancelled | NspawnError::DeploymentCancellationRollbackIncomplete(_)
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -232,6 +411,8 @@ async fn run_deploy_internal(
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
     logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
+    cancellation: DeploymentCancellation,
+    rolling_back: Arc<AtomicBool>,
 ) -> Result<()> {
     crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
     let system_operations = exec_ctx.system_operations.clone();
@@ -244,34 +425,41 @@ async fn run_deploy_internal(
 
     push_log!(format!("=== Deploying '{}' ===", name));
 
-    // 1. Create storage
     let is_ext = deployer.is_external_storage_managed();
-    let mut receipt = DeploymentReceipt::none();
-    if !is_ext {
-        log::info!(
-            "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
-            name,
-            storage.get_type().label()
-        );
-        push_log!(format!(
-            "Creating storage (type: {:?})...",
-            storage.get_type()
-        ));
-        storage.create(&name).await?;
-    }
-
-    // 2. Deployment & Configuration scoping
+    let mut report = ApplyReport::default();
     let mut raw_mount_target: Option<crate::nspawn::adapters::rootfs::RootfsTarget> = None;
+    let mut storage_mount_attempted = false;
+    let mut external_provider_started = false;
 
     let result = async {
-        // 2. Mount storage (returns rootfs path)
+        cancellation.checkpoint()?;
+        validate_deployment_sidecars(&name, &exec_ctx).await?;
+        cancellation.checkpoint()?;
+
+        if !is_ext {
+            log::info!(
+                "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
+                name,
+                storage.get_type().label()
+            );
+            push_log!(format!(
+                "Creating storage (type: {:?})...",
+                storage.get_type()
+            ));
+            storage.create(&name).await?;
+            report.record_created(AppliedResource::LocalStorage);
+            cancellation.checkpoint()?;
+        }
+
         let rootfs = if !is_ext {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
                 name
             );
             push_log!("Mounting storage...".to_string());
-            storage.mount(&name).await?
+            storage_mount_attempted = true;
+            let rootfs = storage.mount(&name).await?;
+            rootfs
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
             crate::paths::machine_root(&name)
@@ -282,11 +470,23 @@ async fn run_deploy_internal(
             "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
             name
         );
-        receipt = deployer.deploy(&name, &cfg, &rootfs, logs.clone()).await?;
+        external_provider_started = is_ext;
+        deployer
+            .deploy(
+                &name,
+                &cfg,
+                &rootfs,
+                logs.clone(),
+                &cancellation,
+                &mut report,
+            )
+            .await?;
+        cancellation.checkpoint()?;
 
         // 4. Post-deployment configuration
         if !deployer.requires_post_config() {
             log::info!("[AUDIT] [Container: {}] [Step: Config] Skipping post-config for pre-configured clones.", name);
+            cancellation.checkpoint()?;
             return Ok(());
         }
 
@@ -311,6 +511,7 @@ async fn run_deploy_internal(
                     ));
                 }
             }
+            cancellation.checkpoint()?;
         }
 
         let has_os_layout = exec_ctx
@@ -334,6 +535,7 @@ async fn run_deploy_internal(
                     log::warn!("{}", warning);
                     push_log!(warning);
                 }
+                cancellation.checkpoint()?;
             }
 
             for user in &cfg.users {
@@ -346,6 +548,7 @@ async fn run_deploy_internal(
                     log::warn!("{}", warning);
                     push_log!(warning);
                 }
+                cancellation.checkpoint()?;
 
                 if cfg.wayland_socket.is_some() {
                     push_log!(format!("Setting up wayland env for {}...", user.username));
@@ -354,6 +557,7 @@ async fn run_deploy_internal(
                         .rootfs
                         .configure_wayland(&actual_rootfs_target, user, &display)
                         .await?;
+                    cancellation.checkpoint()?;
                 }
             }
         } else if !has_os_layout {
@@ -381,9 +585,12 @@ async fn run_deploy_internal(
             .map_err(|error| {
                 NspawnError::Runtime(format!("NVIDIA CDI discovery failed: {error}"))
             })?;
+            cancellation.checkpoint()?;
 
             // Persist the validated snapshot and its profile for lifecycle diffing.
-            exec_ctx.nvidia_state.write(&name, &state).await?;
+            let state_apply = exec_ctx.nvidia_state.write_initial(&name, &state).await?;
+            report.record_apply(AppliedResource::NvidiaState, state_apply)?;
+            cancellation.checkpoint()?;
 
             // Write ld.so.conf.d and env vars into rootfs (one-time setup)
             if supports_offline_commands {
@@ -413,6 +620,7 @@ async fn run_deploy_internal(
                 push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
             }
             initial_nvidia_state = Some(state);
+            cancellation.checkpoint()?;
         }
 
         if cfg.private_users == Some(crate::nspawn::models::PrivateUsersMode::No) {
@@ -426,7 +634,7 @@ async fn run_deploy_internal(
         }
 
         push_log!("Writing .nspawn config...".to_string());
-        exec_ctx
+        let nspawn_apply = exec_ctx
             .nspawn
             .write_generated(
                 &cfg,
@@ -434,6 +642,8 @@ async fn run_deploy_internal(
                 initial_nvidia_state.as_ref(),
             )
             .await?;
+        report.record_apply(AppliedResource::NspawnConfig, nspawn_apply)?;
+        cancellation.checkpoint()?;
 
         if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
             log::info!(
@@ -441,15 +651,20 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Writing systemd service override...".to_string());
-            exec_ctx.systemd_unit.write_override(
-                &name,
-                &cfg.device_binds,
-                cfg.nvidia_gpu,
-                cfg.graphics_acceleration,
-                cfg.wayland_socket.is_some(),
-            ).await?;
+            let override_apply = exec_ctx
+                .systemd_unit
+                .write_override(
+                    &name,
+                    &cfg.device_binds,
+                    cfg.nvidia_gpu,
+                    cfg.graphics_acceleration,
+                    cfg.wayland_socket.is_some(),
+                )
+                .await?;
+            report.record_apply(AppliedResource::SystemdOverride, override_apply)?;
 
-            let _ = system_operations.reload_daemon().await;
+            system_operations.reload_daemon().await?;
+            cancellation.checkpoint()?;
         }
 
         if supports_offline_commands {
@@ -462,62 +677,93 @@ async fn run_deploy_internal(
                     if let Err(e) = exec_ctx.rootfs.configure_network(&actual_rootfs_target).await {
                         push_log!(format!("WARNING: {} (might not be a systemd container)", e));
                     }
+                    cancellation.checkpoint()?;
                 }
             }
         }
+        cancellation.checkpoint()?;
         Ok::<(), NspawnError>(())
     }
     .await;
 
-    // ---- Cleanup Guard ----
+    if let Err(NspawnError::DeploymentProcessStateUnknown(message)) = &result {
+        let warning = format!(
+            "could not safely clean up deployment {name:?}: {message}; mounts and resources were preserved for manual inspection"
+        );
+        log::error!("[DEPLOY] {warning}");
+        push_log!(format!("FATAL: {warning}"));
+        return Err(NspawnError::DeploymentProcessStateUnknown(message.clone()));
+    }
 
-    // 1. Unmount the managed raw-image configuration mount if it was used
+    let mut cleanup_errors = Vec::new();
     if let Some(target) = raw_mount_target {
         push_log!("Unmounting raw image...".to_string());
         if let Err(error) = exec_ctx.rootfs.unmount_managed_raw(&target).await {
-            log::warn!(
-                "Failed to clean up raw image configuration mount: {}",
-                error
+            let message = format!("raw image configuration mount: {error}");
+            log::warn!("Failed to clean up {message}");
+            report.block_storage_removal(message.clone());
+            cleanup_errors.push(message);
+        }
+    }
+
+    if storage_mount_attempted {
+        push_log!("Cleaning up storage mount...".to_string());
+        if let Err(error) = storage.unmount(&name).await {
+            let message = format!("storage unmount: {error}");
+            log::warn!("Failed to clean up {message}");
+            report.block_storage_removal(message.clone());
+            cleanup_errors.push(message);
+        }
+    }
+
+    let result = if result.is_ok() && cancellation.is_requested() {
+        Err(NspawnError::DeploymentCancelled)
+    } else if result.is_ok() && !cleanup_errors.is_empty() {
+        Err(NspawnError::Runtime(
+            "Deployment cleanup failed before completion".into(),
+        ))
+    } else {
+        result
+    };
+
+    if let Err(error) = result {
+        push_log!(format!("Deployment stopped: {}", error));
+        rolling_back.store(true, Ordering::SeqCst);
+        push_log!("Rolling back resources created by this deployment...".to_string());
+
+        let external_ownership_confirmed = report.owns(AppliedResource::ExternalImage);
+        let mut rollback_errors = cleanup_errors;
+        rollback_errors.extend(
+            rollback_apply_report(&name, &mut report, storage.as_ref(), &exec_ctx, &logs).await,
+        );
+
+        if external_provider_started && !external_ownership_confirmed {
+            let warning = format!(
+                "external provider did not confirm ownership of image {name:?}; any partial provider output was preserved for manual inspection"
             );
+            log::warn!("{warning}");
+            push_log!(format!("WARNING: {warning}"));
         }
-    }
 
-    // 2. Unmount Lasper storage
-    if !is_ext {
-        push_log!("Unmounting storage...".to_string());
-        let _ = storage.unmount(&name).await;
-    }
-
-    // 3. Transactional Rollback
-    if let Err(e) = result {
-        push_log!(format!("Deployment failed: {}", e));
-        push_log!("Rolling back broken container...".to_string());
-
-        match storage_rollback(is_ext, receipt) {
-            StorageRollback::ExternalOwned => {
-                // Cleanup only systemd-managed storage that this deployment
-                // successfully created and explicitly acknowledged.
-                let _ = exec_ctx.nspawn.remove(&name).await;
-                let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
-                let _ = exec_ctx.system_operations.remove_image(&name).await;
-            }
-            StorageRollback::ExternalUnknown => {
-                // The provider failed before ownership was established.  Do
-                // not call either image removal or local storage deletion.
-                log::warn!(
-                    "External deployment for {} failed before ownership was confirmed; leaving storage untouched",
-                    name
-                );
-            }
-            StorageRollback::Local => {
-                // Local storage was created by this deployment, so its
-                // generated host configuration is owned by the same attempt.
-                let _ = exec_ctx.nspawn.remove(&name).await;
-                let _ = exec_ctx.systemd_unit.remove_overrides(&name).await;
-                let _ = storage.delete(&name).await;
-            }
+        rolling_back.store(false, Ordering::SeqCst);
+        if rollback_errors.is_empty() {
+            push_log!("Rollback complete.".to_string());
+            return Err(error);
         }
-        return Err(e);
+
+        for rollback_error in &rollback_errors {
+            push_log!(format!("ROLLBACK ERROR: {rollback_error}"));
+        }
+        let rollback_errors = rollback_errors.join("; ");
+        return if matches!(error, NspawnError::DeploymentCancelled) {
+            Err(NspawnError::DeploymentCancellationRollbackIncomplete(
+                rollback_errors,
+            ))
+        } else {
+            Err(NspawnError::DeployError(format!(
+                "{error}; rollback incomplete: {rollback_errors}"
+            )))
+        };
     }
 
     push_log!("");
@@ -525,11 +771,95 @@ async fn run_deploy_internal(
     Ok(())
 }
 
+async fn validate_deployment_sidecars(
+    name: &str,
+    exec_ctx: &crate::nspawn::sys::ExecutionContext,
+) -> Result<()> {
+    if let Some(config) = exec_ctx.nspawn.inspect(name).await? {
+        return Err(NspawnError::Validation(format!(
+            "Deployment target has existing .nspawn configuration: {}",
+            config.path.display()
+        )));
+    }
+    if exec_ctx.nvidia_state.read(name).await?.is_some() {
+        return Err(NspawnError::Validation(format!(
+            "Deployment target {name:?} has existing NVIDIA state"
+        )));
+    }
+
+    let unit = exec_ctx.systemd_unit.read(name).await?;
+    if let Some(drop_in) = unit.drop_ins.iter().find(|drop_in| {
+        std::path::Path::new(&drop_in.path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| matches!(name, "override.conf" | "10-lasper-nvidia.conf"))
+    }) {
+        return Err(NspawnError::Validation(format!(
+            "Deployment target has existing Lasper-managed unit drop-in: {}",
+            drop_in.path
+        )));
+    }
+    Ok(())
+}
+
+async fn rollback_apply_report(
+    name: &str,
+    report: &mut ApplyReport,
+    storage: &dyn StorageBackend,
+    exec_ctx: &crate::nspawn::sys::ExecutionContext,
+    logs: &Sender<DeployLogEvent>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut reload_daemon = false;
+
+    while let Some(resource) = report.resources.pop() {
+        send_deploy_log(logs, format!("Rolling back {}...", resource.label())).await;
+        let result = match resource {
+            AppliedResource::SystemdOverride => {
+                reload_daemon = true;
+                exec_ctx.systemd_unit.remove_service_override(name).await
+            }
+            AppliedResource::NspawnConfig => exec_ctx.nspawn.remove(name).await,
+            AppliedResource::NvidiaState => exec_ctx.nvidia_state.remove(name).await,
+            AppliedResource::ExternalImage => {
+                let blockers = report.removal_blockers(resource);
+                if blockers.is_empty() {
+                    exec_ctx.system_operations.remove_image(name).await
+                } else {
+                    Err(NspawnError::Runtime(format!(
+                        "external image removal blocked: {}",
+                        blockers.join("; ")
+                    )))
+                }
+            }
+            AppliedResource::LocalStorage => {
+                let blockers = report.removal_blockers(resource);
+                if blockers.is_empty() {
+                    storage.delete(name).await
+                } else {
+                    Err(NspawnError::Runtime(format!(
+                        "local storage removal blocked: {}",
+                        blockers.join("; ")
+                    )))
+                }
+            }
+        };
+        if let Err(error) = result {
+            errors.push(format!("{}: {error}", resource.label()));
+        }
+    }
+
+    if reload_daemon {
+        if let Err(error) = exec_ctx.system_operations.reload_daemon().await {
+            errors.push(format!("systemd daemon reload: {error}"));
+        }
+    }
+    errors
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_high_signal_deploy_stream, storage_rollback, DeploymentReceipt, StorageRollback,
-    };
+    use super::*;
 
     #[test]
     fn deploy_stream_classifies_recoverable_bootstrap_diagnostics() {
@@ -561,26 +891,122 @@ mod tests {
     }
 
     #[test]
-    fn external_rollback_is_allowed_only_with_an_ownership_receipt() {
-        assert_eq!(
-            storage_rollback(true, DeploymentReceipt::none()),
-            StorageRollback::ExternalUnknown
-        );
-        assert_eq!(
-            storage_rollback(true, DeploymentReceipt::external_image()),
-            StorageRollback::ExternalOwned
-        );
+    fn apply_report_records_only_resources_created_by_this_attempt() {
+        let mut report = ApplyReport::default();
+        report
+            .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+            .unwrap();
+        report
+            .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+            .unwrap();
+        report
+            .record_apply(AppliedResource::SystemdOverride, ApplyStatus::Unchanged)
+            .unwrap();
+
+        assert_eq!(report.resources, vec![AppliedResource::NspawnConfig]);
     }
 
     #[test]
-    fn external_failure_never_falls_back_to_local_storage_cleanup() {
+    fn unknown_nspawn_owner_blocks_external_image_compensation() {
+        let mut report = ApplyReport::default();
+        let error = report
+            .record_apply(
+                AppliedResource::NspawnConfig,
+                ApplyStatus::ConflictUnknownOwner,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("unknown ownership"));
+        assert!(report.resources.is_empty());
+        assert_eq!(report.external_image_blockers.len(), 1);
+    }
+
+    #[test]
+    fn failed_unmount_blocks_local_and_external_storage_compensation() {
+        let mut report = ApplyReport::default();
+        report
+            .external_image_blockers
+            .push("unknown .nspawn owner".into());
+        report.block_storage_removal("storage is still mounted");
+
         assert_eq!(
-            storage_rollback(true, DeploymentReceipt::none()),
-            StorageRollback::ExternalUnknown
+            report.removal_blockers(AppliedResource::LocalStorage),
+            vec!["storage is still mounted"]
         );
         assert_eq!(
-            storage_rollback(false, DeploymentReceipt::none()),
-            StorageRollback::Local
+            report.removal_blockers(AppliedResource::ExternalImage),
+            vec!["unknown .nspawn owner", "storage is still mounted"]
         );
+    }
+
+    #[tokio::test]
+    async fn deployment_cancellation_notifies_waiters_and_fails_checkpoints() {
+        let cancellation = DeploymentCancellation::default();
+        let waiter = cancellation.clone();
+        let task = tokio::spawn(async move { waiter.cancelled().await });
+
+        cancellation.request();
+        task.await.unwrap();
+        assert!(matches!(
+            cancellation.checkpoint(),
+            Err(NspawnError::DeploymentCancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_process_wait_is_not_treated_as_a_rollback_safe_failure() {
+        let spawned = crate::nspawn::sys::command::SpawnedProcess::new_cancellable(
+            Box::new(tokio::io::empty()),
+            async { Err(std::io::Error::other("wait channel closed")) },
+            |_| Box::pin(async { Ok(()) }),
+        );
+        let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+
+        let error = stream_deploy_command(
+            spawned,
+            &logs,
+            &DeploymentCancellation::default(),
+            "test deployer",
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::DeploymentProcessStateUnknown(message)
+                if message.contains("test deployer") && message.contains("wait channel closed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn authoritative_completion_wins_a_racing_cancellation() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let spawned = crate::nspawn::sys::command::SpawnedProcess::new_cancellable(
+            Box::new(tokio::io::empty()),
+            async { Ok(std::process::ExitStatus::from_raw(0)) },
+            |_| Box::pin(async { Ok(()) }),
+        )
+        .with_completion_wins_cancellation();
+        let cancellation = DeploymentCancellation::default();
+        cancellation.request();
+        let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+
+        let status = stream_deploy_command(spawned, &logs, &cancellation, "authoritative transfer")
+            .await
+            .unwrap();
+
+        assert!(status.success());
+    }
+
+    #[test]
+    fn only_confirmed_cancellation_outcomes_are_reported_as_cancelled() {
+        assert!(is_cancelled_outcome(&NspawnError::DeploymentCancelled));
+        assert!(is_cancelled_outcome(
+            &NspawnError::DeploymentCancellationRollbackIncomplete("cleanup failed".into())
+        ));
+        assert!(!is_cancelled_outcome(
+            &NspawnError::DeploymentProcessStateUnknown("still running".into())
+        ));
     }
 }

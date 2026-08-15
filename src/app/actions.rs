@@ -349,7 +349,9 @@ impl App {
         };
 
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(action_label.to_string()).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -599,7 +601,9 @@ impl App {
             );
         }
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(format!("Start {}", name)).await {
                 Ok(audit) => audit,
                 Err(error) => {
@@ -673,7 +677,9 @@ impl App {
             None => return,
         };
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(format!("Remove image {}", name)).await {
                 Ok(audit) => audit,
                 Err(error) => {

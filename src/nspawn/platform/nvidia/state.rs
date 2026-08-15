@@ -1,5 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::nspawn::models::{ApplyStatus, MachineName};
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
@@ -212,6 +212,20 @@ impl NvidiaStateStore {
         Ok(())
     }
 
+    pub async fn write_initial(&self, name: &str, state: &NvidiaState) -> Result<ApplyStatus> {
+        let result = self
+            .execute(NvidiaStateOperation::WriteInitial(Box::new(
+                WriteNvidiaState {
+                    machine: parse_machine_name(name)?,
+                    state: state.clone(),
+                },
+            )))
+            .await?;
+        result.apply.ok_or_else(|| {
+            NspawnError::Runtime("initial NVIDIA state write returned no apply status".into())
+        })
+    }
+
     pub async fn remove(&self, name: &str) -> Result<()> {
         self.execute(NvidiaStateOperation::Remove(RemoveNvidiaState {
             machine: parse_machine_name(name)?,
@@ -245,6 +259,7 @@ impl std::fmt::Debug for NvidiaStateStore {
 pub(crate) enum NvidiaStateOperation {
     Read(ReadNvidiaState),
     Write(Box<WriteNvidiaState>),
+    WriteInitial(Box<WriteNvidiaState>),
     Remove(RemoveNvidiaState),
 }
 
@@ -271,6 +286,8 @@ pub(crate) struct RemoveNvidiaState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NvidiaStateResult {
     state: Option<NvidiaState>,
+    #[serde(default)]
+    apply: Option<ApplyStatus>,
 }
 
 pub(crate) async fn execute_nvidia_state_operation(
@@ -279,10 +296,19 @@ pub(crate) async fn execute_nvidia_state_operation(
     match operation {
         NvidiaStateOperation::Read(request) => Ok(NvidiaStateResult {
             state: read_state_at(&state_path(&request.machine)).await?,
+            ..Default::default()
         }),
         NvidiaStateOperation::Write(request) => {
             write_state_at(&state_path(&request.machine), &request.state).await?;
             Ok(NvidiaStateResult::default())
+        }
+        NvidiaStateOperation::WriteInitial(request) => {
+            let apply =
+                write_initial_state_at(&state_path(&request.machine), &request.state).await?;
+            Ok(NvidiaStateResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
         }
         NvidiaStateOperation::Remove(request) => {
             remove_state_at(&state_path(&request.machine)).await?;
@@ -329,12 +355,37 @@ async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
     AsyncLockedWriter::write_atomic(path, &content).await
 }
 
-async fn remove_state_at(path: &Path) -> Result<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<ApplyStatus> {
+    validate_state(state)?;
+    let content = serde_json::to_string_pretty(state)?;
+    if content.len() > MAX_NVIDIA_STATE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA state exceeds {} bytes",
+            MAX_NVIDIA_STATE_BYTES
+        )));
     }
+    AsyncLockedWriter::apply_locked(path, move |existing| {
+        Ok(match existing {
+            None => (Some(content), ApplyStatus::Created),
+            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+        })
+    })
+    .await
+}
+
+async fn remove_state_at(path: &Path) -> Result<()> {
+    for target in [
+        path.to_path_buf(),
+        crate::nspawn::sys::io::lock_path_for(path),
+    ] {
+        match tokio::fs::remove_file(&target).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NspawnError::Io(target, error)),
+        }
+    }
+    Ok(())
 }
 
 fn validate_state(state: &NvidiaState) -> Result<()> {
@@ -788,6 +839,37 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_state(&state).is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_state_apply_is_create_only_and_cleanup_removes_its_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.json");
+        let state = NvidiaState {
+            driver_version: "1".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            write_initial_state_at(&path, &state).await.unwrap(),
+            ApplyStatus::Created
+        );
+        assert_eq!(
+            write_initial_state_at(&path, &state).await.unwrap(),
+            ApplyStatus::Unchanged
+        );
+        let different = NvidiaState {
+            driver_version: "2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_initial_state_at(&path, &different).await.unwrap(),
+            ApplyStatus::ConflictUnknownOwner
+        );
+
+        remove_state_at(&path).await.unwrap();
+        assert!(!path.exists());
+        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[tokio::test]
