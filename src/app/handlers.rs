@@ -137,7 +137,17 @@ impl App {
             && (layout.terminal.is_some_and(|r| in_rect(col, row, r))
                 || self.data.terminal.wants_mouse_capture())
         {
-            self.data.terminal.handle_mouse(mouse);
+            match self.data.terminal.handle_mouse(mouse) {
+                crate::ui::views::terminal_panel::TerminalInputStatus::Queued => {}
+                crate::ui::views::terminal_panel::TerminalInputStatus::Full => self.set_status(
+                    "Terminal input queue is full; input was dropped.".into(),
+                    StatusLevel::Warn,
+                ),
+                crate::ui::views::terminal_panel::TerminalInputStatus::Closed => self.set_status(
+                    "Terminal input channel is closed.".into(),
+                    StatusLevel::Error,
+                ),
+            }
         }
     }
 }
@@ -216,6 +226,20 @@ impl App {
             TerminalKeyOutcome::PassThrough => false,
             TerminalKeyOutcome::ConsumedAndRefreshDetail => {
                 self.refresh_detail().await;
+                true
+            }
+            TerminalKeyOutcome::InputQueueFull => {
+                self.set_status(
+                    "Terminal input queue is full; input was dropped.".into(),
+                    StatusLevel::Warn,
+                );
+                true
+            }
+            TerminalKeyOutcome::InputChannelClosed => {
+                self.set_status(
+                    "Terminal input channel is closed.".into(),
+                    StatusLevel::Error,
+                );
                 true
             }
         }

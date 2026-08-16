@@ -59,6 +59,13 @@ pub struct TerminalManager {
     redraw_gate: crate::nspawn::adapters::comm::pty::RedrawGate,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalInputStatus {
+    Queued,
+    Full,
+    Closed,
+}
+
 impl TerminalManager {
     pub fn new() -> Self {
         Self {
@@ -315,9 +322,11 @@ impl TerminalManager {
             let application_cursor = session.terminal.lock().screen().application_cursor();
             let bytes = super::encode_key_for_mode(key, application_cursor);
             if !bytes.is_empty() {
-                let _ = session
-                    .pty_tx
-                    .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
+                return match queue_input(&session.pty_tx, bytes) {
+                    TerminalInputStatus::Queued => TerminalKeyOutcome::Consumed,
+                    TerminalInputStatus::Full => TerminalKeyOutcome::InputQueueFull,
+                    TerminalInputStatus::Closed => TerminalKeyOutcome::InputChannelClosed,
+                };
             }
             TerminalKeyOutcome::Consumed
         } else {
@@ -421,11 +430,11 @@ impl TerminalManager {
 
     // mouse dispatch
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> TerminalInputStatus {
         let idx = self.active_idx;
         let session = match self.sessions.get_mut(idx) {
             Some(s) => s,
-            None => return,
+            None => return TerminalInputStatus::Closed,
         };
 
         let term_area = self.term_area;
@@ -434,7 +443,7 @@ impl TerminalManager {
             && mouse.row >= term_area.y
             && mouse.row < term_area.y.saturating_add(term_area.height);
         if !inside && !session.selection.active && !session.mouse_capture {
-            return;
+            return TerminalInputStatus::Queued;
         }
 
         // Convert absolute screen coords to terminal-relative cell coords.
@@ -469,14 +478,16 @@ impl TerminalManager {
                     modifiers: mouse.modifiers,
                 };
                 if let Some(seq) = super::encode_mouse_for_protocol(rel_mouse, mode, encoding) {
-                    let _ = session
-                        .pty_tx
-                        .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(seq));
+                    let status = queue_input(&session.pty_tx, seq);
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        session.mouse_capture = false;
+                    }
+                    return status;
                 }
                 if matches!(mouse.kind, MouseEventKind::Up(_)) {
                     session.mouse_capture = false;
                 }
-                return;
+                return TerminalInputStatus::Queued;
             }
         }
 
@@ -507,6 +518,7 @@ impl TerminalManager {
             }
             _ => {}
         }
+        TerminalInputStatus::Queued
     }
 }
 
@@ -562,6 +574,17 @@ fn queue_resize(
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => QueueResizeResult::Full,
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => QueueResizeResult::Closed,
+    }
+}
+
+fn queue_input(
+    tx: &tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
+    bytes: Vec<u8>,
+) -> TerminalInputStatus {
+    match tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes)) {
+        Ok(()) => TerminalInputStatus::Queued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => TerminalInputStatus::Full,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => TerminalInputStatus::Closed,
     }
 }
 
@@ -642,11 +665,17 @@ pub enum TerminalKeyOutcome {
     /// Key was consumed AND the detail pane should be refreshed
     /// (tab switch changed the selected container).
     ConsumedAndRefreshDetail,
+    /// The PTY writer queue was full; the key was consumed but not delivered.
+    InputQueueFull,
+    /// The PTY writer is no longer available; the key was consumed.
+    InputChannelClosed,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{queue_resize, QueueResizeResult, TerminalManager};
+    use super::{
+        queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalManager,
+    };
     use crate::nspawn::adapters::comm::pty::PtyMessage;
     use crate::nspawn::models::{ContainerEntry, ContainerState};
 
@@ -680,6 +709,17 @@ mod tests {
             QueueResizeResult::Closed
         );
         assert_eq!(queued, Some((80, 24)));
+    }
+
+    #[test]
+    fn input_queue_reports_full_and_closed_channels() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(queue_input(&tx, vec![b'a']), TerminalInputStatus::Queued);
+        assert_eq!(queue_input(&tx, vec![b'b']), TerminalInputStatus::Full);
+
+        let _ = rx.try_recv();
+        drop(rx);
+        assert_eq!(queue_input(&tx, vec![b'c']), TerminalInputStatus::Closed);
     }
 
     #[tokio::test]

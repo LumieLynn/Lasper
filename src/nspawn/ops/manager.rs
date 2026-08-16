@@ -82,7 +82,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tx: tokio::sync::mpsc::Sender<String>,
         fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()>;
     async fn get_properties(&self, name: &str, entry: &ContainerEntry)
@@ -587,7 +587,7 @@ impl NspawnManager for DefaultManager {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tx: tokio::sync::mpsc::Sender<String>,
         fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let name = name.to_string();
@@ -600,7 +600,7 @@ impl NspawnManager for DefaultManager {
                     Ok(fd) => fd,
                     Err(e) => {
                         fatal_clone.store(true, Ordering::Relaxed);
-                        let _ = tx.send(format!("Log stream error: {e}"));
+                        let _ = tx.send(format!("Log stream error: {e}")).await;
                         return;
                     }
                 };
@@ -610,13 +610,13 @@ impl NspawnManager for DefaultManager {
                     Ok(receiver) => {
                         let mut lines = tokio::io::BufReader::new(receiver).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            if tx.send(line).is_err() {
+                            if tx.send(line).await.is_err() {
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(format!("Log stream error: {e}"));
+                        let _ = tx.send(format!("Log stream error: {e}")).await;
                     }
                 }
             });
@@ -638,13 +638,15 @@ impl NspawnManager for DefaultManager {
                 Ok(c) => c,
                 Err(e) => {
                     fatal.store(true, Ordering::Relaxed);
-                    let _ = tx.send(format!("Log stream error: {e}"));
+                    let _ = tx.send(format!("Log stream error: {e}")).await;
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        let _ = tx.send(
-                            "Hint: add yourself to the 'systemd-journal' \
+                        let _ = tx
+                            .send(
+                                "Hint: add yourself to the 'systemd-journal' \
                              group: sudo usermod -a -G systemd-journal $USER"
-                                .into(),
-                        );
+                                    .into(),
+                            )
+                            .await;
                     }
                     return;
                 }
@@ -660,7 +662,7 @@ impl NspawnManager for DefaultManager {
                         tokio::select! {
                             line_res = lines.next_line() => {
                                 if let Ok(Some(line)) = line_res {
-                                    if tx.send(line).is_err() {
+                                    if tx.send(line).await.is_err() {
                                         break;
                                     }
                                 } else {
@@ -679,8 +681,9 @@ impl NspawnManager for DefaultManager {
                     if let Ok(n) = stderr_pipe.read_to_end(&mut buf).await {
                         if n > 0 {
                             fatal.store(true, Ordering::Relaxed);
-                            let _ =
-                                tx.send(format!("Log stream: {}", String::from_utf8_lossy(&buf)));
+                            let _ = tx
+                                .send(format!("Log stream: {}", String::from_utf8_lossy(&buf)))
+                                .await;
                         }
                     }
                     Ok(())
@@ -688,7 +691,7 @@ impl NspawnManager for DefaultManager {
                 .await;
 
             if let Err(e) = stream_result {
-                let _ = tx.send(format!("Log stream stopped: {e}"));
+                let _ = tx.send(format!("Log stream stopped: {e}")).await;
             }
         })
     }
