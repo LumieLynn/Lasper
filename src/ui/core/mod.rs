@@ -13,6 +13,8 @@ pub enum WizardMessage {
     Close,
     DialogSubmit,
     DialogCancel,
+    AcceptUnsafeRemoteTar,
+    DeclineUnsafeRemoteTar,
 
     // Dialog open requests (add = blank, edit = pre-filled)
     OpenUserDialog,

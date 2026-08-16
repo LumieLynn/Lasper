@@ -24,6 +24,7 @@ pub enum BackendResponse {
     ValidationSuccess,
     ValidationError(String),
     ValidationWarning(String),
+    TarImportRiskConfirmationRequired(String),
     DeployStarted,
     DeployFailed(String),
     DeployCancelled(String),

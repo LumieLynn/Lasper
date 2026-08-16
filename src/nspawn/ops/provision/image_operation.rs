@@ -13,6 +13,21 @@ use std::sync::Arc;
 #[serde(deny_unknown_fields)]
 pub(crate) struct ImportTarRequest {
     pub(crate) target: RootfsTarget,
+    pub(crate) source_origin: TarSourceOrigin,
+    pub(crate) allow_unsafe_remote: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TarSourceOrigin {
+    Local,
+    Remote,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TarRuntimeAssessment {
+    pub(crate) risk: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -50,9 +65,15 @@ impl ImageImportStore {
         &self,
         target: RootfsTarget,
         source: std::fs::File,
+        source_origin: TarSourceOrigin,
+        allow_unsafe_remote: bool,
     ) -> Result<ImageImportReport> {
         validate_source(&source)?;
-        let request = ImportTarRequest { target };
+        let request = ImportTarRequest {
+            target,
+            source_origin,
+            allow_unsafe_remote,
+        };
         if let Some(daemon) = &self.daemon {
             daemon
                 .import_tar_image(request, source)
@@ -60,6 +81,21 @@ impl ImageImportStore {
                 .map_err(|error| NspawnError::Runtime(error.to_string()))
         } else {
             import_tar_image(request, source).await
+        }
+    }
+
+    pub(crate) async fn assess_tar_runtime(&self) -> Result<TarRuntimeAssessment> {
+        if let Some(daemon) = &self.daemon {
+            daemon
+                .assess_tar_runtime()
+                .await
+                .map_err(|error| NspawnError::Runtime(error.to_string()))
+        } else {
+            tokio::task::spawn_blocking(inspect_tar_runtime)
+                .await
+                .map_err(|error| {
+                    NspawnError::Runtime(format!("tar runtime inspection task failed: {error}"))
+                })?
         }
     }
 }
@@ -125,14 +161,29 @@ pub(crate) async fn import_tar_image(
     validate_tar_target(&request.target).await?;
     let target = request.target.path()?;
     let operation_target = target.clone();
+    let source_origin = request.source_origin;
+    let allow_unsafe_remote = request.allow_unsafe_remote;
 
-    tokio::task::spawn_blocking(move || extract_tar_at(&operation_target, source))
-        .await
-        .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))?
+    tokio::task::spawn_blocking(move || {
+        extract_tar_at(
+            &operation_target,
+            source,
+            source_origin,
+            allow_unsafe_remote,
+        )
+    })
+    .await
+    .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))?
 }
 
-fn extract_tar_at(target: &std::path::Path, source: std::fs::File) -> Result<ImageImportReport> {
-    let report = inspect_tar_runtime()?;
+fn extract_tar_at(
+    target: &std::path::Path,
+    source: std::fs::File,
+    source_origin: TarSourceOrigin,
+    allow_unsafe_remote: bool,
+) -> Result<ImageImportReport> {
+    let assessment = inspect_tar_runtime()?;
+    let report = tar_runtime_policy(source_origin, &assessment, allow_unsafe_remote)?;
     for warning in &report.warnings {
         log::warn!("[AUDIT] [Tar import] {warning}");
     }
@@ -163,7 +214,7 @@ fn tar_command() -> std::process::Command {
     command
 }
 
-fn inspect_tar_runtime() -> Result<ImageImportReport> {
+pub(crate) fn inspect_tar_runtime() -> Result<TarRuntimeAssessment> {
     let output = tar_command()
         .arg("--version")
         .output()
@@ -175,8 +226,9 @@ fn inspect_tar_runtime() -> Result<ImageImportReport> {
         .success()
         .then(|| parse_gnu_tar_version(&String::from_utf8_lossy(&output.stdout)))
         .flatten();
-    let warnings = tar_version_warning(version).into_iter().collect();
-    Ok(ImageImportReport { warnings })
+    Ok(TarRuntimeAssessment {
+        risk: tar_runtime_risk(version),
+    })
 }
 
 fn parse_gnu_tar_version(output: &str) -> Option<(u32, u32)> {
@@ -195,21 +247,47 @@ fn parse_gnu_tar_version(output: &str) -> Option<(u32, u32)> {
     })
 }
 
-fn tar_version_warning(version: Option<(u32, u32)>) -> Option<String> {
+fn tar_runtime_risk(version: Option<(u32, u32)>) -> Option<String> {
     match version {
         Some(version) if version < (1, 34) => Some(format!(
-            "GNU tar {}.{} predates 1.34 and may follow archive-created symbolic links outside the target. Continuing for compatibility; import only trusted archives or upgrade to GNU tar 1.35+.",
+            "GNU tar {}.{} predates 1.34 and may follow archive-created symbolic links outside the target.",
             version.0, version.1
         )),
         Some(version) if version < (1, 35) => Some(format!(
-            "GNU tar {}.{} lacks the hard-link confinement added in 1.35. Continuing for compatibility; import only trusted archives or upgrade to GNU tar 1.35+.",
+            "GNU tar {}.{} lacks the hard-link confinement added in 1.35.",
             version.0, version.1
         )),
         Some(_) => None,
         None => Some(
-            "Could not verify GNU tar 1.35+ extraction protections. Continuing with the host tar implementation; import only trusted archives."
+            "Could not verify GNU tar 1.35+ extraction protections for the host tar implementation."
                 .into(),
         ),
+    }
+}
+
+fn tar_runtime_policy(
+    source_origin: TarSourceOrigin,
+    assessment: &TarRuntimeAssessment,
+    allow_unsafe_remote: bool,
+) -> Result<ImageImportReport> {
+    let Some(risk) = assessment.risk.as_deref() else {
+        return Ok(ImageImportReport::default());
+    };
+
+    match source_origin {
+        TarSourceOrigin::Local => Ok(ImageImportReport {
+            warnings: vec![format!(
+                "{risk} Continuing because the archive was explicitly selected from a local path; import only trusted archives or upgrade to GNU tar 1.35+."
+            )],
+        }),
+        TarSourceOrigin::Remote if allow_unsafe_remote => Ok(ImageImportReport {
+            warnings: vec![format!(
+                "{risk} Continuing with the remote archive after explicit confirmation; import only trusted archives or upgrade to GNU tar 1.35+."
+            )],
+        }),
+        TarSourceOrigin::Remote => Err(NspawnError::Validation(format!(
+            "Remote tar import requires explicit risk confirmation: {risk}"
+        ))),
     }
 }
 
@@ -241,6 +319,26 @@ mod tests {
             }
         }"#;
         assert!(serde_json::from_str::<ImportTarRequest>(request).is_err());
+
+        let missing_origin = r#"{
+            "target": {
+                "kind": "machine",
+                "machine": "valid-machine"
+            }
+        }"#;
+        assert!(serde_json::from_str::<ImportTarRequest>(missing_origin).is_err());
+
+        let valid = r#"{
+            "target": {
+                "kind": "machine",
+                "machine": "valid-machine"
+            },
+            "source_origin": "remote",
+            "allow_unsafe_remote": true
+        }"#;
+        let request = serde_json::from_str::<ImportTarRequest>(valid).unwrap();
+        assert_eq!(request.source_origin, TarSourceOrigin::Remote);
+        assert!(request.allow_unsafe_remote);
 
         let request = r#"{
             "target": {
@@ -275,16 +373,37 @@ mod tests {
         );
         assert_eq!(parse_gnu_tar_version("bsdtar 3.7.7\n"), None);
 
-        assert!(tar_version_warning(Some((1, 33)))
+        assert!(tar_runtime_risk(Some((1, 33)))
             .unwrap()
             .contains("symbolic links"));
-        assert!(tar_version_warning(Some((1, 34)))
+        assert!(tar_runtime_risk(Some((1, 34)))
             .unwrap()
             .contains("hard-link"));
-        assert!(tar_version_warning(Some((1, 35))).is_none());
-        assert!(tar_version_warning(None)
-            .unwrap()
-            .contains("Could not verify"));
+        assert!(tar_runtime_risk(Some((1, 35))).is_none());
+        assert!(tar_runtime_risk(None).unwrap().contains("Could not verify"));
+    }
+
+    #[test]
+    fn risky_tar_runtime_requires_remote_confirmation() {
+        let assessment = TarRuntimeAssessment {
+            risk: tar_runtime_risk(Some((1, 34))),
+        };
+        let local = tar_runtime_policy(TarSourceOrigin::Local, &assessment, false).unwrap();
+        assert_eq!(local.warnings.len(), 1);
+        assert!(local.warnings[0].contains("local path"));
+
+        let error = tar_runtime_policy(TarSourceOrigin::Remote, &assessment, false).unwrap_err();
+        assert!(error.to_string().contains("explicit risk confirmation"));
+
+        let accepted = tar_runtime_policy(TarSourceOrigin::Remote, &assessment, true).unwrap();
+        assert_eq!(accepted.warnings.len(), 1);
+        assert!(accepted.warnings[0].contains("explicit confirmation"));
+
+        let safe = TarRuntimeAssessment::default();
+        assert_eq!(
+            tar_runtime_policy(TarSourceOrigin::Remote, &safe, false).unwrap(),
+            ImageImportReport::default()
+        );
     }
 
     #[test]
@@ -314,7 +433,7 @@ mod tests {
         assert!(output.status.success());
         archive.seek(SeekFrom::Start(0)).unwrap();
 
-        extract_tar_at(target.path(), archive).unwrap();
+        extract_tar_at(target.path(), archive, TarSourceOrigin::Local, false).unwrap();
         assert_eq!(
             std::fs::read(target.path().join("etc/os-release")).unwrap(),
             b"NAME=Lasper test\n"

@@ -41,7 +41,9 @@ use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
 };
-use crate::nspawn::ops::provision::image_operation::{ImageImportReport, ImportTarRequest};
+use crate::nspawn::ops::provision::image_operation::{
+    inspect_tar_runtime, ImageImportReport, ImportTarRequest, TarRuntimeAssessment,
+};
 use crate::nspawn::ops::provision::oci_operation::{
     run_oci_transfer, OciPullRequest, OciTransferCancellation, OciTransferOutcome,
 };
@@ -62,7 +64,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const DAEMON_BOOTSTRAP_VERSION: u32 = 7;
+const DAEMON_BOOTSTRAP_VERSION: u32 = 8;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -691,6 +693,14 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
+    pub(crate) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {
+        let result = self
+            .rpc_call("assess_tar_runtime", serde_json::json!({}))
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     // ── FD-passing ──
     //
     // Connect and write the request async, then hand the fd to a blocking
@@ -1272,6 +1282,36 @@ async fn handle_request(
                             "message":error.to_string(),
                         }})
                     }
+                };
+                if let Ok(line) = serde_json::to_string(&response) {
+                    let _ = out_tx.send(line).await;
+                }
+            });
+            HandleOutcome::Spawned
+        }
+
+        "assess_tar_runtime" => {
+            if request.params != serde_json::json!({}) {
+                return HandleOutcome::Sync(Err(
+                    "assess_tar_runtime does not accept parameters".into()
+                ));
+            }
+            let id = request.id;
+            let out_tx = out_tx.clone();
+            tokio::spawn(async move {
+                let result = tokio::task::spawn_blocking(inspect_tar_runtime).await;
+                let response = match result {
+                    Ok(Ok(assessment)) => {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":assessment})
+                    }
+                    Ok(Err(error)) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":error.to_string(),
+                    }}),
+                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                        "code":-1,
+                        "message":format!("tar runtime inspection task failed: {error}"),
+                    }}),
                 };
                 if let Ok(line) = serde_json::to_string(&response) {
                     let _ = out_tx.send(line).await;
@@ -2229,12 +2269,17 @@ mod tests {
                 target: crate::nspawn::adapters::rootfs::RootfsTarget::Machine {
                     machine: MachineName::new("test-machine").unwrap(),
                 },
+                source_origin:
+                    crate::nspawn::ops::provision::image_operation::TarSourceOrigin::Remote,
+                allow_unsafe_remote: true,
             }),
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["method"], "import_tar_image");
         assert_eq!(json["params"]["target"]["kind"], "machine");
         assert_eq!(json["params"]["target"]["machine"], "test-machine");
+        assert_eq!(json["params"]["source_origin"], "remote");
+        assert_eq!(json["params"]["allow_unsafe_remote"], true);
         assert!(json["params"].get("path").is_none());
         assert!(json["params"].get("source").is_none());
     }
@@ -2301,6 +2346,34 @@ mod tests {
             ..valid
         };
         assert!(request_machine_name(&invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
+        let request = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 7,
+            method: "assess_tar_runtime".into(),
+            params: serde_json::json!({}),
+        };
+
+        assert!(matches!(
+            handle_request(&request, &None, &out_tx, uzers::get_current_uid()).await,
+            HandleOutcome::Spawned
+        ));
+        let response: RpcResponse = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+        assert!(response.error.is_none());
+        let _: TarRuntimeAssessment = serde_json::from_value(response.result.unwrap()).unwrap();
+
+        let invalid = RpcRequest {
+            params: serde_json::json!({"program": "tar"}),
+            ..request
+        };
+        assert!(matches!(
+            handle_request(&invalid, &None, &out_tx, uzers::get_current_uid()).await,
+            HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
+        ));
     }
 
     #[tokio::test]

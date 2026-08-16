@@ -40,12 +40,32 @@ pub struct SourceState {
     pub clone_source: String,
     pub pull_url: String,
     pub is_pull_raw: bool,
+    unsafe_tar_accepted_for: Option<String>,
     pub copy_idx: usize,
     pub profiles: Vec<ConfiguredSourceProfile>,
     pub default_profiles: Vec<ConfiguredSourceProfile>,
 }
 
 impl SourceState {
+    pub fn remote_tar_url(&self) -> Option<&str> {
+        (self.kind == SourceKind::Pull && !self.is_pull_raw)
+            .then(|| self.pull_url.trim())
+            .filter(|url| !url.is_empty())
+    }
+
+    pub fn unsafe_remote_tar_accepted(&self) -> bool {
+        self.remote_tar_url()
+            .is_some_and(|url| self.unsafe_tar_accepted_for.as_deref() == Some(url))
+    }
+
+    pub fn accept_unsafe_remote_tar(&mut self) -> bool {
+        let Some(url) = self.remote_tar_url().map(str::to_owned) else {
+            return false;
+        };
+        self.unsafe_tar_accepted_for = Some(url);
+        true
+    }
+
     pub fn extract_config(&self) -> SourceConfig {
         match &self.kind {
             SourceKind::Copy => SourceConfig::Copy {
@@ -551,6 +571,7 @@ impl WizardContext {
                     .unwrap_or_default(),
                 pull_url: "".to_string(),
                 is_pull_raw: false,
+                unsafe_tar_accepted_for: None,
                 copy_idx: 0,
                 profiles,
                 default_profiles,
@@ -721,6 +742,7 @@ impl WizardContext {
         image_import: crate::nspawn::ops::provision::ImageImportStore,
         oci_pull: crate::nspawn::ops::provision::OciPullStore,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+        let allow_unsafe_remote_tar = self.source.unsafe_remote_tar_accepted();
         self.builder().get_deployer_and_storage(
             system_operations,
             nspawn,
@@ -729,6 +751,7 @@ impl WizardContext {
             bootstrap,
             image_import,
             oci_pull,
+            allow_unsafe_remote_tar,
         )
     }
 
@@ -797,6 +820,7 @@ mod tests {
             clone_source: "".into(),
             pull_url: "".into(),
             is_pull_raw: false,
+            unsafe_tar_accepted_for: None,
             copy_idx: 0,
             profiles: vec![],
             default_profiles: vec![],
@@ -841,6 +865,24 @@ mod tests {
 
         state.local_path = "test.tar.gz".into();
         assert!(!state.is_storage_managed_externally());
+    }
+
+    #[test]
+    fn unsafe_tar_acceptance_is_bound_to_the_current_remote_url() {
+        let mut state = test_source_state();
+        state.kind = SourceKind::Pull;
+        state.pull_url = " https://example.test/rootfs.tar ".into();
+
+        assert!(!state.unsafe_remote_tar_accepted());
+        assert!(state.accept_unsafe_remote_tar());
+        assert!(state.unsafe_remote_tar_accepted());
+
+        state.pull_url = "https://example.test/other.tar".into();
+        assert!(!state.unsafe_remote_tar_accepted());
+
+        state.pull_url = "https://example.test/rootfs.tar".into();
+        state.is_pull_raw = true;
+        assert!(!state.unsafe_remote_tar_accepted());
     }
 
     #[test]

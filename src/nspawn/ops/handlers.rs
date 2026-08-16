@@ -41,6 +41,30 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let bootstrap = exec_ctx.bootstrap.clone();
             let image_import = exec_ctx.image_import.clone();
             let oci_pull = exec_ctx.oci_pull.clone();
+
+            if ctx.source.remote_tar_url().is_some() && !ctx.source.unsafe_remote_tar_accepted() {
+                match image_import.assess_tar_runtime().await {
+                    Ok(assessment) => {
+                        if let Some(risk) = assessment.risk {
+                            let _ = tx
+                                .send(AppEvent::BackendResult(
+                                    BackendResponse::TarImportRiskConfirmationRequired(risk),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(AppEvent::BackendResult(BackendResponse::ValidationError(
+                                format!("Could not inspect the host tar runtime: {error}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(
                 system_operations,

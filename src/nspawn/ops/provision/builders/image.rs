@@ -9,6 +9,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::ops::provision::image_operation::TarSourceOrigin;
 use crate::nspawn::ops::provision::{
     process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
     AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
@@ -19,6 +20,15 @@ use crate::nspawn::sys::log_output;
 pub enum ImageSource {
     Local(String),
     Remote(String),
+}
+
+impl ImageSource {
+    fn tar_origin(&self) -> TarSourceOrigin {
+        match self {
+            Self::Local(_) => TarSourceOrigin::Local,
+            Self::Remote(_) => TarSourceOrigin::Remote,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,6 +51,7 @@ pub struct ImageDeployer {
     pub source: ImageSource,
     pub format: ImageFormat,
     pub image_import: crate::nspawn::ops::provision::ImageImportStore,
+    pub allow_unsafe_remote_tar: bool,
 }
 
 #[async_trait]
@@ -76,7 +87,15 @@ impl Deployer for ImageDeployer {
                 let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
                     name, rootfs,
                 )?;
-                let report = self.image_import.import_tar(target, source).await?;
+                let report = self
+                    .image_import
+                    .import_tar(
+                        target,
+                        source,
+                        self.source.tar_origin(),
+                        self.allow_unsafe_remote_tar,
+                    )
+                    .await?;
                 for warning in report.warnings {
                     send_deploy_log(&logs, format!("WARNING: {warning}")).await;
                 }
@@ -460,6 +479,18 @@ mod tests {
                 format: crate::nspawn::models::ArtifactFormat::Auto,
             }),
             ImageFormat::Tar
+        );
+    }
+
+    #[test]
+    fn image_source_origin_is_preserved_for_tar_policy() {
+        assert_eq!(
+            ImageSource::Local("/tmp/rootfs.tar".into()).tar_origin(),
+            TarSourceOrigin::Local
+        );
+        assert_eq!(
+            ImageSource::Remote("https://example.test/rootfs.tar".into()).tar_origin(),
+            TarSourceOrigin::Remote
         );
     }
 

@@ -11,6 +11,41 @@ use ratatui::{
     Frame,
 };
 
+struct TarRiskConfirmationDialog {
+    dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog,
+}
+
+impl TarRiskConfirmationDialog {
+    fn new(risk: String) -> Self {
+        Self {
+            dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+                "Continue Remote Tar Import?",
+                format!(
+                    "{risk}\n\nThis remote archive will be extracted as root and may write outside the target through archive-created links. Continue only if you trust the archive source."
+                ),
+            ),
+        }
+    }
+}
+
+impl Component for TarRiskConfirmationDialog {
+    fn render(&mut self, frame: &mut Frame, area: Rect) {
+        self.dialog.render(frame, area);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::AcceptUnsafeRemoteTar))
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                EventResult::Message(AppMessage::Wizard(WizardMessage::DeclineUnsafeRemoteTar))
+            }
+            _ => self.dialog.handle_key(key),
+        }
+    }
+}
+
 pub struct Wizard {
     pub step: WizardStep,
     pub context: WizardContext,
@@ -214,64 +249,21 @@ impl Wizard {
         match msg {
             AppMessage::Wizard(ref wiz_msg) => match wiz_msg {
                 WizardMessage::Close => StepAction::Close,
-                WizardMessage::Submit => {
-                    if let Some(error) = source_permission_error(
-                        &self.context.source.kind,
-                        self.context.permission_level,
-                    ) {
+                WizardMessage::Submit => self.submit_config(),
+                WizardMessage::AcceptUnsafeRemoteTar => {
+                    if !self.context.source.accept_unsafe_remote_tar() {
                         return StepAction::Status(
-                            format!("Validation Error: {error}"),
+                            "The remote tar source changed before confirmation; review it and try again."
+                                .into(),
                             crate::ui::StatusLevel::Error,
                         );
                     }
-                    if self.context.source.kind == SourceKind::Copy {
-                        let source_cfg = self.context.source.clone_source.clone();
-                        if !self
-                            .context
-                            .images
-                            .iter()
-                            .any(|image| image.name == source_cfg)
-                        {
-                            return StepAction::Status(
-                                format!(
-                                    "Validation Error: Source image '{}' no longer exists",
-                                    source_cfg
-                                ),
-                                crate::ui::StatusLevel::Error,
-                            );
-                        }
+                    match self.submit_config() {
+                        StepAction::None => StepAction::CloseDialog,
+                        action => action,
                     }
-                    let target_name = self.context.basic.name.clone();
-                    if self.context.entries.iter().any(|e| e.name == target_name)
-                        || self
-                            .context
-                            .images
-                            .iter()
-                            .any(|image| image.name == target_name)
-                    {
-                        return StepAction::Status(
-                            format!(
-                                "Validation Error: Container '{}' already exists",
-                                target_name
-                            ),
-                            crate::ui::StatusLevel::Error,
-                        );
-                    }
-
-                    self.loading = true;
-                    let tx = self.command_tx.clone();
-                    let cmd = crate::nspawn::ops::BackendCommand::SubmitConfig(Box::new(
-                        self.context.clone(),
-                    ));
-                    if tx.try_send(cmd).is_err() {
-                        self.loading = false;
-                        return StepAction::Status(
-                            "Internal error: Backend channel busy or closed".into(),
-                            crate::ui::StatusLevel::Error,
-                        );
-                    }
-                    StepAction::None
                 }
+                WizardMessage::DeclineUnsafeRemoteTar => StepAction::CloseDialog,
                 WizardMessage::OpenUserDialog => {
                     let mut editor =
                         crate::ui::widgets::dialogs::user_editor::UserEditor::new(|u| {
@@ -419,6 +411,9 @@ impl Wizard {
                     crate::nspawn::ops::BackendResponse::ValidationError(e) => {
                         StepAction::Status(format!("Error: {}", e), crate::ui::StatusLevel::Error)
                     }
+                    crate::nspawn::ops::BackendResponse::TarImportRiskConfirmationRequired(
+                        risk,
+                    ) => StepAction::OpenDialog(Box::new(TarRiskConfirmationDialog::new(risk))),
                     crate::nspawn::ops::BackendResponse::DeployStarted => {
                         self.move_next();
                         StepAction::None
@@ -517,6 +512,66 @@ impl Wizard {
         }
     }
 
+    fn submit_config(&mut self) -> StepAction {
+        if let Some(error) =
+            source_permission_error(&self.context.source.kind, self.context.permission_level)
+        {
+            return StepAction::Status(
+                format!("Validation Error: {error}"),
+                crate::ui::StatusLevel::Error,
+            );
+        }
+        if self.context.source.kind == SourceKind::Copy {
+            let source_cfg = self.context.source.clone_source.clone();
+            if !self
+                .context
+                .images
+                .iter()
+                .any(|image| image.name == source_cfg)
+            {
+                return StepAction::Status(
+                    format!(
+                        "Validation Error: Source image '{}' no longer exists",
+                        source_cfg
+                    ),
+                    crate::ui::StatusLevel::Error,
+                );
+            }
+        }
+        let target_name = self.context.basic.name.clone();
+        if self
+            .context
+            .entries
+            .iter()
+            .any(|entry| entry.name == target_name)
+            || self
+                .context
+                .images
+                .iter()
+                .any(|image| image.name == target_name)
+        {
+            return StepAction::Status(
+                format!(
+                    "Validation Error: Container '{}' already exists",
+                    target_name
+                ),
+                crate::ui::StatusLevel::Error,
+            );
+        }
+
+        self.loading = true;
+        let command =
+            crate::nspawn::ops::BackendCommand::SubmitConfig(Box::new(self.context.clone()));
+        if self.command_tx.try_send(command).is_err() {
+            self.loading = false;
+            return StepAction::Status(
+                "Internal error: Backend channel busy or closed".into(),
+                crate::ui::StatusLevel::Error,
+            );
+        }
+        StepAction::None
+    }
+
     fn move_next(&mut self) {
         if let Some(next_step) = self.resolve_next_step(self.step) {
             self.step = next_step;
@@ -548,9 +603,11 @@ fn source_permission_error(
 
 #[cfg(test)]
 mod tests {
-    use super::source_permission_error;
+    use super::{source_permission_error, TarRiskConfirmationDialog};
     use crate::nspawn::ops::PermissionLevel;
+    use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
     use crate::ui::wizard::core::context::SourceKind;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn oci_submission_requires_root_or_elevated_daemon() {
@@ -563,5 +620,22 @@ mod tests {
     fn regular_sources_keep_existing_permission_policy() {
         assert!(source_permission_error(&SourceKind::Pacstrap, PermissionLevel::User).is_none());
         assert!(source_permission_error(&SourceKind::Copy, PermissionLevel::User).is_none());
+    }
+
+    #[test]
+    fn tar_risk_dialog_requires_an_explicit_choice() {
+        let mut dialog = TarRiskConfirmationDialog::new("GNU tar 1.34 is risky".into());
+        assert!(matches!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            EventResult::Ignored
+        ));
+        assert!(matches!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            EventResult::Message(AppMessage::Wizard(WizardMessage::AcceptUnsafeRemoteTar))
+        ));
+        assert!(matches!(
+            dialog.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+            EventResult::Message(AppMessage::Wizard(WizardMessage::DeclineUnsafeRemoteTar))
+        ));
     }
 }

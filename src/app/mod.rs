@@ -596,8 +596,17 @@ impl App {
     fn handle_backend_result(&mut self, res: crate::nspawn::ops::BackendResponse) {
         if let Some(wizard) = &mut self.ui.wizard {
             let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
-            if let crate::ui::wizard::StepAction::Status(msg, level) = action {
-                self.set_status(msg, level);
+            match action {
+                crate::ui::wizard::StepAction::Status(msg, level) => {
+                    self.set_status(msg, level);
+                }
+                crate::ui::wizard::StepAction::OpenDialog(dialog) => {
+                    self.ui.active_dialog = Some(dialog);
+                }
+                crate::ui::wizard::StepAction::CloseDialog => {
+                    self.ui.active_dialog = None;
+                }
+                _ => {}
             }
         }
     }

@@ -234,6 +234,7 @@ impl ContainerConfigBuilder {
         bootstrap: crate::nspawn::ops::provision::BootstrapStore,
         image_import: crate::nspawn::ops::provision::ImageImportStore,
         oci_pull: crate::nspawn::ops::provision::OciPullStore,
+        allow_unsafe_remote_tar: bool,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
         use crate::nspawn::adapters::storage::*;
         use crate::nspawn::ops::provision::*;
@@ -292,6 +293,7 @@ impl ContainerConfigBuilder {
                 source: image::ImageSource::Local(artifact.path.clone()),
                 format: image::ImageFormat::from_artifact(&artifact),
                 image_import: image_import.clone(),
+                allow_unsafe_remote_tar: false,
             }) as Box<dyn Deployer>,
             SourceConfig::Pull { url, is_raw } => Box::new(image::ImageDeployer {
                 source: image::ImageSource::Remote(url),
@@ -301,6 +303,7 @@ impl ContainerConfigBuilder {
                     image::ImageFormat::Tar
                 },
                 image_import,
+                allow_unsafe_remote_tar,
             }) as Box<dyn Deployer>,
             SourceConfig::Bootstrap(spec) => {
                 Box::new(bootstrap::BootstrapDeployer { spec, bootstrap }) as Box<dyn Deployer>
