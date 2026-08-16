@@ -16,6 +16,9 @@ use crate::nspawn::ops::provision::{
 };
 use crate::nspawn::sys::log_output;
 
+const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageSource {
     Local(String),
@@ -137,9 +140,11 @@ async fn download_image(
     } else {
         "=http,https"
     };
+    let max_filesize = MAX_IMAGE_BYTES.to_string();
     let mut command = crate::nspawn::sys::new_command("curl");
     command.kill_on_drop(true);
     command.as_std_mut().process_group(0);
+    crate::nspawn::sys::command::limit_file_size(command.as_std_mut(), MAX_IMAGE_BYTES);
     let mut child = command
         .args([
             "--progress-bar",
@@ -150,6 +155,8 @@ async fn download_image(
             "=http,https",
             "--proto-redir",
             redirect_protocols,
+            "--max-filesize",
+            &max_filesize,
             "--user-agent",
             "Lasper/0.3",
             "--",
@@ -183,10 +190,19 @@ async fn download_image(
         .await
         .map_err(|error| process_state_unknown("curl", error))?;
     if !status.success() {
+        if status.code() == Some(CURL_FILESIZE_EXCEEDED_EXIT_CODE)
+            || file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES)
+        {
+            return Err(NspawnError::Validation(format!(
+                "Downloaded image exceeds the {} byte limit",
+                MAX_IMAGE_BYTES
+            )));
+        }
         return Err(NspawnError::DeployError(format!(
             "Network download failed: {status}"
         )));
     }
+    validate_source_size(&destination, "Downloaded image")?;
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
@@ -253,6 +269,7 @@ async fn normalize_compression(
     logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
     cancellation: &DeploymentCancellation,
 ) -> Result<std::fs::File> {
+    validate_source_size(&source, "Image source")?;
     let Some(compression) = detect_compression(&source)? else {
         source
             .seek(SeekFrom::Start(0))
@@ -274,6 +291,7 @@ async fn normalize_compression(
     let mut command = crate::nspawn::sys::new_command(program);
     command.kill_on_drop(true);
     command.as_std_mut().process_group(0);
+    crate::nspawn::sys::command::limit_file_size(command.as_std_mut(), MAX_IMAGE_BYTES);
     let mut child = command
         .args(["-d", "-c"])
         .stdin(Stdio::from(source))
@@ -304,16 +322,40 @@ async fn normalize_compression(
     };
     log_output(program, &result);
     if !result.status.success() {
+        if file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES) {
+            return Err(NspawnError::Validation(format!(
+                "Decompressed image exceeds the {} byte limit",
+                MAX_IMAGE_BYTES
+            )));
+        }
         return Err(NspawnError::cmd_failed(
             "decompress image source",
             format!("{program} -d -c"),
             &result,
         ));
     }
+    validate_source_size(&destination, "Decompressed image")?;
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
     Ok(destination)
+}
+
+fn validate_source_size(source: &std::fs::File, label: &str) -> Result<()> {
+    let metadata = source
+        .metadata()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+    if metadata.is_file() && metadata.len() > MAX_IMAGE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "{label} exceeds the {} byte limit",
+            MAX_IMAGE_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn file_size(file: &std::fs::File) -> Option<u64> {
+    file.metadata().ok().map(|metadata| metadata.len())
 }
 
 async fn terminate_child_group(
@@ -500,6 +542,16 @@ mod tests {
         assert!(validate_download_url("http://example.test/rootfs.raw").is_ok());
         assert!(validate_download_url("file:///etc/shadow").is_err());
         assert!(validate_download_url("https://user:secret@example.test/rootfs.raw").is_err());
+    }
+
+    #[test]
+    fn source_size_limit_rejects_oversized_files_before_processing() {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+
+        let error = validate_source_size(&source, "Image source").unwrap_err();
+
+        assert!(error.to_string().contains("byte limit"));
     }
 
     #[test]

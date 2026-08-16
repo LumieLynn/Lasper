@@ -5,9 +5,12 @@ use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::MachineName;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
+
+const MAX_TAR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,18 +185,25 @@ fn extract_tar_at(
     source_origin: TarSourceOrigin,
     allow_unsafe_remote: bool,
 ) -> Result<ImageImportReport> {
+    super::tar_limits::validate(&source)?;
     let assessment = inspect_tar_runtime()?;
     let report = tar_runtime_policy(source_origin, &assessment, allow_unsafe_remote)?;
     for warning in &report.warnings {
         log::warn!("[AUDIT] [Tar import] {warning}");
     }
 
-    let output = tar_command()
+    let mut command = tar_command();
+    crate::nspawn::sys::command::limit_file_size(
+        &mut command,
+        super::tar_limits::MAX_EXPANDED_BYTES,
+    );
+    command
         .args(["--numeric-owner", "-pxf", "-", "-C"])
         .arg(target)
         .stdin(Stdio::from(source))
-        .output()
-        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = run_tar_extract(command)?;
     crate::nspawn::sys::log_output("typed tar import", &output);
     if output.status.success() {
         Ok(report)
@@ -204,6 +214,52 @@ fn extract_tar_at(
             &output,
         ))
     }
+}
+
+fn run_tar_extract(mut command: std::process::Command) -> Result<std::process::Output> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+    let mut stderr = child.stderr.take().expect("tar stderr piped");
+    let stderr = match read_bounded_diagnostics(&mut stderr, MAX_TAR_DIAGNOSTIC_BYTES) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(NspawnError::Io(PathBuf::from("tar"), error));
+        }
+    };
+    let status = child
+        .wait()
+        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+    Ok(std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr,
+    })
+}
+
+fn read_bounded_diagnostics(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut kept = Vec::with_capacity(limit.min(4096));
+    let mut chunk = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        let take = count.min(remaining);
+        kept.extend_from_slice(&chunk[..take]);
+        truncated |= take < count;
+    }
+    if truncated {
+        const MARKER: &[u8] = b"\n[tar diagnostics truncated]\n";
+        let marker_start = limit.saturating_sub(MARKER.len());
+        kept.truncate(marker_start);
+        kept.extend_from_slice(&MARKER[..MARKER.len().min(limit)]);
+    }
+    Ok(kept)
 }
 
 fn tar_command() -> std::process::Command {
@@ -412,6 +468,16 @@ mod tests {
         assert!(command
             .get_envs()
             .any(|(name, value)| name == "TAR_OPTIONS" && value.is_none()));
+    }
+
+    #[test]
+    fn tar_diagnostics_are_drained_with_a_bounded_capture() {
+        let mut diagnostics = std::io::Cursor::new(vec![b'x'; 4096]);
+
+        let captured = read_bounded_diagnostics(&mut diagnostics, 128).unwrap();
+
+        assert_eq!(captured.len(), 128);
+        assert!(captured.ends_with(b"[tar diagnostics truncated]\n"));
     }
 
     #[test]

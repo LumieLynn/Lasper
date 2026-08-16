@@ -4,6 +4,7 @@ pub(crate) mod bootstrap_operation;
 pub mod builders;
 pub(crate) mod image_operation;
 pub(crate) mod oci_operation;
+mod tar_limits;
 
 pub use bootstrap_operation::BootstrapStore;
 pub use image_operation::ImageImportStore;

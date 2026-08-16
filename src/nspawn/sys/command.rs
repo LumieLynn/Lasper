@@ -180,6 +180,27 @@ pub fn new_sync_command(program: &str) -> std::process::Command {
     cmd
 }
 
+/// Cap the size of regular files written by a child process.
+///
+/// This is a per-file kernel limit. Callers that need a total tree or
+/// archive budget must enforce that budget separately.
+pub(crate) fn limit_file_size(command: &mut std::process::Command, limit: u64) {
+    unsafe {
+        command.pre_exec(move || {
+            let mut resource = std::mem::zeroed::<libc::rlimit>();
+            if libc::getrlimit(libc::RLIMIT_FSIZE, &mut resource) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            resource.rlim_cur = resource.rlim_cur.min(limit as libc::rlim_t);
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &resource) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
 /// Logs the captured stdout/stderr of a finished command.
 ///
 /// - stdout → `log::debug!`
@@ -229,6 +250,21 @@ impl CommandLogged for tokio::process::Command {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn child_file_size_limit_caps_regular_file_output() {
+        let destination = tempfile::tempfile().unwrap();
+        let mut command = new_sync_command("head");
+        command
+            .args(["-c", "2048", "/dev/zero"])
+            .stdout(Stdio::from(destination.try_clone().unwrap()));
+        limit_file_size(&mut command, 1024);
+
+        let status = command.status().unwrap();
+
+        assert!(!status.success());
+        assert!(destination.metadata().unwrap().len() <= 1024);
+    }
 
     #[tokio::test]
     async fn cancellable_process_waits_for_its_process_group_to_exit() {

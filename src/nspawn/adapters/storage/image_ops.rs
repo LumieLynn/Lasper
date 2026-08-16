@@ -9,6 +9,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+
 #[derive(Debug)]
 struct ImagePartitionTable {
     label: String,
@@ -170,6 +172,12 @@ pub(crate) fn validate_import_source(source: &std::fs::File) -> Result<()> {
         return Err(NspawnError::Validation(
             "Source image descriptor is empty".into(),
         ));
+    }
+    if file_type.is_file() && metadata.len() > MAX_IMAGE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "Source image descriptor exceeds the {} byte limit",
+            MAX_IMAGE_BYTES
+        )));
     }
     Ok(())
 }
@@ -387,7 +395,21 @@ fn import_raw_image_blocking(
 }
 
 fn copy_source(source: &mut std::fs::File, destination: &mut std::fs::File) -> std::io::Result<()> {
+    copy_source_with_limit(source, destination, MAX_IMAGE_BYTES)
+}
+
+fn copy_source_with_limit(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    limit: u64,
+) -> std::io::Result<()> {
     let metadata = source.metadata()?;
+    if metadata.is_file() && metadata.len() > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("source image exceeds {limit} bytes"),
+        ));
+    }
     if metadata.is_file() && copy_sparse_regular_file(source, destination, metadata.len())? {
         return Ok(());
     }
@@ -395,7 +417,13 @@ fn copy_source(source: &mut std::fs::File, destination: &mut std::fs::File) -> s
     source.seek(SeekFrom::Start(0))?;
     destination.set_len(0)?;
     destination.seek(SeekFrom::Start(0))?;
-    std::io::copy(source, destination)?;
+    let copied = std::io::copy(&mut source.take(limit.saturating_add(1)), destination)?;
+    if copied > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("source image exceeds {limit} bytes"),
+        ));
+    }
     Ok(())
 }
 
@@ -1663,6 +1691,36 @@ mod tests {
         let mut end = [0u8; 3];
         destination.read_exact(&mut end).unwrap();
         assert_eq!(&end, b"end");
+    }
+
+    #[test]
+    fn source_validation_rejects_oversized_regular_images() {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+
+        let error = validate_import_source(&source).unwrap_err();
+
+        assert!(error.to_string().contains("byte limit"));
+    }
+
+    #[test]
+    fn raw_copy_enforces_the_limit_for_non_sparse_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.raw");
+        let destination_path = directory.path().join("destination.raw");
+        std::fs::write(&source_path, b"0123456789").unwrap();
+        let mut source = std::fs::File::open(&source_path).unwrap();
+        let mut destination = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&destination_path)
+            .unwrap();
+
+        let error = copy_source_with_limit(&mut source, &mut destination, 4).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(destination.metadata().unwrap().len(), 0);
     }
 
     #[test]
