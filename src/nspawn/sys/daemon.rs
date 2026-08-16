@@ -1,18 +1,17 @@
 //! Elevated daemon — a long-running root child process that executes closed,
 //! typed privileged operations on behalf of the unprivileged TUI.
 //!
-//! Communication is JSON-RPC 2.0 over stdin/stdout (one JSON object per
-//! line). The daemon is spawned via `sudo <self> --daemon` before the
-//! terminal enters raw mode, so the sudo password prompt appears on the
-//! clean terminal.
+//! The daemon receives one bootstrap message over stdin, then serves JSON-RPC
+//! 2.0 over an authenticated Unix stream (one JSON object per line). The
+//! daemon is spawned via `sudo <self> --daemon` before the terminal enters
+//! raw mode, so the sudo password prompt appears on the clean terminal.
 //!
 //! ## Architecture
 //!
-//! A dedicated I/O task serializes all RPC traffic through the child's
-//! stdin/stdout pipes. Callers send `(request, oneshot::Sender)` tuples
-//! over an mpsc channel; the I/O task writes the request, reads the
-//! response, and fulfills the oneshot. This avoids locking issues around
-//! async pipe I/O.
+//! A dedicated I/O task serializes all RPC traffic through the authenticated
+//! Unix stream. Callers send `(request, oneshot::Sender)` tuples over an mpsc
+//! channel; the I/O task writes the request, reads the response, and fulfills
+//! the oneshot. This avoids locking issues around async socket I/O.
 //!
 //! ## FD passing
 //!
@@ -21,7 +20,7 @@
 //! over a Unix domain socket using the [`sendfd`] crate. The socket is scoped
 //! to a private per-session directory, owned by the launching user, and each
 //! connection must match both the TUI's PID/UID via `SO_PEERCRED` and a random
-//! session token delivered through the private stdin bootstrap pipe.
+//! session token delivered during the private bootstrap handshake.
 
 use crate::nspawn::adapters::comm::backend::ContainerBackend;
 use crate::nspawn::adapters::config::store::{
@@ -72,6 +71,13 @@ struct DaemonBootstrap {
     protocol_version: u32,
     fd_auth_token: String,
     dbus_enabled: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RpcBootstrap {
+    protocol_version: u32,
+    auth_token: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -157,6 +163,7 @@ struct ImportImageResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RpcRequest {
     jsonrpc: String,
     id: u64,
@@ -213,6 +220,7 @@ pub struct ElevatedDaemon {
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     event_tx: tokio::sync::broadcast::Sender<()>,
     pid: u32,
+    rpc_sock_path: PathBuf,
     fd_sock_path: PathBuf,
     fd_auth_token: Arc<str>,
     _fd_sock_dir: Arc<tempfile::TempDir>,
@@ -237,6 +245,7 @@ impl Clone for ElevatedDaemon {
             next_id: self.next_id.clone(),
             event_tx: self.event_tx.clone(),
             pid: self.pid,
+            rpc_sock_path: self.rpc_sock_path.clone(),
             fd_sock_path: self.fd_sock_path.clone(),
             fd_auth_token: self.fd_auth_token.clone(),
             _fd_sock_dir: self._fd_sock_dir.clone(),
@@ -340,7 +349,7 @@ fn runtime_dir_error_allows_fallback(error: &std::io::Error) -> bool {
     )
 }
 
-fn configure_fd_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
+fn configure_user_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = std::fs::symlink_metadata(path)?;
@@ -353,10 +362,23 @@ fn configure_fd_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
     if secured.uid() != user_uid || secured.mode() & 0o777 != 0o600 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "fd socket ownership or mode verification failed",
+            "daemon socket ownership or mode verification failed",
         ));
     }
     Ok(())
+}
+
+async fn connect_rpc_socket(path: &Path) -> std::io::Result<UnixStream> {
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        match UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl ElevatedDaemon {
@@ -366,19 +388,23 @@ impl ElevatedDaemon {
         let parent_pid = std::process::id();
         let fd_auth_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
         let fd_sock_dir = Arc::new(create_fd_socket_dir(user_uid)?);
-        let sock_path = fd_sock_dir.path().join("fd.sock");
+        let fd_sock_path = fd_sock_dir.path().join("fd.sock");
+        let rpc_sock_path = fd_sock_dir.path().join("rpc.sock");
 
         let mut child = tokio::process::Command::new("sudo")
+            .kill_on_drop(true)
             .arg(&exe)
             .arg("--daemon")
             .arg("--fd-sock")
-            .arg(&sock_path)
+            .arg(&fd_sock_path)
+            .arg("--rpc-sock")
+            .arg(&rpc_sock_path)
             .arg("--daemon-uid")
             .arg(user_uid.to_string())
             .arg("--daemon-pid")
             .arg(parent_pid.to_string())
             .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|error| {
@@ -390,43 +416,45 @@ impl ElevatedDaemon {
 
         let pid = child.id().expect("child has pid");
 
-        let child_stdin = child.stdin.take().expect("stdin piped");
-        let child_stdout = child.stdout.take().expect("stdout piped");
+        let mut child_stdin = child.stdin.take().expect("stdin piped");
+        use tokio::io::AsyncWriteExt;
+        let bootstrap = DaemonBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            fd_auth_token: fd_auth_token.to_string(),
+            dbus_enabled,
+        };
+        let mut bootstrap_line = serde_json::to_vec(&bootstrap).map_err(|error| {
+            std::io::Error::other(format!("serialize daemon bootstrap: {error}"))
+        })?;
+        bootstrap_line.push(b'\n');
+        child_stdin.write_all(&bootstrap_line).await?;
+        child_stdin.flush().await?;
+        drop(child_stdin);
+
+        let mut rpc_stream = connect_rpc_socket(&rpc_sock_path).await?;
+        let rpc_bootstrap = RpcBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            auth_token: fd_auth_token.to_string(),
+        };
+        let mut rpc_bootstrap_line = serde_json::to_vec(&rpc_bootstrap).map_err(|error| {
+            std::io::Error::other(format!("serialize RPC authentication: {error}"))
+        })?;
+        rpc_bootstrap_line.push(b'\n');
+        rpc_stream.write_all(&rpc_bootstrap_line).await?;
+        rpc_stream.flush().await?;
+        let (rpc_reader, rpc_writer) = rpc_stream.into_split();
 
         let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<RpcCall>(8);
         let (event_tx, _) = tokio::sync::broadcast::channel::<()>(16);
 
         let io_pid = pid;
         let event_tx_io = event_tx.clone();
-        let bootstrap_token = fd_auth_token.clone();
         tokio::spawn(async move {
             use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-            let mut stdin = tokio::io::BufWriter::new(child_stdin);
-            let mut stdout = tokio::io::BufReader::new(child_stdout);
+            let mut writer = tokio::io::BufWriter::new(rpc_writer);
+            let mut reader = tokio::io::BufReader::new(rpc_reader);
             let mut line_buf = String::new();
-
-            let bootstrap = DaemonBootstrap {
-                protocol_version: DAEMON_BOOTSTRAP_VERSION,
-                fd_auth_token: bootstrap_token.to_string(),
-                dbus_enabled,
-            };
-            let mut bootstrap_line = match serde_json::to_vec(&bootstrap) {
-                Ok(line) => line,
-                Err(e) => {
-                    log::error!("Daemon I/O: failed to serialize bootstrap: {}", e);
-                    return;
-                }
-            };
-            bootstrap_line.push(b'\n');
-            if let Err(e) = stdin.write_all(&bootstrap_line).await {
-                log::error!("Daemon I/O: failed to write bootstrap: {}", e);
-                return;
-            }
-            if let Err(e) = stdin.flush().await {
-                log::error!("Daemon I/O: failed to flush bootstrap: {}", e);
-                return;
-            }
 
             let mut pending: std::collections::HashMap<
                 u64,
@@ -452,28 +480,28 @@ impl ElevatedDaemon {
                         };
                         req_line.push('\n');
 
-                        if let Err(e) = stdin.write_all(req_line.as_bytes()).await {
-                            log::error!("Daemon I/O: failed to write to child stdin: {}", e);
+                        if let Err(e) = writer.write_all(req_line.as_bytes()).await {
+                            log::error!("Daemon I/O: failed to write to daemon RPC socket: {}", e);
                             break;
                         }
-                        if let Err(e) = stdin.flush().await {
-                            log::error!("Daemon I/O: failed to flush child stdin: {}", e);
+                        if let Err(e) = writer.flush().await {
+                            log::error!("Daemon I/O: failed to flush daemon RPC socket: {}", e);
                             break;
                         }
 
                         pending.insert(id, response_tx);
                     }
 
-                    read_res = stdout.read_line(&mut line_buf) => {
+                    read_res = reader.read_line(&mut line_buf) => {
                         match read_res {
                             Ok(0) => {
-                                log::info!("[lasper] I/O task: daemon stdout EOF");
-                                log::error!("Daemon I/O: child stdout closed (EOF)");
+                                log::info!("[lasper] I/O task: daemon RPC socket EOF");
+                                log::error!("Daemon I/O: RPC socket closed (EOF)");
                                 break;
                             }
                             Ok(_) => {}
                             Err(e) => {
-                                log::error!("Daemon I/O: failed to read child stdout: {}", e);
+                                log::error!("Daemon I/O: failed to read daemon RPC socket: {}", e);
                                 break;
                             }
                         }
@@ -520,7 +548,7 @@ impl ElevatedDaemon {
                 "[lasper] I/O task exiting, waiting for child pid={}...",
                 io_pid
             );
-            drop(stdin);
+            drop(writer);
             let _ = child.wait().await;
             log::info!("[lasper] I/O task done (child reaped)");
         });
@@ -532,7 +560,8 @@ impl ElevatedDaemon {
             next_id,
             event_tx,
             pid,
-            fd_sock_path: sock_path,
+            rpc_sock_path,
+            fd_sock_path,
             fd_auth_token,
             _fd_sock_dir: fd_sock_dir,
             next_spawn_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -614,6 +643,7 @@ impl ElevatedDaemon {
         log::info!("[lasper] daemon::exit() sending RPC...");
         // Send exit command and ignore response since daemon will exit immediately
         let _ = self.rpc_call("exit", serde_json::json!({})).await;
+        let _ = tokio::fs::remove_file(&self.rpc_sock_path).await;
         let _ = tokio::fs::remove_file(&self.fd_sock_path).await;
         let _ = tokio::fs::remove_dir(self._fd_sock_dir.path()).await;
         log::info!("[lasper] daemon::exit() RPC returned");
@@ -947,17 +977,66 @@ impl ElevatedDaemon {
 
 // ── Daemon main loop (child side) ──
 
+async fn accept_rpc_connection(
+    listener: &UnixListener,
+    expected_peer: PeerCredentials,
+    expected_auth_token: &str,
+) -> std::io::Result<(
+    tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    tokio::net::unix::OwnedWriteHalf,
+)> {
+    use tokio::io::AsyncBufReadExt;
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let actual_peer = match get_peer_credentials(&stream) {
+            Ok(credentials) => credentials,
+            Err(error) => {
+                log::warn!("Daemon RPC: failed to read peer credentials: {error}");
+                continue;
+            }
+        };
+        if let Err(error) = authorize_fd_peer(actual_peer, expected_peer) {
+            log::warn!("Daemon RPC: rejected peer: {error:?}");
+            continue;
+        }
+
+        let (read_half, write_half) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut line = String::new();
+        if reader.read_line(&mut line).await? == 0 {
+            log::warn!("Daemon RPC: authentication handshake is missing");
+            continue;
+        }
+        let bootstrap: RpcBootstrap = match serde_json::from_str(&line) {
+            Ok(bootstrap) => bootstrap,
+            Err(error) => {
+                log::warn!("Daemon RPC: invalid authentication handshake: {error}");
+                continue;
+            }
+        };
+        if bootstrap.protocol_version != DAEMON_BOOTSTRAP_VERSION
+            || authorize_fd_token(&bootstrap.auth_token, expected_auth_token).is_err()
+        {
+            log::warn!("Daemon RPC: authentication handshake rejected");
+            continue;
+        }
+        return Ok((reader, write_half));
+    }
+}
+
 pub async fn daemon_main(
     fd_sock_opt: Option<PathBuf>,
+    rpc_sock_opt: Option<PathBuf>,
     user_uid: u32,
     expected_parent_pid: u32,
 ) -> ! {
     use tokio::io::AsyncBufReadExt;
 
     let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
+    let mut bootstrap_lines = stdin.lines();
 
-    let bootstrap_line = match lines.next_line().await {
+    let bootstrap_line = match bootstrap_lines.next_line().await {
         Ok(Some(line)) => line,
         Ok(None) => {
             eprintln!("lasper daemon: missing bootstrap message");
@@ -984,17 +1063,71 @@ pub async fn daemon_main(
     }
     let fd_auth_token: Arc<str> = Arc::from(bootstrap.fd_auth_token);
 
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let expected_peer = PeerCredentials {
+        pid: expected_parent_pid,
+        uid: user_uid,
+    };
 
+    // ── Authenticated JSON-RPC Unix socket ──
+    let rpc_sock_path = match rpc_sock_opt {
+        Some(path) => path,
+        None => {
+            log::error!("Daemon: missing RPC socket path");
+            std::process::exit(1);
+        }
+    };
+    let rpc_listener = match UnixListener::bind(&rpc_sock_path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            log::error!("Daemon: failed to bind RPC socket: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = configure_user_socket(&rpc_sock_path, user_uid) {
+        log::error!("Daemon: failed to secure RPC socket: {error}");
+        std::process::exit(1);
+    }
+
+    // ── FD-passing Unix socket ──
+    let sock_path = match fd_sock_opt {
+        Some(path) => path,
+        None => {
+            log::error!("Daemon: missing fd socket path");
+            std::process::exit(1);
+        }
+    };
+    let listener = match UnixListener::bind(&sock_path) {
+        Ok(l) => l,
+        Err(e) => {
+            log::error!("Daemon: failed to bind: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = configure_user_socket(&sock_path, user_uid) {
+        log::error!("Daemon: failed to secure fd socket: {}", e);
+        std::process::exit(1);
+    }
+
+    let (rpc_reader, rpc_writer) =
+        match accept_rpc_connection(&rpc_listener, expected_peer, &fd_auth_token).await {
+            Ok(parts) => parts,
+            Err(error) => {
+                log::error!("Daemon: RPC authentication failed: {error}");
+                std::process::exit(1);
+            }
+        };
+
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
+    let mut lines = rpc_reader.lines();
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
-        let mut stdout = tokio::io::BufWriter::new(tokio::io::stdout());
+        let mut writer = tokio::io::BufWriter::new(rpc_writer);
         while let Some(mut line) = out_rx.recv().await {
             line.push('\n');
-            if stdout.write_all(line.as_bytes()).await.is_err() {
+            if writer.write_all(line.as_bytes()).await.is_err() {
                 break;
             }
-            if stdout.flush().await.is_err() {
+            if writer.flush().await.is_err() {
                 break;
             }
         }
@@ -1024,30 +1157,6 @@ pub async fn daemon_main(
         });
     }
 
-    // ── FD-passing Unix socket ──
-    let sock_path = match fd_sock_opt {
-        Some(path) => path,
-        None => {
-            log::error!("Daemon: missing fd socket path");
-            std::process::exit(1);
-        }
-    };
-    let listener = match UnixListener::bind(&sock_path) {
-        Ok(l) => l,
-        Err(e) => {
-            log::error!("Daemon: failed to bind: {}", e);
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = configure_fd_socket(&sock_path, user_uid) {
-        log::error!("Daemon: failed to secure fd socket: {}", e);
-        std::process::exit(1);
-    }
-
-    let expected_peer = PeerCredentials {
-        pid: expected_parent_pid,
-        uid: user_uid,
-    };
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -1079,7 +1188,7 @@ pub async fn daemon_main(
             Ok(Some(l)) => l,
             Ok(None) => std::process::exit(0),
             Err(e) => {
-                log::error!("Daemon stdin error: {}", e);
+                log::error!("Daemon RPC socket error: {}", e);
                 std::process::exit(1);
             }
         };
@@ -2073,6 +2182,82 @@ mod tests {
         assert!(serde_json::from_value::<DaemonBootstrap>(unknown_field).is_err());
     }
 
+    #[test]
+    fn rpc_bootstrap_requires_the_session_secret_and_known_fields() {
+        let bootstrap = RpcBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            auth_token: TEST_TOKEN.to_string(),
+        };
+        let json = serde_json::to_value(&bootstrap).unwrap();
+        let parsed: RpcBootstrap = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed.auth_token, TEST_TOKEN);
+
+        let wrong_token = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "auth_token": "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce1",
+        });
+        let parsed: RpcBootstrap = serde_json::from_value(wrong_token).unwrap();
+        assert!(authorize_fd_token(&parsed.auth_token, TEST_TOKEN).is_err());
+
+        let unknown_field = serde_json::json!({
+            "protocol_version": DAEMON_BOOTSTRAP_VERSION,
+            "auth_token": TEST_TOKEN,
+            "unexpected": true,
+        });
+        assert!(serde_json::from_value::<RpcBootstrap>(unknown_field).is_err());
+    }
+
+    #[test]
+    fn rpc_request_rejects_unknown_fields() {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "ping",
+            "params": {},
+            "auth_token": TEST_TOKEN,
+        });
+        assert!(serde_json::from_value::<RpcRequest>(request).is_err());
+    }
+
+    #[tokio::test]
+    async fn rpc_handshake_preserves_the_first_request_after_authentication() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("rpc.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let expected_peer = PeerCredentials {
+            pid: std::process::id(),
+            uid: uzers::get_current_uid(),
+        };
+        let server = tokio::spawn(async move {
+            accept_rpc_connection(&listener, expected_peer, TEST_TOKEN)
+                .await
+                .unwrap()
+        });
+
+        let mut client = UnixStream::connect(&socket_path).await.unwrap();
+        let authentication = RpcBootstrap {
+            protocol_version: DAEMON_BOOTSTRAP_VERSION,
+            auth_token: TEST_TOKEN.to_string(),
+        };
+        let request = r#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+        client
+            .write_all(
+                format!(
+                    "{}\n{request}\n",
+                    serde_json::to_string(&authentication).unwrap()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let (reader, _writer) = server.await.unwrap();
+        let mut lines = reader.lines();
+        assert_eq!(lines.next_line().await.unwrap().as_deref(), Some(request));
+    }
+
     #[tokio::test]
     async fn cli_mode_skips_daemon_dbus_initialization() {
         assert!(initialize_dbus_backend(false).await.is_none());
@@ -2395,7 +2580,7 @@ mod tests {
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let uid = uzers::get_current_uid();
 
-        configure_fd_socket(&socket_path, uid).unwrap();
+        configure_user_socket(&socket_path, uid).unwrap();
 
         let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
         assert_eq!(metadata.uid(), uid);

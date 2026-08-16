@@ -107,6 +107,7 @@ struct CliOptions {
     want_cli_mode: bool,
     is_daemon: bool,
     fd_sock: Option<PathBuf>,
+    rpc_sock: Option<PathBuf>,
     daemon_uid: u32,
     daemon_pid: u32,
 }
@@ -118,6 +119,7 @@ fn parse_flags() -> std::result::Result<CliOptions, i32> {
         want_cli_mode: false,
         is_daemon: false,
         fd_sock: None,
+        rpc_sock: None,
         daemon_uid: 0,
         daemon_pid: 0,
     };
@@ -143,6 +145,14 @@ fn parse_flags() -> std::result::Result<CliOptions, i32> {
                     return Err(1);
                 }
                 options.fd_sock = Some(PathBuf::from(&args[i]));
+            }
+            "--rpc-sock" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --rpc-sock requires a path argument");
+                    return Err(1);
+                }
+                options.rpc_sock = Some(PathBuf::from(&args[i]));
             }
             "--daemon-uid" => {
                 i += 1;
@@ -197,6 +207,7 @@ async fn main() -> Result<()> {
     if options.is_daemon {
         crate::nspawn::sys::daemon::daemon_main(
             options.fd_sock,
+            options.rpc_sock,
             options.daemon_uid,
             options.daemon_pid,
         )

@@ -13,9 +13,9 @@ Lasper manages host-level container resources and may execute operations as root
 Each daemon session uses:
 
 - A private, randomly named temporary directory.
-- A Unix socket owned by the invoking user with mode `0600`.
+- Authenticated control and FD-passing Unix sockets owned by the invoking user with mode `0600`.
 - Kernel `SO_PEERCRED` checks for the exact PID and UID of the launching TUI.
-- A random per-session token delivered through the daemon's stdin bootstrap channel and required on privileged requests.
+- A random per-session token delivered once during bootstrap and required on both RPC and FD-passing connections.
 - Structured request messages instead of delimiter-based command strings.
 
 The daemon exits when Lasper shuts it down normally. A crashed or forcibly terminated session can leave a temporary directory behind, but the random path, directory permissions, peer checks, and expired session token prevent it from becoming a reusable daemon endpoint.
