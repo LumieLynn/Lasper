@@ -45,18 +45,9 @@ impl BasicStepView {
                 " Hostname (optional, defaults to name) ",
                 initial_data.hostname.clone(),
             )
-            .with_validator(|v| {
-                let s = v.trim();
-                if s.is_empty() {
-                    return Ok(());
-                }
-                if !s
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
-                {
-                    return Err("Invalid hostname characters".into());
-                }
-                Ok(())
+            .with_validator(|value| {
+                crate::nspawn::models::validate_nspawn_hostname(value)
+                    .map_err(|error| error.to_string())
             }),
             show_hostname,
             focus: FocusTracker::new(),

@@ -33,7 +33,7 @@ pub struct NspawnConfigSpec {
 
 impl NspawnConfigSpec {
     pub fn validate(&self) -> Result<()> {
-        validate_text("hostname", &self.hostname, true)?;
+        validate_nspawn_hostname(&self.hostname)?;
 
         let expected_resolv_conf = ResolvConfMode::for_network(self.network.as_ref());
         if self.resolv_conf != expected_resolv_conf {
@@ -61,13 +61,17 @@ impl NspawnConfigSpec {
             ));
         }
 
+        for port_forward in &self.port_forwards {
+            port_forward.validate()?;
+        }
+
         if let Some(network) = &self.network {
             match network {
                 NetworkMode::Bridge(name)
                 | NetworkMode::MacVlan(name)
                 | NetworkMode::IpVlan(name)
                 | NetworkMode::Interface(name) => {
-                    validate_text("network interface", name, false)?;
+                    validate_nspawn_interface_name(name)?;
                 }
                 NetworkMode::Host | NetworkMode::None | NetworkMode::Veth => {}
             }
@@ -176,11 +180,24 @@ impl TryFrom<&PortForward> for NspawnPortForward {
                 )));
             }
         };
-        Ok(Self {
+        let forward = Self {
             host: value.host,
             container: value.container,
             protocol,
-        })
+        };
+        forward.validate()?;
+        Ok(forward)
+    }
+}
+
+impl NspawnPortForward {
+    fn validate(&self) -> Result<()> {
+        if self.host == 0 || self.container == 0 {
+            return Err(NspawnError::Validation(
+                "Port-forward ports must be in the range 1..=65535".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -198,6 +215,46 @@ impl TransportProtocol {
             Self::Udp => "udp",
         }
     }
+}
+
+pub(crate) fn validate_nspawn_hostname(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Ok(());
+    }
+    let valid = value.len() <= 64
+        && !value.starts_with('.')
+        && !value.ends_with('.')
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    if !valid {
+        return Err(NspawnError::Validation(format!(
+            "Invalid hostname: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_nspawn_interface_name(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 15
+        && !matches!(value, "." | ".." | "all" | "default")
+        && !bytes.iter().all(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .all(|byte| (33..=126).contains(byte) && !matches!(*byte, b':' | b'/' | b'%'));
+    if !valid {
+        return Err(NspawnError::Validation(format!(
+            "Invalid network interface name: {value:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_text(label: &str, value: &str, allow_empty: bool) -> Result<()> {
@@ -329,5 +386,75 @@ mod tests {
             };
             NspawnConfigSpec::try_from(&config).unwrap();
         }
+    }
+
+    #[test]
+    fn port_forwards_reject_zero_in_typed_and_deserialized_specs() {
+        for (host, container) in [(0, 80), (8080, 0)] {
+            let config = ContainerConfig {
+                name: "port-test".into(),
+                port_forwards: vec![PortForward {
+                    host,
+                    container,
+                    proto: "tcp".into(),
+                }],
+                ..Default::default()
+            };
+            assert!(NspawnConfigSpec::try_from(&config).is_err());
+        }
+
+        let mut spec = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "wire-port-test".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        spec.port_forwards.push(NspawnPortForward {
+            host: 0,
+            container: 80,
+            protocol: TransportProtocol::Tcp,
+        });
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn hostname_validation_matches_nspawn_hostname_rules() {
+        for hostname in ["", "host", "Host-01", "host.example"] {
+            assert!(validate_nspawn_hostname(hostname).is_ok(), "{hostname:?}");
+        }
+        assert!(validate_nspawn_hostname(&"a".repeat(64)).is_ok());
+
+        for hostname in [
+            "host name",
+            "host_name",
+            ".host",
+            "host.",
+            "host..name",
+            "-host",
+            "host-",
+        ] {
+            assert!(validate_nspawn_hostname(hostname).is_err(), "{hostname:?}");
+        }
+        assert!(validate_nspawn_hostname(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn interface_validation_matches_systemd_ifname_rules() {
+        for interface in ["eth0", "br-test", "veth.0", "name@peer"] {
+            assert!(
+                validate_nspawn_interface_name(interface).is_ok(),
+                "{interface:?}"
+            );
+        }
+        assert!(validate_nspawn_interface_name(&"a".repeat(15)).is_ok());
+
+        for interface in [
+            "", ".", "..", "all", "default", "123", "eth 0", "eth/0", "eth:0", "eth%0", "接口0",
+        ] {
+            assert!(
+                validate_nspawn_interface_name(interface).is_err(),
+                "{interface:?}"
+            );
+        }
+        assert!(validate_nspawn_interface_name(&"a".repeat(16)).is_err());
     }
 }

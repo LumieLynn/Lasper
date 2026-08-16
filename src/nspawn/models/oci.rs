@@ -86,10 +86,17 @@ fn validate_oci_reference(reference: &str) -> Result<(), &'static str> {
         return Err("expected a registry image reference, not a transport URL or digest");
     }
 
-    // Match systemd's current oci_ref_parse(): the final ':' introduces a
-    // tag, then the first '/' separates an optional registry from the image.
-    let (without_tag, tag) = match reference.rsplit_once(':') {
-        Some((image, tag)) => (image, Some(tag)),
+    // A colon before the first image slash belongs to the registry port; only
+    // a colon in the image portion introduces a tag. This preserves both
+    // registry:port/image and registry:port/image:tag.
+    let last_slash = reference.rfind('/');
+    let tag_separator = match (reference.rfind(':'), last_slash) {
+        (Some(colon), Some(slash)) if colon > slash => Some(colon),
+        (Some(colon), None) => Some(colon),
+        _ => None,
+    };
+    let (without_tag, tag) = match tag_separator {
+        Some(colon) => (&reference[..colon], Some(&reference[colon + 1..])),
         None => (reference, None),
     };
     if let Some(tag) = tag {
@@ -107,18 +114,33 @@ fn validate_oci_reference(reference: &str) -> Result<(), &'static str> {
 }
 
 fn validate_registry(registry: &str) -> Result<(), &'static str> {
-    if registry.is_empty() || registry.starts_with('.') || registry.ends_with('.') {
+    let (host, port) = match registry.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (registry, None),
+    };
+    if host.is_empty() || host.len() > 253 || host.starts_with('.') {
         return Err("registry name is invalid");
     }
-    if registry.split('.').any(|label| {
-        label.is_empty()
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    }) {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || host.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
         return Err("registry name is invalid");
+    }
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("registry name is invalid");
+        }
+        match port.parse::<u16>() {
+            Ok(port) if port != 0 => {}
+            _ => return Err("registry name is invalid"),
+        }
     }
     Ok(())
 }
@@ -175,6 +197,9 @@ mod tests {
             "library/nginx",
             "docker.io/library/nginx:latest",
             "quay.io/fedora/fedora:44",
+            "localhost:5000/library/nginx",
+            "registry.internal:5000/team/image:dev",
+            "registry_name.example/team/image:latest",
         ] {
             assert!(OciReference::new(reference).is_ok(), "{reference}");
         }
@@ -189,6 +214,10 @@ mod tests {
             "dir:/tmp/layout",
             "docker.io/Library/Nginx",
             "docker.io/library/nginx@sha256:abc",
+            "localhost:0/library/nginx",
+            "localhost:65536/library/nginx",
+            "localhost:not-a-port/library/nginx",
+            ":5000/library/nginx",
             "../escape",
             "--force",
         ] {

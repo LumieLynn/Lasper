@@ -133,21 +133,15 @@ impl NetworkStepView {
             mode_selector: RadioGroup::new(" Network Mode ", modes, mode_idx),
             bridge_list,
             custom_bridge: TextBox::new(" Custom Bridge Name ", initial_bridge.clone())
-                .with_validator(|v| {
-                    if v.trim().is_empty() {
-                        Err("Bridge name required".into())
-                    } else {
-                        Ok(())
-                    }
+                .with_validator(|value| {
+                    crate::nspawn::models::validate_nspawn_interface_name(value)
+                        .map_err(|error| error.to_string())
                 }),
             interface_list,
             custom_interface: TextBox::new(" Custom Interface Name ", initial_interface.clone())
-                .with_validator(|v| {
-                    if v.trim().is_empty() {
-                        Err("Interface name required".into())
-                    } else {
-                        Ok(())
-                    }
+                .with_validator(|value| {
+                    crate::nspawn::models::validate_nspawn_interface_name(value)
+                        .map_err(|error| error.to_string())
                 }),
             port_list: EditableList::new(
                 " Configured Port Forwards ",
