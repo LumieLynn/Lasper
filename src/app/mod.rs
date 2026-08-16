@@ -1254,6 +1254,95 @@ mod tests {
         }
     }
 
+    mod tar_risk_confirmation {
+        use super::*;
+        use crate::nspawn::ops::{BackendCommand, BackendResponse, PermissionLevel};
+        use crate::ui::wizard::{Wizard, WizardStep};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        async fn prepare_confirmation() -> (
+            App,
+            tokio::sync::mpsc::Receiver<crate::nspawn::ops::BackendCommand>,
+        ) {
+            let mut app = make_app();
+            let (command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+            let mut wizard = Wizard::new(
+                vec![],
+                vec![],
+                false,
+                command_tx,
+                PermissionLevel::User,
+                app.data.exec_ctx.clone(),
+                app.config.clone(),
+            )
+            .await;
+            wizard.step = WizardStep::Review;
+            wizard.context.source.kind = crate::ui::wizard::context::SourceKind::Pull;
+            wizard.context.source.pull_url = "https://example.test/rootfs.tar".into();
+            wizard.context.source.is_pull_raw = false;
+            wizard.context.basic.name = "tar-test".into();
+            wizard.active_view = None;
+            app.ui.wizard = Some(wizard);
+            app.ui.show_wizard = true;
+            app.handle_backend_result(BackendResponse::TarImportRiskConfirmationRequired(
+                "GNU tar 1.34 lacks hard-link confinement".into(),
+            ));
+            (app, command_rx)
+        }
+
+        #[tokio::test]
+        async fn topmost_tar_dialog_consumes_keys_and_decline_never_submits() {
+            let (mut app, mut command_rx) = prepare_confirmation().await;
+            assert!(app.ui.active_dialog.is_some());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_some());
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
+            assert!(command_rx.try_recv().is_err());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_none());
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
+            assert!(command_rx.try_recv().is_err());
+            assert!(!app
+                .ui
+                .wizard
+                .as_ref()
+                .unwrap()
+                .context
+                .deploy
+                .cancellation
+                .is_requested());
+        }
+
+        #[tokio::test]
+        async fn accepting_tar_risk_submits_once_and_enter_does_not_cancel_deployment() {
+            let (mut app, mut command_rx) = prepare_confirmation().await;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_none());
+            let command = command_rx.try_recv().expect("confirmed deployment command");
+            let BackendCommand::SubmitConfig(context) = command else {
+                panic!("tar confirmation must submit the configured deployment");
+            };
+            assert!(context.source.unsafe_remote_tar_accepted());
+            assert!(command_rx.try_recv().is_err());
+
+            app.handle_backend_result(BackendResponse::DeployStarted);
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Deploy);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await;
+
+            let wizard = app.ui.wizard.as_ref().unwrap();
+            assert_eq!(wizard.step, WizardStep::Deploy);
+            assert!(!wizard.context.deploy.cancellation.is_requested());
+            assert!(command_rx.try_recv().is_err());
+        }
+    }
+
     mod select_next_prev {
         use super::*;
 
