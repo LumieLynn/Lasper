@@ -94,6 +94,7 @@ async fn configure_sudoer(
     username: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<()> {
+    let mut group_failures = Vec::new();
     for group in ["sudo", "wheel"] {
         let output = runner
             .run(
@@ -107,14 +108,25 @@ async fn configure_sudoer(
                 None,
             )
             .await;
-        if let Ok(output) = &output {
-            log_output("usermod", output);
-        }
-        if !output.is_ok_and(|output| output.status.success()) {
-            continue;
+        match output {
+            Ok(output) if output.status.success() => {
+                log_output("usermod", &output);
+            }
+            Ok(output) => {
+                log_output("usermod", &output);
+                group_failures.push(format!("{group}: {}", command_error(&output)));
+                continue;
+            }
+            Err(error) => {
+                group_failures.push(format!("{group}: {error}"));
+                continue;
+            }
         }
 
-        let sudoers = format!("%{group} ALL=(ALL:ALL) ALL\n").into_bytes();
+        let sudoers = format!(
+            "# Managed by Lasper: sudo access for provisioned users\n%{group} ALL=(ALL:ALL) ALL\n"
+        )
+        .into_bytes();
         let output = runner
             .run(
                 rootfs,
@@ -123,10 +135,20 @@ async fn configure_sudoer(
                     "-eu".into(),
                     "-c".into(),
                     concat!(
-                        "target=/etc/sudoers.d/$1; ",
+                        "grep -Eq '^[[:space:]]*([@#]includedir)[[:space:]]+\"?(/etc/)?sudoers\\.d/?\"?([[:space:]]|$)' /etc/sudoers || ",
+                        "{ echo '/etc/sudoers does not include /etc/sudoers.d' >&2; exit 1; }; ",
+                        "command -v visudo >/dev/null || { echo 'visudo is unavailable' >&2; exit 1; }; ",
+                        "LC_ALL=C visudo -cf /etc/sudoers >/dev/null; ",
+                        "target=/etc/sudoers.d/90-lasper-$1; ",
                         "install -d -m 0750 /etc/sudoers.d; ",
                         "[ ! -L \"$target\" ]; ",
-                        "cat > \"$target\"; chmod 0440 \"$target\""
+                        "if [ -e \"$target\" ]; then head -n 1 \"$target\" | ",
+                        "grep -Fx '# Managed by Lasper: sudo access for provisioned users' >/dev/null || ",
+                        "{ echo 'refusing to replace an unmanaged sudoers policy' >&2; exit 1; }; fi; ",
+                        "tmp=$(mktemp /etc/sudoers.d/.lasper-sudoers.XXXXXX); ",
+                        "trap 'rm -f \"$tmp\"' EXIT; cat > \"$tmp\"; chmod 0440 \"$tmp\"; ",
+                        "LC_ALL=C visudo -cf \"$tmp\" >/dev/null; mv -f \"$tmp\" \"$target\"; ",
+                        "trap - EXIT; LC_ALL=C visudo -cf /etc/sudoers >/dev/null"
                     )
                     .into(),
                     "_".into(),
@@ -144,9 +166,12 @@ async fn configure_sudoer(
                 &output,
             ));
         }
-        break;
+        return Ok(());
     }
-    Ok(())
+    Err(NspawnError::Runtime(format!(
+        "Could not grant sudo access to {username:?}: neither sudo nor wheel group was usable ({})",
+        group_failures.join("; ")
+    )))
 }
 
 fn command_error(output: &std::process::Output) -> String {
@@ -171,6 +196,14 @@ mod tests {
             status: std::process::ExitStatus::from_raw(0),
             stdout: Vec::new(),
             stderr: Vec::new(),
+        }
+    }
+
+    fn failure_output(message: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: message.as_bytes().to_vec(),
         }
     }
 
@@ -234,5 +267,80 @@ mod tests {
             set_root_password(Path::new("/tmp/rootfs"), "safe\nalice:pwned", &runner).await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn sudoer_configuration_fails_when_neither_group_is_usable() {
+        let mut runner = MockRootfsProcessRunner::new();
+        runner
+            .expect_run()
+            .times(2)
+            .withf(|_, command, stdin| {
+                command.first().is_some_and(|arg| arg == "usermod") && stdin.is_none()
+            })
+            .returning(|_, command, _| {
+                let group = command.get(2).map(String::as_str).unwrap_or("unknown");
+                Ok(failure_output(&format!("group {group} does not exist")))
+            });
+
+        let error = configure_sudoer(Path::new("/tmp/rootfs"), "alice", &runner)
+            .await
+            .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("neither sudo nor wheel group was usable"));
+        assert!(message.contains("sudo: group sudo does not exist"));
+        assert!(message.contains("wheel: group wheel does not exist"));
+    }
+
+    #[tokio::test]
+    async fn sudoer_configuration_falls_back_to_wheel_and_writes_managed_policy() {
+        let mut sequence = mockall::Sequence::new();
+        let mut runner = MockRootfsProcessRunner::new();
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .withf(|_, command, stdin| {
+                command
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["usermod", "-aG", "sudo", "alice"])
+                    && stdin.is_none()
+            })
+            .returning(|_, _, _| Ok(failure_output("group sudo does not exist")));
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .withf(|_, command, stdin| {
+                command
+                    .iter()
+                    .map(String::as_str)
+                    .eq(["usermod", "-aG", "wheel", "alice"])
+                    && stdin.is_none()
+            })
+            .returning(|_, _, _| Ok(success_output()));
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .withf(|_, command, stdin| {
+                let script = command.get(3).map(String::as_str).unwrap_or_default();
+                command.first().is_some_and(|arg| arg == "sh")
+                    && command.last().is_some_and(|arg| arg == "wheel")
+                    && script.contains("/etc/sudoers does not include /etc/sudoers.d")
+                    && script.contains("90-lasper-$1")
+                    && script.contains("visudo -cf")
+                    && stdin.as_deref().is_some_and(|policy| {
+                        policy.starts_with(b"# Managed by Lasper:")
+                            && policy.ends_with(b"%wheel ALL=(ALL:ALL) ALL\n")
+                    })
+            })
+            .returning(|_, _, _| Ok(success_output()));
+
+        configure_sudoer(Path::new("/tmp/rootfs"), "alice", &runner)
+            .await
+            .unwrap();
     }
 }
