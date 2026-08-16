@@ -331,14 +331,23 @@ pub(crate) async fn unmount_image(
         }
     }
 
-    if matches!(source, ImageMountSource::Managed(_)) {
-        detach_image_loops(&image_source_path(machine, source), runner).await?;
-    }
+    finish_successful_unmount(machine, source, unmount_error, runner).await?;
+    remove_mount_point(&mount_point).await?;
+    Ok(())
+}
 
+async fn finish_successful_unmount(
+    machine: &MachineName,
+    source: ImageMountSource,
+    unmount_error: Option<NspawnError>,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
     if let Some(error) = unmount_error {
         return Err(error);
     }
-    remove_mount_point(&mount_point).await?;
+    if matches!(source, ImageMountSource::Managed(_)) {
+        detach_image_loops(&image_source_path(machine, source), runner).await?;
+    }
     Ok(())
 }
 
@@ -1384,6 +1393,24 @@ mod tests {
             .return_once(|_, _| Ok(successful_output("")));
 
         detach_image_loops(image, &runner).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_unmount_never_detaches_managed_image_loops() {
+        let machine = MachineName::new("test").unwrap();
+        let mut runner = crate::nspawn::sys::command::MockCommandRunner::new();
+        runner.expect_run().times(0);
+
+        let error = finish_successful_unmount(
+            &machine,
+            ImageMountSource::Managed(ManagedImageKind::Raw),
+            Some(NspawnError::Runtime("mount remains active".into())),
+            &runner,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("mount remains active"));
     }
 
     #[test]
