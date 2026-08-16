@@ -29,21 +29,15 @@ impl MachineInspectionStore {
         }
     }
 
-    /// Inspect systemd properties without requiring a machined runtime
-    /// registration. This is used by the image inspector.
-    pub async fn inspect_static(&self, name: &str) -> Result<MachineProperties> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .cli_inspect_machine(name)
-                .await
-                .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
-        } else {
-            crate::nspawn::adapters::comm::cli::get_properties_with_runner(
-                name,
-                &crate::nspawn::sys::command::DefaultCommandRunner,
-            )
-            .await
-        }
+    /// Inspect the systemd unit associated with an image, if its name can be
+    /// represented as an nspawn machine name. This read-only query runs in the
+    /// caller and never asks machined for a runtime registration.
+    pub async fn inspect_static(&self, name: &str) -> Result<Option<MachineProperties>> {
+        crate::nspawn::adapters::comm::cli::get_image_unit_properties_with_runner(
+            name,
+            &crate::nspawn::sys::command::DefaultCommandRunner,
+        )
+        .await
     }
 }
 

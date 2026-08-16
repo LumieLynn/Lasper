@@ -280,37 +280,7 @@ pub(crate) async fn get_properties_with_runner(
         }
     }
 
-    let system_out = cmd_runner
-        .run(
-            "systemctl",
-            vec![
-                "--no-ask-password".to_string(),
-                "--".to_string(),
-                "show".to_string(),
-                name.systemd_nspawn_unit(),
-            ],
-        )
-        .await;
-
-    if let Ok(out) = system_out {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    let key = k.trim();
-                    let val = v.trim();
-                    let formatted = crate::nspawn::adapters::comm::formatting::format_property(
-                        key,
-                        &zbus::zvariant::Value::Str(val.into()),
-                    );
-                    crate::nspawn::adapters::comm::formatting::insert_systemd_property(
-                        &mut props,
-                        key.to_string(),
-                        formatted,
-                    );
-                }
-            }
-        }
-    }
+    let _ = append_systemd_unit_properties(&name, cmd_runner, &mut props).await;
 
     if props.groups.is_empty() {
         return Err(NspawnError::CommandFailed(
@@ -321,6 +291,78 @@ pub(crate) async fn get_properties_with_runner(
     }
 
     Ok(props)
+}
+
+/// Inspect only the systemd-nspawn unit associated with an image.
+///
+/// Image names follow filesystem component rules and are broader than machine
+/// names. `None` means the image cannot have a corresponding nspawn machine
+/// unit; command or systemd failures remain errors.
+pub(crate) async fn get_image_unit_properties_with_runner(
+    name: &str,
+    cmd_runner: &dyn CommandRunner,
+) -> Result<Option<MachineProperties>> {
+    let Ok(name) = MachineName::new(name) else {
+        return Ok(None);
+    };
+    let mut props =
+        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    append_systemd_unit_properties(&name, cmd_runner, &mut props).await?;
+    Ok(Some(props))
+}
+
+async fn append_systemd_unit_properties(
+    name: &MachineName,
+    cmd_runner: &dyn CommandRunner,
+    props: &mut MachineProperties,
+) -> Result<()> {
+    let unit = name.systemd_nspawn_unit();
+    let args = vec![
+        "--no-ask-password".to_string(),
+        "--".to_string(),
+        "show".to_string(),
+        unit.clone(),
+    ];
+    let system_out = cmd_runner
+        .run("systemctl", args.clone())
+        .await
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("systemctl"), error))?;
+
+    if !system_out.status.success() {
+        return Err(NspawnError::cmd_failed(
+            format!("systemctl show {unit}"),
+            format!("systemctl {}", args.join(" ")),
+            &system_out,
+        ));
+    }
+
+    let mut inserted = 0usize;
+    for line in String::from_utf8_lossy(&system_out.stdout).lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim();
+            let formatted = crate::nspawn::adapters::comm::formatting::format_property(
+                key,
+                &zbus::zvariant::Value::Str(val.into()),
+            );
+            crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                props,
+                key.to_string(),
+                formatted,
+            );
+            inserted = inserted.saturating_add(1);
+        }
+    }
+
+    if inserted == 0 {
+        return Err(NspawnError::CommandFailed(
+            format!("systemctl show {unit}"),
+            format!("systemctl {}", args.join(" ")),
+            "No properties found".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
@@ -568,6 +610,55 @@ mod tests {
 
         let result = provider.get_properties("missing-ctr").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_runs_only_systemctl() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .times(1)
+            .withf(|program, args| {
+                program == "systemctl"
+                    && args
+                        == &[
+                            "--no-ask-password".to_string(),
+                            "--".to_string(),
+                            "show".to_string(),
+                            "systemd-nspawn@test-image.service".to_string(),
+                        ]
+            })
+            .returning(|_, _| {
+                Ok(mock_output(
+                    true,
+                    "ActiveState=inactive\nLoadState=loaded\n",
+                    "",
+                ))
+            });
+
+        let properties = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap()
+            .expect("valid machine name has a unit");
+
+        let systemd = properties.get_group("Systemd").unwrap();
+        assert_eq!(
+            systemd.get("ActiveState").map(String::as_str),
+            Some("inactive")
+        );
+        assert_eq!(systemd.get("LoadState").map(String::as_str), Some("loaded"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_skips_non_machine_image_names() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        let properties = get_image_unit_properties_with_runner("Ubuntu Resolute 镜像", &runner)
+            .await
+            .unwrap();
+
+        assert!(properties.is_none());
     }
 
     // action methods

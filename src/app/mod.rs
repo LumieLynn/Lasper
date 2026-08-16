@@ -1585,6 +1585,27 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn image_unit_clears_stale_state_for_non_machine_image_name() {
+            let name = "Ubuntu Resolute 镜像";
+            let mut app = make_app();
+            app.data.images = vec![make_image(name)];
+            app.data.detail_target = DetailTarget::Image {
+                name: name.into(),
+                internal: false,
+            };
+            app.data.unit_name = Some("systemd-nspawn@stale.service".into());
+            app.ui.focus.active_idx = 2;
+            app.ui.inspector_source = InspectorSource::Image;
+            app.ui.detail_panel.active_pane = crate::ui::views::detail_panel::DetailPane::ImageUnit;
+
+            app.refresh_detail().await;
+
+            assert!(app.data.unit_name.is_none());
+            assert!(app.data.unit_drop_ins.is_empty());
+            assert!(app.data.properties.as_ref().unwrap().groups.is_empty());
+        }
+
+        #[tokio::test]
         async fn visible_help_consumes_mouse_before_background_focus() {
             let mut app = make_app();
             app.ui.focus.active_idx = 2;

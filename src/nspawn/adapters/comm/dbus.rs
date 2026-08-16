@@ -11,6 +11,12 @@ use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
 
+type EnableUnitFilesBody<'a> = (Vec<&'a str>, bool, bool);
+
+fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
+    (vec![unit], false, false)
+}
+
 #[proxy(
     interface = "org.freedesktop.machine1.Manager",
     default_service = "org.freedesktop.machine1",
@@ -215,10 +221,9 @@ impl ContainerBackend for DbusBackend {
     async fn enable(&self, name: &str) -> Result<()> {
         let name = parse_machine_name(name)?;
         let unit = name.systemd_nspawn_unit();
-        let files: Vec<(&str, bool)> = vec![(&unit, false)];
         self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
             "EnableUnitFiles",
-            &(files, false),
+            &enable_unit_files_body(&unit),
         )
         .await
     }
@@ -422,6 +427,20 @@ async fn get_systemd1_properties(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enable_unit_files_uses_systemd_manager_signature() {
+        let body = enable_unit_files_body("systemd-nspawn@test.service");
+        let message = zbus::Message::method("/org/freedesktop/systemd1", "EnableUnitFiles")
+            .unwrap()
+            .build(&body)
+            .unwrap();
+
+        assert_eq!(message.body().signature().unwrap().as_str(), "asbb");
+        assert_eq!(body.0, ["systemd-nspawn@test.service"]);
+        assert!(!body.1, "runtime must remain disabled");
+        assert!(!body.2, "force must remain disabled");
+    }
 
     #[test]
     fn image_names_are_not_validated_as_machine_names() {

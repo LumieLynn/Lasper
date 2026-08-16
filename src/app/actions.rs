@@ -104,36 +104,50 @@ impl App {
                 }
                 DetailPane::ImageConfig => self.read_nspawn_config(&name).await,
                 DetailPane::ImageUnit => {
-                    match self
+                    let has_corresponding_unit = match self
                         .data
                         .exec_ctx
                         .machine_inspection
                         .inspect_static(&name)
                         .await
                     {
-                        Ok(properties) => {
+                        Ok(Some(properties)) => {
                             self.data.properties = Ok(properties);
                             self.data.properties_dirty = true;
                             self.data.details_dirty = true;
+                            true
+                        }
+                        Ok(None) => {
+                            self.data.properties = Ok(MachineProperties::default());
+                            self.data.properties_dirty = true;
+                            self.data.details_dirty = true;
+                            false
                         }
                         Err(error) => {
                             self.data.properties = Err(error.to_string());
                             self.data.properties_dirty = true;
                             self.data.details_dirty = true;
+                            true
                         }
-                    }
-                    match self.data.exec_ctx.systemd_unit.read(&name).await {
-                        Ok(unit) => {
-                            self.data.unit_name = Some(unit.unit);
-                            self.data.unit_drop_ins = unit.drop_ins;
+                    };
+                    if has_corresponding_unit {
+                        match self.data.exec_ctx.systemd_unit.read(&name).await {
+                            Ok(unit) => {
+                                self.data.unit_name = Some(unit.unit);
+                                self.data.unit_drop_ins = unit.drop_ins;
+                            }
+                            Err(error) => {
+                                log::debug!("Failed to read unit drop-ins for {name}: {error}");
+                                self.data.unit_name =
+                                    crate::nspawn::models::MachineName::new(&name)
+                                        .ok()
+                                        .map(|name| name.systemd_nspawn_unit());
+                                self.data.unit_drop_ins.clear();
+                            }
                         }
-                        Err(error) => {
-                            log::debug!("Failed to read unit drop-ins for {name}: {error}");
-                            self.data.unit_name = crate::nspawn::models::MachineName::new(&name)
-                                .ok()
-                                .map(|name| name.systemd_nspawn_unit());
-                            self.data.unit_drop_ins.clear();
-                        }
+                    } else {
+                        self.data.unit_name = None;
+                        self.data.unit_drop_ins.clear();
                     }
                     self.data.unit_dirty = true;
                 }
