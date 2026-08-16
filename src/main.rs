@@ -17,6 +17,41 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 
+struct TerminalRestoreGuard<F: FnMut()> {
+    restore: F,
+    armed: bool,
+}
+
+impl<F: FnMut()> TerminalRestoreGuard<F> {
+    fn new(restore: F) -> Self {
+        Self {
+            restore,
+            armed: false,
+        }
+    }
+
+    fn arm(&mut self) {
+        self.armed = true;
+    }
+
+    fn restore(&mut self) {
+        if std::mem::take(&mut self.armed) {
+            (self.restore)();
+        }
+    }
+}
+
+impl<F: FnMut()> Drop for TerminalRestoreGuard<F> {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
 /// Resolve the log directory.
 ///
 /// * Not root — user's XDG state directory.
@@ -240,7 +275,9 @@ async fn main() -> Result<()> {
     }));
 
     // 6. Initialize terminal
+    let mut terminal_restore = TerminalRestoreGuard::new(restore_terminal);
     enable_raw_mode().context("Failed to enable raw mode")?;
+    terminal_restore.arm();
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
         .context("Failed to enter alternate screen")?;
@@ -269,12 +306,7 @@ async fn main() -> Result<()> {
     log::info!("[lasper] run() completed, restoring terminal...");
 
     // 8. Restore terminal
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
+    terminal_restore.restore();
     let _ = terminal.show_cursor();
 
     if let Err(ref e) = result {
@@ -289,4 +321,36 @@ async fn main() -> Result<()> {
     log::info!("[lasper] main() returning");
     let code = if result.is_ok() { 0 } else { 1 };
     std::process::exit(code);
+}
+
+#[cfg(test)]
+mod terminal_restore_tests {
+    use super::TerminalRestoreGuard;
+    use std::cell::Cell;
+
+    #[test]
+    fn armed_guard_restores_on_early_return_and_only_once() {
+        let calls = Cell::new(0);
+        {
+            let mut guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+            guard.arm();
+        }
+        assert_eq!(calls.get(), 1);
+
+        {
+            let mut guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+            guard.arm();
+            guard.restore();
+        }
+        assert_eq!(calls.get(), 2);
+    }
+
+    #[test]
+    fn unarmed_guard_does_not_restore() {
+        let calls = Cell::new(0);
+        {
+            let _guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+        }
+        assert_eq!(calls.get(), 0);
+    }
 }
