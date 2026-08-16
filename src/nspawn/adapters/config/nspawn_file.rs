@@ -1,6 +1,6 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode};
-use ini::Ini;
+use ini::{EscapePolicy, Ini};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
@@ -240,6 +240,21 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     xdg_runtime: Option<&str>,
     verified_wayland_socket: Option<&Path>,
 ) -> Result<String> {
+    let verified_x11_directory = verified_bind_directory(Path::new("/tmp/.X11-unix"));
+    nspawn_config_content_from_spec_with_host_paths(
+        spec,
+        xdg_runtime,
+        verified_wayland_socket,
+        verified_x11_directory,
+    )
+}
+
+fn nspawn_config_content_from_spec_with_host_paths(
+    spec: &NspawnConfigSpec,
+    xdg_runtime: Option<&str>,
+    verified_wayland_socket: Option<&Path>,
+    verified_x11_directory: Option<&Path>,
+) -> Result<String> {
     spec.validate()?;
     let mut conf = Ini::new();
 
@@ -340,19 +355,18 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         }
 
         for dev in &spec.device_binds {
-            files.append("Bind", dev.clone());
+            files.append("Bind", escape_nspawn_bind_path(dev));
         }
         for ro in &spec.readonly_binds {
-            files.append("BindReadOnly", ro.clone());
+            files.append("BindReadOnly", escape_nspawn_bind_path(ro));
         }
         for bm in &spec.bind_mounts {
+            let source = escape_nspawn_bind_path(&bm.source);
+            let target = escape_nspawn_bind_path(&bm.target);
             if bm.readonly {
-                files.append(
-                    "BindReadOnly",
-                    format!("{}:{}{}", bm.source, bm.target, bm.suffix),
-                );
+                files.append("BindReadOnly", format!("{source}:{target}{}", bm.suffix));
             } else {
-                files.append("Bind", format!("{}:{}{}", bm.source, bm.target, bm.suffix));
+                files.append("Bind", format!("{source}:{target}{}", bm.suffix));
             }
         }
 
@@ -368,13 +382,18 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
                 .or_else(|| xdg_runtime.map(|runtime| PathBuf::from(runtime).join(socket_name)));
             if let Some(socket_path) = socket_path {
                 let socket_path = validated_nspawn_path("Wayland socket path", &socket_path)?;
+                let socket_path = escape_nspawn_bind_path(socket_path);
                 files.append("Bind", format!("{socket_path}:/mnt/wayland-socket{suffix}"));
             }
 
-            files.append(
-                "BindReadOnly",
-                format!("/tmp/.X11-unix:/mnt/host-x11{}", suffix),
-            );
+            if let Some(x11_directory) = verified_x11_directory {
+                let x11_directory = validated_nspawn_path("X11 socket directory", x11_directory)?;
+                let x11_directory = escape_nspawn_bind_path(x11_directory);
+                files.append(
+                    "BindReadOnly",
+                    format!("{x11_directory}:/mnt/host-x11{suffix}"),
+                );
+            }
 
             if std::path::Path::new("/dev/dri").exists() {
                 files.append("Bind", "/dev/dri");
@@ -386,9 +405,16 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     }
 
     let mut buffer = Vec::new();
-    conf.write_to(&mut buffer)
+    // Values have already been validated and systemd-specific bind escaping has
+    // already been applied. Generic INI escaping would double those backslashes.
+    conf.write_to_policy(&mut buffer, EscapePolicy::Nothing)
         .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn verified_bind_directory(path: &Path) -> Option<&Path> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(path)
 }
 
 fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
@@ -778,6 +804,76 @@ mod tests {
             NspawnConfig::apply_gpu_passthrough_to_content("[Files]\n".into(), &state, &[])
                 .unwrap();
         assert!(updated.contains(r"Bind=/dev/dri/card0:/dev/dri/by-path/pci-0000\:01\:00.0-card"));
+    }
+
+    #[test]
+    fn ordinary_binds_escape_colons_and_backslashes() {
+        use crate::nspawn::models::{BindMount, IdmapSuffix};
+
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            device_binds: vec![r"/dev/dri/by-path/pci-0000:01:00.0-card".into()],
+            readonly_binds: vec![r"/srv/driver\archive:current".into()],
+            bind_mounts: vec![BindMount {
+                source: r"/srv/source:one\two".into(),
+                target: r"/mnt/target:one\two".into(),
+                readonly: true,
+                suffix: IdmapSuffix::Noidmap,
+            }],
+            ..Default::default()
+        };
+
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(
+            content.contains(r"Bind=/dev/dri/by-path/pci-0000\:01\:00.0-card"),
+            "{content}"
+        );
+        assert!(
+            content.contains(r"BindReadOnly=/srv/driver\\archive\:current"),
+            "{content}"
+        );
+        assert!(
+            content.contains(r"BindReadOnly=/srv/source\:one\\two:/mnt/target\:one\\two:noidmap"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn wayland_x11_bind_requires_a_verified_directory() {
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            wayland_socket: Some("wayland-0".into()),
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&cfg).unwrap();
+        let runtime = Path::new("/run/user/1000/wayland-0");
+        let x11 = Path::new("/tmp/.X11-unix");
+
+        let without_x11 =
+            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), None)
+                .unwrap();
+        assert!(!without_x11.contains("/mnt/host-x11"));
+
+        let with_x11 =
+            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), Some(x11))
+                .unwrap();
+        assert!(with_x11.contains("BindReadOnly=/tmp/.X11-unix:/mnt/host-x11:idmap"));
+    }
+
+    #[test]
+    fn x11_source_verification_rejects_files_and_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("x11");
+        std::fs::create_dir(&source).unwrap();
+        assert_eq!(verified_bind_directory(&source), Some(source.as_path()));
+
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(verified_bind_directory(&file).is_none());
+
+        let symlink = directory.path().join("link");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        assert!(verified_bind_directory(&symlink).is_none());
     }
 
     #[test]

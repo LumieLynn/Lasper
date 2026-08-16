@@ -78,10 +78,10 @@ impl NspawnConfigSpec {
             validate_absolute_path("bind target", &bind.target)?;
         }
         for bind in &self.device_binds {
-            validate_bind_expression("device bind", bind)?;
+            validate_absolute_path("device bind", bind)?;
         }
         for bind in &self.readonly_binds {
-            validate_bind_expression("read-only bind", bind)?;
+            validate_absolute_path("read-only bind", bind)?;
         }
 
         if let Some(socket) = &self.wayland_socket {
@@ -217,17 +217,6 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<()> {
     if !Path::new(value).is_absolute() {
         return Err(NspawnError::Validation(format!(
             "{label} must be absolute: {value:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn validate_bind_expression(label: &str, value: &str) -> Result<()> {
-    validate_text(label, value, false)?;
-    let source = value.split_once(':').map_or(value, |(source, _)| source);
-    if !Path::new(source).is_absolute() {
-        return Err(NspawnError::Validation(format!(
-            "{label} source must be absolute: {value:?}"
         )));
     }
     Ok(())
