@@ -103,7 +103,7 @@ Feature work that requires general-purpose root hooks or arbitrary daemon comman
 
 ## Credits
 
-The terminal emulator in `src/term/` is ported from [mprocs](https://github.com/pvolok/mprocs) by Pavel Volokitin (MIT license).
+The terminal emulator in `src/term/` is ported from [dekit (formerly mprocs)](https://github.com/pvolok/dekit) by Pavel Volokitin. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for its MIT license.
 
 ## License
 
