@@ -27,8 +27,9 @@ pub async fn discover_host_gpus() -> Vec<GpuDevice> {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name().to_string_lossy().to_string();
 
-            // We only care about cardX and renderDX nodes
-            if !file_name.starts_with("card") && !file_name.starts_with("renderD") {
+            // Connector entries such as card0-HDMI-A-1 also live here, but only
+            // cardN and renderDN correspond to device nodes under /dev/dri.
+            if !is_drm_device_node_name(&file_name) {
                 continue;
             }
 
@@ -99,6 +100,15 @@ pub async fn discover_host_gpus() -> Vec<GpuDevice> {
     result
 }
 
+fn is_drm_device_node_name(name: &str) -> bool {
+    let number = name
+        .strip_prefix("card")
+        .or_else(|| name.strip_prefix("renderD"));
+    number.is_some_and(|number| {
+        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
 /// Helper function to resolve the real hardware name from Sysfs
 async fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) -> String {
     // Try reading Vendor ID and Device ID (Standard PCIe)
@@ -134,4 +144,27 @@ async fn resolve_hardware_name(device_path: &Path, pci_db: Option<&Database>) ->
     }
 
     "Unknown Graphics Device".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_drm_device_node_name;
+
+    #[test]
+    fn drm_device_names_exclude_connectors_and_incomplete_names() {
+        for valid in ["card0", "card12", "renderD128", "renderD999"] {
+            assert!(is_drm_device_node_name(valid), "{valid}");
+        }
+        for invalid in [
+            "card",
+            "renderD",
+            "card0-HDMI-A-1",
+            "card0-DP-1",
+            "cardx",
+            "renderD12x",
+            "controlD64",
+        ] {
+            assert!(!is_drm_device_node_name(invalid), "{invalid}");
+        }
+    }
 }

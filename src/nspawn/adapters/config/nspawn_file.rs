@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode};
 use ini::{EscapePolicy, Ini};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
@@ -8,6 +9,21 @@ pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
 }
 
 pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
+    let fields = parse_nspawn_bind_fields(value)?;
+    let source = fields.first()?.trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let destination = fields
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source)
+        .to_string();
+    Some((source, destination))
+}
+
+fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
     let mut fields = vec![String::new()];
     let mut chars = value.chars().peekable();
     while let Some(character) = chars.next() {
@@ -23,9 +39,65 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
         }
     }
 
-    let source = fields.first()?.clone();
-    let destination = fields.get(1).cloned().unwrap_or_else(|| source.clone());
-    Some((source, destination))
+    Some(fields)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NspawnBindSemantics {
+    source: String,
+    destination: String,
+    readonly: bool,
+    options: Vec<String>,
+}
+
+impl NspawnBindSemantics {
+    fn from_passthrough(bind: &crate::nspawn::platform::nvidia::state::PassthroughBind) -> Self {
+        Self {
+            source: bind.host_path.clone(),
+            destination: bind.container_path.clone(),
+            readonly: bind.readonly,
+            options: Vec::new(),
+        }
+    }
+}
+
+fn parse_nspawn_bind_line(line: &str) -> Option<NspawnBindSemantics> {
+    let (key, value) = line.trim().split_once('=')?;
+    let readonly = match key.trim() {
+        "Bind" => false,
+        "BindReadOnly" => true,
+        _ => return None,
+    };
+    let fields = parse_nspawn_bind_fields(value.trim())?;
+    if fields.is_empty() || fields.len() > 3 {
+        return None;
+    }
+
+    let source = fields[0].trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let destination = fields
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source)
+        .to_string();
+    let options = fields
+        .get(2)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|option| !option.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    Some(NspawnBindSemantics {
+        source,
+        destination,
+        readonly,
+        options,
+    })
 }
 
 /// Raw content of a `.nspawn` file and the path it was read from.
@@ -128,46 +200,60 @@ impl NspawnConfig {
     pub fn apply_gpu_passthrough_to_content(
         content: String,
         new_state: &crate::nspawn::platform::nvidia::NvidiaState,
-        _death_list: &[String],
+        removed_binds: &[crate::nspawn::platform::nvidia::state::PassthroughBind],
     ) -> Result<String> {
         // 1. Purge existing block using markers (preserves everything else)
         let (clean_content, _extracted_deaths) = Self::purge_nvidia_block(&content)?;
 
-        // 2. Read-only INI parse for legacy dedup detection
-        let mut lines_to_remove: Vec<String> = Vec::new();
-        if let Ok(conf) = Ini::load_from_str(&clean_content) {
-            if let Some(files_section) = conf.section(Some("Files")) {
-                for (key, value) in files_section.iter() {
-                    let Some((host_path, container_path)) = parse_nspawn_bind_paths(value) else {
+        // 2. Remove only complete semantic duplicates from marker-external
+        // configuration. A destination collision with different semantics is
+        // administrator-owned content and must stop the update unchanged.
+        let new_binds = new_state
+            .binds
+            .iter()
+            .map(NspawnBindSemantics::from_passthrough)
+            .collect::<HashSet<_>>();
+        let removed_binds = removed_binds
+            .iter()
+            .map(NspawnBindSemantics::from_passthrough)
+            .collect::<HashSet<_>>();
+        let new_destinations = new_binds
+            .iter()
+            .map(|bind| bind.destination.clone())
+            .collect::<HashSet<_>>();
+        let mut conflicts = BTreeSet::new();
+        let mut result_lines = Vec::new();
+        let mut in_files = false;
+
+        for line in clean_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_files = trimmed.eq_ignore_ascii_case("[files]");
+                result_lines.push(line.to_string());
+                continue;
+            }
+
+            if in_files {
+                if let Some(bind) = parse_nspawn_bind_line(line) {
+                    if new_binds.contains(&bind) || removed_binds.contains(&bind) {
                         continue;
-                    };
-
-                    let is_in_binds = new_state
-                        .binds
-                        .iter()
-                        .any(|b| b.host_path == host_path || b.container_path == container_path);
-
-                    if (key == "Bind" || key == "BindReadOnly") && is_in_binds {
-                        if key == "Bind" {
-                            lines_to_remove.push(format!("Bind={}", value));
-                        } else {
-                            lines_to_remove.push(format!("BindReadOnly={}", value));
-                        }
+                    }
+                    if new_destinations.contains(&bind.destination) {
+                        conflicts.insert(bind.destination);
                     }
                 }
             }
+            result_lines.push(line.to_string());
         }
 
-        // 3. Line-level dedup (preserves everything else including comments)
-        let mut result_lines: Vec<String> = clean_content.lines().map(|l| l.to_string()).collect();
-        if !lines_to_remove.is_empty() {
-            result_lines.retain(|line| {
-                let trimmed = line.trim();
-                !lines_to_remove.iter().any(|dup| trimmed == dup)
-            });
+        if !conflicts.is_empty() {
+            return Err(NspawnError::InvalidConfig(format!(
+                "NVIDIA bind conflicts with administrator-owned entries at container path(s): {}",
+                conflicts.into_iter().collect::<Vec<_>>().join(", ")
+            )));
         }
 
-        // 4. Build the new managed block from unified PassthroughBind list
+        // 3. Build the new managed block from unified PassthroughBind list
         if !new_state.binds.is_empty() {
             let mut block = Vec::new();
             block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
@@ -188,7 +274,7 @@ impl NspawnConfig {
             }
             block.push("X-Lasper-Nvidia-End=true".to_string());
 
-            // 5. Find [Files] section and insert block at its end
+            // 4. Find [Files] section and insert block at its end
             let files_idx = result_lines
                 .iter()
                 .position(|l| l.trim().eq_ignore_ascii_case("[files]"));
@@ -940,6 +1026,75 @@ mod tests {
             "Legacy duplicate should be removed, got:\n{}",
             updated
         );
+    }
+
+    #[test]
+    fn gpu_update_preserves_same_source_at_another_destination() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content = "[Files]\nBind=/dev/nvidia0:/srv/user-device\n".to_string();
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("Bind=/dev/nvidia0:/srv/user-device"));
+        assert!(updated.contains("Bind=/dev/nvidia0"));
+    }
+
+    #[test]
+    fn gpu_update_rejects_marker_external_destination_conflicts() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content =
+            "[Files]\nBindReadOnly = /srv/user-lib:/usr/lib/libcuda.so:noidmap\n".to_string();
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/host/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap_err();
+        assert!(error.to_string().contains("/usr/lib/libcuda.so"));
+        assert!(error.to_string().contains("administrator-owned"));
+    }
+
+    #[test]
+    fn gpu_update_removes_only_exact_legacy_state_binds() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content = concat!(
+            "[Files]\n",
+            "BindReadOnly = /old/libcuda.so:/usr/lib/old-libcuda.so\n",
+            "BindReadOnly=/old/libcuda.so:/usr/lib/old-libcuda.so:noidmap\n",
+            "Bind=/user/source:/usr/lib/old-libcuda.so\n",
+        )
+        .to_string();
+        let removed = vec![PassthroughBind {
+            host_path: "/old/libcuda.so".into(),
+            container_path: "/usr/lib/old-libcuda.so".into(),
+            readonly: true,
+        }];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(
+            content,
+            &crate::nspawn::platform::nvidia::NvidiaState::default(),
+            &removed,
+        )
+        .unwrap();
+        assert!(!updated.contains("BindReadOnly = /old/libcuda.so:/usr/lib/old-libcuda.so\n"));
+        assert!(updated.contains("BindReadOnly=/old/libcuda.so:/usr/lib/old-libcuda.so:noidmap"));
+        assert!(updated.contains("Bind=/user/source:/usr/lib/old-libcuda.so"));
     }
 
     #[test]

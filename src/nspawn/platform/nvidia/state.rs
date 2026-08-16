@@ -12,7 +12,7 @@ const MAX_NVIDIA_STATE_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_STATE_ITEMS: usize = 16384;
 
 /// A single host→container path mapping for an nspawn Bind= or BindReadOnly= entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PassthroughBind {
     pub host_path: String,
     pub container_path: String,
@@ -86,7 +86,7 @@ impl NvidiaState {
                 self.binds.push(PassthroughBind {
                     host_path: ce.host_path.clone(),
                     container_path: ce.default_container_path.clone(),
-                    readonly: true,
+                    readonly: ce.readonly,
                 });
             }
         }
@@ -508,6 +508,18 @@ pub(crate) fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<
         .collect()
 }
 
+pub(crate) fn calculate_removed_binds(
+    old: &NvidiaState,
+    new: &NvidiaState,
+) -> Vec<PassthroughBind> {
+    let new_binds = new.binds.iter().collect::<HashSet<_>>();
+    old.binds
+        .iter()
+        .filter(|bind| !new_binds.contains(bind))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -556,6 +568,7 @@ mod tests {
                 host_path: "/host/gsp.bin".into(),
                 default_container_path: "/lib/firmware/nvidia/gsp.bin".into(),
                 category: crate::nspawn::platform::nvidia::classify::NvidiaFileCategory::Firmware,
+                readonly: true,
             }],
             symlinks: vec![SymlinkEntry {
                 target: "/usr/lib/libcuda.so.1".into(),
@@ -749,6 +762,49 @@ mod tests {
     }
 
     #[test]
+    fn removed_binds_preserve_full_mount_semantics() {
+        let old = NvidiaState {
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/old/libcuda.so".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+                PassthroughBind {
+                    host_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/nvidia0".into(),
+                    readonly: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let new = NvidiaState {
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/new/libcuda.so".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+                PassthroughBind {
+                    host_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/nvidia0".into(),
+                    readonly: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            calculate_removed_binds(&old, &new),
+            vec![PassthroughBind {
+                host_path: "/old/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }]
+        );
+    }
+
+    #[test]
     fn test_nvidia_state_serde_roundtrip() {
         let state = NvidiaState {
             driver_version: "550.1".to_string(),
@@ -789,7 +845,11 @@ mod tests {
             "driver_version": "550.1",
             "readonly_binds": ["/usr/lib/libcuda.so"],
             "device_binds": ["/dev/nvidia0"],
-            "classified_entries": [],
+            "classified_entries": [{
+                "host_path": "/host/gsp.bin",
+                "default_container_path": "/lib/firmware/nvidia/gsp.bin",
+                "category": "Firmware"
+            }],
             "symlinks": [],
             "ldcache_folders": [],
             "env_vars": []
@@ -797,7 +857,7 @@ mod tests {
         let mut state: NvidiaState = serde_json::from_str(json).unwrap();
         assert!(state.binds.is_empty());
         state.migrate_from_legacy();
-        assert_eq!(state.binds.len(), 2);
+        assert_eq!(state.binds.len(), 3);
         assert!(state
             .binds
             .iter()
@@ -806,6 +866,10 @@ mod tests {
             .binds
             .iter()
             .any(|b| b.host_path == "/usr/lib/libcuda.so" && b.readonly));
+        assert!(state
+            .binds
+            .iter()
+            .any(|b| b.host_path == "/host/gsp.bin" && b.readonly));
     }
 
     #[test]

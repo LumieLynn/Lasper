@@ -110,9 +110,13 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
         );
     }
 
-    // Mounts → BindReadOnly
+    // Mounts preserve the OCI ro/rw option. Mounts are writable unless the
+    // option sequence resolves to ro.
     for m in &all_mounts {
         source_map.insert(m.container_path.clone(), m.host_path.clone());
+        if !m.readonly() {
+            writable_sources.insert(m.container_path.clone());
+        }
     }
 
     let (classified, unclassified) = classify::classify_mounts(all_mounts);
@@ -122,7 +126,7 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
             PassthroughBind {
                 host_path: ce.host_path.clone(),
                 container_path: ce.default_container_path.clone(),
-                readonly: true,
+                readonly: ce.readonly,
             },
         );
     }
@@ -132,7 +136,7 @@ fn cdi_to_raw_binds(spec: &CdiSpec) -> Vec<PassthroughBind> {
             PassthroughBind {
                 host_path: m.source,
                 container_path: m.target,
-                readonly: true,
+                readonly: m.readonly,
             },
         );
     }
@@ -348,6 +352,7 @@ fn extract_classified_entries(binds: &[PassthroughBind]) -> Vec<ClassifiedEntry>
                 host_path: b.host_path.clone(),
                 default_container_path: b.container_path.clone(),
                 category,
+                readonly: b.readonly,
             })
         })
         .collect()
@@ -755,6 +760,38 @@ mod tests {
     }
 
     #[test]
+    fn cdi_mount_binds_preserve_ro_and_rw_options() {
+        let spec = CdiSpec {
+            container_edits: Some(super::super::cdi::CdiEdits {
+                device_nodes: None,
+                mounts: Some(vec![
+                    CdiMount {
+                        host_path: "/host/libcuda.so".into(),
+                        container_path: "/usr/lib/libcuda.so".into(),
+                        options: Some(vec!["rbind".into(), "ro".into()]),
+                    },
+                    CdiMount {
+                        host_path: "/host/nvidia-data".into(),
+                        container_path: "/var/lib/nvidia-data".into(),
+                        options: Some(vec!["rbind".into(), "rw".into()]),
+                    },
+                ]),
+                hooks: None,
+                env: None,
+            }),
+            devices: None,
+        };
+
+        let binds = cdi_to_raw_binds(&spec);
+        assert!(binds
+            .iter()
+            .any(|bind| { bind.container_path == "/usr/lib/libcuda.so" && bind.readonly }));
+        assert!(binds
+            .iter()
+            .any(|bind| { bind.container_path == "/var/lib/nvidia-data" && !bind.readonly }));
+    }
+
+    #[test]
     fn test_cdi_device_symlink_keeps_writable_binding() {
         let spec = CdiSpec {
             container_edits: Some(super::super::cdi::CdiEdits {
@@ -797,7 +834,7 @@ mod tests {
         let mount = CdiMount {
             host_path: "/host/libcuda.so.595.58.03".into(),
             container_path: "/usr/lib/libcuda.so.595.58.03".into(),
-            options: None,
+            options: Some(vec!["rbind".into(), "ro".into()]),
         };
         let hook = CdiHook {
             hook_name: "createContainer".into(),

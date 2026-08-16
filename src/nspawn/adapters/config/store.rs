@@ -95,12 +95,12 @@ impl NspawnConfigStore {
         &self,
         name: &str,
         state: &NvidiaState,
-        death_list: &[String],
+        removed_binds: &[crate::nspawn::platform::nvidia::state::PassthroughBind],
     ) -> Result<()> {
         self.execute(NspawnConfigOperation::UpdateGpu(UpdateNspawnGpu {
             machine: parse_machine_name(name)?,
             state: state.clone(),
-            death_list: death_list.to_vec(),
+            removed_binds: removed_binds.to_vec(),
         }))
         .await?;
         Ok(())
@@ -184,7 +184,7 @@ pub(crate) struct PrepareOciPromotion {
 pub(crate) struct UpdateNspawnGpu {
     machine: MachineName,
     state: NvidiaState,
-    death_list: Vec<String>,
+    removed_binds: Vec<crate::nspawn::platform::nvidia::state::PassthroughBind>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -275,7 +275,7 @@ pub(crate) async fn execute_nspawn_config_operation(
                 &nspawn_path(&request.machine),
                 request.machine,
                 request.state,
-                request.death_list,
+                request.removed_binds,
             )
             .await?;
             Ok(NspawnConfigResult::default())
@@ -722,14 +722,15 @@ async fn update_gpu_at(
     path: &Path,
     machine: MachineName,
     state: NvidiaState,
-    death_list: Vec<String>,
+    removed_binds: Vec<crate::nspawn::platform::nvidia::state::PassthroughBind>,
 ) -> Result<()> {
-    validate_nvidia_update(&state, &death_list)?;
+    validate_nvidia_update(&state, &removed_binds)?;
     AsyncLockedWriter::write_locked(path, move |existing| {
         let content = existing.ok_or_else(|| {
             NspawnError::Runtime(format!("No .nspawn configuration found for {machine}"))
         })?;
-        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &state, &death_list)?;
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &state, &removed_binds)?;
         validate_content_size(&updated)?;
         Ok(updated)
     })
@@ -746,8 +747,11 @@ fn validate_content_size(content: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_nvidia_update(state: &NvidiaState, death_list: &[String]) -> Result<()> {
-    if state.binds.len() > MAX_NVIDIA_BINDS || death_list.len() > MAX_NVIDIA_BINDS {
+fn validate_nvidia_update(
+    state: &NvidiaState,
+    removed_binds: &[crate::nspawn::platform::nvidia::state::PassthroughBind],
+) -> Result<()> {
+    if state.binds.len() > MAX_NVIDIA_BINDS || removed_binds.len() > MAX_NVIDIA_BINDS {
         return Err(NspawnError::Validation(
             "Too many NVIDIA bind entries".into(),
         ));
@@ -757,8 +761,9 @@ fn validate_nvidia_update(state: &NvidiaState, death_list: &[String]) -> Result<
         validate_absolute_value("NVIDIA host path", &bind.host_path)?;
         validate_absolute_value("NVIDIA container path", &bind.container_path)?;
     }
-    for path in death_list {
-        validate_absolute_value("NVIDIA removal path", path)?;
+    for bind in removed_binds {
+        validate_absolute_value("removed NVIDIA host path", &bind.host_path)?;
+        validate_absolute_value("removed NVIDIA container path", &bind.container_path)?;
     }
     Ok(())
 }
