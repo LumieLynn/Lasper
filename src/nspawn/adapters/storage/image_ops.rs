@@ -159,6 +159,10 @@ pub(crate) async fn import_raw_image(
 }
 
 pub(crate) fn validate_import_source(source: &std::fs::File) -> Result<()> {
+    validate_import_source_with_limit(source, MAX_IMAGE_BYTES)
+}
+
+fn validate_import_source_with_limit(source: &std::fs::File, limit: u64) -> Result<()> {
     let metadata = source
         .metadata()
         .map_err(|error| NspawnError::Io(PathBuf::from("import source fd"), error))?;
@@ -173,10 +177,10 @@ pub(crate) fn validate_import_source(source: &std::fs::File) -> Result<()> {
             "Source image descriptor is empty".into(),
         ));
     }
-    if file_type.is_file() && metadata.len() > MAX_IMAGE_BYTES {
+    if file_type.is_file() && metadata.len() > limit {
         return Err(NspawnError::Validation(format!(
             "Source image descriptor exceeds the {} byte limit",
-            MAX_IMAGE_BYTES
+            limit
         )));
     }
     Ok(())
@@ -1696,11 +1700,11 @@ mod tests {
     #[test]
     fn source_validation_rejects_oversized_regular_images() {
         let source = tempfile::tempfile().unwrap();
-        source.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        source.set_len(5).unwrap();
 
-        let error = validate_import_source(&source).unwrap_err();
+        let error = validate_import_source_with_limit(&source, 4).unwrap_err();
 
-        assert!(error.to_string().contains("byte limit"));
+        assert!(error.to_string().contains("4 byte limit"));
     }
 
     #[test]

@@ -342,13 +342,17 @@ async fn normalize_compression(
 }
 
 fn validate_source_size(source: &std::fs::File, label: &str) -> Result<()> {
+    validate_source_size_with_limit(source, label, MAX_IMAGE_BYTES)
+}
+
+fn validate_source_size_with_limit(source: &std::fs::File, label: &str, limit: u64) -> Result<()> {
     let metadata = source
         .metadata()
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
-    if metadata.is_file() && metadata.len() > MAX_IMAGE_BYTES {
+    if metadata.is_file() && metadata.len() > limit {
         return Err(NspawnError::Validation(format!(
             "{label} exceeds the {} byte limit",
-            MAX_IMAGE_BYTES
+            limit
         )));
     }
     Ok(())
@@ -547,11 +551,11 @@ mod tests {
     #[test]
     fn source_size_limit_rejects_oversized_files_before_processing() {
         let source = tempfile::tempfile().unwrap();
-        source.set_len(MAX_IMAGE_BYTES + 1).unwrap();
+        source.set_len(5).unwrap();
 
-        let error = validate_source_size(&source, "Image source").unwrap_err();
+        let error = validate_source_size_with_limit(&source, "Image source", 4).unwrap_err();
 
-        assert!(error.to_string().contains("byte limit"));
+        assert!(error.to_string().contains("4 byte limit"));
     }
 
     #[test]
