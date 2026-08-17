@@ -93,11 +93,11 @@ The next stable milestone is `0.3.0`. The release is not defined by adding more 
 
 Before `0.3.0` stable, the project should:
 
-- continue migrating elevated-daemon authority from generic command/path RPCs to typed operations;
+- decompose the largest daemon, provisioning, and UI modules into readable ownership boundaries without widening the typed privilege interface;
 - keep the systemd-native OCI application provider clearly experimental; it does not turn arbitrary OCI images into bootable system containers;
 - preserve unknown `.nspawn` settings instead of rewriting files from only the fields Lasper understands;
 - make long-running provisioning and image operations observable and recoverable enough for normal use;
-- fail closed on unsafe storage/image conflicts instead of overwriting host resources.
+- retain fail-closed storage and image conflict behavior while expanding smoke coverage across representative systemd hosts.
 
 Feature work that requires general-purpose root hooks or arbitrary daemon commands is intentionally deferred.
 

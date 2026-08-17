@@ -63,6 +63,7 @@ Cargo audit also reports these informational transitive warnings:
 | --- | --- | --- |
 | `RUSTSEC-2024-0436` | `ratatui -> paste` | The proc-macro crate is unmaintained; no vulnerability is reported. |
 | `RUSTSEC-2026-0002` | `ratatui -> lru` | The issue affects `LruCache::iter_mut`; ratatui 0.29 uses cache lookup, insertion, and resize operations instead. |
+| `RUSTSEC-2026-0253` | `ratatui -> lru` | Exploitation requires `LruCache::pop` with a key whose destructor panics; ratatui 0.29 does not call that cache API. |
 | `RUSTSEC-2026-0097` | `zbus -> rand` | Exploitation requires a custom logger that calls `thread_rng` from inside its logging callback; Lasper's logger does not do this. |
 
 These warnings should still be removed through compatible ratatui and zbus upgrades rather than treated as permanent exemptions.
