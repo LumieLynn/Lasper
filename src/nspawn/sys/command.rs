@@ -4,6 +4,35 @@ use std::future::Future;
 use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DAEMON_CHILD_LIFECYCLE: AtomicBool = AtomicBool::new(false);
+
+/// Mark commands created after daemon startup so the kernel terminates their
+/// direct child when the root daemon itself disappears unexpectedly.
+pub(crate) fn enable_daemon_child_lifecycle() {
+    DAEMON_CHILD_LIFECYCLE.store(true, Ordering::Release);
+}
+
+fn install_parent_death_signal(command: &mut std::process::Command) {
+    if !DAEMON_CHILD_LIFECYCLE.load(Ordering::Acquire) {
+        return;
+    }
+    let daemon_pid = unsafe { libc::getpid() };
+    unsafe {
+        command.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the fork/exec race: if the daemon died before this child
+            // installed the death signal, terminate the child immediately.
+            if libc::getppid() != daemon_pid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
 
 /// Handle to a spawned command: stderr merged into stdout via `2>&1`,
 /// exit status retrievable via [`SpawnedProcess::wait`].
@@ -146,6 +175,7 @@ impl CommandRunner for DefaultCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        install_parent_death_signal(command.as_std_mut());
         command.as_std_mut().process_group(0);
         let mut child = command.spawn()?;
         let pid = child.id().expect("spawned command has pid");
@@ -166,6 +196,7 @@ pub fn new_command(program: &str) -> tokio::process::Command {
     cmd.env("LC_ALL", "C");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    install_parent_death_signal(cmd.as_std_mut());
     cmd
 }
 
@@ -177,6 +208,7 @@ pub fn new_sync_command(program: &str) -> std::process::Command {
     cmd.env("LC_ALL", "C");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
+    install_parent_death_signal(&mut cmd);
     cmd
 }
 

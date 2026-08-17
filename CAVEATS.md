@@ -14,9 +14,9 @@ Lasper is alpha software. It manages host-level systemd resources and may run op
 
 ## Elevated Daemon
 
-`lasper -e` keeps the TUI unprivileged and starts a dedicated root daemon for that Lasper process. The FD-passing socket is protected by a private directory, `0600` permissions, exact PID/UID peer checks, and a per-session token.
+`lasper -e` keeps the TUI unprivileged and starts a dedicated root daemon for that Lasper process. The control and FD-passing sockets live in a private directory, use `0600` permissions, and require exact PID/UID peer checks; the TUI also verifies that the control peer is root, and a per-session token protects each FD request. Privileged RPC traffic does not use the child process's stdin or stdout pipes.
 
-This protects the FD interface from independent local processes. It does not protect against code already executing inside the Lasper TUI process. The daemon's normal interface is now typed rather than a generic command/file RPC, but those typed operations still carry the host authority needed to manage containers. See [SECURITY.md](SECURITY.md).
+This isolates the daemon interfaces from independent local processes, and the daemon monitors the launching TUI so it can terminate tracked child operations when that session disappears. It does not protect against code already executing inside the Lasper TUI process. The daemon's normal interface is typed rather than a generic command/file RPC, but those typed operations still carry the host authority needed to manage containers. See [SECURITY.md](SECURITY.md).
 
 ## OCI Images
 

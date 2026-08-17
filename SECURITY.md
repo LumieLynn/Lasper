@@ -13,12 +13,14 @@ Lasper manages host-level container resources and may execute operations as root
 Each daemon session uses:
 
 - A private, randomly named temporary directory.
-- Authenticated control and FD-passing Unix sockets owned by the invoking user with mode `0600`.
-- Kernel `SO_PEERCRED` checks for the exact PID and UID of the launching TUI.
-- A random per-session token delivered once during bootstrap and required on both RPC and FD-passing connections.
+- Mutually authenticated control and FD-passing Unix sockets owned by the invoking user with mode `0600`.
+- Kernel `SO_PEERCRED` checks: the daemon requires the exact launching TUI PID/UID, while the TUI requires a root daemon peer.
+- A random per-session token negotiated only after the control connection is authenticated and required on FD-passing requests.
+- A Linux pidfd monitor that terminates the daemon and its tracked child process groups when the launching TUI exits; direct command children also receive a kernel parent-death signal.
+- Bounded protocol frames, authenticated FD setup timeouts, a concurrent FD-connection limit, and rate-limited authentication diagnostics.
 - Structured request messages instead of delimiter-based command strings.
 
-The daemon exits when Lasper shuts it down normally. A crashed or forcibly terminated session can leave a temporary directory behind, but the random path, directory permissions, peer checks, and expired session token prevent it from becoming a reusable daemon endpoint.
+The daemon exits when Lasper shuts it down normally or when its launching TUI exits. A crashed or forcibly terminated session can still leave a temporary directory behind, but the random path, directory permissions, peer checks, and session token prevent it from becoming a reusable daemon endpoint. Each daemon writes a uniquely named, root-owned `0600` session log under `/var/lib/lasper/logs`; a session is capped at 8 MiB, and startup cleanup retains up to eight sessions within a 64 MiB budget while leaving locked logs from active daemons untouched.
 
 ## Remaining Trust Boundary
 
