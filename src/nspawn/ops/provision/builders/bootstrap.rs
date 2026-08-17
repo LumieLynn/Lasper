@@ -1,7 +1,6 @@
 //! Typed debootstrap, pacstrap, and DNF5 deployment implementations.
 
 use async_trait::async_trait;
-use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::adapters::rootfs::RootfsTarget;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -10,8 +9,8 @@ use crate::nspawn::models::{
 };
 use crate::nspawn::ops::provision::bootstrap_operation::BootstrapRequest;
 use crate::nspawn::ops::provision::{
-    send_deploy_log, send_deploy_stream_log, BootstrapStore, DeployLogEvent, Deployer,
-    DeploymentReceipt,
+    send_deploy_log, stream_deploy_command, ApplyReport, BootstrapStore, DeployLogEvent, Deployer,
+    DeploymentCancellation,
 };
 
 pub struct BootstrapDeployer {
@@ -27,7 +26,9 @@ impl Deployer for BootstrapDeployer {
         cfg: &ContainerConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<DeploymentReceipt> {
+        cancellation: &DeploymentCancellation,
+        _report: &mut ApplyReport,
+    ) -> Result<()> {
         self.spec.validate()?;
         if signature_verification_disabled(&self.spec) {
             send_deploy_log(
@@ -79,19 +80,8 @@ impl Deployer for BootstrapDeployer {
             spec: self.spec.clone(),
             include_sudo: cfg.users.iter().any(|user| user.sudoer),
         };
-        let mut spawned = self.bootstrap.spawn(request).await?;
-        {
-            let reader = &mut spawned.stdout;
-            let mut lines = tokio::io::BufReader::new(reader).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                send_deploy_stream_log(&logs, line).await;
-            }
-        }
-
-        let status = spawned
-            .wait()
-            .await
-            .map_err(|error| NspawnError::Io(std::path::PathBuf::from(label), error))?;
+        let spawned = self.bootstrap.spawn(request).await?;
+        let status = stream_deploy_command(spawned, &logs, cancellation, label).await?;
         if !status.success() {
             return Err(NspawnError::CommandFailed(
                 format!("Bootstrap tool ({label})"),
@@ -99,7 +89,7 @@ impl Deployer for BootstrapDeployer {
                 "Command failed. Check deployment logs for detailed output.".to_string(),
             ));
         }
-        Ok(DeploymentReceipt::none())
+        Ok(())
     }
 }
 

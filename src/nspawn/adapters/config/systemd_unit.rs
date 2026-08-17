@@ -1,5 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::nspawn::models::{ApplyStatus, MachineName};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
 use ini::Ini;
@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 const MAX_OVERRIDE_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_DEVICE_ALLOW_ENTRIES: usize = 4096;
+const LASPER_OVERRIDE_FILE: &str = "override.conf";
+const LASPER_NVIDIA_OVERRIDE_FILE: &str = "10-lasper-nvidia.conf";
 
 /// Read-only view of the host unit drop-ins associated with a machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,31 +43,37 @@ impl SystemdUnitStore {
         nvidia_gpu: bool,
         graphics_acceleration: bool,
         wayland_socket: bool,
-    ) -> Result<()> {
+    ) -> Result<ApplyStatus> {
         if device_binds.is_empty() && !nvidia_gpu && !wayland_socket && !graphics_acceleration {
-            return Ok(());
+            return Ok(ApplyStatus::Unchanged);
         }
 
-        self.execute(SystemdUnitOperation::WriteOverride(WriteServiceOverride {
-            machine: parse_machine_name(name)?,
-            spec: ServiceOverrideSpec {
-                device_binds: device_binds.to_vec(),
-                nvidia_gpu,
-                graphics_acceleration,
-                wayland_socket,
-            },
-        }))
-        .await?;
-        Ok(())
+        let result = self
+            .execute(SystemdUnitOperation::WriteOverride(WriteServiceOverride {
+                machine: parse_machine_name(name)?,
+                spec: ServiceOverrideSpec {
+                    device_binds: device_binds.to_vec(),
+                    nvidia_gpu,
+                    graphics_acceleration,
+                    wayland_socket,
+                },
+            }))
+            .await?;
+        result.apply.ok_or_else(|| {
+            NspawnError::Runtime("systemd override write returned no apply status".into())
+        })
     }
 
-    pub async fn clone_override(&self, source: &str, destination: &str) -> Result<()> {
-        self.execute(SystemdUnitOperation::CloneOverride(CloneServiceOverride {
-            source: parse_machine_name(source)?,
-            destination: parse_machine_name(destination)?,
-        }))
-        .await?;
-        Ok(())
+    pub async fn clone_override(&self, source: &str, destination: &str) -> Result<ApplyStatus> {
+        let result = self
+            .execute(SystemdUnitOperation::CloneOverride(CloneServiceOverride {
+                source: parse_machine_name(source)?,
+                destination: parse_machine_name(destination)?,
+            }))
+            .await?;
+        result.apply.ok_or_else(|| {
+            NspawnError::Runtime("systemd override clone returned no apply status".into())
+        })
     }
 
     pub async fn write_nvidia_device_allow(
@@ -86,6 +94,16 @@ impl SystemdUnitStore {
     pub async fn remove_overrides(&self, name: &str) -> Result<()> {
         self.execute(SystemdUnitOperation::RemoveOverrides(
             RemoveServiceOverrides {
+                machine: parse_machine_name(name)?,
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_service_override(&self, name: &str) -> Result<()> {
+        self.execute(SystemdUnitOperation::RemoveOverride(
+            RemoveServiceOverride {
                 machine: parse_machine_name(name)?,
             },
         ))
@@ -132,6 +150,7 @@ pub(crate) enum SystemdUnitOperation {
     WriteOverride(WriteServiceOverride),
     CloneOverride(CloneServiceOverride),
     WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
+    RemoveOverride(RemoveServiceOverride),
     RemoveOverrides(RemoveServiceOverrides),
 }
 
@@ -170,6 +189,12 @@ pub(crate) struct RemoveServiceOverrides {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct RemoveServiceOverride {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ServiceOverrideSpec {
     device_binds: Vec<String>,
     nvidia_gpu: bool,
@@ -182,6 +207,8 @@ pub(crate) struct ServiceOverrideSpec {
 pub(crate) struct SystemdUnitResult {
     #[serde(default)]
     drop_ins: Vec<SystemdDropIn>,
+    #[serde(default)]
+    apply: Option<ApplyStatus>,
 }
 
 pub(crate) async fn execute_systemd_unit_operation(
@@ -194,7 +221,10 @@ pub(crate) async fn execute_systemd_unit_operation(
             drop_ins
                 .extend(read_drop_ins(&transient_service_override_dir(&request.machine)).await?);
             drop_ins.sort_by(|left, right| left.path.cmp(&right.path));
-            return Ok(SystemdUnitResult { drop_ins });
+            return Ok(SystemdUnitResult {
+                drop_ins,
+                ..Default::default()
+            });
         }
         SystemdUnitOperation::WriteOverride(request) => {
             validate_override_spec(&request.spec)?;
@@ -205,14 +235,25 @@ pub(crate) async fn execute_systemd_unit_operation(
                 request.spec.wayland_socket,
             );
             validate_content_size(&content)?;
-            write_override_at(&service_override_path(&request.machine), &content).await?;
+            let apply =
+                apply_new_override_at(&service_override_path(&request.machine), content).await?;
+            return Ok(SystemdUnitResult {
+                apply: Some(apply),
+                ..Default::default()
+            });
         }
         SystemdUnitOperation::CloneOverride(request) => {
             let source = service_override_path(&request.source);
-            if let Some(content) = read_optional(&source).await? {
+            let apply = if let Some(content) = read_optional(&source).await? {
                 validate_content_size(&content)?;
-                write_override_at(&service_override_path(&request.destination), &content).await?;
-            }
+                apply_new_override_at(&service_override_path(&request.destination), content).await?
+            } else {
+                ApplyStatus::Unchanged
+            };
+            return Ok(SystemdUnitResult {
+                apply: Some(apply),
+                ..Default::default()
+            });
         }
         SystemdUnitOperation::WriteNvidiaDeviceAllow(request) => {
             validate_device_allow_paths(&request.device_paths)?;
@@ -225,8 +266,15 @@ pub(crate) async fn execute_systemd_unit_operation(
             )
             .await?;
         }
+        SystemdUnitOperation::RemoveOverride(request) => {
+            remove_service_override_at(&service_override_dir(&request.machine)).await?;
+        }
         SystemdUnitOperation::RemoveOverrides(request) => {
-            remove_overrides_at(&service_override_dir(&request.machine)).await?;
+            remove_lasper_overrides_at(
+                &service_override_dir(&request.machine),
+                &transient_service_override_dir(&request.machine),
+            )
+            .await?;
         }
     }
     Ok(SystemdUnitResult::default())
@@ -277,7 +325,7 @@ fn service_override_dir(machine: &MachineName) -> PathBuf {
 }
 
 fn service_override_path(machine: &MachineName) -> PathBuf {
-    service_override_dir(machine).join("override.conf")
+    service_override_dir(machine).join(LASPER_OVERRIDE_FILE)
 }
 
 fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
@@ -288,11 +336,11 @@ fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
 }
 
 fn persistent_nvidia_override_path(machine: &MachineName) -> PathBuf {
-    service_override_dir(machine).join("10-lasper-nvidia.conf")
+    service_override_dir(machine).join(LASPER_NVIDIA_OVERRIDE_FILE)
 }
 
 fn transient_nvidia_override_path(machine: &MachineName) -> PathBuf {
-    transient_service_override_dir(machine).join("10-lasper-nvidia.conf")
+    transient_service_override_dir(machine).join(LASPER_NVIDIA_OVERRIDE_FILE)
 }
 
 fn validate_override_spec(spec: &ServiceOverrideSpec) -> Result<()> {
@@ -396,6 +444,17 @@ async fn write_override_at(path: &Path, content: &str) -> Result<()> {
     AsyncLockedWriter::write_atomic(path, content).await
 }
 
+async fn apply_new_override_at(path: &Path, content: String) -> Result<ApplyStatus> {
+    AsyncLockedWriter::apply_locked(path, move |existing| {
+        Ok(match existing {
+            None => (Some(content), ApplyStatus::Created),
+            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+        })
+    })
+    .await
+}
+
 async fn write_nvidia_device_allow_at(
     persistent_path: &Path,
     transient_path: &Path,
@@ -420,11 +479,56 @@ async fn remove_optional_file(path: &Path) -> Result<()> {
     }
 }
 
-async fn remove_overrides_at(path: &Path) -> Result<()> {
-    match tokio::fs::remove_dir_all(path).await {
+async fn remove_empty_dir(path: &Path) -> Result<()> {
+    match tokio::fs::remove_dir(path).await {
         Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
         Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn remove_service_override_at(persistent_dir: &Path) -> Result<()> {
+    let override_path = persistent_dir.join(LASPER_OVERRIDE_FILE);
+    remove_optional_file(&override_path).await?;
+    remove_optional_file(&crate::nspawn::sys::io::lock_path_for(&override_path)).await?;
+    remove_empty_dir(persistent_dir).await
+}
+
+async fn remove_lasper_overrides_at(persistent_dir: &Path, transient_dir: &Path) -> Result<()> {
+    let override_path = persistent_dir.join(LASPER_OVERRIDE_FILE);
+    let managed_files = [
+        override_path.clone(),
+        crate::nspawn::sys::io::lock_path_for(&override_path),
+        persistent_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+        transient_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+    ];
+    let mut errors = Vec::new();
+
+    for path in managed_files {
+        if let Err(error) = remove_optional_file(&path).await {
+            errors.push(error.to_string());
+        }
+    }
+    for directory in [persistent_dir, transient_dir] {
+        if let Err(error) = remove_empty_dir(directory).await {
+            errors.push(error.to_string());
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(NspawnError::Runtime(format!(
+            "failed to remove one or more Lasper unit drop-ins: {}",
+            errors.join("; ")
+        )))
     }
 }
 
@@ -521,6 +625,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_override_apply_never_replaces_unknown_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("override.conf");
+        let content = systemd_override_content(&["/dev/nvidia0".into()], false, false, false);
+
+        assert_eq!(
+            apply_new_override_at(&path, content.clone()).await.unwrap(),
+            ApplyStatus::Created
+        );
+        assert_eq!(
+            apply_new_override_at(&path, content.clone()).await.unwrap(),
+            ApplyStatus::Unchanged
+        );
+        assert_eq!(
+            apply_new_override_at(&path, "[Service]\nPrivateDevices=yes\n".into())
+                .await
+                .unwrap(),
+            ApplyStatus::ConflictUnknownOwner
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn exact_override_rollback_preserves_other_drop_ins() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        let override_path = persistent.join(LASPER_OVERRIDE_FILE);
+        apply_new_override_at(&override_path, "[Service]\n".into())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            persistent.join(LASPER_NVIDIA_OVERRIDE_FILE),
+            "[Service]\nDeviceAllow=/dev/nvidia0 rw\n",
+        )
+        .await
+        .unwrap();
+
+        remove_service_override_at(&persistent).await.unwrap();
+
+        assert!(!override_path.exists());
+        assert!(persistent.join(LASPER_NVIDIA_OVERRIDE_FILE).exists());
+        assert!(persistent.exists());
+    }
+
+    #[tokio::test]
     async fn write_nvidia_device_allow_removes_transient_override() {
         let directory = tempfile::tempdir().unwrap();
         let persistent = directory.path().join("etc/10-lasper-nvidia.conf");
@@ -543,17 +693,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_overrides_deletes_directory() {
+    async fn remove_overrides_removes_known_files_and_empty_directories() {
         let directory = tempfile::tempdir().unwrap();
-        let override_dir = directory.path().join("systemd-nspawn@test.service.d");
-        tokio::fs::create_dir_all(&override_dir).await.unwrap();
-        tokio::fs::write(override_dir.join("override.conf"), "[Service]\n")
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        tokio::fs::create_dir_all(&transient).await.unwrap();
+        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(persistent.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
             .await
             .unwrap();
 
-        remove_overrides_at(&override_dir).await.unwrap();
+        remove_lasper_overrides_at(&persistent, &transient)
+            .await
+            .unwrap();
 
-        assert!(!override_dir.exists());
+        assert!(!persistent.exists());
+        assert!(!transient.exists());
+    }
+
+    #[tokio::test]
+    async fn remove_overrides_preserves_unknown_drop_ins_and_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        tokio::fs::create_dir_all(&transient).await.unwrap();
+        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(persistent.join("90-administrator.conf"), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir(transient.join("unknown-directory"))
+            .await
+            .unwrap();
+
+        remove_lasper_overrides_at(&persistent, &transient)
+            .await
+            .unwrap();
+
+        assert!(!persistent.join(LASPER_OVERRIDE_FILE).exists());
+        assert!(persistent.join("90-administrator.conf").exists());
+        assert!(persistent.exists());
+        assert!(!transient.join(LASPER_NVIDIA_OVERRIDE_FILE).exists());
+        assert!(transient.join("unknown-directory").exists());
+        assert!(transient.exists());
     }
 
     #[tokio::test]

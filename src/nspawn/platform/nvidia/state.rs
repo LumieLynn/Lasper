@@ -1,5 +1,5 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::nspawn::models::{ApplyStatus, MachineName};
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
@@ -12,7 +12,7 @@ const MAX_NVIDIA_STATE_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_STATE_ITEMS: usize = 16384;
 
 /// A single host→container path mapping for an nspawn Bind= or BindReadOnly= entry.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct PassthroughBind {
     pub host_path: String,
     pub container_path: String,
@@ -86,7 +86,7 @@ impl NvidiaState {
                 self.binds.push(PassthroughBind {
                     host_path: ce.host_path.clone(),
                     container_path: ce.default_container_path.clone(),
-                    readonly: true,
+                    readonly: ce.readonly,
                 });
             }
         }
@@ -212,6 +212,20 @@ impl NvidiaStateStore {
         Ok(())
     }
 
+    pub async fn write_initial(&self, name: &str, state: &NvidiaState) -> Result<ApplyStatus> {
+        let result = self
+            .execute(NvidiaStateOperation::WriteInitial(Box::new(
+                WriteNvidiaState {
+                    machine: parse_machine_name(name)?,
+                    state: state.clone(),
+                },
+            )))
+            .await?;
+        result.apply.ok_or_else(|| {
+            NspawnError::Runtime("initial NVIDIA state write returned no apply status".into())
+        })
+    }
+
     pub async fn remove(&self, name: &str) -> Result<()> {
         self.execute(NvidiaStateOperation::Remove(RemoveNvidiaState {
             machine: parse_machine_name(name)?,
@@ -245,6 +259,7 @@ impl std::fmt::Debug for NvidiaStateStore {
 pub(crate) enum NvidiaStateOperation {
     Read(ReadNvidiaState),
     Write(Box<WriteNvidiaState>),
+    WriteInitial(Box<WriteNvidiaState>),
     Remove(RemoveNvidiaState),
 }
 
@@ -271,6 +286,8 @@ pub(crate) struct RemoveNvidiaState {
 #[serde(deny_unknown_fields)]
 pub(crate) struct NvidiaStateResult {
     state: Option<NvidiaState>,
+    #[serde(default)]
+    apply: Option<ApplyStatus>,
 }
 
 pub(crate) async fn execute_nvidia_state_operation(
@@ -279,10 +296,19 @@ pub(crate) async fn execute_nvidia_state_operation(
     match operation {
         NvidiaStateOperation::Read(request) => Ok(NvidiaStateResult {
             state: read_state_at(&state_path(&request.machine)).await?,
+            ..Default::default()
         }),
         NvidiaStateOperation::Write(request) => {
             write_state_at(&state_path(&request.machine), &request.state).await?;
             Ok(NvidiaStateResult::default())
+        }
+        NvidiaStateOperation::WriteInitial(request) => {
+            let apply =
+                write_initial_state_at(&state_path(&request.machine), &request.state).await?;
+            Ok(NvidiaStateResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
         }
         NvidiaStateOperation::Remove(request) => {
             remove_state_at(&state_path(&request.machine)).await?;
@@ -329,12 +355,37 @@ async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
     AsyncLockedWriter::write_atomic(path, &content).await
 }
 
-async fn remove_state_at(path: &Path) -> Result<()> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<ApplyStatus> {
+    validate_state(state)?;
+    let content = serde_json::to_string_pretty(state)?;
+    if content.len() > MAX_NVIDIA_STATE_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA state exceeds {} bytes",
+            MAX_NVIDIA_STATE_BYTES
+        )));
     }
+    AsyncLockedWriter::apply_locked(path, move |existing| {
+        Ok(match existing {
+            None => (Some(content), ApplyStatus::Created),
+            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+        })
+    })
+    .await
+}
+
+async fn remove_state_at(path: &Path) -> Result<()> {
+    for target in [
+        path.to_path_buf(),
+        crate::nspawn::sys::io::lock_path_for(path),
+    ] {
+        match tokio::fs::remove_file(&target).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NspawnError::Io(target, error)),
+        }
+    }
+    Ok(())
 }
 
 fn validate_state(state: &NvidiaState) -> Result<()> {
@@ -457,6 +508,18 @@ pub(crate) fn calculate_death_list(old: &NvidiaState, new: &NvidiaState) -> Vec<
         .collect()
 }
 
+pub(crate) fn calculate_removed_binds(
+    old: &NvidiaState,
+    new: &NvidiaState,
+) -> Vec<PassthroughBind> {
+    let new_binds = new.binds.iter().collect::<HashSet<_>>();
+    old.binds
+        .iter()
+        .filter(|bind| !new_binds.contains(bind))
+        .cloned()
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,6 +568,7 @@ mod tests {
                 host_path: "/host/gsp.bin".into(),
                 default_container_path: "/lib/firmware/nvidia/gsp.bin".into(),
                 category: crate::nspawn::platform::nvidia::classify::NvidiaFileCategory::Firmware,
+                readonly: true,
             }],
             symlinks: vec![SymlinkEntry {
                 target: "/usr/lib/libcuda.so.1".into(),
@@ -698,6 +762,49 @@ mod tests {
     }
 
     #[test]
+    fn removed_binds_preserve_full_mount_semantics() {
+        let old = NvidiaState {
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/old/libcuda.so".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+                PassthroughBind {
+                    host_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/nvidia0".into(),
+                    readonly: false,
+                },
+            ],
+            ..Default::default()
+        };
+        let new = NvidiaState {
+            binds: vec![
+                PassthroughBind {
+                    host_path: "/new/libcuda.so".into(),
+                    container_path: "/usr/lib/libcuda.so".into(),
+                    readonly: true,
+                },
+                PassthroughBind {
+                    host_path: "/dev/nvidia0".into(),
+                    container_path: "/dev/nvidia0".into(),
+                    readonly: false,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            calculate_removed_binds(&old, &new),
+            vec![PassthroughBind {
+                host_path: "/old/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }]
+        );
+    }
+
+    #[test]
     fn test_nvidia_state_serde_roundtrip() {
         let state = NvidiaState {
             driver_version: "550.1".to_string(),
@@ -738,7 +845,11 @@ mod tests {
             "driver_version": "550.1",
             "readonly_binds": ["/usr/lib/libcuda.so"],
             "device_binds": ["/dev/nvidia0"],
-            "classified_entries": [],
+            "classified_entries": [{
+                "host_path": "/host/gsp.bin",
+                "default_container_path": "/lib/firmware/nvidia/gsp.bin",
+                "category": "Firmware"
+            }],
             "symlinks": [],
             "ldcache_folders": [],
             "env_vars": []
@@ -746,7 +857,7 @@ mod tests {
         let mut state: NvidiaState = serde_json::from_str(json).unwrap();
         assert!(state.binds.is_empty());
         state.migrate_from_legacy();
-        assert_eq!(state.binds.len(), 2);
+        assert_eq!(state.binds.len(), 3);
         assert!(state
             .binds
             .iter()
@@ -755,6 +866,10 @@ mod tests {
             .binds
             .iter()
             .any(|b| b.host_path == "/usr/lib/libcuda.so" && b.readonly));
+        assert!(state
+            .binds
+            .iter()
+            .any(|b| b.host_path == "/host/gsp.bin" && b.readonly));
     }
 
     #[test]
@@ -788,6 +903,37 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_state(&state).is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_state_apply_is_create_only_and_cleanup_removes_its_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.json");
+        let state = NvidiaState {
+            driver_version: "1".into(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            write_initial_state_at(&path, &state).await.unwrap(),
+            ApplyStatus::Created
+        );
+        assert_eq!(
+            write_initial_state_at(&path, &state).await.unwrap(),
+            ApplyStatus::Unchanged
+        );
+        let different = NvidiaState {
+            driver_version: "2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            write_initial_state_at(&path, &different).await.unwrap(),
+            ApplyStatus::ConflictUnknownOwner
+        );
+
+        remove_state_at(&path).await.unwrap();
+        assert!(!path.exists());
+        assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[tokio::test]

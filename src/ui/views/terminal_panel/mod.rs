@@ -1,5 +1,5 @@
 pub mod manager;
-pub use manager::{TerminalKeyOutcome, TerminalManager, TextSelection};
+pub use manager::{TerminalInputStatus, TerminalKeyOutcome, TerminalManager, TextSelection};
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},

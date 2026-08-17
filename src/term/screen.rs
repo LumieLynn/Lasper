@@ -17,6 +17,7 @@ const MODE_APPLICATION_CURSOR: u8 = 0b0000_0010;
 const MODE_HIDE_CURSOR: u8 = 0b0000_0100;
 const MODE_ALTERNATE_SCREEN: u8 = 0b0000_1000;
 const MODE_BRACKETED_PASTE: u8 = 0b0001_0000;
+const MAX_PENDING_SEQUENCE_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum CharSet {
@@ -319,11 +320,17 @@ impl Screen {
             // don't even try to draw control characters
             return;
         }
-        let width = width
+        let mut width = width
             .unwrap_or(1)
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+        let c = if width > size.width {
+            width = 1;
+            '\u{fffd}'
+        } else {
+            c
+        };
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
@@ -334,7 +341,7 @@ impl Screen {
         // (xterm handles this by introducing the concept of triple width
         // cells, which i really don't want to do).
         let mut wrap = false;
-        if pos.col > size.width - width {
+        if pos.col > size.width.saturating_sub(width) {
             let last_cell_pos = super::grid::Pos {
                 row: pos.row,
                 col: size.width - 1,
@@ -863,8 +870,10 @@ impl Screen {
             consumed = pos;
         }
 
-        self.feed_buf = buf;
-        self.feed_buf.drain(0..consumed);
+        let pending = &buf[consumed..];
+        if pending.len() <= MAX_PENDING_SEQUENCE_BYTES {
+            self.feed_buf.extend_from_slice(pending);
+        }
     }
 
     fn process_csi(
@@ -1360,18 +1369,16 @@ fn utf8_char_len(first_byte: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{MouseProtocolEncoding, MouseProtocolMode, Screen};
+    use super::{MouseProtocolEncoding, MouseProtocolMode, Screen, MAX_PENDING_SEQUENCE_BYTES};
     use crate::term::common::Size;
+
+    fn screen_with_size(width: u16, height: u16) -> Screen {
+        Screen::new(Size { width, height }, 32)
+    }
 
     #[test]
     fn parser_exposes_mouse_protocol_state_to_input_encoding() {
-        let mut screen = Screen::new(
-            Size {
-                width: 80,
-                height: 24,
-            },
-            32,
-        );
+        let mut screen = screen_with_size(80, 24);
         let mut events = Vec::new();
         screen.process(b"\x1b[?1002h\x1b[?1005h\x1b[?1h\x1b[?25l", &mut events);
 
@@ -1385,5 +1392,71 @@ mod tests {
         );
         assert!(screen.application_cursor());
         assert!(screen.hide_cursor());
+    }
+
+    #[test]
+    fn grid_size_is_never_smaller_than_one_cell() {
+        let mut screen = screen_with_size(0, 0);
+
+        assert_eq!(
+            screen.size(),
+            Size {
+                width: 1,
+                height: 1
+            }
+        );
+
+        screen.set_size(0, 0);
+        assert_eq!(
+            screen.size(),
+            Size {
+                width: 1,
+                height: 1
+            }
+        );
+    }
+
+    #[test]
+    fn one_column_screen_replaces_wide_characters() {
+        let mut screen = screen_with_size(1, 1);
+        let mut events = Vec::new();
+
+        screen.process("界".as_bytes(), &mut events);
+
+        assert_eq!(screen.cell(0, 0).map(|cell| cell.contents()), Some("�"));
+    }
+
+    #[test]
+    fn drops_oversized_unterminated_control_strings() {
+        for prefix in [b"\x1b]".as_slice(), b"\x1bP", b"\x1bX", b"\x1b^", b"\x1b_"] {
+            let mut screen = screen_with_size(80, 24);
+            let mut events = Vec::new();
+
+            screen.process(prefix, &mut events);
+            assert_eq!(screen.feed_buf, prefix);
+
+            screen.process(&vec![b'x'; MAX_PENDING_SEQUENCE_BYTES + 1], &mut events);
+
+            assert!(screen.feed_buf.is_empty());
+            screen.process(b"ok", &mut events);
+            assert_eq!(screen.cell(0, 0).map(|cell| cell.contents()), Some("o"));
+        }
+    }
+
+    #[test]
+    fn arbitrary_bytes_do_not_grow_pending_buffer() {
+        let mut screen = screen_with_size(1, 1);
+        let mut events = Vec::new();
+        let mut state = 0x1234_5678_u32;
+        let mut bytes = vec![0_u8; MAX_PENDING_SEQUENCE_BYTES * 2];
+
+        for byte in &mut bytes {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        for chunk in bytes.chunks(257) {
+            screen.process(chunk, &mut events);
+            assert!(screen.feed_buf.len() <= MAX_PENDING_SEQUENCE_BYTES);
+        }
     }
 }

@@ -30,6 +30,11 @@ pub struct Grid {
 
 impl Grid {
     pub fn new(size: Size, scrollback_len: usize) -> Self {
+        let size = Size {
+            height: size.height.max(1),
+            width: size.width.max(1),
+        };
+
         let mut rows = VecDeque::with_capacity(size.height.into());
         for _ in 0..size.height {
             rows.push_back(Row::new(size.width));
@@ -132,6 +137,11 @@ impl Grid {
     }
 
     pub fn set_size(&mut self, size: Size) {
+        let size = Size {
+            height: size.height.max(1),
+            width: size.width.max(1),
+        };
+
         if self.size == size {
             return;
         }
@@ -544,11 +554,11 @@ impl Grid {
     }
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
-        if self.pos.col > self.size.width - width {
+        if self.pos.col > self.size.width.saturating_sub(width) {
             let mut prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
+            prev_pos.row = prev_pos.row.saturating_sub(scrolled);
             let new_pos = self.pos;
             self.drawing_row_mut(prev_pos.row)
                 // we assume self.pos.row is always valid, and so prev_pos.row

@@ -1,6 +1,7 @@
 use super::discovery::get_nvidia_state;
 use super::profile::NvidiaPassthroughMode;
-use super::state::{calculate_death_list, NvidiaState};
+use super::state::{calculate_death_list, calculate_removed_binds, NvidiaState};
+use crate::nspawn::adapters::config::nspawn_file::NspawnConfig;
 use crate::nspawn::errors::Result;
 
 macro_rules! log_step {
@@ -143,7 +144,8 @@ pub async fn ensure_gpu_passthrough(
     let external_cache = state_store.read(name).await?.unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
 
-    // Remapping already happens inside get_nvidia_state
+    // Discovery and snapshot validation are fail-closed. No rootfs, config,
+    // unit, or state mutation may move above this boundary.
     let host_state = get_nvidia_state(Some(&profile)).await?;
 
     log_step!(
@@ -196,6 +198,7 @@ pub async fn ensure_gpu_passthrough(
     }
 
     let death_list = calculate_death_list(&old_state, &host_state);
+    let removed_binds = calculate_removed_binds(&old_state, &host_state);
     if !death_list.is_empty() {
         log_step!(
             name,
@@ -205,6 +208,14 @@ pub async fn ensure_gpu_passthrough(
         );
     }
 
+    // Detect marker-external administrator bind conflicts before touching the
+    // rootfs. The locked write below repeats this check against the latest file.
+    NspawnConfig::apply_gpu_passthrough_to_content(
+        config.content.clone(),
+        &host_state,
+        &removed_binds,
+    )?;
+
     // 4. Cleanup stale files in rootfs
     for warning in rootfs.cleanup_nvidia(name, &death_list).await? {
         log::warn!("{}", warning);
@@ -212,7 +223,7 @@ pub async fn ensure_gpu_passthrough(
 
     // 5. Update .nspawn config (symlinks are now synthesized as Bind entries here)
     log_step!(name, "Surgery", "Mutating .nspawn configuration AST...");
-    nspawn.update_gpu(name, &host_state, &death_list).await?;
+    nspawn.update_gpu(name, &host_state, &removed_binds).await?;
 
     // 6. Persist state and inject DeviceAllow rules
     log_step!(

@@ -89,6 +89,11 @@ pub fn render_unit(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if let Some(unit) = &data.unit_name {
         lines.push(field("Unit", unit));
         lines.push(Line::from(""));
+    } else {
+        lines.push(
+            Line::from("No corresponding systemd-nspawn unit for this image.")
+                .style(Style::default().fg(t.text_secondary)),
+        );
     }
     if let Ok(properties) = &data.properties {
         for group in &properties.groups {

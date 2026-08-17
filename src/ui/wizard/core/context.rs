@@ -3,13 +3,15 @@ pub use crate::nspawn::adapters::config::builder::{
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };
 use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
-use crate::nspawn::models::ContainerEntry;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::nspawn::models::{BindMount, CreateUser, NetworkMode, PortForward};
+use crate::nspawn::models::{
+    BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
+};
+use crate::nspawn::models::{ContainerEntry, ImageEntry};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
-use crate::nspawn::ops::provision::{DeployLogEvent, Deployer};
+use crate::nspawn::ops::provision::{DeployLogEvent, Deployer, DeploymentCancellation};
 use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::ExecutionContext;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -27,6 +29,7 @@ pub struct SourceState {
     pub kind: SourceKind,
     pub oci_url: String,
     pub oci_read_only: bool,
+    pub oci_network: OciNetworkMode,
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub deboot_pkgs: String,
@@ -37,12 +40,32 @@ pub struct SourceState {
     pub clone_source: String,
     pub pull_url: String,
     pub is_pull_raw: bool,
+    unsafe_tar_accepted_for: Option<String>,
     pub copy_idx: usize,
     pub profiles: Vec<ConfiguredSourceProfile>,
     pub default_profiles: Vec<ConfiguredSourceProfile>,
 }
 
 impl SourceState {
+    pub fn remote_tar_url(&self) -> Option<&str> {
+        (self.kind == SourceKind::Pull && !self.is_pull_raw)
+            .then(|| self.pull_url.trim())
+            .filter(|url| !url.is_empty())
+    }
+
+    pub fn unsafe_remote_tar_accepted(&self) -> bool {
+        self.remote_tar_url()
+            .is_some_and(|url| self.unsafe_tar_accepted_for.as_deref() == Some(url))
+    }
+
+    pub fn accept_unsafe_remote_tar(&mut self) -> bool {
+        let Some(url) = self.remote_tar_url().map(str::to_owned) else {
+            return false;
+        };
+        self.unsafe_tar_accepted_for = Some(url);
+        true
+    }
+
     pub fn extract_config(&self) -> SourceConfig {
         match &self.kind {
             SourceKind::Copy => SourceConfig::Copy {
@@ -51,6 +74,7 @@ impl SourceState {
             SourceKind::Oci => SourceConfig::Oci {
                 reference: self.oci_url.trim().into(),
                 read_only: self.oci_read_only,
+                network: self.oci_network,
             },
             SourceKind::Debootstrap => {
                 let mut spec = self
@@ -338,7 +362,7 @@ pub struct UnclassifiedFile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PassthroughState {
     pub privileged: bool,
-    pub private_users: Option<String>,
+    pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
     pub wayland_socket: Option<String>,
     pub discovered_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
@@ -370,7 +394,7 @@ impl PassthroughState {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: self.selected_gpu_nodes.clone(),
             privileged: self.privileged,
-            private_users: self.private_users.clone(),
+            private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
             wayland_socket: if is_host_nw {
                 self.wayland_socket.clone()
@@ -427,6 +451,9 @@ pub struct DeployState {
     pub log_rx: RefCell<Option<broadcast::Receiver<DeployLogEvent>>>,
     pub done: Arc<AtomicBool>,
     pub success: Arc<AtomicBool>,
+    pub cancelled: Arc<AtomicBool>,
+    pub rolling_back: Arc<AtomicBool>,
+    pub cancellation: DeploymentCancellation,
 }
 
 impl Clone for DeployState {
@@ -436,6 +463,9 @@ impl Clone for DeployState {
             log_rx: RefCell::new(Some(self.log_tx.subscribe())),
             done: self.done.clone(),
             success: self.success.clone(),
+            cancelled: self.cancelled.clone(),
+            rolling_back: self.rolling_back.clone(),
+            cancellation: self.cancellation.clone(),
         }
     }
 }
@@ -451,6 +481,8 @@ impl std::fmt::Debug for DeployState {
         f.debug_struct("DeployState")
             .field("done", &self.done)
             .field("success", &self.success)
+            .field("cancelled", &self.cancelled)
+            .field("rolling_back", &self.rolling_back)
             .finish_non_exhaustive()
     }
 }
@@ -467,7 +499,7 @@ pub struct WizardContext {
     pub review: ReviewState,
     pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
-    pub image_names: Vec<String>,
+    pub images: Vec<ImageEntry>,
     pub xdg_runtime: Option<String>,
     pub permission_level: PermissionLevel,
     pub exec_ctx: Arc<ExecutionContext>,
@@ -476,7 +508,7 @@ pub struct WizardContext {
 impl WizardContext {
     pub async fn new(
         entries: Vec<ContainerEntry>,
-        image_names: Vec<String>,
+        images: Vec<ImageEntry>,
         permission_level: PermissionLevel,
         exec_ctx: Arc<ExecutionContext>,
         config: Arc<crate::config::AppConfig>,
@@ -525,6 +557,7 @@ impl WizardContext {
                 kind: default_kind,
                 oci_url: "".to_string(),
                 oci_read_only: false,
+                oci_network: OciNetworkMode::Host,
                 deboot_mirror: deboot_prefill.mirror.unwrap_or_default(),
                 deboot_suite: deboot_prefill.suite,
                 deboot_pkgs: deboot_prefill.packages.join(" "),
@@ -532,9 +565,13 @@ impl WizardContext {
                 dnf_releasever: dnf_prefill.releasever,
                 dnf_pkgs: dnf_prefill.packages.join(" "),
                 local_path: artifact_prefill,
-                clone_source: entries.first().map(|e| e.name.clone()).unwrap_or_default(),
+                clone_source: images
+                    .first()
+                    .map(|image| image.name.clone())
+                    .unwrap_or_default(),
                 pull_url: "".to_string(),
                 is_pull_raw: false,
+                unsafe_tar_accepted_for: None,
                 copy_idx: 0,
                 profiles,
                 default_profiles,
@@ -612,10 +649,13 @@ impl WizardContext {
                     log_rx: RefCell::new(Some(log_rx)),
                     done: Arc::new(AtomicBool::new(false)),
                     success: Arc::new(AtomicBool::new(false)),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    rolling_back: Arc::new(AtomicBool::new(false)),
+                    cancellation: DeploymentCancellation::default(),
                 }
             },
             entries,
-            image_names,
+            images,
             xdg_runtime,
             permission_level,
             exec_ctx,
@@ -702,6 +742,7 @@ impl WizardContext {
         image_import: crate::nspawn::ops::provision::ImageImportStore,
         oci_pull: crate::nspawn::ops::provision::OciPullStore,
     ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
+        let allow_unsafe_remote_tar = self.source.unsafe_remote_tar_accepted();
         self.builder().get_deployer_and_storage(
             system_operations,
             nspawn,
@@ -710,6 +751,7 @@ impl WizardContext {
             bootstrap,
             image_import,
             oci_pull,
+            allow_unsafe_remote_tar,
         )
     }
 
@@ -767,6 +809,7 @@ mod tests {
             kind: SourceKind::Copy,
             oci_url: "".into(),
             oci_read_only: false,
+            oci_network: OciNetworkMode::Host,
             deboot_mirror: "".into(),
             deboot_suite: "".into(),
             deboot_pkgs: "".into(),
@@ -777,6 +820,7 @@ mod tests {
             clone_source: "".into(),
             pull_url: "".into(),
             is_pull_raw: false,
+            unsafe_tar_accepted_for: None,
             copy_idx: 0,
             profiles: vec![],
             default_profiles: vec![],
@@ -824,6 +868,24 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_tar_acceptance_is_bound_to_the_current_remote_url() {
+        let mut state = test_source_state();
+        state.kind = SourceKind::Pull;
+        state.pull_url = " https://example.test/rootfs.tar ".into();
+
+        assert!(!state.unsafe_remote_tar_accepted());
+        assert!(state.accept_unsafe_remote_tar());
+        assert!(state.unsafe_remote_tar_accepted());
+
+        state.pull_url = "https://example.test/other.tar".into();
+        assert!(!state.unsafe_remote_tar_accepted());
+
+        state.pull_url = "https://example.test/rootfs.tar".into();
+        state.is_pull_raw = true;
+        assert!(!state.unsafe_remote_tar_accepted());
+    }
+
+    #[test]
     fn oci_source_preserves_systemd_storage_mode() {
         let mut state = test_source_state();
         state.kind = SourceKind::Oci;
@@ -835,6 +897,7 @@ mod tests {
             SourceConfig::Oci {
                 reference: "docker.io/library/nginx:latest".into(),
                 read_only: true,
+                network: OciNetworkMode::Host,
             }
         );
     }

@@ -17,6 +17,33 @@ use std::path::{Path, PathBuf};
 
 const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024;
 
+/// Read the leader PID from machined's registration for a validated machine.
+/// The same bounded, no-symlink parser used by CLI inspection protects this
+/// value before it is used as a namespace target.
+pub(crate) fn leader_pid(name: &MachineName) -> std::io::Result<u32> {
+    leader_pid_at(
+        &crate::paths::runtime_machine_state(name.as_str()),
+        name.as_str(),
+    )
+}
+
+pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result<u32> {
+    let fields = read_runtime_state(path, expected_name)?;
+    let value = fields.get("LEADER").ok_or_else(|| {
+        std::io::Error::new(ErrorKind::InvalidData, "runtime state has no LEADER field")
+    })?;
+    let pid = value.parse::<u32>().map_err(|_| {
+        std::io::Error::new(ErrorKind::InvalidData, "runtime state LEADER is not a PID")
+    })?;
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "runtime state LEADER is outside the Linux PID range",
+        ));
+    }
+    Ok(pid)
+}
+
 /// Enumerate runtime registrations without asking machined to inspect the
 /// containers. This mirrors `sd_get_machine_names()` at the public API level:
 /// names come from the runtime directory, while `unit:` helper symlinks and
@@ -360,6 +387,19 @@ mod tests {
             Some("/var/lib/machines/test machine")
         );
         assert_eq!(machine_value(&properties, "IPAddresses"), Some("10.0.0.2"));
+    }
+
+    #[test]
+    fn leader_pid_uses_the_validated_runtime_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-machine");
+        std::fs::write(&path, "NAME=test-machine\nLEADER=4242\n").unwrap();
+
+        assert_eq!(leader_pid_at(&path, "test-machine").unwrap(), 4242);
+        assert!(leader_pid_at(&path, "another-machine").is_err());
+
+        std::fs::write(&path, "NAME=test-machine\nLEADER=0\n").unwrap();
+        assert!(leader_pid_at(&path, "test-machine").is_err());
     }
 
     #[tokio::test]

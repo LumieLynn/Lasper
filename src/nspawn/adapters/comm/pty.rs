@@ -7,9 +7,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+#[derive(Debug)]
 pub enum PtyMessage {
     Data(Vec<u8>),
+    Reply(Vec<u8>),
     Resize { cols: u16, rows: u16 },
+}
+
+/// Forward terminal replies through the single PTY writer owner.
+///
+/// A reader can discover a CPR/DA response while parsing output, but the
+/// portable-pty master does not expose a second writer.  Blocking here keeps
+/// replies ordered and applies backpressure instead of silently dropping them.
+fn forward_vt_replies(
+    events: Vec<crate::term::screen::VtEvent>,
+    tx: &mpsc::Sender<PtyMessage>,
+) -> bool {
+    for event in events {
+        let crate::term::screen::VtEvent::Reply(reply) = event else {
+            continue;
+        };
+        if tx
+            .blocking_send(PtyMessage::Reply(reply.as_bytes().to_vec()))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Coalesces terminal output notifications while one redraw is queued.
@@ -112,6 +137,24 @@ pub fn spawn_terminal(
     TerminalHandle,
     ResizeState,
 )> {
+    let mut command = CommandBuilder::new(cmd_name);
+    command.args(args);
+    spawn_terminal_command(command, cols, rows, app_tx, redraw_gate)
+}
+
+#[allow(clippy::type_complexity)]
+pub fn spawn_terminal_command(
+    command: CommandBuilder,
+    cols: u16,
+    rows: u16,
+    app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
+    redraw_gate: RedrawGate,
+) -> Result<(
+    Arc<Mutex<crate::term::Parser>>,
+    mpsc::Sender<PtyMessage>,
+    TerminalHandle,
+    ResizeState,
+)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
         rows,
@@ -120,10 +163,7 @@ pub fn spawn_terminal(
         pixel_height: 0,
     })?;
 
-    let mut cmd = CommandBuilder::new(cmd_name);
-    cmd.args(args);
-
-    let child = pair.slave.spawn_command(cmd)?;
+    let child = pair.slave.spawn_command(command)?;
 
     // Master handles
     let mut reader = pair.master.try_clone_reader()?;
@@ -138,6 +178,7 @@ pub fn spawn_terminal(
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
     let redraw_gate_clone = redraw_gate.clone();
+    let reply_tx = pty_tx.clone();
 
     // Reading thread
     let reader_handle = tokio::task::spawn_blocking(move || {
@@ -146,10 +187,14 @@ pub fn spawn_terminal(
             if n == 0 {
                 break;
             }
-            {
+            let events = {
                 let mut p = parser_clone.lock();
                 let mut events = Vec::new();
                 p.screen.process(&buf[..n], &mut events);
+                events
+            };
+            if !forward_vt_replies(events, &reply_tx) {
+                break;
             }
             redraw_gate_clone.notify(&app_tx_clone);
         }
@@ -163,7 +208,7 @@ pub fn spawn_terminal(
     let writer_handle = tokio::task::spawn_blocking(move || {
         while let Some(msg) = pty_rx.blocking_recv() {
             match msg {
-                PtyMessage::Data(bytes) => {
+                PtyMessage::Data(bytes) | PtyMessage::Reply(bytes) => {
                     let _ = writer.write_all(&bytes);
                     let _ = writer.flush();
                 }
@@ -238,6 +283,7 @@ pub fn spawn_terminal_with_fd(
     let parser_clone = parser.clone();
     let app_tx_clone = app_tx.clone();
     let redraw_gate_clone = redraw_gate.clone();
+    let reply_tx = pty_tx.clone();
 
     // Reading thread
     let reader_handle = tokio::task::spawn_blocking(move || {
@@ -246,9 +292,15 @@ pub fn spawn_terminal_with_fd(
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut p = parser_clone.lock();
-                    let mut events = Vec::new();
-                    p.screen.process(&buf[..n], &mut events);
+                    let events = {
+                        let mut p = parser_clone.lock();
+                        let mut events = Vec::new();
+                        p.screen.process(&buf[..n], &mut events);
+                        events
+                    };
+                    if !forward_vt_replies(events, &reply_tx) {
+                        break;
+                    }
                     redraw_gate_clone.notify(&app_tx_clone);
                 }
                 Err(_) => break,
@@ -264,7 +316,7 @@ pub fn spawn_terminal_with_fd(
     let writer_handle = tokio::task::spawn_blocking(move || {
         while let Some(msg) = pty_rx.blocking_recv() {
             match msg {
-                PtyMessage::Data(bytes) => {
+                PtyMessage::Data(bytes) | PtyMessage::Reply(bytes) => {
                     let _ = writer.write_all(&bytes);
                     let _ = writer.flush();
                 }
@@ -305,7 +357,7 @@ pub fn spawn_terminal_with_fd(
 
 #[cfg(test)]
 mod tests {
-    use super::RedrawGate;
+    use super::{forward_vt_replies, PtyMessage, RedrawGate};
     use crate::events::AppEvent;
 
     #[test]
@@ -321,5 +373,20 @@ mod tests {
         gate.clear();
         gate.notify(&tx);
         assert!(matches!(rx.try_recv(), Ok(AppEvent::TerminalRedraw)));
+    }
+
+    #[test]
+    fn vt_replies_are_forwarded_to_the_writer_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let events = vec![
+            crate::term::screen::VtEvent::Bell,
+            crate::term::screen::VtEvent::Reply("\x1b[1;1R".into()),
+        ];
+
+        assert!(forward_vt_replies(events, &tx));
+        match rx.try_recv() {
+            Ok(PtyMessage::Reply(bytes)) => assert_eq!(bytes, b"\x1b[1;1R"),
+            other => panic!("unexpected PTY message: {other:?}"),
+        }
     }
 }

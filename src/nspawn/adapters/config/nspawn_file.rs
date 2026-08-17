@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode};
-use ini::Ini;
+use ini::{EscapePolicy, Ini};
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
@@ -8,6 +9,21 @@ pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
 }
 
 pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
+    let fields = parse_nspawn_bind_fields(value)?;
+    let source = fields.first()?.trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let destination = fields
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source)
+        .to_string();
+    Some((source, destination))
+}
+
+fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
     let mut fields = vec![String::new()];
     let mut chars = value.chars().peekable();
     while let Some(character) = chars.next() {
@@ -23,9 +39,65 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
         }
     }
 
-    let source = fields.first()?.clone();
-    let destination = fields.get(1).cloned().unwrap_or_else(|| source.clone());
-    Some((source, destination))
+    Some(fields)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct NspawnBindSemantics {
+    source: String,
+    destination: String,
+    readonly: bool,
+    options: Vec<String>,
+}
+
+impl NspawnBindSemantics {
+    fn from_passthrough(bind: &crate::nspawn::platform::nvidia::state::PassthroughBind) -> Self {
+        Self {
+            source: bind.host_path.clone(),
+            destination: bind.container_path.clone(),
+            readonly: bind.readonly,
+            options: Vec::new(),
+        }
+    }
+}
+
+fn parse_nspawn_bind_line(line: &str) -> Option<NspawnBindSemantics> {
+    let (key, value) = line.trim().split_once('=')?;
+    let readonly = match key.trim() {
+        "Bind" => false,
+        "BindReadOnly" => true,
+        _ => return None,
+    };
+    let fields = parse_nspawn_bind_fields(value.trim())?;
+    if fields.is_empty() || fields.len() > 3 {
+        return None;
+    }
+
+    let source = fields[0].trim().to_string();
+    if source.is_empty() {
+        return None;
+    }
+    let destination = fields
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&source)
+        .to_string();
+    let options = fields
+        .get(2)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|option| !option.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    Some(NspawnBindSemantics {
+        source,
+        destination,
+        readonly,
+        options,
+    })
 }
 
 /// Raw content of a `.nspawn` file and the path it was read from.
@@ -128,46 +200,60 @@ impl NspawnConfig {
     pub fn apply_gpu_passthrough_to_content(
         content: String,
         new_state: &crate::nspawn::platform::nvidia::NvidiaState,
-        _death_list: &[String],
+        removed_binds: &[crate::nspawn::platform::nvidia::state::PassthroughBind],
     ) -> Result<String> {
         // 1. Purge existing block using markers (preserves everything else)
         let (clean_content, _extracted_deaths) = Self::purge_nvidia_block(&content)?;
 
-        // 2. Read-only INI parse for legacy dedup detection
-        let mut lines_to_remove: Vec<String> = Vec::new();
-        if let Ok(conf) = Ini::load_from_str(&clean_content) {
-            if let Some(files_section) = conf.section(Some("Files")) {
-                for (key, value) in files_section.iter() {
-                    let Some((host_path, container_path)) = parse_nspawn_bind_paths(value) else {
+        // 2. Remove only complete semantic duplicates from marker-external
+        // configuration. A destination collision with different semantics is
+        // administrator-owned content and must stop the update unchanged.
+        let new_binds = new_state
+            .binds
+            .iter()
+            .map(NspawnBindSemantics::from_passthrough)
+            .collect::<HashSet<_>>();
+        let removed_binds = removed_binds
+            .iter()
+            .map(NspawnBindSemantics::from_passthrough)
+            .collect::<HashSet<_>>();
+        let new_destinations = new_binds
+            .iter()
+            .map(|bind| bind.destination.clone())
+            .collect::<HashSet<_>>();
+        let mut conflicts = BTreeSet::new();
+        let mut result_lines = Vec::new();
+        let mut in_files = false;
+
+        for line in clean_content.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_files = trimmed.eq_ignore_ascii_case("[files]");
+                result_lines.push(line.to_string());
+                continue;
+            }
+
+            if in_files {
+                if let Some(bind) = parse_nspawn_bind_line(line) {
+                    if new_binds.contains(&bind) || removed_binds.contains(&bind) {
                         continue;
-                    };
-
-                    let is_in_binds = new_state
-                        .binds
-                        .iter()
-                        .any(|b| b.host_path == host_path || b.container_path == container_path);
-
-                    if (key == "Bind" || key == "BindReadOnly") && is_in_binds {
-                        if key == "Bind" {
-                            lines_to_remove.push(format!("Bind={}", value));
-                        } else {
-                            lines_to_remove.push(format!("BindReadOnly={}", value));
-                        }
+                    }
+                    if new_destinations.contains(&bind.destination) {
+                        conflicts.insert(bind.destination);
                     }
                 }
             }
+            result_lines.push(line.to_string());
         }
 
-        // 3. Line-level dedup (preserves everything else including comments)
-        let mut result_lines: Vec<String> = clean_content.lines().map(|l| l.to_string()).collect();
-        if !lines_to_remove.is_empty() {
-            result_lines.retain(|line| {
-                let trimmed = line.trim();
-                !lines_to_remove.iter().any(|dup| trimmed == dup)
-            });
+        if !conflicts.is_empty() {
+            return Err(NspawnError::InvalidConfig(format!(
+                "NVIDIA bind conflicts with administrator-owned entries at container path(s): {}",
+                conflicts.into_iter().collect::<Vec<_>>().join(", ")
+            )));
         }
 
-        // 4. Build the new managed block from unified PassthroughBind list
+        // 3. Build the new managed block from unified PassthroughBind list
         if !new_state.binds.is_empty() {
             let mut block = Vec::new();
             block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
@@ -188,7 +274,7 @@ impl NspawnConfig {
             }
             block.push("X-Lasper-Nvidia-End=true".to_string());
 
-            // 5. Find [Files] section and insert block at its end
+            // 4. Find [Files] section and insert block at its end
             let files_idx = result_lines
                 .iter()
                 .position(|l| l.trim().eq_ignore_ascii_case("[files]"));
@@ -240,6 +326,21 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     xdg_runtime: Option<&str>,
     verified_wayland_socket: Option<&Path>,
 ) -> Result<String> {
+    let verified_x11_directory = verified_bind_directory(Path::new("/tmp/.X11-unix"));
+    nspawn_config_content_from_spec_with_host_paths(
+        spec,
+        xdg_runtime,
+        verified_wayland_socket,
+        verified_x11_directory,
+    )
+}
+
+fn nspawn_config_content_from_spec_with_host_paths(
+    spec: &NspawnConfigSpec,
+    xdg_runtime: Option<&str>,
+    verified_wayland_socket: Option<&Path>,
+    verified_x11_directory: Option<&Path>,
+) -> Result<String> {
     spec.validate()?;
     let mut conf = Ini::new();
 
@@ -254,6 +355,10 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
 
         if let Some(mode) = spec.private_users {
             exec.set("PrivateUsers", mode.as_str());
+        }
+
+        if let Some(mode) = spec.resolv_conf {
+            exec.set("ResolvConf", mode.as_str());
         }
 
         if spec.privileged {
@@ -325,8 +430,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         || !spec.bind_mounts.is_empty()
         || spec.wayland_socket.is_some()
         || spec.graphics_acceleration
-        || spec.nvidia_gpu
-        || matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host));
+        || spec.nvidia_gpu;
 
     if has_files {
         conf.with_section(Some("Files")).set("__ensure_files", "");
@@ -337,19 +441,18 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
         }
 
         for dev in &spec.device_binds {
-            files.append("Bind", dev.clone());
+            files.append("Bind", escape_nspawn_bind_path(dev));
         }
         for ro in &spec.readonly_binds {
-            files.append("BindReadOnly", ro.clone());
+            files.append("BindReadOnly", escape_nspawn_bind_path(ro));
         }
         for bm in &spec.bind_mounts {
+            let source = escape_nspawn_bind_path(&bm.source);
+            let target = escape_nspawn_bind_path(&bm.target);
             if bm.readonly {
-                files.append(
-                    "BindReadOnly",
-                    format!("{}:{}{}", bm.source, bm.target, bm.suffix),
-                );
+                files.append("BindReadOnly", format!("{source}:{target}{}", bm.suffix));
             } else {
-                files.append("Bind", format!("{}:{}{}", bm.source, bm.target, bm.suffix));
+                files.append("Bind", format!("{source}:{target}{}", bm.suffix));
             }
         }
 
@@ -359,26 +462,24 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
             ":idmap"
         };
 
-        if matches!(spec.network, Some(crate::nspawn::models::NetworkMode::Host)) {
-            files.append(
-                "BindReadOnly",
-                format!("/etc/resolv.conf:/etc/resolv.conf{}", suffix),
-            );
-        }
-
         if let Some(socket_name) = &spec.wayland_socket {
             let socket_path = verified_wayland_socket
                 .map(PathBuf::from)
                 .or_else(|| xdg_runtime.map(|runtime| PathBuf::from(runtime).join(socket_name)));
             if let Some(socket_path) = socket_path {
                 let socket_path = validated_nspawn_path("Wayland socket path", &socket_path)?;
+                let socket_path = escape_nspawn_bind_path(socket_path);
                 files.append("Bind", format!("{socket_path}:/mnt/wayland-socket{suffix}"));
             }
 
-            files.append(
-                "BindReadOnly",
-                format!("/tmp/.X11-unix:/mnt/host-x11{}", suffix),
-            );
+            if let Some(x11_directory) = verified_x11_directory {
+                let x11_directory = validated_nspawn_path("X11 socket directory", x11_directory)?;
+                let x11_directory = escape_nspawn_bind_path(x11_directory);
+                files.append(
+                    "BindReadOnly",
+                    format!("{x11_directory}:/mnt/host-x11{suffix}"),
+                );
+            }
 
             if std::path::Path::new("/dev/dri").exists() {
                 files.append("Bind", "/dev/dri");
@@ -390,9 +491,16 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     }
 
     let mut buffer = Vec::new();
-    conf.write_to(&mut buffer)
+    // Values have already been validated and systemd-specific bind escaping has
+    // already been applied. Generic INI escaping would double those backslashes.
+    conf.write_to_policy(&mut buffer, EscapePolicy::Nothing)
         .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn verified_bind_directory(path: &Path) -> Option<&Path> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(path)
 }
 
 fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
@@ -588,7 +696,8 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=no"));
-        assert!(content.contains("BindReadOnly=/etc/resolv.conf:/etc/resolv.conf"));
+        assert!(content.contains("ResolvConf=bind-host"));
+        assert!(!content.contains("BindReadOnly=/etc/resolv.conf"));
     }
 
     #[test]
@@ -612,6 +721,7 @@ mod tests {
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("VirtualEthernet=yes"));
+        assert!(content.contains("ResolvConf=off"));
         assert!(content.contains("Port=tcp:8080:80"));
         assert!(content.contains("Port=tcp:4443:443"));
     }
@@ -642,7 +752,7 @@ mod tests {
     fn test_nspawn_config_content_private_users_explicit_no() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("no".into()),
+            private_users: Some(PrivateUsersMode::No),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
@@ -653,7 +763,7 @@ mod tests {
     fn test_nspawn_config_content_private_users_explicit_yes() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("yes".into()),
+            private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
@@ -664,11 +774,34 @@ mod tests {
     fn test_nspawn_config_content_private_users_pick() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            private_users: Some("pick".into()),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
         let content = nspawn_config_content(&cfg, None).unwrap();
         assert!(content.contains("PrivateUsers=pick"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_managed() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            network: Some(crate::nspawn::models::NetworkMode::None),
+            private_users: Some(PrivateUsersMode::Managed),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=managed"));
+    }
+
+    #[test]
+    fn test_nspawn_config_content_private_users_identity() {
+        let cfg = ContainerConfig {
+            name: "test".to_string(),
+            private_users: Some(PrivateUsersMode::Identity),
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(content.contains("PrivateUsers=identity"));
     }
 
     #[test]
@@ -760,6 +893,76 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_binds_escape_colons_and_backslashes() {
+        use crate::nspawn::models::{BindMount, IdmapSuffix};
+
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            device_binds: vec![r"/dev/dri/by-path/pci-0000:01:00.0-card".into()],
+            readonly_binds: vec![r"/srv/driver\archive:current".into()],
+            bind_mounts: vec![BindMount {
+                source: r"/srv/source:one\two".into(),
+                target: r"/mnt/target:one\two".into(),
+                readonly: true,
+                suffix: IdmapSuffix::Noidmap,
+            }],
+            ..Default::default()
+        };
+
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert!(
+            content.contains(r"Bind=/dev/dri/by-path/pci-0000\:01\:00.0-card"),
+            "{content}"
+        );
+        assert!(
+            content.contains(r"BindReadOnly=/srv/driver\\archive\:current"),
+            "{content}"
+        );
+        assert!(
+            content.contains(r"BindReadOnly=/srv/source\:one\\two:/mnt/target\:one\\two:noidmap"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn wayland_x11_bind_requires_a_verified_directory() {
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            wayland_socket: Some("wayland-0".into()),
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&cfg).unwrap();
+        let runtime = Path::new("/run/user/1000/wayland-0");
+        let x11 = Path::new("/tmp/.X11-unix");
+
+        let without_x11 =
+            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), None)
+                .unwrap();
+        assert!(!without_x11.contains("/mnt/host-x11"));
+
+        let with_x11 =
+            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), Some(x11))
+                .unwrap();
+        assert!(with_x11.contains("BindReadOnly=/tmp/.X11-unix:/mnt/host-x11:idmap"));
+    }
+
+    #[test]
+    fn x11_source_verification_rejects_files_and_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("x11");
+        std::fs::create_dir(&source).unwrap();
+        assert_eq!(verified_bind_directory(&source), Some(source.as_path()));
+
+        let file = directory.path().join("file");
+        std::fs::write(&file, b"not a directory").unwrap();
+        assert!(verified_bind_directory(&file).is_none());
+
+        let symlink = directory.path().join("link");
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        assert!(verified_bind_directory(&symlink).is_none());
+    }
+
+    #[test]
     fn test_apply_gpu_appends_to_existing_files_section() {
         use crate::nspawn::platform::nvidia::state::PassthroughBind;
 
@@ -823,6 +1026,75 @@ mod tests {
             "Legacy duplicate should be removed, got:\n{}",
             updated
         );
+    }
+
+    #[test]
+    fn gpu_update_preserves_same_source_at_another_destination() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content = "[Files]\nBind=/dev/nvidia0:/srv/user-device\n".to_string();
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
+        assert!(updated.contains("Bind=/dev/nvidia0:/srv/user-device"));
+        assert!(updated.contains("Bind=/dev/nvidia0"));
+    }
+
+    #[test]
+    fn gpu_update_rejects_marker_external_destination_conflicts() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content =
+            "[Files]\nBindReadOnly = /srv/user-lib:/usr/lib/libcuda.so:noidmap\n".to_string();
+        let new_state = crate::nspawn::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/host/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+
+        let error =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap_err();
+        assert!(error.to_string().contains("/usr/lib/libcuda.so"));
+        assert!(error.to_string().contains("administrator-owned"));
+    }
+
+    #[test]
+    fn gpu_update_removes_only_exact_legacy_state_binds() {
+        use crate::nspawn::platform::nvidia::state::PassthroughBind;
+
+        let content = concat!(
+            "[Files]\n",
+            "BindReadOnly = /old/libcuda.so:/usr/lib/old-libcuda.so\n",
+            "BindReadOnly=/old/libcuda.so:/usr/lib/old-libcuda.so:noidmap\n",
+            "Bind=/user/source:/usr/lib/old-libcuda.so\n",
+        )
+        .to_string();
+        let removed = vec![PassthroughBind {
+            host_path: "/old/libcuda.so".into(),
+            container_path: "/usr/lib/old-libcuda.so".into(),
+            readonly: true,
+        }];
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(
+            content,
+            &crate::nspawn::platform::nvidia::NvidiaState::default(),
+            &removed,
+        )
+        .unwrap();
+        assert!(!updated.contains("BindReadOnly = /old/libcuda.so:/usr/lib/old-libcuda.so\n"));
+        assert!(updated.contains("BindReadOnly=/old/libcuda.so:/usr/lib/old-libcuda.so:noidmap"));
+        assert!(updated.contains("Bind=/user/source:/usr/lib/old-libcuda.so"));
     }
 
     #[test]

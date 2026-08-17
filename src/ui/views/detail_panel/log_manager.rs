@@ -3,11 +3,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+const LOG_STREAM_CHANNEL_CAPACITY: usize = 1024;
+
 pub struct LogBuffer {
     pub lines: VecDeque<String>,
     pub dirty: bool,
     pub stream: Option<tokio::task::JoinHandle<()>>,
-    pub log_rx: Option<mpsc::UnboundedReceiver<String>>,
+    pub log_rx: Option<mpsc::Receiver<String>>,
     /// Set by the spawned log-stream task when it hits a non-recoverable
     /// error (e.g. permission denied).  Checked by [`LogManager::start_stream`]
     /// to avoid restart loops.
@@ -80,10 +82,7 @@ impl LogManager {
     /// Create a channel for `name` and return the sender half together with
     /// a fatal flag.  The spawned log-stream task sets the flag on
     /// non-recoverable errors so we avoid restart loops.
-    pub fn start_stream(
-        &mut self,
-        name: &str,
-    ) -> Option<(mpsc::UnboundedSender<String>, Arc<AtomicBool>)> {
+    pub fn start_stream(&mut self, name: &str) -> Option<(mpsc::Sender<String>, Arc<AtomicBool>)> {
         let buf = self.buffers.get_mut(name)?;
         if buf
             .stream
@@ -97,7 +96,9 @@ impl LogManager {
             return None; // previous attempt failed permanently
         }
         buf.stream_failed = false;
-        let (tx, rx) = mpsc::unbounded_channel();
+        // A full channel applies backpressure to journalctl instead of
+        // allowing a log burst to grow memory without bound.
+        let (tx, rx) = mpsc::channel(LOG_STREAM_CHANNEL_CAPACITY);
         let fatal = Arc::new(AtomicBool::new(false));
         buf.fatal_flag = Some(Arc::clone(&fatal));
         buf.log_rx = Some(rx);
@@ -195,5 +196,42 @@ impl LogManager {
         }
         self.buffers.clear();
         self.active_name = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LogManager, LOG_STREAM_CHANNEL_CAPACITY};
+    use tokio::sync::mpsc::error::TrySendError;
+
+    #[test]
+    fn log_stream_channel_is_bounded() {
+        let mut manager = LogManager::new(5000);
+        manager.get_or_create("machine");
+        let (tx, _) = manager.start_stream("machine").expect("stream channel");
+
+        for _ in 0..LOG_STREAM_CHANNEL_CAPACITY {
+            tx.try_send("line".to_string()).expect("channel capacity");
+        }
+        assert!(matches!(
+            tx.try_send("overflow".to_string()),
+            Err(TrySendError::Full(_))
+        ));
+    }
+
+    #[test]
+    fn draining_log_stream_preserves_line_cap() {
+        let mut manager = LogManager::new(2);
+        manager.get_or_create("machine");
+        let (tx, _) = manager.start_stream("machine").expect("stream channel");
+        for line in ["one", "two", "three"] {
+            tx.try_send(line.to_string()).expect("channel capacity");
+        }
+
+        manager.drain_all();
+        let buffer = manager.active_buffer().expect("buffer");
+        assert_eq!(buffer.lines.len(), 2);
+        assert_eq!(buffer.lines.front().map(String::as_str), Some("two"));
+        assert_eq!(buffer.lines.back().map(String::as_str), Some("three"));
     }
 }

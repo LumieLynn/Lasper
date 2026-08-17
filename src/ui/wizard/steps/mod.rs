@@ -34,7 +34,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         WizardStep::Source => Box::new(source_view::SourceStepView::new(&context.source)),
 
         WizardStep::CopySelect => Box::new(copy_select_view::CopySelectStepView::new(
-            &context.entries,
+            &context.images,
             context.source.copy_idx,
         )),
 
@@ -87,6 +87,9 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
                 rx,
                 context.deploy.done.clone(),
                 context.deploy.success.clone(),
+                context.deploy.cancelled.clone(),
+                context.deploy.rolling_back.clone(),
+                context.deploy.cancellation.clone(),
             ))
         }
     }

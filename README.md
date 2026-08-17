@@ -9,7 +9,7 @@ Lasper is currently alpha software. It is suitable for testing and personal work
 ## Features
 
 - **Machine and Image Management**: Running machines and persistent systemd images are shown as separate resources. Start images, control machine lifecycles, and inspect properties, journal logs, and image metadata without treating cached backing layers as stopped containers.
-- **Integrated Terminal**: Seamlessly jump into container shells via `machinectl login`. Features a modal interface (Normal/Insert modes) for easy scrolling and multi-session management without leaving the dashboard.
+- **Integrated Terminal**: Open multi-session container terminals through native `machinectl login`, with a typed `nsenter` fallback for running containers that do not provide a system bus.
 - **Creation Wizard**: Interactively generate `.nspawn` configurations and run provisioning tasks.
 - **Image Provisioning**:
   - Pull OCI registry images through systemd 260+'s `importctl pull-oci` as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
@@ -20,12 +20,14 @@ Lasper is currently alpha software. It is suitable for testing and personal work
 ## Prerequisites
 
 - `systemd-container` (provides `machinectl` and `systemd-nspawn`)
+- `util-linux` (provides `nsenter` for terminal attachment to containers without a system bus)
 - Permission to perform privileged container operations. The recommended mode
   is `lasper -e`: the TUI stays unprivileged and starts a separate root daemon
   through `sudo`. Running the entire TUI with `sudo lasper` remains supported
   for compatibility but has a larger root attack surface.
 - *Optional*: systemd 260+ (for OCI application images via `importctl pull-oci`)
 - *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
+- *Optional*: GNU tar 1.35+ (recommended for Tar rootfs imports; older versions remain usable with a security warning)
 - *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
 
 ## ⚠️ Before You Begin – Must Read
@@ -64,7 +66,7 @@ Pass `--version` or `--help` for version info and usage.
 
 You can add a container via the creation wizard. Tap `a` or `n` to open the wizard.
 
-You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user_name>@<container_name>`. Containers intended to boot through `machinectl` need an init system and a working system bus inside the root filesystem.
+You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user_name>@<container_name>`. Containers with a working system bus use `machinectl login`; when Lasper runs as root or with `lasper -e`, a running container without that bus can instead receive a fixed `nsenter` shell through its machined leader PID.
 
 **Keybindings:**
 - `j` / `k` or `↓` / `↑` : Navigate
@@ -91,17 +93,17 @@ The next stable milestone is `0.3.0`. The release is not defined by adding more 
 
 Before `0.3.0` stable, the project should:
 
-- continue migrating elevated-daemon authority from generic command/path RPCs to typed operations;
+- decompose the largest daemon, provisioning, and UI modules into readable ownership boundaries without widening the typed privilege interface;
 - keep the systemd-native OCI application provider clearly experimental; it does not turn arbitrary OCI images into bootable system containers;
 - preserve unknown `.nspawn` settings instead of rewriting files from only the fields Lasper understands;
 - make long-running provisioning and image operations observable and recoverable enough for normal use;
-- fail closed on unsafe storage/image conflicts instead of overwriting host resources.
+- retain fail-closed storage and image conflict behavior while expanding smoke coverage across representative systemd hosts.
 
 Feature work that requires general-purpose root hooks or arbitrary daemon commands is intentionally deferred.
 
 ## Credits
 
-The terminal emulator in `src/term/` is ported from [mprocs](https://github.com/pvolok/mprocs) by Pavel Volokitin (MIT license).
+The terminal emulator in `src/term/` is ported from [dekit (formerly mprocs)](https://github.com/pvolok/dekit) by Pavel Volokitin. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for its MIT license.
 
 ## License
 

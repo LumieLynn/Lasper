@@ -6,9 +6,41 @@ use crate::nspawn::models::{
 };
 use crate::nspawn::ops::SystemOperationStore;
 use crate::nspawn::sys::CommandRunner;
+use serde::Deserialize;
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Deserialize)]
+struct MachinectlImageRow {
+    name: String,
+    #[serde(rename = "type")]
+    image_type: String,
+    ro: bool,
+    usage: Option<u64>,
+}
+
+fn parse_list_images_json(output: &[u8]) -> Result<Vec<ImageEntry>> {
+    let rows: Vec<MachinectlImageRow> = serde_json::from_slice(output).map_err(|error| {
+        NspawnError::Runtime(format!(
+            "failed to parse machinectl list-images JSON output: {error}"
+        ))
+    })?;
+    let mut images = rows
+        .into_iter()
+        .map(|row| ImageEntry {
+            name: row.name,
+            image_type: row.image_type,
+            readonly: row.ro,
+            usage: row
+                .usage
+                .map(crate::nspawn::adapters::comm::formatting::format_size),
+            dbus_object_path: None,
+        })
+        .collect::<Vec<_>>();
+    images.sort();
+    Ok(images)
+}
 
 fn snapshot_update(
     previous: &mut Option<RuntimeSnapshot>,
@@ -100,8 +132,7 @@ impl ContainerBackend for CliBackend {
                 "machinectl",
                 vec![
                     "--no-ask-password".to_string(),
-                    "-l".to_string(),
-                    "--no-legend".to_string(),
+                    "--output=json".to_string(),
                     "--no-pager".to_string(),
                     "--all".to_string(),
                     "--".to_string(),
@@ -114,28 +145,12 @@ impl ContainerBackend for CliBackend {
         if !out.status.success() {
             return Err(NspawnError::cmd_failed(
                 "machinectl list-images",
-                "machinectl --no-ask-password -l --no-legend --no-pager --all -- list-images",
+                "machinectl --no-ask-password --output=json --no-pager --all -- list-images",
                 &out,
             ));
         }
 
-        let mut images = Vec::new();
-        for line in String::from_utf8_lossy(&out.stdout).lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() < 3 {
-                continue;
-            }
-            let name = parts[0].to_string();
-            images.push(ImageEntry {
-                name,
-                image_type: parts[1].to_string(),
-                readonly: parts[2] == "yes",
-                usage: parts.get(3).map(|s| s.to_string()),
-                dbus_object_path: None,
-            });
-        }
-        images.sort();
-        Ok(images)
+        parse_list_images_json(&out.stdout)
     }
 
     async fn start(&self, name: &str) -> Result<()> {
@@ -265,37 +280,7 @@ pub(crate) async fn get_properties_with_runner(
         }
     }
 
-    let system_out = cmd_runner
-        .run(
-            "systemctl",
-            vec![
-                "--no-ask-password".to_string(),
-                "--".to_string(),
-                "show".to_string(),
-                name.systemd_nspawn_unit(),
-            ],
-        )
-        .await;
-
-    if let Ok(out) = system_out {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    let key = k.trim();
-                    let val = v.trim();
-                    let formatted = crate::nspawn::adapters::comm::formatting::format_property(
-                        key,
-                        &zbus::zvariant::Value::Str(val.into()),
-                    );
-                    crate::nspawn::adapters::comm::formatting::insert_systemd_property(
-                        &mut props,
-                        key.to_string(),
-                        formatted,
-                    );
-                }
-            }
-        }
-    }
+    let _ = append_systemd_unit_properties(&name, cmd_runner, &mut props).await;
 
     if props.groups.is_empty() {
         return Err(NspawnError::CommandFailed(
@@ -306,6 +291,78 @@ pub(crate) async fn get_properties_with_runner(
     }
 
     Ok(props)
+}
+
+/// Inspect only the systemd-nspawn unit associated with an image.
+///
+/// Image names follow filesystem component rules and are broader than machine
+/// names. `None` means the image cannot have a corresponding nspawn machine
+/// unit; command or systemd failures remain errors.
+pub(crate) async fn get_image_unit_properties_with_runner(
+    name: &str,
+    cmd_runner: &dyn CommandRunner,
+) -> Result<Option<MachineProperties>> {
+    let Ok(name) = MachineName::new(name) else {
+        return Ok(None);
+    };
+    let mut props =
+        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    append_systemd_unit_properties(&name, cmd_runner, &mut props).await?;
+    Ok(Some(props))
+}
+
+async fn append_systemd_unit_properties(
+    name: &MachineName,
+    cmd_runner: &dyn CommandRunner,
+    props: &mut MachineProperties,
+) -> Result<()> {
+    let unit = name.systemd_nspawn_unit();
+    let args = vec![
+        "--no-ask-password".to_string(),
+        "--".to_string(),
+        "show".to_string(),
+        unit.clone(),
+    ];
+    let system_out = cmd_runner
+        .run("systemctl", args.clone())
+        .await
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("systemctl"), error))?;
+
+    if !system_out.status.success() {
+        return Err(NspawnError::cmd_failed(
+            format!("systemctl show {unit}"),
+            format!("systemctl {}", args.join(" ")),
+            &system_out,
+        ));
+    }
+
+    let mut inserted = 0usize;
+    for line in String::from_utf8_lossy(&system_out.stdout).lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            let key = k.trim();
+            let val = v.trim();
+            let formatted = crate::nspawn::adapters::comm::formatting::format_property(
+                key,
+                &zbus::zvariant::Value::Str(val.into()),
+            );
+            crate::nspawn::adapters::comm::formatting::insert_systemd_property(
+                props,
+                key.to_string(),
+                formatted,
+            );
+            inserted = inserted.saturating_add(1);
+        }
+    }
+
+    if inserted == 0 {
+        return Err(NspawnError::CommandFailed(
+            format!("systemctl show {unit}"),
+            format!("systemctl {}", args.join(" ")),
+            "No properties found".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
@@ -399,22 +456,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_images_preserves_names_used_for_hidden_visibility() {
+    async fn list_images_preserves_systemd_image_names() {
         let runner = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
             r.expect_run()
                 .withf(|program, args| {
                     program == "machinectl"
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
-                        && args.get(5).is_some_and(|arg| arg == "--")
-                        && args.get(6).is_some_and(|arg| arg == "list-images")
+                        && args.get(1).is_some_and(|arg| arg == "--output=json")
+                        && args.get(4).is_some_and(|arg| arg == "--")
+                        && args.get(5).is_some_and(|arg| arg == "list-images")
                 })
                 .returning(|_, _| {
                     Ok(mock_output(
                         true,
-                        ".host subvolume yes 1G /\n\
-                     .oci-sha256:abc subvolume yes 10M /var/lib/machines/.oci-sha256:abc\n\
-                     ubuntu mstack no 20M /var/lib/machines/ubuntu.mstack\n",
+                        r#"[
+                            {"name":".host","type":"subvolume","ro":true,"usage":null,"created":null,"modified":null},
+                            {"name":".oci-sha256:abc","type":"subvolume","ro":true,"usage":10485760,"created":0,"modified":0},
+                            {"name":"Ubuntu Resolute 镜像","type":"directory","ro":false,"usage":20971520,"created":0,"modified":0},
+                            {"name":" edge spaced ","type":"raw","ro":false,"usage":0,"created":0,"modified":0}
+                        ]"#,
                         "",
                     ))
                 });
@@ -424,7 +485,7 @@ mod tests {
 
         let images = provider.list_images().await.unwrap();
 
-        assert_eq!(images.len(), 3);
+        assert_eq!(images.len(), 4);
         assert!(
             images
                 .iter()
@@ -432,9 +493,30 @@ mod tests {
                     || image.is_hidden() == image.name.starts_with('.'))
         );
         assert!(images.iter().any(|image| image.name == ".host"));
-        let ubuntu = images.iter().find(|image| image.name == "ubuntu").unwrap();
+        let ubuntu = images
+            .iter()
+            .find(|image| image.name == "Ubuntu Resolute 镜像")
+            .unwrap();
         assert!(!ubuntu.is_hidden());
-        assert_eq!(ubuntu.image_type, "mstack");
+        assert_eq!(ubuntu.image_type, "directory");
+        assert_eq!(ubuntu.usage.as_deref(), Some("20.0M"));
+        assert!(images.iter().any(|image| image.name == " edge spaced "));
+        assert_eq!(
+            images
+                .iter()
+                .find(|image| image.name == ".host")
+                .and_then(|image| image.usage.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn list_images_rejects_non_json_output() {
+        let error = parse_list_images_json(b"ubuntu directory no 20M\n").unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("failed to parse machinectl list-images JSON output"));
     }
 
     #[tokio::test]
@@ -449,15 +531,20 @@ mod tests {
                         && args
                             == &[
                                 "--no-ask-password".to_string(),
-                                "-l".to_string(),
-                                "--no-legend".to_string(),
+                                "--output=json".to_string(),
                                 "--no-pager".to_string(),
                                 "--all".to_string(),
                                 "--".to_string(),
                                 "list-images".to_string(),
                             ]
                 })
-                .returning(|_, _| Ok(mock_output(true, "active directory no 20M\n", "")));
+                .returning(|_, _| {
+                    Ok(mock_output(
+                        true,
+                        r#"[{"name":"active","type":"directory","ro":false,"usage":20971520}]"#,
+                        "",
+                    ))
+                });
             runner
         });
         let runtime = tempfile::tempdir().unwrap();
@@ -525,6 +612,55 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[tokio::test]
+    async fn image_unit_inspection_runs_only_systemctl() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .times(1)
+            .withf(|program, args| {
+                program == "systemctl"
+                    && args
+                        == &[
+                            "--no-ask-password".to_string(),
+                            "--".to_string(),
+                            "show".to_string(),
+                            "systemd-nspawn@test-image.service".to_string(),
+                        ]
+            })
+            .returning(|_, _| {
+                Ok(mock_output(
+                    true,
+                    "ActiveState=inactive\nLoadState=loaded\n",
+                    "",
+                ))
+            });
+
+        let properties = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap()
+            .expect("valid machine name has a unit");
+
+        let systemd = properties.get_group("Systemd").unwrap();
+        assert_eq!(
+            systemd.get("ActiveState").map(String::as_str),
+            Some("inactive")
+        );
+        assert_eq!(systemd.get("LoadState").map(String::as_str), Some("loaded"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_skips_non_machine_image_names() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        let properties = get_image_unit_properties_with_runner("Ubuntu Resolute 镜像", &runner)
+            .await
+            .unwrap();
+
+        assert!(properties.is_none());
+    }
+
     // action methods
 
     #[tokio::test]
@@ -583,7 +719,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clone_rejects_invalid_machine_name_before_machinectl() {
+    async fn test_clone_rejects_invalid_image_name_before_machinectl() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
             r.expect_run().never();

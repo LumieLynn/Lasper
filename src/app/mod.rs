@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{
-        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, RuntimeSnapshot,
-        StatusUpdate,
+        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName,
+        RuntimeSnapshot, StatusUpdate,
     },
     ops::{DefaultManager, NspawnManager},
     sys::ExecutionContext,
@@ -68,6 +68,38 @@ pub struct PanelLayout {
     pub terminal: Option<Rect>,
 }
 
+pub struct PendingImageRemoval {
+    target: ImageName,
+    dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog,
+}
+
+impl PendingImageRemoval {
+    fn new(
+        target: ImageName,
+        dialog: crate::ui::widgets::dialogs::confirmation::ConfirmationDialog,
+    ) -> Self {
+        Self { target, dialog }
+    }
+
+    fn target(&self) -> &ImageName {
+        &self.target
+    }
+
+    fn cleanup_artifacts(&self) -> bool {
+        self.dialog.checkbox_checked().unwrap_or(false)
+    }
+}
+
+impl Component for PendingImageRemoval {
+    fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        self.dialog.render(f, area);
+    }
+
+    fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> crate::ui::core::EventResult {
+        self.dialog.handle_key(key)
+    }
+}
+
 pub struct AppUi {
     pub focus: FocusTracker,
     pub prev_active_idx: usize,
@@ -88,7 +120,7 @@ pub struct AppUi {
     pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
-    pub delete_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
+    pub delete_dialog: Option<PendingImageRemoval>,
     pub active_dialog: Option<Box<dyn Component>>,
 
     pub resize_mode: ResizeMode,
@@ -499,12 +531,7 @@ impl App {
 
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.entries = self.data.entries.clone();
-            wizard.context.image_names = self
-                .data
-                .images
-                .iter()
-                .map(|image| image.name.clone())
-                .collect();
+            wizard.context.images = self.data.images.clone();
         }
 
         // Check if any DBus call fell back to CLI during this background refresh
@@ -561,12 +588,7 @@ impl App {
             self.refresh_detail().await;
         }
         if let Some(wizard) = &mut self.ui.wizard {
-            wizard.context.image_names = self
-                .data
-                .images
-                .iter()
-                .map(|image| image.name.clone())
-                .collect();
+            wizard.context.images = self.data.images.clone();
         }
     }
 
@@ -574,8 +596,17 @@ impl App {
     fn handle_backend_result(&mut self, res: crate::nspawn::ops::BackendResponse) {
         if let Some(wizard) = &mut self.ui.wizard {
             let action = wizard.process_message(crate::ui::core::AppMessage::Backend(res));
-            if let crate::ui::wizard::StepAction::Status(msg, level) = action {
-                self.set_status(msg, level);
+            match action {
+                crate::ui::wizard::StepAction::Status(msg, level) => {
+                    self.set_status(msg, level);
+                }
+                crate::ui::wizard::StepAction::OpenDialog(dialog) => {
+                    self.ui.active_dialog = Some(dialog);
+                }
+                crate::ui::wizard::StepAction::CloseDialog => {
+                    self.ui.active_dialog = None;
+                }
+                _ => {}
             }
         }
     }
@@ -976,11 +1007,14 @@ mod tests {
                 vec![make_entry("test", ContainerState::Starting)]
             );
             assert!(app.data.transitions.contains_key("test"));
+            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 1);
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("start task should finish")
                 .expect("start task should report a result");
+            tokio::task::yield_now().await;
+            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
                 AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
@@ -1051,6 +1085,261 @@ mod tests {
                     .map(|(message, _)| message.as_str()),
                 Some("test is already starting.")
             );
+        }
+
+        #[tokio::test]
+        async fn mstack_start_warns_but_still_dispatches_to_systemd() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_start()
+                .withf(|name| name == "test")
+                .once()
+                .returning(|_| Ok(()));
+            let (mut app, mut rx) = prepare_image_start(manager);
+            app.data.images[0].image_type = "mstack".into();
+
+            app.action_start();
+
+            assert_eq!(app.data.entries[0].state, ContainerState::Starting);
+            assert_eq!(app.data.transitions.len(), 1);
+            assert_eq!(
+                app.ui
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some(
+                    "test is an OCI application and may not be bootable; systemd will still try to start it."
+                )
+            );
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("mstack start should finish")
+                    .expect("mstack start should report a result"),
+                AppEvent::ActionDone(..)
+            ));
+        }
+    }
+
+    mod image_removal {
+        use super::*;
+        use crate::events::AppEvent;
+        use crate::nspawn::ops::manager::MockNspawnManager;
+
+        fn prepare_image_removal(
+            manager: MockNspawnManager,
+        ) -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let mut app = make_app();
+            app.data.manager = std::sync::Arc::new(manager);
+            app.data.images = vec![make_image("first"), make_image("second")];
+            app.ui.focus.active_idx = 1;
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            app.ui.app_tx = Some(tx);
+            (app, rx)
+        }
+
+        #[tokio::test]
+        async fn confirmation_binds_target_across_selection_and_focus_changes() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_remove()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            manager
+                .expect_cleanup_image_artifacts()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.data.image_selected = 1;
+            app.ui.focus.active_idx = 0;
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
+                    if message == "Removed image first and Lasper artifacts"
+            ));
+        }
+
+        #[tokio::test]
+        async fn confirmation_can_skip_lasper_artifact_cleanup() {
+            let mut manager = MockNspawnManager::new();
+            manager
+                .expect_remove()
+                .withf(|name| name == "first")
+                .once()
+                .returning(|_| Ok(()));
+            manager.expect_cleanup_image_artifacts().never();
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            let result = app
+                .ui
+                .delete_dialog
+                .as_mut()
+                .expect("delete dialog")
+                .handle_key(crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char(' '),
+                    crossterm::event::KeyModifiers::NONE,
+                ));
+            assert!(matches!(result, crate::ui::core::EventResult::Consumed));
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
+                    if message == "Removed image first"
+            ));
+        }
+
+        #[tokio::test]
+        async fn cleanup_failure_preserves_successful_removal_result() {
+            let mut manager = MockNspawnManager::new();
+            manager.expect_remove().once().returning(|_| Ok(()));
+            manager
+                .expect_cleanup_image_artifacts()
+                .once()
+                .returning(|_| {
+                    Err(crate::nspawn::errors::NspawnError::Runtime(
+                        "cleanup failed".into(),
+                    ))
+                });
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Warn)
+                    if message.contains("Removed image first")
+                        && message.contains("cleanup failed")
+            ));
+        }
+
+        #[test]
+        fn confirmation_rejects_a_target_that_disappeared() {
+            let mut manager = MockNspawnManager::new();
+            manager.expect_remove().never();
+            manager.expect_cleanup_image_artifacts().never();
+            let (mut app, _rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.data.images.clear();
+            app.action_remove();
+
+            assert_eq!(
+                app.ui
+                    .status_message
+                    .as_ref()
+                    .map(|(message, _)| message.as_str()),
+                Some("Image first changed before confirmation; refresh and try again.")
+            );
+        }
+    }
+
+    mod tar_risk_confirmation {
+        use super::*;
+        use crate::nspawn::ops::{BackendCommand, BackendResponse, PermissionLevel};
+        use crate::ui::wizard::{Wizard, WizardStep};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        async fn prepare_confirmation() -> (
+            App,
+            tokio::sync::mpsc::Receiver<crate::nspawn::ops::BackendCommand>,
+        ) {
+            let mut app = make_app();
+            let (command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+            let mut wizard = Wizard::new(
+                vec![],
+                vec![],
+                false,
+                command_tx,
+                PermissionLevel::User,
+                app.data.exec_ctx.clone(),
+                app.config.clone(),
+            )
+            .await;
+            wizard.step = WizardStep::Review;
+            wizard.context.source.kind = crate::ui::wizard::context::SourceKind::Pull;
+            wizard.context.source.pull_url = "https://example.test/rootfs.tar".into();
+            wizard.context.source.is_pull_raw = false;
+            wizard.context.basic.name = "tar-test".into();
+            wizard.active_view = None;
+            app.ui.wizard = Some(wizard);
+            app.ui.show_wizard = true;
+            app.handle_backend_result(BackendResponse::TarImportRiskConfirmationRequired(
+                "GNU tar 1.34 lacks hard-link confinement".into(),
+            ));
+            (app, command_rx)
+        }
+
+        #[tokio::test]
+        async fn topmost_tar_dialog_consumes_keys_and_decline_never_submits() {
+            let (mut app, mut command_rx) = prepare_confirmation().await;
+            assert!(app.ui.active_dialog.is_some());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_some());
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
+            assert!(command_rx.try_recv().is_err());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_none());
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
+            assert!(command_rx.try_recv().is_err());
+            assert!(!app
+                .ui
+                .wizard
+                .as_ref()
+                .unwrap()
+                .context
+                .deploy
+                .cancellation
+                .is_requested());
+        }
+
+        #[tokio::test]
+        async fn accepting_tar_risk_submits_once_and_enter_does_not_cancel_deployment() {
+            let (mut app, mut command_rx) = prepare_confirmation().await;
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.active_dialog.is_none());
+            let command = command_rx.try_recv().expect("confirmed deployment command");
+            let BackendCommand::SubmitConfig(context) = command else {
+                panic!("tar confirmation must submit the configured deployment");
+            };
+            assert!(context.source.unsafe_remote_tar_accepted());
+            assert!(command_rx.try_recv().is_err());
+
+            app.handle_backend_result(BackendResponse::DeployStarted);
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Deploy);
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .await;
+
+            let wizard = app.ui.wizard.as_ref().unwrap();
+            assert_eq!(wizard.step, WizardStep::Deploy);
+            assert!(!wizard.context.deploy.cancellation.is_requested());
+            assert!(command_rx.try_recv().is_err());
         }
     }
 
@@ -1293,6 +1582,27 @@ mod tests {
                 .get_group("Image")
                 .unwrap();
             assert_eq!(image_properties.get("Name").unwrap(), "retained");
+        }
+
+        #[tokio::test]
+        async fn image_unit_clears_stale_state_for_non_machine_image_name() {
+            let name = "Ubuntu Resolute 镜像";
+            let mut app = make_app();
+            app.data.images = vec![make_image(name)];
+            app.data.detail_target = DetailTarget::Image {
+                name: name.into(),
+                internal: false,
+            };
+            app.data.unit_name = Some("systemd-nspawn@stale.service".into());
+            app.ui.focus.active_idx = 2;
+            app.ui.inspector_source = InspectorSource::Image;
+            app.ui.detail_panel.active_pane = crate::ui::views::detail_panel::DetailPane::ImageUnit;
+
+            app.refresh_detail().await;
+
+            assert!(app.data.unit_name.is_none());
+            assert!(app.data.unit_drop_ins.is_empty());
+            assert!(app.data.properties.as_ref().unwrap().groups.is_empty());
         }
 
         #[tokio::test]

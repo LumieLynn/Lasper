@@ -3,21 +3,35 @@
 use async_trait::async_trait;
 use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
+use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
+use crate::nspawn::ops::provision::image_operation::TarSourceOrigin;
 use crate::nspawn::ops::provision::{
-    send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent, Deployer,
-    DeploymentReceipt,
+    process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
+    AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
 use crate::nspawn::sys::log_output;
+
+const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImageSource {
     Local(String),
     Remote(String),
+}
+
+impl ImageSource {
+    fn tar_origin(&self) -> TarSourceOrigin {
+        match self {
+            Self::Local(_) => TarSourceOrigin::Local,
+            Self::Remote(_) => TarSourceOrigin::Remote,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +54,7 @@ pub struct ImageDeployer {
     pub source: ImageSource,
     pub format: ImageFormat,
     pub image_import: crate::nspawn::ops::provision::ImageImportStore,
+    pub allow_unsafe_remote_tar: bool,
 }
 
 #[async_trait]
@@ -54,43 +69,62 @@ impl Deployer for ImageDeployer {
         _cfg: &ContainerConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<DeploymentReceipt> {
-        let source = acquire_image_source(&self.source, &logs).await?;
-        let source = normalize_compression(source, &logs).await?;
+        cancellation: &DeploymentCancellation,
+        report: &mut ApplyReport,
+    ) -> Result<()> {
+        cancellation.checkpoint()?;
+        let source = acquire_image_source(&self.source, &logs, cancellation).await?;
+        let source = normalize_compression(source, &logs, cancellation).await?;
+        cancellation.checkpoint()?;
         match self.format {
             ImageFormat::Raw => {
                 send_deploy_log(&logs, "Importing typed RAW machine image...").await;
                 let machine = crate::nspawn::models::MachineName::new(name)
                     .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 self.image_import.import_raw(machine, source).await?;
-                Ok(DeploymentReceipt::external_image())
+                report.record_created(AppliedResource::ExternalImage);
+                cancellation.checkpoint()?;
             }
             ImageFormat::Tar => {
                 send_deploy_log(&logs, "Extracting typed rootfs archive...").await;
                 let target = crate::nspawn::adapters::rootfs::RootfsTarget::from_provisioned_path(
                     name, rootfs,
                 )?;
-                self.image_import.import_tar(target, source).await?;
-                Ok(DeploymentReceipt::none())
+                let report = self
+                    .image_import
+                    .import_tar(
+                        target,
+                        source,
+                        self.source.tar_origin(),
+                        self.allow_unsafe_remote_tar,
+                    )
+                    .await?;
+                for warning in report.warnings {
+                    send_deploy_log(&logs, format!("WARNING: {warning}")).await;
+                }
+                cancellation.checkpoint()?;
             }
         }
+        Ok(())
     }
 }
 
 async fn acquire_image_source(
     source: &ImageSource,
     logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    cancellation: &DeploymentCancellation,
 ) -> Result<std::fs::File> {
     match source {
         ImageSource::Local(path) => std::fs::File::open(path)
             .map_err(|error| NspawnError::Io(std::path::PathBuf::from(path), error)),
-        ImageSource::Remote(url) => download_image(url, logs).await,
+        ImageSource::Remote(url) => download_image(url, logs, cancellation).await,
     }
 }
 
 async fn download_image(
     url: &str,
     logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    cancellation: &DeploymentCancellation,
 ) -> Result<std::fs::File> {
     check_tool("curl")?;
     let url = validate_download_url(url)?;
@@ -106,8 +140,11 @@ async fn download_image(
     } else {
         "=http,https"
     };
+    let max_filesize = MAX_IMAGE_BYTES.to_string();
     let mut command = crate::nspawn::sys::new_command("curl");
     command.kill_on_drop(true);
+    command.as_std_mut().process_group(0);
+    crate::nspawn::sys::command::limit_file_size(command.as_std_mut(), MAX_IMAGE_BYTES);
     let mut child = command
         .args([
             "--progress-bar",
@@ -118,6 +155,8 @@ async fn download_image(
             "=http,https",
             "--proto-redir",
             redirect_protocols,
+            "--max-filesize",
+            &max_filesize,
             "--user-agent",
             "Lasper/0.3",
             "--",
@@ -127,17 +166,43 @@ async fn download_image(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+    let pid = child.id().expect("curl has pid");
     let mut stderr = child.stderr.take().expect("curl stderr piped");
-    stream_curl_output(&mut stderr, logs).await?;
+    let stream_result = tokio::select! {
+        result = stream_curl_output(&mut stderr, logs) => Some(result),
+        _ = cancellation.cancelled() => None,
+    };
+    drop(stderr);
+    let Some(stream_result) = stream_result else {
+        terminate_child_group(&mut child, pid, "curl").await?;
+        return Err(NspawnError::DeploymentCancelled);
+    };
+    if let Err(error) = stream_result {
+        terminate_child_group(&mut child, pid, "curl").await?;
+        return Err(error);
+    }
+    if cancellation.is_requested() {
+        terminate_child_group(&mut child, pid, "curl").await?;
+        return Err(NspawnError::DeploymentCancelled);
+    }
     let status = child
         .wait()
         .await
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+        .map_err(|error| process_state_unknown("curl", error))?;
     if !status.success() {
+        if status.code() == Some(CURL_FILESIZE_EXCEEDED_EXIT_CODE)
+            || file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES)
+        {
+            return Err(NspawnError::Validation(format!(
+                "Downloaded image exceeds the {} byte limit",
+                MAX_IMAGE_BYTES
+            )));
+        }
         return Err(NspawnError::DeployError(format!(
             "Network download failed: {status}"
         )));
     }
+    validate_source_size(&destination, "Downloaded image")?;
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
@@ -202,7 +267,9 @@ fn detect_compression(source: &std::fs::File) -> Result<Option<ImageCompression>
 async fn normalize_compression(
     mut source: std::fs::File,
     logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    cancellation: &DeploymentCancellation,
 ) -> Result<std::fs::File> {
+    validate_source_size(&source, "Image source")?;
     let Some(compression) = detect_compression(&source)? else {
         source
             .seek(SeekFrom::Start(0))
@@ -223,29 +290,125 @@ async fn normalize_compression(
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
     let mut command = crate::nspawn::sys::new_command(program);
     command.kill_on_drop(true);
-    let child = command
+    command.as_std_mut().process_group(0);
+    crate::nspawn::sys::command::limit_file_size(command.as_std_mut(), MAX_IMAGE_BYTES);
+    let mut child = command
         .args(["-d", "-c"])
         .stdin(Stdio::from(source))
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
-    let result = child
-        .wait_with_output()
-        .await
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+    let pid = child.id().expect("decompressor has pid");
+    let mut stderr = child.stderr.take().expect("decompressor stderr piped");
+    let mut stderr_bytes = Vec::new();
+    let mut completed =
+        Box::pin(async { tokio::join!(child.wait(), stderr.read_to_end(&mut stderr_bytes)) });
+    let completed_result = tokio::select! {
+        result = &mut completed => Some(result),
+        _ = cancellation.cancelled() => None,
+    };
+    drop(completed);
+    let Some((status, stderr_result)) = completed_result else {
+        terminate_child_group(&mut child, pid, program).await?;
+        return Err(NspawnError::DeploymentCancelled);
+    };
+    let status = status.map_err(|error| process_state_unknown(program, error))?;
+    stderr_result.map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+    let result = std::process::Output {
+        status,
+        stdout: Vec::new(),
+        stderr: stderr_bytes,
+    };
     log_output(program, &result);
     if !result.status.success() {
+        if file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES) {
+            return Err(NspawnError::Validation(format!(
+                "Decompressed image exceeds the {} byte limit",
+                MAX_IMAGE_BYTES
+            )));
+        }
         return Err(NspawnError::cmd_failed(
             "decompress image source",
             format!("{program} -d -c"),
             &result,
         ));
     }
+    validate_source_size(&destination, "Decompressed image")?;
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
     Ok(destination)
+}
+
+fn validate_source_size(source: &std::fs::File, label: &str) -> Result<()> {
+    validate_source_size_with_limit(source, label, MAX_IMAGE_BYTES)
+}
+
+fn validate_source_size_with_limit(source: &std::fs::File, label: &str, limit: u64) -> Result<()> {
+    let metadata = source
+        .metadata()
+        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+    if metadata.is_file() && metadata.len() > limit {
+        return Err(NspawnError::Validation(format!(
+            "{label} exceeds the {} byte limit",
+            limit
+        )));
+    }
+    Ok(())
+}
+
+fn file_size(file: &std::fs::File) -> Option<u64> {
+    file.metadata().ok().map(|metadata| metadata.len())
+}
+
+async fn terminate_child_group(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    label: &str,
+) -> Result<()> {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    if let Err(error) = crate::nspawn::sys::command::signal_process_group(pid, libc::SIGTERM) {
+        log::warn!("Failed to request termination of {label}: {error}; waiting for natural exit");
+        tokio::time::timeout(STOP_TIMEOUT, child.wait())
+            .await
+            .map_err(|_| {
+                process_state_unknown(
+                    label,
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "termination request failed ({error}) and process exit was not confirmed"
+                        ),
+                    ),
+                )
+            })?
+            .map_err(|wait_error| process_state_unknown(label, wait_error))?;
+        return Ok(());
+    }
+    match tokio::time::timeout(STOP_TIMEOUT, child.wait()).await {
+        Ok(status) => {
+            status.map_err(|error| process_state_unknown(label, error))?;
+        }
+        Err(_) => {
+            crate::nspawn::sys::command::signal_process_group(pid, libc::SIGKILL)
+                .map_err(|error| process_state_unknown(label, error))?;
+            tokio::time::timeout(STOP_TIMEOUT, child.wait())
+                .await
+                .map_err(|_| {
+                    process_state_unknown(
+                        label,
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "process exit was not confirmed after SIGKILL",
+                        ),
+                    )
+                })?
+                .map_err(|error| process_state_unknown(label, error))?;
+        }
+    }
+    Ok(())
 }
 
 /// Parse curl's carriage-return progress frames and forward normal output.
@@ -366,11 +529,33 @@ mod tests {
     }
 
     #[test]
+    fn image_source_origin_is_preserved_for_tar_policy() {
+        assert_eq!(
+            ImageSource::Local("/tmp/rootfs.tar".into()).tar_origin(),
+            TarSourceOrigin::Local
+        );
+        assert_eq!(
+            ImageSource::Remote("https://example.test/rootfs.tar".into()).tar_origin(),
+            TarSourceOrigin::Remote
+        );
+    }
+
+    #[test]
     fn download_urls_are_limited_to_http_without_embedded_credentials() {
         assert!(validate_download_url("https://example.test/rootfs.tar.xz").is_ok());
         assert!(validate_download_url("http://example.test/rootfs.raw").is_ok());
         assert!(validate_download_url("file:///etc/shadow").is_err());
         assert!(validate_download_url("https://user:secret@example.test/rootfs.raw").is_err());
+    }
+
+    #[test]
+    fn source_size_limit_rejects_oversized_files_before_processing() {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(5).unwrap();
+
+        let error = validate_source_size_with_limit(&source, "Image source", 4).unwrap_err();
+
+        assert!(error.to_string().contains("4 byte limit"));
     }
 
     #[test]
@@ -409,7 +594,10 @@ mod tests {
         compressed.seek(SeekFrom::Start(0)).unwrap();
 
         let (logs, _receiver) = tokio::sync::mpsc::channel(4);
-        let mut decoded = normalize_compression(compressed, &logs).await.unwrap();
+        let mut decoded =
+            normalize_compression(compressed, &logs, &DeploymentCancellation::default())
+                .await
+                .unwrap();
         let mut payload = Vec::new();
         decoded.read_to_end(&mut payload).unwrap();
         assert_eq!(payload, b"typed image payload");
@@ -422,6 +610,10 @@ mod tests {
         compressed.seek(SeekFrom::Start(0)).unwrap();
 
         let (logs, _receiver) = tokio::sync::mpsc::channel(4);
-        assert!(normalize_compression(compressed, &logs).await.is_err());
+        assert!(
+            normalize_compression(compressed, &logs, &DeploymentCancellation::default())
+                .await
+                .is_err()
+        );
     }
 }

@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use fs2::FileExt;
 use std::ffi::OsString;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -30,6 +31,40 @@ impl AsyncLockedWriter {
     pub async fn write_locked<F>(path: &Path, content_generator: F) -> Result<()>
     where
         F: FnOnce(Option<String>) -> Result<String>,
+    {
+        Self::apply_locked_inner(path, None, move |existing| {
+            content_generator(existing).map(|content| (Some(content), ()))
+        })
+        .await
+    }
+
+    /// Applies a locked update and returns a typed result. `None` keeps the
+    /// existing file byte-for-byte without an atomic rewrite.
+    pub async fn apply_locked<T, F>(path: &Path, content_generator: F) -> Result<T>
+    where
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
+    {
+        Self::apply_locked_inner(path, None, content_generator).await
+    }
+
+    pub async fn apply_locked_with_mode<T, F>(
+        path: &Path,
+        mode: u32,
+        content_generator: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
+    {
+        Self::apply_locked_inner(path, Some(mode), content_generator).await
+    }
+
+    async fn apply_locked_inner<T, F>(
+        path: &Path,
+        mode: Option<u32>,
+        content_generator: F,
+    ) -> Result<T>
+    where
+        F: FnOnce(Option<String>) -> Result<(Option<String>, T)>,
     {
         let path_buf = path.to_path_buf();
         let lock_path = lock_path_for(path);
@@ -77,13 +112,28 @@ impl AsyncLockedWriter {
         };
 
         // Mutate
-        let new_content = content_generator(existing_content)?;
+        let (new_content, result) = content_generator(existing_content)?;
+
+        let Some(new_content) = new_content else {
+            return Ok(result);
+        };
 
         // Atomic update with durability
         {
-            let mut f = fs::File::create(&tmp_path)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            if let Some(mode) = mode {
+                options.mode(mode);
+            }
+            let mut f = options
+                .open(&tmp_path)
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            if let Some(mode) = mode {
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            }
             f.write_all(new_content.as_bytes())
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
@@ -107,7 +157,7 @@ impl AsyncLockedWriter {
         // concurrent process to open a new inode while another process still
         // holds a lock on the old, unlinked inode.
 
-        Ok(())
+        Ok(result)
     }
 
     /// Safely writes content to a file using atomic rename and fsync to ensure durability.

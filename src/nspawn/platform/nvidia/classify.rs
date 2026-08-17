@@ -75,6 +75,12 @@ pub struct ClassifiedEntry {
     pub host_path: String,
     pub default_container_path: String,
     pub category: NvidiaFileCategory,
+    #[serde(default = "default_readonly")]
+    pub readonly: bool,
+}
+
+fn default_readonly() -> bool {
+    true
 }
 
 /// Symlink to be created inside the container, parsed from CDI hooks.
@@ -123,17 +129,19 @@ pub fn classify_mounts(mounts: Vec<CdiMount>) -> (Vec<ClassifiedEntry>, Vec<Bind
     let mut unclassified = Vec::new();
 
     for m in mounts {
+        let readonly = m.readonly();
         if let Some(cat) = classify_path(&m.container_path) {
             classified.push(ClassifiedEntry {
                 host_path: m.host_path,
                 default_container_path: m.container_path,
                 category: cat,
+                readonly,
             });
         } else {
             unclassified.push(BindMount {
                 source: m.host_path,
                 target: m.container_path,
-                readonly: true,
+                readonly,
                 suffix: Default::default(),
             });
         }
@@ -467,16 +475,19 @@ mod tests {
                 host_path: "".into(),
                 default_container_path: "".into(),
                 category: NvidiaFileCategory::Bin,
+                readonly: true,
             },
             ClassifiedEntry {
                 host_path: "".into(),
                 default_container_path: "".into(),
                 category: NvidiaFileCategory::Lib64,
+                readonly: true,
             },
             ClassifiedEntry {
                 host_path: "".into(),
                 default_container_path: "".into(),
                 category: NvidiaFileCategory::Bin,
+                readonly: true,
             },
         ];
 

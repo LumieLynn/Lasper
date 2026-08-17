@@ -82,7 +82,7 @@ pub trait NspawnManager: Send + Sync + 'static {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tx: tokio::sync::mpsc::Sender<String>,
         fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()>;
     async fn get_properties(&self, name: &str, entry: &ContainerEntry)
@@ -92,7 +92,10 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
+    /// Remove the systemd-managed image and its settings through `RemoveImage`.
     async fn remove(&self, name: &str) -> Result<()>;
+    /// Remove Lasper's NVIDIA state and known systemd unit drop-ins.
+    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>);
@@ -322,32 +325,20 @@ impl DefaultManager {
                 format!("-u {unit} --since @{started_epoch}"),
             )
         };
-        let journal_command =
-            format!("journalctl {selector_display} --priority=warning --no-pager");
+        let journal_command = format!("journalctl {selector_display} --no-pager");
 
-        let mut priority_args = selector.clone();
-        priority_args.extend([
-            "--priority=warning".into(),
+        // nspawn emits some fatal setup diagnostics below warning priority. A
+        // priority filter can therefore retain an unrelated warning while
+        // hiding the line that explains why the process exited.
+        let mut journal_args = selector;
+        journal_args.extend([
             "-n".into(),
-            "20".into(),
+            "40".into(),
             "--no-pager".into(),
             "--quiet".into(),
             "--output=short".into(),
         ]);
-        let journal = self.read_journal(priority_args).await;
-        let journal = if journal.is_some() {
-            journal
-        } else {
-            let mut fallback_args = selector;
-            fallback_args.extend([
-                "-n".into(),
-                "8".into(),
-                "--no-pager".into(),
-                "--quiet".into(),
-                "--output=short".into(),
-            ]);
-            self.read_journal(fallback_args).await
-        };
+        let journal = self.read_journal(journal_args).await;
 
         if let Some(journal) = journal {
             log::error!(
@@ -564,31 +555,30 @@ impl NspawnManager for DefaultManager {
         };
 
         result?;
+        self.nudge();
+        Ok(())
+    }
 
-        if hidden || !managed_machine_name {
-            self.nudge();
-            return Ok(());
-        }
+    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()> {
+        crate::nspawn::models::MachineName::new(name)
+            .map_err(|error| crate::nspawn::errors::NspawnError::Validation(error.to_string()))?;
 
         let mut cleanup_errors = Vec::new();
-        if let Err(error) = self.exec_ctx.nspawn.remove(name).await {
-            cleanup_errors.push(format!("nspawn config: {}", error));
-        }
         if let Err(error) = self.exec_ctx.systemd_unit.remove_overrides(name).await {
-            cleanup_errors.push(format!("systemd override: {}", error));
+            cleanup_errors.push(format!("systemd unit drop-ins: {error}"));
         }
         if let Err(error) = self.exec_ctx.nvidia_state.remove(name).await {
-            cleanup_errors.push(format!("NVIDIA state: {}", error));
+            cleanup_errors.push(format!("NVIDIA state: {error}"));
         }
         if let Err(error) = self.reload_daemon_fallback().await {
-            cleanup_errors.push(format!("systemd daemon reload: {}", error));
+            cleanup_errors.push(format!("systemd daemon reload: {error}"));
         }
-        self.nudge();
+
         if cleanup_errors.is_empty() {
             Ok(())
         } else {
             Err(crate::nspawn::errors::NspawnError::Runtime(format!(
-                "image was removed, but managed cleanup was incomplete: {}",
+                "Lasper artifact cleanup was incomplete: {}",
                 cleanup_errors.join("; ")
             )))
         }
@@ -597,7 +587,7 @@ impl NspawnManager for DefaultManager {
     fn spawn_log_stream(
         &self,
         name: &str,
-        tx: tokio::sync::mpsc::UnboundedSender<String>,
+        tx: tokio::sync::mpsc::Sender<String>,
         fatal: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let name = name.to_string();
@@ -610,7 +600,7 @@ impl NspawnManager for DefaultManager {
                     Ok(fd) => fd,
                     Err(e) => {
                         fatal_clone.store(true, Ordering::Relaxed);
-                        let _ = tx.send(format!("Log stream error: {e}"));
+                        let _ = tx.send(format!("Log stream error: {e}")).await;
                         return;
                     }
                 };
@@ -620,13 +610,13 @@ impl NspawnManager for DefaultManager {
                     Ok(receiver) => {
                         let mut lines = tokio::io::BufReader::new(receiver).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
-                            if tx.send(line).is_err() {
+                            if tx.send(line).await.is_err() {
                                 break;
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = tx.send(format!("Log stream error: {e}"));
+                        let _ = tx.send(format!("Log stream error: {e}")).await;
                     }
                 }
             });
@@ -648,13 +638,15 @@ impl NspawnManager for DefaultManager {
                 Ok(c) => c,
                 Err(e) => {
                     fatal.store(true, Ordering::Relaxed);
-                    let _ = tx.send(format!("Log stream error: {e}"));
+                    let _ = tx.send(format!("Log stream error: {e}")).await;
                     if e.kind() == std::io::ErrorKind::PermissionDenied {
-                        let _ = tx.send(
-                            "Hint: add yourself to the 'systemd-journal' \
+                        let _ = tx
+                            .send(
+                                "Hint: add yourself to the 'systemd-journal' \
                              group: sudo usermod -a -G systemd-journal $USER"
-                                .into(),
-                        );
+                                    .into(),
+                            )
+                            .await;
                     }
                     return;
                 }
@@ -670,7 +662,7 @@ impl NspawnManager for DefaultManager {
                         tokio::select! {
                             line_res = lines.next_line() => {
                                 if let Ok(Some(line)) = line_res {
-                                    if tx.send(line).is_err() {
+                                    if tx.send(line).await.is_err() {
                                         break;
                                     }
                                 } else {
@@ -689,8 +681,9 @@ impl NspawnManager for DefaultManager {
                     if let Ok(n) = stderr_pipe.read_to_end(&mut buf).await {
                         if n > 0 {
                             fatal.store(true, Ordering::Relaxed);
-                            let _ =
-                                tx.send(format!("Log stream: {}", String::from_utf8_lossy(&buf)));
+                            let _ = tx
+                                .send(format!("Log stream: {}", String::from_utf8_lossy(&buf)))
+                                .await;
                         }
                     }
                     Ok(())
@@ -698,7 +691,7 @@ impl NspawnManager for DefaultManager {
                 .await;
 
             if let Err(e) = stream_result {
-                let _ = tx.send(format!("Log stream stopped: {e}"));
+                let _ = tx.send(format!("Log stream stopped: {e}")).await;
             }
         })
     }

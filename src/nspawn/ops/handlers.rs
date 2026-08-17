@@ -41,6 +41,30 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
             let bootstrap = exec_ctx.bootstrap.clone();
             let image_import = exec_ctx.image_import.clone();
             let oci_pull = exec_ctx.oci_pull.clone();
+
+            if ctx.source.remote_tar_url().is_some() && !ctx.source.unsafe_remote_tar_accepted() {
+                match image_import.assess_tar_runtime().await {
+                    Ok(assessment) => {
+                        if let Some(risk) = assessment.risk {
+                            let _ = tx
+                                .send(AppEvent::BackendResult(
+                                    BackendResponse::TarImportRiskConfirmationRequired(risk),
+                                ))
+                                .await;
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = tx
+                            .send(AppEvent::BackendResult(BackendResponse::ValidationError(
+                                format!("Could not inspect the host tar runtime: {error}"),
+                            )))
+                            .await;
+                        return;
+                    }
+                }
+            }
+
             let built = ctx.build_config();
             let (deployer, storage) = ctx.get_deployer_and_storage(
                 system_operations,
@@ -67,11 +91,16 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
 
             let done = ctx.deploy.done.clone();
             let success = ctx.deploy.success.clone();
+            let cancelled = ctx.deploy.cancelled.clone();
+            let rolling_back = ctx.deploy.rolling_back.clone();
+            let cancellation = ctx.deploy.cancellation.clone();
 
             // Run the real deployment
             let tx_panic = tx.clone();
             let tx_deploy = tx.clone();
+            let operation = exec_ctx.host_operations.begin();
             let deploy_handle = tokio::spawn(async move {
+                let _operation = operation;
                 crate::nspawn::ops::provision::run_deploy_task(
                     deployer,
                     storage,
@@ -82,6 +111,9 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                     log_mpsc_tx,
                     done,
                     success,
+                    cancelled,
+                    rolling_back,
+                    cancellation,
                     tx_deploy,
                 )
                 .await;
@@ -142,13 +174,12 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                 .send(AppEvent::BackendResult(BackendResponse::DiscoveryStarted))
                 .await;
 
-            let devices_res = crate::nspawn::platform::nvidia::discovery::list_devices().await;
-            let state_res =
-                crate::nspawn::platform::nvidia::discovery::get_nvidia_state(None).await;
+            let discovery_res =
+                crate::nspawn::platform::nvidia::discovery::discover_hardware().await;
             let gpus = crate::nspawn::platform::gpu::discover_host_gpus().await;
 
-            match (devices_res, state_res) {
-                (Ok(nvidia_devices), Ok(nvidia_state)) => {
+            match discovery_res {
+                Ok((nvidia_devices, nvidia_state)) => {
                     let _ = tx
                         .send(AppEvent::BackendResult(
                             BackendResponse::HardwareDiscovered {
@@ -159,7 +190,7 @@ async fn dispatch_command(cmd: BackendCommand, tx: Sender<AppEvent>) {
                         ))
                         .await;
                 }
-                (Err(e), _) | (_, Err(e)) => {
+                Err(e) => {
                     log::error!("Hardware discovery failed: {}", e);
                     let _ = tx
                         .send(AppEvent::BackendResult(BackendResponse::DiscoveryFailed(

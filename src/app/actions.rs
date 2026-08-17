@@ -104,36 +104,50 @@ impl App {
                 }
                 DetailPane::ImageConfig => self.read_nspawn_config(&name).await,
                 DetailPane::ImageUnit => {
-                    match self
+                    let has_corresponding_unit = match self
                         .data
                         .exec_ctx
                         .machine_inspection
                         .inspect_static(&name)
                         .await
                     {
-                        Ok(properties) => {
+                        Ok(Some(properties)) => {
                             self.data.properties = Ok(properties);
                             self.data.properties_dirty = true;
                             self.data.details_dirty = true;
+                            true
+                        }
+                        Ok(None) => {
+                            self.data.properties = Ok(MachineProperties::default());
+                            self.data.properties_dirty = true;
+                            self.data.details_dirty = true;
+                            false
                         }
                         Err(error) => {
                             self.data.properties = Err(error.to_string());
                             self.data.properties_dirty = true;
                             self.data.details_dirty = true;
+                            true
                         }
-                    }
-                    match self.data.exec_ctx.systemd_unit.read(&name).await {
-                        Ok(unit) => {
-                            self.data.unit_name = Some(unit.unit);
-                            self.data.unit_drop_ins = unit.drop_ins;
+                    };
+                    if has_corresponding_unit {
+                        match self.data.exec_ctx.systemd_unit.read(&name).await {
+                            Ok(unit) => {
+                                self.data.unit_name = Some(unit.unit);
+                                self.data.unit_drop_ins = unit.drop_ins;
+                            }
+                            Err(error) => {
+                                log::debug!("Failed to read unit drop-ins for {name}: {error}");
+                                self.data.unit_name =
+                                    crate::nspawn::models::MachineName::new(&name)
+                                        .ok()
+                                        .map(|name| name.systemd_nspawn_unit());
+                                self.data.unit_drop_ins.clear();
+                            }
                         }
-                        Err(error) => {
-                            log::debug!("Failed to read unit drop-ins for {name}: {error}");
-                            self.data.unit_name = crate::nspawn::models::MachineName::new(&name)
-                                .ok()
-                                .map(|name| name.systemd_nspawn_unit());
-                            self.data.unit_drop_ins.clear();
-                        }
+                    } else {
+                        self.data.unit_name = None;
+                        self.data.unit_drop_ins.clear();
                     }
                     self.data.unit_dirty = true;
                 }
@@ -349,7 +363,9 @@ impl App {
         };
 
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(action_label.to_string()).await {
                 Ok(a) => a,
                 Err(e) => {
@@ -540,7 +556,7 @@ impl App {
     }
 
     pub fn action_remove(&mut self) {
-        if self.image_is_focused() {
+        if self.ui.delete_dialog.is_some() || self.image_is_focused() {
             self.action_remove_image();
             return;
         }
@@ -569,6 +585,7 @@ impl App {
             None => return,
         };
         let name = image.name.clone();
+        let is_mstack = image.image_type == "mstack";
         if let Some(state) = self
             .data
             .entries
@@ -588,8 +605,19 @@ impl App {
             None => return,
         };
         self.begin_image_start_transition(&name);
+        if is_mstack {
+            self.set_status(
+                format!(
+                    "{} is an OCI application and may not be bootable; systemd will still try to start it.",
+                    name
+                ),
+                crate::ui::StatusLevel::Warn,
+            );
+        }
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(format!("Start {}", name)).await {
                 Ok(audit) => audit,
                 Err(error) => {
@@ -620,22 +648,52 @@ impl App {
     }
 
     fn action_remove_image(&mut self) {
-        self.ui.delete_dialog = None;
         if !self.check_action_cooldown() {
             return;
         }
-        let image = match self.selected_image() {
-            Some(image) => image,
+        let pending = match self.ui.delete_dialog.take() {
+            Some(pending) => pending,
             None => return,
         };
-        let name = image.name.clone();
+        let name = pending.target().as_str().to_string();
+        let cleanup_artifacts = pending.cleanup_artifacts();
+        let image_still_exists = self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .any(|image| image.name == name);
+        if !image_still_exists {
+            self.set_status(
+                format!(
+                    "Image {} changed before confirmation; refresh and try again.",
+                    name
+                ),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
+        if self
+            .data
+            .entries
+            .iter()
+            .any(|machine| machine.name == name && machine.state.is_running())
+        {
+            self.set_status(
+                format!("Stop machine '{}' before deleting its image.", name),
+                crate::ui::StatusLevel::Warn,
+            );
+            return;
+        }
         let manager = self.data.manager.clone();
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
             None => return,
         };
         let pm = self.permissions.clone();
+        let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _operation = operation;
             let audit = match pm.request_elevation(format!("Remove image {}", name)).await {
                 Ok(audit) => audit,
                 Err(error) => {
@@ -650,14 +708,33 @@ impl App {
             };
             let result = audit.run(manager.remove(&name)).await;
             let event = match result {
-                Ok(()) => crate::events::AppEvent::ActionDone(
-                    format!("Removed image {}", name),
-                    crate::ui::StatusLevel::Success,
-                ),
                 Err(error) => crate::events::AppEvent::ActionDone(
                     format!("Remove failed: {}", error),
                     crate::ui::StatusLevel::Error,
                 ),
+                Ok(()) if !cleanup_artifacts => crate::events::AppEvent::ActionDone(
+                    format!("Removed image {}", name),
+                    crate::ui::StatusLevel::Success,
+                ),
+                Ok(()) => {
+                    let cleanup_result = match pm
+                        .request_elevation(format!("Clean Lasper artifacts for {}", name))
+                        .await
+                    {
+                        Ok(audit) => audit.run(manager.cleanup_image_artifacts(&name)).await,
+                        Err(error) => Err(error),
+                    };
+                    match cleanup_result {
+                        Ok(()) => crate::events::AppEvent::ActionDone(
+                            format!("Removed image {} and Lasper artifacts", name),
+                            crate::ui::StatusLevel::Success,
+                        ),
+                        Err(error) => crate::events::AppEvent::ActionDone(
+                            format!("Removed image {}; cleanup warning: {}", name, error),
+                            crate::ui::StatusLevel::Warn,
+                        ),
+                    }
+                }
             };
             let _ = tx.send(event).await;
         });
@@ -755,13 +832,18 @@ impl App {
             .spawn(&entry, rows, &self.ui.app_tx, &self.data.exec_ctx)
             .await
         {
-            Ok(_idx) => {
+            Ok(session) => {
                 self.set_focus_idx(3);
                 self.refresh_detail().await;
-                self.set_status(
-                    format!("Logged into {}", entry.name),
-                    crate::ui::StatusLevel::Info,
-                );
+                let message = match session.attach_kind {
+                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Login => {
+                        format!("Logged into {}", entry.name)
+                    }
+                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Namespace => {
+                        format!("Attached to {} through its namespaces", entry.name)
+                    }
+                };
+                self.set_status(message, crate::ui::StatusLevel::Info);
             }
             Err(msg) => {
                 self.set_status(msg, crate::ui::StatusLevel::Error);

@@ -49,18 +49,6 @@ impl Default for NvidiaPassthroughProfile {
     }
 }
 
-impl NvidiaPassthroughProfile {
-    pub async fn save(
-        &self,
-        name: &str,
-        state_store: &crate::nspawn::platform::nvidia::NvidiaStateStore,
-    ) -> crate::nspawn::errors::Result<()> {
-        let mut state = state_store.read(name).await?.unwrap_or_default();
-        state.profile = Some(self.clone());
-        state_store.write(name, &state).await
-    }
-}
-
 #[allow(dead_code)]
 pub struct ProfileTemplate {
     pub name: String,

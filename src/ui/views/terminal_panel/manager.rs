@@ -1,8 +1,10 @@
 //! Terminal session management.
 
 use crate::events::AppEvent;
-use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::models::{ContainerEntry, MachineName};
+use crate::nspawn::ops::PermissionLevel;
 use crate::nspawn::sys::execution::ExecutionContext;
+use crate::nspawn::sys::terminal_attach::TerminalAttachKind;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::sync::Arc;
@@ -22,6 +24,7 @@ pub struct TextSelection {
 
 pub struct TerminalSession {
     pub container_name: String,
+    pub attach_kind: TerminalAttachKind,
     pub terminal: Arc<parking_lot::Mutex<crate::term::Parser>>,
     pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
     pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
@@ -38,6 +41,11 @@ pub struct TerminalSession {
     resize_state: crate::nspawn::adapters::comm::pty::ResizeState,
 }
 
+#[derive(Debug)]
+pub struct SpawnedTerminalSession {
+    pub attach_kind: TerminalAttachKind,
+}
+
 /// Holds all terminal-session state that was previously scattered across `AppUi` and `AppData`.
 pub struct TerminalManager {
     pub sessions: Vec<TerminalSession>,
@@ -49,6 +57,13 @@ pub struct TerminalManager {
     /// Long-lived clipboard instance so data survives on Linux (ownership model).
     pub clipboard: Option<arboard::Clipboard>,
     redraw_gate: crate::nspawn::adapters::comm::pty::RedrawGate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalInputStatus {
+    Queued,
+    Full,
+    Closed,
 }
 
 impl TerminalManager {
@@ -85,19 +100,17 @@ impl TerminalManager {
 
     // lifecycle
 
-    /// Spawn a `machinectl login` PTY for `entry`. Returns the new session
-    /// index on success so the caller can update focus.
+    /// Spawn the best supported terminal attachment for `entry`.
     ///
-    /// When an elevated daemon is active, it spawns `machinectl login` as root
-    /// and passes back the PTY master fd. Otherwise `machinectl login` runs
-    /// directly as the current user.
+    /// Root/elevated execution can fall back from `machinectl login` to a
+    /// closed `nsenter` command when the container has no system bus.
     pub async fn spawn(
         &mut self,
         entry: &ContainerEntry,
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
         ctx: &ExecutionContext,
-    ) -> Result<usize, String> {
+    ) -> Result<SpawnedTerminalSession, String> {
         if entry.state != crate::nspawn::models::ContainerState::Running {
             return Err(format!("Container {} is not running", entry.name));
         }
@@ -110,7 +123,9 @@ impl TerminalManager {
         {
             self.active_idx = idx;
             self.show = true;
-            return Ok(idx);
+            return Ok(SpawnedTerminalSession {
+                attach_kind: self.sessions[idx].attach_kind,
+            });
         }
 
         let tx = app_tx
@@ -119,36 +134,66 @@ impl TerminalManager {
 
         let cols: u16 = 80;
 
-        let (term, pty_tx, handle, resize_state) = if let Some(daemon) = ctx.daemon_ref() {
-            // Elevated: daemon spawns machinectl login as root, passes back PTY master fd.
-            let master_fd = daemon
-                .spawn_login(&entry.name, cols, rows)
-                .await
-                .map_err(|e| format!("Failed to spawn login via daemon: {}", e))?;
+        let (term, pty_tx, handle, resize_state, attach_kind) =
+            if let Some(daemon) = ctx.daemon_ref() {
+                let spawned = daemon
+                    .spawn_terminal(&entry.name, cols, rows)
+                    .await
+                    .map_err(|e| format!("Failed to attach terminal via daemon: {}", e))?;
 
-            crate::nspawn::adapters::comm::pty::spawn_terminal_with_fd(
-                master_fd,
-                cols,
-                rows,
-                tx.clone(),
-                self.redraw_gate.clone(),
-            )
-            .map_err(|e| format!("Failed to setup PTY from fd: {}", e))?
-        } else {
-            let args: [&str; 3] = ["--", "login", &entry.name];
-            crate::nspawn::adapters::comm::pty::spawn_terminal(
-                "machinectl",
-                &args,
-                cols,
-                rows,
-                tx.clone(),
-                self.redraw_gate.clone(),
-            )
-            .map_err(|e| format!("Failed to spawn terminal: {}", e))?
-        };
+                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal_with_fd(
+                    spawned.master_fd,
+                    cols,
+                    rows,
+                    tx.clone(),
+                    self.redraw_gate.clone(),
+                )
+                .map_err(|e| format!("Failed to setup PTY from fd: {}", e))?;
+                (
+                    terminal.0,
+                    terminal.1,
+                    terminal.2,
+                    terminal.3,
+                    spawned.attach_kind,
+                )
+            } else if ctx.permission_level() == PermissionLevel::Root {
+                let name = MachineName::new(&entry.name)
+                    .map_err(|error| format!("Invalid machine name: {error}"))?;
+                let attach = crate::nspawn::sys::terminal_attach::select(&name)
+                    .map_err(|error| format!("Failed to plan terminal attachment: {error}"))?;
+                let attach_kind = attach.kind();
+                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal_command(
+                    attach.into_pty_command(),
+                    cols,
+                    rows,
+                    tx.clone(),
+                    self.redraw_gate.clone(),
+                )
+                .map_err(|e| format!("Failed to spawn terminal: {}", e))?;
+                (terminal.0, terminal.1, terminal.2, terminal.3, attach_kind)
+            } else {
+                let args: [&str; 3] = ["--", "login", &entry.name];
+                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal(
+                    "machinectl",
+                    &args,
+                    cols,
+                    rows,
+                    tx.clone(),
+                    self.redraw_gate.clone(),
+                )
+                .map_err(|e| format!("Failed to spawn terminal: {}", e))?;
+                (
+                    terminal.0,
+                    terminal.1,
+                    terminal.2,
+                    terminal.3,
+                    TerminalAttachKind::Login,
+                )
+            };
 
         let session = TerminalSession {
             container_name: entry.name.clone(),
+            attach_kind,
             terminal: term,
             pty_tx,
             handle,
@@ -164,7 +209,7 @@ impl TerminalManager {
         self.sessions.push(session);
         self.active_idx = self.sessions.len() - 1;
         self.show = true;
-        Ok(self.active_idx)
+        Ok(SpawnedTerminalSession { attach_kind })
     }
 
     pub fn close_active(&mut self) {
@@ -277,9 +322,11 @@ impl TerminalManager {
             let application_cursor = session.terminal.lock().screen().application_cursor();
             let bytes = super::encode_key_for_mode(key, application_cursor);
             if !bytes.is_empty() {
-                let _ = session
-                    .pty_tx
-                    .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes));
+                return match queue_input(&session.pty_tx, bytes) {
+                    TerminalInputStatus::Queued => TerminalKeyOutcome::Consumed,
+                    TerminalInputStatus::Full => TerminalKeyOutcome::InputQueueFull,
+                    TerminalInputStatus::Closed => TerminalKeyOutcome::InputChannelClosed,
+                };
             }
             TerminalKeyOutcome::Consumed
         } else {
@@ -383,11 +430,11 @@ impl TerminalManager {
 
     // mouse dispatch
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> TerminalInputStatus {
         let idx = self.active_idx;
         let session = match self.sessions.get_mut(idx) {
             Some(s) => s,
-            None => return,
+            None => return TerminalInputStatus::Closed,
         };
 
         let term_area = self.term_area;
@@ -396,7 +443,7 @@ impl TerminalManager {
             && mouse.row >= term_area.y
             && mouse.row < term_area.y.saturating_add(term_area.height);
         if !inside && !session.selection.active && !session.mouse_capture {
-            return;
+            return TerminalInputStatus::Queued;
         }
 
         // Convert absolute screen coords to terminal-relative cell coords.
@@ -431,14 +478,16 @@ impl TerminalManager {
                     modifiers: mouse.modifiers,
                 };
                 if let Some(seq) = super::encode_mouse_for_protocol(rel_mouse, mode, encoding) {
-                    let _ = session
-                        .pty_tx
-                        .try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(seq));
+                    let status = queue_input(&session.pty_tx, seq);
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        session.mouse_capture = false;
+                    }
+                    return status;
                 }
                 if matches!(mouse.kind, MouseEventKind::Up(_)) {
                     session.mouse_capture = false;
                 }
-                return;
+                return TerminalInputStatus::Queued;
             }
         }
 
@@ -469,6 +518,7 @@ impl TerminalManager {
             }
             _ => {}
         }
+        TerminalInputStatus::Queued
     }
 }
 
@@ -524,6 +574,17 @@ fn queue_resize(
         }
         Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => QueueResizeResult::Full,
         Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => QueueResizeResult::Closed,
+    }
+}
+
+fn queue_input(
+    tx: &tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
+    bytes: Vec<u8>,
+) -> TerminalInputStatus {
+    match tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes)) {
+        Ok(()) => TerminalInputStatus::Queued,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => TerminalInputStatus::Full,
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => TerminalInputStatus::Closed,
     }
 }
 
@@ -604,11 +665,17 @@ pub enum TerminalKeyOutcome {
     /// Key was consumed AND the detail pane should be refreshed
     /// (tab switch changed the selected container).
     ConsumedAndRefreshDetail,
+    /// The PTY writer queue was full; the key was consumed but not delivered.
+    InputQueueFull,
+    /// The PTY writer is no longer available; the key was consumed.
+    InputChannelClosed,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{queue_resize, QueueResizeResult, TerminalManager};
+    use super::{
+        queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalManager,
+    };
     use crate::nspawn::adapters::comm::pty::PtyMessage;
     use crate::nspawn::models::{ContainerEntry, ContainerState};
 
@@ -642,6 +709,17 @@ mod tests {
             QueueResizeResult::Closed
         );
         assert_eq!(queued, Some((80, 24)));
+    }
+
+    #[test]
+    fn input_queue_reports_full_and_closed_channels() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(queue_input(&tx, vec![b'a']), TerminalInputStatus::Queued);
+        assert_eq!(queue_input(&tx, vec![b'b']), TerminalInputStatus::Full);
+
+        let _ = rx.try_recv();
+        drop(rx);
+        assert_eq!(queue_input(&tx, vec![b'c']), TerminalInputStatus::Closed);
     }
 
     #[tokio::test]

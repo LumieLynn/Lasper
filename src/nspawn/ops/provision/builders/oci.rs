@@ -1,20 +1,21 @@
 //! systemd-native OCI application image deployment.
 
 use async_trait::async_trait;
-use tokio::io::AsyncBufReadExt;
 
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, MachineName, OciReference};
+use crate::nspawn::models::{ContainerConfig, MachineName, OciNetworkMode, OciReference};
 use crate::nspawn::ops::provision::oci_operation::{ensure_pull_oci_available, OciPullRequest};
 use crate::nspawn::ops::provision::{
-    send_deploy_log, send_deploy_stream_log, DeployLogEvent, Deployer, DeploymentReceipt,
-    OciPullStore,
+    send_deploy_log, stream_deploy_command, AppliedResource, ApplyReport, DeployLogEvent, Deployer,
+    DeploymentCancellation, OciPullStore,
 };
 
 pub struct OciDeployer {
     pub reference: String,
     pub read_only: bool,
+    pub network: OciNetworkMode,
     pub oci_pull: OciPullStore,
+    pub nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
 }
 
 #[async_trait]
@@ -33,8 +34,13 @@ impl Deployer for OciDeployer {
         _cfg: &ContainerConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    ) -> Result<DeploymentReceipt> {
+        cancellation: &DeploymentCancellation,
+        report: &mut ApplyReport,
+    ) -> Result<()> {
         ensure_pull_oci_available()?;
+        cancellation.checkpoint()?;
+        self.nspawn.prepare_oci_promotion(name).await?;
+        cancellation.checkpoint()?;
         let request = OciPullRequest {
             reference: OciReference::new(self.reference.trim())
                 .map_err(|error| NspawnError::Validation(error.to_string()))?,
@@ -53,45 +59,70 @@ impl Deployer for OciDeployer {
             name
         );
 
-        let mut spawned = self.oci_pull.spawn(request).await?;
-        {
-            let mut lines = tokio::io::BufReader::new(&mut spawned.stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                send_deploy_stream_log(&logs, line).await;
-            }
-        }
-        let status = spawned.wait().await.map_err(|error| {
-            NspawnError::Io(std::path::PathBuf::from("importctl pull-oci"), error)
-        })?;
+        let spawned = self.oci_pull.spawn(request).await?;
+        let status =
+            stream_deploy_command(spawned, &logs, cancellation, "systemd-importd OCI transfer")
+                .await?;
         if !status.success() {
             return Err(NspawnError::CommandFailed(
                 "systemd OCI pull".into(),
-                "typed importctl pull-oci operation".into(),
+                "typed systemd-importd PullOci operation".into(),
                 "Command failed. Check deployment logs for detailed output.".into(),
             ));
         }
+        report.record_created(AppliedResource::ExternalImage);
+        cancellation.checkpoint()?;
+
+        send_deploy_log(
+            &logs,
+            format!(
+                "Preserving OCI runtime configuration with PrivateUsers=no and network={}",
+                self.network.as_str()
+            ),
+        )
+        .await;
+        log::warn!(
+            "[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled for system-scoped OCI application.",
+            name
+        );
+        send_deploy_log(
+            &logs,
+            "WARNING: PrivateUsers=no disables user namespace isolation for this OCI application.",
+        )
+        .await;
+        let apply = self
+            .nspawn
+            .promote_oci(name, self.network)
+            .await
+            .map_err(|error| {
+                NspawnError::Runtime(format!(
+                    "Failed to configure OCI application after import: {error}"
+                ))
+            })?;
+        report.record_apply(AppliedResource::NspawnConfig, apply)?;
+        cancellation.checkpoint()?;
 
         send_deploy_log(
             &logs,
             format!("OCI application installed as /var/lib/machines/{name}.mstack"),
         )
         .await;
-        Ok(DeploymentReceipt::external_image())
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::sys::command::DefaultCommandRunner;
-    use std::sync::Arc;
 
     #[test]
-    fn oci_deployer_leaves_storage_and_runtime_configuration_to_systemd() {
+    fn oci_deployer_uses_external_storage_and_skips_rootfs_post_config() {
         let deployer = OciDeployer {
             reference: "docker.io/library/nginx:latest".into(),
             read_only: false,
-            oci_pull: OciPullStore::new(Arc::new(DefaultCommandRunner), None),
+            network: OciNetworkMode::Host,
+            oci_pull: OciPullStore::new(None),
+            nspawn: crate::nspawn::adapters::config::NspawnConfigStore::new(None),
         };
 
         assert!(deployer.is_external_storage_managed());

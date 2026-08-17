@@ -1,5 +1,6 @@
-use crate::nspawn::ops::provision::{DeployLogEvent, DeployProgress};
+use crate::nspawn::ops::provision::{DeployLogEvent, DeployProgress, DeploymentCancellation};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
+use crate::ui::widgets::dialogs::confirmation::ConfirmationDialog;
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::wizard::context::WizardContext;
@@ -9,7 +10,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::Style,
-    widgets::{Block, BorderType, Borders, Gauge},
+    widgets::{Block, BorderType, Borders, Gauge, Paragraph},
     Frame,
 };
 use std::sync::{
@@ -24,10 +25,14 @@ pub struct DeployStepView {
     log_rx: Option<broadcast::Receiver<DeployLogEvent>>,
     done: Arc<AtomicBool>,
     success: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+    rolling_back: Arc<AtomicBool>,
+    cancellation: DeploymentCancellation,
     status_block: TextBlock,
     log_list: SelectableList<String>,
     internal_logs: Vec<String>,
     progress: Option<DeployProgress>,
+    cancel_dialog: Option<ConfirmationDialog>,
 }
 
 impl DeployStepView {
@@ -35,15 +40,22 @@ impl DeployStepView {
         log_rx: broadcast::Receiver<DeployLogEvent>,
         done: Arc<AtomicBool>,
         success: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+        rolling_back: Arc<AtomicBool>,
+        cancellation: DeploymentCancellation,
     ) -> Self {
         Self {
             log_rx: Some(log_rx),
             done,
             success,
+            cancelled,
+            rolling_back,
+            cancellation,
             status_block: TextBlock::new(" Status ", "Deploying...".to_string()),
             log_list: SelectableList::new(" Deployment logs ", vec![], |s| s.clone()),
             internal_logs: vec![],
             progress: None,
+            cancel_dialog: None,
         }
     }
 
@@ -111,11 +123,22 @@ impl Component for DeployStepView {
 
         let done = self.done.load(Ordering::SeqCst);
         let success = self.success.load(Ordering::SeqCst);
+        let cancelled = self.cancelled.load(Ordering::SeqCst);
+        let rolling_back = self.rolling_back.load(Ordering::SeqCst);
+        if done {
+            self.cancel_dialog = None;
+        }
 
-        let status = if !done {
+        let status = if rolling_back {
+            "Rolling back deployment changes...".to_string()
+        } else if !done && self.cancellation.is_requested() {
+            "Cancellation requested; waiting for a safe rollback point...".to_string()
+        } else if !done {
             "Deploying... please wait.".to_string()
         } else if success {
             "SUCCESS: Deployment completed.".to_string()
+        } else if cancelled {
+            "CANCELLED: Deployment stopped; review rollback logs.".to_string()
         } else {
             "FAILED: Deployment encountered an error.".to_string()
         };
@@ -152,25 +175,64 @@ impl Component for DeployStepView {
             self.status_block.render(f, chunks[0]);
         }
         self.log_list.render(f, chunks[1]);
+
+        let hint = if done {
+            " [Enter/q/Esc] Close "
+        } else if self.cancellation.is_requested() {
+            " Cancellation in progress "
+        } else {
+            " [q/Esc] Cancel deployment "
+        };
+        f.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
+            chunks[2],
+        );
+
+        if let Some(dialog) = &mut self.cancel_dialog {
+            dialog.render(f, area);
+        }
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         let done = self.done.load(Ordering::SeqCst);
-        if !done {
-            // Block all close attempts while deploying; allow log scrolling only
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
-                    return EventResult::Consumed; // refuse silently
+        if done {
+            self.cancel_dialog = None;
+            return match key.code {
+                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => {
+                    EventResult::Message(AppMessage::Wizard(WizardMessage::Close))
                 }
-                _ => return self.log_list.handle_key(key),
-            }
+                _ => self.log_list.handle_key(key),
+            };
         }
-        // Deployment finished — allow closing
-        match key.code {
-            KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => {
-                EventResult::Message(AppMessage::Wizard(WizardMessage::Close))
-            }
 
+        if let Some(dialog) = &mut self.cancel_dialog {
+            return match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.cancel_dialog = None;
+                    self.cancellation.request();
+                    EventResult::Consumed
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.cancel_dialog = None;
+                    EventResult::Consumed
+                }
+                _ => {
+                    let _ = dialog.handle_key(key);
+                    EventResult::Consumed
+                }
+            };
+        }
+
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc if !self.cancellation.is_requested() => {
+                self.cancel_dialog = Some(ConfirmationDialog::new(
+                    "Cancel Deployment?",
+                    "Stop this deployment and roll back changes created by it?",
+                ));
+                EventResult::Consumed
+            }
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => EventResult::Consumed,
             _ => self.log_list.handle_key(key),
         }
     }
@@ -202,5 +264,66 @@ mod tests {
             "\u{5bb9}\u{5668}\u{4e0b}..."
         );
         assert_eq!(truncate_to_width("abc", 2), "..");
+    }
+
+    #[test]
+    fn cancellation_requires_confirmation() {
+        let (tx, rx) = broadcast::channel(4);
+        let cancellation = DeploymentCancellation::default();
+        let mut view = DeployStepView::new(
+            rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            cancellation.clone(),
+        );
+        drop(tx);
+
+        let result = view.handle_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(result, EventResult::Consumed);
+        assert!(view.cancel_dialog.is_some());
+        assert!(!cancellation.is_requested());
+
+        let result = view.handle_key(KeyEvent::new(
+            KeyCode::Char('y'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(result, EventResult::Consumed);
+        assert!(view.cancel_dialog.is_none());
+        assert!(cancellation.is_requested());
+    }
+
+    #[test]
+    fn declining_cancellation_keeps_deployment_running() {
+        let (tx, rx) = broadcast::channel(4);
+        let cancellation = DeploymentCancellation::default();
+        let mut view = DeployStepView::new(
+            rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            cancellation.clone(),
+        );
+        drop(tx);
+
+        let _ = view.handle_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        let result = view.handle_key(KeyEvent::new(
+            KeyCode::Char('n'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+
+        assert_eq!(result, EventResult::Consumed);
+        assert!(view.cancel_dialog.is_none());
+        assert!(!cancellation.is_requested());
     }
 }

@@ -11,7 +11,6 @@ pub(crate) struct CdiSpec {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiDevice {
-    #[allow(dead_code)]
     pub(crate) name: String,
     pub(crate) container_edits: Option<CdiEdits>,
 }
@@ -55,6 +54,26 @@ pub(crate) struct CdiMount {
     pub(crate) options: Option<Vec<String>>,
 }
 
+impl CdiMount {
+    pub(crate) fn readonly(&self) -> bool {
+        let mut readonly = false;
+        for option in self
+            .options
+            .iter()
+            .flatten()
+            .flat_map(|option| option.split(','))
+            .map(str::trim)
+        {
+            match option {
+                "ro" => readonly = true,
+                "rw" => readonly = false,
+                _ => {}
+            }
+        }
+        readonly
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,5 +97,19 @@ mod tests {
 
         assert!(nodes.contains(&"/dev/nvidiactl".to_string()));
         assert!(nodes.contains(&"/dev/nvidia0".to_string()));
+    }
+
+    #[test]
+    fn mount_options_apply_oci_readonly_order() {
+        let mount = |options: Option<Vec<&str>>| CdiMount {
+            host_path: "/host".into(),
+            container_path: "/container".into(),
+            options: options.map(|options| options.into_iter().map(str::to_string).collect()),
+        };
+
+        assert!(!mount(None).readonly());
+        assert!(mount(Some(vec!["rbind", "ro"])).readonly());
+        assert!(!mount(Some(vec!["ro", "rw"])).readonly());
+        assert!(mount(Some(vec!["rw,ro"])).readonly());
     }
 }
