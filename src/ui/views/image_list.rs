@@ -1,18 +1,18 @@
 use crate::nspawn::ImageEntry;
-use crate::ui::core::{AppMessage, EventResult, ListMessage};
+use crate::ui::core::EventResult;
 use crate::ui::theme;
+use crate::ui::widgets::lists::resource_list::{ResourceList, ResourceListRender};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
+    widgets::ListItem,
     Frame,
 };
 
 pub struct ImageListComponent {
-    state: ListState,
-    focused: bool,
+    list: ResourceList,
     active_tab: ImageListTab,
 }
 
@@ -24,17 +24,14 @@ pub enum ImageListTab {
 
 impl ImageListComponent {
     pub fn new() -> Self {
-        let mut state = ListState::default();
-        state.select(Some(0));
         Self {
-            state,
-            focused: false,
+            list: ResourceList::new(" Images "),
             active_tab: ImageListTab::Regular,
         }
     }
 
     pub fn set_focus(&mut self, focused: bool) {
-        self.focused = focused;
+        self.list.set_focus(focused);
     }
 
     pub fn shows_internal(&self) -> bool {
@@ -64,22 +61,7 @@ impl ImageListComponent {
             _ => {}
         }
 
-        if len == 0 {
-            return EventResult::Ignored;
-        }
-        let current = self.state.selected().unwrap_or(0);
-        match key.code {
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.state.select(Some((current + 1) % len));
-                EventResult::Message(AppMessage::List(ListMessage::Next))
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.state
-                    .select(Some(if current == 0 { len - 1 } else { current - 1 }));
-                EventResult::Message(AppMessage::List(ListMessage::Prev))
-            }
-            _ => EventResult::Ignored,
-        }
+        self.list.handle_key(key, len)
     }
 
     pub fn render(
@@ -91,64 +73,39 @@ impl ImageListComponent {
         resize_mode: bool,
     ) {
         let t = theme::theme();
-        let block = self.block(area.width, resize_mode);
-        if images.is_empty() {
-            let message = if self.shows_internal() {
-                "  No internal images found"
-            } else {
-                "  No regular machine images found"
-            };
-            f.render_widget(
-                Paragraph::new(message).block(block.style(Style::default().fg(t.text_secondary))),
-                area,
-            );
-            return;
-        }
-
-        self.state.select(Some(selected.min(images.len() - 1)));
-        let items: Vec<ListItem> = images
-            .iter()
-            .map(|image| {
-                let selected = self
-                    .state
-                    .selected()
-                    .is_some_and(|idx| images[idx].name == image.name);
-                let style = if selected {
-                    let style = Style::default().fg(if self.focused {
-                        t.list_selected_focused
-                    } else {
-                        t.list_selected_unfocused
-                    });
-                    if self.focused {
-                        style.add_modifier(Modifier::BOLD)
-                    } else {
-                        style
-                    }
-                } else {
-                    Style::default().fg(t.list_unselected)
-                };
+        let trailing_title = self.tab_title(area.width);
+        let empty_message = if self.shows_internal() {
+            "No internal images found"
+        } else {
+            "No regular images found"
+        };
+        self.list.render(
+            f,
+            area,
+            images,
+            ResourceListRender {
+                selected,
+                resize_mode,
+                empty_message,
+                trailing_title: Some(trailing_title),
+            },
+            |image, styles| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(if selected { ">> " } else { "   " }, style),
+                    styles.cursor_span(),
                     Span::styled("◆ ", Style::default().fg(t.list_icon_alive)),
-                    Span::styled(image.name.clone(), style),
-                    Span::styled(format!(" ({})", image.image_type), style),
+                    Span::styled(image.name.as_str(), styles.text),
+                    Span::styled(format!(" ({})", image.image_type), styles.text),
                     if image.readonly {
                         Span::styled(" [ro]", Style::default().fg(t.text_secondary))
                     } else {
                         Span::raw("")
                     },
                 ]))
-            })
-            .collect();
-
-        let border_color = crate::ui::panel_border_color(resize_mode, self.focused, true);
-        let list = List::new(items)
-            .block(block.border_style(Style::default().fg(border_color)))
-            .highlight_style(Style::default());
-        f.render_stateful_widget(list, area, &mut self.state);
+            },
+        );
     }
 
-    fn block(&self, width: u16, resize_mode: bool) -> Block<'static> {
+    fn tab_title(&self, width: u16) -> Line<'static> {
         let t = theme::theme();
         let labels = if width >= 32 {
             [" Regular ", " Internal "]
@@ -163,7 +120,7 @@ impl ImageListComponent {
         {
             let style = if tab == self.active_tab {
                 Style::default()
-                    .fg(if self.focused {
+                    .fg(if self.list.is_focused() {
                         t.tab_active_focused
                     } else {
                         t.tab_active_unfocused
@@ -178,16 +135,7 @@ impl ImageListComponent {
             }
         }
 
-        Block::default()
-            .title(" Images ")
-            .title(Line::from(spans).right_aligned())
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::ui::panel_border_color(
-                resize_mode,
-                self.focused,
-                true,
-            )))
+        Line::from(spans)
     }
 }
 

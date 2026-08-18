@@ -436,7 +436,10 @@ impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
         match self.ui.focus.active_idx {
             0 => {
-                let result = self.ui.container_list.handle_key(key);
+                let result = self
+                    .ui
+                    .container_list
+                    .handle_key(key, self.data.entries.len());
                 self.handle_container_list_result(result).await;
             }
             1 => {

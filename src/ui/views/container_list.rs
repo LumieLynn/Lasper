@@ -1,24 +1,25 @@
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::ListItem,
     Frame,
 };
 
-use crate::nspawn::ContainerEntry;
-use crate::ui::core::{AppMessage, EventResult, ListMessage};
-use crate::ui::widgets::lists::shared_container_list::SharedContainerList;
+use crate::nspawn::{ContainerEntry, ContainerState};
+use crate::ui::core::EventResult;
+use crate::ui::theme;
+use crate::ui::widgets::lists::resource_list::{ResourceList, ResourceListRender};
 
 pub struct ContainerListComponent {
-    list: SharedContainerList,
+    list: ResourceList,
 }
 
 impl ContainerListComponent {
     pub fn new() -> Self {
         Self {
-            list: SharedContainerList::new(" Machines ", 0),
+            list: ResourceList::new(" Machines "),
         }
     }
 
@@ -32,40 +33,53 @@ impl ContainerListComponent {
         focused: bool,
         resize_mode: bool,
     ) {
-        // Sync state from background data
-        self.list.select(selected);
         self.list.set_focus(focused);
-
-        // Zero-copy rendering
-        self.list.render(f, area, entries, resize_mode);
-
-        if entries.is_empty() {
-            // Hint logic (simplified for now but preserving the spirit)
-            let hint = "  No running machines found";
-            f.render_widget(
-                Paragraph::new(vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        hint,
-                        Style::default().fg(crate::ui::theme::theme().text_secondary),
-                    )),
-                ]),
-                area,
-            );
-        }
+        let t = theme::theme();
+        self.list.render(
+            f,
+            area,
+            entries,
+            ResourceListRender {
+                selected,
+                resize_mode,
+                empty_message: "No running machines found",
+                trailing_title: None,
+            },
+            |entry, styles| {
+                let icon_style = match &entry.state {
+                    ContainerState::Running | ContainerState::Starting => {
+                        Style::default().fg(t.list_icon_alive)
+                    }
+                    ContainerState::Exiting | ContainerState::Off => {
+                        Style::default().fg(t.list_icon_dead)
+                    }
+                };
+                let icon = match &entry.state {
+                    ContainerState::Running => "● ",
+                    ContainerState::Starting => "◑ ",
+                    ContainerState::Exiting => "◐ ",
+                    ContainerState::Off => "○ ",
+                };
+                let mut spans = vec![
+                    styles.cursor_span(),
+                    Span::styled(icon, icon_style),
+                    Span::styled(entry.name.as_str(), styles.text),
+                    Span::styled(format!(" ({})", entry.state.label()), styles.text),
+                ];
+                if let Some(address) = &entry.address {
+                    spans.push(Span::styled(
+                        format!(" - {address}"),
+                        Style::default().fg(t.list_addr).add_modifier(Modifier::DIM),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            },
+        );
     }
 
     /// Handles navigation keys and returns the corresponding AppMessage.
     /// j/↓ → ListNext, k/↑ → ListPrev. All other keys are Ignored.
-    pub fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                EventResult::Message(AppMessage::List(ListMessage::Next))
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                EventResult::Message(AppMessage::List(ListMessage::Prev))
-            }
-            _ => EventResult::Ignored,
-        }
+    pub fn handle_key(&mut self, key: KeyEvent, len: usize) -> EventResult {
+        self.list.handle_key(key, len)
     }
 }
