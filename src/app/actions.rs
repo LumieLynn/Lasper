@@ -495,11 +495,29 @@ impl App {
             self.action_start_image();
             return;
         }
+        let Some(name) = self
+            .data
+            .entries
+            .get(self.data.selected)
+            .map(|entry| entry.name.clone())
+        else {
+            return;
+        };
+        let start_reservation = match self.data.image_lifecycle.reserve_machine_start(&name) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.set_status(error.to_string(), crate::ui::StatusLevel::Warn);
+                return;
+            }
+        };
         self.perform_container_action(
             "Started",
             Some(ContainerState::Starting),
             |e| !e.state.is_running(),
-            |name, manager| async move { manager.start(&name).await },
+            move |name, manager| async move {
+                let _start_reservation = start_reservation;
+                manager.start(&name).await
+            },
         );
     }
 
@@ -556,16 +574,13 @@ impl App {
     }
 
     pub fn action_remove(&mut self) {
-        if self.ui.delete_dialog.is_some() || self.image_is_focused() {
+        if self.ui.delete_dialog.is_some() {
             self.action_remove_image();
             return;
         }
-        self.ui.delete_dialog = None;
-        self.perform_container_action(
-            "Removed",
-            None,
-            |e| !e.state.is_running(),
-            |name, manager| async move { manager.remove(&name).await },
+        self.set_status(
+            "Focus Images to remove a machine image.".into(),
+            crate::ui::StatusLevel::Info,
         );
     }
 
@@ -599,6 +614,13 @@ impl App {
             );
             return;
         }
+        let start_reservation = match self.data.image_lifecycle.reserve_machine_start(&name) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.set_status(error.to_string(), crate::ui::StatusLevel::Warn);
+                return;
+            }
+        };
         let manager = self.data.manager.clone();
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
@@ -617,6 +639,7 @@ impl App {
         let pm = self.permissions.clone();
         let operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
+            let _start_reservation = start_reservation;
             let _operation = operation;
             let audit = match pm.request_elevation(format!("Start {}", name)).await {
                 Ok(audit) => audit,
@@ -685,7 +708,34 @@ impl App {
             );
             return;
         }
-        let manager = self.data.manager.clone();
+        let image = match self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .find(|image| image.name == name)
+            .cloned()
+        {
+            Some(image) => image,
+            None => {
+                self.set_status(
+                    format!("Image {} changed before removal started.", name),
+                    crate::ui::StatusLevel::Warn,
+                );
+                return;
+            }
+        };
+        let removal = match self
+            .data
+            .image_lifecycle
+            .begin_remove(&image, cleanup_artifacts)
+        {
+            Ok(operation) => operation,
+            Err(error) => {
+                self.set_status(error.to_string(), crate::ui::StatusLevel::Warn);
+                return;
+            }
+        };
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
             None => return,
@@ -706,34 +756,88 @@ impl App {
                     return;
                 }
             };
-            let result = audit.run(manager.remove(&name)).await;
+            let result = audit.run(async { Ok(removal.run().await) }).await;
             let event = match result {
                 Err(error) => crate::events::AppEvent::ActionDone(
                     format!("Remove failed: {}", error),
                     crate::ui::StatusLevel::Error,
                 ),
-                Ok(()) if !cleanup_artifacts => crate::events::AppEvent::ActionDone(
-                    format!("Removed image {}", name),
-                    crate::ui::StatusLevel::Success,
-                ),
-                Ok(()) => {
-                    let cleanup_result = match pm
-                        .request_elevation(format!("Clean Lasper artifacts for {}", name))
-                        .await
-                    {
-                        Ok(audit) => audit.run(manager.cleanup_image_artifacts(&name)).await,
-                        Err(error) => Err(error),
+                Ok(crate::nspawn::ops::ImageRemovalOutcome::NotAttempted { reason, .. }) => {
+                    crate::events::AppEvent::ActionDone(
+                        format!("Remove was not attempted: {}", reason),
+                        crate::ui::StatusLevel::Warn,
+                    )
+                }
+                Ok(crate::nspawn::ops::ImageRemovalOutcome::Removed(report)) => {
+                    let unit_warning = match &report.unit {
+                        crate::nspawn::ops::image_lifecycle::UnitDisableReport::Failed(reason) => {
+                            Some(reason.clone())
+                        }
+                        _ => None,
                     };
-                    match cleanup_result {
-                        Ok(()) => crate::events::AppEvent::ActionDone(
-                            format!("Removed image {} and Lasper artifacts", name),
-                            crate::ui::StatusLevel::Success,
-                        ),
-                        Err(error) => crate::events::AppEvent::ActionDone(
-                            format!("Removed image {}; cleanup warning: {}", name, error),
+                    match report.artifacts {
+                        crate::nspawn::ops::image_lifecycle::ArtifactCleanupReport::Removed => {
+                            match unit_warning {
+                                Some(reason) => crate::events::AppEvent::ActionDone(
+                                    format!(
+                                        "Removed image {} and Lasper artifacts; unit disable warning: {}",
+                                        name, reason
+                                    ),
+                                    crate::ui::StatusLevel::Warn,
+                                ),
+                                None => crate::events::AppEvent::ActionDone(
+                                    format!("Removed image {} and Lasper artifacts", name),
+                                    crate::ui::StatusLevel::Success,
+                                ),
+                            }
+                        }
+                        crate::nspawn::ops::image_lifecycle::ArtifactCleanupReport::PreservedAmbiguous(
+                            errors,
+                        )
+                        | crate::nspawn::ops::image_lifecycle::ArtifactCleanupReport::PartiallyRemoved(errors)
+                        | crate::nspawn::ops::image_lifecycle::ArtifactCleanupReport::Failed(
+                            errors,
+                        ) => crate::events::AppEvent::ActionDone(
+                            format!(
+                                "Removed image {}; cleanup warning: {}{}",
+                                name,
+                                errors.join("; "),
+                                unit_warning
+                                    .as_deref()
+                                    .map(|reason| format!("; unit disable: {reason}"))
+                                    .unwrap_or_default()
+                            ),
                             crate::ui::StatusLevel::Warn,
                         ),
+                        _ => match unit_warning {
+                            Some(reason) => crate::events::AppEvent::ActionDone(
+                                format!("Removed image {}; unit disable warning: {}", name, reason),
+                                crate::ui::StatusLevel::Warn,
+                            ),
+                            None => crate::events::AppEvent::ActionDone(
+                                format!("Removed image {}", name),
+                                crate::ui::StatusLevel::Success,
+                            ),
+                        },
                     }
+                }
+                Ok(crate::nspawn::ops::ImageRemovalOutcome::Rejected { reason, .. }) => {
+                    crate::events::AppEvent::ActionDone(
+                        format!("Remove rejected: {}", reason),
+                        crate::ui::StatusLevel::Warn,
+                    )
+                }
+                Ok(crate::nspawn::ops::ImageRemovalOutcome::Failed { reason, .. }) => {
+                    crate::events::AppEvent::ActionDone(
+                        format!("Remove failed: {}", reason),
+                        crate::ui::StatusLevel::Error,
+                    )
+                }
+                Ok(crate::nspawn::ops::ImageRemovalOutcome::OutcomeUnknown { reason, .. }) => {
+                    crate::events::AppEvent::ActionDone(
+                        format!("Removal outcome unknown: {}", reason),
+                        crate::ui::StatusLevel::Warn,
+                    )
                 }
             };
             let _ = tx.send(event).await;

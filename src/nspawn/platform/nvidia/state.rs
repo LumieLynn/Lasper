@@ -1,5 +1,6 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, MachineName};
+use crate::nspawn::ops::image_lifecycle::ArtifactOwnership;
 use crate::nspawn::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 
 const MAX_NVIDIA_STATE_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_STATE_ITEMS: usize = 16384;
+const NVIDIA_STATE_MARKER: &str = "lasper-nvidia-state-v1";
 
 /// A single host→container path mapping for an nspawn Bind= or BindReadOnly= entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -25,6 +27,11 @@ pub struct PassthroughBind {
 pub struct NvidiaState {
     /// Host driver version when this state was captured.
     pub driver_version: String,
+
+    /// Present only in state files written by the current Lasper cleanup path.
+    /// Missing or unknown markers make an existing file ambiguous.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_marker: Option<String>,
 
     /// Unified bind-mount entries. This is the primary field.
     #[serde(default)]
@@ -234,6 +241,17 @@ impl NvidiaStateStore {
         Ok(())
     }
 
+    pub async fn remove_owned(&self, name: &str) -> Result<ArtifactOwnership> {
+        let result = self
+            .execute(NvidiaStateOperation::RemoveOwned(RemoveNvidiaState {
+                machine: parse_machine_name(name)?,
+            }))
+            .await?;
+        result.ownership.ok_or_else(|| {
+            NspawnError::Runtime("owned NVIDIA cleanup returned no ownership evidence".into())
+        })
+    }
+
     async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
         if let Some(daemon) = &self.daemon {
             daemon
@@ -261,6 +279,7 @@ pub(crate) enum NvidiaStateOperation {
     Write(Box<WriteNvidiaState>),
     WriteInitial(Box<WriteNvidiaState>),
     Remove(RemoveNvidiaState),
+    RemoveOwned(RemoveNvidiaState),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -288,6 +307,8 @@ pub(crate) struct NvidiaStateResult {
     state: Option<NvidiaState>,
     #[serde(default)]
     apply: Option<ApplyStatus>,
+    #[serde(default)]
+    ownership: Option<ArtifactOwnership>,
 }
 
 pub(crate) async fn execute_nvidia_state_operation(
@@ -313,6 +334,13 @@ pub(crate) async fn execute_nvidia_state_operation(
         NvidiaStateOperation::Remove(request) => {
             remove_state_at(&state_path(&request.machine)).await?;
             Ok(NvidiaStateResult::default())
+        }
+        NvidiaStateOperation::RemoveOwned(request) => {
+            let ownership = remove_owned_state_at(&state_path(&request.machine)).await?;
+            Ok(NvidiaStateResult {
+                ownership: Some(ownership),
+                ..Default::default()
+            })
         }
     }
 }
@@ -345,26 +373,30 @@ async fn read_state_at(path: &Path) -> Result<Option<NvidiaState>> {
 
 async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
     validate_state(state)?;
-    let content = serde_json::to_string_pretty(state)?;
+    let mut state = state.clone();
+    state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
+    let content = serde_json::to_string_pretty(&state)?;
     if content.len() > MAX_NVIDIA_STATE_BYTES {
         return Err(NspawnError::Validation(format!(
             "NVIDIA state exceeds {} bytes",
             MAX_NVIDIA_STATE_BYTES
         )));
     }
-    AsyncLockedWriter::write_atomic(path, &content).await
+    AsyncLockedWriter::write_atomic_with_mode(path, &content, Some(0o600)).await
 }
 
 async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<ApplyStatus> {
     validate_state(state)?;
-    let content = serde_json::to_string_pretty(state)?;
+    let mut state = state.clone();
+    state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
+    let content = serde_json::to_string_pretty(&state)?;
     if content.len() > MAX_NVIDIA_STATE_BYTES {
         return Err(NspawnError::Validation(format!(
             "NVIDIA state exceeds {} bytes",
             MAX_NVIDIA_STATE_BYTES
         )));
     }
-    AsyncLockedWriter::apply_locked(path, move |existing| {
+    AsyncLockedWriter::apply_locked_with_mode(path, 0o600, move |existing| {
         Ok(match existing {
             None => (Some(content), ApplyStatus::Created),
             Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
@@ -388,7 +420,53 @@ async fn remove_state_at(path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn remove_owned_state_at(path: &Path) -> Result<ArtifactOwnership> {
+    remove_owned_state_at_with_uid(path, 0).await
+}
+
+async fn remove_owned_state_at_with_uid(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<ArtifactOwnership> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArtifactOwnership::NotPresent)
+        }
+        Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() > MAX_NVIDIA_STATE_BYTES as u64
+        || std::os::unix::fs::MetadataExt::uid(&metadata) != expected_uid
+        || (std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777) != 0o600
+    {
+        return Ok(ArtifactOwnership::AmbiguousLegacy);
+    }
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    let state: NvidiaState = match serde_json::from_str(&content) {
+        Ok(state) => state,
+        Err(_) => return Ok(ArtifactOwnership::AmbiguousLegacy),
+    };
+    if state.ownership_marker.as_deref() != Some(NVIDIA_STATE_MARKER) {
+        return Ok(ArtifactOwnership::AmbiguousLegacy);
+    }
+    if validate_state(&state).is_err() {
+        return Ok(ArtifactOwnership::AmbiguousLegacy);
+    }
+    remove_state_at(path).await?;
+    Ok(ArtifactOwnership::ProvenOwned)
+}
+
 fn validate_state(state: &NvidiaState) -> Result<()> {
+    if let Some(marker) = &state.ownership_marker {
+        if marker != NVIDIA_STATE_MARKER {
+            return Err(NspawnError::Validation(
+                "unknown NVIDIA state ownership marker".into(),
+            ));
+        }
+    }
     let total_items = state.binds.len()
         + state.readonly_binds.len()
         + state.device_binds.len()
@@ -523,6 +601,7 @@ pub(crate) fn calculate_removed_binds(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_passthrough_bind_serde_roundtrip() {
@@ -966,5 +1045,69 @@ mod tests {
         remove_state_at(&path).await.unwrap();
 
         assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn owned_state_cleanup_requires_marker_and_safe_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let owned = directory.path().join("state.json");
+        let legacy = directory.path().join("legacy.json");
+        let unsafe_mode = directory.path().join("unsafe.json");
+        let symlink = directory.path().join("symlink.json");
+        let state = NvidiaState {
+            driver_version: "555.0".into(),
+            ..Default::default()
+        };
+        write_state_at(&owned, &state).await.unwrap();
+        tokio::fs::write(&legacy, serde_json::to_string(&state).unwrap())
+            .await
+            .unwrap();
+        let mut marked = state.clone();
+        marked.ownership_marker = Some(NVIDIA_STATE_MARKER.into());
+        tokio::fs::write(&unsafe_mode, serde_json::to_string(&marked).unwrap())
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o666))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&owned, &symlink).unwrap();
+
+        assert_eq!(
+            remove_owned_state_at_with_uid(&owned, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ArtifactOwnership::ProvenOwned
+        );
+        assert!(!owned.exists());
+        assert_eq!(
+            remove_owned_state_at_with_uid(&legacy, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ArtifactOwnership::AmbiguousLegacy
+        );
+        assert_eq!(
+            remove_owned_state_at_with_uid(&unsafe_mode, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ArtifactOwnership::AmbiguousLegacy
+        );
+        assert_eq!(
+            remove_owned_state_at_with_uid(&symlink, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ArtifactOwnership::AmbiguousLegacy
+        );
+        assert!(legacy.exists());
+        assert!(unsafe_mode.exists());
+        assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            remove_owned_state_at_with_uid(
+                &directory.path().join("missing.json"),
+                uzers::get_current_uid(),
+            )
+            .await
+            .unwrap(),
+            ArtifactOwnership::NotPresent
+        );
     }
 }

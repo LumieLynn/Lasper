@@ -34,7 +34,6 @@ pub trait MachineControl: Send + Sync + 'static {
     async fn enable(&self, name: &str) -> Result<()>;
     async fn disable(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
-    async fn remove(&self, name: &str) -> Result<()>;
     async fn reload_daemon(&self) -> Result<()>;
 }
 
@@ -153,10 +152,6 @@ where
 
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
         self.backend.kill(name, signal).await
-    }
-
-    async fn remove(&self, name: &str) -> Result<()> {
-        self.backend.remove(name).await
     }
 
     async fn reload_daemon(&self) -> Result<()> {

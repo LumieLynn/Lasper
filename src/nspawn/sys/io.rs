@@ -162,7 +162,18 @@ impl AsyncLockedWriter {
 
     /// Safely writes content to a file using atomic rename and fsync to ensure durability.
     /// Does not use a lock file.
+    #[allow(dead_code)]
     pub async fn write_atomic(path: &Path, content: &str) -> Result<()> {
+        Self::write_atomic_with_mode(path, content, None).await
+    }
+
+    /// Safely writes content with an explicit final mode using atomic rename.
+    /// Does not use a lock file.
+    pub async fn write_atomic_with_mode(
+        path: &Path,
+        content: &str,
+        mode: Option<u32>,
+    ) -> Result<()> {
         let tmp_path = path.with_extension("write.tmp");
 
         // 1. Ensure parent exists
@@ -174,9 +185,20 @@ impl AsyncLockedWriter {
 
         // 2. Write and sync
         {
-            let mut f = fs::File::create(&tmp_path)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create(true).truncate(true);
+            if let Some(mode) = mode {
+                options.mode(mode);
+            }
+            let mut f = options
+                .open(&tmp_path)
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            if let Some(mode) = mode {
+                f.set_permissions(std::fs::Permissions::from_mode(mode))
+                    .await
+                    .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
+            }
             f.write_all(content.as_bytes())
                 .await
                 .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;

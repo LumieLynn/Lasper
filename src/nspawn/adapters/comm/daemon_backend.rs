@@ -12,6 +12,9 @@ use crate::nspawn::models::{
     AllowedSignal, ContainerEntry, ImageEntry, ImageName, MachineName, MachineProperties,
     StatusUpdate,
 };
+use crate::nspawn::ops::image_lifecycle::{
+    ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
+};
 use crate::nspawn::ops::system_operation::SystemOperation;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
@@ -126,8 +129,30 @@ impl ContainerBackend for DaemonBackend {
     async fn remove(&self, name: &str) -> Result<()> {
         let image =
             ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
-        self.call_system_operation(SystemOperation::RemoveImage { image })
-            .await
+        let value = self
+            .call(
+                "image_remove",
+                serde_json::to_value(ImageRemoveRequest {
+                    image,
+                    transport: ImageRemoveTransport::Dbus,
+                })
+                .map_err(|error| NspawnError::Runtime(error.to_string()))?,
+            )
+            .await?;
+        let outcome: ImageControlOutcome = serde_json::from_value(value)
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+        match outcome {
+            ImageControlOutcome::Removed => Ok(()),
+            ImageControlOutcome::NotAttempted { reason } => Err(NspawnError::Runtime(format!(
+                "image removal not attempted: {reason}"
+            ))),
+            ImageControlOutcome::Rejected { reason, .. } => Err(NspawnError::Validation(reason)),
+            ImageControlOutcome::Failed { reason } => Err(NspawnError::Runtime(reason)),
+            ImageControlOutcome::OutcomeUnknown { reason } => Err(NspawnError::Io(
+                std::path::PathBuf::from("daemon image removal"),
+                std::io::Error::new(std::io::ErrorKind::Interrupted, reason),
+            )),
+        }
     }
 
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {

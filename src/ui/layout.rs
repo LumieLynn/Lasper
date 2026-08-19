@@ -195,9 +195,14 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         (app.data.images.as_slice(), app.data.image_selected)
     };
-    app.ui
-        .image_list
-        .render(f, images_area, images, image_selected, resize_mode);
+    app.ui.image_list.render(
+        f,
+        images_area,
+        images,
+        image_selected,
+        &app.data.image_lifecycle.active_images(),
+        resize_mode,
+    );
 
     if !maximized {
         app.ui

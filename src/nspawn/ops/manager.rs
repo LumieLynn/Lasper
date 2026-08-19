@@ -6,7 +6,7 @@ use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{
-    AllowedSignal, ContainerEntry, ImageEntry, MachineProperties, RuntimeSnapshot, StatusUpdate,
+    AllowedSignal, ContainerEntry, MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 use crate::nspawn::ops::{PermissionLevel, PermissionManager};
 use crate::nspawn::sys::ExecutionContext;
@@ -92,10 +92,6 @@ pub trait NspawnManager: Send + Sync + 'static {
     async fn poweroff(&self, name: &str) -> Result<()>;
     async fn reboot(&self, name: &str) -> Result<()>;
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()>;
-    /// Remove the systemd-managed image and its settings through `RemoveImage`.
-    async fn remove(&self, name: &str) -> Result<()>;
-    /// Remove Lasper's NVIDIA state and known systemd unit drop-ins.
-    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()>;
     async fn is_dbus_available(&self) -> bool;
     fn did_fallback(&self) -> Option<String>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>);
@@ -521,94 +517,6 @@ impl NspawnManager for DefaultManager {
         fallback_to_cli!(self, kill, name, signal)
     }
 
-    async fn remove(&self, name: &str) -> Result<()> {
-        if ImageEntry::is_protected_name(name) {
-            return Err(crate::nspawn::errors::NspawnError::Validation(
-                "the .host image cannot be removed".into(),
-            ));
-        }
-        if !ImageEntry::is_valid_name(name) {
-            return Err(crate::nspawn::errors::NspawnError::Validation(format!(
-                "invalid image name {:?}",
-                name
-            )));
-        }
-        if self
-            .list_machines()
-            .await?
-            .iter()
-            .any(|machine| machine.name == name && machine.state.is_running())
-        {
-            return Err(crate::nspawn::errors::NspawnError::ContainerAlreadyRunning(
-                name.to_string(),
-            ));
-        }
-
-        let hidden = ImageEntry::is_hidden_name(name);
-        let managed_machine_name = crate::nspawn::models::MachineName::new(name).is_ok();
-        // Keep a removed regular image from leaving an enabled nspawn unit
-        // behind. Hidden images and regular images whose names cannot identify
-        // an nspawn machine have no Lasper-managed unit sidecars.
-        if !hidden && managed_machine_name {
-            if let Err(error) = self.disable(name).await {
-                log::warn!("Failed to disable {} before image removal: {}", name, error);
-            }
-        }
-
-        // systemd's `RemoveImage` operation accepts image names rather than
-        // machine names, including dot-prefixed hidden images. The CLI uses
-        // the same D-Bus method, so both paths share the same validation and
-        // deletion semantics.
-        let result = if !self.cli_mode && self.dbus.is_available().await {
-            match self.dbus_control.remove(name).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    let reason = Self::classify_fallback(&e);
-                    log::warn!("DBus remove failed ({}), falling back to CLI", reason);
-                    self.mark_fallback(&reason);
-                    self.cli_control.remove(name).await.map_err(|e| {
-                        log::error!("CLI remove failed for {}: {}", name, e);
-                        e
-                    })
-                }
-            }
-        } else {
-            self.cli_control.remove(name).await.map_err(|e| {
-                log::error!("CLI remove failed for {}: {}", name, e);
-                e
-            })
-        };
-
-        result?;
-        self.nudge();
-        Ok(())
-    }
-
-    async fn cleanup_image_artifacts(&self, name: &str) -> Result<()> {
-        crate::nspawn::models::MachineName::new(name)
-            .map_err(|error| crate::nspawn::errors::NspawnError::Validation(error.to_string()))?;
-
-        let mut cleanup_errors = Vec::new();
-        if let Err(error) = self.exec_ctx.systemd_unit.remove_overrides(name).await {
-            cleanup_errors.push(format!("systemd unit drop-ins: {error}"));
-        }
-        if let Err(error) = self.exec_ctx.nvidia_state.remove(name).await {
-            cleanup_errors.push(format!("NVIDIA state: {error}"));
-        }
-        if let Err(error) = self.reload_daemon_fallback().await {
-            cleanup_errors.push(format!("systemd daemon reload: {error}"));
-        }
-
-        if cleanup_errors.is_empty() {
-            Ok(())
-        } else {
-            Err(crate::nspawn::errors::NspawnError::Runtime(format!(
-                "Lasper artifact cleanup was incomplete: {}",
-                cleanup_errors.join("; ")
-            )))
-        }
-    }
-
     fn spawn_log_stream(
         &self,
         name: &str,
@@ -938,7 +846,7 @@ mod tests {
         ContainerBackend, MachineControl, MockContainerBackend, RuntimeSource,
     };
     use crate::nspawn::errors::NspawnError;
-    use crate::nspawn::models::ContainerState;
+    use crate::nspawn::models::{ContainerState, ImageEntry};
     use crate::nspawn::ops::DefaultPermissionManager;
     fn dummy_entry(name: &str) -> ContainerEntry {
         ContainerEntry {
@@ -1082,10 +990,6 @@ mod tests {
             self.0.kill(name, signal).await
         }
 
-        async fn remove(&self, name: &str) -> Result<()> {
-            self.0.remove(name).await
-        }
-
         async fn reload_daemon(&self) -> Result<()> {
             self.0.reload_daemon().await
         }
@@ -1118,120 +1022,6 @@ mod tests {
             watch_paths: vec![],
             nudge_tx: tokio::sync::watch::channel(()).0,
         }
-    }
-
-    #[tokio::test]
-    async fn remove_allows_hidden_images_without_origin_classification() {
-        let dbus = mock_dbus_unavailable();
-        let mut cli = MockContainerBackend::new();
-        cli.expect_list_machines().returning(|| Ok(vec![]));
-        cli.expect_remove().returning(|_| Ok(()));
-        let mgr = test_manager(dbus, cli, false);
-
-        let result = mgr.remove(".download").await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn remove_allows_hidden_images_of_unknown_type() {
-        let dbus = mock_dbus_unavailable();
-        let mut cli = MockContainerBackend::new();
-        cli.expect_list_machines().returning(|| Ok(vec![]));
-        cli.expect_remove().returning(|_| Ok(()));
-        let mgr = test_manager(dbus, cli, false);
-
-        let result = mgr.remove(".unclassified-image").await;
-
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn remove_hidden_image_uses_dbus_image_name_validation() {
-        let mut dbus = mock_dbus_available();
-        dbus.expect_list_machines().returning(|| Ok(vec![]));
-        dbus.expect_remove()
-            .withf(|name| name == ".oci-sha256:abc")
-            .returning(|_| Ok(()));
-
-        let mgr = test_manager(dbus, MockContainerBackend::new(), false);
-
-        mgr.remove(".oci-sha256:abc").await.unwrap();
-        assert!(mgr.did_fallback().is_none());
-    }
-
-    #[tokio::test]
-    async fn remove_hidden_image_falls_back_only_after_a_real_dbus_failure() {
-        let mut dbus = mock_dbus_available();
-        dbus.expect_list_machines().returning(|| Ok(vec![]));
-        dbus.expect_remove().returning(|_| {
-            Err(NspawnError::Dbus(zbus::Error::Failure(
-                "machined unavailable".into(),
-            )))
-        });
-
-        let mut cli = MockContainerBackend::new();
-        cli.expect_remove()
-            .withf(|name| name == ".oci-sha256:abc")
-            .returning(|_| Ok(()));
-
-        let mgr = test_manager(dbus, cli, false);
-
-        mgr.remove(".oci-sha256:abc").await.unwrap();
-        assert!(mgr.did_fallback().is_some());
-    }
-
-    #[tokio::test]
-    async fn remove_rejects_protected_and_temporary_image_names_before_routing() {
-        let mgr = test_manager(
-            MockContainerBackend::new(),
-            MockContainerBackend::new(),
-            false,
-        );
-
-        assert!(matches!(
-            mgr.remove(".host").await.unwrap_err(),
-            NspawnError::Validation(_)
-        ));
-        assert!(matches!(
-            mgr.remove(".#temporary").await.unwrap_err(),
-            NspawnError::Validation(_)
-        ));
-    }
-
-    #[tokio::test]
-    async fn remove_rechecks_running_machine_state() {
-        let mut dbus = mock_dbus_available();
-        dbus.expect_list_machines().returning(|| {
-            let mut entry = dummy_entry("active");
-            entry.state = ContainerState::Running;
-            Ok(vec![entry])
-        });
-        let mgr = test_manager(dbus, MockContainerBackend::new(), false);
-
-        let error = mgr.remove("active").await.unwrap_err();
-
-        assert!(matches!(error, NspawnError::ContainerAlreadyRunning(_)));
-    }
-
-    #[tokio::test]
-    async fn cli_mode_remove_does_not_probe_dbus() {
-        let dbus = MockContainerBackend::new();
-        let mut cli = MockContainerBackend::new();
-        cli.expect_list_machines().once().returning(|| Ok(vec![]));
-        cli.expect_disable()
-            .withf(|name| name == "regular-image")
-            .once()
-            .returning(|_| Ok(()));
-        cli.expect_remove()
-            .withf(|name| name == "regular-image")
-            .once()
-            .returning(|_| Ok(()));
-        let mgr = test_manager(dbus, cli, true);
-
-        mgr.remove("regular-image").await.unwrap();
-
-        assert!(mgr.did_fallback().is_none());
     }
 
     // list_machines

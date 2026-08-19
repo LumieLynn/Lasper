@@ -1,14 +1,19 @@
 pub mod activity;
 pub mod handlers;
+pub mod image_lifecycle;
+pub(crate) mod image_lifecycle_adapter;
 pub mod inspect;
 pub mod manager;
 pub mod permission;
 pub mod provision;
+pub mod registry;
 pub mod system_operation;
 
 pub use activity::HostOperationTracker;
+pub use image_lifecycle::{ImageLifecycleService, ImageRemovalOutcome};
 pub use manager::{DefaultManager, NspawnManager};
 pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
+pub use registry::{OperationRegistry, ResourceClaim, ResourceKey};
 pub use system_operation::SystemOperationStore;
 
 #[derive(Clone)]

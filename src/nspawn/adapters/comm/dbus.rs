@@ -6,6 +6,7 @@ use crate::nspawn::models::{
     ContainerEntry, ContainerState, ImageEntry, ImageName, InspectionCompleteness,
     InspectionSource, MachineName, MachineProperties, StatusUpdate,
 };
+use crate::nspawn::ops::image_lifecycle::{ImageControlOutcome, ImageRemovalRejection};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -79,6 +80,23 @@ impl DbusBackend {
         ManagerProxy::new(&conn).await.ok()
     }
 
+    pub(crate) async fn remove_image_outcome(&self, image: &ImageName) -> ImageControlOutcome {
+        let Some(proxy) = self.manager_proxy().await else {
+            return ImageControlOutcome::NotAttempted {
+                reason: "systemd-machined D-Bus endpoint is unavailable".into(),
+            };
+        };
+        match proxy.remove_image(image.as_str()).await {
+            Ok(()) => ImageControlOutcome::Removed,
+            Err(zbus::Error::MethodError(name, detail, _)) => {
+                classify_remove_image_method_error(name.as_str(), detail)
+            }
+            Err(error) => ImageControlOutcome::OutcomeUnknown {
+                reason: format!("RemoveImage response was not confirmed: {error}"),
+            },
+        }
+    }
+
     /// Call a method on `org.freedesktop.systemd1.Manager` with
     /// `AllowInteractiveAuth` set, so polkit can trigger the desktop
     /// environment's authentication agent (the same path `machinectl` uses).
@@ -110,6 +128,33 @@ impl DbusBackend {
                 )))
             })?;
         Ok(())
+    }
+}
+
+fn classify_remove_image_method_error(name: &str, detail: Option<String>) -> ImageControlOutcome {
+    let reason = detail.unwrap_or_else(|| name.to_string());
+    let rejection = match name {
+        "org.freedesktop.machine1.NoSuchImage" | "System.Error.ENOENT" => {
+            Some(ImageRemovalRejection::NotFound)
+        }
+        "System.Error.EBUSY" => Some(ImageRemovalRejection::Busy),
+        "org.freedesktop.DBus.Error.AccessDenied"
+        | "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired"
+        | "org.freedesktop.PolicyKit1.Error.NotAuthorized"
+        | "org.freedesktop.PolicyKit1.Error.AuthorizationFailed"
+        | "org.freedesktop.PolicyKit1.Error.Failed"
+        | "System.Error.EACCES"
+        | "System.Error.EPERM" => Some(ImageRemovalRejection::PermissionDenied),
+        "org.freedesktop.DBus.Error.InvalidArgs" | "System.Error.EINVAL" => {
+            Some(ImageRemovalRejection::InvalidTarget)
+        }
+        _ => None,
+    };
+    match rejection {
+        Some(rejection) => ImageControlOutcome::Rejected { rejection, reason },
+        None => ImageControlOutcome::Failed {
+            reason: format!("{name}: {reason}"),
+        },
     }
 }
 
@@ -454,5 +499,36 @@ mod tests {
         );
         assert!(parse_image_name(".#temporary").is_err());
         assert!(parse_image_name("../escape").is_err());
+    }
+
+    #[test]
+    fn remove_image_method_errors_keep_semantic_outcomes() {
+        for (name, expected) in [
+            (
+                "org.freedesktop.machine1.NoSuchImage",
+                ImageRemovalRejection::NotFound,
+            ),
+            ("System.Error.EBUSY", ImageRemovalRejection::Busy),
+            (
+                "org.freedesktop.DBus.Error.AccessDenied",
+                ImageRemovalRejection::PermissionDenied,
+            ),
+            (
+                "org.freedesktop.DBus.Error.InvalidArgs",
+                ImageRemovalRejection::InvalidTarget,
+            ),
+        ] {
+            assert!(matches!(
+                classify_remove_image_method_error(name, Some("detail".into())),
+                ImageControlOutcome::Rejected { rejection, .. } if rejection == expected
+            ));
+        }
+        assert!(matches!(
+            classify_remove_image_method_error(
+                "org.freedesktop.machine1.UnexpectedFailure",
+                Some("failed".into()),
+            ),
+            ImageControlOutcome::Failed { .. }
+        ));
     }
 }

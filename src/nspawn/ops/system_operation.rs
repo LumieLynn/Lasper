@@ -2,6 +2,7 @@
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{AllowedSignal, ImageEntry, ImageName, MachineName};
+use crate::nspawn::ops::image_lifecycle::ImageControlOutcome;
 use crate::nspawn::sys::command::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use serde::{Deserialize, Serialize};
@@ -143,6 +144,42 @@ impl SystemOperationStore {
     }
 }
 
+pub(crate) async fn execute_cli_image_remove(image: ImageName) -> ImageControlOutcome {
+    execute_cli_image_remove_with_runner(image, &DefaultCommandRunner).await
+}
+
+pub(crate) async fn execute_cli_image_remove_with_runner(
+    image: ImageName,
+    runner: &dyn CommandRunner,
+) -> ImageControlOutcome {
+    let operation = SystemOperation::RemoveImage { image };
+    let (program, args) = match command(&operation) {
+        Ok(command) => command,
+        Err(error) => return crate::nspawn::ops::image_lifecycle::map_native_error(error),
+    };
+    let output = match runner.run(program, args.clone()).await {
+        Ok(output) => output,
+        Err(error) => {
+            return ImageControlOutcome::NotAttempted {
+                reason: format!("failed to launch {program}: {error}"),
+            }
+        }
+    };
+    crate::nspawn::sys::log_output(program, &output);
+    if output.status.success() {
+        ImageControlOutcome::Removed
+    } else {
+        ImageControlOutcome::Failed {
+            reason: NspawnError::cmd_failed(
+                "typed image removal",
+                format!("{} {}", program, args.join(" ")),
+                &output,
+            )
+            .to_string(),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::nspawn::adapters::comm::backend::MachineControl for SystemOperationStore {
     async fn start(&self, name: &str) -> Result<()> {
@@ -171,10 +208,6 @@ impl crate::nspawn::adapters::comm::backend::MachineControl for SystemOperationS
 
     async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
         Self::kill(self, name, signal).await
-    }
-
-    async fn remove(&self, name: &str) -> Result<()> {
-        Self::remove_image(self, name).await
     }
 
     async fn reload_daemon(&self) -> Result<()> {
@@ -305,6 +338,14 @@ mod tests {
         }
     }
 
+    fn failure(stderr: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: vec![],
+            stderr: stderr.as_bytes().to_vec(),
+        }
+    }
+
     #[test]
     fn operation_deserialization_rejects_untyped_arguments() {
         let traversal = r#"{"operation":"remove_image","image":"../host"}"#;
@@ -351,6 +392,47 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_cli_removal_reports_success() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().once().returning(|_, _| Ok(success()));
+
+        assert_eq!(
+            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
+            ImageControlOutcome::Removed
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_cli_removal_reports_launch_failure_as_not_attempted() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().once().returning(|_, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "machinectl missing",
+            ))
+        });
+
+        assert!(matches!(
+            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
+            ImageControlOutcome::NotAttempted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn typed_cli_removal_reports_nonzero_exit_as_failed() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .once()
+            .returning(|_, _| Ok(failure("image is busy")));
+
+        assert!(matches!(
+            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
+            ImageControlOutcome::Failed { .. }
+        ));
     }
 
     #[tokio::test]

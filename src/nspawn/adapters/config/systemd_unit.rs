@@ -1,16 +1,21 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, MachineName};
+use crate::nspawn::ops::image_lifecycle::ArtifactOwnership;
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use crate::nspawn::sys::io::AsyncLockedWriter;
 use ini::Ini;
 use serde::{Deserialize, Serialize};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const MAX_OVERRIDE_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_DEVICE_ALLOW_ENTRIES: usize = 4096;
-const LASPER_OVERRIDE_FILE: &str = "override.conf";
-const LASPER_NVIDIA_OVERRIDE_FILE: &str = "10-lasper-nvidia.conf";
+const LASPER_OVERRIDE_FILE: &str = "90-lasper.conf";
+const LASPER_NVIDIA_OVERRIDE_FILE: &str = "90-lasper-nvidia.conf";
+const LEGACY_OVERRIDE_FILE: &str = "override.conf";
+const LEGACY_NVIDIA_OVERRIDE_FILE: &str = "10-lasper-nvidia.conf";
+const LASPER_OVERRIDE_MARKER: &str = "# Managed by Lasper: systemd unit override v1";
 
 /// Read-only view of the host unit drop-ins associated with a machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,14 +96,19 @@ impl SystemdUnitStore {
         Ok(())
     }
 
-    pub async fn remove_overrides(&self, name: &str) -> Result<()> {
-        self.execute(SystemdUnitOperation::RemoveOverrides(
-            RemoveServiceOverrides {
-                machine: parse_machine_name(name)?,
-            },
-        ))
-        .await?;
-        Ok(())
+    /// Remove only current Lasper drop-ins whose marker and file safety checks
+    /// prove ownership. Legacy unmarked names are deliberately preserved.
+    pub async fn remove_owned_overrides(&self, name: &str) -> Result<Vec<ArtifactOwnership>> {
+        let result = self
+            .execute(SystemdUnitOperation::RemoveOwnedOverrides(
+                RemoveServiceOverrides {
+                    machine: parse_machine_name(name)?,
+                },
+            ))
+            .await?;
+        result.ownership.ok_or_else(|| {
+            NspawnError::Runtime("owned override cleanup returned no ownership evidence".into())
+        })
     }
 
     pub async fn remove_service_override(&self, name: &str) -> Result<()> {
@@ -151,7 +161,7 @@ pub(crate) enum SystemdUnitOperation {
     CloneOverride(CloneServiceOverride),
     WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
     RemoveOverride(RemoveServiceOverride),
-    RemoveOverrides(RemoveServiceOverrides),
+    RemoveOwnedOverrides(RemoveServiceOverrides),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -209,6 +219,8 @@ pub(crate) struct SystemdUnitResult {
     drop_ins: Vec<SystemdDropIn>,
     #[serde(default)]
     apply: Option<ApplyStatus>,
+    #[serde(default)]
+    ownership: Option<Vec<ArtifactOwnership>>,
 }
 
 pub(crate) async fn execute_systemd_unit_operation(
@@ -269,12 +281,16 @@ pub(crate) async fn execute_systemd_unit_operation(
         SystemdUnitOperation::RemoveOverride(request) => {
             remove_service_override_at(&service_override_dir(&request.machine)).await?;
         }
-        SystemdUnitOperation::RemoveOverrides(request) => {
-            remove_lasper_overrides_at(
+        SystemdUnitOperation::RemoveOwnedOverrides(request) => {
+            let ownership = remove_owned_lasper_overrides_at(
                 &service_override_dir(&request.machine),
                 &transient_service_override_dir(&request.machine),
             )
             .await?;
+            return Ok(SystemdUnitResult {
+                ownership: Some(ownership),
+                ..Default::default()
+            });
         }
     }
     Ok(SystemdUnitResult::default())
@@ -309,7 +325,10 @@ pub fn systemd_override_content(
 
     let mut buffer = Vec::new();
     conf.write_to(&mut buffer).unwrap_or_default();
-    String::from_utf8_lossy(&buffer).into_owned()
+    format!(
+        "{LASPER_OVERRIDE_MARKER}\n{}",
+        String::from_utf8_lossy(&buffer)
+    )
 }
 
 /// Write a systemd service override to allow devices via cgroups.
@@ -383,7 +402,7 @@ fn validate_device_allow(value: &str) -> Result<()> {
 }
 
 fn nvidia_device_allow_content(device_paths: &[String]) -> String {
-    let mut content = String::from("[Service]\n");
+    let mut content = format!("{LASPER_OVERRIDE_MARKER}\n[Service]\n");
     for path in device_paths {
         content.push_str(&format!("DeviceAllow={} rw\n", path));
     }
@@ -441,11 +460,11 @@ async fn read_drop_ins(dir: &Path) -> Result<Vec<SystemdDropIn>> {
 }
 
 async fn write_override_at(path: &Path, content: &str) -> Result<()> {
-    AsyncLockedWriter::write_atomic(path, content).await
+    AsyncLockedWriter::write_atomic_with_mode(path, content, Some(0o644)).await
 }
 
 async fn apply_new_override_at(path: &Path, content: String) -> Result<ApplyStatus> {
-    AsyncLockedWriter::apply_locked(path, move |existing| {
+    AsyncLockedWriter::apply_locked_with_mode(path, 0o644, move |existing| {
         Ok(match existing {
             None => (Some(content), ApplyStatus::Created),
             Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
@@ -501,35 +520,108 @@ async fn remove_service_override_at(persistent_dir: &Path) -> Result<()> {
     remove_empty_dir(persistent_dir).await
 }
 
-async fn remove_lasper_overrides_at(persistent_dir: &Path, transient_dir: &Path) -> Result<()> {
-    let override_path = persistent_dir.join(LASPER_OVERRIDE_FILE);
-    let managed_files = [
-        override_path.clone(),
-        crate::nspawn::sys::io::lock_path_for(&override_path),
+async fn remove_owned_lasper_overrides_at(
+    persistent_dir: &Path,
+    transient_dir: &Path,
+) -> Result<Vec<ArtifactOwnership>> {
+    remove_owned_lasper_overrides_at_with_uid(persistent_dir, transient_dir, 0).await
+}
+
+async fn remove_owned_lasper_overrides_at_with_uid(
+    persistent_dir: &Path,
+    transient_dir: &Path,
+    expected_uid: u32,
+) -> Result<Vec<ArtifactOwnership>> {
+    let owned_paths = [
+        persistent_dir.join(LASPER_OVERRIDE_FILE),
         persistent_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
         transient_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
     ];
-    let mut errors = Vec::new();
-
-    for path in managed_files {
-        if let Err(error) = remove_optional_file(&path).await {
-            errors.push(error.to_string());
+    let legacy_paths = [
+        persistent_dir.join(LEGACY_OVERRIDE_FILE),
+        persistent_dir.join(LEGACY_NVIDIA_OVERRIDE_FILE),
+        transient_dir.join(LEGACY_NVIDIA_OVERRIDE_FILE),
+    ];
+    let mut ownership = Vec::with_capacity(owned_paths.len() + legacy_paths.len());
+    for path in owned_paths {
+        let evidence = probe_owned_override_at(&path, expected_uid).await?;
+        if evidence == ArtifactOwnership::ProvenOwned {
+            remove_optional_file(&path).await?;
+            remove_optional_file(&crate::nspawn::sys::io::lock_path_for(&path)).await?;
         }
+        ownership.push(evidence);
+    }
+    for path in legacy_paths {
+        ownership.push(probe_legacy_override_at(&path).await?);
     }
     for directory in [persistent_dir, transient_dir] {
-        if let Err(error) = remove_empty_dir(directory).await {
-            errors.push(error.to_string());
+        remove_empty_dir(directory).await?;
+    }
+    Ok(ownership)
+}
+
+async fn probe_owned_override_at(path: &Path, expected_uid: u32) -> Result<ArtifactOwnership> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ArtifactOwnership::NotPresent)
+        }
+        Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+    };
+    if !metadata.file_type().is_file()
+        || metadata.len() > MAX_OVERRIDE_CONTENT_BYTES as u64
+        || metadata.uid() != expected_uid
+        || (metadata.permissions().mode() & 0o7777) != 0o644
+    {
+        return Ok(ArtifactOwnership::AmbiguousLegacy);
+    }
+    let content = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    Ok(if is_owned_override_content(&content) {
+        ArtifactOwnership::ProvenOwned
+    } else {
+        ArtifactOwnership::AmbiguousLegacy
+    })
+}
+
+async fn probe_legacy_override_at(path: &Path) -> Result<ArtifactOwnership> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(ArtifactOwnership::AmbiguousLegacy),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ArtifactOwnership::NotPresent)
+        }
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+fn is_owned_override_content(content: &str) -> bool {
+    if !content.starts_with(&format!("{LASPER_OVERRIDE_MARKER}\n")) {
+        return false;
+    }
+    let Ok(config) = Ini::load_from_str(content) else {
+        return false;
+    };
+    let mut saw_service = false;
+    for (section, properties) in &config {
+        match section {
+            None if properties.is_empty() => {}
+            Some("Service") => {
+                saw_service = true;
+                if properties.iter().any(|(key, value)| {
+                    key != "DeviceAllow"
+                        || match value.strip_suffix(" rw") {
+                            Some(path) => validate_device_allow(path).is_err(),
+                            None => true,
+                        }
+                }) {
+                    return false;
+                }
+            }
+            _ => return false,
         }
     }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(NspawnError::Runtime(format!(
-            "failed to remove one or more Lasper unit drop-ins: {}",
-            errors.join("; ")
-        )))
-    }
+    saw_service
 }
 
 #[cfg(test)]
@@ -580,7 +672,7 @@ mod tests {
     #[test]
     fn operation_deserialization_rejects_invalid_machine_name() {
         let json = r#"{
-            "operation": "remove_overrides",
+            "operation": "remove_owned_overrides",
             "params": {"machine": "../escape"}
         }"#;
         assert!(serde_json::from_str::<SystemdUnitOperation>(json).is_err());
@@ -608,6 +700,10 @@ mod tests {
         assert!(content.contains("[Service]"));
         assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
         assert!(Ini::load_from_str(&content).is_ok());
+        assert!(is_owned_override_content(&content));
+        assert!(!is_owned_override_content(&format!(
+            "{LASPER_OVERRIDE_MARKER}\n[Service]\nExecStart=/bin/sh\n"
+        )));
     }
 
     #[tokio::test]
@@ -693,60 +789,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_overrides_removes_known_files_and_empty_directories() {
+    async fn owned_override_cleanup_requires_marker_and_safe_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
         let transient = directory.path().join("run/systemd-nspawn@test.service.d");
         tokio::fs::create_dir_all(&persistent).await.unwrap();
         tokio::fs::create_dir_all(&transient).await.unwrap();
-        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
+
+        let owned = persistent.join(LASPER_OVERRIDE_FILE);
+        let legacy = persistent.join(LASPER_NVIDIA_OVERRIDE_FILE);
+        let legacy_override = persistent.join(LEGACY_OVERRIDE_FILE);
+        let unsafe_mode = transient.join(LASPER_NVIDIA_OVERRIDE_FILE);
+        let owned_content = systemd_override_content(&[], false, false, true);
+        assert!(
+            is_owned_override_content(&owned_content),
+            "{owned_content:?}"
+        );
+        tokio::fs::write(&owned, owned_content).await.unwrap();
+        tokio::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o644))
             .await
             .unwrap();
-        tokio::fs::write(persistent.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+        tokio::fs::write(&legacy, "[Service]\nDeviceAllow=/dev/nvidia0 rw\n")
             .await
             .unwrap();
-        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
+        tokio::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+        tokio::fs::write(&legacy_override, "[Service]\nDeviceAllow=/dev/dri rw\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            &unsafe_mode,
+            nvidia_device_allow_content(&["/dev/nvidia0".into()]),
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o666))
             .await
             .unwrap();
 
-        remove_lasper_overrides_at(&persistent, &transient)
-            .await
-            .unwrap();
+        let ownership = remove_owned_lasper_overrides_at_with_uid(
+            &persistent,
+            &transient,
+            uzers::get_current_uid(),
+        )
+        .await
+        .unwrap();
 
-        assert!(!persistent.exists());
-        assert!(!transient.exists());
+        assert_eq!(
+            ownership[..3],
+            [
+                ArtifactOwnership::ProvenOwned,
+                ArtifactOwnership::AmbiguousLegacy,
+                ArtifactOwnership::AmbiguousLegacy,
+            ]
+        );
+        assert_eq!(ownership[3], ArtifactOwnership::AmbiguousLegacy);
+        assert!(ownership[4..]
+            .iter()
+            .all(|evidence| *evidence == ArtifactOwnership::NotPresent));
+        assert!(!owned.exists());
+        assert!(legacy.exists());
+        assert!(legacy_override.exists());
+        assert!(unsafe_mode.exists());
+        assert!(persistent.exists());
+        assert!(transient.exists());
     }
 
     #[tokio::test]
-    async fn remove_overrides_preserves_unknown_drop_ins_and_directories() {
+    async fn owned_override_probe_preserves_candidate_symlinks() {
         let directory = tempfile::tempdir().unwrap();
-        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
-        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
-        tokio::fs::create_dir_all(&persistent).await.unwrap();
-        tokio::fs::create_dir_all(&transient).await.unwrap();
-        tokio::fs::write(persistent.join(LASPER_OVERRIDE_FILE), "[Service]\n")
-            .await
-            .unwrap();
-        tokio::fs::write(persistent.join("90-administrator.conf"), "[Service]\n")
-            .await
-            .unwrap();
-        tokio::fs::write(transient.join(LASPER_NVIDIA_OVERRIDE_FILE), "[Service]\n")
-            .await
-            .unwrap();
-        tokio::fs::create_dir(transient.join("unknown-directory"))
-            .await
-            .unwrap();
+        let target = directory.path().join("target.conf");
+        let candidate = directory.path().join(LASPER_OVERRIDE_FILE);
+        tokio::fs::write(
+            &target,
+            systemd_override_content(&["/dev/nvidia0".into()], false, false, false),
+        )
+        .await
+        .unwrap();
+        std::os::unix::fs::symlink(&target, &candidate).unwrap();
 
-        remove_lasper_overrides_at(&persistent, &transient)
-            .await
-            .unwrap();
-
-        assert!(!persistent.join(LASPER_OVERRIDE_FILE).exists());
-        assert!(persistent.join("90-administrator.conf").exists());
-        assert!(persistent.exists());
-        assert!(!transient.join(LASPER_NVIDIA_OVERRIDE_FILE).exists());
-        assert!(transient.join("unknown-directory").exists());
-        assert!(transient.exists());
+        assert_eq!(
+            probe_owned_override_at(&candidate, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ArtifactOwnership::AmbiguousLegacy
+        );
+        assert!(candidate
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[tokio::test]

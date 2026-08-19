@@ -13,7 +13,7 @@ use crate::nspawn::{
         ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName,
         RuntimeSnapshot, StatusUpdate,
     },
-    ops::{DefaultManager, NspawnManager},
+    ops::{DefaultManager, ImageLifecycleService, NspawnManager},
     sys::ExecutionContext,
 };
 use crate::ui::core::{Component, FocusTracker};
@@ -189,6 +189,7 @@ pub struct AppData {
     pub unit_drop_ins: Vec<crate::nspawn::adapters::config::systemd_unit::SystemdDropIn>,
     pub dbus_active: bool,
     pub manager: std::sync::Arc<dyn NspawnManager>,
+    pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
     pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
     pub transitions:
@@ -229,6 +230,14 @@ impl App {
             cli_mode,
             exec_ctx.clone(),
         ));
+        let image_lifecycle = std::sync::Arc::new(
+            crate::nspawn::ops::image_lifecycle_adapter::compose_image_lifecycle(
+                manager.clone(),
+                permissions.level(),
+                cli_mode,
+                &exec_ctx,
+            ),
+        );
         Self {
             permissions,
             config,
@@ -251,6 +260,7 @@ impl App {
                 unit_drop_ins: Vec::new(),
                 dbus_active: !cli_mode,
                 manager,
+                image_lifecycle,
                 exec_ctx,
                 action_cooldown: None,
                 transitions: std::collections::HashMap::new(),
@@ -1124,13 +1134,25 @@ mod tests {
     mod image_removal {
         use super::*;
         use crate::events::AppEvent;
-        use crate::nspawn::ops::manager::MockNspawnManager;
+        use crate::nspawn::ops::image_lifecycle::{
+            ArtifactCleanupReport, ImageControlOutcome, MockImageControl, MockImageRuntime,
+            MockManagedArtifactCleanup, UnitDisableReport,
+        };
+        use crate::nspawn::ops::OperationRegistry;
 
         fn prepare_image_removal(
-            manager: MockNspawnManager,
+            control: MockImageControl,
+            cleanup: MockManagedArtifactCleanup,
         ) -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let mut runtime = MockImageRuntime::new();
+            runtime.expect_list_machines().returning(|| Ok(Vec::new()));
             let mut app = make_app();
-            app.data.manager = std::sync::Arc::new(manager);
+            app.data.image_lifecycle = std::sync::Arc::new(ImageLifecycleService::new(
+                std::sync::Arc::new(runtime),
+                std::sync::Arc::new(control),
+                std::sync::Arc::new(cleanup),
+                OperationRegistry::new(),
+            ));
             app.data.images = vec![make_image("first"), make_image("second")];
             app.ui.focus.active_idx = 1;
             let (tx, rx) = tokio::sync::mpsc::channel(2);
@@ -1140,18 +1162,24 @@ mod tests {
 
         #[tokio::test]
         async fn confirmation_binds_target_across_selection_and_focus_changes() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_remove()
-                .withf(|name| name == "first")
+            let mut control = MockImageControl::new();
+            control
+                .expect_disable_unit()
+                .withf(|name| name.as_str() == "first")
                 .once()
-                .returning(|_| Ok(()));
-            manager
-                .expect_cleanup_image_artifacts()
-                .withf(|name| name == "first")
+                .returning(|_| UnitDisableReport::Disabled);
+            control
+                .expect_remove_image()
+                .withf(|name| name.as_str() == "first")
                 .once()
-                .returning(|_| Ok(()));
-            let (mut app, mut rx) = prepare_image_removal(manager);
+                .returning(|_| ImageControlOutcome::Removed);
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup
+                .expect_cleanup()
+                .withf(|name| name.as_str() == "first")
+                .once()
+                .returning(|_| ArtifactCleanupReport::Removed);
+            let (mut app, mut rx) = prepare_image_removal(control, cleanup);
 
             app.show_delete_dialog();
             app.data.image_selected = 1;
@@ -1171,14 +1199,18 @@ mod tests {
 
         #[tokio::test]
         async fn confirmation_can_skip_lasper_artifact_cleanup() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_remove()
-                .withf(|name| name == "first")
+            let mut control = MockImageControl::new();
+            control
+                .expect_disable_unit()
+                .returning(|_| UnitDisableReport::Disabled);
+            control
+                .expect_remove_image()
+                .withf(|name| name.as_str() == "first")
                 .once()
-                .returning(|_| Ok(()));
-            manager.expect_cleanup_image_artifacts().never();
-            let (mut app, mut rx) = prepare_image_removal(manager);
+                .returning(|_| ImageControlOutcome::Removed);
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup.expect_cleanup().never();
+            let (mut app, mut rx) = prepare_image_removal(control, cleanup);
 
             app.show_delete_dialog();
             let result = app
@@ -1206,17 +1238,20 @@ mod tests {
 
         #[tokio::test]
         async fn cleanup_failure_preserves_successful_removal_result() {
-            let mut manager = MockNspawnManager::new();
-            manager.expect_remove().once().returning(|_| Ok(()));
-            manager
-                .expect_cleanup_image_artifacts()
+            let mut control = MockImageControl::new();
+            control
+                .expect_disable_unit()
+                .returning(|_| UnitDisableReport::Disabled);
+            control
+                .expect_remove_image()
                 .once()
-                .returning(|_| {
-                    Err(crate::nspawn::errors::NspawnError::Runtime(
-                        "cleanup failed".into(),
-                    ))
-                });
-            let (mut app, mut rx) = prepare_image_removal(manager);
+                .returning(|_| ImageControlOutcome::Removed);
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup
+                .expect_cleanup()
+                .once()
+                .returning(|_| ArtifactCleanupReport::Failed(vec!["cleanup failed".into()]));
+            let (mut app, mut rx) = prepare_image_removal(control, cleanup);
 
             app.show_delete_dialog();
             app.action_remove();
@@ -1234,15 +1269,53 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn removal_failure_never_runs_optional_cleanup() {
-            let mut manager = MockNspawnManager::new();
-            manager.expect_remove().once().returning(|_| {
-                Err(crate::nspawn::errors::NspawnError::Runtime(
-                    "remove failed".into(),
-                ))
+        async fn ambiguous_artifacts_are_reported_as_preserved() {
+            let mut control = MockImageControl::new();
+            control
+                .expect_disable_unit()
+                .returning(|_| UnitDisableReport::Disabled);
+            control
+                .expect_remove_image()
+                .once()
+                .returning(|_| ImageControlOutcome::Removed);
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup.expect_cleanup().once().returning(|_| {
+                ArtifactCleanupReport::PreservedAmbiguous(vec![
+                    "legacy drop-in was preserved".into()
+                ])
             });
-            manager.expect_cleanup_image_artifacts().never();
-            let (mut app, mut rx) = prepare_image_removal(manager);
+            let (mut app, mut rx) = prepare_image_removal(control, cleanup);
+
+            app.show_delete_dialog();
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Warn)
+                    if message.contains("Removed image first")
+                        && message.contains("legacy drop-in was preserved")
+            ));
+        }
+
+        #[tokio::test]
+        async fn removal_failure_never_runs_optional_cleanup() {
+            let mut control = MockImageControl::new();
+            control
+                .expect_disable_unit()
+                .returning(|_| UnitDisableReport::Disabled);
+            control
+                .expect_remove_image()
+                .once()
+                .returning(|_| ImageControlOutcome::Failed {
+                    reason: "remove failed".into(),
+                });
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup.expect_cleanup().never();
+            let (mut app, mut rx) = prepare_image_removal(control, cleanup);
 
             app.show_delete_dialog();
             app.action_remove();
@@ -1254,16 +1327,18 @@ mod tests {
             assert!(matches!(
                 event,
                 AppEvent::ActionDone(message, crate::ui::StatusLevel::Error)
-                    if message == "Remove failed: Runtime error: remove failed"
+                    if message == "Remove failed: remove failed"
             ));
         }
 
         #[test]
         fn confirmation_rejects_a_target_that_disappeared() {
-            let mut manager = MockNspawnManager::new();
-            manager.expect_remove().never();
-            manager.expect_cleanup_image_artifacts().never();
-            let (mut app, _rx) = prepare_image_removal(manager);
+            let mut control = MockImageControl::new();
+            control.expect_disable_unit().never();
+            control.expect_remove_image().never();
+            let mut cleanup = MockManagedArtifactCleanup::new();
+            cleanup.expect_cleanup().never();
+            let (mut app, _rx) = prepare_image_removal(control, cleanup);
 
             app.show_delete_dialog();
             app.data.images.clear();

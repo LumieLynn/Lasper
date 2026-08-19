@@ -70,6 +70,7 @@ impl ImageListComponent {
         area: Rect,
         images: &[ImageEntry],
         selected: usize,
+        removing: &std::collections::HashSet<String>,
         resize_mode: bool,
     ) {
         let t = theme::theme();
@@ -95,6 +96,11 @@ impl ImageListComponent {
                     Span::styled("◆ ", Style::default().fg(t.list_icon_alive)),
                     Span::styled(image.name.as_str(), styles.text),
                     Span::styled(format!(" ({})", image.image_type), styles.text),
+                    if removing.contains(&image.name) {
+                        Span::styled(" [removing]", Style::default().fg(t.warning))
+                    } else {
+                        Span::raw("")
+                    },
                     if image.readonly {
                         Span::styled(" [ro]", Style::default().fg(t.text_secondary))
                     } else {

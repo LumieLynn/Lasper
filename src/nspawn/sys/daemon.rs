@@ -39,6 +39,9 @@ use crate::nspawn::adapters::storage::store::{
 use crate::nspawn::models::{
     ContainerEntry, ImageEntry, MachineName, MachineProperties, TerminalSize,
 };
+use crate::nspawn::ops::image_lifecycle::{
+    map_native_error, ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
+};
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
@@ -50,7 +53,8 @@ use crate::nspawn::ops::provision::oci_operation::{
     run_oci_transfer, OciPullRequest, OciTransferCancellation, OciTransferOutcome,
 };
 use crate::nspawn::ops::system_operation::{
-    execute_dbus_system_operation, execute_system_operation, SystemOperation,
+    execute_cli_image_remove, execute_dbus_system_operation, execute_system_operation,
+    SystemOperation,
 };
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
@@ -70,6 +74,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 const RPC_PROTOCOL_VERSION: u32 = 9;
 const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_RPC_IN_FLIGHT: usize = 64;
 const MAX_FD_CONNECTIONS: usize = 32;
 const DAEMON_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 const DAEMON_LOG_MAX_SESSIONS: usize = 8;
@@ -1088,6 +1093,17 @@ impl ElevatedDaemon {
         Ok(())
     }
 
+    pub(crate) async fn image_remove(
+        &self,
+        request: ImageRemoveRequest,
+    ) -> std::io::Result<ImageControlOutcome> {
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("image_remove", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     pub(crate) async fn cli_inspect_machine(
         &self,
         name: &str,
@@ -1668,13 +1684,15 @@ async fn run_rpc_request_pump<R, B>(
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
-    B: DaemonDbusExecutor,
+    B: DaemonDbusExecutor + Clone + 'static,
 {
     async fn send(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) -> bool {
         let line = serde_json::to_string(&json).expect("JSON-RPC values are serializable");
         out_tx.send(line).await.is_ok()
     }
 
+    let request_slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_IN_FLIGHT));
+    let operation_registry = crate::nspawn::ops::OperationRegistry::new();
     loop {
         let Some(line) = read_bounded_line(reader, MAX_RPC_FRAME_BYTES).await? else {
             return Ok(());
@@ -1701,34 +1719,117 @@ where
             }
         };
 
-        match handle_request(&request, dbus, out_tx, invoking_uid).await {
-            HandleOutcome::Spawned => {}
-            HandleOutcome::Sync(Ok(result)) => {
+        let reservation = match daemon_resource_claim(&request) {
+            Ok(Some(claim)) => match operation_registry.reserve([claim]) {
+                Ok(reservation) => Some(reservation),
+                Err(conflict) => {
+                    if !send(
+                        out_tx,
+                        serde_json::json!({
+                            "jsonrpc":"2.0","id":request.id,
+                            "error":{"code":-32002,"message":format!(
+                                "resource is busy: {:?}", conflict.key
+                            )}
+                        }),
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            },
+            Ok(None) => None,
+            Err(error) => {
                 if !send(
                     out_tx,
                     serde_json::json!({
-                        "jsonrpc":"2.0","id":request.id,"result":result
+                        "jsonrpc":"2.0","id":request.id,
+                        "error":{"code":-32602,"message":error}
                     }),
                 )
                 .await
                 {
                     return Ok(());
                 }
+                continue;
             }
-            HandleOutcome::Sync(Err(e)) => {
+        };
+        let permit = match request_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
                 if !send(
                     out_tx,
                     serde_json::json!({
-                        "jsonrpc":"2.0","id":request.id,"error":{"code":-1,"message":e}
+                        "jsonrpc":"2.0","id":request.id,
+                        "error":{"code":-32001,"message":"daemon request limit reached"}
                     }),
                 )
                 .await
                 {
                     return Ok(());
                 }
+                continue;
             }
-        }
+        };
+
+        let dbus = dbus.clone();
+        let out_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _reservation = reservation;
+            match handle_request(&request, &dbus, &out_tx, invoking_uid).await {
+                HandleOutcome::Spawned => {}
+                HandleOutcome::Sync(Ok(result)) => {
+                    let _ = send(
+                        &out_tx,
+                        serde_json::json!({
+                            "jsonrpc":"2.0","id":request.id,"result":result
+                        }),
+                    )
+                    .await;
+                }
+                HandleOutcome::Sync(Err(e)) => {
+                    let _ = send(
+                        &out_tx,
+                        serde_json::json!({
+                            "jsonrpc":"2.0","id":request.id,"error":{"code":-1,"message":e}
+                        }),
+                    )
+                    .await;
+                }
+            }
+        });
     }
+}
+
+fn daemon_resource_claim(
+    request: &RpcRequest,
+) -> Result<Option<crate::nspawn::ops::ResourceClaim>, String> {
+    if !matches!(
+        request.method.as_str(),
+        "system_operation" | "dbus_system_operation" | "image_remove"
+    ) {
+        return Ok(None);
+    }
+    let key = if request.method == "image_remove" {
+        let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
+            .map_err(|error| format!("invalid image_remove request: {error}"))?;
+        crate::nspawn::ops::ResourceKey::for_image(&request.image)
+    } else {
+        let operation: SystemOperation = serde_json::from_value(request.params.clone())
+            .map_err(|error| format!("invalid {} request: {error}", request.method))?;
+        match operation {
+            SystemOperation::Start { machine } => {
+                crate::nspawn::ops::ResourceKey::for_machine(&machine)
+            }
+            SystemOperation::RemoveImage { image } => {
+                crate::nspawn::ops::ResourceKey::for_image(&image)
+            }
+            _ => return Ok(None),
+        }
+    };
+    Ok(Some(crate::nspawn::ops::ResourceClaim::exclusive(key)))
 }
 
 async fn handle_request<B: DaemonDbusExecutor>(
@@ -1932,21 +2033,10 @@ async fn handle_request<B: DaemonDbusExecutor>(
                     )));
                 }
             };
-            let id = request.id;
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_system_operation(operation).await {
-                    Ok(()) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":null}),
-                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":-1,
-                        "message":error.to_string(),
-                    }}),
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
+            match execute_system_operation(operation).await {
+                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
         }
 
         "cli_inspect_machine" => {
@@ -2032,6 +2122,35 @@ async fn handle_request<B: DaemonDbusExecutor>(
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
+        }
+
+        "image_remove" => {
+            let request: ImageRemoveRequest = match serde_json::from_value(request.params.clone()) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid image_remove request: {error}"
+                    )))
+                }
+            };
+            let outcome = match request.transport {
+                ImageRemoveTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => match dbus
+                        .system_operation(SystemOperation::RemoveImage {
+                            image: request.image,
+                        })
+                        .await
+                    {
+                        Ok(()) => ImageControlOutcome::Removed,
+                        Err(error) => map_native_error(error),
+                    },
+                    None => ImageControlOutcome::NotAttempted {
+                        reason: "DBus backend is unavailable".into(),
+                    },
+                },
+                ImageRemoveTransport::Cli => execute_cli_image_remove(request.image).await,
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
 
         "dbus_get_properties" => {
@@ -2898,11 +3017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_remove_image_reproduces_inline_pump_blocking() {
-        if std::env::var_os("LASPER_RUN_SLOW_REPRODUCER").is_none() {
-            return;
-        }
-
+    async fn slow_remove_image_does_not_block_independent_requests() {
         let slow = SlowRemoveDbus {
             started: Arc::new(tokio::sync::Notify::new()),
             release: Arc::new(tokio::sync::Notify::new()),
@@ -2934,8 +3049,9 @@ mod tests {
         let (mut client, server) = tokio::io::duplex(4096);
         let mut reader = tokio::io::BufReader::new(server);
 
-        // This is the production request pump. The test is intentionally
-        // env-gated until Phase 1 replaces this assertion with responsiveness.
+        // This is the production request pump. A slow non-cancelable image
+        // removal must not prevent an independent in-memory query from being
+        // read and completed.
         let mut pump = tokio::spawn(async move {
             run_rpc_request_pump(&mut reader, &dbus, &out_tx, uzers::get_current_uid()).await
         });
@@ -2945,27 +3061,97 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
             .await
             .expect("RemoveImage did not reach the slow executor");
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), out_rx.recv())
+        let ping_response =
+            tokio::time::timeout(std::time::Duration::from_millis(250), out_rx.recv())
                 .await
-                .is_err()
-        );
+                .expect("ping response remained blocked behind RemoveImage")
+                .expect("request pump stopped before ping responded");
+        let ping_response: RpcResponse = serde_json::from_str(&ping_response).unwrap();
+        assert_eq!(ping_response.id, 2);
+        assert!(ping_response.error.is_none());
 
         release.notify_one();
-        let first = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+        let remove_response =
+            tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+                .await
+                .expect("RemoveImage response was not emitted")
+                .expect("request pump stopped before RemoveImage responded");
+        let remove_response: RpcResponse = serde_json::from_str(&remove_response).unwrap();
+        assert_eq!(remove_response.id, 1);
+        assert!(remove_response.error.is_none());
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut pump)
             .await
-            .expect("RemoveImage response was not emitted")
-            .expect("request pump stopped before RemoveImage responded");
-        let second = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .expect("request pump did not stop after input EOF")
+            .expect("request pump task panicked")
+            .expect("request pump returned an error");
+    }
+
+    #[tokio::test]
+    async fn slow_remove_image_rejects_same_resource_start_promptly() {
+        let slow = SlowRemoveDbus {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let started = slow.started.clone();
+        let release = slow.release.clone();
+        let dbus = Some(slow);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
+        let image = crate::nspawn::models::ImageName::new("slow-image").unwrap();
+        let remove = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "image_remove".into(),
+            params: serde_json::to_value(ImageRemoveRequest {
+                image: image.clone(),
+                transport: ImageRemoveTransport::Dbus,
+            })
+            .unwrap(),
+        };
+        let start = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 2,
+            method: "dbus_system_operation".into(),
+            params: serde_json::to_value(SystemOperation::Start {
+                machine: crate::nspawn::models::MachineName::new(image.as_str()).unwrap(),
+            })
+            .unwrap(),
+        };
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(server);
+        let mut pump = tokio::spawn(async move {
+            run_rpc_request_pump(&mut reader, &dbus, &out_tx, uzers::get_current_uid()).await
+        });
+        use tokio::io::AsyncWriteExt;
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&remove).unwrap()).as_bytes())
             .await
-            .expect("ping response was not emitted")
-            .expect("request pump stopped before ping responded");
-        let first: RpcResponse = serde_json::from_str(&first).unwrap();
-        let second: RpcResponse = serde_json::from_str(&second).unwrap();
-        assert_eq!(first.id, 1);
-        assert!(first.error.is_none());
-        assert_eq!(second.id, 2);
-        assert!(second.error.is_none());
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("image removal did not acquire its daemon claim");
+        client
+            .write_all(format!("{}\n", serde_json::to_string(&start).unwrap()).as_bytes())
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(std::time::Duration::from_millis(250), out_rx.recv())
+            .await
+            .expect("same-resource start waited behind image removal")
+            .expect("request pump stopped before rejecting start");
+        let response: RpcResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.id, 2);
+        assert_eq!(response.error.unwrap().code, -32002);
+
+        release.notify_one();
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("image removal did not finish")
+            .expect("request pump stopped before removal response");
+        let response: RpcResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.id, 1);
+        assert!(response.error.is_none());
 
         drop(client);
         tokio::time::timeout(std::time::Duration::from_secs(1), &mut pump)
