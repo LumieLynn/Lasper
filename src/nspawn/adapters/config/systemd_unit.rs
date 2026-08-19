@@ -440,7 +440,8 @@ async fn read_drop_ins(dir: &Path) -> Result<Vec<SystemdDropIn>> {
             .file_type()
             .await
             .map_err(|error| NspawnError::Io(path.clone(), error))?;
-        if !file_type.is_file() {
+        if !file_type.is_file() || path.extension().and_then(|value| value.to_str()) != Some("conf")
+        {
             continue;
         }
         let content = tokio::fs::read_to_string(&path)
@@ -559,9 +560,16 @@ async fn remove_owned_lasper_overrides_at_with_uid(
     let mut ownership = Vec::with_capacity(owned_paths.len() + legacy_paths.len());
     for path in owned_paths {
         let evidence = probe_owned_override_at(&path, expected_uid).await?;
-        if evidence == ArtifactOwnership::ProvenOwned {
-            remove_optional_file(&path).await?;
-            remove_optional_file(&crate::nspawn::sys::io::lock_path_for(&path)).await?;
+        match evidence {
+            ArtifactOwnership::ProvenOwned => {
+                remove_optional_file(&path).await?;
+                remove_optional_file(&crate::nspawn::sys::io::lock_path_for(&path)).await?;
+            }
+            ArtifactOwnership::NotPresent => {
+                let lock_path = crate::nspawn::sys::io::lock_path_for(&path);
+                AsyncLockedWriter::remove_lock_if_target_absent(&path, &lock_path).await?;
+            }
+            ArtifactOwnership::AmbiguousLegacy => {}
         }
         ownership.push(evidence);
     }
@@ -896,6 +904,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_override_cleanup_removes_orphan_locks_and_empty_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        tokio::fs::create_dir_all(&transient).await.unwrap();
+
+        let paths = [
+            persistent.join(LASPER_OVERRIDE_FILE),
+            persistent.join(LASPER_NVIDIA_OVERRIDE_FILE),
+            transient.join(LASPER_NVIDIA_OVERRIDE_FILE),
+        ];
+        for path in &paths {
+            tokio::fs::write(crate::nspawn::sys::io::lock_path_for(path), "")
+                .await
+                .unwrap();
+        }
+
+        let ownership = remove_owned_lasper_overrides_at_with_uid(
+            &persistent,
+            &transient,
+            uzers::get_current_uid(),
+        )
+        .await
+        .unwrap();
+
+        assert!(ownership
+            .iter()
+            .all(|evidence| *evidence == ArtifactOwnership::NotPresent));
+        assert!(paths
+            .iter()
+            .all(|path| !crate::nspawn::sys::io::lock_path_for(path).exists()));
+        assert!(!persistent.exists());
+        assert!(!transient.exists());
+    }
+
+    #[tokio::test]
     async fn owned_override_probe_preserves_candidate_symlinks() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("target.conf");
@@ -927,6 +972,15 @@ mod tests {
         let override_dir = directory.path().join("systemd-nspawn@test.service.d");
         tokio::fs::create_dir_all(&override_dir).await.unwrap();
         tokio::fs::write(override_dir.join("override.conf"), "[Service]\n")
+            .await
+            .unwrap();
+        tokio::fs::write(
+            override_dir.join(".90-lasper.conf.lock"),
+            "not a systemd drop-in",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(override_dir.join("README"), "not a systemd drop-in")
             .await
             .unwrap();
         tokio::fs::create_dir(override_dir.join("nested"))

@@ -47,7 +47,10 @@ pub(crate) fn compose_image_lifecycle(
             fallback_operations: exec_ctx.system_operations.clone(),
         },
     };
-    let control: Arc<dyn ImageControl> = Arc::new(RoutedImageControl { route });
+    let control: Arc<dyn ImageControl> = Arc::new(RoutedImageControl {
+        route,
+        nspawn: exec_ctx.nspawn.clone(),
+    });
     let cleanup: Arc<dyn ManagedArtifactCleanup> = Arc::new(StoreArtifactCleanup {
         systemd_unit: exec_ctx.systemd_unit.clone(),
         nvidia_state: exec_ctx.nvidia_state.clone(),
@@ -112,6 +115,7 @@ enum ImageControlRoute {
 
 struct RoutedImageControl {
     route: ImageControlRoute,
+    nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
 }
 
 #[async_trait::async_trait]
@@ -151,7 +155,7 @@ impl ImageControl for RoutedImageControl {
     }
 
     async fn remove_image(&self, image: &ImageName) -> ImageControlOutcome {
-        match &self.route {
+        let outcome = match &self.route {
             ImageControlRoute::DirectDbus {
                 dbus,
                 fallback_runner,
@@ -187,7 +191,24 @@ impl ImageControl for RoutedImageControl {
                     },
                 }
             }
+        };
+
+        if matches!(&outcome, ImageControlOutcome::Removed) {
+            match self.nspawn.cleanup_sidecar_locks(image.as_str()).await {
+                Ok(true) => log::debug!(
+                    "Removed stale nspawn sidecar locks for image {}",
+                    image.as_str()
+                ),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "Image {} was removed, but its nspawn sidecar locks could not be cleaned: {}",
+                    image.as_str(),
+                    error
+                ),
+            }
         }
+
+        outcome
     }
 }
 

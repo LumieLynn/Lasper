@@ -114,6 +114,19 @@ impl NspawnConfigStore {
         Ok(())
     }
 
+    /// Reclaim sidecar locks after systemd removes an image's administrator
+    /// `.nspawn` file. The configuration itself is never removed here.
+    pub async fn cleanup_sidecar_locks(&self, name: &str) -> Result<bool> {
+        let result = self
+            .execute(NspawnConfigOperation::CleanupSidecarLocks(
+                CleanupNspawnSidecarLocks {
+                    image: parse_image_name(name)?,
+                },
+            ))
+            .await?;
+        Ok(result.sidecars_cleaned.unwrap_or(false))
+    }
+
     async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
         if let Some(daemon) = &self.daemon {
             daemon
@@ -144,6 +157,7 @@ pub(crate) enum NspawnConfigOperation {
     PromoteOci(PromoteOciConfig),
     UpdateGpu(UpdateNspawnGpu),
     Remove(RemoveNspawnConfig),
+    CleanupSidecarLocks(CleanupNspawnSidecarLocks),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -193,6 +207,8 @@ pub(crate) struct NspawnConfigResult {
     content: Option<NspawnConfigInspection>,
     #[serde(default)]
     apply: Option<ApplyStatus>,
+    #[serde(default)]
+    sidecars_cleaned: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,6 +231,12 @@ impl From<NspawnConfigInspection> for NspawnConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct RemoveNspawnConfig {
     machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanupNspawnSidecarLocks {
+    image: ImageName,
 }
 
 pub(crate) async fn execute_nspawn_config_operation(
@@ -284,6 +306,14 @@ pub(crate) async fn execute_nspawn_config_operation(
             let path = nspawn_path(&request.machine);
             remove_config_at(&path).await?;
             Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::CleanupSidecarLocks(request) => {
+            let paths = discovered_nspawn_paths(&request.image);
+            let cleaned = cleanup_sidecar_locks_at(&paths).await?;
+            Ok(NspawnConfigResult {
+                sidecars_cleaned: Some(cleaned),
+                ..Default::default()
+            })
         }
     }
 }
@@ -374,6 +404,23 @@ async fn remove_config_at(path: &Path) -> Result<()> {
     remove_optional_file(&crate::nspawn::sys::io::lock_path_for(path)).await?;
     remove_optional_file(&path.with_extension("lock")).await?;
     Ok(())
+}
+
+async fn cleanup_sidecar_locks_at(paths: &[PathBuf]) -> Result<bool> {
+    let mut cleaned = false;
+    for path in paths {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+        }
+
+        let lock_path = crate::nspawn::sys::io::lock_path_for(path);
+        let legacy_lock_path = path.with_extension("lock");
+        cleaned |= AsyncLockedWriter::remove_lock_if_target_absent(path, &lock_path).await?;
+        cleaned |= AsyncLockedWriter::remove_lock_if_target_absent(path, &legacy_lock_path).await?;
+    }
+    Ok(cleaned)
 }
 
 async fn apply_new_content_at(
@@ -883,6 +930,12 @@ mod tests {
             "params": {"image": "vendor image"}
         }"#;
         assert!(serde_json::from_str::<NspawnConfigOperation>(json).is_ok());
+
+        let cleanup = r#"{
+            "operation": "cleanup_sidecar_locks",
+            "params": {"image": "vendor image"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(cleanup).is_ok());
     }
 
     #[test]
@@ -1371,6 +1424,33 @@ Unknown=preserve-me\n";
         assert!(!path.exists());
         assert!(!lock_path.exists());
         assert!(!legacy_lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_sidecar_locks_waits_for_config_removal_and_supports_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vendor image.nspawn");
+        let lock_path = crate::nspawn::sys::io::lock_path_for(&path);
+        let legacy_lock_path = path.with_extension("lock");
+        tokio::fs::write(&path, "[Exec]\nBoot=no\n").await.unwrap();
+        tokio::fs::write(&lock_path, "").await.unwrap();
+        tokio::fs::write(&legacy_lock_path, "").await.unwrap();
+
+        assert!(!cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
+        assert!(lock_path.exists());
+        assert!(legacy_lock_path.exists());
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
+        assert!(!lock_path.exists());
+        assert!(!legacy_lock_path.exists());
+        assert!(!cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

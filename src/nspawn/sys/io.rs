@@ -1,7 +1,8 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use fs2::FileExt;
 use std::ffi::OsString;
-use std::os::unix::fs::PermissionsExt;
+use std::fs::File;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -21,6 +22,9 @@ pub(crate) fn lock_path_for(path: &Path) -> std::path::PathBuf {
 pub struct AsyncLockedWriter;
 
 impl AsyncLockedWriter {
+    const MAX_LOCK_ATTEMPTS: usize = 100;
+    const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
+
     /// Performs a transactional write operation on a file.
     ///
     /// The process follows these safety rules:
@@ -77,32 +81,11 @@ impl AsyncLockedWriter {
                 .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
         }
 
-        // Acquire lock (Async Backoff Loop)
-        let lock_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(|e| NspawnError::Io(lock_path.clone(), e))?;
-
-        let mut attempts = 0;
-        let max_attempts = 100; // 100 * 10ms = 1s timeout
-        loop {
-            match lock_file.try_lock_exclusive() {
-                Ok(_) => break,
-                Err(_) if attempts < max_attempts => {
-                    attempts += 1;
-                    sleep(Duration::from_millis(10)).await;
-                }
-                Err(e) => {
-                    return Err(NspawnError::Runtime(format!(
-                        "Could not acquire lock on {:?} after {} attempts: {}",
-                        lock_path, attempts, e
-                    )))
-                }
-            }
-        }
+        // Keep the guard alive until the atomic update and directory sync
+        // complete; dropping it releases the advisory lock.
+        let _lock_file = Self::acquire_stable_lock(&lock_path, true)
+            .await?
+            .expect("create=true always returns a lock file");
 
         // Read existing content - FIX: Direct read to avoid TOCTOU
         let existing_content = match fs::read_to_string(&path_buf).await {
@@ -158,6 +141,96 @@ impl AsyncLockedWriter {
         // holds a lock on the old, unlinked inode.
 
         Ok(result)
+    }
+
+    /// Remove the current sidecar inode only after locking it and confirming
+    /// that its target no longer exists. Writers validate the inode again
+    /// after acquiring it, so a writer queued on an unlinked inode retries on
+    /// the replacement instead of entering a split critical section.
+    pub async fn remove_lock_if_target_absent(target: &Path, lock_path: &Path) -> Result<bool> {
+        let Some(lock_file) = Self::acquire_stable_lock(lock_path, false).await? else {
+            return Ok(false);
+        };
+
+        match fs::symlink_metadata(target).await {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::remove_file(lock_path)
+                    .await
+                    .map_err(|error| NspawnError::Io(lock_path.to_path_buf(), error))?;
+                drop(lock_file);
+                Ok(true)
+            }
+            Err(error) => Err(NspawnError::Io(target.to_path_buf(), error)),
+        }
+    }
+
+    async fn acquire_stable_lock(lock_path: &Path, create: bool) -> Result<Option<File>> {
+        let mut attempts = 0;
+        'open: loop {
+            let lock_file = match std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(create)
+                .truncate(false)
+                .open(lock_path)
+            {
+                Ok(file) => file,
+                Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(None)
+                }
+                Err(error) => return Err(NspawnError::Io(lock_path.to_path_buf(), error)),
+            };
+
+            loop {
+                match lock_file.try_lock_exclusive() {
+                    Ok(()) => break,
+                    Err(error) if attempts < Self::MAX_LOCK_ATTEMPTS => {
+                        attempts += 1;
+                        sleep(Self::LOCK_RETRY_DELAY).await;
+                    }
+                    Err(error) => {
+                        return Err(NspawnError::Runtime(format!(
+                            "Could not acquire lock on {:?} after {} attempts: {}",
+                            lock_path, attempts, error
+                        )))
+                    }
+                }
+            }
+
+            if Self::locked_inode_is_current(&lock_file, lock_path)? {
+                return Ok(Some(lock_file));
+            }
+
+            let _ = fs2::FileExt::unlock(&lock_file);
+            if attempts >= Self::MAX_LOCK_ATTEMPTS {
+                return Err(NspawnError::Runtime(format!(
+                    "Lock path {:?} kept changing while it was acquired",
+                    lock_path
+                )));
+            }
+            attempts += 1;
+            sleep(Self::LOCK_RETRY_DELAY).await;
+            continue 'open;
+        }
+    }
+
+    fn locked_inode_is_current(lock_file: &File, lock_path: &Path) -> Result<bool> {
+        let opened = lock_file
+            .metadata()
+            .map_err(|error| NspawnError::Io(lock_path.to_path_buf(), error))?;
+        let current = match std::fs::symlink_metadata(lock_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(NspawnError::Io(lock_path.to_path_buf(), error)),
+        };
+        if !current.file_type().is_file() {
+            return Err(NspawnError::Validation(format!(
+                "Lock path {} is not a regular file",
+                lock_path.display()
+            )));
+        }
+        Ok(opened.dev() == current.dev() && opened.ino() == current.ino())
     }
 
     /// Safely writes content to a file using atomic rename and fsync to ensure durability.
@@ -220,5 +293,56 @@ impl AsyncLockedWriter {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lock_cleanup_only_removes_lock_for_an_absent_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.conf");
+        let lock = lock_path_for(&target);
+        tokio::fs::write(&target, "[Exec]\nBoot=no\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&lock, "").await.unwrap();
+
+        assert!(
+            !AsyncLockedWriter::remove_lock_if_target_absent(&target, &lock)
+                .await
+                .unwrap()
+        );
+        assert!(lock.exists());
+
+        tokio::fs::remove_file(&target).await.unwrap();
+        assert!(
+            AsyncLockedWriter::remove_lock_if_target_absent(&target, &lock)
+                .await
+                .unwrap()
+        );
+        assert!(!lock.exists());
+    }
+
+    #[test]
+    fn replaced_lock_path_is_not_the_inode_already_locked() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join(".settings.conf.lock");
+        let replacement = directory.path().join("replacement.lock");
+        std::fs::write(&lock, "old").unwrap();
+        let old = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock)
+            .unwrap();
+        old.lock_exclusive().unwrap();
+
+        std::fs::write(&replacement, "new").unwrap();
+        std::fs::rename(&replacement, &lock).unwrap();
+
+        assert!(!AsyncLockedWriter::locked_inode_is_current(&old, &lock).unwrap());
+        old.unlock().unwrap();
     }
 }

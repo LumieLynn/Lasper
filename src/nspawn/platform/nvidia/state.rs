@@ -447,10 +447,21 @@ async fn remove_owned_state_at_with_uid(
     expected_uid: u32,
 ) -> Result<ArtifactOwnership> {
     let ownership = probe_owned_state_at_with_uid(path, expected_uid).await?;
-    if ownership == ArtifactOwnership::ProvenOwned {
-        remove_state_at(path).await?;
+    match ownership {
+        ArtifactOwnership::ProvenOwned => remove_state_at(path).await?,
+        ArtifactOwnership::NotPresent => {
+            remove_optional_lock_at(path).await?;
+        }
+        ArtifactOwnership::AmbiguousLegacy => {}
     }
     Ok(ownership)
+}
+
+async fn remove_optional_lock_at(path: &Path) -> Result<()> {
+    let lock_path = crate::nspawn::sys::io::lock_path_for(path);
+    AsyncLockedWriter::remove_lock_if_target_absent(path, &lock_path)
+        .await
+        .map(|_| ())
 }
 
 async fn probe_owned_state_at_with_uid(
@@ -1099,10 +1110,13 @@ mod tests {
     async fn remove_state_ignores_missing_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing.json");
+        let lock_path = crate::nspawn::sys::io::lock_path_for(&path);
+        tokio::fs::write(&lock_path, "").await.unwrap();
 
         remove_state_at(&path).await.unwrap();
 
         assert!(!path.exists());
+        assert!(!lock_path.exists());
     }
 
     #[tokio::test]
