@@ -1161,6 +1161,26 @@ mod tests {
         assert!(matches!(error, NspawnError::ContainerAlreadyRunning(_)));
     }
 
+    #[tokio::test]
+    async fn cli_mode_remove_does_not_probe_dbus() {
+        let dbus = MockContainerBackend::new();
+        let mut cli = MockContainerBackend::new();
+        cli.expect_list_machines().once().returning(|| Ok(vec![]));
+        cli.expect_disable()
+            .withf(|name| name == "regular-image")
+            .once()
+            .returning(|_| Ok(()));
+        cli.expect_remove()
+            .withf(|name| name == "regular-image")
+            .once()
+            .returning(|_| Ok(()));
+        let mgr = test_manager(dbus, cli, true);
+
+        mgr.remove("regular-image").await.unwrap();
+
+        assert!(mgr.did_fallback().is_none());
+    }
+
     // list_machines
 
     #[tokio::test]

@@ -36,7 +36,9 @@ use crate::nspawn::adapters::rootfs::store::{
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
-use crate::nspawn::models::{MachineName, MachineProperties, TerminalSize};
+use crate::nspawn::models::{
+    ContainerEntry, ImageEntry, MachineName, MachineProperties, TerminalSize,
+};
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
     validate_target as validate_bootstrap_target, BootstrapRequest,
@@ -213,7 +215,50 @@ async fn initialize_dbus_backend(
     }
 
     let dbus = crate::nspawn::adapters::comm::dbus::DbusBackend::new();
-    dbus.is_available().await.then_some(dbus)
+    ContainerBackend::is_available(&dbus).await.then_some(dbus)
+}
+
+/// The D-Bus surface used by the RPC dispatcher.
+///
+/// This is intentionally private to the daemon for now. It keeps dispatch
+/// tests independent from a live system bus without pretending that the
+/// application already has a general host capability layer.
+#[async_trait::async_trait]
+trait DaemonDbusExecutor: Send + Sync {
+    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>>;
+    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>>;
+    async fn system_operation(
+        &self,
+        operation: SystemOperation,
+    ) -> crate::nspawn::errors::Result<()>;
+    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties>;
+    async fn is_available(&self) -> bool;
+}
+
+#[async_trait::async_trait]
+impl DaemonDbusExecutor for crate::nspawn::adapters::comm::dbus::DbusBackend {
+    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
+        ContainerBackend::list_machines(self).await
+    }
+
+    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
+        ContainerBackend::list_images(self).await
+    }
+
+    async fn system_operation(
+        &self,
+        operation: SystemOperation,
+    ) -> crate::nspawn::errors::Result<()> {
+        execute_dbus_system_operation(self, operation).await
+    }
+
+    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties> {
+        ContainerBackend::get_properties(self, name).await
+    }
+
+    async fn is_available(&self) -> bool {
+        ContainerBackend::is_available(self).await
+    }
 }
 
 // ── Parent-side handle ──
@@ -1669,14 +1714,12 @@ pub async fn daemon_main(
     }
 }
 
-async fn handle_request(
+async fn handle_request<B: DaemonDbusExecutor>(
     request: &RpcRequest,
-    dbus: &Option<crate::nspawn::adapters::comm::dbus::DbusBackend>,
+    dbus: &Option<B>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
     invoking_uid: u32,
 ) -> HandleOutcome {
-    use crate::nspawn::adapters::comm::backend::ContainerBackend;
-
     match request.method.as_str() {
         "ping" => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
 
@@ -1968,7 +2011,7 @@ async fn handle_request(
                     )));
                 }
             };
-            match execute_dbus_system_operation(dbus, operation).await {
+            match dbus.system_operation(operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
@@ -2654,6 +2697,56 @@ mod tests {
 
     const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
+    #[derive(Clone)]
+    struct SlowRemoveDbus {
+        started: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl DaemonDbusExecutor for SlowRemoveDbus {
+        async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
+            Err(crate::nspawn::errors::NspawnError::Runtime(
+                "slow test backend does not list machines".into(),
+            ))
+        }
+
+        async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
+            Err(crate::nspawn::errors::NspawnError::Runtime(
+                "slow test backend does not list images".into(),
+            ))
+        }
+
+        async fn system_operation(
+            &self,
+            operation: SystemOperation,
+        ) -> crate::nspawn::errors::Result<()> {
+            match operation {
+                SystemOperation::RemoveImage { .. } => {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                    Ok(())
+                }
+                _ => Err(crate::nspawn::errors::NspawnError::Runtime(
+                    "slow test backend only handles image removal".into(),
+                )),
+            }
+        }
+
+        async fn get_properties(
+            &self,
+            _name: &str,
+        ) -> crate::nspawn::errors::Result<MachineProperties> {
+            Err(crate::nspawn::errors::NspawnError::Runtime(
+                "slow test backend does not inspect machines".into(),
+            ))
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn unhanded_command_is_stopped_and_reaped() {
         let cmd_id = u64::MAX;
@@ -2785,6 +2878,72 @@ mod tests {
     #[tokio::test]
     async fn cli_mode_skips_daemon_dbus_initialization() {
         assert!(initialize_dbus_backend(false).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn slow_remove_image_reproduces_inline_pump_blocking() {
+        if std::env::var_os("LASPER_RUN_SLOW_REPRODUCER").is_none() {
+            return;
+        }
+
+        let slow = SlowRemoveDbus {
+            started: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let started = slow.started.clone();
+        let release = slow.release.clone();
+        let dbus = Some(slow);
+        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(4);
+        let remove = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "dbus_system_operation".into(),
+            params: serde_json::to_value(SystemOperation::RemoveImage {
+                image: crate::nspawn::models::ImageName::new("slow-image").unwrap(),
+            })
+            .unwrap(),
+        };
+        let ping = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 2,
+            method: "ping".into(),
+            params: serde_json::json!({}),
+        };
+
+        // This mirrors the current daemon loop: one dispatch future is
+        // awaited before the next frame is read. The test is intentionally
+        // env-gated until Phase 1 replaces this assertion with responsiveness.
+        let mut pump = tokio::spawn(async move {
+            let remove_outcome =
+                handle_request(&remove, &dbus, &out_tx, uzers::get_current_uid()).await;
+            let ping_outcome =
+                handle_request(&ping, &dbus, &out_tx, uzers::get_current_uid()).await;
+            (remove_outcome, ping_outcome)
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("RemoveImage did not reach the slow executor");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pump)
+                .await
+                .is_err()
+        );
+
+        release.notify_one();
+        let (remove_outcome, ping_outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), pump)
+                .await
+                .expect("pump did not resume after RemoveImage completed")
+                .expect("pump task panicked");
+        assert!(matches!(
+            remove_outcome,
+            HandleOutcome::Sync(Ok(serde_json::Value::Null))
+        ));
+        assert!(matches!(
+            ping_outcome,
+            HandleOutcome::Sync(Ok(serde_json::Value::Null))
+        ));
     }
 
     #[test]
@@ -3082,7 +3241,13 @@ mod tests {
         };
 
         assert!(matches!(
-            handle_request(&request, &None, &out_tx, uzers::get_current_uid()).await,
+            handle_request(
+                &request,
+                &None::<crate::nspawn::adapters::comm::dbus::DbusBackend>,
+                &out_tx,
+                uzers::get_current_uid(),
+            )
+            .await,
             HandleOutcome::Spawned
         ));
         let response: RpcResponse = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
@@ -3094,7 +3259,13 @@ mod tests {
             ..request
         };
         assert!(matches!(
-            handle_request(&invalid, &None, &out_tx, uzers::get_current_uid()).await,
+            handle_request(
+                &invalid,
+                &None::<crate::nspawn::adapters::comm::dbus::DbusBackend>,
+                &out_tx,
+                uzers::get_current_uid(),
+            )
+            .await,
             HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
         ));
     }

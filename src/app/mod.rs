@@ -1233,6 +1233,31 @@ mod tests {
             ));
         }
 
+        #[tokio::test]
+        async fn removal_failure_never_runs_optional_cleanup() {
+            let mut manager = MockNspawnManager::new();
+            manager.expect_remove().once().returning(|_| {
+                Err(crate::nspawn::errors::NspawnError::Runtime(
+                    "remove failed".into(),
+                ))
+            });
+            manager.expect_cleanup_image_artifacts().never();
+            let (mut app, mut rx) = prepare_image_removal(manager);
+
+            app.show_delete_dialog();
+            app.action_remove();
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("remove task should finish")
+                .expect("remove task should report a result");
+            assert!(matches!(
+                event,
+                AppEvent::ActionDone(message, crate::ui::StatusLevel::Error)
+                    if message == "Remove failed: Runtime error: remove failed"
+            ));
+        }
+
         #[test]
         fn confirmation_rejects_a_target_that_disappeared() {
             let mut manager = MockNspawnManager::new();
