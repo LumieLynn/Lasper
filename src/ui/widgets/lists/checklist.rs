@@ -59,6 +59,10 @@ impl<T> Checklist<T> {
         &self.checked_indices
     }
 
+    pub fn selected_idx(&self) -> Option<usize> {
+        self.state.selected()
+    }
+
     #[allow(dead_code)]
     pub fn checked_items(&self) -> Vec<&T> {
         self.checked_indices

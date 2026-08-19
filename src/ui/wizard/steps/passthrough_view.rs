@@ -9,7 +9,24 @@ use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
-use ratatui::{layout::Rect, Frame};
+use ratatui::{layout::Rect, widgets::ScrollbarState, Frame};
+
+#[derive(Clone)]
+enum GpuSelectionItem {
+    AllDrm,
+    Device(GpuDevice),
+}
+
+fn is_drm_gpu(gpu: &GpuDevice) -> bool {
+    gpu.nodes.iter().any(|node| node.starts_with("/dev/dri/"))
+}
+
+fn scrollbar_state(scroll_offset: u16, scroll_max: u16, viewport_height: u16) -> ScrollbarState {
+    // Ratatui models content_length as the number of valid scroll positions.
+    ScrollbarState::new(usize::from(scroll_max) + 1)
+        .position(usize::from(scroll_offset))
+        .viewport_content_length(usize::from(viewport_height))
+}
 
 /// Single source of truth: returns (component, height, is_focusable) for every visible item.
 macro_rules! layout_items {
@@ -18,14 +35,10 @@ macro_rules! layout_items {
         let wayland_checked = $self.wayland_socket.checked();
         let wayland_selector_active = wayland_checked && !$self.wayland_sockets.is_empty();
         let is_privileged = $self.privileged.checked();
-        let has_gpus = !$self.discovered_gpus.is_empty();
-        let all_drm = $self.gpu_all.checked();
-        let has_gpu_access = is_accel && (all_drm || !$self.gpu_list.checked_indices().is_empty());
+        let has_gpus = !$self.gpu_list.items().is_empty();
+        let has_gpu_access = is_accel && !$self.gpu_list.checked_indices().is_empty();
         let wayland_without_gpu = wayland_checked && !has_gpu_access;
-        let gpu_count = $self.discovered_gpus.len() as u16;
-        let gpu_all_warning_height = $self
-            .gpu_all_warning
-            .required_height($self.scroll_area.width.max(20));
+        let gpu_count = $self.gpu_list.items().len() as u16;
         let wayland_gpu_note_height = $self
             .wayland_gpu_note
             .required_height($self.scroll_area.width.max(20));
@@ -41,17 +54,9 @@ macro_rules! layout_items {
 
         items.push((&mut $self.graphics_acceleration, 3, true));
 
-        if is_accel {
-            items.push((&mut $self.gpu_all, 3, true));
-        }
-
-        if is_accel && all_drm {
-            items.push((&mut $self.gpu_all_warning, gpu_all_warning_height, false));
-        }
-
         if is_accel && has_gpus {
             let height = (gpu_count + 2).min(10);
-            items.push((&mut $self.gpu_list, height, !all_drm));
+            items.push((&mut $self.gpu_list, height, true));
         } else if is_accel && !has_gpus {
             items.push((&mut $self.gpu_empty, 3, false));
         }
@@ -98,10 +103,8 @@ impl_wizard_nav!(PassthroughStepView, active_comps);
 
 pub struct PassthroughStepView {
     graphics_acceleration: Checkbox,
-    discovered_gpus: Vec<GpuDevice>,
-    gpu_list: Checklist<GpuDevice>,
-    gpu_all: Checkbox,
-    gpu_all_warning: TextBlock,
+    gpu_list: Checklist<GpuSelectionItem>,
+    gpu_all_index: Option<usize>,
     gpu_empty: TextBlock,
     wayland_socket: Checkbox,
     wayland_selector: RadioGroup,
@@ -130,19 +133,6 @@ impl PassthroughStepView {
         discovered_gpus: Vec<GpuDevice>,
         hardware_scanning: bool,
     ) -> Self {
-        let is_host_nw = matches!(nw_mode, Some(NetworkMode::Host));
-        let wayland_label = if is_host_nw {
-            "Wayland Socket Passthrough"
-        } else {
-            "Wayland Socket Passthrough (Requires Host Network)"
-        };
-
-        let initial_wayland = if is_host_nw {
-            initial_data.wayland_socket.is_some()
-        } else {
-            false
-        };
-
         let wayland_options = if wayland_sockets.is_empty() {
             vec!["No sockets found".to_string()]
         } else {
@@ -158,13 +148,22 @@ impl PassthroughStepView {
             0
         };
 
-        let mut gpu_list = Checklist::new("Select Host GPU(s)", discovered_gpus.clone(), |gpu| {
-            format!(
-                "{} ({})",
-                gpu.display_name,
-                gpu.nodes.first().cloned().unwrap_or_default()
-            )
-        });
+        let has_drm_devices = discovered_gpus
+            .iter()
+            .flat_map(|gpu| &gpu.nodes)
+            .any(|node| node.starts_with("/dev/dri/"));
+        let gpu_all_index = has_drm_devices.then_some(0);
+        let mut gpu_items =
+            Vec::with_capacity(discovered_gpus.len() + usize::from(has_drm_devices));
+        if has_drm_devices {
+            gpu_items.push(GpuSelectionItem::AllDrm);
+        }
+        gpu_items.extend(
+            discovered_gpus
+                .iter()
+                .cloned()
+                .map(GpuSelectionItem::Device),
+        );
 
         let mut checked_indices = Vec::new();
         for (i, gpu) in discovered_gpus.iter().enumerate() {
@@ -173,14 +172,27 @@ impl PassthroughStepView {
                 .iter()
                 .any(|node| initial_data.device_binds.contains(node))
             {
-                checked_indices.push(i);
+                checked_indices.push(i + usize::from(has_drm_devices));
             }
         }
+        if initial_data.gpu_passthrough_all {
+            if let Some(all_index) = gpu_all_index {
+                checked_indices.push(all_index);
+            }
+            checked_indices.extend(gpu_items.iter().enumerate().filter_map(|(index, item)| {
+                matches!(item, GpuSelectionItem::Device(gpu) if is_drm_gpu(gpu)).then_some(index)
+            }));
+        }
+
+        let mut gpu_list = Checklist::new("Select Host GPU(s)", gpu_items, |item| match item {
+            GpuSelectionItem::AllDrm => "All DRM devices (/dev/dri)".to_string(),
+            GpuSelectionItem::Device(gpu) => format!(
+                "{} ({})",
+                gpu.display_name,
+                gpu.nodes.first().cloned().unwrap_or_default()
+            ),
+        });
         gpu_list.set_checked(checked_indices);
-        let has_drm_devices = discovered_gpus
-            .iter()
-            .flat_map(|gpu| &gpu.nodes)
-            .any(|node| node.starts_with("/dev/dri/"));
 
         let warning_text = "Enabled setting: [Exec] Capability=all. This grants every Linux capability, including system and mount administration, device and raw I/O access, network administration, kernel/module controls, and process tracing. PrivateUsers and networking remain controlled by their separate settings. A compromised container may take over the host.";
 
@@ -189,22 +201,16 @@ impl PassthroughStepView {
                 "Hardware Graphics Acceleration",
                 initial_data.graphics_acceleration,
             ),
-            discovered_gpus,
             gpu_list,
-            gpu_all: Checkbox::new(
-                "Passthrough all DRM devices (/dev/dri)",
-                initial_data.gpu_passthrough_all && has_drm_devices,
-            )
-            .with_enabled(has_drm_devices),
-            gpu_all_warning: TextBlock::new(
-                " BROAD DEVICE ACCESS ",
-                "Every host DRM device is exposed through /dev/dri. Prefer selecting one GPU when possible.",
-            ),
+            gpu_all_index,
             gpu_empty: TextBlock::new(
                 " No GPUs Detected ",
                 "No compatible GPU devices found on the host. Graphics acceleration may not work as expected.",
             ),
-            wayland_socket: Checkbox::new(wayland_label, initial_wayland).with_enabled(is_host_nw),
+            wayland_socket: Checkbox::new(
+                "Wayland Socket Passthrough",
+                initial_data.wayland_socket.is_some(),
+            ),
             wayland_selector: RadioGroup::new("Source Socket", wayland_options, initial_socket_idx),
             wayland_sockets,
             wayland_empty: TextBlock::new(
@@ -248,7 +254,6 @@ impl PassthroughStepView {
             private_network: nw_mode.as_ref().is_some_and(NetworkMode::is_private),
         };
 
-        view.update_gpu_state();
         view.update_wayland_state();
         view.update_focus();
         view
@@ -259,8 +264,72 @@ impl PassthroughStepView {
         self.wayland_selector.set_enabled(enabled);
     }
 
-    fn update_gpu_state(&mut self) {
-        self.gpu_list.set_enabled(!self.gpu_all.checked());
+    fn gpu_all_selected(&self) -> bool {
+        self.gpu_all_index
+            .is_some_and(|index| self.gpu_list.checked_indices().contains(&index))
+    }
+
+    fn toggle_gpu_selection(&mut self) {
+        let Some(selected) = self.gpu_list.selected_idx() else {
+            return;
+        };
+        let mut checked = self.gpu_list.checked_indices().clone();
+
+        if self.gpu_all_index == Some(selected) {
+            if checked.contains(&selected) {
+                checked.remove(&selected);
+                for (index, item) in self.gpu_list.items().iter().enumerate() {
+                    if matches!(item, GpuSelectionItem::Device(gpu) if is_drm_gpu(gpu)) {
+                        checked.remove(&index);
+                    }
+                }
+            } else {
+                checked.insert(selected);
+                checked.extend(self.gpu_list.items().iter().enumerate().filter_map(
+                    |(index, item)| {
+                        matches!(item, GpuSelectionItem::Device(gpu) if is_drm_gpu(gpu))
+                            .then_some(index)
+                    },
+                ));
+            }
+        } else {
+            let selected_is_drm = matches!(
+                self.gpu_list.items().get(selected),
+                Some(GpuSelectionItem::Device(gpu)) if is_drm_gpu(gpu)
+            );
+            if !checked.insert(selected) {
+                checked.remove(&selected);
+            }
+            if selected_is_drm {
+                if let Some(all_index) = self.gpu_all_index {
+                    checked.remove(&all_index);
+                }
+            }
+        }
+
+        self.gpu_list.set_checked(checked.into_iter().collect());
+    }
+
+    fn selected_gpu_nodes(&self) -> Vec<String> {
+        if !self.graphics_acceleration.checked() {
+            return Vec::new();
+        }
+
+        let all_drm = self.gpu_all_selected();
+        let mut selected_nodes = Vec::new();
+        for &index in self.gpu_list.checked_indices() {
+            if let Some(GpuSelectionItem::Device(gpu)) = self.gpu_list.items().get(index) {
+                selected_nodes.extend(
+                    gpu.nodes
+                        .iter()
+                        .filter(|node| !all_drm || !node.starts_with("/dev/dri/"))
+                        .cloned(),
+                );
+            }
+        }
+        selected_nodes.sort();
+        selected_nodes.dedup();
+        selected_nodes
     }
 }
 
@@ -338,10 +407,8 @@ impl Component for PassthroughStepView {
 
         // Scrollbar
         if total_height > area.height {
-            use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
-            let mut state = ScrollbarState::new(total_height as usize)
-                .position(self.scroll_offset as usize)
-                .viewport_content_length(usize::from(area.height));
+            use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
+            let mut state = scrollbar_state(self.scroll_offset, max_scroll, area.height);
             let scrollbar = Scrollbar::default()
                 .orientation(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("▲"))
@@ -361,13 +428,19 @@ impl Component for PassthroughStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if key.code == KeyCode::Char(' ') && self.gpu_list.is_focused() {
+            self.toggle_gpu_selection();
+            self.update_wayland_state();
+            self.update_focus();
+            return EventResult::Consumed;
+        }
+
         let res = delegate_wizard_navigation!(self, key, active_comps);
 
         if matches!(
             key.code,
             KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right
         ) {
-            self.update_gpu_state();
             self.update_wayland_state();
             self.update_focus();
         }
@@ -412,7 +485,7 @@ impl StepComponent for PassthroughStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.passthrough.graphics_acceleration = self.graphics_acceleration.checked();
         ctx.passthrough.gpu_passthrough_all =
-            self.graphics_acceleration.checked() && self.gpu_all.checked();
+            self.graphics_acceleration.checked() && self.gpu_all_selected();
         ctx.passthrough.privileged = self.privileged.checked();
         ctx.passthrough.private_users = match self.private_users.selected_idx() {
             0 => None,
@@ -423,22 +496,9 @@ impl StepComponent for PassthroughStepView {
             _ => None,
         };
 
-        let mut selected_nodes = Vec::new();
-        if self.graphics_acceleration.checked() && !self.gpu_all.checked() {
-            for &idx in self.gpu_list.checked_indices() {
-                if let Some(gpu) = self.discovered_gpus.get(idx) {
-                    selected_nodes.extend(gpu.nodes.clone());
-                }
-            }
-        }
-        ctx.passthrough.selected_gpu_nodes = selected_nodes;
+        ctx.passthrough.selected_gpu_nodes = self.selected_gpu_nodes();
 
-        let is_host_nw = matches!(
-            ctx.network.network_mode(),
-            Some(crate::nspawn::models::NetworkMode::Host)
-        );
-
-        if self.wayland_socket.checked() && is_host_nw && !self.wayland_sockets.is_empty() {
+        if self.wayland_socket.checked() && !self.wayland_sockets.is_empty() {
             let idx = self.wayland_selector.selected_idx();
             ctx.passthrough.wayland_socket = Some(self.wayland_sockets[idx].clone());
         } else {
@@ -454,7 +514,37 @@ impl StepComponent for PassthroughStepView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::Buffer,
+        widgets::{Scrollbar, ScrollbarOrientation, StatefulWidget},
+        Terminal,
+    };
+
+    #[test]
+    fn scrollbar_thumb_uses_the_bounded_scroll_range() {
+        let area = Rect::new(0, 0, 1, 8);
+        let scrollbar = || {
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+        };
+
+        let mut top_buffer = Buffer::empty(area);
+        let mut top_state = scrollbar_state(0, 8, area.height);
+        StatefulWidget::render(scrollbar(), area, &mut top_buffer, &mut top_state);
+        assert_eq!(top_buffer[(0, 1)].symbol(), "█");
+        assert_eq!(top_buffer[(0, 3)].symbol(), "█");
+        assert_eq!(top_buffer[(0, 4)].symbol(), "║");
+
+        let mut bottom_buffer = Buffer::empty(area);
+        let mut bottom_state = scrollbar_state(8, 8, area.height);
+        StatefulWidget::render(scrollbar(), area, &mut bottom_buffer, &mut bottom_state);
+        assert_eq!(bottom_buffer[(0, 3)].symbol(), "║");
+        assert_eq!(bottom_buffer[(0, 4)].symbol(), "█");
+        assert_eq!(bottom_buffer[(0, 6)].symbol(), "█");
+    }
 
     #[test]
     fn privileged_warning_names_the_effective_setting_and_independent_controls() {
@@ -496,34 +586,59 @@ mod tests {
     }
 
     #[test]
-    fn all_drm_option_is_explicit_and_disables_individual_gpu_selection() {
+    fn all_drm_list_item_selects_drm_devices_and_keeps_individual_control() {
         crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
         let config = PassthroughConfig {
             bind_mounts: Vec::new(),
-            device_binds: Vec::new(),
+            device_binds: vec!["/dev/mali".into()],
             privileged: false,
             private_users: None,
             graphics_acceleration: true,
-            gpu_passthrough_all: true,
+            gpu_passthrough_all: false,
             wayland_socket: Some("wayland-0".into()),
             nvidia_gpu: false,
             nvidia_profile: None,
         };
-        let gpu = GpuDevice {
-            display_name: "Test GPU".into(),
+        let first_gpu = GpuDevice {
+            display_name: "First DRM GPU".into(),
             driver_type: "DRM/KMS".into(),
             nodes: vec!["/dev/dri/card0".into(), "/dev/dri/renderD128".into()],
         };
+        let second_gpu = GpuDevice {
+            display_name: "Second DRM GPU".into(),
+            driver_type: "DRM/KMS".into(),
+            nodes: vec!["/dev/dri/card1".into(), "/dev/dri/renderD129".into()],
+        };
+        let legacy_gpu = GpuDevice {
+            display_name: "Legacy Mali GPU".into(),
+            driver_type: "Mali/Proprietary".into(),
+            nodes: vec!["/dev/mali".into()],
+        };
+        let gpus = vec![first_gpu, second_gpu, legacy_gpu];
         let mut view = PassthroughStepView::new(
             &config,
             Some(NetworkMode::Host),
             vec!["wayland-0".into()],
-            vec![gpu],
+            gpus.clone(),
             false,
         );
 
-        assert!(view.gpu_all.checked());
-        assert!(!view.gpu_list.is_enabled());
+        assert!(!view.gpu_all_selected());
+        assert_eq!(view.gpu_list.checked_indices().len(), 1);
+        view.focus.active_idx = 1;
+        view.update_focus();
+        assert_eq!(view.gpu_list.selected_idx(), Some(0));
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert!(view.gpu_all_selected());
+        assert_eq!(view.gpu_list.checked_indices().len(), 4);
+        assert!(view.gpu_list.is_enabled());
+        assert_eq!(view.selected_gpu_nodes(), vec!["/dev/mali"]);
 
         let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
         terminal
@@ -539,8 +654,97 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains("Passthrough all DRM devices (/dev/dri)"));
-        assert!(rendered.contains("Every host DRM device is exposed"));
+        assert!(rendered.contains("All DRM devices (/dev/dri)"));
         assert!(!rendered.contains("SOCKET ONLY"));
+
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert_eq!(view.gpu_list.selected_idx(), Some(1));
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert!(!view.gpu_all_selected());
+        assert!(!view.gpu_list.checked_indices().contains(&1));
+        assert!(view.gpu_list.checked_indices().contains(&2));
+        assert!(view.gpu_list.checked_indices().contains(&3));
+        assert_eq!(
+            view.selected_gpu_nodes(),
+            vec!["/dev/dri/card1", "/dev/dri/renderD129", "/dev/mali"]
+        );
+
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert!(!view.gpu_all_selected());
+        assert_eq!(view.gpu_list.checked_indices().len(), 3);
+
+        let mut restored_config = config;
+        restored_config.gpu_passthrough_all = true;
+        let restored_view = PassthroughStepView::new(
+            &restored_config,
+            Some(NetworkMode::Host),
+            vec!["wayland-0".into()],
+            gpus,
+            false,
+        );
+        assert!(restored_view.gpu_all_selected());
+        assert_eq!(restored_view.gpu_list.checked_indices().len(), 4);
+        assert_eq!(restored_view.selected_gpu_nodes(), vec!["/dev/mali"]);
+    }
+
+    #[test]
+    fn wayland_passthrough_remains_available_with_private_networking() {
+        crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
+        let config = PassthroughConfig {
+            bind_mounts: Vec::new(),
+            device_binds: Vec::new(),
+            privileged: false,
+            private_users: Some(PrivateUsersMode::Managed),
+            graphics_acceleration: false,
+            gpu_passthrough_all: false,
+            wayland_socket: Some("wayland-0".into()),
+            nvidia_gpu: false,
+            nvidia_profile: None,
+        };
+        let mut view = PassthroughStepView::new(
+            &config,
+            Some(NetworkMode::Veth),
+            vec!["wayland-0".into()],
+            Vec::new(),
+            false,
+        );
+
+        assert!(view.wayland_socket.checked());
+        assert!(view.wayland_socket.is_enabled());
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Wayland Socket Passthrough"));
+        assert!(!rendered.contains("Requires Host Network"));
     }
 }

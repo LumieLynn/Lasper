@@ -328,21 +328,6 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     xdg_runtime: Option<&str>,
     verified_wayland_socket: Option<&Path>,
 ) -> Result<String> {
-    let verified_x11_directory = verified_bind_directory(Path::new("/tmp/.X11-unix"));
-    nspawn_config_content_from_spec_with_host_paths(
-        spec,
-        xdg_runtime,
-        verified_wayland_socket,
-        verified_x11_directory,
-    )
-}
-
-fn nspawn_config_content_from_spec_with_host_paths(
-    spec: &NspawnConfigSpec,
-    xdg_runtime: Option<&str>,
-    verified_wayland_socket: Option<&Path>,
-    verified_x11_directory: Option<&Path>,
-) -> Result<String> {
     spec.validate()?;
     let passthrough_all_drm = spec.gpu_passthrough_all
         || spec
@@ -485,15 +470,6 @@ fn nspawn_config_content_from_spec_with_host_paths(
                 let socket_path = escape_nspawn_bind_path(socket_path);
                 files.append("Bind", format!("{socket_path}:/mnt/wayland-socket{suffix}"));
             }
-
-            if let Some(x11_directory) = verified_x11_directory {
-                let x11_directory = validated_nspawn_path("X11 socket directory", x11_directory)?;
-                let x11_directory = escape_nspawn_bind_path(x11_directory);
-                files.append(
-                    "BindReadOnly",
-                    format!("{x11_directory}:/mnt/host-x11{suffix}"),
-                );
-            }
         }
 
         // Individual device binds are populated in cfg.device_binds. The
@@ -506,11 +482,6 @@ fn nspawn_config_content_from_spec_with_host_paths(
     conf.write_to_policy(&mut buffer, EscapePolicy::Nothing)
         .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
-}
-
-fn verified_bind_directory(path: &Path) -> Option<&Path> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
-    (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(path)
 }
 
 fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
@@ -950,43 +921,23 @@ mod tests {
     }
 
     #[test]
-    fn wayland_x11_bind_requires_a_verified_directory() {
+    fn wayland_passthrough_binds_only_the_verified_socket() {
         let cfg = ContainerConfig {
             name: "test".into(),
+            network: Some(crate::nspawn::models::NetworkMode::Veth),
+            private_users: Some(PrivateUsersMode::Managed),
             wayland_socket: Some("wayland-0".into()),
             ..Default::default()
         };
         let spec = NspawnConfigSpec::try_from(&cfg).unwrap();
         let runtime = Path::new("/run/user/1000/wayland-0");
-        let x11 = Path::new("/tmp/.X11-unix");
+        let content =
+            nspawn_config_content_from_spec_with_wayland_path(&spec, None, Some(runtime)).unwrap();
 
-        let without_x11 =
-            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), None)
-                .unwrap();
-        assert!(!without_x11.contains("/mnt/host-x11"));
-        assert!(!without_x11.contains("Bind=/dev/dri"));
-
-        let with_x11 =
-            nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), Some(x11))
-                .unwrap();
-        assert!(with_x11.contains("BindReadOnly=/tmp/.X11-unix:/mnt/host-x11:idmap"));
-        assert!(!with_x11.contains("Bind=/dev/dri"));
-    }
-
-    #[test]
-    fn x11_source_verification_rejects_files_and_symlinks() {
-        let directory = tempfile::tempdir().unwrap();
-        let source = directory.path().join("x11");
-        std::fs::create_dir(&source).unwrap();
-        assert_eq!(verified_bind_directory(&source), Some(source.as_path()));
-
-        let file = directory.path().join("file");
-        std::fs::write(&file, b"not a directory").unwrap();
-        assert!(verified_bind_directory(&file).is_none());
-
-        let symlink = directory.path().join("link");
-        std::os::unix::fs::symlink(&source, &symlink).unwrap();
-        assert!(verified_bind_directory(&symlink).is_none());
+        assert!(content.contains("Bind=/run/user/1000/wayland-0:/mnt/wayland-socket:idmap"));
+        assert!(!content.contains("X11"));
+        assert!(!content.contains("host-x11"));
+        assert!(!content.contains("Bind=/dev/dri"));
     }
 
     #[test]

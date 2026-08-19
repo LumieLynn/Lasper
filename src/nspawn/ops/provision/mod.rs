@@ -564,10 +564,9 @@ async fn run_deploy_internal(
 
                 if cfg.wayland_socket.is_some() {
                     push_log!(format!("Setting up wayland env for {}...", user.username));
-                    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
                     exec_ctx
                         .rootfs
-                        .configure_wayland(&actual_rootfs_target, user, &display)
+                        .configure_wayland(&actual_rootfs_target, user)
                         .await?;
                     cancellation.checkpoint()?;
                 }

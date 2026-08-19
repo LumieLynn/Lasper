@@ -6,16 +6,14 @@ use std::path::Path;
 
 const WAYLAND_RC_MARKER: &str = "# Added by Lasper: Wayland passthrough";
 const WAYLAND_RC_SOURCE: &str = "[ -f ~/.wayland-env ] && source ~/.wayland-env";
-const MAX_DISPLAY_BYTES: usize = 255;
 
 pub(crate) async fn setup_wayland_shell_env(
     rootfs: &Path,
     username: &str,
     shell: &str,
-    host_display: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<()> {
-    validate_wayland_config(username, shell, host_display)?;
+    validate_wayland_config(username, shell)?;
 
     let home = if username == "root" {
         "/root".to_string()
@@ -23,45 +21,21 @@ pub(crate) async fn setup_wayland_shell_env(
         format!("/home/{username}")
     };
     let env_path = format!("{home}/.wayland-env");
-    let display = shell_single_quote(host_display);
-    let script = format!(
-        r#"
+    let script = r#"
 export WAYLAND_DISPLAY=/mnt/wayland-socket
-export DISPLAY={display}
-if [ -d /mnt/host-x11 ] && [ -d /tmp/.X11-unix ]; then
-    for sock in /mnt/host-x11/*; do
-        if [ -S "$sock" ]; then
-            ln -sf "$sock" "/tmp/.X11-unix/$(basename "$sock")" 2>/dev/null
-        fi
-    done
-fi
 "#
-    );
-    write_user_file(rootfs, username, &env_path, script.into_bytes(), runner).await?;
+    .as_bytes()
+    .to_vec();
+    write_user_file(rootfs, username, &env_path, script, runner).await?;
 
     if shell.ends_with("fish") {
         let fish_path = format!("{home}/.config/fish/conf.d/wayland-env.fish");
-        let fish_script = format!(
-            r#"
+        let fish_script = r#"
 set -gx WAYLAND_DISPLAY /mnt/wayland-socket
-set -gx DISPLAY {display}
-if test -d /mnt/host-x11; and test -d /tmp/.X11-unix
-    for sock in /mnt/host-x11/*
-        if test -S "$sock"
-            ln -sf "$sock" "/tmp/.X11-unix/"(basename "$sock") 2>/dev/null
-        end
-    end
-end
 "#
-        );
-        write_user_file(
-            rootfs,
-            username,
-            &fish_path,
-            fish_script.into_bytes(),
-            runner,
-        )
-        .await?;
+        .as_bytes()
+        .to_vec();
+        write_user_file(rootfs, username, &fish_path, fish_script, runner).await?;
         return Ok(());
     }
 
@@ -73,14 +47,9 @@ end
     append_wayland_source(rootfs, username, &format!("{home}/{rc_file}"), runner).await
 }
 
-pub(crate) fn validate_wayland_config(
-    username: &str,
-    shell: &str,
-    host_display: &str,
-) -> Result<()> {
+pub(crate) fn validate_wayland_config(username: &str, shell: &str) -> Result<()> {
     validate_login_username(username)?;
-    validate_login_shell(shell)?;
-    validate_display(host_display)
+    validate_login_shell(shell)
 }
 
 async fn write_user_file(
@@ -176,19 +145,6 @@ async fn append_wayland_source(
     }
 }
 
-fn validate_display(display: &str) -> Result<()> {
-    if display.is_empty()
-        || display.len() > MAX_DISPLAY_BYTES
-        || display.chars().any(char::is_control)
-    {
-        return Err(NspawnError::Validation(
-            "DISPLAY must be non-empty, at most 255 bytes, and contain no control characters"
-                .into(),
-        ));
-    }
-    Ok(())
-}
-
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -222,15 +178,9 @@ mod tests {
                 Ok(success_output())
             });
 
-        setup_wayland_shell_env(
-            Path::new("/tmp/rootfs"),
-            "alice",
-            "/usr/bin/zsh",
-            ":0",
-            &runner,
-        )
-        .await
-        .unwrap();
+        setup_wayland_shell_env(Path::new("/tmp/rootfs"), "alice", "/usr/bin/zsh", &runner)
+            .await
+            .unwrap();
 
         let calls = calls.lock().unwrap();
         assert!(calls[0]
@@ -239,6 +189,8 @@ mod tests {
             .any(|arg| arg == "/home/alice/.wayland-env"));
         let env = String::from_utf8(calls[0].1.clone().unwrap()).unwrap();
         assert!(env.contains("WAYLAND_DISPLAY=/mnt/wayland-socket"));
+        assert!(!env.lines().any(|line| line.starts_with("export DISPLAY=")));
+        assert!(!env.contains("host-x11"));
         assert!(!env.contains("XDG_RUNTIME_DIR"));
         assert!(!env.contains("mkdir -p"));
         assert!(!env.contains("ln -sf /mnt/wayland-socket"));
@@ -260,27 +212,19 @@ mod tests {
                 Ok(success_output())
             });
 
-        setup_wayland_shell_env(
-            Path::new("/tmp/rootfs"),
-            "alice",
-            "/usr/bin/fish",
-            ":0",
-            &runner,
-        )
-        .await
-        .unwrap();
+        setup_wayland_shell_env(Path::new("/tmp/rootfs"), "alice", "/usr/bin/fish", &runner)
+            .await
+            .unwrap();
 
         let calls = calls.lock().unwrap();
         let fish_env = String::from_utf8(calls[1].1.clone().unwrap()).unwrap();
         assert!(fish_env.contains("WAYLAND_DISPLAY /mnt/wayland-socket"));
+        assert!(!fish_env
+            .lines()
+            .any(|line| line.starts_with("set -gx DISPLAY ")));
+        assert!(!fish_env.contains("host-x11"));
         assert!(!fish_env.contains("XDG_RUNTIME_DIR"));
         assert!(!fish_env.contains("mkdir -p"));
         assert!(!fish_env.contains("ln -sf /mnt/wayland-socket"));
-    }
-
-    #[test]
-    fn display_is_shell_quoted_and_control_characters_are_rejected() {
-        assert_eq!(shell_single_quote("host'quoted:0"), "'host'\"'\"'quoted:0'");
-        assert!(validate_display(":0\nmalicious").is_err());
     }
 }

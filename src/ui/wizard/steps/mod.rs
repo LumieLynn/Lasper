@@ -55,9 +55,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         )),
 
         WizardStep::Passthrough => Box::new(passthrough_view::PassthroughStepView::new(
-            &context
-                .passthrough
-                .extract_config(context.network.network_mode()),
+            &context.passthrough.extract_config(),
             context.network.network_mode(),
             context.passthrough.wayland_sockets.clone(),
             context.passthrough.discovered_gpus.clone(),
@@ -65,9 +63,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         )),
 
         WizardStep::Devices => Box::new(devices_view::DevicesStepView::new(
-            &context
-                .passthrough
-                .extract_config(context.network.network_mode()),
+            &context.passthrough.extract_config(),
             &context.passthrough.unclassified_files,
             context.passthrough.nvidia_toolkit_installed,
         )),

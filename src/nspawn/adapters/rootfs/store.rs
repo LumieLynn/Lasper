@@ -166,13 +166,11 @@ impl RootfsStore {
         &self,
         target: &RootfsTarget,
         user: &CreateUser,
-        display: &str,
     ) -> Result<()> {
         self.execute(RootfsOperation::ConfigureWayland(ConfigureWaylandRequest {
             target: target.clone(),
             username: user.username.clone(),
             shell: user.shell.clone(),
-            display: display.to_string(),
         }))
         .await?;
         Ok(())
@@ -283,7 +281,6 @@ pub(crate) struct ConfigureWaylandRequest {
     target: RootfsTarget,
     username: String,
     shell: String,
-    display: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -400,14 +397,13 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::ConfigureWayland(request) => {
-            wayland::validate_wayland_config(&request.username, &request.shell, &request.display)?;
+            wayland::validate_wayland_config(&request.username, &request.shell)?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
             wayland::setup_wayland_shell_env(
                 &path,
                 &request.username,
                 &request.shell,
-                &request.display,
                 rootfs_runner,
             )
             .await?;
@@ -731,11 +727,21 @@ mod tests {
                 "target":{"kind":"machine","machine":"test"},
                 "username":"alice",
                 "shell":"/bin/bash",
-                "display":":0",
                 "path":"/etc/shadow"
             }
         }"#;
         assert!(serde_json::from_str::<RootfsOperation>(arbitrary_path).is_err());
+
+        let x11_display = r#"{
+            "operation":"configure_wayland",
+            "params":{
+                "target":{"kind":"machine","machine":"test"},
+                "username":"alice",
+                "shell":"/bin/bash",
+                "display":":0"
+            }
+        }"#;
+        assert!(serde_json::from_str::<RootfsOperation>(x11_display).is_err());
     }
 
     #[tokio::test]

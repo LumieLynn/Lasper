@@ -389,8 +389,7 @@ pub struct PassthroughState {
 }
 
 impl PassthroughState {
-    pub fn extract_config(&self, mode: Option<NetworkMode>) -> PassthroughConfig {
-        let is_host_nw = matches!(mode, Some(NetworkMode::Host));
+    pub fn extract_config(&self) -> PassthroughConfig {
         PassthroughConfig {
             bind_mounts: self.bind_mounts.clone(),
             device_binds: self.selected_gpu_nodes.clone(),
@@ -398,11 +397,7 @@ impl PassthroughState {
             private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
             gpu_passthrough_all: self.gpu_passthrough_all,
-            wayland_socket: if is_host_nw {
-                self.wayland_socket.clone()
-            } else {
-                None
-            },
+            wayland_socket: self.wayland_socket.clone(),
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
             nvidia_profile: if self.nvidia_gpu {
                 let manual_classifications: Vec<
@@ -672,7 +667,7 @@ impl WizardContext {
             storage: Some(self.storage.extract_config()),
             user: Some(self.user.extract_config()),
             network: Some(self.network.extract_config()),
-            passthrough: Some(self.passthrough.extract_config(self.network.network_mode())),
+            passthrough: Some(self.passthrough.extract_config()),
         }
     }
 
@@ -1072,18 +1067,14 @@ mod tests {
             hardware_scanning: false,
         };
 
-        // Wayland only if Host network
-        let cfg = state.extract_config(Some(NetworkMode::Host));
+        let cfg = state.extract_config();
         assert!(cfg.wayland_socket.is_some());
         assert!(cfg.gpu_passthrough_all);
-
-        let cfg = state.extract_config(Some(NetworkMode::Veth));
-        assert!(cfg.wayland_socket.is_none());
 
         // Nvidia GPU only if toolkit installed
         let mut state_no_toolkit = state.clone();
         state_no_toolkit.nvidia_toolkit_installed = false;
-        let cfg = state_no_toolkit.extract_config(Some(NetworkMode::Host));
+        let cfg = state_no_toolkit.extract_config();
         assert!(!cfg.nvidia_gpu);
     }
 }
