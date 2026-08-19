@@ -116,15 +116,43 @@ pub struct DefaultManager {
     nudge_tx: tokio::sync::watch::Sender<()>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagerRoute {
+    DirectDbus,
+    ElevatedDbus,
+    LocalCli,
+    ElevatedCli,
+}
+
+impl ManagerRoute {
+    fn select(level: PermissionLevel, cli_mode: bool) -> Self {
+        match (level, cli_mode) {
+            (PermissionLevel::Elevated, false) => Self::ElevatedDbus,
+            (PermissionLevel::Elevated, true) => Self::ElevatedCli,
+            (PermissionLevel::User | PermissionLevel::Root, false) => Self::DirectDbus,
+            (PermissionLevel::User | PermissionLevel::Root, true) => Self::LocalCli,
+        }
+    }
+
+    fn is_cli(self) -> bool {
+        matches!(self, Self::LocalCli | Self::ElevatedCli)
+    }
+
+    fn uses_elevated_backend(self) -> bool {
+        matches!(self, Self::ElevatedDbus | Self::ElevatedCli)
+    }
+}
+
 impl DefaultManager {
     pub fn new(
         pm: std::sync::Arc<dyn PermissionManager>,
         cli_mode: bool,
         exec_ctx: std::sync::Arc<ExecutionContext>,
     ) -> Self {
-        if cli_mode {
+        let route = ManagerRoute::select(pm.level(), cli_mode);
+        if route.is_cli() {
             log::info!("CLI mode active — Lasper DBus backend disabled");
-            if pm.level() == PermissionLevel::Elevated {
+            if route == ManagerRoute::ElevatedCli {
                 log::info!("Elevated CLI inspection routed through the root daemon");
             }
         }
@@ -132,29 +160,26 @@ impl DefaultManager {
         let (dbus_backend, dbus_control): (
             std::sync::Arc<dyn RuntimeSource>,
             std::sync::Arc<dyn MachineControl>,
-        ) = match pm.level() {
-            PermissionLevel::Elevated => {
-                if !cli_mode {
-                    log::info!("Elevated mode — DBus operations proxied through daemon");
-                }
-                let backend = DaemonBackend::new(
-                    exec_ctx
-                        .daemon_ref()
-                        .cloned()
-                        .expect("daemon required for Elevated mode"),
-                );
-                (
-                    std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
-                    std::sync::Arc::new(ControlAdapter::new(backend)),
-                )
+        ) = if route.uses_elevated_backend() {
+            if route == ManagerRoute::ElevatedDbus {
+                log::info!("Elevated mode — DBus operations proxied through daemon");
             }
-            _ => {
-                let backend = DbusBackend::new();
-                (
-                    std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
-                    std::sync::Arc::new(ControlAdapter::new(backend)),
-                )
-            }
+            let backend = DaemonBackend::new(
+                exec_ctx
+                    .daemon_ref()
+                    .cloned()
+                    .expect("daemon required for Elevated mode"),
+            );
+            (
+                std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
+                std::sync::Arc::new(ControlAdapter::new(backend)),
+            )
+        } else {
+            let backend = DbusBackend::new();
+            (
+                std::sync::Arc::new(RuntimeAdapter::new(backend.clone())),
+                std::sync::Arc::new(ControlAdapter::new(backend)),
+            )
         };
 
         let cli_backend = CliBackend::with_system_operations(
@@ -167,7 +192,7 @@ impl DefaultManager {
         cli_backend.set_nudge(nudge_rx);
         Self {
             pm,
-            cli_mode,
+            cli_mode: route.is_cli(),
             dbus: dbus_backend,
             cli: std::sync::Arc::new(RuntimeAdapter::new(cli_backend)),
             dbus_control,
@@ -964,6 +989,34 @@ mod tests {
         let mut backend = MockContainerBackend::new();
         backend.expect_is_available().returning(|| false);
         backend
+    }
+
+    #[test]
+    fn manager_route_covers_authority_and_cli_modes() {
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::User, false),
+            ManagerRoute::DirectDbus
+        );
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::Root, false),
+            ManagerRoute::DirectDbus
+        );
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::Elevated, false),
+            ManagerRoute::ElevatedDbus
+        );
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::User, true),
+            ManagerRoute::LocalCli
+        );
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::Root, true),
+            ManagerRoute::LocalCli
+        );
+        assert_eq!(
+            ManagerRoute::select(PermissionLevel::Elevated, true),
+            ManagerRoute::ElevatedCli
+        );
     }
 
     struct SharedMockBackend(std::sync::Arc<MockContainerBackend>);

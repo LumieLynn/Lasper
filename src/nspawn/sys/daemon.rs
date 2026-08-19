@@ -1649,27 +1649,35 @@ pub async fn daemon_main(
         }
     });
 
-    // ── Main request loop ──
-    async fn send_or_exit(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) {
-        let line = serde_json::to_string(&json).unwrap();
-        if out_tx.send(line).await.is_err() {
-            shutdown_daemon_resources().await;
-            std::process::exit(0);
+    let exit_code = match run_rpc_request_pump(&mut rpc_reader, &dbus, &out_tx, user_uid).await {
+        Ok(()) => 0,
+        Err(error) => {
+            log::error!("Daemon RPC socket error: {error}");
+            1
         }
+    };
+    shutdown_daemon_resources().await;
+    std::process::exit(exit_code);
+}
+
+async fn run_rpc_request_pump<R, B>(
+    reader: &mut R,
+    dbus: &Option<B>,
+    out_tx: &tokio::sync::mpsc::Sender<String>,
+    invoking_uid: u32,
+) -> std::io::Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    B: DaemonDbusExecutor,
+{
+    async fn send(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) -> bool {
+        let line = serde_json::to_string(&json).expect("JSON-RPC values are serializable");
+        out_tx.send(line).await.is_ok()
     }
 
     loop {
-        let line = match read_bounded_line(&mut rpc_reader, MAX_RPC_FRAME_BYTES).await {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                shutdown_daemon_resources().await;
-                std::process::exit(0);
-            }
-            Err(e) => {
-                log::error!("Daemon RPC socket error: {}", e);
-                shutdown_daemon_resources().await;
-                std::process::exit(1);
-            }
+        let Some(line) = read_bounded_line(reader, MAX_RPC_FRAME_BYTES).await? else {
+            return Ok(());
         };
         if line.trim().is_empty() {
             continue;
@@ -1678,37 +1686,46 @@ pub async fn daemon_main(
         let request: RpcRequest = match serde_json::from_str(&line) {
             Ok(req) => req,
             Err(e) => {
-                send_or_exit(
-                    &out_tx,
+                if !send(
+                    out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":null,
                         "error":{"code":-32700,"message":format!("Parse error: {}", e)}
                     }),
                 )
-                .await;
+                .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
 
-        match handle_request(&request, &dbus, &out_tx, user_uid).await {
+        match handle_request(&request, dbus, out_tx, invoking_uid).await {
             HandleOutcome::Spawned => {}
             HandleOutcome::Sync(Ok(result)) => {
-                send_or_exit(
-                    &out_tx,
+                if !send(
+                    out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":request.id,"result":result
                     }),
                 )
-                .await;
+                .await
+                {
+                    return Ok(());
+                }
             }
             HandleOutcome::Sync(Err(e)) => {
-                send_or_exit(
-                    &out_tx,
+                if !send(
+                    out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":request.id,"error":{"code":-1,"message":e}
                     }),
                 )
-                .await;
+                .await
+                {
+                    return Ok(());
+                }
             }
         }
     }
@@ -2893,7 +2910,7 @@ mod tests {
         let started = slow.started.clone();
         let release = slow.release.clone();
         let dbus = Some(slow);
-        let (out_tx, _out_rx) = tokio::sync::mpsc::channel(4);
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
         let remove = RpcRequest {
             jsonrpc: "2.0".into(),
             id: 1,
@@ -2909,41 +2926,53 @@ mod tests {
             method: "ping".into(),
             params: serde_json::json!({}),
         };
+        let input = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&remove).unwrap(),
+            serde_json::to_string(&ping).unwrap()
+        );
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut reader = tokio::io::BufReader::new(server);
 
-        // This mirrors the current daemon loop: one dispatch future is
-        // awaited before the next frame is read. The test is intentionally
+        // This is the production request pump. The test is intentionally
         // env-gated until Phase 1 replaces this assertion with responsiveness.
         let mut pump = tokio::spawn(async move {
-            let remove_outcome =
-                handle_request(&remove, &dbus, &out_tx, uzers::get_current_uid()).await;
-            let ping_outcome =
-                handle_request(&ping, &dbus, &out_tx, uzers::get_current_uid()).await;
-            (remove_outcome, ping_outcome)
+            run_rpc_request_pump(&mut reader, &dbus, &out_tx, uzers::get_current_uid()).await
         });
+        use tokio::io::AsyncWriteExt;
+        client.write_all(input.as_bytes()).await.unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
             .await
             .expect("RemoveImage did not reach the slow executor");
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pump)
+            tokio::time::timeout(std::time::Duration::from_millis(50), out_rx.recv())
                 .await
                 .is_err()
         );
 
         release.notify_one();
-        let (remove_outcome, ping_outcome) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), pump)
-                .await
-                .expect("pump did not resume after RemoveImage completed")
-                .expect("pump task panicked");
-        assert!(matches!(
-            remove_outcome,
-            HandleOutcome::Sync(Ok(serde_json::Value::Null))
-        ));
-        assert!(matches!(
-            ping_outcome,
-            HandleOutcome::Sync(Ok(serde_json::Value::Null))
-        ));
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("RemoveImage response was not emitted")
+            .expect("request pump stopped before RemoveImage responded");
+        let second = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+            .await
+            .expect("ping response was not emitted")
+            .expect("request pump stopped before ping responded");
+        let first: RpcResponse = serde_json::from_str(&first).unwrap();
+        let second: RpcResponse = serde_json::from_str(&second).unwrap();
+        assert_eq!(first.id, 1);
+        assert!(first.error.is_none());
+        assert_eq!(second.id, 2);
+        assert!(second.error.is_none());
+
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut pump)
+            .await
+            .expect("request pump did not stop after input EOF")
+            .expect("request pump task panicked")
+            .expect("request pump returned an error");
     }
 
     #[test]
