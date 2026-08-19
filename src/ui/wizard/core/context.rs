@@ -364,6 +364,7 @@ pub struct PassthroughState {
     pub privileged: bool,
     pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
+    pub gpu_passthrough_all: bool,
     pub wayland_socket: Option<String>,
     pub discovered_gpus: Vec<crate::nspawn::platform::gpu::GpuDevice>,
     pub nvidia_gpu: bool,
@@ -396,6 +397,7 @@ impl PassthroughState {
             privileged: self.privileged,
             private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
+            gpu_passthrough_all: self.gpu_passthrough_all,
             wayland_socket: if is_host_nw {
                 self.wayland_socket.clone()
             } else {
@@ -622,6 +624,7 @@ impl WizardContext {
                 privileged: false,
                 private_users: None,
                 graphics_acceleration: false,
+                gpu_passthrough_all: false,
                 wayland_socket: None,
                 discovered_gpus,
                 nvidia_gpu: false,
@@ -1050,6 +1053,7 @@ mod tests {
             privileged: true,
             private_users: None,
             graphics_acceleration: true,
+            gpu_passthrough_all: true,
             wayland_socket: Some("wayland-0".into()),
             discovered_gpus: vec![],
             nvidia_gpu: true,
@@ -1071,6 +1075,7 @@ mod tests {
         // Wayland only if Host network
         let cfg = state.extract_config(Some(NetworkMode::Host));
         assert!(cfg.wayland_socket.is_some());
+        assert!(cfg.gpu_passthrough_all);
 
         let cfg = state.extract_config(Some(NetworkMode::Veth));
         assert!(cfg.wayland_socket.is_none());

@@ -386,6 +386,14 @@ async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
 }
 
 async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<ApplyStatus> {
+    write_initial_state_at_with_uid(path, state, 0).await
+}
+
+async fn write_initial_state_at_with_uid(
+    path: &Path,
+    state: &NvidiaState,
+    expected_uid: u32,
+) -> Result<ApplyStatus> {
     validate_state(state)?;
     let mut state = state.clone();
     state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
@@ -396,10 +404,20 @@ async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<Appl
             MAX_NVIDIA_STATE_BYTES
         )));
     }
+    let ownership = probe_owned_state_at_with_uid(path, expected_uid).await?;
+    if ownership == ArtifactOwnership::AmbiguousLegacy {
+        return Ok(ApplyStatus::ConflictUnknownOwner);
+    }
     AsyncLockedWriter::apply_locked_with_mode(path, 0o600, move |existing| {
         Ok(match existing {
             None => (Some(content), ApplyStatus::Created),
             Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(existing)
+                if ownership == ArtifactOwnership::ProvenOwned
+                    && is_owned_state_content(&existing) =>
+            {
+                (Some(content), ApplyStatus::ReplacedOwned)
+            }
             Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
         })
     })
@@ -428,6 +446,17 @@ async fn remove_owned_state_at_with_uid(
     path: &Path,
     expected_uid: u32,
 ) -> Result<ArtifactOwnership> {
+    let ownership = probe_owned_state_at_with_uid(path, expected_uid).await?;
+    if ownership == ArtifactOwnership::ProvenOwned {
+        remove_state_at(path).await?;
+    }
+    Ok(ownership)
+}
+
+async fn probe_owned_state_at_with_uid(
+    path: &Path,
+    expected_uid: u32,
+) -> Result<ArtifactOwnership> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -445,18 +474,21 @@ async fn remove_owned_state_at_with_uid(
     let content = tokio::fs::read_to_string(path)
         .await
         .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
-    let state: NvidiaState = match serde_json::from_str(&content) {
-        Ok(state) => state,
-        Err(_) => return Ok(ArtifactOwnership::AmbiguousLegacy),
+    Ok(if is_owned_state_content(&content) {
+        ArtifactOwnership::ProvenOwned
+    } else {
+        ArtifactOwnership::AmbiguousLegacy
+    })
+}
+
+fn is_owned_state_content(content: &str) -> bool {
+    if content.len() > MAX_NVIDIA_STATE_BYTES {
+        return false;
+    }
+    let Ok(state) = serde_json::from_str::<NvidiaState>(content) else {
+        return false;
     };
-    if state.ownership_marker.as_deref() != Some(NVIDIA_STATE_MARKER) {
-        return Ok(ArtifactOwnership::AmbiguousLegacy);
-    }
-    if validate_state(&state).is_err() {
-        return Ok(ArtifactOwnership::AmbiguousLegacy);
-    }
-    remove_state_at(path).await?;
-    Ok(ArtifactOwnership::ProvenOwned)
+    state.ownership_marker.as_deref() == Some(NVIDIA_STATE_MARKER) && validate_state(&state).is_ok()
 }
 
 fn validate_state(state: &NvidiaState) -> Result<()> {
@@ -985,7 +1017,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_state_apply_is_create_only_and_cleanup_removes_its_lock() {
+    async fn initial_state_apply_replaces_owned_and_preserves_unknown_state() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.json");
         let state = NvidiaState {
@@ -994,11 +1026,15 @@ mod tests {
         };
 
         assert_eq!(
-            write_initial_state_at(&path, &state).await.unwrap(),
+            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
+                .await
+                .unwrap(),
             ApplyStatus::Created
         );
         assert_eq!(
-            write_initial_state_at(&path, &state).await.unwrap(),
+            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
+                .await
+                .unwrap(),
             ApplyStatus::Unchanged
         );
         let different = NvidiaState {
@@ -1006,8 +1042,30 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            write_initial_state_at(&path, &different).await.unwrap(),
+            write_initial_state_at_with_uid(&path, &different, uzers::get_current_uid())
+                .await
+                .unwrap(),
+            ApplyStatus::ReplacedOwned
+        );
+        assert_eq!(
+            read_state_at(&path).await.unwrap().unwrap().driver_version,
+            "2"
+        );
+
+        let mut unmarked = different.clone();
+        unmarked.driver_version = "legacy".into();
+        tokio::fs::write(&path, serde_json::to_string(&unmarked).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
+                .await
+                .unwrap(),
             ApplyStatus::ConflictUnknownOwner
+        );
+        assert_eq!(
+            read_state_at(&path).await.unwrap().unwrap().driver_version,
+            "legacy"
         );
 
         remove_state_at(&path).await.unwrap();

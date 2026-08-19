@@ -1,6 +1,7 @@
 use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::nspawn::platform::nvidia::profile::NvidiaPassthroughMode;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
@@ -16,6 +17,8 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+
+const NVIDIA_TOGGLE_LABEL: &str = " NVIDIA GPU Passthrough";
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -43,6 +46,7 @@ pub struct DevicesStepView {
     bind_list: EditableList<BindMount>,
     unclassified_list: SelectableList<UnclassifiedFile>,
     nvidia_toggle: Checkbox,
+    nvidia_unavailable: TextBlock,
     nvidia_enabled: bool,
     nvidia_mode: NvidiaPassthroughMode,
     nvidia_toolkit_installed: bool,
@@ -55,7 +59,7 @@ impl DevicesStepView {
         unclassified_files: &[UnclassifiedFile],
         nvidia_toolkit_installed: bool,
     ) -> Self {
-        let nvidia_enabled = initial_data.nvidia_gpu;
+        let nvidia_enabled = initial_data.nvidia_gpu && nvidia_toolkit_installed;
         let nvidia_mode = initial_data
             .nvidia_profile
             .as_ref()
@@ -107,8 +111,12 @@ impl DevicesStepView {
         let mut view = Self {
             bind_list,
             unclassified_list,
-            nvidia_toggle: Checkbox::new(" NVIDIA GPU Passthrough", nvidia_enabled)
+            nvidia_toggle: Checkbox::new(NVIDIA_TOGGLE_LABEL, nvidia_enabled)
                 .with_enabled(nvidia_toolkit_installed),
+            nvidia_unavailable: TextBlock::new(
+                " NVIDIA TOOLKIT REQUIRED ",
+                "nvidia-container-toolkit is not installed on this host.",
+            ),
             nvidia_enabled,
             nvidia_mode,
             nvidia_toolkit_installed,
@@ -132,8 +140,14 @@ impl DevicesStepView {
 impl Component for DevicesStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let has_uc = self.has_unclassified();
+        let unavailable_height = self
+            .nvidia_unavailable
+            .required_height(area.width.saturating_sub(2));
 
         let mut constraints = vec![Constraint::Length(3)]; // NVIDIA toggle
+        if !self.nvidia_toolkit_installed {
+            constraints.push(Constraint::Length(unavailable_height));
+        }
         if has_uc {
             constraints.push(Constraint::Min(5)); // Unclassified list
         }
@@ -150,14 +164,21 @@ impl Component for DevicesStepView {
         self.nvidia_toggle.render(f, chunks[0]);
 
         let mut next = 1;
+        if !self.nvidia_toolkit_installed {
+            self.nvidia_unavailable.render(f, chunks[next]);
+            next += 1;
+        }
         if has_uc {
             self.unclassified_list.render(f, chunks[next]);
             next += 1;
         }
         self.bind_list.render(f, chunks[next]);
 
-        let footer =
-            " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next ";
+        let footer = if self.nvidia_toolkit_installed {
+            " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next "
+        } else {
+            " [Tab] switch focus, [A]dd/[E]dit/[D]elete, [Enter] next "
+        };
         f.render_widget(
             Paragraph::new(footer)
                 .style(Style::default().fg(crate::ui::theme::theme().wizard_footer)),
@@ -243,7 +264,7 @@ impl StepComponent for DevicesStepView {
             AppMessage::Wizard(WizardMessage::NvidiaConfigSaved(result)) => {
                 self.nvidia_enabled = true;
                 self.nvidia_mode = result.mode.clone();
-                self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", true)
+                self.nvidia_toggle = Checkbox::new(NVIDIA_TOGGLE_LABEL, true)
                     .with_enabled(self.nvidia_toolkit_installed);
                 if self.has_unclassified() {
                     self.focus.active_idx = 1;
@@ -258,7 +279,7 @@ impl StepComponent for DevicesStepView {
             }
             AppMessage::Wizard(WizardMessage::DialogCancel) => {
                 if !self.nvidia_enabled {
-                    self.nvidia_toggle = Checkbox::new(" NVIDIA GPU Passthrough", false)
+                    self.nvidia_toggle = Checkbox::new(NVIDIA_TOGGLE_LABEL, false)
                         .with_enabled(self.nvidia_toolkit_installed);
                 }
                 StepAction::CloseDialog
@@ -275,5 +296,51 @@ impl StepComponent for DevicesStepView {
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
         self.render(f, area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn passthrough_config(nvidia_gpu: bool) -> PassthroughConfig {
+        PassthroughConfig {
+            bind_mounts: Vec::new(),
+            device_binds: Vec::new(),
+            privileged: false,
+            private_users: None,
+            graphics_acceleration: false,
+            gpu_passthrough_all: false,
+            wayland_socket: None,
+            nvidia_gpu,
+            nvidia_profile: None,
+        }
+    }
+
+    #[test]
+    fn missing_nvidia_toolkit_disables_and_explains_passthrough() {
+        crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
+        let mut view = DevicesStepView::new(&passthrough_config(true), &[], false);
+        assert!(!view.nvidia_enabled);
+        assert!(!view.nvidia_toggle.is_enabled());
+
+        let mut terminal = Terminal::new(TestBackend::new(50, 18)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("NVIDIA GPU Passthrough"));
+        assert!(rendered.contains("nvidia-container-toolkit is not installed"));
+        assert!(!rendered.contains("toggle NVIDIA"));
     }
 }

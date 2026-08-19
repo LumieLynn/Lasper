@@ -16,6 +16,7 @@ const LASPER_NVIDIA_OVERRIDE_FILE: &str = "90-lasper-nvidia.conf";
 const LEGACY_OVERRIDE_FILE: &str = "override.conf";
 const LEGACY_NVIDIA_OVERRIDE_FILE: &str = "10-lasper-nvidia.conf";
 const LASPER_OVERRIDE_MARKER: &str = "# Managed by Lasper: systemd unit override v1";
+const ALL_DRM_DEVICE_ALLOW: &str = "char-drm";
 
 /// Read-only view of the host unit drop-ins associated with a machine.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,11 +46,9 @@ impl SystemdUnitStore {
         &self,
         name: &str,
         device_binds: &[String],
-        nvidia_gpu: bool,
-        graphics_acceleration: bool,
-        wayland_socket: bool,
+        gpu_passthrough_all: bool,
     ) -> Result<ApplyStatus> {
-        if device_binds.is_empty() && !nvidia_gpu && !wayland_socket && !graphics_acceleration {
+        if device_binds.is_empty() && !gpu_passthrough_all {
             return Ok(ApplyStatus::Unchanged);
         }
 
@@ -58,9 +57,7 @@ impl SystemdUnitStore {
                 machine: parse_machine_name(name)?,
                 spec: ServiceOverrideSpec {
                     device_binds: device_binds.to_vec(),
-                    nvidia_gpu,
-                    graphics_acceleration,
-                    wayland_socket,
+                    gpu_passthrough_all,
                 },
             }))
             .await?;
@@ -207,9 +204,8 @@ pub(crate) struct RemoveServiceOverride {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ServiceOverrideSpec {
     device_binds: Vec<String>,
-    nvidia_gpu: bool,
-    graphics_acceleration: bool,
-    wayland_socket: bool,
+    #[serde(default)]
+    gpu_passthrough_all: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -242,9 +238,7 @@ pub(crate) async fn execute_systemd_unit_operation(
             validate_override_spec(&request.spec)?;
             let content = systemd_override_content(
                 &request.spec.device_binds,
-                request.spec.nvidia_gpu,
-                request.spec.graphics_acceleration,
-                request.spec.wayland_socket,
+                request.spec.gpu_passthrough_all,
             );
             validate_content_size(&content)?;
             let apply =
@@ -297,31 +291,25 @@ pub(crate) async fn execute_systemd_unit_operation(
 }
 
 /// Generate the content for a systemd service override.
-pub fn systemd_override_content(
-    device_binds: &[String],
-    _nvidia_gpu: bool,
-    _graphics_acceleration: bool,
-    wayland_socket: bool,
-) -> String {
+pub fn systemd_override_content(device_binds: &[String], gpu_passthrough_all: bool) -> String {
+    let passthrough_all_drm = gpu_passthrough_all
+        || device_binds
+            .iter()
+            .any(|path| path == crate::nspawn::models::ALL_DRM_DEVICES_PATH);
     let mut conf = Ini::new();
     conf.with_section(Some("Service")).set("__placeholder", "");
     let s = conf.section_mut(Some("Service")).unwrap();
     s.remove("__placeholder");
 
-    // if nvidia_gpu || wayland_socket {
-    //     s.insert("Delegate", "yes");
-    // }
-    // Note: Delegate=yes is no longer used for GPU/Wayland passthrough to maintain
-    // the Principle of Least Privilege and avoid cgroup management power-leaks.
-
     for dev in device_binds {
+        if dev == crate::nspawn::models::ALL_DRM_DEVICES_PATH {
+            continue;
+        }
         s.append("DeviceAllow", format!("{} rw", dev));
     }
-    if wayland_socket {
-        s.append("DeviceAllow", "/dev/dri rw");
+    if passthrough_all_drm {
+        s.append("DeviceAllow", format!("{ALL_DRM_DEVICE_ALLOW} rw"));
     }
-    // Note: Individual device allows (/dev/dri, /dev/mali, etc.) are now
-    // dynamically discovered and passed via device_binds.
 
     let mut buffer = Vec::new();
     conf.write_to(&mut buffer).unwrap_or_default();
@@ -370,7 +358,7 @@ fn validate_override_spec(spec: &ServiceOverrideSpec) -> Result<()> {
     }
 
     for bind in &spec.device_binds {
-        validate_device_allow(bind)?;
+        validate_device_allow_path(bind)?;
     }
     Ok(())
 }
@@ -383,12 +371,12 @@ fn validate_device_allow_paths(device_paths: &[String]) -> Result<()> {
     }
 
     for path in device_paths {
-        validate_device_allow(path)?;
+        validate_device_allow_path(path)?;
     }
     Ok(())
 }
 
-fn validate_device_allow(value: &str) -> Result<()> {
+fn validate_device_allow_path(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 4096
         || value.chars().any(char::is_control)
@@ -399,6 +387,14 @@ fn validate_device_allow(value: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn validate_device_allow_spec(value: &str) -> Result<()> {
+    if value == ALL_DRM_DEVICE_ALLOW {
+        Ok(())
+    } else {
+        validate_device_allow_path(value)
+    }
 }
 
 fn nvidia_device_allow_content(device_paths: &[String]) -> String {
@@ -464,10 +460,28 @@ async fn write_override_at(path: &Path, content: &str) -> Result<()> {
 }
 
 async fn apply_new_override_at(path: &Path, content: String) -> Result<ApplyStatus> {
+    apply_new_override_at_with_uid(path, content, 0).await
+}
+
+async fn apply_new_override_at_with_uid(
+    path: &Path,
+    content: String,
+    expected_uid: u32,
+) -> Result<ApplyStatus> {
+    let ownership = probe_owned_override_at(path, expected_uid).await?;
+    if ownership == ArtifactOwnership::AmbiguousLegacy {
+        return Ok(ApplyStatus::ConflictUnknownOwner);
+    }
     AsyncLockedWriter::apply_locked_with_mode(path, 0o644, move |existing| {
         Ok(match existing {
             None => (Some(content), ApplyStatus::Created),
             Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            Some(existing)
+                if ownership == ArtifactOwnership::ProvenOwned
+                    && is_owned_override_content(&existing) =>
+            {
+                (Some(content), ApplyStatus::ReplacedOwned)
+            }
             Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
         })
     })
@@ -611,7 +625,7 @@ fn is_owned_override_content(content: &str) -> bool {
                 if properties.iter().any(|(key, value)| {
                     key != "DeviceAllow"
                         || match value.strip_suffix(" rw") {
-                            Some(path) => validate_device_allow(path).is_err(),
+                            Some(path) => validate_device_allow_spec(path).is_err(),
                             None => true,
                         }
                 }) {
@@ -631,21 +645,28 @@ mod tests {
     #[test]
     fn test_systemd_override_content_devices() {
         let binds = vec!["/dev/nvidia0".to_string(), "/dev/nvidiactl".to_string()];
-        let content = systemd_override_content(&binds, false, false, false);
+        let content = systemd_override_content(&binds, false);
         assert!(content.contains("[Service]"));
         assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
         assert!(content.contains("DeviceAllow=/dev/nvidiactl rw"));
     }
 
     #[test]
-    fn test_systemd_override_content_wayland() {
-        let content = systemd_override_content(&[], false, false, true);
-        assert!(content.contains("DeviceAllow=/dev/dri rw"));
+    fn test_systemd_override_content_all_drm() {
+        let content = systemd_override_content(&[], true);
+        assert!(content.contains("DeviceAllow=char-drm rw"));
+        assert!(!content.contains("DeviceAllow=/dev/dri rw"));
+        assert!(is_owned_override_content(&content));
+
+        let legacy_explicit_path =
+            systemd_override_content(&[crate::nspawn::models::ALL_DRM_DEVICES_PATH.into()], false);
+        assert!(legacy_explicit_path.contains("DeviceAllow=char-drm rw"));
+        assert!(!legacy_explicit_path.contains("DeviceAllow=/dev/dri rw"));
     }
 
     #[test]
-    fn test_systemd_override_content_empty_devices_no_wayland() {
-        let content = systemd_override_content(&[], false, false, false);
+    fn test_systemd_override_content_empty_devices() {
+        let content = systemd_override_content(&[], false);
         assert!(content.contains("[Service]"));
         assert!(!content.contains("DeviceAllow"));
     }
@@ -653,18 +674,15 @@ mod tests {
     #[test]
     fn test_systemd_override_content_combined() {
         let binds = vec!["/dev/nvidia0".to_string()];
-        let content = systemd_override_content(&binds, true, true, true);
+        let content = systemd_override_content(&binds, true);
         assert!(content.contains("DeviceAllow=/dev/nvidia0 rw"));
-        assert!(content.contains("DeviceAllow=/dev/dri rw"));
-        // nvidia_gpu and graphics_acceleration params are currently unused/commented out
-        // They should NOT produce any additional output
-        assert!(!content.contains("Delegate"));
+        assert!(content.contains("DeviceAllow=char-drm rw"));
     }
 
     #[test]
     fn test_systemd_override_content_is_valid_ini() {
         let binds = vec!["/dev/nvidia0".to_string()];
-        let content = systemd_override_content(&binds, false, false, true);
+        let content = systemd_override_content(&binds, false);
         // Should be parseable as valid INI
         assert!(Ini::load_from_str(&content).is_ok());
     }
@@ -682,9 +700,7 @@ mod tests {
     fn override_spec_rejects_relative_device_allow_path() {
         let spec = ServiceOverrideSpec {
             device_binds: vec!["dev/nvidia0".into()],
-            nvidia_gpu: false,
-            graphics_acceleration: false,
-            wayland_socket: false,
+            gpu_passthrough_all: false,
         };
         assert!(validate_override_spec(&spec).is_err());
     }
@@ -710,37 +726,60 @@ mod tests {
     async fn write_override_is_atomic_without_persistent_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("override.conf");
-        let content = systemd_override_content(&["/dev/nvidia0".into()], false, false, true);
+        let content = systemd_override_content(&["/dev/nvidia0".into()], false);
 
         write_override_at(&path, &content).await.unwrap();
 
         let written = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(written.contains("DeviceAllow=/dev/nvidia0 rw"));
-        assert!(written.contains("DeviceAllow=/dev/dri rw"));
+        assert!(!written.contains("DeviceAllow=/dev/dri rw"));
         assert!(!crate::nspawn::sys::io::lock_path_for(&path).exists());
     }
 
     #[tokio::test]
-    async fn deployment_override_apply_never_replaces_unknown_content() {
+    async fn deployment_override_apply_replaces_owned_and_preserves_unknown_content() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("override.conf");
-        let content = systemd_override_content(&["/dev/nvidia0".into()], false, false, false);
+        let content = systemd_override_content(&["/dev/nvidia0".into()], false);
 
         assert_eq!(
-            apply_new_override_at(&path, content.clone()).await.unwrap(),
+            apply_new_override_at_with_uid(&path, content.clone(), uzers::get_current_uid())
+                .await
+                .unwrap(),
             ApplyStatus::Created
         );
         assert_eq!(
-            apply_new_override_at(&path, content.clone()).await.unwrap(),
-            ApplyStatus::Unchanged
-        );
-        assert_eq!(
-            apply_new_override_at(&path, "[Service]\nPrivateDevices=yes\n".into())
+            apply_new_override_at_with_uid(&path, content.clone(), uzers::get_current_uid())
                 .await
                 .unwrap(),
+            ApplyStatus::Unchanged
+        );
+        let replacement = systemd_override_content(&["/dev/dri/card0".into()], false);
+        assert_eq!(
+            apply_new_override_at_with_uid(&path, replacement.clone(), uzers::get_current_uid(),)
+                .await
+                .unwrap(),
+            ApplyStatus::ReplacedOwned
+        );
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), replacement);
+
+        tokio::fs::write(&path, "[Service]\nPrivateDevices=yes\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            apply_new_override_at_with_uid(
+                &path,
+                systemd_override_content(&["/dev/nvidia1".into()], false),
+                uzers::get_current_uid(),
+            )
+            .await
+            .unwrap(),
             ApplyStatus::ConflictUnknownOwner
         );
-        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            "[Service]\nPrivateDevices=yes\n"
+        );
     }
 
     #[tokio::test]
@@ -800,7 +839,7 @@ mod tests {
         let legacy = persistent.join(LASPER_NVIDIA_OVERRIDE_FILE);
         let legacy_override = persistent.join(LEGACY_OVERRIDE_FILE);
         let unsafe_mode = transient.join(LASPER_NVIDIA_OVERRIDE_FILE);
-        let owned_content = systemd_override_content(&[], false, false, true);
+        let owned_content = systemd_override_content(&[], true);
         assert!(
             is_owned_override_content(&owned_content),
             "{owned_content:?}"
@@ -863,7 +902,7 @@ mod tests {
         let candidate = directory.path().join(LASPER_OVERRIDE_FILE);
         tokio::fs::write(
             &target,
-            systemd_override_content(&["/dev/nvidia0".into()], false, false, false),
+            systemd_override_content(&["/dev/nvidia0".into()], false),
         )
         .await
         .unwrap();

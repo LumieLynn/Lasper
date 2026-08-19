@@ -180,7 +180,7 @@ impl Theme {
             // --- Borders ---
             border_focused: Color::Cyan,
             border_unfocused: Color::White,
-            border_disabled: Color::White,
+            border_disabled: Color::DarkGray,
             border_panel_primary: Color::White,
             border_panel_secondary: Color::White,
 
@@ -217,7 +217,7 @@ impl Theme {
             list_cursor_focused: Color::Yellow,
             list_cursor_unfocused: Color::White,
             list_highlight_symbol: Color::Yellow,
-            list_disabled_item: Color::White,
+            list_disabled_item: Color::DarkGray,
 
             // --- Properties ---
             prop_enabled: Color::Green,
@@ -302,7 +302,7 @@ impl Theme {
             // --- Borders ---
             border_focused: Color::Blue,
             border_unfocused: Color::Black,
-            border_disabled: Color::Black,
+            border_disabled: Color::Gray,
             border_panel_primary: Color::Black,
             border_panel_secondary: Color::Black,
 
@@ -339,7 +339,7 @@ impl Theme {
             list_cursor_focused: Color::Yellow,
             list_cursor_unfocused: Color::Black,
             list_highlight_symbol: Color::Yellow,
-            list_disabled_item: Color::Black,
+            list_disabled_item: Color::Gray,
 
             // --- Properties ---
             prop_enabled: Color::Green,
@@ -439,5 +439,23 @@ impl Theme {
             StatusLevel::Warn => self.status_warning,
             StatusLevel::Error => self.status_error,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_defaults_are_visually_distinct_from_supported_content() {
+        let dark = Theme::dark();
+        assert_eq!(dark.border_disabled, Color::DarkGray);
+        assert_eq!(dark.list_disabled_item, Color::DarkGray);
+        assert_ne!(dark.list_disabled_item, dark.list_unselected);
+
+        let light = Theme::light();
+        assert_eq!(light.border_disabled, Color::Gray);
+        assert_eq!(light.list_disabled_item, Color::Gray);
+        assert_ne!(light.list_disabled_item, light.list_unselected);
     }
 }

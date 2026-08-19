@@ -2,7 +2,7 @@ use crate::ui::core::{Component, EventResult};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
-    style::Style,
+    style::{Modifier, Style},
     widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
@@ -72,7 +72,14 @@ impl Component for RadioGroup {
             .title(self.label.as_str())
             .border_style(style);
 
-        let paragraph = Paragraph::new(text).block(block);
+        let text_style = if self.enabled {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(crate::ui::theme::theme().border_disabled)
+                .add_modifier(Modifier::DIM)
+        };
+        let paragraph = Paragraph::new(text).style(text_style).block(block);
         f.render_widget(paragraph, area);
     }
 

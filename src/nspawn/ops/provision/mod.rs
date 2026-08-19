@@ -131,21 +131,29 @@ impl ApplyReport {
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("a replaced .nspawn configuration cannot be restored".into());
+                    return Err(NspawnError::Runtime(format!(
+                        "Deployment cannot roll back replaced {} without its previous content",
+                        resource.label()
+                    )));
                 }
-                Err(NspawnError::Runtime(format!(
-                    "Deployment cannot roll back replaced {} without its previous content",
-                    resource.label()
-                )))
+                // A create intent may adopt and replace a stale, proven-owned
+                // sidecar. Rollback removes the replacement instead of
+                // restoring stale state for a target that was not deployed.
+                self.record_created(resource);
+                Ok(())
             }
             ApplyStatus::ConflictUnknownOwner => {
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("an existing .nspawn configuration has unknown ownership".into());
+                    return Err(NspawnError::Validation(format!(
+                        "Refusing to replace existing {} with unknown ownership",
+                        resource.label()
+                    )));
                 }
-                Err(NspawnError::Validation(format!(
-                    "Refusing to replace existing {} with unknown ownership",
-                    resource.label()
-                )))
+                // Auxiliary state is optional. Preserve the unknown file and
+                // let the caller surface the degraded result as a warning.
+                Ok(())
             }
         }
     }
@@ -434,7 +442,10 @@ async fn run_deploy_internal(
 
     let result = async {
         cancellation.checkpoint()?;
-        validate_deployment_sidecars(&name, &exec_ctx).await?;
+        for warning in inspect_deployment_sidecars(&name, &exec_ctx).await? {
+            log::warn!("[AUDIT] [Container: {}] [Step: Preflight] {}", name, warning);
+            push_log!(format!("WARNING: {warning}"));
+        }
         cancellation.checkpoint()?;
 
         if !is_ext {
@@ -591,6 +602,19 @@ async fn run_deploy_internal(
             // Persist the validated snapshot and its profile for lifecycle diffing.
             let state_apply = exec_ctx.nvidia_state.write_initial(&name, &state).await?;
             report.record_apply(AppliedResource::NvidiaState, state_apply)?;
+            match state_apply {
+                ApplyStatus::ReplacedOwned => {
+                    let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ApplyStatus::ConflictUnknownOwner => {
+                    let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+            }
             cancellation.checkpoint()?;
 
             // Write ld.so.conf.d and env vars into rootfs (one-time setup)
@@ -646,7 +670,7 @@ async fn run_deploy_internal(
         report.record_apply(AppliedResource::NspawnConfig, nspawn_apply)?;
         cancellation.checkpoint()?;
 
-        if !cfg.device_binds.is_empty() || cfg.nvidia_gpu || cfg.wayland_socket.is_some() || cfg.graphics_acceleration {
+        if !cfg.device_binds.is_empty() || cfg.gpu_passthrough_all {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Config] Writing systemd service override...",
                 name
@@ -657,12 +681,23 @@ async fn run_deploy_internal(
                 .write_override(
                     &name,
                     &cfg.device_binds,
-                    cfg.nvidia_gpu,
-                    cfg.graphics_acceleration,
-                    cfg.wayland_socket.is_some(),
+                    cfg.gpu_passthrough_all,
                 )
                 .await?;
             report.record_apply(AppliedResource::SystemdOverride, override_apply)?;
+            match override_apply {
+                ApplyStatus::ReplacedOwned => {
+                    let warning = "Replaced an existing Lasper-owned systemd service drop-in for this deployment.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ApplyStatus::ConflictUnknownOwner => {
+                    let warning = "Preserved the existing systemd service drop-in because Lasper could not prove ownership; requested device allowances were not written there.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+            }
 
             system_operations.reload_daemon().await?;
             cancellation.checkpoint()?;
@@ -772,35 +807,51 @@ async fn run_deploy_internal(
     Ok(())
 }
 
-async fn validate_deployment_sidecars(
+async fn inspect_deployment_sidecars(
     name: &str,
     exec_ctx: &crate::nspawn::sys::ExecutionContext,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     if let Some(config) = exec_ctx.nspawn.inspect(name).await? {
         return Err(NspawnError::Validation(format!(
             "Deployment target has existing .nspawn configuration: {}",
             config.path.display()
         )));
     }
-    if exec_ctx.nvidia_state.read(name).await?.is_some() {
-        return Err(NspawnError::Validation(format!(
-            "Deployment target {name:?} has existing NVIDIA state"
-        )));
+    let mut warnings = Vec::new();
+    match exec_ctx.nvidia_state.read(name).await {
+        Ok(Some(_)) => warnings.push(format!(
+            "Deployment target {name:?} has existing NVIDIA state; it will be replaced only when current Lasper ownership can be proven."
+        )),
+        Ok(None) => {}
+        Err(error) => warnings.push(format!(
+            "Existing NVIDIA state could not be safely inspected and will be preserved: {error}"
+        )),
     }
 
-    let unit = exec_ctx.systemd_unit.read(name).await?;
-    if let Some(drop_in) = unit.drop_ins.iter().find(|drop_in| {
-        std::path::Path::new(&drop_in.path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| matches!(name, "override.conf" | "10-lasper-nvidia.conf"))
-    }) {
-        return Err(NspawnError::Validation(format!(
-            "Deployment target has existing Lasper-managed unit drop-in: {}",
-            drop_in.path
-        )));
+    match exec_ctx.systemd_unit.read(name).await {
+        Ok(unit) => {
+            for drop_in in unit.drop_ins {
+                let file_name = std::path::Path::new(&drop_in.path)
+                    .file_name()
+                    .and_then(|name| name.to_str());
+                if file_name == Some("90-lasper.conf") {
+                    warnings.push(format!(
+                        "Existing systemd service drop-in {} will be replaced only when current Lasper ownership can be proven.",
+                        drop_in.path
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "Existing systemd service drop-in {} will be preserved.",
+                        drop_in.path
+                    ));
+                }
+            }
+        }
+        Err(error) => warnings.push(format!(
+            "Existing systemd service drop-ins could not be safely inspected and will be preserved unless a validated Lasper-owned target is updated: {error}"
+        )),
     }
-    Ok(())
+    Ok(warnings)
 }
 
 async fn rollback_apply_report(
@@ -920,6 +971,23 @@ mod tests {
         assert!(error.to_string().contains("unknown ownership"));
         assert!(report.resources.is_empty());
         assert_eq!(report.external_image_blockers.len(), 1);
+    }
+
+    #[test]
+    fn sidecar_conflicts_are_preserved_and_owned_replacements_are_adopted() {
+        let mut report = ApplyReport::default();
+        report
+            .record_apply(
+                AppliedResource::NvidiaState,
+                ApplyStatus::ConflictUnknownOwner,
+            )
+            .unwrap();
+        report
+            .record_apply(AppliedResource::SystemdOverride, ApplyStatus::ReplacedOwned)
+            .unwrap();
+
+        assert_eq!(report.resources, vec![AppliedResource::SystemdOverride]);
+        assert!(report.external_image_blockers.is_empty());
     }
 
     #[test]

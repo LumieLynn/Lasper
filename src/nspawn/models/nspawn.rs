@@ -7,6 +7,9 @@ use std::path::Path;
 
 const MAX_CONFIG_ITEMS: usize = 4096;
 
+/// Explicit opt-in path for exposing every host DRM device to a container.
+pub const ALL_DRM_DEVICES_PATH: &str = "/dev/dri";
+
 /// The subset of `ContainerConfig` that is allowed to affect a `.nspawn` file.
 ///
 /// Passwords, users, image sources, and other provisioning-only data are
@@ -26,6 +29,8 @@ pub struct NspawnConfigSpec {
     pub privileged: bool,
     pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
+    #[serde(default)]
+    pub gpu_passthrough_all: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub boot: bool,
@@ -126,6 +131,7 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
             privileged: config.privileged,
             private_users: config.private_users,
             graphics_acceleration: config.graphics_acceleration,
+            gpu_passthrough_all: config.gpu_passthrough_all,
             wayland_socket: config.wayland_socket.clone(),
             nvidia_gpu: config.nvidia_gpu,
             boot: config.boot,

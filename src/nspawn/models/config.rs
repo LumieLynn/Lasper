@@ -449,6 +449,9 @@ pub struct ContainerConfig {
     pub private_users: Option<PrivateUsersMode>,
     /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
     pub graphics_acceleration: bool,
+    /// Whether to expose the complete host DRM device directory.
+    #[serde(default)]
+    pub gpu_passthrough_all: bool,
     pub root_password: Option<String>,
     pub users: Vec<CreateUser>,
     /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.
@@ -479,6 +482,7 @@ impl Default for ContainerConfig {
             privileged: Default::default(),
             private_users: None,
             graphics_acceleration: Default::default(),
+            gpu_passthrough_all: Default::default(),
             root_password: Default::default(),
             users: Default::default(),
             wayland_socket: Default::default(),

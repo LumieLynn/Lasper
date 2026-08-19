@@ -1,5 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, NspawnConfigSpec, PrivateUsersMode};
+use crate::nspawn::models::{
+    ContainerConfig, NspawnConfigSpec, PrivateUsersMode, ALL_DRM_DEVICES_PATH,
+};
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -342,6 +344,11 @@ fn nspawn_config_content_from_spec_with_host_paths(
     verified_x11_directory: Option<&Path>,
 ) -> Result<String> {
     spec.validate()?;
+    let passthrough_all_drm = spec.gpu_passthrough_all
+        || spec
+            .device_binds
+            .iter()
+            .any(|path| path == ALL_DRM_DEVICES_PATH);
     let mut conf = Ini::new();
 
     //[Exec]
@@ -429,7 +436,7 @@ fn nspawn_config_content_from_spec_with_host_paths(
         || !spec.readonly_binds.is_empty()
         || !spec.bind_mounts.is_empty()
         || spec.wayland_socket.is_some()
-        || spec.graphics_acceleration
+        || passthrough_all_drm
         || spec.nvidia_gpu;
 
     if has_files {
@@ -440,7 +447,14 @@ fn nspawn_config_content_from_spec_with_host_paths(
             files.append("X-Lasper-Nvidia-Enabled", "true");
         }
 
+        if passthrough_all_drm {
+            files.append("Bind", ALL_DRM_DEVICES_PATH);
+        }
+
         for dev in &spec.device_binds {
+            if dev == ALL_DRM_DEVICES_PATH {
+                continue;
+            }
             files.append("Bind", escape_nspawn_bind_path(dev));
         }
         for ro in &spec.readonly_binds {
@@ -480,14 +494,10 @@ fn nspawn_config_content_from_spec_with_host_paths(
                     format!("{x11_directory}:/mnt/host-x11{suffix}"),
                 );
             }
-
-            if std::path::Path::new("/dev/dri").exists() {
-                files.append("Bind", "/dev/dri");
-            }
         }
 
-        // Note: Individual device binds (/dev/dri, /dev/mali, etc.) are now
-        // dynamically discovered and populated in cfg.device_binds by builder.rs.
+        // Individual device binds are populated in cfg.device_binds. The
+        // complete /dev/dri directory is emitted only for explicit opt-in.
     }
 
     let mut buffer = Vec::new();
@@ -925,6 +935,21 @@ mod tests {
     }
 
     #[test]
+    fn all_drm_passthrough_is_explicit_and_deduplicated() {
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            graphics_acceleration: true,
+            gpu_passthrough_all: true,
+            device_binds: vec![ALL_DRM_DEVICES_PATH.into(), "/dev/dri/card0".into()],
+            ..Default::default()
+        };
+
+        let content = nspawn_config_content(&cfg, None).unwrap();
+        assert_eq!(content.matches("Bind=/dev/dri\n").count(), 1, "{content}");
+        assert!(content.contains("Bind=/dev/dri/card0"), "{content}");
+    }
+
+    #[test]
     fn wayland_x11_bind_requires_a_verified_directory() {
         let cfg = ContainerConfig {
             name: "test".into(),
@@ -939,11 +964,13 @@ mod tests {
             nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), None)
                 .unwrap();
         assert!(!without_x11.contains("/mnt/host-x11"));
+        assert!(!without_x11.contains("Bind=/dev/dri"));
 
         let with_x11 =
             nspawn_config_content_from_spec_with_host_paths(&spec, None, Some(runtime), Some(x11))
                 .unwrap();
         assert!(with_x11.contains("BindReadOnly=/tmp/.X11-unix:/mnt/host-x11:idmap"));
+        assert!(!with_x11.contains("Bind=/dev/dri"));
     }
 
     #[test]

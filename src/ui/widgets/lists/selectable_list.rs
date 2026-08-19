@@ -41,6 +41,14 @@ impl<T> SelectableList<T> {
 
     pub fn with_item_enablement(mut self, f: impl Fn(&T) -> bool + 'static) -> Self {
         self.is_item_enabled_fn = Some(Box::new(f));
+        if self
+            .state
+            .selected()
+            .is_some_and(|index| !self.is_item_enabled(index))
+        {
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
+        }
         self
     }
 
@@ -76,8 +84,12 @@ impl<T> SelectableList<T> {
         true
     }
 
+    fn first_enabled_index(&self) -> Option<usize> {
+        (0..self.items.len()).find(|index| self.is_item_enabled(*index))
+    }
+
     pub fn select(&mut self, index: usize) {
-        if index < self.items.len() {
+        if index < self.items.len() && self.is_item_enabled(index) {
             self.state.select(Some(index));
         }
     }
@@ -85,19 +97,21 @@ impl<T> SelectableList<T> {
     pub fn set_items(&mut self, items: Vec<T>) {
         self.items = items;
         if let Some(i) = self.state.selected() {
-            if i >= self.items.len() {
-                self.state
-                    .select(if self.items.is_empty() { None } else { Some(0) });
+            if i >= self.items.len() || !self.is_item_enabled(i) {
+                let first_enabled = self.first_enabled_index();
+                self.state.select(first_enabled);
             }
         } else if !self.items.is_empty() {
-            self.state.select(Some(0));
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
         }
     }
 
     pub fn add_item(&mut self, item: T) {
         self.items.push(item);
         if self.state.selected().is_none() {
-            self.state.select(Some(0));
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
         }
     }
 
@@ -187,7 +201,9 @@ impl<T> SelectableList<T> {
                 let item_style = if self.is_item_enabled(i) {
                     Style::default()
                 } else {
-                    Style::default().fg(t.list_disabled_item)
+                    Style::default()
+                        .fg(t.list_disabled_item)
+                        .add_modifier(Modifier::DIM)
                 };
                 ListItem::new(content).style(item_style)
             })
@@ -253,5 +269,26 @@ impl<T> Component for SelectableList<T> {
 
     fn is_enabled(&self) -> bool {
         self.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_items_cannot_be_selected_programmatically_or_by_navigation() {
+        let mut list = SelectableList::new(
+            "Storage",
+            vec![("unsupported", false), ("supported", true)],
+            |(label, _)| (*label).to_string(),
+        )
+        .with_item_enablement(|(_, supported)| *supported);
+
+        assert_eq!(list.selected_idx(), Some(1));
+        list.select(0);
+        assert_eq!(list.selected_idx(), Some(1));
+        list.next();
+        assert_eq!(list.selected_idx(), Some(1));
     }
 }

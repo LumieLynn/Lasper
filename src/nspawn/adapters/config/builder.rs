@@ -74,6 +74,7 @@ pub struct PassthroughConfig {
     pub privileged: bool,
     pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
+    pub gpu_passthrough_all: bool,
     pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
@@ -101,6 +102,7 @@ impl ContainerConfigBuilder {
                 privileged: false,
                 private_users: None,
                 graphics_acceleration: false,
+                gpu_passthrough_all: false,
                 wayland_socket: None,
                 nvidia_gpu: false,
                 nvidia_profile: None,
@@ -147,6 +149,7 @@ impl ContainerConfigBuilder {
             privileged: passthrough.privileged,
             private_users,
             graphics_acceleration: passthrough.graphics_acceleration,
+            gpu_passthrough_all: passthrough.gpu_passthrough_all,
             root_password: user.root_password.clone(),
             users: user.users.clone(),
             wayland_socket: passthrough.wayland_socket.clone(),
@@ -203,17 +206,11 @@ impl ContainerConfigBuilder {
             &nspawn_config_content(&cfg, xdg_runtime)
                 .unwrap_or_else(|e| format!(" [ERROR: {}]", e)),
         );
-        if !cfg.device_binds.is_empty()
-            || cfg.nvidia_gpu
-            || cfg.wayland_socket.is_some()
-            || cfg.graphics_acceleration
-        {
+        if !cfg.device_binds.is_empty() || cfg.gpu_passthrough_all {
             content.push_str("\n#[systemd override.conf]\n");
             content.push_str(&systemd_override_content(
                 &cfg.device_binds,
-                cfg.nvidia_gpu,
-                cfg.graphics_acceleration,
-                cfg.wayland_socket.is_some(),
+                cfg.gpu_passthrough_all,
             ));
         }
 
@@ -361,6 +358,7 @@ mod tests {
             privileged: true,
             private_users: None,
             graphics_acceleration: true,
+            gpu_passthrough_all: false,
             wayland_socket: Some("wayland-0".to_string()),
             nvidia_gpu: true,
             nvidia_profile: None,
