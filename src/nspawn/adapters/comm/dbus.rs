@@ -1,6 +1,6 @@
 #![allow(clippy::type_complexity)]
 
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
     ContainerEntry, ContainerState, ImageEntry, ImageName, InspectionCompleteness,
@@ -129,6 +129,109 @@ impl DbusBackend {
             })?;
         Ok(())
     }
+
+    pub(crate) async fn start(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
+        self.call_systemd1::<_, OwnedObjectPath>("StartUnit", &(&unit, "fail"))
+            .await
+    }
+
+    pub(crate) async fn terminate(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .terminate_machine(name.as_str())
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    pub(crate) async fn poweroff(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .kill_machine(name.as_str(), "leader", libc::SIGRTMIN() + 4)
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    pub(crate) async fn reboot(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .kill_machine(name.as_str(), "leader", libc::SIGINT)
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    pub(crate) async fn enable(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
+        self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
+            "EnableUnitFiles",
+            &enable_unit_files_body(&unit),
+        )
+        .await
+    }
+
+    pub(crate) async fn disable(&self, name: &str) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let unit = name.systemd_nspawn_unit();
+        let files: Vec<&str> = vec![&unit];
+        self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
+            .await
+    }
+
+    pub(crate) async fn kill(
+        &self,
+        name: &str,
+        signal: crate::nspawn::models::AllowedSignal,
+    ) -> Result<()> {
+        let name = parse_machine_name(name)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .kill_machine(name.as_str(), "all", signal.as_raw())
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    pub(crate) async fn remove(&self, name: &str) -> Result<()> {
+        if ImageEntry::is_protected_name(name) {
+            return Err(NspawnError::Validation(
+                "the .host image cannot be removed".into(),
+            ));
+        }
+        let name = parse_image_name(name)?;
+        let proxy = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        proxy
+            .remove_image(name.as_str())
+            .await
+            .map_err(NspawnError::Dbus)?;
+        Ok(())
+    }
+
+    pub(crate) async fn reload_daemon(&self) -> Result<()> {
+        self.call_systemd1::<_, ()>("Reload", &()).await
+    }
 }
 
 fn classify_remove_image_method_error(name: &str, detail: Option<String>) -> ImageControlOutcome {
@@ -159,7 +262,7 @@ fn classify_remove_image_method_error(name: &str, detail: Option<String>) -> Ima
 }
 
 #[async_trait::async_trait]
-impl ContainerBackend for DbusBackend {
+impl RuntimeSource for DbusBackend {
     async fn is_available(&self) -> bool {
         self.connection().await.is_some()
     }
@@ -216,102 +319,6 @@ impl ContainerBackend for DbusBackend {
         Ok(images)
     }
 
-    async fn start(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let unit = name.systemd_nspawn_unit();
-        self.call_systemd1::<_, OwnedObjectPath>("StartUnit", &(&unit, "fail"))
-            .await
-    }
-
-    async fn terminate(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let proxy = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .terminate_machine(name.as_str())
-            .await
-            .map_err(NspawnError::Dbus)?;
-        Ok(())
-    }
-
-    async fn poweroff(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let proxy = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let sig = libc::SIGRTMIN() + 4;
-        proxy
-            .kill_machine(name.as_str(), "leader", sig)
-            .await
-            .map_err(NspawnError::Dbus)?;
-        Ok(())
-    }
-
-    async fn reboot(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let proxy = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .kill_machine(name.as_str(), "leader", libc::SIGINT)
-            .await
-            .map_err(NspawnError::Dbus)?;
-        Ok(())
-    }
-
-    async fn enable(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let unit = name.systemd_nspawn_unit();
-        self.call_systemd1::<_, (bool, Vec<(String, String, String)>)>(
-            "EnableUnitFiles",
-            &enable_unit_files_body(&unit),
-        )
-        .await
-    }
-
-    async fn disable(&self, name: &str) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let unit = name.systemd_nspawn_unit();
-        let files: Vec<&str> = vec![&unit];
-        self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
-            .await
-    }
-
-    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
-        let name = parse_machine_name(name)?;
-        let proxy = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .kill_machine(name.as_str(), "all", signal.as_raw())
-            .await
-            .map_err(NspawnError::Dbus)?;
-        Ok(())
-    }
-
-    async fn remove(&self, name: &str) -> Result<()> {
-        if ImageEntry::is_protected_name(name) {
-            return Err(NspawnError::Validation(
-                "the .host image cannot be removed".into(),
-            ));
-        }
-        let name = parse_image_name(name)?;
-        let proxy = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .remove_image(name.as_str())
-            .await
-            .map_err(NspawnError::Dbus)?;
-        Ok(())
-    }
-
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let name = parse_machine_name(name)?;
         let conn = self
@@ -348,10 +355,6 @@ impl ContainerBackend for DbusBackend {
         } else {
             Ok(props)
         }
-    }
-
-    async fn reload_daemon(&self) -> Result<()> {
-        self.call_systemd1::<_, ()>("Reload", &()).await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {

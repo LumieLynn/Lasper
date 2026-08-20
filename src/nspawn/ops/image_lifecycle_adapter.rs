@@ -5,9 +5,11 @@ use super::image_lifecycle::{
     ImageLifecycleService, ImageRemoveRequest, ImageRemoveTransport, ImageRuntime,
     ManagedArtifactCleanup, UnitDisableReport,
 };
-use super::{NspawnManager, OperationRegistry, PermissionLevel};
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
-use crate::nspawn::adapters::comm::daemon_backend::DaemonBackend;
+use super::machine_lifecycle::{
+    MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+};
+use super::{OperationRegistry, PermissionLevel, RuntimeCatalog};
+use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::adapters::comm::dbus::DbusBackend;
 use crate::nspawn::models::{ContainerEntry, ImageName, MachineName};
 use crate::nspawn::sys::command::CommandRunner;
@@ -16,24 +18,19 @@ use crate::nspawn::sys::ExecutionContext;
 use std::sync::Arc;
 
 pub(crate) fn compose_image_lifecycle(
-    manager: Arc<dyn NspawnManager>,
+    runtime_catalog: Arc<RuntimeCatalog>,
+    registry: Arc<OperationRegistry>,
     level: PermissionLevel,
     cli_mode: bool,
     exec_ctx: &ExecutionContext,
 ) -> ImageLifecycleService {
-    let runtime: Arc<dyn ImageRuntime> = Arc::new(LegacyImageRuntime(manager));
+    let runtime: Arc<dyn ImageRuntime> = Arc::new(CatalogImageRuntime(runtime_catalog));
     let route = match select_image_control_route(level, cli_mode) {
         ImageControlRouteKind::Daemon(transport) => ImageControlRoute::Daemon {
             daemon: exec_ctx
                 .daemon_ref()
                 .cloned()
                 .expect("elevated image lifecycle requires daemon"),
-            dbus: DaemonBackend::new(
-                exec_ctx
-                    .daemon_ref()
-                    .cloned()
-                    .expect("elevated image lifecycle requires daemon"),
-            ),
             system_operations: exec_ctx.system_operations.clone(),
             transport,
         },
@@ -56,7 +53,7 @@ pub(crate) fn compose_image_lifecycle(
         nvidia_state: exec_ctx.nvidia_state.clone(),
         system_operations: exec_ctx.system_operations.clone(),
     });
-    ImageLifecycleService::new(runtime, control, cleanup, OperationRegistry::new())
+    ImageLifecycleService::new(runtime, control, cleanup, registry)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,14 +80,15 @@ fn direct_remove_may_fallback(outcome: &ImageControlOutcome) -> bool {
     matches!(outcome, ImageControlOutcome::NotAttempted { .. })
 }
 
-struct LegacyImageRuntime(Arc<dyn NspawnManager>);
+struct CatalogImageRuntime(Arc<RuntimeCatalog>);
 
 #[async_trait::async_trait]
-impl ImageRuntime for LegacyImageRuntime {
+impl ImageRuntime for CatalogImageRuntime {
     async fn list_machines(&self) -> Result<Vec<ContainerEntry>, String> {
         self.0
-            .list_machines()
+            .machines()
             .await
+            .map(|query| query.value)
             .map_err(|error| error.to_string())
     }
 }
@@ -107,7 +105,6 @@ enum ImageControlRoute {
     },
     Daemon {
         daemon: Arc<ElevatedDaemon>,
-        dbus: DaemonBackend,
         system_operations: super::SystemOperationStore,
         transport: ImageRemoveTransport,
     },
@@ -127,8 +124,8 @@ impl ImageControl for RoutedImageControl {
                 fallback_operations,
                 ..
             } => {
-                if ContainerBackend::is_available(dbus).await {
-                    ContainerBackend::disable(dbus, machine.as_str()).await
+                if RuntimeSource::is_available(dbus).await {
+                    dbus.disable(machine.as_str()).await
                 } else {
                     fallback_operations.disable(machine.as_str()).await
                 }
@@ -137,14 +134,12 @@ impl ImageControl for RoutedImageControl {
                 system_operations, ..
             } => system_operations.disable(machine.as_str()).await,
             ImageControlRoute::Daemon {
-                dbus,
+                daemon,
                 system_operations,
                 transport,
                 ..
             } => match transport {
-                ImageRemoveTransport::Dbus => {
-                    ContainerBackend::disable(dbus, machine.as_str()).await
-                }
+                ImageRemoveTransport::Dbus => disable_unit_via_daemon(daemon, machine).await,
                 ImageRemoveTransport::Cli => system_operations.disable(machine.as_str()).await,
             },
         };
@@ -209,6 +204,26 @@ impl ImageControl for RoutedImageControl {
         }
 
         outcome
+    }
+}
+
+async fn disable_unit_via_daemon(
+    daemon: &ElevatedDaemon,
+    machine: &MachineName,
+) -> crate::nspawn::errors::Result<()> {
+    let outcome = daemon
+        .machine_control(MachineControlRequest {
+            machine: machine.clone(),
+            action: MachineAction::Disable,
+            transport: MachineControlTransport::Dbus,
+        })
+        .await
+        .map_err(|error| crate::nspawn::errors::NspawnError::Runtime(error.to_string()))?;
+    match outcome {
+        MachineControlOutcome::Succeeded => Ok(()),
+        other => Err(crate::nspawn::errors::NspawnError::Runtime(format!(
+            "disable unit was not completed: {other:?}"
+        ))),
     }
 }
 

@@ -3,17 +3,26 @@ pub mod handlers;
 pub mod image_lifecycle;
 pub(crate) mod image_lifecycle_adapter;
 pub mod inspect;
-pub mod manager;
+pub mod journal_stream;
+pub mod machine_lifecycle;
+pub(crate) mod machine_lifecycle_adapter;
 pub mod permission;
 pub mod provision;
 pub mod registry;
+pub mod route;
+pub mod runtime_catalog;
+pub(crate) mod runtime_catalog_adapter;
 pub mod system_operation;
 
 pub use activity::HostOperationTracker;
 pub use image_lifecycle::{ImageLifecycleService, ImageRemovalOutcome};
-pub use manager::{DefaultManager, NspawnManager};
+pub use journal_stream::JournalStreamSource;
+pub use machine_lifecycle::{
+    MachineAction, MachineLifecycleOutcome, MachineLifecycleResult, MachineLifecycleService,
+};
 pub use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
 pub use registry::{OperationRegistry, ResourceClaim, ResourceKey};
+pub use runtime_catalog::{RuntimeCatalog, RuntimeQuery, RuntimeUpdate};
 pub use system_operation::SystemOperationStore;
 
 #[derive(Clone)]

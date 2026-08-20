@@ -23,7 +23,7 @@
 //! session token negotiated after the control connection's peer credentials
 //! have been authenticated.
 
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::adapters::config::store::{
     execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
 };
@@ -41,6 +41,10 @@ use crate::nspawn::models::{
 };
 use crate::nspawn::ops::image_lifecycle::{
     map_native_error, ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
+};
+use crate::nspawn::ops::machine_lifecycle::{
+    map_native_error as map_machine_native_error, MachineAction, MachineControlOutcome,
+    MachineControlRequest, MachineControlTransport,
 };
 use crate::nspawn::ops::provision::bootstrap_operation::{
     build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
@@ -72,7 +76,7 @@ use tokio::net::{UnixListener, UnixStream};
 
 // ── RPC message types ──
 
-const RPC_PROTOCOL_VERSION: u32 = 9;
+const RPC_PROTOCOL_VERSION: u32 = 10;
 const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RPC_IN_FLIGHT: usize = 64;
 const MAX_FD_CONNECTIONS: usize = 32;
@@ -220,7 +224,7 @@ async fn initialize_dbus_backend(
     }
 
     let dbus = crate::nspawn::adapters::comm::dbus::DbusBackend::new();
-    ContainerBackend::is_available(&dbus).await.then_some(dbus)
+    RuntimeSource::is_available(&dbus).await.then_some(dbus)
 }
 
 /// The D-Bus surface used by the RPC dispatcher.
@@ -236,6 +240,25 @@ trait DaemonDbusExecutor: Send + Sync {
         &self,
         operation: SystemOperation,
     ) -> crate::nspawn::errors::Result<()>;
+    async fn machine_control(
+        &self,
+        machine: MachineName,
+        action: MachineAction,
+    ) -> MachineControlOutcome {
+        let operation = match action {
+            MachineAction::Start => SystemOperation::Start { machine },
+            MachineAction::Terminate => SystemOperation::Terminate { machine },
+            MachineAction::Poweroff => SystemOperation::Poweroff { machine },
+            MachineAction::Reboot => SystemOperation::Reboot { machine },
+            MachineAction::Enable => SystemOperation::Enable { machine },
+            MachineAction::Disable => SystemOperation::Disable { machine },
+            MachineAction::Kill { signal } => SystemOperation::Kill { machine, signal },
+        };
+        match self.system_operation(operation).await {
+            Ok(()) => MachineControlOutcome::Succeeded,
+            Err(error) => map_machine_native_error(error),
+        }
+    }
     async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties>;
     async fn is_available(&self) -> bool;
 }
@@ -243,11 +266,11 @@ trait DaemonDbusExecutor: Send + Sync {
 #[async_trait::async_trait]
 impl DaemonDbusExecutor for crate::nspawn::adapters::comm::dbus::DbusBackend {
     async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
-        ContainerBackend::list_machines(self).await
+        RuntimeSource::list_machines(self).await
     }
 
     async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
-        ContainerBackend::list_images(self).await
+        RuntimeSource::list_images(self).await
     }
 
     async fn system_operation(
@@ -258,11 +281,11 @@ impl DaemonDbusExecutor for crate::nspawn::adapters::comm::dbus::DbusBackend {
     }
 
     async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties> {
-        ContainerBackend::get_properties(self, name).await
+        RuntimeSource::get_properties(self, name).await
     }
 
     async fn is_available(&self) -> bool {
-        ContainerBackend::is_available(self).await
+        RuntimeSource::is_available(self).await
     }
 }
 
@@ -1104,6 +1127,17 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
+    pub(crate) async fn machine_control(
+        &self,
+        request: MachineControlRequest,
+    ) -> std::io::Result<MachineControlOutcome> {
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("machine_control", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     pub(crate) async fn cli_inspect_machine(
         &self,
         name: &str,
@@ -1808,7 +1842,7 @@ fn daemon_resource_claim(
 ) -> Result<Option<crate::nspawn::ops::ResourceClaim>, String> {
     if !matches!(
         request.method.as_str(),
-        "system_operation" | "dbus_system_operation" | "image_remove"
+        "system_operation" | "dbus_system_operation" | "image_remove" | "machine_control"
     ) {
         return Ok(None);
     }
@@ -1816,6 +1850,10 @@ fn daemon_resource_claim(
         let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
             .map_err(|error| format!("invalid image_remove request: {error}"))?;
         crate::nspawn::ops::ResourceKey::for_image(&request.image)
+    } else if request.method == "machine_control" {
+        let request: MachineControlRequest = serde_json::from_value(request.params.clone())
+            .map_err(|error| format!("invalid machine_control request: {error}"))?;
+        crate::nspawn::ops::ResourceKey::for_machine(&request.machine)
     } else {
         let operation: SystemOperation = serde_json::from_value(request.params.clone())
             .map_err(|error| format!("invalid {} request: {error}", request.method))?;
@@ -2122,6 +2160,34 @@ async fn handle_request<B: DaemonDbusExecutor>(
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
+        }
+
+        "machine_control" => {
+            let request: MachineControlRequest =
+                match serde_json::from_value(request.params.clone()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid machine_control request: {error}"
+                        )))
+                    }
+                };
+            let outcome = match request.transport {
+                MachineControlTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => dbus.machine_control(request.machine, request.action).await,
+                    None => MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    },
+                },
+                MachineControlTransport::Cli => {
+                    crate::nspawn::ops::machine_lifecycle_adapter::execute_cli_machine_control(
+                        request.machine,
+                        request.action,
+                    )
+                    .await
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
 
         "image_remove" => {
@@ -2942,6 +3008,33 @@ mod tests {
             "auth_token": TEST_TOKEN,
         });
         assert!(serde_json::from_value::<RpcRequest>(request).is_err());
+    }
+
+    #[test]
+    fn machine_control_rpc_is_typed_and_claims_the_machine_resource() {
+        let request = RpcRequest {
+            jsonrpc: "2.0".into(),
+            id: 1,
+            method: "machine_control".into(),
+            params: serde_json::to_value(MachineControlRequest {
+                machine: MachineName::new("test-machine").unwrap(),
+                action: MachineAction::Kill {
+                    signal: crate::nspawn::models::AllowedSignal::Kill,
+                },
+                transport: MachineControlTransport::Dbus,
+            })
+            .unwrap(),
+        };
+
+        assert_eq!(
+            daemon_resource_claim(&request).unwrap(),
+            Some(crate::nspawn::ops::ResourceClaim::exclusive(
+                crate::nspawn::ops::ResourceKey::Nspawn("test-machine".into())
+            ))
+        );
+        let mut invalid = request.params;
+        invalid["program"] = serde_json::json!("sh");
+        assert!(serde_json::from_value::<MachineControlRequest>(invalid).is_err());
     }
 
     #[tokio::test]

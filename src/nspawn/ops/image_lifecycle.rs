@@ -247,16 +247,6 @@ impl ImageLifecycleService {
         self.registry.active_image_names()
     }
 
-    pub fn reserve_machine_start(
-        &self,
-        name: &str,
-    ) -> Result<ResourceReservation, ImageRemovalRejection> {
-        let machine = MachineName::new(name).map_err(|_| ImageRemovalRejection::InvalidTarget)?;
-        self.registry
-            .reserve([ResourceClaim::exclusive(ResourceKey::for_machine(&machine))])
-            .map_err(|ResourceConflict { .. }| ImageRemovalRejection::Busy)
-    }
-
     pub fn begin_remove(
         &self,
         image: &ImageEntry,

@@ -5,15 +5,17 @@ pub mod handlers;
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{
-        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName,
-        RuntimeSnapshot, StatusUpdate,
+        ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
     },
-    ops::{DefaultManager, ImageLifecycleService, NspawnManager},
+    ops::{
+        ImageLifecycleService, JournalStreamSource, MachineLifecycleService, RuntimeCatalog,
+        RuntimeUpdate,
+    },
     sys::ExecutionContext,
 };
 use crate::ui::core::{Component, FocusTracker};
@@ -56,8 +58,6 @@ pub const DETAIL_PCT_MAX: u16 = 85;
 pub const LEFT_MACHINES_PCT_MIN: u16 = 20;
 pub const LEFT_MACHINES_PCT_MAX: u16 = 80;
 const MAX_EVENTS_PER_FRAME: usize = 64;
-const STARTING_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
-const DEFAULT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Screen-area rects for mouse hit-testing, populated on each render.
 #[derive(Debug, Clone, Copy, Default)]
@@ -188,12 +188,12 @@ pub struct AppData {
     pub unit_name: Option<String>,
     pub unit_drop_ins: Vec<crate::nspawn::adapters::config::systemd_unit::SystemdDropIn>,
     pub dbus_active: bool,
-    pub manager: std::sync::Arc<dyn NspawnManager>,
+    pub journal_stream: std::sync::Arc<dyn JournalStreamSource>,
+    pub runtime_catalog: std::sync::Arc<RuntimeCatalog>,
+    pub machine_lifecycle: std::sync::Arc<MachineLifecycleService>,
     pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
     pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
-    pub transitions:
-        std::collections::HashMap<String, (crate::nspawn::models::ContainerState, Instant)>,
     pub metrics: HashMap<String, ContainerMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
@@ -225,19 +225,34 @@ impl App {
         exec_ctx: std::sync::Arc<ExecutionContext>,
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
-        let manager = std::sync::Arc::new(DefaultManager::new(
-            permissions.clone(),
+        let journal_stream: std::sync::Arc<dyn JournalStreamSource> = std::sync::Arc::new(
+            crate::nspawn::ops::journal_stream::DefaultJournalStreamSource::new(
+                exec_ctx.daemon_ref().cloned(),
+            ),
+        );
+        let runtime_catalog = crate::nspawn::ops::runtime_catalog_adapter::compose_runtime_catalog(
+            permissions.level(),
             cli_mode,
-            exec_ctx.clone(),
-        ));
+            &exec_ctx,
+        );
+        let operation_registry = crate::nspawn::ops::OperationRegistry::new();
         let image_lifecycle = std::sync::Arc::new(
             crate::nspawn::ops::image_lifecycle_adapter::compose_image_lifecycle(
-                manager.clone(),
+                runtime_catalog.clone(),
+                operation_registry.clone(),
                 permissions.level(),
                 cli_mode,
                 &exec_ctx,
             ),
         );
+        let machine_lifecycle =
+            crate::nspawn::ops::machine_lifecycle_adapter::compose_machine_lifecycle(
+                runtime_catalog.clone(),
+                operation_registry,
+                permissions.level(),
+                cli_mode,
+                &exec_ctx,
+            );
         Self {
             permissions,
             config,
@@ -259,11 +274,12 @@ impl App {
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
                 dbus_active: !cli_mode,
-                manager,
+                journal_stream,
+                runtime_catalog,
+                machine_lifecycle,
                 image_lifecycle,
                 exec_ctx,
                 action_cooldown: None,
-                transitions: std::collections::HashMap::new(),
                 metrics: HashMap::new(),
                 cpu_cores: std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -452,67 +468,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Helper to apply active transitions (Starting/Exiting) to a list of entries.
-    pub fn merge_transitional_states(
-        &mut self,
-        mut entries: Vec<crate::nspawn::models::ContainerEntry>,
-    ) -> Vec<crate::nspawn::models::ContainerEntry> {
-        let now = Instant::now();
-        // Filter out timed out or resolved transitions.
-        self.data.transitions.retain(|name, (state, start_time)| {
-            let timeout = match state {
-                crate::nspawn::models::ContainerState::Starting => STARTING_TRANSITION_TIMEOUT,
-                _ => DEFAULT_TRANSITION_TIMEOUT,
-            };
-            if now.duration_since(*start_time) > timeout {
-                return false;
-            }
-            // If backend already matches the target, remove the transition.
-            if let Some(entry) = entries.iter().find(|e| &e.name == name) {
-                match state {
-                    crate::nspawn::models::ContainerState::Starting => {
-                        if entry.state == crate::nspawn::models::ContainerState::Running {
-                            return false;
-                        }
-                    }
-                    crate::nspawn::models::ContainerState::Exiting => {
-                        if entry.state == crate::nspawn::models::ContainerState::Off {
-                            return false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            true
-        });
-
-        // Apply remaining transitions to the entry list.
-        for entry in &mut entries {
-            if let Some((trans_state, _)) = self.data.transitions.get(&entry.name) {
-                entry.state = trans_state.clone();
-            }
-        }
-
-        // A newly started image is not present in the runtime snapshot until
-        // systemd-machined registers it. Keep its optimistic row visible until
-        // the backend reports Running or the start action fails/times out.
-        let missing_starts: Vec<_> = self
-            .data
-            .transitions
-            .iter()
-            .filter(|(_, (state, _))| *state == crate::nspawn::models::ContainerState::Starting)
-            .filter(|(name, _)| entries.iter().all(|entry| &entry.name != *name))
-            .map(|(name, _)| name.clone())
-            .collect();
-        entries.extend(missing_starts.into_iter().map(|name| ContainerEntry {
-            name,
-            state: crate::nspawn::models::ContainerState::Starting,
-            address: None,
-            all_addresses: Vec::new(),
-        }));
-        entries
-    }
-
     /// Update entries and selection state from a background refresh.
     async fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
         let prev_name = self
@@ -520,8 +475,7 @@ impl App {
             .entries
             .get(self.data.selected)
             .map(|e| e.name.clone());
-        self.data.entries = self.merge_transitional_states(entries);
-        self.data.entries.sort();
+        self.data.entries = self.data.machine_lifecycle.project_machines(entries);
         let active_names: std::collections::HashSet<&String> =
             self.data.entries.iter().map(|e| &e.name).collect();
         self.data
@@ -542,16 +496,6 @@ impl App {
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.entries = self.data.entries.clone();
             wizard.context.images = self.data.images.clone();
-        }
-
-        // Check if any DBus call fell back to CLI during this background refresh
-        if self.data.dbus_active {
-            if let Some(reason) = self.data.manager.did_fallback() {
-                self.set_status(
-                    format!("DBus fallback: {}", reason),
-                    crate::ui::StatusLevel::Warn,
-                );
-            }
         }
     }
 
@@ -602,6 +546,25 @@ impl App {
         }
     }
 
+    async fn sync_runtime_query(
+        &mut self,
+        query: crate::nspawn::ops::RuntimeQuery<RuntimeSnapshot>,
+    ) {
+        self.data.dbus_active = query.route.is_dbus();
+        if let Some(fallback) = query.fallback {
+            self.set_status(
+                format!(
+                    "{} unavailable: {}; using {}",
+                    fallback.from.label(),
+                    fallback.reason,
+                    fallback.to.label()
+                ),
+                crate::ui::StatusLevel::Warn,
+            );
+        }
+        self.sync_snapshot(query.value).await;
+    }
+
     /// Forward backend response to the active wizard/context.
     fn handle_backend_result(&mut self, res: crate::nspawn::ops::BackendResponse) {
         if let Some(wizard) = &mut self.ui.wizard {
@@ -645,14 +608,10 @@ impl App {
                 self.set_status(msg, level);
                 self.refresh().await;
             }
-            AppEvent::ContainerActionFailed {
-                name,
-                previous_state,
-                message,
-            } => {
-                self.rollback_container_transition(&name, previous_state);
-                self.set_status(message, crate::ui::StatusLevel::Error);
+            AppEvent::MachineActionFinished(outcome) => {
+                let (message, level) = machine_outcome_status(outcome);
                 self.refresh().await;
+                self.set_status(message, level);
             }
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
@@ -667,7 +626,7 @@ impl App {
         crate::ui::theme::init_theme(crate::ui::theme::load_theme(self.config.theme.as_ref()));
 
         let mut events = EventHandler::new(100);
-        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(4);
+        let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<RuntimeUpdate>(4);
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::nspawn::ops::BackendCommand>(100);
 
@@ -687,53 +646,17 @@ impl App {
             self.data.cpu_representation,
         );
 
-        // Start data monitoring engine. CLI observers publish complete
-        // snapshots; DBus and filesystem observers publish dirty hints.
-        let (status_tx, mut status_rx) = tokio::sync::mpsc::channel::<StatusUpdate>(4);
-        self.data.manager.watch(status_tx).await;
-
-        // Resolve dirty hints off the UI task. Snapshot updates from the CLI
-        // observer pass through without repeating the machinectl queries.
-        let manager_clone = self.data.manager.clone();
-        let refresh_tx_clone = refresh_tx.clone();
-        tokio::spawn(async move {
-            let mut dirty_failures = 0u32;
-            while let Some(update) = status_rx.recv().await {
-                let resolved = match update {
-                    StatusUpdate::Dirty => match manager_clone.snapshot().await {
-                        Ok(snapshot) => {
-                            dirty_failures = 0;
-                            StatusUpdate::Snapshot(snapshot)
-                        }
-                        Err(error) => {
-                            dirty_failures = dirty_failures.saturating_add(1);
-                            StatusUpdate::BackendFailure {
-                                message: error.to_string(),
-                                consecutive_failures: dirty_failures,
-                            }
-                        }
-                    },
-                    StatusUpdate::Snapshot(snapshot) => {
-                        dirty_failures = 0;
-                        StatusUpdate::Snapshot(snapshot)
-                    }
-                    failure @ StatusUpdate::BackendFailure { .. } => failure,
-                };
-                if refresh_tx_clone.send(resolved).await.is_err() {
-                    break;
-                }
-            }
-        });
+        self.data.runtime_catalog.watch(refresh_tx).await;
 
         loop {
             // Drain at most 3 refresh batches per frame so rapid background
             // updates can't starve user-input events from the select! below.
             for _ in 0..3 {
                 match refresh_rx.try_recv() {
-                    Ok(StatusUpdate::Snapshot(snapshot)) => {
-                        self.sync_snapshot(snapshot).await;
+                    Ok(RuntimeUpdate::Snapshot(snapshot)) => {
+                        self.sync_runtime_query(snapshot).await;
                     }
-                    Ok(StatusUpdate::BackendFailure {
+                    Ok(RuntimeUpdate::BackendFailure {
                         message,
                         consecutive_failures,
                     }) => {
@@ -750,7 +673,6 @@ impl App {
                             );
                         }
                     }
-                    Ok(StatusUpdate::Dirty) => {}
                     Err(_) => break,
                 }
             }
@@ -813,11 +735,69 @@ impl App {
     }
 }
 
+fn machine_outcome_status(
+    outcome: crate::nspawn::ops::MachineLifecycleOutcome,
+) -> (String, crate::ui::StatusLevel) {
+    use crate::nspawn::ops::MachineLifecycleResult;
+
+    let fallback = outcome
+        .fallback
+        .map(|fallback| format!(" (CLI fallback: {})", fallback.reason))
+        .unwrap_or_default();
+    let machine = outcome.machine.as_str();
+    match outcome.result {
+        MachineLifecycleResult::Succeeded => (
+            format!("{} {}{}", outcome.action.success_label(), machine, fallback),
+            crate::ui::StatusLevel::Success,
+        ),
+        MachineLifecycleResult::NotAttempted(reason) => (
+            format!(
+                "{} {} was not attempted: {}{}",
+                outcome.action.audit_label(),
+                machine,
+                reason,
+                fallback
+            ),
+            crate::ui::StatusLevel::Error,
+        ),
+        MachineLifecycleResult::Rejected { reason, .. } => (
+            format!(
+                "{} {} was rejected: {}{}",
+                outcome.action.audit_label(),
+                machine,
+                reason,
+                fallback
+            ),
+            crate::ui::StatusLevel::Warn,
+        ),
+        MachineLifecycleResult::Failed(reason) => (
+            format!(
+                "{} {} failed: {}{}",
+                outcome.action.audit_label(),
+                machine,
+                reason,
+                fallback
+            ),
+            crate::ui::StatusLevel::Error,
+        ),
+        MachineLifecycleResult::OutcomeUnknown(reason) => (
+            format!(
+                "{} {} outcome is unknown: {}{}",
+                outcome.action.audit_label(),
+                machine,
+                reason,
+                fallback
+            ),
+            crate::ui::StatusLevel::Warn,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
         ContainerEntry {
@@ -858,141 +838,54 @@ mod tests {
         )
     }
 
-    mod merge_transitional_states {
-        use super::*;
-
-        #[test]
-        fn adds_starting_overlay() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            let entries = vec![make_entry("test", ContainerState::Off)];
-            let result = app.merge_transitional_states(entries);
-
-            assert_eq!(result[0].state, ContainerState::Starting);
-        }
-
-        #[test]
-        fn synthesizes_starting_entry_missing_from_runtime_snapshot() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            let result = app.merge_transitional_states(vec![]);
-
-            assert_eq!(result, vec![make_entry("test", ContainerState::Starting)]);
-            assert!(app.data.transitions.contains_key("test"));
-        }
-
-        #[test]
-        fn repeated_empty_snapshots_do_not_duplicate_synthetic_start() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            let first = app.merge_transitional_states(vec![]);
-            let second = app.merge_transitional_states(vec![]);
-
-            assert_eq!(first, vec![make_entry("test", ContainerState::Starting)]);
-            assert_eq!(second, first);
-        }
-
-        #[test]
-        fn adds_exiting_overlay() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Exiting, Instant::now()),
-            );
-
-            let entries = vec![make_entry("test", ContainerState::Running)];
-            let result = app.merge_transitional_states(entries);
-
-            assert_eq!(result[0].state, ContainerState::Exiting);
-        }
-
-        #[test]
-        fn expires_stale() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (
-                    ContainerState::Starting,
-                    Instant::now() - STARTING_TRANSITION_TIMEOUT - Duration::from_secs(1),
-                ),
-            );
-
-            let entries = vec![make_entry("test", ContainerState::Off)];
-            let result = app.merge_transitional_states(entries);
-
-            assert_eq!(result[0].state, ContainerState::Off);
-            assert!(app.data.transitions.is_empty());
-        }
-
-        #[test]
-        fn removes_when_backend_resolved() {
-            let mut app = make_app();
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            let entries = vec![make_entry("test", ContainerState::Running)];
-            let result = app.merge_transitional_states(entries);
-
-            assert_eq!(result[0].state, ContainerState::Running);
-            assert!(app.data.transitions.is_empty());
-        }
-
-        #[test]
-        fn failed_start_rolls_back_optimistic_state_immediately() {
-            let mut app = make_app();
-            app.data.entries = vec![make_entry("test", ContainerState::Starting)];
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            app.rollback_container_transition("test", Some(ContainerState::Off));
-
-            assert_eq!(app.data.entries[0].state, ContainerState::Off);
-            assert!(!app.data.transitions.contains_key("test"));
-        }
-
-        #[test]
-        fn failed_synthetic_start_removes_machine_entry() {
-            let mut app = make_app();
-            app.data.entries = vec![make_entry("test", ContainerState::Starting)];
-            app.data.transitions.insert(
-                "test".to_string(),
-                (ContainerState::Starting, Instant::now()),
-            );
-
-            app.rollback_container_transition("test", None);
-
-            assert!(app.data.entries.is_empty());
-            assert!(!app.data.transitions.contains_key("test"));
-        }
-    }
-
     mod image_start_transitions {
         use super::*;
         use crate::events::AppEvent;
-        use crate::nspawn::errors::NspawnError;
-        use crate::nspawn::ops::manager::MockNspawnManager;
+        use crate::nspawn::ops::machine_lifecycle::{
+            MachineControlOutcome, MockMachineControl, MockMachineObservation,
+            MockMachineStartDiagnostics, MockMachineStartPreparation, RoutedMachineControlOutcome,
+        };
+        use crate::nspawn::ops::route::ExecutionRoute;
+        use crate::nspawn::ops::{MachineLifecycleResult, OperationRegistry};
 
         fn prepare_image_start(
-            manager: MockNspawnManager,
+            control_outcome: MachineControlOutcome,
         ) -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let successful = matches!(control_outcome, MachineControlOutcome::Succeeded);
+            let mut control = MockMachineControl::new();
+            control
+                .expect_execute()
+                .once()
+                .returning(move |_, _| RoutedMachineControlOutcome {
+                    outcome: control_outcome.clone(),
+                    route: ExecutionRoute::DirectDbus,
+                    fallback: None,
+                });
+            let mut preparation = MockMachineStartPreparation::new();
+            preparation.expect_prepare().once().returning(|_| Ok(()));
+            let mut observation = MockMachineObservation::new();
+            if successful {
+                observation.expect_inspect().once().returning(|_, _| {
+                    let mut properties = crate::nspawn::models::MachineProperties::default();
+                    properties.insert(
+                        crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                        "ActiveState".into(),
+                        "active".into(),
+                    );
+                    Ok(properties)
+                });
+            }
+            observation.expect_invalidate().once().return_const(());
+            let diagnostics = MockMachineStartDiagnostics::new();
+            let lifecycle = std::sync::Arc::new(MachineLifecycleService::new(
+                std::sync::Arc::new(control),
+                std::sync::Arc::new(preparation),
+                std::sync::Arc::new(observation),
+                std::sync::Arc::new(diagnostics),
+                OperationRegistry::new(),
+            ));
             let mut app = make_app();
-            app.data.manager = std::sync::Arc::new(manager);
+            app.data.machine_lifecycle = lifecycle;
             app.data.images = vec![make_image("test")];
             app.ui.focus.active_idx = 1;
             let (tx, rx) = tokio::sync::mpsc::channel(2);
@@ -1002,13 +895,7 @@ mod tests {
 
         #[tokio::test]
         async fn image_start_adds_machine_before_backend_completion() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_start()
-                .withf(|name| name == "test")
-                .once()
-                .returning(|_| Ok(()));
-            let (mut app, mut rx) = prepare_image_start(manager);
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
 
             app.action_start();
 
@@ -1016,8 +903,6 @@ mod tests {
                 app.data.entries,
                 vec![make_entry("test", ContainerState::Starting)]
             );
-            assert!(app.data.transitions.contains_key("test"));
-            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 1);
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
@@ -1027,25 +912,22 @@ mod tests {
             assert_eq!(app.data.exec_ctx.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
-                AppEvent::ActionDone(message, crate::ui::StatusLevel::Success)
-                    if message == "Started test"
+                AppEvent::MachineActionFinished(outcome)
+                    if outcome.result == MachineLifecycleResult::Succeeded
             ));
 
-            let resolved =
-                app.merge_transitional_states(vec![make_entry("test", ContainerState::Running)]);
+            let resolved = app
+                .data
+                .machine_lifecycle
+                .project_machines(vec![make_entry("test", ContainerState::Running)]);
             assert_eq!(resolved, vec![make_entry("test", ContainerState::Running)]);
-            assert!(!app.data.transitions.contains_key("test"));
         }
 
         #[tokio::test]
         async fn image_start_failure_removes_synthetic_machine() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_start()
-                .withf(|name| name == "test")
-                .once()
-                .returning(|_| Err(NspawnError::Generic("start rejected".into())));
-            let (mut app, mut rx) = prepare_image_start(manager);
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Failed {
+                reason: "start rejected".into(),
+            });
 
             app.action_start();
 
@@ -1053,31 +935,23 @@ mod tests {
                 .await
                 .expect("start task should finish")
                 .expect("start task should report a result");
-            let AppEvent::ContainerActionFailed {
-                name,
-                previous_state,
-                message,
-            } = event
-            else {
-                panic!("start failure should request transition rollback");
+            let AppEvent::MachineActionFinished(outcome) = event else {
+                panic!("start failure should report a semantic outcome");
             };
-            assert_eq!(message, "Start failed: start rejected");
-
-            app.rollback_container_transition(&name, previous_state);
-
-            assert!(app.data.entries.is_empty());
-            assert!(app.data.transitions.is_empty());
+            assert_eq!(
+                outcome.result,
+                MachineLifecycleResult::Failed("start rejected".into())
+            );
+            assert!(app
+                .data
+                .machine_lifecycle
+                .project_machines(vec![])
+                .is_empty());
         }
 
         #[tokio::test]
         async fn image_start_does_not_dispatch_again_while_machine_is_starting() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_start()
-                .withf(|name| name == "test")
-                .once()
-                .returning(|_| Ok(()));
-            let (mut app, mut rx) = prepare_image_start(manager);
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
 
             app.action_start();
             app.data.action_cooldown = None;
@@ -1087,7 +961,7 @@ mod tests {
                 .await
                 .expect("first start task should finish")
                 .expect("first start task should report a result");
-            assert!(matches!(event, AppEvent::ActionDone(..)));
+            assert!(matches!(event, AppEvent::MachineActionFinished(..)));
             assert_eq!(
                 app.ui
                     .status_message
@@ -1099,19 +973,12 @@ mod tests {
 
         #[tokio::test]
         async fn mstack_start_warns_but_still_dispatches_to_systemd() {
-            let mut manager = MockNspawnManager::new();
-            manager
-                .expect_start()
-                .withf(|name| name == "test")
-                .once()
-                .returning(|_| Ok(()));
-            let (mut app, mut rx) = prepare_image_start(manager);
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
             app.data.images[0].image_type = "mstack".into();
 
             app.action_start();
 
             assert_eq!(app.data.entries[0].state, ContainerState::Starting);
-            assert_eq!(app.data.transitions.len(), 1);
             assert_eq!(
                 app.ui
                     .status_message
@@ -1126,7 +993,7 @@ mod tests {
                     .await
                     .expect("mstack start should finish")
                     .expect("mstack start should report a result"),
-                AppEvent::ActionDone(..)
+                AppEvent::MachineActionFinished(..)
             ));
         }
     }

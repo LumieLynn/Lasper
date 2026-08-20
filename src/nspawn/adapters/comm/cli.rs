@@ -1,10 +1,9 @@
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
     ContainerEntry, ImageEntry, InspectionCompleteness, InspectionSource, MachineName,
     MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
-use crate::nspawn::ops::SystemOperationStore;
 use crate::nspawn::sys::CommandRunner;
 use serde::Deserialize;
 use std::time::Duration;
@@ -72,25 +71,14 @@ fn snapshot_update(
 #[derive(Clone)]
 pub struct CliBackend {
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
-    system_operations: SystemOperationStore,
     runtime_machines_dir: std::path::PathBuf,
     nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
 impl CliBackend {
-    #[cfg(test)]
     pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
-        let system_operations = SystemOperationStore::new(runner.clone(), None);
-        Self::with_system_operations(runner, system_operations)
-    }
-
-    pub fn with_system_operations(
-        runner: std::sync::Arc<dyn CommandRunner>,
-        system_operations: SystemOperationStore,
-    ) -> Self {
         Self {
             cmd_runner: runner,
-            system_operations,
             runtime_machines_dir: crate::paths::runtime_machines_dir(),
             nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
@@ -113,7 +101,7 @@ impl CliBackend {
 }
 
 #[async_trait::async_trait]
-impl ContainerBackend for CliBackend {
+impl RuntimeSource for CliBackend {
     async fn is_available(&self) -> bool {
         which::which("machinectl").is_ok()
     }
@@ -153,44 +141,8 @@ impl ContainerBackend for CliBackend {
         parse_list_images_json(&out.stdout)
     }
 
-    async fn start(&self, name: &str) -> Result<()> {
-        self.system_operations.start(name).await
-    }
-
-    async fn terminate(&self, name: &str) -> Result<()> {
-        self.system_operations.terminate(name).await
-    }
-
-    async fn poweroff(&self, name: &str) -> Result<()> {
-        self.system_operations.poweroff(name).await
-    }
-
-    async fn reboot(&self, name: &str) -> Result<()> {
-        self.system_operations.reboot(name).await
-    }
-
-    async fn enable(&self, name: &str) -> Result<()> {
-        self.system_operations.enable(name).await
-    }
-
-    async fn disable(&self, name: &str) -> Result<()> {
-        self.system_operations.disable(name).await
-    }
-
-    async fn kill(&self, name: &str, signal: crate::nspawn::models::AllowedSignal) -> Result<()> {
-        self.system_operations.kill(name, signal).await
-    }
-
-    async fn remove(&self, name: &str) -> Result<()> {
-        self.system_operations.remove_image(name).await
-    }
-
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         get_properties_with_runner(name, self.cmd_runner.as_ref()).await
-    }
-
-    async fn reload_daemon(&self) -> Result<()> {
-        self.system_operations.reload_daemon().await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
@@ -228,7 +180,7 @@ impl ContainerBackend for CliBackend {
             if let Some(update) = snapshot_update(
                 &mut previous,
                 &mut consecutive_failures,
-                self.snapshot().await,
+                RuntimeSource::snapshot(self).await,
             ) {
                 if tx.send(update).await.is_err() {
                     break;
@@ -447,7 +399,7 @@ mod tests {
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
-        let machines = provider.list_machines().await.unwrap();
+        let machines = RuntimeSource::list_machines(&provider).await.unwrap();
 
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].name, "active");
@@ -483,7 +435,7 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let images = provider.list_images().await.unwrap();
+        let images = RuntimeSource::list_images(&provider).await.unwrap();
 
         assert_eq!(images.len(), 4);
         assert!(
@@ -552,7 +504,7 @@ mod tests {
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
-        let snapshot = provider.snapshot().await.unwrap();
+        let snapshot = RuntimeSource::snapshot(&provider).await.unwrap();
 
         assert_eq!(snapshot.machines.len(), 1);
         assert_eq!(snapshot.machines[0].name, "active");
@@ -588,7 +540,9 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let props = provider.get_properties("test-ctr").await.unwrap();
+        let props = RuntimeSource::get_properties(&provider, "test-ctr")
+            .await
+            .unwrap();
 
         assert_eq!(props.source, InspectionSource::Cli);
         assert_eq!(props.completeness, InspectionCompleteness::Full);
@@ -608,7 +562,7 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let result = provider.get_properties("missing-ctr").await;
+        let result = RuntimeSource::get_properties(&provider, "missing-ctr").await;
         assert!(result.is_err());
     }
 
@@ -659,79 +613,5 @@ mod tests {
             .unwrap();
 
         assert!(properties.is_none());
-    }
-
-    // action methods
-
-    #[tokio::test]
-    async fn test_start_calls_machinectl_start() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            let out = mock_output(true, "", "");
-            r.expect_run().returning(move |_, _| Ok(out.clone()));
-            r
-        });
-        let provider = CliBackend::with_runner(runner);
-
-        provider.start("my-ctr").await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_start_rejects_invalid_machine_name_before_machinectl() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            r.expect_run().never();
-            r
-        });
-        let provider = CliBackend::with_runner(runner);
-
-        let result = provider.start("../escape").await;
-
-        assert!(matches!(result, Err(NspawnError::Validation(_))));
-    }
-
-    #[tokio::test]
-    async fn test_kill_calls_machinectl_kill_with_signal() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            let out = mock_output(true, "", "");
-            r.expect_run()
-                .withf(|program, args| {
-                    program == "machinectl"
-                        && args
-                            == &[
-                                "-s".to_string(),
-                                "SIGTERM".to_string(),
-                                "--".to_string(),
-                                "kill".to_string(),
-                                "my-ctr".to_string(),
-                            ]
-                })
-                .returning(move |_, _| Ok(out.clone()));
-            r
-        });
-        let provider = CliBackend::with_runner(runner);
-
-        provider
-            .kill("my-ctr", crate::nspawn::models::AllowedSignal::Terminate)
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_clone_rejects_invalid_image_name_before_machinectl() {
-        let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
-            let mut r = MockCommandRunner::new();
-            r.expect_run().never();
-            r
-        });
-        let provider = CliBackend::with_runner(runner);
-
-        let result = provider
-            .system_operations
-            .clone_image("source", "bad/name")
-            .await;
-
-        assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
 }

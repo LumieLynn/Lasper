@@ -8,10 +8,9 @@ impl App {
         if self.ui.show_wizard || self.ui.show_help || self.ui.power_menu.is_some() {
             return;
         }
-        self.data.dbus_active = self.data.manager.is_dbus_available().await;
-        match self.data.manager.snapshot().await {
+        match self.data.runtime_catalog.snapshot().await {
             Ok(snapshot) => {
-                self.sync_snapshot(snapshot).await;
+                self.sync_runtime_query(snapshot).await;
             }
             Err(error) => {
                 log::error!("runtime snapshot: {}", error);
@@ -58,9 +57,20 @@ impl App {
                     });
                 match self.ui.detail_panel.active_pane {
                     DetailPane::Properties | DetailPane::Details => {
-                        match self.data.manager.get_properties(&name, &entry).await {
-                            Ok(p) => {
-                                self.data.properties = Ok(p);
+                        match self.data.runtime_catalog.inspect(&name, &entry).await {
+                            Ok(query) => {
+                                if let Some(fallback) = query.fallback {
+                                    self.set_status(
+                                        format!(
+                                            "{} unavailable: {}; using {}",
+                                            fallback.from.label(),
+                                            fallback.reason,
+                                            fallback.to.label()
+                                        ),
+                                        crate::ui::StatusLevel::Warn,
+                                    );
+                                }
+                                self.data.properties = Ok(query.value);
                                 self.data.properties_dirty = true;
                                 self.data.details_dirty = true;
                             }
@@ -78,9 +88,21 @@ impl App {
                             if !self.data.log_manager.stream_is_active(&name) {
                                 if let Some((tx, fatal)) = self.data.log_manager.start_stream(&name)
                                 {
-                                    let handle =
-                                        self.data.manager.spawn_log_stream(&name, tx, fatal);
-                                    self.data.log_manager.attach_stream_handle(&name, handle);
+                                    match crate::nspawn::models::MachineName::new(&name) {
+                                        Ok(machine) => {
+                                            let handle =
+                                                self.data.journal_stream.spawn(machine, tx, fatal);
+                                            self.data
+                                                .log_manager
+                                                .attach_stream_handle(&name, handle);
+                                        }
+                                        Err(error) => {
+                                            self.data.log_manager.push_line(
+                                                &name,
+                                                format!("Log stream error: {error}"),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         } else if self.data.log_manager.stop_stream(&name) {
@@ -313,167 +335,84 @@ impl App {
         true
     }
 
-    /// Generic helper for container actions to reduce boilerplate.
-    fn perform_container_action<F, Fut>(
+    fn perform_machine_action(
         &mut self,
-        action_label: &'static str,
-        transition: Option<ContainerState>,
-        validate: impl FnOnce(&ContainerEntry) -> bool,
-        action: F,
-    ) where
-        F: FnOnce(String, std::sync::Arc<dyn crate::nspawn::ops::NspawnManager>) -> Fut
-            + Send
-            + 'static,
-        Fut: std::future::Future<Output = crate::nspawn::errors::Result<()>> + Send + 'static,
-    {
+        name: String,
+        action: crate::nspawn::ops::MachineAction,
+        observed_state: Option<ContainerState>,
+    ) -> bool {
         if !self.check_action_cooldown() {
-            return;
+            return false;
         }
-
-        let (name, manager, tx, previous_state) = {
-            let e = match self.data.entries.get_mut(self.data.selected) {
-                Some(e) => e,
-                None => return,
-            };
-
-            if !validate(e) {
-                return;
-            }
-
-            let previous_state = transition.as_ref().map(|_| e.state.clone());
-            if let Some(state) = transition {
-                self.data
-                    .transitions
-                    .insert(e.name.clone(), (state.clone(), Instant::now()));
-                // Apply immediately so the transition icon shows on the next
-                // frame even when no watcher nudge arrives mid-operation.
-                e.state = state;
-            }
-
-            let tx = match &self.ui.app_tx {
-                Some(tx) => tx.clone(),
-                None => return,
-            };
-            (
-                e.name.clone(),
-                self.data.manager.clone(),
-                tx,
-                previous_state,
-            )
+        let tx = match &self.ui.app_tx {
+            Some(tx) => tx.clone(),
+            None => return false,
         };
+        let operation = match self
+            .data
+            .machine_lifecycle
+            .begin(&name, action, observed_state)
+        {
+            Ok(operation) => operation,
+            Err(rejection) => {
+                self.set_status(
+                    format!("{}: {}", name, rejection),
+                    crate::ui::StatusLevel::Warn,
+                );
+                return false;
+            }
+        };
+        self.apply_machine_projection();
 
         let pm = self.permissions.clone();
-        let operation = self.data.exec_ctx.host_operations.begin();
+        let host_operation = self.data.exec_ctx.host_operations.begin();
         tokio::spawn(async move {
-            let _operation = operation;
-            let audit = match pm.request_elevation(action_label.to_string()).await {
+            let _host_operation = host_operation;
+            let audit = match pm
+                .request_elevation(format!("{} {}", action.audit_label(), name))
+                .await
+            {
                 Ok(a) => a,
-                Err(e) => {
+                Err(error) => {
+                    drop(operation);
                     let _ = tx
-                        .send(crate::events::AppEvent::ContainerActionFailed {
-                            name,
-                            previous_state,
-                            message: e.to_string(),
-                        })
+                        .send(crate::events::AppEvent::MachineActionFinished(
+                            crate::nspawn::ops::MachineLifecycleOutcome {
+                                machine: crate::nspawn::models::MachineName::new(name)
+                                    .expect("lifecycle operation already validated the name"),
+                                action,
+                                result: crate::nspawn::ops::MachineLifecycleResult::NotAttempted(
+                                    error.to_string(),
+                                ),
+                                route: None,
+                                fallback: None,
+                            },
+                        ))
                         .await;
                     return;
                 }
             };
-
-            let res = audit.run(action(name.clone(), manager.clone())).await;
-            // audit dropped — scope closed
-
-            let suffix = match manager.did_fallback() {
-                Some(reason) => format!(" (CLI fallback: {})", reason),
-                None => String::new(),
-            };
-
-            match res {
-                Ok(_) => {
-                    let message = format!("{} {}{}", action_label, name, suffix);
-                    let _ = tx
-                        .send(crate::events::AppEvent::ActionDone(
-                            message,
-                            crate::ui::StatusLevel::Success,
-                        ))
-                        .await;
-                }
-                Err(error) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ContainerActionFailed {
-                            name,
-                            previous_state,
-                            message: format!("Error: {error}"),
-                        })
-                        .await;
-                }
-            }
+            let outcome = audit
+                .run(async move { Ok(operation.run().await) })
+                .await
+                .expect("machine lifecycle operation returns a semantic outcome");
+            let _ = tx
+                .send(crate::events::AppEvent::MachineActionFinished(outcome))
+                .await;
         });
+        true
     }
 
-    pub(crate) fn rollback_container_transition(
-        &mut self,
-        name: &str,
-        previous_state: Option<ContainerState>,
-    ) {
-        let transition = self.data.transitions.remove(name);
-        if let Some(previous_state) = previous_state {
-            if let Some(entry) = self
-                .data
-                .entries
-                .iter_mut()
-                .find(|entry| entry.name == name)
-            {
-                entry.state = previous_state;
-            }
-        } else if matches!(transition, Some((ContainerState::Starting, _))) {
-            let selected_name = self
-                .data
-                .entries
-                .get(self.data.selected)
-                .map(|entry| entry.name.clone());
-            self.data
-                .entries
-                .retain(|entry| entry.name != name || entry.state != ContainerState::Starting);
-            self.data.selected = selected_name
-                .and_then(|selected| {
-                    self.data
-                        .entries
-                        .iter()
-                        .position(|entry| entry.name == selected)
-                })
-                .unwrap_or(0)
-                .min(self.data.entries.len().saturating_sub(1));
-        }
-    }
-
-    fn begin_image_start_transition(&mut self, name: &str) {
+    fn apply_machine_projection(&mut self) {
         let selected_name = self
             .data
             .entries
             .get(self.data.selected)
             .map(|entry| entry.name.clone());
-        self.data
-            .transitions
-            .insert(name.to_string(), (ContainerState::Starting, Instant::now()));
-
-        if let Some(entry) = self
+        self.data.entries = self
             .data
-            .entries
-            .iter_mut()
-            .find(|entry| entry.name == name)
-        {
-            entry.state = ContainerState::Starting;
-        } else {
-            self.data.entries.push(ContainerEntry {
-                name: name.to_string(),
-                state: ContainerState::Starting,
-                address: None,
-                all_addresses: Vec::new(),
-            });
-        }
-
-        self.data.entries.sort();
+            .machine_lifecycle
+            .project_machines(std::mem::take(&mut self.data.entries));
         self.data.selected = selected_name
             .and_then(|selected| {
                 self.data
@@ -481,13 +420,8 @@ impl App {
                     .iter()
                     .position(|entry| entry.name == selected)
             })
-            .or_else(|| {
-                self.data
-                    .entries
-                    .iter()
-                    .position(|entry| entry.name == name)
-            })
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(self.data.entries.len().saturating_sub(1));
     }
 
     pub fn action_start(&mut self) {
@@ -495,29 +429,13 @@ impl App {
             self.action_start_image();
             return;
         }
-        let Some(name) = self
-            .data
-            .entries
-            .get(self.data.selected)
-            .map(|entry| entry.name.clone())
-        else {
+        let Some(entry) = self.data.entries.get(self.data.selected).cloned() else {
             return;
         };
-        let start_reservation = match self.data.image_lifecycle.reserve_machine_start(&name) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                self.set_status(error.to_string(), crate::ui::StatusLevel::Warn);
-                return;
-            }
-        };
-        self.perform_container_action(
-            "Started",
-            Some(ContainerState::Starting),
-            |e| !e.state.is_running(),
-            move |name, manager| async move {
-                let _start_reservation = start_reservation;
-                manager.start(&name).await
-            },
+        self.perform_machine_action(
+            entry.name,
+            crate::nspawn::ops::MachineAction::Start,
+            Some(entry.state),
         );
     }
 
@@ -525,52 +443,54 @@ impl App {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Powered off",
-            Some(ContainerState::Exiting),
-            |e| e.state.is_running(),
-            |name, manager| async move { manager.poweroff(&name).await },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Poweroff,
+                Some(entry.state),
+            );
+        }
     }
 
     pub fn action_terminate(&mut self) {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Terminated",
-            Some(ContainerState::Exiting),
-            |e| e.state.is_running(),
-            |name, manager| async move { manager.terminate(&name).await },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Terminate,
+                Some(entry.state),
+            );
+        }
     }
 
     pub fn action_reboot(&mut self) {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Rebooting",
-            Some(ContainerState::Exiting),
-            |e| e.state.is_running(),
-            |name, manager| async move { manager.reboot(&name).await },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Reboot,
+                Some(entry.state),
+            );
+        }
     }
 
     pub fn action_kill(&mut self) {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Sent SIGKILL to",
-            None,
-            |e| e.state.is_running(),
-            |name, manager| async move {
-                manager
-                    .kill(&name, crate::nspawn::models::AllowedSignal::Kill)
-                    .await
-            },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Kill {
+                    signal: crate::nspawn::models::AllowedSignal::Kill,
+                },
+                Some(entry.state),
+            );
+        }
     }
 
     pub fn action_remove(&mut self) {
@@ -592,9 +512,6 @@ impl App {
             );
             return;
         }
-        if !self.check_action_cooldown() {
-            return;
-        }
         let image = match self.data.images.get(self.data.image_selected) {
             Some(image) => image,
             None => return,
@@ -614,20 +531,9 @@ impl App {
             );
             return;
         }
-        let start_reservation = match self.data.image_lifecycle.reserve_machine_start(&name) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                self.set_status(error.to_string(), crate::ui::StatusLevel::Warn);
-                return;
-            }
-        };
-        let manager = self.data.manager.clone();
-        let tx = match &self.ui.app_tx {
-            Some(tx) => tx.clone(),
-            None => return,
-        };
-        self.begin_image_start_transition(&name);
-        if is_mstack {
+        if self.perform_machine_action(name.clone(), crate::nspawn::ops::MachineAction::Start, None)
+            && is_mstack
+        {
             self.set_status(
                 format!(
                     "{} is an OCI application and may not be bootable; systemd will still try to start it.",
@@ -636,38 +542,6 @@ impl App {
                 crate::ui::StatusLevel::Warn,
             );
         }
-        let pm = self.permissions.clone();
-        let operation = self.data.exec_ctx.host_operations.begin();
-        tokio::spawn(async move {
-            let _start_reservation = start_reservation;
-            let _operation = operation;
-            let audit = match pm.request_elevation(format!("Start {}", name)).await {
-                Ok(audit) => audit,
-                Err(error) => {
-                    let _ = tx
-                        .send(crate::events::AppEvent::ContainerActionFailed {
-                            name,
-                            previous_state: None,
-                            message: format!("Start failed: {}", error),
-                        })
-                        .await;
-                    return;
-                }
-            };
-            let result = audit.run(manager.start(&name)).await;
-            let event = match result {
-                Ok(()) => crate::events::AppEvent::ActionDone(
-                    format!("Started {}", name),
-                    crate::ui::StatusLevel::Success,
-                ),
-                Err(error) => crate::events::AppEvent::ContainerActionFailed {
-                    name,
-                    previous_state: None,
-                    message: format!("Start failed: {}", error),
-                },
-            };
-            let _ = tx.send(event).await;
-        });
     }
 
     fn action_remove_image(&mut self) {
@@ -848,24 +722,26 @@ impl App {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Enabled",
-            None,
-            |_| true,
-            |name, manager| async move { manager.enable(&name).await },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Enable,
+                Some(entry.state),
+            );
+        }
     }
 
     pub fn action_disable(&mut self) {
         if self.image_is_focused() {
             return;
         }
-        self.perform_container_action(
-            "Disabled",
-            None,
-            |_| true,
-            |name, manager| async move { manager.disable(&name).await },
-        );
+        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
+            self.perform_machine_action(
+                entry.name,
+                crate::nspawn::ops::MachineAction::Disable,
+                Some(entry.state),
+            );
+        }
     }
 
     pub async fn spawn_terminal(&mut self) {
@@ -887,22 +763,10 @@ impl App {
                 .iter()
                 .position(|entry| entry.name == image.name)
             else {
-                if self
-                    .data
-                    .transitions
-                    .get(&image.name)
-                    .is_some_and(|(state, _)| *state == ContainerState::Starting)
-                {
-                    self.set_status(
-                        format!("{} is still starting.", image.name),
-                        crate::ui::StatusLevel::Info,
-                    );
-                } else {
-                    self.set_status(
-                        format!("{} is not running.", image.name),
-                        crate::ui::StatusLevel::Info,
-                    );
-                }
+                self.set_status(
+                    format!("{} is not running.", image.name),
+                    crate::ui::StatusLevel::Info,
+                );
                 return;
             };
             let machine = self.data.entries[machine_idx].clone();

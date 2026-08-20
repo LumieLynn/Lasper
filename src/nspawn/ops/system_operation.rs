@@ -69,52 +69,9 @@ impl SystemOperationStore {
         }
     }
 
-    pub async fn start(&self, name: &str) -> Result<()> {
-        self.execute(SystemOperation::Start {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    pub async fn terminate(&self, name: &str) -> Result<()> {
-        self.execute(SystemOperation::Terminate {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    pub async fn poweroff(&self, name: &str) -> Result<()> {
-        self.execute(SystemOperation::Poweroff {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    pub async fn reboot(&self, name: &str) -> Result<()> {
-        self.execute(SystemOperation::Reboot {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    pub async fn enable(&self, name: &str) -> Result<()> {
-        self.execute(SystemOperation::Enable {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
     pub async fn disable(&self, name: &str) -> Result<()> {
         self.execute(SystemOperation::Disable {
             machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    pub async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
-        self.execute(SystemOperation::Kill {
-            machine: machine_name(name)?,
-            signal,
         })
         .await
     }
@@ -180,41 +137,6 @@ pub(crate) async fn execute_cli_image_remove_with_runner(
     }
 }
 
-#[async_trait::async_trait]
-impl crate::nspawn::adapters::comm::backend::MachineControl for SystemOperationStore {
-    async fn start(&self, name: &str) -> Result<()> {
-        Self::start(self, name).await
-    }
-
-    async fn terminate(&self, name: &str) -> Result<()> {
-        Self::terminate(self, name).await
-    }
-
-    async fn poweroff(&self, name: &str) -> Result<()> {
-        Self::poweroff(self, name).await
-    }
-
-    async fn reboot(&self, name: &str) -> Result<()> {
-        Self::reboot(self, name).await
-    }
-
-    async fn enable(&self, name: &str) -> Result<()> {
-        Self::enable(self, name).await
-    }
-
-    async fn disable(&self, name: &str) -> Result<()> {
-        Self::disable(self, name).await
-    }
-
-    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
-        Self::kill(self, name, signal).await
-    }
-
-    async fn reload_daemon(&self) -> Result<()> {
-        Self::reload_daemon(self).await
-    }
-}
-
 impl std::fmt::Debug for SystemOperationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SystemOperationStore")
@@ -239,8 +161,6 @@ pub(crate) async fn execute_dbus_system_operation(
     dbus: &crate::nspawn::adapters::comm::dbus::DbusBackend,
     operation: SystemOperation,
 ) -> Result<()> {
-    use crate::nspawn::adapters::comm::backend::ContainerBackend;
-
     match operation {
         SystemOperation::Start { machine } => dbus.start(machine.as_str()).await,
         SystemOperation::Terminate { machine } => dbus.terminate(machine.as_str()).await,
@@ -257,7 +177,7 @@ pub(crate) async fn execute_dbus_system_operation(
     }
 }
 
-async fn execute_system_operation_with_runner(
+pub(crate) async fn execute_system_operation_with_runner(
     operation: SystemOperation,
     runner: &dyn CommandRunner,
 ) -> Result<()> {

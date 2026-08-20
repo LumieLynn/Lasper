@@ -1,21 +1,13 @@
-//! [`DaemonBackend`] — a [`ContainerBackend`] that proxies every call
-//! through the elevated daemon's root DBus connection.
+//! [`DaemonBackend`] — a [`RuntimeSource`] that proxies runtime reads
+//! through the elevated daemon's root D-Bus connection.
 //!
 //! In Elevated mode the daemon runs as root, so its zbus `Connection::system()`
-//! has full privileges and polkit passes automatically. This backend sends
-//! high-level `ContainerBackend` operations over the daemon's JSON-RPC link
-//! instead of connecting to DBus directly.
+//! has full privileges and polkit passes automatically. Runtime queries are
+//! read-only here; machine and image mutations use typed lifecycle requests.
 
-use crate::nspawn::adapters::comm::backend::ContainerBackend;
+use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    AllowedSignal, ContainerEntry, ImageEntry, ImageName, MachineName, MachineProperties,
-    StatusUpdate,
-};
-use crate::nspawn::ops::image_lifecycle::{
-    ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
-};
-use crate::nspawn::ops::system_operation::SystemOperation;
+use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties, StatusUpdate};
 use crate::nspawn::sys::daemon::ElevatedDaemon;
 use std::sync::Arc;
 
@@ -35,17 +27,10 @@ impl DaemonBackend {
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("daemon"), e))
     }
-
-    async fn call_system_operation(&self, operation: SystemOperation) -> Result<()> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-        self.call("dbus_system_operation", params).await?;
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
-impl ContainerBackend for DaemonBackend {
+impl RuntimeSource for DaemonBackend {
     async fn is_available(&self) -> bool {
         self.call("dbus_is_available", serde_json::json!({}))
             .await
@@ -76,85 +61,6 @@ impl ContainerBackend for DaemonBackend {
         })
     }
 
-    async fn start(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Start {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn terminate(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Terminate {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn poweroff(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Poweroff {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn reboot(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Reboot {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn enable(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Enable {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn disable(&self, name: &str) -> Result<()> {
-        self.call_system_operation(SystemOperation::Disable {
-            machine: machine_name(name)?,
-        })
-        .await
-    }
-
-    async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
-        self.call_system_operation(SystemOperation::Kill {
-            machine: machine_name(name)?,
-            signal,
-        })
-        .await
-    }
-
-    async fn remove(&self, name: &str) -> Result<()> {
-        let image =
-            ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
-        let value = self
-            .call(
-                "image_remove",
-                serde_json::to_value(ImageRemoveRequest {
-                    image,
-                    transport: ImageRemoveTransport::Dbus,
-                })
-                .map_err(|error| NspawnError::Runtime(error.to_string()))?,
-            )
-            .await?;
-        let outcome: ImageControlOutcome = serde_json::from_value(value)
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-        match outcome {
-            ImageControlOutcome::Removed => Ok(()),
-            ImageControlOutcome::NotAttempted { reason } => Err(NspawnError::Runtime(format!(
-                "image removal not attempted: {reason}"
-            ))),
-            ImageControlOutcome::Rejected { reason, .. } => Err(NspawnError::Validation(reason)),
-            ImageControlOutcome::Failed { reason } => Err(NspawnError::Runtime(reason)),
-            ImageControlOutcome::OutcomeUnknown { reason } => Err(NspawnError::Io(
-                std::path::PathBuf::from("daemon image removal"),
-                std::io::Error::new(std::io::ErrorKind::Interrupted, reason),
-            )),
-        }
-    }
-
     async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
         let json = self
             .call("dbus_get_properties", serde_json::json!({"name": name}))
@@ -165,11 +71,6 @@ impl ContainerBackend for DaemonBackend {
                 e
             )))
         })
-    }
-
-    async fn reload_daemon(&self) -> Result<()> {
-        self.call_system_operation(SystemOperation::ReloadDaemon)
-            .await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
@@ -196,8 +97,4 @@ impl ContainerBackend for DaemonBackend {
         }
         Ok(())
     }
-}
-
-fn machine_name(name: &str) -> Result<MachineName> {
-    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
