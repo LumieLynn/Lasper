@@ -185,7 +185,7 @@ impl AsyncLockedWriter {
             loop {
                 match lock_file.try_lock_exclusive() {
                     Ok(()) => break,
-                    Err(error) if attempts < Self::MAX_LOCK_ATTEMPTS => {
+                    Err(_) if attempts < Self::MAX_LOCK_ATTEMPTS => {
                         attempts += 1;
                         sleep(Self::LOCK_RETRY_DELAY).await;
                     }
