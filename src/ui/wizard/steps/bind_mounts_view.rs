@@ -40,9 +40,9 @@ macro_rules! active_comps {
     }};
 }
 
-impl_wizard_nav!(DevicesStepView, active_comps);
+impl_wizard_nav!(BindMountsStepView, active_comps);
 
-pub struct DevicesStepView {
+pub struct BindMountsStepView {
     bind_list: EditableList<BindMount>,
     unclassified_list: SelectableList<UnclassifiedFile>,
     nvidia_toggle: Checkbox,
@@ -53,7 +53,7 @@ pub struct DevicesStepView {
     focus: FocusTracker,
 }
 
-impl DevicesStepView {
+impl BindMountsStepView {
     pub fn new(
         initial_data: &PassthroughConfig,
         unclassified_files: &[UnclassifiedFile],
@@ -137,7 +137,7 @@ impl DevicesStepView {
     }
 }
 
-impl Component for DevicesStepView {
+impl Component for BindMountsStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         let has_uc = self.has_unclassified();
         let unavailable_height = self
@@ -250,7 +250,7 @@ impl Component for DevicesStepView {
     }
 }
 
-impl StepComponent for DevicesStepView {
+impl StepComponent for BindMountsStepView {
     fn handle_message(&mut self, msg: &AppMessage) -> StepAction {
         match msg {
             AppMessage::Wizard(WizardMessage::BindMountAdded(bm)) => {
@@ -321,7 +321,7 @@ mod tests {
     #[test]
     fn missing_nvidia_toolkit_disables_and_explains_passthrough() {
         crate::ui::theme::init_theme(crate::ui::theme::Theme::dark());
-        let mut view = DevicesStepView::new(&passthrough_config(true), &[], false);
+        let mut view = BindMountsStepView::new(&passthrough_config(true), &[], false);
         assert!(!view.nvidia_enabled);
         assert!(!view.nvidia_toggle.is_enabled());
 

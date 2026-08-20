@@ -3,11 +3,11 @@ use crate::nspawn::sys::{log_output, CommandRunner};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
-/// Enable systemd-networkd inside the container.
+/// Enable the guest services used by Lasper's veth and bridge network setup.
 pub(crate) async fn configure_network_at(
     rootfs: &Path,
     cmd_runner: &dyn CommandRunner,
-) -> Result<()> {
+) -> Result<Vec<String>> {
     let rootfs_s = rootfs.to_string_lossy().to_string();
     let systemctl_probe = cmd_runner
         .run(
@@ -26,22 +26,32 @@ pub(crate) async fn configure_network_at(
         .map_err(|error| NspawnError::Io(PathBuf::from("systemd-nspawn"), error))?;
     log_output("systemctl probe", &systemctl_probe);
     if !systemctl_probe.status.success() {
-        return Ok(());
+        return Ok(vec![
+            "WARNING: Guest network services were not enabled because systemctl could not be used inside the container."
+                .into(),
+        ]);
     }
 
-    let networkd = enable_systemd_unit(rootfs, &rootfs_s, "systemd-networkd", cmd_runner).await?;
-    if !networkd.status.success() {
-        return Err(NspawnError::cmd_failed(
-            "systemctl enable systemd-networkd in container",
-            format!(
-                "systemd-nspawn -D {:?} systemctl enable systemd-networkd",
-                rootfs
-            ),
-            &networkd,
-        ));
+    let mut warnings = Vec::new();
+    for (unit, consequence) in [
+        (
+            "systemd-networkd.service",
+            "Veth/bridge addressing may not work",
+        ),
+        (
+            "systemd-resolved.service",
+            "Veth/bridge DNS resolution may not work",
+        ),
+    ] {
+        let output = enable_systemd_unit(rootfs, &rootfs_s, unit, cmd_runner).await?;
+        if !output.status.success() {
+            warnings.push(format!(
+                "WARNING: Could not enable {unit} inside the container; the unit may be missing. {consequence}."
+            ));
+        }
     }
 
-    Ok(())
+    Ok(warnings)
 }
 
 async fn enable_systemd_unit(
@@ -96,7 +106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn networkd_success_does_not_mutate_resolver_configuration() {
+    async fn network_services_are_enabled_without_rewriting_resolver_configuration() {
         let rootfs = rootfs_with_systemctl();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
@@ -109,21 +119,22 @@ mod tests {
             });
         }
 
-        configure_network_at(rootfs.path(), &runner).await.unwrap();
+        let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
 
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
+        assert!(warnings.is_empty());
+        assert_eq!(calls.len(), 3);
+        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd.service"));
         assert!(calls
             .iter()
-            .all(|args| !args.iter().any(|arg| arg == "systemd-resolved")));
+            .any(|args| args.iter().any(|arg| arg == "systemd-resolved.service")));
         assert!(calls.iter().all(|args| !args
             .iter()
             .any(|arg| arg == "/etc/resolv.conf" || arg.contains("stub-resolv.conf"))));
     }
 
     #[tokio::test]
-    async fn networkd_failure_still_fails_network_enable() {
+    async fn network_unit_failures_are_reported_independently() {
         let rootfs = rootfs_with_systemctl();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
         let mut runner = MockCommandRunner::new();
@@ -140,12 +151,19 @@ mod tests {
             });
         }
 
-        let result = configure_network_at(rootfs.path(), &runner).await;
+        let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
 
-        assert!(result.is_err());
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings.iter().any(|warning| warning.contains("networkd")));
+        assert!(warnings.iter().any(|warning| warning.contains("resolved")));
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert!(calls[1].iter().any(|arg| arg == "systemd-networkd"));
+        assert_eq!(calls.len(), 3);
+        assert!(calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "systemd-networkd.service")));
+        assert!(calls
+            .iter()
+            .any(|args| args.iter().any(|arg| arg == "systemd-resolved.service")));
     }
 
     #[tokio::test]
@@ -162,9 +180,11 @@ mod tests {
             });
         }
 
-        configure_network_at(rootfs.path(), &runner).await.unwrap();
+        let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
 
         let calls = calls.lock().unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("systemctl could not be used"));
         assert_eq!(calls.len(), 1);
         assert!(calls[0].iter().any(|arg| arg == "/usr/bin/systemctl"));
     }

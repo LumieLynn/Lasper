@@ -13,7 +13,7 @@ pub use oci_operation::OciPullStore;
 use crate::events::AppEvent;
 use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig, NetworkMode};
+use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -704,13 +704,24 @@ async fn run_deploy_internal(
 
         if supports_offline_commands {
             if let Some(mode) = &cfg.network {
-                if matches!(
-                    mode,
-                    NetworkMode::None | NetworkMode::Veth | NetworkMode::Bridge(_)
-                ) {
-                    push_log!("Enabling container network (systemd-networkd)...".to_string());
-                    if let Err(e) = exec_ctx.rootfs.configure_network(&actual_rootfs_target).await {
-                        push_log!(format!("WARNING: {} (might not be a systemd container)", e));
+                if mode.uses_default_guest_network_stack() {
+                    push_log!(
+                        "Enabling container network and DNS services (systemd-networkd, systemd-resolved)..."
+                            .to_string()
+                    );
+                    match exec_ctx.rootfs.configure_network(&actual_rootfs_target).await {
+                        Ok(warnings) => {
+                            for warning in warnings {
+                                log::warn!("{}", warning);
+                                push_log!(warning);
+                            }
+                        }
+                        Err(error) => {
+                            push_log!(format!(
+                                "WARNING: {} (might not be a systemd container)",
+                                error
+                            ));
+                        }
                     }
                     cancellation.checkpoint()?;
                 }

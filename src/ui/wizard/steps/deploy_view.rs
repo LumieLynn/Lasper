@@ -1,5 +1,6 @@
 use crate::nspawn::ops::provision::{DeployLogEvent, DeployProgress, DeploymentCancellation};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
+use crate::ui::soft_wrap_text;
 use crate::ui::widgets::dialogs::confirmation::ConfirmationDialog;
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
@@ -19,7 +20,6 @@ use std::sync::{
 };
 
 use tokio::sync::broadcast;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub struct DeployStepView {
     log_rx: Option<broadcast::Receiver<DeployLogEvent>>,
@@ -86,27 +86,10 @@ impl DeployStepView {
     }
 }
 
-fn truncate_to_width(input: &str, max_width: usize) -> String {
-    if UnicodeWidthStr::width(input) <= max_width {
-        return input.to_string();
-    }
-    if max_width <= 3 {
-        return ".".repeat(max_width);
-    }
-
-    let content_width = max_width - 3;
-    let mut width = 0;
-    let mut output = String::new();
-    for character in input.chars() {
-        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
-        if width + character_width > content_width {
-            break;
-        }
-        output.push(character);
-        width += character_width;
-    }
-    output.push_str("...");
-    output
+fn wrap_log_lines(logs: &[String], max_width: usize) -> Vec<String> {
+    logs.iter()
+        .flat_map(|line| soft_wrap_text(line, max_width))
+        .collect()
 }
 
 impl Component for DeployStepView {
@@ -145,14 +128,14 @@ impl Component for DeployStepView {
         self.status_block.set_content(status);
 
         let logs_changed = self.update_logs();
-        let log_width = chunks[1].width.saturating_sub(5) as usize;
-        self.log_list.set_items(
-            self.internal_logs
-                .iter()
-                .map(|line| truncate_to_width(line, log_width))
-                .collect(),
-        );
-        if logs_changed {
+        let was_following_tail = self
+            .log_list
+            .selected_idx()
+            .is_some_and(|selected| selected + 1 == self.log_list.items().len());
+        let log_width = usize::from(chunks[1].width.saturating_sub(5).max(1));
+        self.log_list
+            .set_items(wrap_log_lines(&self.internal_logs, log_width));
+        if logs_changed || was_following_tail {
             self.log_list.select_last();
         }
 
@@ -257,13 +240,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn long_log_lines_are_clipped_by_display_width() {
-        assert_eq!(truncate_to_width("abcdefghij", 8), "abcde...");
+    fn long_log_lines_soft_wrap_by_display_width() {
         assert_eq!(
-            truncate_to_width("\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}", 9),
-            "\u{5bb9}\u{5668}\u{4e0b}..."
+            wrap_log_lines(&["abcdefghij".into()], 8),
+            ["abcdefgh", "ij"]
         );
-        assert_eq!(truncate_to_width("abc", 2), "..");
+        assert_eq!(
+            wrap_log_lines(
+                &["\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}".into()],
+                9
+            ),
+            ["\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}", "\u{5b8c}\u{6210}"]
+        );
+        assert_eq!(
+            wrap_log_lines(&["fatal error with a long explanation".into()], 12),
+            ["fatal error", "with a long", "explanation"]
+        );
     }
 
     #[test]

@@ -104,6 +104,12 @@ mirror = "https://mirror.nju.edu.cn/ubuntu"
 packages = ["sudo", "zsh"]
 ```
 
+## Package Inheritance
+
+Each bootstrap provider has a default package set. Profiles implicitly inherit it with `inherit_default_packages = true`, and their `packages` are appended with stable de-duplication. Set `inherit_default_packages = false` when a distribution release uses different package names or already supplies the required components through another package. Lasper then passes only the explicit `packages` plus packages required by selected wizard features; currently a sudo-enabled user always adds `sudo`. The wizard exposes the same choice as `Include default packages` for each editable bootstrap source.
+
+Disabling inheritance is intentionally allowed and produces a deployment warning rather than being rejected on its own. The resulting profile is responsible for supplying a bootable system manager, D-Bus, the selected guest network stack, and any other facilities expected by its container configuration. Pacstrap and DNF5 still require at least one effective package after wizard-required packages such as `sudo` are included; Lasper rejects an empty final transaction instead of silently restoring pacstrap's implicit `base` package or issuing an invalid DNF5 command.
+
 ## Provider Policies
 
 Bootstrap policy is provider-specific. There is deliberately no common source-policy table: debootstrap verifies a Release file, pacstrap inherits selected host pacman state, and DNF5 obtains package-signature behavior from repository configuration. A field is exposed only when Lasper can map it to that provider without changing its meaning.
@@ -121,7 +127,8 @@ Table location:
 | `suite` | string | required for named profiles | Distribution suite, such as `noble` or `bookworm`. It may be omitted from the partial `default` preset and entered in the wizard. |
 | `architecture` | string | omitted | Target architecture passed through the typed `--arch` option. |
 | `mirror` | string | omitted | Optional debootstrap mirror URL. |
-| `packages` | array of strings | `[]` | Additional packages installed after Lasper's debootstrap runtime baseline. Lasper also adds `sudo` when the user setup requires it. |
+| `packages` | array of strings | `[]` | Packages appended to the inherited defaults, or the explicit package set when inheritance is disabled. Lasper also adds `sudo` when the user setup requires it. |
+| `inherit_default_packages` | boolean | `true` | Include the debootstrap default package set before `packages`. |
 | `exclude_packages` | array of strings | `[]` | Packages excluded from the base installation. |
 | `extra_suites` | array of strings | `[]` | Additional archive suites used during bootstrap. |
 | `variant` | string | omitted | Optional debootstrap variant. |
@@ -141,7 +148,16 @@ Debootstrap policy fields:
 
 `release_signatures = "required"` uses `--force-check-sig`; `disabled` uses `--no-check-sig`. Lasper probes the installed debootstrap help at execution time and falls back to the legacy `--force-check-gpg` or `--no-check-gpg` spelling when required. `https_only` and `allowed_mirror_hosts` require an explicit mirror. Debootstrap does not expose a separate package-signature policy, so Lasper does not model one.
 
-Lasper always includes `systemd-sysv`, `libpam-systemd`, `dbus`, and `dbus-user-session`. This is the minimum Debian/Ubuntu runtime contract for booting under systemd-nspawn, registering PAM logins with logind, creating `/run/user/$UID`, and providing system and user D-Bus sessions.
+The debootstrap defaults are `systemd-sysv`, `libpam-systemd`, `dbus`, `dbus-user-session`, and `systemd-resolved`. They provide the default systemd-nspawn runtime, login/session integration, D-Bus, and the resolver used by Lasper's Veth/Bridge guest network setup.
+
+Debian Bullseye and Ubuntu Jammy ship `systemd-resolved` as part of `systemd`, while Debian Bookworm and Ubuntu Noble use the separate `systemd-resolved` binary package. A legacy profile can therefore replace the defaults without losing the resolver service:
+
+```toml
+[bootstrap.methods.debootstrap.profiles."debian-bullseye"]
+suite = "bullseye"
+inherit_default_packages = false
+packages = ["systemd-sysv", "libpam-systemd", "dbus", "dbus-user-session"]
+```
 
 Example:
 
@@ -151,6 +167,7 @@ suite = "noble"
 architecture = "amd64"
 mirror = "https://archive.ubuntu.com/ubuntu"
 packages = ["zsh", "git"]
+inherit_default_packages = true
 exclude_packages = ["nano"]
 extra_suites = ["noble-updates"]
 variant = "minbase"
@@ -175,7 +192,8 @@ Table location:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `packages` | array of strings | `[]` | Additional packages installed after the fixed `base` package. |
+| `packages` | array of strings | `[]` | Packages appended to the inherited defaults, or the explicit package set when inheritance is disabled. |
+| `inherit_default_packages` | boolean | `true` | Include the pacstrap default package set before `packages`. |
 | `cache` | `host`, `target` | `host` | Use the host package cache (`-c`) or create/use the target cache. |
 | `isolation` | `host`, `unshare` | `host` | Use normal execution or pacstrap's unshare mode (`-N`). |
 | `dependency_checks` | `check`, `skip_checks` | `check` | Use normal pacman dependency checks or pass `-D`. |
@@ -191,11 +209,14 @@ Pacstrap policy fields:
 
 These are pacstrap's real host-integration controls, not generic signature or transport promises. Typed alternate `pacman.conf` and repository definitions are intentionally not exposed yet.
 
+The pacstrap default package set is `base`. Arch's `systemd` package supplies both networkd and resolved; Lasper enables their services during Veth/Bridge rootfs finalization rather than adding distribution-specific split packages. Pacstrap itself treats an omitted package list as `base`, so a profile that disables inheritance must still produce at least one effective package through `packages` or a selected wizard feature.
+
 Example:
 
 ```toml
 [bootstrap.methods.pacstrap.profiles."arch-desktop"]
 packages = ["zsh", "networkmanager"]
+inherit_default_packages = true
 cache = "host"
 isolation = "unshare"
 dependency_checks = "check"
@@ -216,9 +237,10 @@ Table location:
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `releasever` | string | required for named profiles | Fedora/RPM release version. It may be entered in the editable default form. |
+| `releasever` | string | required for named profiles | DNF repository release version. It may be entered in the editable default form. |
 | `architecture` | string | omitted | Force the target architecture with `--forcearch`. |
-| `packages` | array of strings | `[]` | Additional packages appended to Lasper's DNF5 runtime baseline. |
+| `packages` | array of strings | `[]` | Packages appended to the inherited defaults, or the explicit package set when inheritance is disabled. |
+| `inherit_default_packages` | boolean | `true` | Include the Fedora/RHEL-oriented DNF5 default package set before `packages`. |
 | `exclude_packages` | array of strings | `[]` | Package specs excluded from the transaction. |
 | `only_repositories` | array of repository selectors | `[]` | Enable only these repositories with `--repo`. Cannot be combined with the enable/disable lists. |
 | `enable_repositories` | array of repository selectors | `[]` | Additionally enable matching host repositories. |
@@ -238,7 +260,7 @@ DNF5 policy fields:
 
 `repository = "host"` is required until Lasper has a typed repository-definition model. Repository metadata verification is not exposed here: DNF5's `--no-gpgchecks` controls package signatures, so presenting it as a metadata policy would be inaccurate.
 
-Lasper always installs `systemd`, `systemd-pam`, `dbus`, `shadow-utils`, `util-linux`, `dnf5`, `systemd-networkd`, and `systemd-resolved`. The selected repository still determines the distribution identity, so a repository-specific package such as `fedora-release-container` remains an additional package rather than being hard-coded into the generic DNF5 provider.
+The DNF5 defaults are `systemd`, `systemd-pam`, `dbus`, `shadow-utils`, `util-linux`, `dnf5`, `systemd-networkd`, and `systemd-resolved`. These names match current Fedora and RHEL-family repositories, where networkd and resolved are separate systemd subpackages. They are not a universal RPM convention: for example, openSUSE packages these components differently. Disable inheritance and provide the repository's package names when using a non-Fedora/RHEL DNF5 source. The selected repository still determines distribution identity, so `fedora-release-container` remains an explicit profile package.
 
 Example:
 
@@ -247,6 +269,7 @@ Example:
 releasever = "43"
 architecture = "x86_64"
 packages = ["fedora-release-container", "zsh"]
+inherit_default_packages = true
 exclude_packages = ["kernel-debug*"]
 only_repositories = ["fedora", "updates"]
 metadata = "refresh"

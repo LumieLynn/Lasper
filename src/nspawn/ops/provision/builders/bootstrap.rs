@@ -41,6 +41,17 @@ impl Deployer for BootstrapDeployer {
                 name
             );
         }
+        if !self.spec.inherits_default_packages() {
+            send_deploy_log(
+                &logs,
+                "WARNING: Default packages are disabled; the configured package set must provide the services required by the selected container setup.",
+            )
+            .await;
+            log::warn!(
+                "[AUDIT] [Container: {}] [Step: Bootstrap] Provider default packages disabled",
+                name
+            );
+        }
         match &self.spec {
             BootstrapSpec::Pacstrap(spec)
                 if matches!(spec.cache, crate::nspawn::models::PacstrapCacheMode::Host)

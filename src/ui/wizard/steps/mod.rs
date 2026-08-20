@@ -1,9 +1,9 @@
 pub mod basic_view;
+pub mod bind_mounts_view;
 pub mod copy_select_view;
 pub mod deploy_view;
-pub mod devices_view;
+pub mod host_integration_view;
 pub mod network_view;
-pub mod passthrough_view;
 pub mod review_view;
 pub mod source_view;
 pub mod storage_view;
@@ -54,15 +54,17 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
             &context.network.physical_interfaces,
         )),
 
-        WizardStep::Passthrough => Box::new(passthrough_view::PassthroughStepView::new(
-            &context.passthrough.extract_config(),
-            context.network.network_mode(),
-            context.passthrough.wayland_sockets.clone(),
-            context.passthrough.discovered_gpus.clone(),
-            context.passthrough.hardware_scanning,
-        )),
+        WizardStep::HostIntegration => {
+            Box::new(host_integration_view::HostIntegrationStepView::new(
+                &context.passthrough.extract_config(),
+                context.network.network_mode(),
+                context.passthrough.wayland_sockets.clone(),
+                context.passthrough.discovered_gpus.clone(),
+                context.passthrough.hardware_scanning,
+            ))
+        }
 
-        WizardStep::Devices => Box::new(devices_view::DevicesStepView::new(
+        WizardStep::BindMounts => Box::new(bind_mounts_view::BindMountsStepView::new(
             &context.passthrough.extract_config(),
             &context.passthrough.unclassified_files,
             context.passthrough.nvidia_toolkit_installed,

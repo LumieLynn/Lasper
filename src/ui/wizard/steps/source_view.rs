@@ -4,6 +4,7 @@ use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::inputs::path_box::expand_user_path;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
+use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::wizard::context::{ConfiguredSourceProfile, SourceKind, SourceState, WizardContext};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
@@ -28,11 +29,16 @@ macro_rules! active_comps {
             SourceKind::Debootstrap => {
                 comps.push(&mut $self.deboot_mirror);
                 comps.push(&mut $self.deboot_suite);
+                comps.push(&mut $self.deboot_inherit_default_packages);
                 comps.push(&mut $self.deboot_pkgs);
             }
-            SourceKind::Pacstrap => comps.push(&mut $self.pacstrap_pkgs),
+            SourceKind::Pacstrap => {
+                comps.push(&mut $self.pacstrap_inherit_default_packages);
+                comps.push(&mut $self.pacstrap_pkgs);
+            }
             SourceKind::Dnf5 => {
                 comps.push(&mut $self.dnf_releasever);
+                comps.push(&mut $self.dnf_inherit_default_packages);
                 comps.push(&mut $self.dnf_pkgs);
             }
             SourceKind::Pull => {
@@ -55,9 +61,12 @@ pub struct SourceStepView {
     oci_network: crate::ui::widgets::selectors::radio_group::RadioGroup,
     deboot_mirror: TextBox,
     deboot_suite: TextBox,
+    deboot_inherit_default_packages: Checkbox,
     deboot_pkgs: TextBox,
+    pacstrap_inherit_default_packages: Checkbox,
     pacstrap_pkgs: TextBox,
     dnf_releasever: TextBox,
+    dnf_inherit_default_packages: Checkbox,
     dnf_pkgs: TextBox,
     local_path: TextBox,
     pull_url: TextBox,
@@ -147,13 +156,21 @@ impl SourceStepView {
                     Ok(())
                 }
             }),
+            deboot_inherit_default_packages: Checkbox::new(
+                "Include default packages",
+                initial_data.deboot_inherit_default_packages,
+            ),
             deboot_pkgs: TextBox::new(
-                " Additional packages (space separated) ",
+                " Packages (space separated) ",
                 initial_data.deboot_pkgs.clone(),
             )
             .with_validator(validate_package_text),
+            pacstrap_inherit_default_packages: Checkbox::new(
+                "Include default packages",
+                initial_data.pacstrap_inherit_default_packages,
+            ),
             pacstrap_pkgs: TextBox::new(
-                " Additional packages (space separated) ",
+                " Packages (space separated) ",
                 initial_data.pacstrap_pkgs.clone(),
             )
             .with_validator(validate_package_text),
@@ -168,8 +185,12 @@ impl SourceStepView {
                     Ok(())
                 }
             }),
+            dnf_inherit_default_packages: Checkbox::new(
+                "Include default packages",
+                initial_data.dnf_inherit_default_packages,
+            ),
             dnf_pkgs: TextBox::new(
-                " Additional packages (space separated) ",
+                " Packages (space separated) ",
                 initial_data.dnf_pkgs.clone(),
             )
             .with_validator(validate_package_text),
@@ -257,10 +278,16 @@ impl Component for SourceStepView {
                 Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
+                Constraint::Length(3),
             ],
-            SourceKind::Pacstrap => vec![Constraint::Min(0), Constraint::Length(3)],
+            SourceKind::Pacstrap => vec![
+                Constraint::Min(0),
+                Constraint::Length(3),
+                Constraint::Length(3),
+            ],
             SourceKind::Dnf5 => vec![
                 Constraint::Min(0),
+                Constraint::Length(3),
                 Constraint::Length(3),
                 Constraint::Length(3),
             ],
@@ -293,12 +320,17 @@ impl Component for SourceStepView {
             SourceKind::Debootstrap => {
                 self.deboot_mirror.render(f, chunks[1]);
                 self.deboot_suite.render(f, chunks[2]);
-                self.deboot_pkgs.render(f, chunks[3]);
+                self.deboot_inherit_default_packages.render(f, chunks[3]);
+                self.deboot_pkgs.render(f, chunks[4]);
             }
-            SourceKind::Pacstrap => self.pacstrap_pkgs.render(f, chunks[1]),
+            SourceKind::Pacstrap => {
+                self.pacstrap_inherit_default_packages.render(f, chunks[1]);
+                self.pacstrap_pkgs.render(f, chunks[2]);
+            }
             SourceKind::Dnf5 => {
                 self.dnf_releasever.render(f, chunks[1]);
-                self.dnf_pkgs.render(f, chunks[2]);
+                self.dnf_inherit_default_packages.render(f, chunks[2]);
+                self.dnf_pkgs.render(f, chunks[3]);
             }
             SourceKind::Pull => {
                 self.pull_url.render(f, chunks[1]);
@@ -384,9 +416,13 @@ impl StepComponent for SourceStepView {
         };
         ctx.source.deboot_mirror = self.deboot_mirror.value().to_string();
         ctx.source.deboot_suite = self.deboot_suite.value().to_string();
+        ctx.source.deboot_inherit_default_packages = self.deboot_inherit_default_packages.checked();
         ctx.source.deboot_pkgs = self.deboot_pkgs.value().to_string();
+        ctx.source.pacstrap_inherit_default_packages =
+            self.pacstrap_inherit_default_packages.checked();
         ctx.source.pacstrap_pkgs = self.pacstrap_pkgs.value().to_string();
         ctx.source.dnf_releasever = self.dnf_releasever.value().to_string();
+        ctx.source.dnf_inherit_default_packages = self.dnf_inherit_default_packages.checked();
         ctx.source.dnf_pkgs = self.dnf_pkgs.value().to_string();
         ctx.source.local_path = expand_user_path(self.local_path.value())
             .unwrap_or_else(|_| self.local_path.value().trim().into())
@@ -431,7 +467,7 @@ fn source_kind_description(kind: &SourceKind) -> &'static str {
         SourceKind::Oci => "systemd 260+ experimental",
         SourceKind::Debootstrap => "Debian or Ubuntu",
         SourceKind::Pacstrap => "Arch Linux",
-        SourceKind::Dnf5 => "Fedora or RPM",
+        SourceKind::Dnf5 => "Fedora / DNF5",
         SourceKind::Pull => "network tar or raw image",
         SourceKind::LocalFile => "local tar or raw image",
         SourceKind::Profile { .. } => "configured profile",

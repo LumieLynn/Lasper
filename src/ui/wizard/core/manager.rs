@@ -161,8 +161,8 @@ impl Wizard {
                 WizardStep::Basic,
                 WizardStep::User,
                 WizardStep::Network,
-                WizardStep::Passthrough,
-                WizardStep::Devices,
+                WizardStep::HostIntegration,
+                WizardStep::BindMounts,
                 WizardStep::Review,
                 WizardStep::Deploy,
             ];
@@ -432,9 +432,9 @@ impl Wizard {
                     } => {
                         self.context
                             .update_hardware_data(nvidia_state, nvidia_devices, host_gpus);
-                        // Force a view rebuild if we are on Passthrough or Devices steps
-                        if self.step == crate::ui::wizard::WizardStep::Passthrough
-                            || self.step == crate::ui::wizard::WizardStep::Devices
+                        // Rebuild host-facing steps with the completed discovery data.
+                        if self.step == crate::ui::wizard::WizardStep::HostIntegration
+                            || self.step == crate::ui::wizard::WizardStep::BindMounts
                         {
                             self.active_view = None;
                         }

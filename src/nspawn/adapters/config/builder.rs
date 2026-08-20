@@ -202,6 +202,15 @@ impl ContainerConfigBuilder {
             storage.storage_type.get_path(&basic.name).display()
         ));
         content.push_str(&format!(" Hostname: {}\n", cfg.hostname));
+        if let Some(SourceConfig::Bootstrap(spec)) = &self.source {
+            if spec.inherits_default_packages() {
+                content.push_str(" Bootstrap packages: defaults + configured additions\n");
+            } else {
+                content.push_str(
+                    " WARNING: Default packages are disabled; configured packages must satisfy the container runtime and network requirements.\n",
+                );
+            }
+        }
         content.push_str(
             &nspawn_config_content(&cfg, xdg_runtime)
                 .unwrap_or_else(|e| format!(" [ERROR: {}]", e)),

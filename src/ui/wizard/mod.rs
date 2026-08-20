@@ -14,8 +14,8 @@ pub enum WizardStep {
     Storage,
     User,
     Network,
-    Passthrough,
-    Devices,
+    HostIntegration,
+    BindMounts,
     Review,
     Deploy,
 }
@@ -39,8 +39,8 @@ impl WizardStep {
             WizardStep::Storage => "Storage Settings",
             WizardStep::User => "User Management",
             WizardStep::Network => "Network Configuration",
-            WizardStep::Passthrough => "Host Integration",
-            WizardStep::Devices => "Bind Mounts",
+            WizardStep::HostIntegration => "Host Integration",
+            WizardStep::BindMounts => "Bind Mounts",
             WizardStep::Review => "Final Review",
             WizardStep::Deploy => "Deployment Progress",
         }

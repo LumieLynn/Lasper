@@ -27,6 +27,11 @@ impl NetworkMode {
     pub fn is_private(&self) -> bool {
         !matches!(self, Self::Host)
     }
+
+    /// Whether Lasper relies on the guest's default networkd/resolved setup.
+    pub const fn uses_default_guest_network_stack(&self) -> bool {
+        matches!(self, Self::Veth | Self::Bridge(_))
+    }
 }
 
 /// Network modes exposed for system-scoped OCI application imports.
@@ -621,5 +626,16 @@ mod tests {
             NetworkMode::None
         );
         assert_eq!(OciNetworkMode::Veth.into_network_mode(), NetworkMode::Veth);
+    }
+
+    #[test]
+    fn only_veth_based_modes_use_the_default_guest_network_stack() {
+        assert!(NetworkMode::Veth.uses_default_guest_network_stack());
+        assert!(NetworkMode::Bridge("br0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::Host.uses_default_guest_network_stack());
+        assert!(!NetworkMode::None.uses_default_guest_network_stack());
+        assert!(!NetworkMode::MacVlan("eth0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::IpVlan("eth0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::Interface("eth0".into()).uses_default_guest_network_stack());
     }
 }

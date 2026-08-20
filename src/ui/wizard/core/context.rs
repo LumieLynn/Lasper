@@ -33,9 +33,12 @@ pub struct SourceState {
     pub deboot_mirror: String,
     pub deboot_suite: String,
     pub deboot_pkgs: String,
+    pub deboot_inherit_default_packages: bool,
     pub pacstrap_pkgs: String,
+    pub pacstrap_inherit_default_packages: bool,
     pub dnf_releasever: String,
     pub dnf_pkgs: String,
+    pub dnf_inherit_default_packages: bool,
     pub local_path: String,
     pub clone_source: String,
     pub pull_url: String,
@@ -87,6 +90,7 @@ impl SourceState {
                 spec.suite = self.deboot_suite.trim().into();
                 spec.mirror = nonempty(&self.deboot_mirror);
                 spec.packages = split_packages(&self.deboot_pkgs);
+                spec.inherit_default_packages = self.deboot_inherit_default_packages;
                 SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec))
             }
             SourceKind::Pacstrap => {
@@ -98,6 +102,7 @@ impl SourceState {
                     })
                     .unwrap_or_default();
                 spec.packages = split_packages(&self.pacstrap_pkgs);
+                spec.inherit_default_packages = self.pacstrap_inherit_default_packages;
                 SourceConfig::Bootstrap(BootstrapSpec::Pacstrap(spec))
             }
             SourceKind::Dnf5 => {
@@ -110,6 +115,7 @@ impl SourceState {
                     .unwrap_or_default();
                 spec.releasever = self.dnf_releasever.trim().into();
                 spec.packages = split_packages(&self.dnf_pkgs);
+                spec.inherit_default_packages = self.dnf_inherit_default_packages;
                 if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Unspecified {
                     spec.repository = crate::nspawn::models::Dnf5RepositorySource::Host;
                 }
@@ -558,9 +564,12 @@ impl WizardContext {
                 deboot_mirror: deboot_prefill.mirror.unwrap_or_default(),
                 deboot_suite: deboot_prefill.suite,
                 deboot_pkgs: deboot_prefill.packages.join(" "),
+                deboot_inherit_default_packages: deboot_prefill.inherit_default_packages,
                 pacstrap_pkgs: pacstrap_prefill.packages.join(" "),
+                pacstrap_inherit_default_packages: pacstrap_prefill.inherit_default_packages,
                 dnf_releasever: dnf_prefill.releasever,
                 dnf_pkgs: dnf_prefill.packages.join(" "),
+                dnf_inherit_default_packages: dnf_prefill.inherit_default_packages,
                 local_path: artifact_prefill,
                 clone_source: images
                     .first()
@@ -811,9 +820,12 @@ mod tests {
             deboot_mirror: "".into(),
             deboot_suite: "".into(),
             deboot_pkgs: "".into(),
+            deboot_inherit_default_packages: true,
             pacstrap_pkgs: "".into(),
+            pacstrap_inherit_default_packages: true,
             dnf_releasever: "".into(),
             dnf_pkgs: "".into(),
+            dnf_inherit_default_packages: true,
             local_path: "".into(),
             clone_source: "".into(),
             pull_url: "".into(),
@@ -961,6 +973,7 @@ mod tests {
         state.kind = SourceKind::Debootstrap;
         state.deboot_suite = "noble".into();
         state.deboot_pkgs = "sudo zsh".into();
+        state.deboot_inherit_default_packages = false;
         state.default_profiles = defaults;
         let SourceConfig::Bootstrap(BootstrapSpec::Debootstrap(spec)) = state.extract_config()
         else {
@@ -968,6 +981,7 @@ mod tests {
         };
         assert_eq!(spec.suite, "noble");
         assert_eq!(spec.packages, ["sudo", "zsh"]);
+        assert!(!spec.inherit_default_packages);
         assert_eq!(
             spec.policy.release_signatures,
             crate::nspawn::models::DebootstrapReleaseSignaturePolicy::Disabled

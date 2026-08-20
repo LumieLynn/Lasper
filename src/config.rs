@@ -275,6 +275,7 @@ mod tests {
             RootfsSourceSpec::Debootstrap(spec) => {
                 assert_eq!(spec.suite, "bookworm");
                 assert_eq!(spec.architecture.as_deref(), Some("amd64"));
+                assert!(spec.inherit_default_packages);
                 assert_eq!(spec.exclude_packages, ["nano"]);
                 assert_eq!(
                     spec.policy.release_signatures,
@@ -295,6 +296,26 @@ mod tests {
             "#,
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn bootstrap_profiles_can_disable_implicit_default_packages() {
+        let config: AppConfig = toml::from_str(
+            r#"
+                [bootstrap.methods.debootstrap.profiles.legacy]
+                suite = "bullseye"
+                inherit_default_packages = false
+                packages = ["systemd-sysv", "dbus"]
+            "#,
+        )
+        .unwrap();
+
+        let resolved = config.bootstrap.resolve();
+        let RootfsSourceSpec::Debootstrap(spec) = &resolved.profiles[0].source else {
+            panic!("expected debootstrap profile");
+        };
+        assert!(!spec.inherit_default_packages);
+        assert_eq!(spec.packages, ["systemd-sysv", "dbus"]);
     }
 
     #[test]

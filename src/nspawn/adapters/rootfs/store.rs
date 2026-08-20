@@ -123,12 +123,13 @@ impl RootfsStore {
         Ok(())
     }
 
-    pub(crate) async fn configure_network(&self, target: &RootfsTarget) -> Result<()> {
-        self.execute(RootfsOperation::ConfigureNetwork(TargetRequest {
-            target: target.clone(),
-        }))
-        .await?;
-        Ok(())
+    pub(crate) async fn configure_network(&self, target: &RootfsTarget) -> Result<Vec<String>> {
+        let result = self
+            .execute(RootfsOperation::ConfigureNetwork(TargetRequest {
+                target: target.clone(),
+            }))
+            .await?;
+        Ok(result.warnings)
     }
 
     pub(crate) async fn set_root_password(
@@ -366,8 +367,11 @@ async fn execute_rootfs_operation_with_runners(
         RootfsOperation::ConfigureNetwork(request) => {
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
-            configure_network_at(&path, runner).await?;
-            Ok(RootfsResult::default())
+            let warnings = configure_network_at(&path, runner).await?;
+            Ok(RootfsResult {
+                warnings,
+                ..Default::default()
+            })
         }
         RootfsOperation::SetRootPassword(request) => {
             validate_chpasswd_secret("root password", &request.password)?;

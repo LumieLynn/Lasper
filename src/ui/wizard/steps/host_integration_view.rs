@@ -99,9 +99,9 @@ macro_rules! active_comps {
     }};
 }
 
-impl_wizard_nav!(PassthroughStepView, active_comps);
+impl_wizard_nav!(HostIntegrationStepView, active_comps);
 
-pub struct PassthroughStepView {
+pub struct HostIntegrationStepView {
     graphics_acceleration: Checkbox,
     gpu_list: Checklist<GpuSelectionItem>,
     gpu_all_index: Option<usize>,
@@ -124,7 +124,7 @@ pub struct PassthroughStepView {
     private_network: bool,
 }
 
-impl PassthroughStepView {
+impl HostIntegrationStepView {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_data: &PassthroughConfig,
@@ -333,7 +333,7 @@ impl PassthroughStepView {
     }
 }
 
-impl Component for PassthroughStepView {
+impl Component for HostIntegrationStepView {
     fn render(&mut self, f: &mut Frame, area: Rect) {
         // Manual margin(1) — shrink area to match other step views
         let area = Rect::new(
@@ -481,7 +481,7 @@ impl Component for PassthroughStepView {
     }
 }
 
-impl StepComponent for PassthroughStepView {
+impl StepComponent for HostIntegrationStepView {
     fn commit_to_context(&self, ctx: &mut WizardContext) {
         ctx.passthrough.graphics_acceleration = self.graphics_acceleration.checked();
         ctx.passthrough.gpu_passthrough_all =
@@ -560,7 +560,7 @@ mod tests {
             nvidia_gpu: false,
             nvidia_profile: None,
         };
-        let mut view = PassthroughStepView::new(
+        let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Host),
             Vec::new(),
@@ -615,7 +615,7 @@ mod tests {
             nodes: vec!["/dev/mali".into()],
         };
         let gpus = vec![first_gpu, second_gpu, legacy_gpu];
-        let mut view = PassthroughStepView::new(
+        let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Host),
             vec!["wayland-0".into()],
@@ -693,7 +693,7 @@ mod tests {
 
         let mut restored_config = config;
         restored_config.gpu_passthrough_all = true;
-        let restored_view = PassthroughStepView::new(
+        let restored_view = HostIntegrationStepView::new(
             &restored_config,
             Some(NetworkMode::Host),
             vec!["wayland-0".into()],
@@ -719,7 +719,7 @@ mod tests {
             nvidia_gpu: false,
             nvidia_profile: None,
         };
-        let mut view = PassthroughStepView::new(
+        let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Veth),
             vec!["wayland-0".into()],
