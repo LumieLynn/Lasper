@@ -85,23 +85,31 @@ impl App {
                     DetailPane::Logs => {
                         self.data.log_manager.get_or_create(&name);
                         if entry.state == ContainerState::Running {
-                            if !self.data.log_manager.stream_is_active(&name) {
-                                if let Some((tx, fatal)) = self.data.log_manager.start_stream(&name)
-                                {
-                                    match crate::nspawn::models::MachineName::new(&name) {
-                                        Ok(machine) => {
-                                            let handle =
-                                                self.data.journal_stream.spawn(machine, tx, fatal);
-                                            self.data
-                                                .log_manager
-                                                .attach_stream_handle(&name, handle);
+                            if self.data.log_manager.can_start_stream(&name) {
+                                match crate::domain::machine::MachineName::new(&name) {
+                                    Ok(machine) => {
+                                        match self.data.session_service.open_journal(machine).await
+                                        {
+                                            Ok(handle) => {
+                                                self.data.log_manager.attach_stream(&name, handle)
+                                            }
+                                            Err(error) => {
+                                                self.data.log_manager.push_line(
+                                                    &name,
+                                                    format!("Log stream error: {error}"),
+                                                );
+                                                if let Some(hint) = error.hint() {
+                                                    self.data.log_manager.push_line(&name, hint);
+                                                }
+                                                self.data.log_manager.mark_stream_failed(&name);
+                                            }
                                         }
-                                        Err(error) => {
-                                            self.data.log_manager.push_line(
-                                                &name,
-                                                format!("Log stream error: {error}"),
-                                            );
-                                        }
+                                    }
+                                    Err(error) => {
+                                        self.data
+                                            .log_manager
+                                            .push_line(&name, format!("Log stream error: {error}"));
+                                        self.data.log_manager.mark_stream_failed(&name);
                                     }
                                 }
                             }
@@ -797,17 +805,17 @@ impl App {
         match self
             .data
             .terminal
-            .spawn(&entry, rows, &self.ui.app_tx, &self.data.exec_ctx)
+            .spawn(&entry, rows, &self.ui.app_tx)
             .await
         {
             Ok(session) => {
                 self.set_focus_idx(3);
                 self.refresh_detail().await;
                 let message = match session.attach_kind {
-                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Login => {
+                    crate::domain::session::TerminalAttachmentKind::Login => {
                         format!("Logged into {}", entry.name)
                     }
-                    crate::nspawn::sys::terminal_attach::TerminalAttachKind::Namespace => {
+                    crate::domain::session::TerminalAttachmentKind::Namespace => {
                         format!("Attached to {} through its namespaces", entry.name)
                     }
                 };

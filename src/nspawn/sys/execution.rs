@@ -74,10 +74,6 @@ impl ExecutionContext {
         })
     }
 
-    pub fn permission_level(&self) -> PermissionLevel {
-        self.permission_level
-    }
-
     /// Expose the daemon reference for callers that need daemon-specific
     /// operations (DBus proxy, terminal spawning, shutdown).
     pub fn daemon_ref(&self) -> Option<&Arc<ElevatedDaemon>> {

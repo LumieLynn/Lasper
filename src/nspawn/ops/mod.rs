@@ -3,7 +3,6 @@ pub mod handlers;
 pub mod image_lifecycle;
 pub(crate) mod image_lifecycle_adapter;
 pub mod inspect;
-pub mod journal_stream;
 pub mod machine_lifecycle;
 pub(crate) mod machine_lifecycle_adapter;
 pub mod permission;
@@ -16,7 +15,6 @@ pub mod system_operation;
 
 pub use activity::HostOperationTracker;
 pub use image_lifecycle::{ImageLifecycleService, ImageRemovalOutcome};
-pub use journal_stream::JournalStreamSource;
 pub use machine_lifecycle::{
     MachineAction, MachineLifecycleOutcome, MachineLifecycleResult, MachineLifecycleService,
 };

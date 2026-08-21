@@ -7,15 +7,13 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::application::sessions::SessionService;
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
     models::{
         ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
     },
-    ops::{
-        ImageLifecycleService, JournalStreamSource, MachineLifecycleService, RuntimeCatalog,
-        RuntimeUpdate,
-    },
+    ops::{ImageLifecycleService, MachineLifecycleService, RuntimeCatalog, RuntimeUpdate},
     sys::ExecutionContext,
 };
 use crate::ui::core::{Component, FocusTracker};
@@ -188,7 +186,7 @@ pub struct AppData {
     pub unit_name: Option<String>,
     pub unit_drop_ins: Vec<crate::nspawn::adapters::config::systemd_unit::SystemdDropIn>,
     pub dbus_active: bool,
-    pub journal_stream: std::sync::Arc<dyn JournalStreamSource>,
+    pub session_service: std::sync::Arc<SessionService>,
     pub runtime_catalog: std::sync::Arc<RuntimeCatalog>,
     pub machine_lifecycle: std::sync::Arc<MachineLifecycleService>,
     pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
@@ -225,10 +223,9 @@ impl App {
         exec_ctx: std::sync::Arc<ExecutionContext>,
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
-        let journal_stream: std::sync::Arc<dyn JournalStreamSource> = std::sync::Arc::new(
-            crate::nspawn::ops::journal_stream::DefaultJournalStreamSource::new(
-                exec_ctx.daemon_ref().cloned(),
-            ),
+        let session_service = crate::nspawn::adapters::session::compose_session_service(
+            permissions.level(),
+            &exec_ctx,
         );
         let runtime_catalog = crate::nspawn::ops::runtime_catalog_adapter::compose_runtime_catalog(
             permissions.level(),
@@ -274,7 +271,7 @@ impl App {
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
                 dbus_active: !cli_mode,
-                journal_stream,
+                session_service: session_service.clone(),
                 runtime_catalog,
                 machine_lifecycle,
                 image_lifecycle,
@@ -289,7 +286,7 @@ impl App {
                 config_dirty: true,
                 unit_dirty: true,
                 details_dirty: true,
-                terminal: TerminalManager::new(),
+                terminal: TerminalManager::new(session_service),
             },
             ui: AppUi::new(),
         }

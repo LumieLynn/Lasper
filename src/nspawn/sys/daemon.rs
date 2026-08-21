@@ -23,6 +23,10 @@
 //! session token negotiated after the control connection's peer credentials
 //! have been authenticated.
 
+mod session_client;
+mod session_protocol;
+mod session_server;
+
 use crate::nspawn::adapters::comm::backend::RuntimeSource;
 use crate::nspawn::adapters::config::store::{
     execute_nspawn_config_operation, NspawnConfigOperation, NspawnConfigResult,
@@ -36,9 +40,7 @@ use crate::nspawn::adapters::rootfs::store::{
 use crate::nspawn::adapters::storage::store::{
     execute_managed_storage_operation, ManagedStorageOperation, ManagedStorageResult,
 };
-use crate::nspawn::models::{
-    ContainerEntry, ImageEntry, MachineName, MachineProperties, TerminalSize,
-};
+use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
 use crate::nspawn::ops::image_lifecycle::{
     map_native_error, ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
 };
@@ -63,7 +65,6 @@ use crate::nspawn::ops::system_operation::{
 use crate::nspawn::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation, NvidiaStateResult,
 };
-use crate::nspawn::sys::terminal_attach::TerminalAttachKind;
 use sendfd::{RecvWithFd, SendWithFd};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
@@ -74,9 +75,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
+use session_protocol::{CloseSessionParams, SpawnJournalctlParams, SpawnTerminalParams};
+use session_server::DaemonServerState;
+
 // ── RPC message types ──
 
-const RPC_PROTOCOL_VERSION: u32 = 10;
+const RPC_PROTOCOL_VERSION: u32 = 11;
 const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
 const MAX_RPC_IN_FLIGHT: usize = 64;
 const MAX_FD_CONNECTIONS: usize = 32;
@@ -122,30 +126,6 @@ enum FdOperation {
     ImportRawImage(ImportRawImageParams),
     #[serde(rename = "import_tar_image")]
     ImportTarImage(ImportTarRequest),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnJournalctlParams {
-    name: MachineName,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnTerminalParams {
-    name: MachineName,
-    size: TerminalSize,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SpawnTerminalResponse {
-    attach_kind: TerminalAttachKind,
-}
-
-pub(crate) struct SpawnedTerminalPty {
-    pub master_fd: RawFd,
-    pub attach_kind: TerminalAttachKind,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -818,14 +798,14 @@ fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
     Ok(pidfd)
 }
 
-fn monitor_parent(pidfd: OwnedFd) -> std::io::Result<()> {
+fn monitor_parent(pidfd: OwnedFd, state: Arc<DaemonServerState>) -> std::io::Result<()> {
     let pidfd = tokio::io::unix::AsyncFd::new(pidfd)?;
     tokio::spawn(async move {
         match pidfd.readable().await {
             Ok(_) => log::info!("Daemon: launching TUI exited; stopping elevated daemon"),
             Err(error) => log::error!("Daemon: parent pidfd monitor failed: {error}"),
         }
-        shutdown_daemon_resources().await;
+        shutdown_daemon_resources(&state).await;
         std::process::exit(0);
     });
     Ok(())
@@ -1208,70 +1188,6 @@ impl ElevatedDaemon {
     // thread for recv_with_fd (sendfd on tokio::UnixStream uses try_io which
     // is unreliable when mixed with prior read/write ops on the same fd).
 
-    pub async fn spawn_journalctl(&self, name: &str) -> std::io::Result<RawFd> {
-        let name = MachineName::try_from(name)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let std_sock = self
-            .open_fd_channel(FdOperation::Journalctl(SpawnJournalctlParams { name }))
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 256];
-            let mut fds = [0i32 as RawFd; 1];
-            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
-            if fd_count > 0 {
-                Ok(fds[0])
-            } else {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                Err(std::io::Error::other(format!(
-                    "daemon error: {}",
-                    msg.trim()
-                )))
-            }
-        })
-        .await?
-    }
-
-    pub async fn spawn_terminal(
-        &self,
-        name: &str,
-        cols: u16,
-        rows: u16,
-    ) -> std::io::Result<SpawnedTerminalPty> {
-        let name = MachineName::try_from(name)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let size = TerminalSize::new(cols, rows)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
-        let std_sock = self
-            .open_fd_channel(FdOperation::Terminal(SpawnTerminalParams { name, size }))
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 256];
-            let mut fds = [0i32 as RawFd; 1];
-            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
-            if fd_count > 0 {
-                match serde_json::from_slice::<SpawnTerminalResponse>(&buf[..n]) {
-                    Ok(response) => Ok(SpawnedTerminalPty {
-                        master_fd: fds[0],
-                        attach_kind: response.attach_kind,
-                    }),
-                    Err(error) => {
-                        unsafe {
-                            libc::close(fds[0]);
-                        }
-                        Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-                    }
-                }
-            } else {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                Err(std::io::Error::other(format!(
-                    "daemon error: {}",
-                    msg.trim()
-                )))
-            }
-        })
-        .await?
-    }
-
     pub(crate) async fn import_raw_image(
         &self,
         machine: MachineName,
@@ -1558,6 +1474,7 @@ pub async fn daemon_main(
         log::error!("Daemon: missing launching TUI PID");
         std::process::exit(1);
     }
+    let server_state = Arc::new(DaemonServerState::default());
     let parent_pidfd = match open_pidfd(expected_parent_pid) {
         Ok(pidfd) => pidfd,
         Err(error) => {
@@ -1565,7 +1482,7 @@ pub async fn daemon_main(
             std::process::exit(1);
         }
     };
-    if let Err(error) = monitor_parent(parent_pidfd) {
+    if let Err(error) = monitor_parent(parent_pidfd, Arc::clone(&server_state)) {
         log::error!("Daemon: failed to monitor launching TUI process: {error}");
         std::process::exit(1);
     }
@@ -1628,6 +1545,7 @@ pub async fn daemon_main(
 
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(32);
     let mut rpc_reader = rpc.reader;
+    let writer_state = Arc::clone(&server_state);
     tokio::spawn(async move {
         use tokio::io::AsyncWriteExt;
         let mut writer = tokio::io::BufWriter::new(rpc.writer);
@@ -1640,7 +1558,7 @@ pub async fn daemon_main(
                 break;
             }
         }
-        shutdown_daemon_resources().await;
+        shutdown_daemon_resources(&writer_state).await;
         std::process::exit(0);
     });
 
@@ -1668,6 +1586,7 @@ pub async fn daemon_main(
     }
 
     let fd_slots = Arc::new(tokio::sync::Semaphore::new(MAX_FD_CONNECTIONS));
+    let fd_server_state = Arc::clone(&server_state);
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -1688,6 +1607,7 @@ pub async fn daemon_main(
                         expected_peer,
                         fd_auth_token.clone(),
                         auth_log.clone(),
+                        Arc::clone(&fd_server_state),
                         permit,
                     ));
                 }
@@ -1699,14 +1619,22 @@ pub async fn daemon_main(
         }
     });
 
-    let exit_code = match run_rpc_request_pump(&mut rpc_reader, &dbus, &out_tx, user_uid).await {
+    let exit_code = match run_rpc_request_pump(
+        &mut rpc_reader,
+        &dbus,
+        &out_tx,
+        user_uid,
+        Arc::clone(&server_state),
+    )
+    .await
+    {
         Ok(()) => 0,
         Err(error) => {
             log::error!("Daemon RPC socket error: {error}");
             1
         }
     };
-    shutdown_daemon_resources().await;
+    shutdown_daemon_resources(&server_state).await;
     std::process::exit(exit_code);
 }
 
@@ -1715,6 +1643,7 @@ async fn run_rpc_request_pump<R, B>(
     dbus: &Option<B>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
     invoking_uid: u32,
+    server_state: Arc<DaemonServerState>,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -1809,10 +1738,19 @@ where
 
         let dbus = dbus.clone();
         let out_tx = out_tx.clone();
+        let server_state = Arc::clone(&server_state);
         tokio::spawn(async move {
             let _permit = permit;
             let _reservation = reservation;
-            match handle_request(&request, &dbus, &out_tx, invoking_uid).await {
+            match handle_request(
+                &request,
+                &dbus,
+                &out_tx,
+                invoking_uid,
+                Arc::clone(&server_state),
+            )
+            .await
+            {
                 HandleOutcome::Spawned => {}
                 HandleOutcome::Sync(Ok(result)) => {
                     let _ = send(
@@ -1875,9 +1813,27 @@ async fn handle_request<B: DaemonDbusExecutor>(
     dbus: &Option<B>,
     out_tx: &tokio::sync::mpsc::Sender<String>,
     invoking_uid: u32,
+    server_state: Arc<DaemonServerState>,
 ) -> HandleOutcome {
     match request.method.as_str() {
         "ping" => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+
+        "close_session" => {
+            let params: CloseSessionParams = match serde_json::from_value(request.params.clone()) {
+                Ok(params) => params,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid close_session request: {error}"
+                    )))
+                }
+            };
+            HandleOutcome::Sync(
+                server_state
+                    .close_and_escalate(params.session_id)
+                    .map(|()| serde_json::Value::Null)
+                    .map_err(|error| error.to_string()),
+            )
+        }
 
         "nspawn_config" => {
             let operation: NspawnConfigOperation =
@@ -2312,7 +2268,7 @@ async fn handle_request<B: DaemonDbusExecutor>(
         }
 
         "exit" => {
-            shutdown_daemon_resources().await;
+            shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
         }
 
@@ -2433,6 +2389,7 @@ async fn handle_fd_connection(
     expected_peer: PeerCredentials,
     expected_auth_token: Arc<str>,
     auth_log: AuthLogLimiter,
+    server_state: Arc<DaemonServerState>,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let actual_peer = match get_peer_credentials(&stream) {
@@ -2517,130 +2474,12 @@ async fn handle_fd_connection(
     };
 
     match operation {
-        FdOperation::Journalctl(SpawnJournalctlParams { name }) => {
-            match crate::nspawn::sys::new_sync_command("journalctl")
-                .args([
-                    "-M",
-                    name.as_str(),
-                    "-n",
-                    "1000",
-                    "-f",
-                    "--no-pager",
-                    "--output=short",
-                ])
-                .stderr(std::process::Stdio::null())
-                .process_group(0)
-                .spawn()
-            {
-                Ok(mut child) => {
-                    let child_pid = child.id();
-                    DAEMON_SESSION_PIDS
-                        .lock()
-                        .insert(child_pid as u64, child_pid);
-                    let stdout = child.stdout.take().expect("stdout piped");
-                    let raw_fd = stdout.as_raw_fd();
-
-                    if let Err(e) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
-                        log::error!("Daemon: send_with_fd (journalctl) failed: {}", e);
-                        let _ = crate::nspawn::sys::command::signal_process_group(
-                            child_pid,
-                            libc::SIGKILL,
-                        );
-                    }
-                    drop(stdout);
-                    tokio::task::spawn_blocking(move || {
-                        let _ = child.wait();
-                        DAEMON_SESSION_PIDS.lock().remove(&(child_pid as u64));
-                    });
-                }
-                Err(e) => {
-                    log::error!("Daemon: spawn journalctl failed: {}", e);
-                }
-            }
+        FdOperation::Journalctl(params) => {
+            session_server::spawn_journal(&mut std_stream, params, server_state);
         }
 
-        FdOperation::Terminal(SpawnTerminalParams { name, size }) => {
-            use portable_pty::{native_pty_system, PtySize};
-            let pty_system = native_pty_system();
-            let pair = match pty_system.openpty(PtySize {
-                rows: size.rows(),
-                cols: size.cols(),
-                pixel_width: 0,
-                pixel_height: 0,
-            }) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::error!("Daemon: openpty failed: {}", e);
-                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
-                    return;
-                }
-            };
-
-            let attach = match crate::nspawn::sys::terminal_attach::select(&name) {
-                Ok(attach) => attach,
-                Err(e) => {
-                    log::error!("Daemon: terminal attach planning failed: {}", e);
-                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
-                    return;
-                }
-            };
-            let attach_kind = attach.kind();
-            let cmd = attach.into_pty_command();
-            let terminal_name = name.to_string();
-            match pair.slave.spawn_command(cmd) {
-                Ok(mut child) => {
-                    drop(pair.slave);
-                    let child_pid = child.process_id();
-                    if let Some(child_pid) = child_pid {
-                        DAEMON_SESSION_PIDS
-                            .lock()
-                            .insert(child_pid as u64, child_pid);
-                    }
-                    let master_fd = pair.master.as_raw_fd().expect("master has fd");
-                    let response = serde_json::to_vec(&SpawnTerminalResponse { attach_kind })
-                        .expect("terminal response is serializable");
-
-                    if let Err(e) = std_stream.send_with_fd(&response, &[master_fd]) {
-                        log::error!("Daemon: send_with_fd (terminal) failed: {}", e);
-                        if let Some(child_pid) = child_pid {
-                            let _ = crate::nspawn::sys::command::signal_process_group(
-                                child_pid,
-                                libc::SIGKILL,
-                            );
-                        }
-                    }
-                    drop(pair.master);
-                    tokio::task::spawn_blocking(move || {
-                        match child.wait() {
-                            Ok(status) if status.success() => log::info!(
-                                "Terminal attachment for {} ({:?}) exited normally",
-                                terminal_name,
-                                attach_kind
-                            ),
-                            Ok(status) => log::warn!(
-                                "Terminal attachment for {} ({:?}) exited with code {} signal {:?}",
-                                terminal_name,
-                                attach_kind,
-                                status.exit_code(),
-                                status.signal()
-                            ),
-                            Err(error) => log::warn!(
-                                "Failed to wait for terminal attachment to {} ({:?}): {}",
-                                terminal_name,
-                                attach_kind,
-                                error
-                            ),
-                        }
-                        if let Some(child_pid) = child_pid {
-                            DAEMON_SESSION_PIDS.lock().remove(&(child_pid as u64));
-                        }
-                    });
-                }
-                Err(e) => {
-                    log::error!("Daemon: spawn terminal attachment failed: {}", e);
-                    let _ = std_stream.send_with_fd(e.to_string().as_bytes(), &[]);
-                }
-            }
+        FdOperation::Terminal(params) => {
+            session_server::spawn_terminal(&mut std_stream, params, server_state);
         }
 
         FdOperation::Bootstrap(params) => {
@@ -2852,18 +2691,14 @@ static OCI_TRANSFER_CANCELLATIONS: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<u64, OciTransferCancellation>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-static DAEMON_SESSION_PIDS: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<u64, u32>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-async fn shutdown_daemon_resources() {
+async fn shutdown_daemon_resources(server_state: &DaemonServerState) {
     for cancellation in OCI_TRANSFER_CANCELLATIONS.lock().values() {
         cancellation.request();
     }
 
     let mut pids = std::collections::HashSet::new();
     pids.extend(SPAWN_PIDS.lock().values().copied());
-    pids.extend(DAEMON_SESSION_PIDS.lock().values().copied());
+    pids.extend(server_state.pids());
     for pid in &pids {
         if let Err(error) = crate::nspawn::sys::command::signal_process_group(*pid, libc::SIGTERM) {
             log::warn!("Daemon: failed to terminate child process group {pid}: {error}");
@@ -2874,7 +2709,7 @@ async fn shutdown_daemon_resources() {
 
     let mut remaining = std::collections::HashSet::new();
     remaining.extend(SPAWN_PIDS.lock().values().copied());
-    remaining.extend(DAEMON_SESSION_PIDS.lock().values().copied());
+    remaining.extend(server_state.pids());
     for pid in remaining {
         if let Err(error) = crate::nspawn::sys::command::signal_process_group(pid, libc::SIGKILL) {
             log::warn!("Daemon: failed to kill child process group {pid}: {error}");
@@ -3141,12 +2976,20 @@ mod tests {
         );
         let (mut client, server) = tokio::io::duplex(4096);
         let mut reader = tokio::io::BufReader::new(server);
+        let server_state = Arc::new(DaemonServerState::default());
 
         // This is the production request pump. A slow non-cancelable image
         // removal must not prevent an independent in-memory query from being
         // read and completed.
         let mut pump = tokio::spawn(async move {
-            run_rpc_request_pump(&mut reader, &dbus, &out_tx, uzers::get_current_uid()).await
+            run_rpc_request_pump(
+                &mut reader,
+                &dbus,
+                &out_tx,
+                uzers::get_current_uid(),
+                server_state,
+            )
+            .await
         });
         use tokio::io::AsyncWriteExt;
         client.write_all(input.as_bytes()).await.unwrap();
@@ -3213,8 +3056,16 @@ mod tests {
         };
         let (mut client, server) = tokio::io::duplex(4096);
         let mut reader = tokio::io::BufReader::new(server);
+        let server_state = Arc::new(DaemonServerState::default());
         let mut pump = tokio::spawn(async move {
-            run_rpc_request_pump(&mut reader, &dbus, &out_tx, uzers::get_current_uid()).await
+            run_rpc_request_pump(
+                &mut reader,
+                &dbus,
+                &out_tx,
+                uzers::get_current_uid(),
+                server_state,
+            )
+            .await
         });
         use tokio::io::AsyncWriteExt;
         client
@@ -3348,13 +3199,15 @@ mod tests {
         let request = FdRequest {
             auth_token: TEST_TOKEN.to_string(),
             operation: FdOperation::Terminal(SpawnTerminalParams {
+                session_id: session_protocol::WireSessionId::new(7).unwrap(),
                 name: MachineName::new("test-machine").unwrap(),
-                size: TerminalSize::new(120, 40).unwrap(),
+                size: crate::nspawn::models::TerminalSize::new(120, 40).unwrap(),
             }),
         };
 
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["method"], "spawn_terminal");
+        assert_eq!(json["params"]["session_id"], 7);
         assert_eq!(json["params"]["name"], "test-machine");
         assert_eq!(json["params"]["size"]["cols"], 120);
         assert_eq!(json["params"]["size"]["rows"], 40);
@@ -3362,8 +3215,12 @@ mod tests {
         let parsed: FdRequest = serde_json::from_value(json).unwrap();
         match parsed.operation {
             FdOperation::Terminal(params) => {
+                assert_eq!(params.session_id.get(), 7);
                 assert_eq!(params.name.as_str(), "test-machine");
-                assert_eq!(params.size, TerminalSize::new(120, 40).unwrap());
+                assert_eq!(
+                    params.size,
+                    crate::nspawn::models::TerminalSize::new(120, 40).unwrap()
+                );
             }
             _ => panic!("expected spawn_terminal"),
         }
@@ -3541,6 +3398,7 @@ mod tests {
     #[tokio::test]
     async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters() {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
+        let server_state = Arc::new(DaemonServerState::default());
         let request = RpcRequest {
             jsonrpc: "2.0".into(),
             id: 7,
@@ -3554,6 +3412,7 @@ mod tests {
                 &None::<crate::nspawn::adapters::comm::dbus::DbusBackend>,
                 &out_tx,
                 uzers::get_current_uid(),
+                Arc::clone(&server_state),
             )
             .await,
             HandleOutcome::Spawned
@@ -3572,6 +3431,7 @@ mod tests {
                 &None::<crate::nspawn::adapters::comm::dbus::DbusBackend>,
                 &out_tx,
                 uzers::get_current_uid(),
+                server_state,
             )
             .await,
             HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")

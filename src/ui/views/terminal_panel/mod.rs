@@ -57,7 +57,7 @@ impl TerminalPanel {
         let border_color = if resize_mode {
             crate::ui::panel_border_color(true, is_focused, false)
         } else if is_focused {
-            if session.insert_mode {
+            if session.is_insert_mode() {
                 t.terminal_insert_border
             } else {
                 t.accent
@@ -66,17 +66,25 @@ impl TerminalPanel {
             t.border_panel_secondary
         };
 
-        let title_suffix = if session.insert_mode {
-            " [INSERT] ".to_string()
-        } else if session.scroll_offset > 0 {
-            let max_scroll = term.screen().row0_count();
-            format!(
-                " [NORMAL] (Scroll: {}/{}) ",
-                session.scroll_offset.min(max_scroll),
-                max_scroll
-            )
-        } else {
-            " [NORMAL] ".to_string()
+        let title_suffix = match session.handle.lifecycle() {
+            crate::domain::session::SessionLifecycle::Running if session.insert_mode => {
+                " [INSERT] ".to_string()
+            }
+            crate::domain::session::SessionLifecycle::Running if session.scroll_offset > 0 => {
+                let max_scroll = term.screen().row0_count();
+                format!(
+                    " [NORMAL] (Scroll: {}/{}) ",
+                    session.scroll_offset.min(max_scroll),
+                    max_scroll
+                )
+            }
+            crate::domain::session::SessionLifecycle::Running => " [NORMAL] ".to_string(),
+            crate::domain::session::SessionLifecycle::Exited { code, .. } => match code {
+                Some(code) => format!(" [EXIT {code}] "),
+                None => " [EXITED] ".to_string(),
+            },
+            crate::domain::session::SessionLifecycle::Failed(_) => " [FAILED] ".to_string(),
+            crate::domain::session::SessionLifecycle::Closed => " [CLOSED] ".to_string(),
         };
 
         let block = Block::default()
@@ -172,7 +180,7 @@ impl TerminalPanel {
             }
 
             if is_focused
-                && session.insert_mode
+                && session.is_insert_mode()
                 && session.scroll_offset == 0
                 && !screen.hide_cursor()
             {

@@ -1,12 +1,15 @@
 //! Terminal session management.
 
+use crate::application::sessions::{
+    SessionSendStatus, SessionService, TerminalSessionHandle, TerminalSessionInput,
+};
+use crate::domain::machine::MachineName;
+use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::events::AppEvent;
-use crate::nspawn::models::{ContainerEntry, MachineName};
-use crate::nspawn::ops::PermissionLevel;
-use crate::nspawn::sys::execution::ExecutionContext;
-use crate::nspawn::sys::terminal_attach::TerminalAttachKind;
+use crate::nspawn::models::ContainerEntry;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
@@ -24,10 +27,11 @@ pub struct TextSelection {
 
 pub struct TerminalSession {
     pub container_name: String,
-    pub attach_kind: TerminalAttachKind,
+    pub attach_kind: TerminalAttachmentKind,
     pub terminal: Arc<parking_lot::Mutex<crate::term::Parser>>,
-    pub pty_tx: tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
-    pub handle: crate::nspawn::adapters::comm::pty::TerminalHandle,
+    pub input: TerminalSessionInput,
+    pub handle: TerminalSessionHandle,
+    output_task: tokio::task::JoinHandle<()>,
     pub scroll_offset: usize,
     pub insert_mode: bool,
     pub selection: TextSelection,
@@ -38,12 +42,68 @@ pub struct TerminalSession {
     resize_channel_closed: bool,
     /// Keeps mouse button tracking active while the pointer leaves the pane.
     mouse_capture: bool,
-    resize_state: crate::nspawn::adapters::comm::pty::ResizeState,
 }
 
 #[derive(Debug)]
 pub struct SpawnedTerminalSession {
-    pub attach_kind: TerminalAttachKind,
+    pub attach_kind: TerminalAttachmentKind,
+}
+
+#[derive(Clone, Debug)]
+struct RedrawGate {
+    pending: Arc<AtomicBool>,
+}
+
+impl RedrawGate {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn clear(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+
+    fn notify(&self, tx: &tokio::sync::mpsc::Sender<AppEvent>) {
+        if self
+            .pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+            && tx.try_send(AppEvent::TerminalRedraw).is_err()
+        {
+            self.clear();
+        }
+    }
+}
+
+fn spawn_output_parser(
+    mut output: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    terminal: Arc<parking_lot::Mutex<crate::term::Parser>>,
+    input: TerminalSessionInput,
+    app_tx: tokio::sync::mpsc::Sender<AppEvent>,
+    redraw_gate: RedrawGate,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(bytes) = output.recv().await {
+            let events = {
+                let mut parser = terminal.lock();
+                let mut events = Vec::new();
+                parser.screen.process(&bytes, &mut events);
+                events
+            };
+            for event in events {
+                let crate::term::screen::VtEvent::Reply(reply) = event else {
+                    continue;
+                };
+                if input.send_reply(reply.as_bytes().to_vec()).await == SessionSendStatus::Closed {
+                    return;
+                }
+            }
+            redraw_gate.notify(&app_tx);
+        }
+        redraw_gate.notify(&app_tx);
+    })
 }
 
 /// Holds all terminal-session state that was previously scattered across `AppUi` and `AppData`.
@@ -56,7 +116,8 @@ pub struct TerminalManager {
     pub term_area: Rect,
     /// Long-lived clipboard instance so data survives on Linux (ownership model).
     pub clipboard: Option<arboard::Clipboard>,
-    redraw_gate: crate::nspawn::adapters::comm::pty::RedrawGate,
+    session_service: Arc<SessionService>,
+    redraw_gate: RedrawGate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,7 +128,7 @@ pub enum TerminalInputStatus {
 }
 
 impl TerminalManager {
-    pub fn new() -> Self {
+    pub fn new(session_service: Arc<SessionService>) -> Self {
         Self {
             sessions: Vec::new(),
             active_idx: 0,
@@ -75,7 +136,8 @@ impl TerminalManager {
             maximized: false,
             term_area: Rect::default(),
             clipboard: None,
-            redraw_gate: crate::nspawn::adapters::comm::pty::RedrawGate::new(),
+            session_service,
+            redraw_gate: RedrawGate::new(),
         }
     }
 
@@ -100,27 +162,21 @@ impl TerminalManager {
 
     // lifecycle
 
-    /// Spawn the best supported terminal attachment for `entry`.
-    ///
-    /// Root/elevated execution can fall back from `machinectl login` to a
-    /// closed `nsenter` command when the container has no system bus.
+    /// Open the terminal attachment selected by the application session service.
     pub async fn spawn(
         &mut self,
         entry: &ContainerEntry,
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
-        ctx: &ExecutionContext,
     ) -> Result<SpawnedTerminalSession, String> {
         if entry.state != crate::nspawn::models::ContainerState::Running {
             return Err(format!("Container {} is not running", entry.name));
         }
 
         // Re-use existing session if one is already open for this container.
-        if let Some(idx) = self
-            .sessions
-            .iter()
-            .position(|s| s.container_name == entry.name)
-        {
+        if let Some(idx) = self.sessions.iter().position(|session| {
+            session.container_name == entry.name && session.handle.lifecycle().is_running()
+        }) {
             self.active_idx = idx;
             self.show = true;
             return Ok(SpawnedTerminalSession {
@@ -128,75 +184,63 @@ impl TerminalManager {
             });
         }
 
+        if let Some(idx) = self
+            .sessions
+            .iter()
+            .position(|session| session.container_name == entry.name)
+        {
+            let mut stale = self.sessions.remove(idx);
+            stale.handle.close();
+            stale.output_task.abort();
+            if self.active_idx > idx {
+                self.active_idx -= 1;
+            } else if self.active_idx >= self.sessions.len() && !self.sessions.is_empty() {
+                self.active_idx = self.sessions.len() - 1;
+            }
+        }
+
         let tx = app_tx
             .as_ref()
             .ok_or_else(|| "Internal error: app_tx not set".to_string())?;
 
-        let cols: u16 = 80;
-
-        let (term, pty_tx, handle, resize_state, attach_kind) =
-            if let Some(daemon) = ctx.daemon_ref() {
-                let spawned = daemon
-                    .spawn_terminal(&entry.name, cols, rows)
-                    .await
-                    .map_err(|e| format!("Failed to attach terminal via daemon: {}", e))?;
-
-                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal_with_fd(
-                    spawned.master_fd,
-                    cols,
-                    rows,
-                    tx.clone(),
-                    self.redraw_gate.clone(),
-                )
-                .map_err(|e| format!("Failed to setup PTY from fd: {}", e))?;
-                (
-                    terminal.0,
-                    terminal.1,
-                    terminal.2,
-                    terminal.3,
-                    spawned.attach_kind,
-                )
-            } else if ctx.permission_level() == PermissionLevel::Root {
-                let name = MachineName::new(&entry.name)
-                    .map_err(|error| format!("Invalid machine name: {error}"))?;
-                let attach = crate::nspawn::sys::terminal_attach::select(&name)
-                    .map_err(|error| format!("Failed to plan terminal attachment: {error}"))?;
-                let attach_kind = attach.kind();
-                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal_command(
-                    attach.into_pty_command(),
-                    cols,
-                    rows,
-                    tx.clone(),
-                    self.redraw_gate.clone(),
-                )
-                .map_err(|e| format!("Failed to spawn terminal: {}", e))?;
-                (terminal.0, terminal.1, terminal.2, terminal.3, attach_kind)
-            } else {
-                let args: [&str; 3] = ["--", "login", &entry.name];
-                let terminal = crate::nspawn::adapters::comm::pty::spawn_terminal(
-                    "machinectl",
-                    &args,
-                    cols,
-                    rows,
-                    tx.clone(),
-                    self.redraw_gate.clone(),
-                )
-                .map_err(|e| format!("Failed to spawn terminal: {}", e))?;
-                (
-                    terminal.0,
-                    terminal.1,
-                    terminal.2,
-                    terminal.3,
-                    TerminalAttachKind::Login,
-                )
-            };
+        let cols = 80;
+        let machine = MachineName::new(&entry.name)
+            .map_err(|error| format!("Invalid machine name: {error}"))?;
+        let size = SessionSize::new(cols, rows)
+            .map_err(|error| format!("Invalid terminal size: {error}"))?;
+        let mut handle = self
+            .session_service
+            .open_terminal(machine, size)
+            .await
+            .map_err(|error| format!("Failed to attach terminal: {error}"))?;
+        let attach_kind = handle.attachment();
+        log::debug!(
+            "opened terminal session {} for {}",
+            handle.id().get(),
+            entry.name
+        );
+        let input = handle.input();
+        let output = handle
+            .take_output()
+            .ok_or_else(|| "Internal error: terminal output already attached".to_string())?;
+        let terminal = Arc::new(parking_lot::Mutex::new(crate::term::Parser::new(
+            rows, cols, 10000,
+        )));
+        let output_task = spawn_output_parser(
+            output,
+            Arc::clone(&terminal),
+            input.clone(),
+            tx.clone(),
+            self.redraw_gate.clone(),
+        );
 
         let session = TerminalSession {
             container_name: entry.name.clone(),
             attach_kind,
-            terminal: term,
-            pty_tx,
+            terminal,
+            input,
             handle,
+            output_task,
             scroll_offset: 0,
             insert_mode: true,
             selection: TextSelection::default(),
@@ -204,7 +248,6 @@ impl TerminalManager {
             queued_size: Some((cols, rows)),
             resize_channel_closed: false,
             mouse_capture: false,
-            resize_state,
         };
         self.sessions.push(session);
         self.active_idx = self.sessions.len() - 1;
@@ -220,7 +263,8 @@ impl TerminalManager {
         }
 
         let mut session = self.sessions.remove(self.active_idx);
-        session.handle.abort();
+        session.handle.close();
+        session.output_task.abort();
 
         if self.active_idx >= self.sessions.len() && !self.sessions.is_empty() {
             self.active_idx = self.sessions.len() - 1;
@@ -250,7 +294,8 @@ impl TerminalManager {
     /// Drop all sessions (called on shutdown).
     pub fn cleanup_all(&mut self) {
         for mut session in self.sessions.drain(..) {
-            session.handle.abort();
+            session.handle.close();
+            session.output_task.abort();
         }
         self.show = false;
         self.maximized = false;
@@ -303,7 +348,7 @@ impl TerminalManager {
         // per-mode handling
         let idx = self.active_idx;
         let insert_mode = match self.sessions.get(idx) {
-            Some(s) => s.insert_mode,
+            Some(session) => session.is_insert_mode(),
             None => return TerminalKeyOutcome::PassThrough,
         };
 
@@ -322,7 +367,7 @@ impl TerminalManager {
             let application_cursor = session.terminal.lock().screen().application_cursor();
             let bytes = super::encode_key_for_mode(key, application_cursor);
             if !bytes.is_empty() {
-                return match queue_input(&session.pty_tx, bytes) {
+                return match queue_input(&session.input, bytes) {
                     TerminalInputStatus::Queued => TerminalKeyOutcome::Consumed,
                     TerminalInputStatus::Full => TerminalKeyOutcome::InputQueueFull,
                     TerminalInputStatus::Closed => TerminalKeyOutcome::InputChannelClosed,
@@ -458,7 +503,7 @@ impl TerminalManager {
         let rel_col = rel_col.min(size.width.saturating_sub(1));
         let rel_row = rel_row.min(size.height.saturating_sub(1));
 
-        if session.insert_mode {
+        if session.is_insert_mode() {
             let (mode, encoding) = {
                 let guard = session.terminal.lock();
                 (
@@ -478,7 +523,7 @@ impl TerminalManager {
                     modifiers: mouse.modifiers,
                 };
                 if let Some(seq) = super::encode_mouse_for_protocol(rel_mouse, mode, encoding) {
-                    let status = queue_input(&session.pty_tx, seq);
+                    let status = queue_input(&session.input, seq);
                     if matches!(mouse.kind, MouseEventKind::Up(_)) {
                         session.mouse_capture = false;
                     }
@@ -523,6 +568,10 @@ impl TerminalManager {
 }
 
 impl TerminalSession {
+    pub fn is_insert_mode(&self) -> bool {
+        self.insert_mode && self.handle.lifecycle().is_running()
+    }
+
     pub(crate) fn request_resize(
         &mut self,
         terminal: &mut crate::term::Parser,
@@ -535,7 +584,7 @@ impl TerminalSession {
             self.selection = TextSelection::default();
         }
 
-        if self.resize_state.take_failure() {
+        if self.handle.take_resize_failure() {
             self.resize_channel_closed = false;
             self.queued_size = None;
         }
@@ -543,7 +592,7 @@ impl TerminalSession {
             return;
         }
 
-        match queue_resize(&self.pty_tx, &mut self.queued_size, cols, rows) {
+        match queue_resize(&self.input, &mut self.queued_size, cols, rows) {
             QueueResizeResult::Queued => {}
             QueueResizeResult::Full => {}
             QueueResizeResult::Closed => {
@@ -562,29 +611,29 @@ enum QueueResizeResult {
 }
 
 fn queue_resize(
-    tx: &tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
+    input: &TerminalSessionInput,
     queued_size: &mut Option<(u16, u16)>,
     cols: u16,
     rows: u16,
 ) -> QueueResizeResult {
-    match tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Resize { cols, rows }) {
-        Ok(()) => {
+    let Ok(size) = SessionSize::new(cols, rows) else {
+        return QueueResizeResult::Closed;
+    };
+    match input.try_resize(size) {
+        SessionSendStatus::Queued => {
             *queued_size = Some((cols, rows));
             QueueResizeResult::Queued
         }
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => QueueResizeResult::Full,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => QueueResizeResult::Closed,
+        SessionSendStatus::Full => QueueResizeResult::Full,
+        SessionSendStatus::Closed => QueueResizeResult::Closed,
     }
 }
 
-fn queue_input(
-    tx: &tokio::sync::mpsc::Sender<crate::nspawn::adapters::comm::pty::PtyMessage>,
-    bytes: Vec<u8>,
-) -> TerminalInputStatus {
-    match tx.try_send(crate::nspawn::adapters::comm::pty::PtyMessage::Data(bytes)) {
-        Ok(()) => TerminalInputStatus::Queued,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => TerminalInputStatus::Full,
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => TerminalInputStatus::Closed,
+fn queue_input(input: &TerminalSessionInput, bytes: Vec<u8>) -> TerminalInputStatus {
+    match input.try_input(bytes) {
+        SessionSendStatus::Queued => TerminalInputStatus::Queued,
+        SessionSendStatus::Full => TerminalInputStatus::Full,
+        SessionSendStatus::Closed => TerminalInputStatus::Closed,
     }
 }
 
@@ -676,24 +725,42 @@ mod tests {
     use super::{
         queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalManager,
     };
-    use crate::nspawn::adapters::comm::pty::PtyMessage;
+    use crate::application::sessions::{
+        terminal_session_channel, SessionService, TERMINAL_COMMAND_CAPACITY,
+    };
+    use crate::domain::session::{SessionId, TerminalAttachmentKind};
+    use crate::nspawn::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
     use crate::nspawn::models::{ContainerEntry, ContainerState};
+    use std::sync::Arc;
+
+    fn terminal_channels() -> (
+        crate::application::sessions::TerminalSessionHandle,
+        crate::application::sessions::TerminalSessionEndpoint,
+    ) {
+        terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login)
+    }
 
     #[test]
     fn resize_remains_pending_when_writer_queue_is_full() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(PtyMessage::Data(vec![b'x'])).unwrap();
+        let (handle, mut endpoint) = terminal_channels();
+        let input = handle.input();
+        for _ in 0..TERMINAL_COMMAND_CAPACITY {
+            assert_eq!(
+                input.try_input(vec![b'x']),
+                crate::application::sessions::SessionSendStatus::Queued
+            );
+        }
         let mut queued = Some((80, 24));
 
         assert_eq!(
-            queue_resize(&tx, &mut queued, 120, 40),
+            queue_resize(&input, &mut queued, 120, 40),
             QueueResizeResult::Full
         );
         assert_eq!(queued, Some((80, 24)));
 
-        let _ = rx.try_recv();
+        let _ = endpoint.commands.try_recv();
         assert_eq!(
-            queue_resize(&tx, &mut queued, 120, 40),
+            queue_resize(&input, &mut queued, 120, 40),
             QueueResizeResult::Queued
         );
         assert_eq!(queued, Some((120, 40)));
@@ -701,11 +768,12 @@ mod tests {
 
     #[test]
     fn resize_reports_a_closed_writer_channel() {
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-        drop(rx);
+        let (handle, endpoint) = terminal_channels();
+        let input = handle.input();
+        drop(endpoint.commands);
         let mut queued = Some((80, 24));
         assert_eq!(
-            queue_resize(&tx, &mut queued, 120, 40),
+            queue_resize(&input, &mut queued, 120, 40),
             QueueResizeResult::Closed
         );
         assert_eq!(queued, Some((80, 24)));
@@ -713,24 +781,25 @@ mod tests {
 
     #[test]
     fn input_queue_reports_full_and_closed_channels() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        assert_eq!(queue_input(&tx, vec![b'a']), TerminalInputStatus::Queued);
-        assert_eq!(queue_input(&tx, vec![b'b']), TerminalInputStatus::Full);
+        let (handle, mut endpoint) = terminal_channels();
+        let input = handle.input();
+        for _ in 0..TERMINAL_COMMAND_CAPACITY {
+            assert_eq!(queue_input(&input, vec![b'a']), TerminalInputStatus::Queued);
+        }
+        assert_eq!(queue_input(&input, vec![b'b']), TerminalInputStatus::Full);
 
-        let _ = rx.try_recv();
-        drop(rx);
-        assert_eq!(queue_input(&tx, vec![b'c']), TerminalInputStatus::Closed);
+        let _ = endpoint.commands.try_recv();
+        drop(endpoint.commands);
+        assert_eq!(queue_input(&input, vec![b'c']), TerminalInputStatus::Closed);
     }
 
     #[tokio::test]
     async fn spawn_rejects_transitional_machine_states() {
-        let ctx = crate::nspawn::sys::execution::ExecutionContext::new(
-            crate::nspawn::ops::PermissionLevel::User,
-            None,
-        )
-        .unwrap();
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+        ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut manager = TerminalManager::new();
+        let mut manager = TerminalManager::new(service);
         for state in [ContainerState::Starting, ContainerState::Exiting] {
             let entry = ContainerEntry {
                 name: "test".into(),
@@ -739,7 +808,7 @@ mod tests {
                 all_addresses: Vec::new(),
             };
             let error = manager
-                .spawn(&entry, 24, &Some(tx.clone()), &ctx)
+                .spawn(&entry, 24, &Some(tx.clone()))
                 .await
                 .expect_err("transitional state must not open a terminal");
             assert!(error.contains("not running"));

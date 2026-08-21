@@ -1,18 +1,11 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
+pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
 use crate::nspawn::adapters::comm::runtime_state;
 use crate::nspawn::models::MachineName;
 use portable_pty::CommandBuilder;
-use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalAttachKind {
-    Login,
-    Namespace,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalAttachCommand {
@@ -117,6 +110,10 @@ fn login_command(name: &MachineName) -> TerminalAttachCommand {
         program: "machinectl".to_string(),
         args: vec!["--".to_string(), "login".to_string(), name.to_string()],
     }
+}
+
+pub(crate) fn login(name: &MachineName) -> TerminalAttachCommand {
+    login_command(name)
 }
 
 fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAttachCommand> {

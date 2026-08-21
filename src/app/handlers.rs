@@ -617,7 +617,7 @@ impl App {
                 .data
                 .terminal
                 .active_session()
-                .map(|s| s.insert_mode)
+                .map(|session| session.is_insert_mode())
                 .unwrap_or(false)
     }
 

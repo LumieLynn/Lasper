@@ -8,7 +8,9 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 
 mod app;
+mod application;
 mod config;
+mod domain;
 mod events;
 mod nspawn;
 mod paths;

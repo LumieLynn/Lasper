@@ -1,392 +1,288 @@
-use anyhow::Result;
-use parking_lot::Mutex;
+//! Low-level PTY transport for application-owned terminal sessions.
+
+use crate::application::sessions::{
+    terminal_session_channel, SessionError, TerminalCommand, TerminalSessionEndpoint,
+    TerminalSessionHandle,
+};
+use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::Ordering;
 
-#[derive(Debug)]
-pub enum PtyMessage {
-    Data(Vec<u8>),
-    Reply(Vec<u8>),
-    Resize { cols: u16, rows: u16 },
+pub(crate) struct RemoteSessionControl {
+    pub close: tokio::sync::oneshot::Receiver<()>,
+    pub lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
 }
 
-/// Forward terminal replies through the single PTY writer owner.
-///
-/// A reader can discover a CPR/DA response while parsing output, but the
-/// portable-pty master does not expose a second writer.  Blocking here keeps
-/// replies ordered and applies backpressure instead of silently dropping them.
-fn forward_vt_replies(
-    events: Vec<crate::term::screen::VtEvent>,
-    tx: &mpsc::Sender<PtyMessage>,
-) -> bool {
-    for event in events {
-        let crate::term::screen::VtEvent::Reply(reply) = event else {
-            continue;
-        };
-        if tx
-            .blocking_send(PtyMessage::Reply(reply.as_bytes().to_vec()))
-            .is_err()
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Coalesces terminal output notifications while one redraw is queued.
-///
-/// PTY output can arrive much faster than a terminal frame can be rendered.
-/// Keeping at most one notification prevents the shared app event queue from
-/// being flooded while preserving a redraw after the current frame.
-#[derive(Clone, Debug)]
-pub struct RedrawGate {
-    pending: Arc<AtomicBool>,
-}
-
-/// Reports resize/ioctl failures back to the UI-side session.  The next
-/// render retries the latest desired dimensions instead of silently accepting
-/// a stale child window size.
-#[derive(Clone, Debug)]
-pub struct ResizeState {
-    failed: Arc<AtomicBool>,
-}
-
-impl ResizeState {
-    pub fn new() -> Self {
-        Self {
-            failed: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn mark_failed(&self) {
-        self.failed.store(true, Ordering::Release);
-    }
-
-    pub fn take_failure(&self) -> bool {
-        self.failed.swap(false, Ordering::AcqRel)
-    }
-}
-
-impl RedrawGate {
-    pub fn new() -> Self {
-        Self {
-            pending: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    pub fn clear(&self) {
-        self.pending.store(false, Ordering::Release);
-    }
-
-    fn notify(&self, tx: &mpsc::Sender<crate::events::AppEvent>) {
-        if self
-            .pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-            && tx
-                .try_send(crate::events::AppEvent::TerminalRedraw)
-                .is_err()
-        {
-            // A full or closed queue must not leave the gate permanently set.
-            self.clear();
-        }
-    }
-}
-
-pub struct TerminalHandle {
-    pub reader: tokio::task::JoinHandle<()>,
-    pub writer: tokio::task::JoinHandle<()>,
-    pub child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
-    /// In the elevated path the reader/writer threads own the PTY master
-    /// fds wrapped in `File`.  `abort()` kills the threads without running
-    /// destructors, so the fds leak unless we close them here.
-    elevated_fds: Option<(RawFd, RawFd)>,
-}
-
-impl TerminalHandle {
-    pub fn abort(&mut self) {
-        self.reader.abort();
-        self.writer.abort();
-        if let Some(ref mut child) = self.child {
-            let _ = child.kill();
-        }
-        if let Some((rfd, wfd)) = self.elevated_fds {
-            unsafe {
-                libc::close(rfd);
-                libc::close(wfd);
-            }
-        }
-    }
-}
-
-#[allow(clippy::type_complexity)]
-pub fn spawn_terminal(
-    cmd_name: &str,
-    args: &[&str],
-    cols: u16,
-    rows: u16,
-    app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    redraw_gate: RedrawGate,
-) -> Result<(
-    Arc<Mutex<crate::term::Parser>>,
-    mpsc::Sender<PtyMessage>,
-    TerminalHandle,
-    ResizeState,
-)> {
-    let mut command = CommandBuilder::new(cmd_name);
-    command.args(args);
-    spawn_terminal_command(command, cols, rows, app_tx, redraw_gate)
-}
-
-#[allow(clippy::type_complexity)]
-pub fn spawn_terminal_command(
+pub(crate) fn spawn_direct_terminal(
     command: CommandBuilder,
-    cols: u16,
-    rows: u16,
-    app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    redraw_gate: RedrawGate,
-) -> Result<(
-    Arc<Mutex<crate::term::Parser>>,
-    mpsc::Sender<PtyMessage>,
-    TerminalHandle,
-    ResizeState,
-)> {
-    let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize {
-        rows,
-        cols,
+    id: SessionId,
+    attachment: TerminalAttachmentKind,
+    size: SessionSize,
+) -> Result<TerminalSessionHandle, SessionError> {
+    let pair = native_pty_system()
+        .openpty(pty_size(size))
+        .map_err(|error| SessionError::new(format!("open terminal PTY: {error}")))?;
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|error| SessionError::new(format!("spawn terminal attachment: {error}")))?;
+    drop(pair.slave);
+
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|error| SessionError::new(format!("clone terminal reader: {error}")))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|error| SessionError::new(format!("open terminal writer: {error}")))?;
+    let killer = child.clone_killer();
+    let (handle, endpoint) = terminal_session_channel(id, attachment);
+    let TerminalSessionEndpoint {
+        commands,
+        output,
+        lifecycle,
+        resize_failed,
+        close,
+    } = endpoint;
+
+    spawn_reader(reader, output, lifecycle.clone());
+    spawn_portable_writer(pair.master, writer, commands, resize_failed);
+    spawn_direct_owner(child, killer, close, lifecycle);
+    Ok(handle)
+}
+
+pub(crate) fn spawn_fd_terminal(
+    master_fd: std::os::fd::RawFd,
+    id: SessionId,
+    attachment: TerminalAttachmentKind,
+) -> Result<(TerminalSessionHandle, RemoteSessionControl), SessionError> {
+    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
+    let reader_fd = master
+        .try_clone()
+        .map_err(|error| SessionError::new(format!("clone elevated terminal fd: {error}")))?;
+    let reader = std::fs::File::from(reader_fd);
+    let writer = std::fs::File::from(master);
+    let (handle, endpoint) = terminal_session_channel(id, attachment);
+    let TerminalSessionEndpoint {
+        commands,
+        output,
+        lifecycle,
+        resize_failed,
+        close,
+    } = endpoint;
+
+    // The daemon-owned status pipe is authoritative for elevated sessions;
+    // PTY EOF alone does not prove the child's exit code.
+    spawn_reader(reader, output, lifecycle.clone());
+    spawn_fd_writer(writer, commands, resize_failed);
+    Ok((handle, RemoteSessionControl { close, lifecycle }))
+}
+
+fn pty_size(size: SessionSize) -> PtySize {
+    PtySize {
+        rows: size.rows(),
+        cols: size.cols(),
         pixel_width: 0,
         pixel_height: 0,
-    })?;
-
-    let child = pair.slave.spawn_command(command)?;
-
-    // Master handles
-    let mut reader = pair.master.try_clone_reader()?;
-    let mut writer = pair.master.take_writer()?;
-
-    let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
-    let resize_state = ResizeState::new();
-
-    // 10,000 lines of scrollback
-    let parser = Arc::new(Mutex::new(crate::term::Parser::new(rows, cols, 10000)));
-
-    let parser_clone = parser.clone();
-    let app_tx_clone = app_tx.clone();
-    let redraw_gate_clone = redraw_gate.clone();
-    let reply_tx = pty_tx.clone();
-
-    // Reading thread
-    let reader_handle = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 4096];
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let events = {
-                let mut p = parser_clone.lock();
-                let mut events = Vec::new();
-                p.screen.process(&buf[..n], &mut events);
-                events
-            };
-            if !forward_vt_replies(events, &reply_tx) {
-                break;
-            }
-            redraw_gate_clone.notify(&app_tx_clone);
-        }
-    });
-
-    let parser_for_write = parser.clone();
-    let master_for_write = pair.master;
-    let resize_state_for_write = resize_state.clone();
-
-    // Writing/Resize thread
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        while let Some(msg) = pty_rx.blocking_recv() {
-            match msg {
-                PtyMessage::Data(bytes) | PtyMessage::Reply(bytes) => {
-                    let _ = writer.write_all(&bytes);
-                    let _ = writer.flush();
-                }
-                PtyMessage::Resize { cols, rows } => {
-                    if let Err(error) = master_for_write.resize(PtySize {
-                        rows,
-                        cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    }) {
-                        resize_state_for_write.mark_failed();
-                        log::warn!("failed to resize terminal PTY to {cols}x{rows}: {error}");
-                    }
-                    let mut p = parser_for_write.lock();
-                    p.set_size(rows, cols);
-                }
-            }
-        }
-    });
-
-    Ok((
-        parser,
-        pty_tx,
-        TerminalHandle {
-            reader: reader_handle,
-            writer: writer_handle,
-            child: Some(child),
-            elevated_fds: None,
-        },
-        resize_state,
-    ))
+    }
 }
 
-#[allow(clippy::type_complexity)]
-pub fn spawn_terminal_with_fd(
-    master_fd: std::os::unix::io::RawFd,
-    cols: u16,
-    rows: u16,
-    app_tx: tokio::sync::mpsc::Sender<crate::events::AppEvent>,
-    redraw_gate: RedrawGate,
-) -> Result<(
-    Arc<Mutex<crate::term::Parser>>,
-    mpsc::Sender<PtyMessage>,
-    TerminalHandle,
-    ResizeState,
-)> {
-    use std::io::{Read, Write};
-    use std::os::unix::io::FromRawFd;
-
-    // Dup the fd: one for reading, one for writing+resize.
-    // elevated_fds is the canonical owner — it closes the fds in abort().
-    // ManuallyDrop on the File wrappers prevents double-close since
-    // spawn_blocking threads may be aborted without running destructors.
-    let reader_fd = master_fd;
-    let writer_fd = unsafe { libc::dup(master_fd) };
-    let elevated_fds = Some((reader_fd, writer_fd));
-    if writer_fd < 0 {
-        return Err(anyhow::anyhow!(
-            "dup failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    let mut reader = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(reader_fd) });
-    let mut writer = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(writer_fd) });
-
-    let (pty_tx, mut pty_rx) = mpsc::channel::<PtyMessage>(1024);
-    let resize_state = ResizeState::new();
-
-    let parser = Arc::new(Mutex::new(crate::term::Parser::new(rows, cols, 10000)));
-
-    let parser_clone = parser.clone();
-    let app_tx_clone = app_tx.clone();
-    let redraw_gate_clone = redraw_gate.clone();
-    let reply_tx = pty_tx.clone();
-
-    // Reading thread
-    let reader_handle = tokio::task::spawn_blocking(move || {
-        let mut buf = [0u8; 4096];
+fn spawn_reader(
+    mut reader: impl Read + Send + 'static,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut buffer = [0u8; 4096];
         loop {
-            match reader.read(&mut buf) {
+            match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(n) => {
-                    let events = {
-                        let mut p = parser_clone.lock();
-                        let mut events = Vec::new();
-                        p.screen.process(&buf[..n], &mut events);
-                        events
-                    };
-                    if !forward_vt_replies(events, &reply_tx) {
+                Ok(read) => {
+                    if output.blocking_send(buffer[..read].to_vec()).is_err() {
                         break;
                     }
-                    redraw_gate_clone.notify(&app_tx_clone);
                 }
-                Err(_) => break,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => {
+                    if lifecycle.borrow().is_running() {
+                        let _ = lifecycle.send(SessionLifecycle::Failed(format!(
+                            "terminal output failed: {error}"
+                        )));
+                    }
+                    return;
+                }
             }
         }
     });
+}
 
-    let parser_for_write = parser.clone();
-    let resize_fd = master_fd; // original fd, still valid (we dup'd for writer)
-    let resize_state_for_write = resize_state.clone();
-
-    // Writing/Resize thread
-    let writer_handle = tokio::task::spawn_blocking(move || {
-        while let Some(msg) = pty_rx.blocking_recv() {
-            match msg {
-                PtyMessage::Data(bytes) | PtyMessage::Reply(bytes) => {
-                    let _ = writer.write_all(&bytes);
-                    let _ = writer.flush();
+fn spawn_portable_writer(
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    mut writer: Box<dyn Write + Send>,
+    mut commands: tokio::sync::mpsc::Receiver<TerminalCommand>,
+    resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::task::spawn_blocking(move || {
+        while let Some(command) = commands.blocking_recv() {
+            match command {
+                TerminalCommand::Input(bytes) | TerminalCommand::Reply(bytes) => {
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
-                PtyMessage::Resize { cols, rows } => {
-                    let ws = libc::winsize {
-                        ws_row: rows,
-                        ws_col: cols,
+                TerminalCommand::Resize(size) => {
+                    if let Err(error) = master.resize(pty_size(size)) {
+                        resize_failed.store(true, Ordering::Release);
+                        log::warn!(
+                            "failed to resize terminal PTY to {}x{}: {error}",
+                            size.cols(),
+                            size.rows()
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_fd_writer(
+    mut writer: std::fs::File,
+    mut commands: tokio::sync::mpsc::Receiver<TerminalCommand>,
+    resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::task::spawn_blocking(move || {
+        while let Some(command) = commands.blocking_recv() {
+            match command {
+                TerminalCommand::Input(bytes) | TerminalCommand::Reply(bytes) => {
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                TerminalCommand::Resize(size) => {
+                    let dimensions = libc::winsize {
+                        ws_row: size.rows(),
+                        ws_col: size.cols(),
                         ws_xpixel: 0,
                         ws_ypixel: 0,
                     };
-                    let result = unsafe { libc::ioctl(resize_fd, libc::TIOCSWINSZ, &ws) };
+                    let result =
+                        unsafe { libc::ioctl(writer.as_raw_fd(), libc::TIOCSWINSZ, &dimensions) };
                     if result < 0 {
-                        resize_state_for_write.mark_failed();
+                        resize_failed.store(true, Ordering::Release);
                         log::warn!(
-                            "failed to resize elevated terminal PTY to {cols}x{rows}: {}",
+                            "failed to resize elevated terminal PTY to {}x{}: {}",
+                            size.cols(),
+                            size.rows(),
                             std::io::Error::last_os_error()
                         );
                     }
-                    let mut p = parser_for_write.lock();
-                    p.set_size(rows, cols);
                 }
             }
         }
     });
+}
 
-    Ok((
-        parser,
-        pty_tx,
-        TerminalHandle {
-            reader: reader_handle,
-            writer: writer_handle,
-            child: None,
-            elevated_fds,
-        },
-        resize_state,
-    ))
+fn spawn_direct_owner(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mut killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    close: tokio::sync::oneshot::Receiver<()>,
+    lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
+) {
+    let mut wait = Box::pin(tokio::task::spawn_blocking(move || child.wait()));
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = close => {
+                if let Err(error) = killer.kill() {
+                    log::warn!("failed to close terminal child: {error}");
+                }
+                if let Err(error) = (&mut wait).await {
+                    log::warn!("terminal child wait task failed after close: {error}");
+                }
+                let _ = lifecycle.send(SessionLifecycle::Closed);
+            }
+            result = &mut wait => {
+                let state = match result {
+                    Ok(Ok(status)) => SessionLifecycle::Exited {
+                        success: status.success(),
+                        code: i32::try_from(status.exit_code()).ok(),
+                    },
+                    Ok(Err(error)) => SessionLifecycle::Failed(format!(
+                        "wait for terminal child: {error}"
+                    )),
+                    Err(error) => SessionLifecycle::Failed(format!(
+                        "terminal child wait task failed: {error}"
+                    )),
+                };
+                if lifecycle.borrow().is_running() {
+                    let _ = lifecycle.send(state);
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{forward_vt_replies, PtyMessage, RedrawGate};
-    use crate::events::AppEvent;
+    use super::*;
+    use portable_pty::CommandBuilder;
+    use std::time::Duration;
 
-    #[test]
-    fn redraw_notifications_are_coalesced_until_consumed() {
-        let gate = RedrawGate::new();
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-
-        gate.notify(&tx);
-        gate.notify(&tx);
-        assert!(matches!(rx.try_recv(), Ok(AppEvent::TerminalRedraw)));
-        assert!(rx.try_recv().is_err());
-
-        gate.clear();
-        gate.notify(&tx);
-        assert!(matches!(rx.try_recv(), Ok(AppEvent::TerminalRedraw)));
+    async fn wait_until_finished(handle: &TerminalSessionHandle) -> SessionLifecycle {
+        for _ in 0..100 {
+            let state = handle.lifecycle();
+            if !state.is_running() {
+                return state;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("terminal session did not reach a terminal lifecycle state")
     }
 
-    #[test]
-    fn vt_replies_are_forwarded_to_the_writer_queue() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
-        let events = vec![
-            crate::term::screen::VtEvent::Bell,
-            crate::term::screen::VtEvent::Reply("\x1b[1;1R".into()),
-        ];
+    #[tokio::test]
+    async fn direct_terminal_reports_child_exit() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "printf ready"]);
+        let id = SessionId::new(1).unwrap();
+        let size = SessionSize::new(80, 24).unwrap();
+        let mut handle =
+            spawn_direct_terminal(command, id, TerminalAttachmentKind::Login, size).unwrap();
+        let mut output = handle.take_output().unwrap();
+        let bytes = tokio::time::timeout(Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("ready"));
+        assert!(matches!(
+            wait_until_finished(&handle).await,
+            SessionLifecycle::Exited { success: true, .. }
+        ));
+        handle.close();
+    }
 
-        assert!(forward_vt_replies(events, &tx));
-        match rx.try_recv() {
-            Ok(PtyMessage::Reply(bytes)) => assert_eq!(bytes, b"\x1b[1;1R"),
-            other => panic!("unexpected PTY message: {other:?}"),
-        }
+    #[tokio::test]
+    async fn direct_terminal_close_reports_closed_after_child_reap() {
+        let mut command = CommandBuilder::new("sh");
+        command.args(["-c", "exec sleep 30"]);
+        let id = SessionId::new(2).unwrap();
+        let size = SessionSize::new(80, 24).unwrap();
+        let mut handle =
+            spawn_direct_terminal(command, id, TerminalAttachmentKind::Login, size).unwrap();
+        let _ = handle.take_output();
+        handle.close();
+        assert!(matches!(
+            wait_until_finished(&handle).await,
+            SessionLifecycle::Closed
+        ));
     }
 }

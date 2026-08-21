@@ -350,7 +350,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     .data
                     .terminal
                     .active_session()
-                    .map(|s| s.insert_mode)
+                    .map(|session| session.is_insert_mode())
                     .unwrap_or(false);
                 if insert_mode {
                     Line::from(vec![
