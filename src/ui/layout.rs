@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::App;
+use crate::app::{App, WorkspaceFocus};
 use crate::ui::core::Component;
 use crate::ui::theme;
 
@@ -105,10 +105,10 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 // Content
 
 fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
-    let machines_focused = app.ui.focus.active_idx == 0;
-    let images_focused = app.ui.focus.active_idx == 1;
-    let detail_focused = app.ui.focus.active_idx == 2;
-    let terminal_focused = app.ui.focus.active_idx == 3;
+    let machines_focused = app.ui.focus.is_machine_list();
+    let images_focused = app.ui.focus.is_image_list();
+    let detail_focused = app.ui.focus.is_inspector();
+    let terminal_focused = app.ui.focus.is_terminal();
     let resize_mode = app.ui.resize_mode == crate::app::ResizeMode::Active;
 
     app.ui.detail_panel.set_focus(detail_focused);
@@ -232,8 +232,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(msg.as_str(), Style::default().fg(color)),
         ])
     } else if app.ui.resize_mode == crate::app::ResizeMode::Active {
-        let vertical_hint = match app.ui.focus.active_idx {
-            0 | 1 => " machine/image split",
+        let vertical_hint = match app.ui.focus {
+            WorkspaceFocus::Machines | WorkspaceFocus::Images => " machine/image split",
             _ if app.data.terminal.is_showing() => " detail taller/shorter",
             _ => " no vertical split",
         };
@@ -246,8 +246,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             hspan(vertical_hint),
         ])
     } else {
-        match app.ui.focus.active_idx {
-            0 => Line::from(vec![
+        match app.ui.focus {
+            WorkspaceFocus::Machines => Line::from(vec![
                 kspan("[j/k]"),
                 hspan(" nav "),
                 kspan("[S]"),
@@ -263,7 +263,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[?]"),
                 hspan(" help"),
             ]),
-            1 if app.ui.image_list.shows_internal() => {
+            WorkspaceFocus::Images if app.ui.image_list.shows_internal() => {
                 let mut spans = vec![kspan("[j/k]"), hspan(" nav ")];
                 if app.selected_image().is_some_and(|image| {
                     !crate::nspawn::models::ImageEntry::is_protected_name(&image.name)
@@ -282,7 +282,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ]);
                 Line::from(spans)
             }
-            1 => {
+            WorkspaceFocus::Images => {
                 let mut spans = vec![
                     kspan("[j/k]"),
                     hspan(" nav "),
@@ -309,7 +309,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 ]);
                 Line::from(spans)
             }
-            2 => {
+            WorkspaceFocus::MachineInspector | WorkspaceFocus::ImageInspector => {
                 let pane_hint = match crate::ui::views::detail_panel::DetailPane::tabs_for(
                     &app.data.detail_target,
                 )
@@ -345,7 +345,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 spans.extend([kspan("[?]"), hspan(" help "), kspan("[q]"), hspan(" quit")]);
                 Line::from(spans)
             }
-            3 => {
+            WorkspaceFocus::Terminal => {
                 let insert_mode = app
                     .data
                     .terminal
@@ -385,7 +385,6 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     ])
                 }
             }
-            _ => Line::from(vec![]),
         }
     };
 

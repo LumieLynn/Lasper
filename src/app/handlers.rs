@@ -1,4 +1,4 @@
-use super::App;
+use super::{App, ModalLayer, WorkspaceFocus};
 use crate::ui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 use crate::ui::wizard::StepAction as WizardAction;
 use crate::ui::StatusLevel;
@@ -35,23 +35,10 @@ fn quit_confirmation_message(terminal_sessions: usize, host_operations: usize) -
 
 impl App {
     pub async fn handle_key(&mut self, key: KeyEvent) {
-        // Modal stack, topmost layer first.  This order mirrors layout.rs.
-        if self.handle_dialog_key(key).await {
-            return;
-        }
-
-        if self.handle_delete_confirm_key(key) {
-            return;
-        }
-
-        if self.handle_quit_confirm_key(key) {
-            return;
-        }
-
-        // Layer 3 – overlays (wizard / help / power menu).  Overlays must
-        // receive keys before the terminal, even when terminal focus was
-        // active when the overlay opened.
-        if self.handle_overlay_key(key).await {
+        // The modal layer is shared with mouse dispatch.  It must receive
+        // input before terminal and workspace shortcuts regardless of the
+        // focus that was active when it opened.
+        if self.handle_modal_key(key).await {
             return;
         }
 
@@ -64,7 +51,7 @@ impl App {
         }
 
         // Layer 2 – terminal panel when it owns focus
-        if self.ui.focus.active_idx == 3 && self.handle_terminal_focused_key(key).await {
+        if self.ui.focus.is_terminal() && self.handle_terminal_focused_key(key).await {
             return;
         }
 
@@ -94,32 +81,26 @@ impl App {
         let maximized = self.data.terminal.is_showing() && self.data.terminal.maximized;
 
         let hit = if in_rect(col, row, layout.machines) {
-            Some(0usize)
+            Some(WorkspaceFocus::Machines)
         } else if in_rect(col, row, layout.images) {
-            Some(1usize)
+            Some(WorkspaceFocus::Images)
         } else if !maximized && in_rect(col, row, layout.detail) {
-            Some(2usize)
+            Some(WorkspaceFocus::for_panel(self.ui.focus, 2))
         } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
-            Some(3usize)
+            Some(WorkspaceFocus::Terminal)
         } else {
             None
         };
 
         // Click-to-focus on button press.
         let mut focus_changed = false;
-        if let (Some(panel_idx), MouseEventKind::Down(_)) = (hit, mouse.kind) {
-            let n = if self.data.terminal.is_showing() {
-                4
-            } else {
-                3
-            };
-            if panel_idx < n
-                && !(self.data.terminal.maximized
-                    && self.data.terminal.is_showing()
-                    && panel_idx == 2)
+        if let (Some(focus), MouseEventKind::Down(_)) = (hit, mouse.kind) {
+            if !(self.data.terminal.maximized
+                && self.data.terminal.is_showing()
+                && focus.is_inspector())
             {
-                focus_changed = self.ui.focus.active_idx != panel_idx;
-                self.set_focus_idx(panel_idx);
+                focus_changed = self.ui.focus != focus;
+                self.set_focus(focus);
             }
         }
 
@@ -128,11 +109,11 @@ impl App {
         }
 
         if focus_changed {
-            self.refresh_detail().await;
+            self.request_detail_refresh();
         }
 
         // Terminal panel: forward mouse to PTY in insert mode, scroll in normal mode.
-        if self.ui.focus.active_idx == 3
+        if self.ui.focus.is_terminal()
             && self.data.terminal.is_showing()
             && (layout.terminal.is_some_and(|r| in_rect(col, row, r))
                 || self.data.terminal.wants_mouse_capture())
@@ -148,6 +129,20 @@ impl App {
                     StatusLevel::Error,
                 ),
             }
+        }
+    }
+}
+
+impl App {
+    async fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
+        match self.ui.modal_layer() {
+            Some(ModalLayer::Dialog) => self.handle_dialog_key(key).await,
+            Some(ModalLayer::DeleteConfirmation) => self.handle_delete_confirm_key(key),
+            Some(ModalLayer::QuitConfirmation) => self.handle_quit_confirm_key(key),
+            Some(ModalLayer::Wizard | ModalLayer::Help | ModalLayer::PowerMenu) => {
+                self.handle_overlay_key(key).await
+            }
+            None => false,
         }
     }
 }
@@ -217,15 +212,20 @@ impl App {
                 .handle_key(key, &self.data.entries, &mut self.data.selected);
 
         // If closing a tab emptied the terminal panel, restore focus to a valid panel.
-        if self.ui.focus.active_idx == 3 && !self.data.terminal.is_showing() {
+        let restored_focus = self.ui.focus.is_terminal() && !self.data.terminal.is_showing();
+        if restored_focus {
             self.restore_non_terminal_focus();
+        }
+
+        if restored_focus && !matches!(&outcome, TerminalKeyOutcome::ConsumedAndRefreshDetail) {
+            self.request_detail_refresh();
         }
 
         match outcome {
             TerminalKeyOutcome::Consumed => true,
             TerminalKeyOutcome::PassThrough => false,
             TerminalKeyOutcome::ConsumedAndRefreshDetail => {
-                self.refresh_detail().await;
+                self.request_detail_refresh();
                 true
             }
             TerminalKeyOutcome::InputQueueFull => {
@@ -352,12 +352,12 @@ impl App {
             }
             KeyCode::Tab => {
                 self.cycle_main_focus(true);
-                self.refresh_detail().await;
+                self.request_detail_refresh();
                 true
             }
             KeyCode::BackTab => {
                 self.cycle_main_focus(false);
-                self.refresh_detail().await;
+                self.request_detail_refresh();
                 true
             }
             KeyCode::Char('s') => {
@@ -415,8 +415,8 @@ impl App {
             KeyCode::Char('T') => {
                 if self.data.terminal.is_showing() {
                     self.data.terminal.maximized = !self.data.terminal.maximized;
-                    if self.data.terminal.maximized && self.ui.focus.active_idx == 2 {
-                        self.set_focus_idx(3);
+                    if self.data.terminal.maximized && self.ui.focus.is_inspector() {
+                        self.set_focus(WorkspaceFocus::Terminal);
                     }
                 }
                 true
@@ -434,34 +434,33 @@ impl App {
 
 impl App {
     async fn route_to_focused_panel(&mut self, key: KeyEvent) {
-        match self.ui.focus.active_idx {
-            0 => {
+        match self.ui.focus {
+            WorkspaceFocus::Machines => {
                 let result = self
                     .ui
                     .container_list
                     .handle_key(key, self.data.entries.len());
                 self.handle_container_list_result(result).await;
             }
-            1 => {
+            WorkspaceFocus::Images => {
                 let was_internal = self.ui.image_list.shows_internal();
                 let image_count = self.active_images().0.len();
                 let result = self.ui.image_list.handle_key(key, image_count);
                 if was_internal != self.ui.image_list.shows_internal() {
                     self.update_detail_target();
-                    self.refresh_detail().await;
+                    self.request_detail_refresh();
                 }
                 self.handle_container_list_result(result).await;
             }
-            2 => {
+            WorkspaceFocus::MachineInspector | WorkspaceFocus::ImageInspector => {
                 let target = self.data.detail_target.clone();
                 let result = self.ui.detail_panel.handle_key(key, &target);
                 self.handle_detail_panel_result(result).await;
             }
-            3 => {
+            WorkspaceFocus::Terminal => {
                 // Already handled in layer 2; only reached when there are
                 // no active sessions (empty terminal panel).
             }
-            _ => {}
         }
     }
 
@@ -471,20 +470,20 @@ impl App {
                 self.select_next();
                 if self.image_is_focused() {
                     self.update_detail_target();
-                    self.refresh_detail().await;
+                    self.request_detail_refresh();
                 } else {
                     self.sync_terminal_to_selected();
-                    self.refresh_detail().await;
+                    self.request_detail_refresh();
                 }
             }
             EventResult::Message(AppMessage::List(ListMessage::Prev)) => {
                 self.select_prev();
                 if self.image_is_focused() {
                     self.update_detail_target();
-                    self.refresh_detail().await;
+                    self.request_detail_refresh();
                 } else {
                     self.sync_terminal_to_selected();
-                    self.refresh_detail().await;
+                    self.request_detail_refresh();
                 }
             }
             _ => {}
@@ -494,7 +493,7 @@ impl App {
     async fn handle_detail_panel_result(&mut self, result: EventResult) {
         match result {
             EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(_pane))) => {
-                self.refresh_detail().await;
+                self.request_detail_refresh();
             }
             EventResult::Consumed | EventResult::Ignored => {}
             _ => {}
@@ -538,10 +537,10 @@ impl App {
     async fn toggle_terminal(&mut self) {
         if self.data.terminal.is_showing() {
             self.data.terminal.show = false;
-            if self.ui.focus.active_idx == 3 {
+            if self.ui.focus.is_terminal() {
                 self.restore_non_terminal_focus();
             }
-            self.refresh_detail().await;
+            self.request_detail_refresh();
         } else {
             self.spawn_terminal().await;
         }
@@ -612,7 +611,7 @@ impl App {
 
 impl App {
     fn is_terminal_insert_mode(&self) -> bool {
-        self.ui.focus.active_idx == 3
+        self.ui.focus.is_terminal()
             && self
                 .data
                 .terminal
@@ -645,7 +644,9 @@ impl App {
                     .min(super::CONTAINER_LIST_PCT_MAX);
                 true
             }
-            KeyCode::Char('j') | KeyCode::Down if self.ui.focus.active_idx <= 1 => {
+            KeyCode::Char('j') | KeyCode::Down
+                if self.ui.focus.is_machine_list() || self.ui.focus.is_image_list() =>
+            {
                 self.ui.left_machines_pct = self
                     .ui
                     .left_machines_pct
@@ -653,7 +654,9 @@ impl App {
                     .min(super::LEFT_MACHINES_PCT_MAX);
                 true
             }
-            KeyCode::Char('k') | KeyCode::Up if self.ui.focus.active_idx <= 1 => {
+            KeyCode::Char('k') | KeyCode::Up
+                if self.ui.focus.is_machine_list() || self.ui.focus.is_image_list() =>
+            {
                 self.ui.left_machines_pct = self
                     .ui
                     .left_machines_pct
@@ -662,7 +665,8 @@ impl App {
                 true
             }
             KeyCode::Char('j') | KeyCode::Down
-                if self.ui.focus.active_idx >= 2 && self.data.terminal.is_showing() =>
+                if (self.ui.focus.is_inspector() || self.ui.focus.is_terminal())
+                    && self.data.terminal.is_showing() =>
             {
                 self.ui.detail_pct = self
                     .ui
@@ -672,7 +676,8 @@ impl App {
                 true
             }
             KeyCode::Char('k') | KeyCode::Up
-                if self.ui.focus.active_idx >= 2 && self.data.terminal.is_showing() =>
+                if (self.ui.focus.is_inspector() || self.ui.focus.is_terminal())
+                    && self.data.terminal.is_showing() =>
             {
                 self.ui.detail_pct = self
                     .ui
@@ -722,23 +727,30 @@ impl App {
     }
 
     fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
-        // Keep this order aligned with layout.rs, where the highest layer is
-        // rendered last.  A visible modal always consumes the event even if
-        // its component has no mouse behavior.
-        if let Some(dialog) = &mut self.ui.active_dialog {
-            let _ = dialog.handle_mouse(mouse);
-            return true;
-        }
-        if self.ui.delete_dialog.is_some() || self.ui.quit_dialog.is_some() || self.ui.show_help {
-            return true;
-        }
-        if self.ui.show_wizard {
-            if let Some(wizard) = &mut self.ui.wizard {
-                wizard.handle_mouse(mouse);
+        // A visible modal always consumes the event even if its component has
+        // no mouse behavior.  The priority comes from AppUi::modal_layer(),
+        // shared with key dispatch.
+        match self.ui.modal_layer() {
+            Some(ModalLayer::Dialog) => {
+                if let Some(dialog) = &mut self.ui.active_dialog {
+                    let _ = dialog.handle_mouse(mouse);
+                }
+                true
             }
-            return true;
+            Some(ModalLayer::Wizard) => {
+                if let Some(wizard) = &mut self.ui.wizard {
+                    let _ = wizard.handle_mouse(mouse);
+                }
+                true
+            }
+            Some(
+                ModalLayer::DeleteConfirmation
+                | ModalLayer::QuitConfirmation
+                | ModalLayer::Help
+                | ModalLayer::PowerMenu,
+            ) => true,
+            None => false,
         }
-        self.ui.power_menu.is_some()
     }
 }
 

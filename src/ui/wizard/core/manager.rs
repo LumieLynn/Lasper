@@ -235,13 +235,16 @@ impl Wizard {
     /// Route mouse input only to the active wizard step.  The parent App
     /// treats the wizard as modal, so an ignored event is still prevented
     /// from reaching the main panels.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> EventResult {
         if self.loading {
-            return;
+            return EventResult::Consumed;
         }
         if let Some(view) = &mut self.active_view {
-            let _ = view.handle_mouse(mouse);
+            let result = view.handle_mouse(mouse);
             view.commit_to_context(&mut self.context);
+            result
+        } else {
+            EventResult::Ignored
         }
     }
 

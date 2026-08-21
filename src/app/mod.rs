@@ -1,7 +1,10 @@
 //! Main application state and event loop.
 
 pub mod actions;
+pub(crate) mod detail_refresh;
+pub mod focus;
 pub mod handlers;
+pub mod modal;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -16,7 +19,7 @@ use crate::nspawn::{
     ops::{ImageLifecycleService, MachineLifecycleService, RuntimeCatalog, RuntimeUpdate},
     sys::ExecutionContext,
 };
-use crate::ui::core::{Component, FocusTracker};
+use crate::ui::core::Component;
 use crate::ui::views::container_list::ContainerListComponent;
 use crate::ui::views::detail_panel::DetailPanel;
 use crate::ui::views::detail_panel::DetailTarget;
@@ -34,20 +37,8 @@ pub enum ResizeMode {
     Active,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InspectorSource {
-    Machine,
-    Image,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MainFocusSlot {
-    Machines,
-    MachineInspector,
-    Images,
-    ImageInspector,
-    Terminal,
-}
+pub use self::focus::WorkspaceFocus;
+pub use self::modal::ModalLayer;
 
 pub const CONTAINER_LIST_PCT_MIN: u16 = 15;
 pub const CONTAINER_LIST_PCT_MAX: u16 = 50;
@@ -99,9 +90,12 @@ impl Component for PendingImageRemoval {
 }
 
 pub struct AppUi {
-    pub focus: FocusTracker,
-    pub prev_active_idx: usize,
-    pub inspector_source: InspectorSource,
+    /// Semantic destination currently owning focus on the main workspace.
+    /// This deliberately distinguishes the two inspector contexts even
+    /// though they share one visible detail panel.
+    pub focus: WorkspaceFocus,
+    /// Last non-terminal focus, used when closing or hiding the terminal.
+    pub prev_focus: WorkspaceFocus,
     pub container_list: ContainerListComponent,
     pub image_list: ImageListComponent,
     pub detail_panel: DetailPanel,
@@ -138,9 +132,8 @@ pub struct AppUi {
 impl AppUi {
     pub fn new() -> Self {
         Self {
-            focus: FocusTracker::new(),
-            prev_active_idx: 0,
-            inspector_source: InspectorSource::Machine,
+            focus: WorkspaceFocus::Machines,
+            prev_focus: WorkspaceFocus::Machines,
             container_list: ContainerListComponent::new(),
             image_list: ImageListComponent::new(),
             detail_panel: DetailPanel::new(),
@@ -162,6 +155,26 @@ impl AppUi {
             detail_pct: 45,
             panel_layout: PanelLayout::default(),
             quit_tx: None,
+        }
+    }
+
+    /// Return the interactive topmost overlay.  Rendering uses the same
+    /// bottom-to-top order in `ui::layout`; input must only reach this layer.
+    pub fn modal_layer(&self) -> Option<ModalLayer> {
+        if self.active_dialog.is_some() {
+            Some(ModalLayer::Dialog)
+        } else if self.delete_dialog.is_some() {
+            Some(ModalLayer::DeleteConfirmation)
+        } else if self.quit_dialog.is_some() {
+            Some(ModalLayer::QuitConfirmation)
+        } else if self.show_help {
+            Some(ModalLayer::Help)
+        } else if self.show_wizard {
+            Some(ModalLayer::Wizard)
+        } else if self.power_menu.is_some() {
+            Some(ModalLayer::PowerMenu)
+        } else {
+            None
         }
     }
 }
@@ -201,6 +214,8 @@ pub struct AppData {
     pub config_dirty: bool,
     pub unit_dirty: bool,
     pub details_dirty: bool,
+
+    pub(crate) detail_refresh: detail_refresh::DetailRefreshState,
 
     // Terminal state
     pub terminal: TerminalManager,
@@ -286,6 +301,7 @@ impl App {
                 config_dirty: true,
                 unit_dirty: true,
                 details_dirty: true,
+                detail_refresh: detail_refresh::DetailRefreshState::default(),
                 terminal: TerminalManager::new(session_service),
             },
             ui: AppUi::new(),
@@ -302,39 +318,34 @@ impl App {
         self.should_quit = true;
     }
 
-    /// Set focus while keeping the last non-terminal panel available for
-    /// restoring focus when the terminal is closed or hidden.
-    pub(crate) fn set_focus_idx(&mut self, idx: usize) {
-        if idx != 3 {
-            self.ui.prev_active_idx = idx.min(2);
+    /// Set focus while keeping the last non-terminal destination available
+    /// for restoring focus when the terminal is closed or hidden.
+    pub(crate) fn set_focus(&mut self, focus: WorkspaceFocus) {
+        if !focus.is_terminal() {
+            self.ui.prev_focus = focus;
         }
-        match idx {
-            0 => self.ui.inspector_source = InspectorSource::Machine,
-            1 => self.ui.inspector_source = InspectorSource::Image,
-            _ => {}
-        }
-        self.ui.focus.active_idx = idx;
+        self.ui.focus = focus;
         self.update_detail_target();
     }
 
     pub(crate) fn cycle_main_focus(&mut self, forward: bool) {
-        const WITHOUT_TERMINAL: &[MainFocusSlot] = &[
-            MainFocusSlot::Machines,
-            MainFocusSlot::MachineInspector,
-            MainFocusSlot::Images,
-            MainFocusSlot::ImageInspector,
+        const WITHOUT_TERMINAL: &[WorkspaceFocus] = &[
+            WorkspaceFocus::Machines,
+            WorkspaceFocus::MachineInspector,
+            WorkspaceFocus::Images,
+            WorkspaceFocus::ImageInspector,
         ];
-        const WITH_TERMINAL: &[MainFocusSlot] = &[
-            MainFocusSlot::Machines,
-            MainFocusSlot::MachineInspector,
-            MainFocusSlot::Images,
-            MainFocusSlot::ImageInspector,
-            MainFocusSlot::Terminal,
+        const WITH_TERMINAL: &[WorkspaceFocus] = &[
+            WorkspaceFocus::Machines,
+            WorkspaceFocus::MachineInspector,
+            WorkspaceFocus::Images,
+            WorkspaceFocus::ImageInspector,
+            WorkspaceFocus::Terminal,
         ];
-        const MAXIMIZED_TERMINAL: &[MainFocusSlot] = &[
-            MainFocusSlot::Machines,
-            MainFocusSlot::Images,
-            MainFocusSlot::Terminal,
+        const MAXIMIZED_TERMINAL: &[WorkspaceFocus] = &[
+            WorkspaceFocus::Machines,
+            WorkspaceFocus::Images,
+            WorkspaceFocus::Terminal,
         ];
 
         let slots = if self.data.terminal.is_showing() && self.data.terminal.maximized {
@@ -344,16 +355,7 @@ impl App {
         } else {
             WITHOUT_TERMINAL
         };
-        let current = match self.ui.focus.active_idx {
-            0 => MainFocusSlot::Machines,
-            1 => MainFocusSlot::Images,
-            2 if self.ui.inspector_source == InspectorSource::Image => {
-                MainFocusSlot::ImageInspector
-            }
-            2 => MainFocusSlot::MachineInspector,
-            3 => MainFocusSlot::Terminal,
-            _ => MainFocusSlot::Machines,
-        };
+        let current = self.ui.focus;
         let current_idx = slots.iter().position(|slot| *slot == current).unwrap_or(0);
         let next_idx = if forward {
             (current_idx + 1) % slots.len()
@@ -361,45 +363,36 @@ impl App {
             (current_idx + slots.len() - 1) % slots.len()
         };
 
-        match slots[next_idx] {
-            MainFocusSlot::Machines => self.set_focus_idx(0),
-            MainFocusSlot::MachineInspector => {
-                self.ui.inspector_source = InspectorSource::Machine;
-                self.set_focus_idx(2);
-            }
-            MainFocusSlot::Images => self.set_focus_idx(1),
-            MainFocusSlot::ImageInspector => {
-                self.ui.inspector_source = InspectorSource::Image;
-                self.set_focus_idx(2);
-            }
-            MainFocusSlot::Terminal => self.set_focus_idx(3),
-        }
+        self.set_focus(slots[next_idx]);
     }
 
     pub(crate) fn restore_non_terminal_focus(&mut self) {
-        self.set_focus_idx(self.ui.prev_active_idx.min(2));
+        let focus = if self.ui.prev_focus.is_terminal() {
+            WorkspaceFocus::Machines
+        } else {
+            self.ui.prev_focus
+        };
+        self.set_focus(focus);
     }
 
     pub(crate) fn update_detail_target(&mut self) {
-        let target = match self.ui.focus.active_idx {
-            0 => self.machine_detail_target(),
-            1 => self.image_detail_target(),
-            2 if self.ui.inspector_source == InspectorSource::Image => {
-                match &self.data.detail_target {
-                    DetailTarget::Image { name, internal }
-                        if self
-                            .data
-                            .images
-                            .iter()
-                            .chain(self.data.internal_images.iter())
-                            .any(|image| image.name == *name && image.is_hidden() == *internal) =>
-                    {
-                        self.data.detail_target.clone()
-                    }
-                    _ => self.image_detail_target(),
+        let target = match self.ui.focus {
+            WorkspaceFocus::Machines => self.machine_detail_target(),
+            WorkspaceFocus::Images => self.image_detail_target(),
+            WorkspaceFocus::ImageInspector => match &self.data.detail_target {
+                DetailTarget::Image { name, internal }
+                    if self
+                        .data
+                        .images
+                        .iter()
+                        .chain(self.data.internal_images.iter())
+                        .any(|image| image.name == *name && image.is_hidden() == *internal) =>
+                {
+                    self.data.detail_target.clone()
                 }
-            }
-            2 => match &self.data.detail_target {
+                _ => self.image_detail_target(),
+            },
+            WorkspaceFocus::MachineInspector => match &self.data.detail_target {
                 DetailTarget::Machine(name)
                     if self.data.entries.iter().any(|entry| entry.name == *name) =>
                 {
@@ -407,7 +400,7 @@ impl App {
                 }
                 _ => self.machine_detail_target(),
             },
-            3 => self
+            WorkspaceFocus::Terminal => self
                 .data
                 .terminal
                 .active_session()
@@ -420,7 +413,6 @@ impl App {
                         .map(|_| DetailTarget::Machine(name.to_string()))
                 })
                 .unwrap_or_else(|| self.machine_detail_target()),
-            _ => DetailTarget::Empty,
         };
 
         if target != self.data.detail_target {
@@ -428,6 +420,9 @@ impl App {
             self.ui
                 .detail_panel
                 .ensure_pane_for_target(&self.data.detail_target);
+            // Background detail reads must never leave the previous target's
+            // properties visible while the new request is in flight.
+            self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
             self.data.properties_dirty = true;
             self.data.details_dirty = true;
             self.data.config_dirty = true;
@@ -466,7 +461,7 @@ impl App {
     }
 
     /// Update entries and selection state from a background refresh.
-    async fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
+    fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
         let prev_name = self
             .data
             .entries
@@ -485,11 +480,6 @@ impl App {
             .and_then(|name| self.data.entries.iter().position(|e| e.name == name))
             .unwrap_or(0)
             .min(self.data.entries.len().saturating_sub(1));
-        self.update_detail_target();
-        if !self.data.detail_target.is_image() {
-            self.refresh_detail().await;
-        }
-
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.entries = self.data.entries.clone();
             wizard.context.images = self.data.images.clone();
@@ -497,13 +487,13 @@ impl App {
     }
 
     /// Apply the independent machine/image snapshot returned by the backend.
-    async fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
+    fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
         let RuntimeSnapshot { machines, images } = snapshot;
         let running: Vec<_> = machines
             .into_iter()
             .filter(|e| e.state.is_running())
             .collect();
-        self.sync_entries(running).await;
+        self.sync_entries(running);
 
         let previous_name = self
             .data
@@ -535,18 +525,13 @@ impl App {
             .unwrap_or(0)
             .min(self.data.internal_images.len().saturating_sub(1));
         self.update_detail_target();
-        if self.data.detail_target.is_image() {
-            self.refresh_detail().await;
-        }
+        self.request_detail_refresh();
         if let Some(wizard) = &mut self.ui.wizard {
             wizard.context.images = self.data.images.clone();
         }
     }
 
-    async fn sync_runtime_query(
-        &mut self,
-        query: crate::nspawn::ops::RuntimeQuery<RuntimeSnapshot>,
-    ) {
+    fn sync_runtime_query(&mut self, query: crate::nspawn::ops::RuntimeQuery<RuntimeSnapshot>) {
         self.data.dbus_active = query.route.is_dbus();
         if let Some(fallback) = query.fallback {
             self.set_status(
@@ -559,7 +544,7 @@ impl App {
                 crate::ui::StatusLevel::Warn,
             );
         }
-        self.sync_snapshot(query.value).await;
+        self.sync_snapshot(query.value);
     }
 
     /// Forward backend response to the active wizard/context.
@@ -626,6 +611,8 @@ impl App {
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<RuntimeUpdate>(4);
         let (backend_tx, mut backend_rx) =
             tokio::sync::mpsc::channel::<crate::nspawn::ops::BackendCommand>(100);
+        let (detail_refresh_tx, mut detail_refresh_rx) =
+            tokio::sync::mpsc::channel::<detail_refresh::DetailRefreshCompletion>(1);
 
         self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());
@@ -651,7 +638,7 @@ impl App {
             for _ in 0..3 {
                 match refresh_rx.try_recv() {
                     Ok(RuntimeUpdate::Snapshot(snapshot)) => {
-                        self.sync_runtime_query(snapshot).await;
+                        self.sync_runtime_query(snapshot);
                     }
                     Ok(RuntimeUpdate::BackendFailure {
                         message,
@@ -677,10 +664,18 @@ impl App {
             // Drain per-buffer log channels before rendering
             self.data.log_manager.drain_all();
 
+            // Detail reads are scheduled after input/observer batches have
+            // coalesced, and never execute on the event-handler call stack.
+            self.start_detail_refresh(&detail_refresh_tx);
+
             // Render a frame
             terminal.draw(|f| crate::ui::draw(f, self))?;
 
             tokio::select! {
+                _ = &mut quit_rx => {
+                    log::info!("[lasper] select!: quit_rx fired");
+                    break;
+                }
                 Some(event) = events.rx.recv() => {
                     self.handle_event(event).await;
                     // Batch a bounded number of events so a busy PTY cannot
@@ -690,12 +685,19 @@ impl App {
                         self.handle_event(event).await;
                     }
                 }
+                Some(completion) = detail_refresh_rx.recv() => {
+                    self.apply_detail_refresh(completion);
+                }
                 Some(cmd) = backend_rx.recv() => {
                     crate::nspawn::ops::handlers::handle_command(cmd, events.tx.clone());
                 }
-                _ = &mut quit_rx => {
-                    log::info!("[lasper] select!: quit_rx fired");
-                    break;
+                changed = events.mouse_motion_rx.changed() => {
+                    if changed.is_ok() {
+                        let mouse = *events.mouse_motion_rx.borrow_and_update();
+                        if let Some(mouse) = mouse {
+                            self.handle_mouse(mouse).await;
+                        }
+                    }
                 }
                 else => {
                     log::info!("[lasper] select!: else branch");
@@ -884,7 +886,7 @@ mod tests {
             let mut app = make_app();
             app.data.machine_lifecycle = lifecycle;
             app.data.images = vec![make_image("test")];
-            app.ui.focus.active_idx = 1;
+            app.ui.focus = WorkspaceFocus::Images;
             let (tx, rx) = tokio::sync::mpsc::channel(2);
             app.ui.app_tx = Some(tx);
             (app, rx)
@@ -1018,7 +1020,7 @@ mod tests {
                 OperationRegistry::new(),
             ));
             app.data.images = vec![make_image("first"), make_image("second")];
-            app.ui.focus.active_idx = 1;
+            app.ui.focus = WorkspaceFocus::Images;
             let (tx, rx) = tokio::sync::mpsc::channel(2);
             app.ui.app_tx = Some(tx);
             (app, rx)
@@ -1047,7 +1049,7 @@ mod tests {
 
             app.show_delete_dialog();
             app.data.image_selected = 1;
-            app.ui.focus.active_idx = 0;
+            app.ui.focus = WorkspaceFocus::Machines;
             app.action_remove();
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -1361,7 +1363,7 @@ mod tests {
             let mut app = make_app();
             app.data.entries = vec![make_entry("machine", ContainerState::Running)];
             app.data.images = vec![make_image("a"), make_image("b")];
-            app.ui.focus.active_idx = 1;
+            app.ui.focus = WorkspaceFocus::Images;
 
             app.select_next();
 
@@ -1377,7 +1379,7 @@ mod tests {
                 make_internal_image(".internal-a"),
                 make_internal_image(".internal-b"),
             ];
-            app.ui.focus.active_idx = 1;
+            app.ui.focus = WorkspaceFocus::Images;
             let _ = app.ui.image_list.handle_key(
                 crossterm::event::KeyEvent::new(
                     crossterm::event::KeyCode::Char(']'),
@@ -1402,8 +1404,33 @@ mod tests {
             let mut app = make_app();
             app.data.entries = vec![make_entry("machine", ContainerState::Running)];
             app.data.images = vec![make_image("image")];
-            app.set_focus_idx(0);
+            app.set_focus(WorkspaceFocus::Machines);
             app
+        }
+
+        #[test]
+        fn modal_layer_reports_the_topmost_rendered_overlay() {
+            use crate::ui::widgets::dialogs::confirmation::ConfirmationDialog;
+
+            let mut ui = AppUi::new();
+            ui.power_menu = Some(crate::ui::widgets::power_menu::PowerMenu::new(0));
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::PowerMenu));
+
+            ui.show_wizard = true;
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::Wizard));
+            ui.show_help = true;
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::Help));
+
+            ui.quit_dialog = Some(ConfirmationDialog::new("Quit", "Confirm"));
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::QuitConfirmation));
+            ui.delete_dialog = Some(PendingImageRemoval::new(
+                ImageName::new("image").unwrap(),
+                ConfirmationDialog::new("Remove", "Confirm"),
+            ));
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::DeleteConfirmation));
+
+            ui.active_dialog = Some(Box::new(ConfirmationDialog::new("Dialog", "Confirm")));
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::Dialog));
         }
 
         #[test]
@@ -1411,24 +1438,22 @@ mod tests {
             let mut app = app_with_machine_and_image();
 
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 2);
-            assert_eq!(app.ui.inspector_source, InspectorSource::Machine);
+            assert_eq!(app.ui.focus, WorkspaceFocus::MachineInspector);
             assert_eq!(
                 app.data.detail_target,
                 DetailTarget::Machine("machine".into())
             );
 
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 1);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Images);
             assert!(matches!(app.data.detail_target, DetailTarget::Image { .. }));
 
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 2);
-            assert_eq!(app.ui.inspector_source, InspectorSource::Image);
+            assert_eq!(app.ui.focus, WorkspaceFocus::ImageInspector);
             assert!(matches!(app.data.detail_target, DetailTarget::Image { .. }));
 
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 0);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Machines);
         }
 
         #[test]
@@ -1436,38 +1461,35 @@ mod tests {
             let mut app = app_with_machine_and_image();
 
             app.cycle_main_focus(false);
-            assert_eq!(app.ui.focus.active_idx, 2);
-            assert_eq!(app.ui.inspector_source, InspectorSource::Image);
+            assert_eq!(app.ui.focus, WorkspaceFocus::ImageInspector);
 
             app.cycle_main_focus(false);
-            assert_eq!(app.ui.focus.active_idx, 1);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Images);
 
             app.cycle_main_focus(false);
-            assert_eq!(app.ui.focus.active_idx, 2);
-            assert_eq!(app.ui.inspector_source, InspectorSource::Machine);
+            assert_eq!(app.ui.focus, WorkspaceFocus::MachineInspector);
 
             app.cycle_main_focus(false);
-            assert_eq!(app.ui.focus.active_idx, 0);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Machines);
         }
 
         #[test]
         fn terminal_joins_the_cycle_and_maximized_mode_skips_inspectors() {
             let mut app = app_with_machine_and_image();
             app.data.terminal.show = true;
-            app.ui.inspector_source = InspectorSource::Image;
-            app.set_focus_idx(2);
+            app.set_focus(WorkspaceFocus::ImageInspector);
 
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 3);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Terminal);
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 0);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Machines);
 
             app.data.terminal.maximized = true;
-            app.set_focus_idx(0);
+            app.set_focus(WorkspaceFocus::Machines);
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 1);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Images);
             app.cycle_main_focus(true);
-            assert_eq!(app.ui.focus.active_idx, 3);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Terminal);
         }
 
         #[test]
@@ -1480,15 +1502,15 @@ mod tests {
         #[test]
         fn focus_restore_tracks_the_latest_non_terminal_panel() {
             let mut app = make_app();
-            app.set_focus_idx(1);
-            app.set_focus_idx(3);
-            assert_eq!(app.ui.prev_active_idx, 1);
+            app.set_focus(WorkspaceFocus::Images);
+            app.set_focus(WorkspaceFocus::Terminal);
+            assert_eq!(app.ui.prev_focus, WorkspaceFocus::Images);
 
-            app.set_focus_idx(0);
-            app.set_focus_idx(3);
-            assert_eq!(app.ui.prev_active_idx, 0);
+            app.set_focus(WorkspaceFocus::Machines);
+            app.set_focus(WorkspaceFocus::Terminal);
+            assert_eq!(app.ui.prev_focus, WorkspaceFocus::Machines);
             app.restore_non_terminal_focus();
-            assert_eq!(app.ui.focus.active_idx, 0);
+            assert_eq!(app.ui.focus, WorkspaceFocus::Machines);
         }
 
         #[test]
@@ -1497,8 +1519,8 @@ mod tests {
             app.data.images = vec![make_image("workstation")];
             app.data.entries = vec![make_entry("workstation", ContainerState::Running)];
 
-            app.set_focus_idx(1);
-            app.set_focus_idx(2);
+            app.set_focus(WorkspaceFocus::Images);
+            app.set_focus(WorkspaceFocus::ImageInspector);
 
             let image = app
                 .focused_image_resource()
@@ -1512,7 +1534,7 @@ mod tests {
             let mut app = make_app();
             app.data.images = vec![make_image("workstation")];
             app.data.entries = vec![make_entry("workstation", ContainerState::Starting)];
-            app.set_focus_idx(1);
+            app.set_focus(WorkspaceFocus::Images);
 
             let image = app.focused_image_resource().unwrap();
             assert!(!app.image_has_running_machine(image));
@@ -1531,12 +1553,11 @@ mod tests {
                 name: "retained".into(),
                 internal: false,
             };
-            app.ui.focus.active_idx = 2;
-            app.ui.inspector_source = InspectorSource::Image;
+            app.ui.focus = WorkspaceFocus::ImageInspector;
             app.ui.detail_panel.active_pane =
                 crate::ui::views::detail_panel::DetailPane::ImageOverview;
 
-            app.refresh_detail().await;
+            app.refresh_detail_now().await;
 
             let image_properties = app
                 .data
@@ -1558,21 +1579,51 @@ mod tests {
                 internal: false,
             };
             app.data.unit_name = Some("systemd-nspawn@stale.service".into());
-            app.ui.focus.active_idx = 2;
-            app.ui.inspector_source = InspectorSource::Image;
+            app.ui.focus = WorkspaceFocus::ImageInspector;
             app.ui.detail_panel.active_pane = crate::ui::views::detail_panel::DetailPane::ImageUnit;
 
-            app.refresh_detail().await;
+            app.refresh_detail_now().await;
 
             assert!(app.data.unit_name.is_none());
             assert!(app.data.unit_drop_ins.is_empty());
             assert!(app.data.properties.as_ref().unwrap().groups.is_empty());
         }
 
+        #[test]
+        fn completed_detail_read_cannot_overwrite_a_new_selection() {
+            use crate::app::detail_refresh::{DetailRefreshCompletion, DetailRefreshResult};
+
+            let mut app = make_app();
+            app.data.entries = vec![
+                make_entry("first", ContainerState::Running),
+                make_entry("second", ContainerState::Running),
+            ];
+            app.set_focus(WorkspaceFocus::Machines);
+            app.request_detail_refresh();
+            let stale_ticket = app.data.detail_refresh.take_pending().unwrap();
+
+            app.data.selected = 1;
+            app.request_detail_refresh();
+            assert_eq!(
+                app.data.detail_target,
+                DetailTarget::Machine("second".into())
+            );
+
+            let mut stale_properties = crate::nspawn::models::MachineProperties::default();
+            stale_properties.insert("Machine", "Name".into(), "first".into());
+            app.apply_detail_refresh(DetailRefreshCompletion {
+                ticket: stale_ticket,
+                result: DetailRefreshResult::ImageOverview(stale_properties),
+            });
+
+            assert!(app.data.properties.as_ref().unwrap().groups.is_empty());
+            assert!(app.data.detail_refresh.has_pending());
+        }
+
         #[tokio::test]
         async fn visible_help_consumes_mouse_before_background_focus() {
             let mut app = make_app();
-            app.ui.focus.active_idx = 2;
+            app.ui.focus = WorkspaceFocus::MachineInspector;
             app.ui.show_help = true;
             app.ui.panel_layout.machines = Rect::new(0, 0, 20, 20);
 
@@ -1584,12 +1635,12 @@ mod tests {
             })
             .await;
 
-            assert_eq!(app.ui.focus.active_idx, 2);
+            assert_eq!(app.ui.focus, WorkspaceFocus::MachineInspector);
         }
     }
 
-    #[tokio::test]
-    async fn image_refresh_sorts_by_name_and_preserves_selection() {
+    #[test]
+    fn image_refresh_sorts_by_name_and_preserves_selection() {
         let mut app = make_app();
         app.data.images = vec![make_image("selected")];
         app.data.internal_images = vec![make_internal_image(".selected-internal")];
@@ -1604,8 +1655,7 @@ mod tests {
                 make_internal_image(".selected-internal"),
                 make_internal_image(".a-internal"),
             ],
-        ))
-        .await;
+        ));
 
         let names: Vec<_> = app
             .data

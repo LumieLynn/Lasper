@@ -1,7 +1,16 @@
+use super::detail_refresh::{
+    DetailRefreshCompletion, DetailRefreshJob, DetailRefreshResult, DetailRefreshServices,
+    DetailRefreshWork,
+};
 use super::App;
 use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry, MachineProperties};
 use crate::ui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
+
+enum PreparedDetailRefresh {
+    Ready(DetailRefreshCompletion),
+    Job(DetailRefreshJob),
+}
 
 impl App {
     pub async fn refresh(&mut self) {
@@ -10,7 +19,7 @@ impl App {
         }
         match self.data.runtime_catalog.snapshot().await {
             Ok(snapshot) => {
-                self.sync_runtime_query(snapshot).await;
+                self.sync_runtime_query(snapshot);
             }
             Err(error) => {
                 log::error!("runtime snapshot: {}", error);
@@ -22,32 +31,64 @@ impl App {
         }
     }
 
-    pub async fn refresh_detail(&mut self) {
+    /// Replace any queued detail read with a snapshot of the currently visible
+    /// target. No host I/O occurs on the input-handler call stack.
+    pub(crate) fn request_detail_refresh(&mut self) {
         self.update_detail_target();
-        let target = self.data.detail_target.clone();
-        let Some(name) = target.name().map(str::to_string) else {
-            if !matches!(target, DetailTarget::Empty) {
-                return;
-            }
-            self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
-            self.data.properties_dirty = true;
-            self.data.log_manager.cleanup_all();
-            self.data.config_content = Option::None;
-            self.data.config_path = Option::None;
-            self.data.config_dirty = true;
-            self.data.unit_name = None;
-            self.data.unit_drop_ins.clear();
-            self.data.unit_dirty = true;
+        self.data.detail_refresh.request(
+            self.data.detail_target.clone(),
+            self.ui.detail_panel.active_pane,
+        );
+    }
+
+    /// Start at most one queued detail read. Repeated input before this point
+    /// has already coalesced to the latest ticket.
+    pub(crate) fn start_detail_refresh(
+        &mut self,
+        completion_tx: &tokio::sync::mpsc::Sender<DetailRefreshCompletion>,
+    ) {
+        let Some(prepared) = self.prepare_detail_refresh() else {
             return;
         };
+        match prepared {
+            PreparedDetailRefresh::Ready(completion) => {
+                self.apply_detail_refresh(completion);
+            }
+            PreparedDetailRefresh::Job(job) => {
+                let completion_tx = completion_tx.clone();
+                let services = self.detail_refresh_services();
+                tokio::spawn(async move {
+                    let completion = job.execute(services).await;
+                    let _ = completion_tx.send(completion).await;
+                });
+            }
+        }
+    }
 
-        match target {
-            DetailTarget::Machine(_) => {
+    fn prepare_detail_refresh(&mut self) -> Option<PreparedDetailRefresh> {
+        let ticket = self.data.detail_refresh.take_pending()?;
+        if ticket.target != self.data.detail_target
+            || ticket.pane != self.ui.detail_panel.active_pane
+        {
+            return Some(PreparedDetailRefresh::Ready(DetailRefreshCompletion {
+                ticket,
+                result: DetailRefreshResult::Noop,
+            }));
+        }
+
+        let ready = |ticket, result| {
+            PreparedDetailRefresh::Ready(DetailRefreshCompletion { ticket, result })
+        };
+        let job = |ticket, work| PreparedDetailRefresh::Job(DetailRefreshJob { ticket, work });
+
+        let prepared = match &ticket.target {
+            DetailTarget::Empty => ready(ticket.clone(), DetailRefreshResult::Empty),
+            DetailTarget::Machine(name) => {
                 let entry = self
                     .data
                     .entries
                     .iter()
-                    .find(|entry| entry.name == name)
+                    .find(|entry| entry.name == *name)
                     .cloned()
                     .unwrap_or(ContainerEntry {
                         name: name.clone(),
@@ -55,154 +96,205 @@ impl App {
                         address: None,
                         all_addresses: Vec::new(),
                     });
-                match self.ui.detail_panel.active_pane {
-                    DetailPane::Properties | DetailPane::Details => {
-                        match self.data.runtime_catalog.inspect(&name, &entry).await {
-                            Ok(query) => {
-                                if let Some(fallback) = query.fallback {
-                                    self.set_status(
-                                        format!(
-                                            "{} unavailable: {}; using {}",
-                                            fallback.from.label(),
-                                            fallback.reason,
-                                            fallback.to.label()
-                                        ),
-                                        crate::ui::StatusLevel::Warn,
-                                    );
-                                }
-                                self.data.properties = Ok(query.value);
-                                self.data.properties_dirty = true;
-                                self.data.details_dirty = true;
-                            }
-                            Err(e) => {
-                                log::debug!("{e}");
-                                self.data.properties = Err(e.to_string());
-                                self.data.properties_dirty = true;
-                                self.data.details_dirty = true;
-                            }
-                        }
-                    }
+                match ticket.pane {
+                    DetailPane::Properties | DetailPane::Details => job(
+                        ticket.clone(),
+                        DetailRefreshWork::MachineProperties {
+                            name: name.clone(),
+                            entry,
+                        },
+                    ),
                     DetailPane::Logs => {
-                        self.data.log_manager.get_or_create(&name);
-                        if entry.state == ContainerState::Running {
-                            if self.data.log_manager.can_start_stream(&name) {
-                                match crate::domain::machine::MachineName::new(&name) {
-                                    Ok(machine) => {
-                                        match self.data.session_service.open_journal(machine).await
-                                        {
-                                            Ok(handle) => {
-                                                self.data.log_manager.attach_stream(&name, handle)
-                                            }
-                                            Err(error) => {
-                                                self.data.log_manager.push_line(
-                                                    &name,
-                                                    format!("Log stream error: {error}"),
-                                                );
-                                                if let Some(hint) = error.hint() {
-                                                    self.data.log_manager.push_line(&name, hint);
-                                                }
-                                                self.data.log_manager.mark_stream_failed(&name);
-                                            }
-                                        }
-                                    }
-                                    Err(error) => {
-                                        self.data
-                                            .log_manager
-                                            .push_line(&name, format!("Log stream error: {error}"));
-                                        self.data.log_manager.mark_stream_failed(&name);
-                                    }
-                                }
+                        self.data.log_manager.get_or_create(name);
+                        if entry.state == ContainerState::Running
+                            && self.data.log_manager.can_start_stream(name)
+                        {
+                            job(
+                                ticket.clone(),
+                                DetailRefreshWork::Journal { name: name.clone() },
+                            )
+                        } else {
+                            if entry.state != ContainerState::Running
+                                && self.data.log_manager.stop_stream(name)
+                            {
+                                self.data.log_manager.push_line(name, "[CONTAINER STOPPED]");
                             }
-                        } else if self.data.log_manager.stop_stream(&name) {
-                            self.data
-                                .log_manager
-                                .push_line(&name, "[CONTAINER STOPPED]");
+                            ready(ticket.clone(), DetailRefreshResult::Noop)
                         }
                     }
-                    DetailPane::Config => {
-                        self.read_nspawn_config(&name).await;
-                    }
-                    DetailPane::Metrics => {}
-                    _ => {}
+                    DetailPane::Config => job(
+                        ticket.clone(),
+                        DetailRefreshWork::Config { name: name.clone() },
+                    ),
+                    DetailPane::Metrics
+                    | DetailPane::ImageOverview
+                    | DetailPane::ImageConfig
+                    | DetailPane::ImageUnit => ready(ticket.clone(), DetailRefreshResult::Noop),
                 }
             }
-            DetailTarget::Image { .. } => match self.ui.detail_panel.active_pane {
-                DetailPane::ImageOverview => {
-                    self.data.properties = Ok(self.image_properties(&name));
-                    self.data.properties_dirty = true;
-                    self.data.details_dirty = true;
+            DetailTarget::Image { name, .. } => match ticket.pane {
+                DetailPane::ImageOverview => ready(
+                    ticket.clone(),
+                    DetailRefreshResult::ImageOverview(self.image_properties(name)),
+                ),
+                DetailPane::ImageConfig => job(
+                    ticket.clone(),
+                    DetailRefreshWork::Config { name: name.clone() },
+                ),
+                DetailPane::ImageUnit => job(
+                    ticket.clone(),
+                    DetailRefreshWork::ImageUnit { name: name.clone() },
+                ),
+                DetailPane::Properties
+                | DetailPane::Details
+                | DetailPane::Logs
+                | DetailPane::Config
+                | DetailPane::Metrics => ready(ticket.clone(), DetailRefreshResult::Noop),
+            },
+        };
+        Some(prepared)
+    }
+
+    pub(crate) fn apply_detail_refresh(&mut self, completion: DetailRefreshCompletion) {
+        if !self.data.detail_refresh.finish(completion.ticket.revision) {
+            return;
+        }
+        if completion.ticket.target != self.data.detail_target
+            || completion.ticket.pane != self.ui.detail_panel.active_pane
+        {
+            return;
+        }
+
+        match completion.result {
+            DetailRefreshResult::Empty => {
+                self.data.properties = Ok(MachineProperties::default());
+                self.data.properties_dirty = true;
+                self.data.details_dirty = true;
+                self.data.log_manager.cleanup_all();
+                self.apply_config_snapshot(None);
+                self.data.unit_name = None;
+                self.data.unit_drop_ins.clear();
+                self.data.unit_dirty = true;
+            }
+            DetailRefreshResult::Noop => {}
+            DetailRefreshResult::MachineProperties(result) => {
+                match result {
+                    Ok(query) => {
+                        if let Some(fallback) = query.fallback {
+                            self.set_status(
+                                format!(
+                                    "{} unavailable: {}; using {}",
+                                    fallback.from.label(),
+                                    fallback.reason,
+                                    fallback.to.label()
+                                ),
+                                crate::ui::StatusLevel::Warn,
+                            );
+                        }
+                        self.data.properties = Ok(query.value);
+                    }
+                    Err(error) => {
+                        log::debug!("{error}");
+                        self.data.properties = Err(error);
+                    }
                 }
-                DetailPane::ImageConfig => self.read_nspawn_config(&name).await,
-                DetailPane::ImageUnit => {
-                    let has_corresponding_unit = match self
-                        .data
-                        .exec_ctx
-                        .machine_inspection
-                        .inspect_static(&name)
-                        .await
-                    {
-                        Ok(Some(properties)) => {
-                            self.data.properties = Ok(properties);
-                            self.data.properties_dirty = true;
-                            self.data.details_dirty = true;
-                            true
-                        }
-                        Ok(None) => {
-                            self.data.properties = Ok(MachineProperties::default());
-                            self.data.properties_dirty = true;
-                            self.data.details_dirty = true;
-                            false
-                        }
-                        Err(error) => {
-                            self.data.properties = Err(error.to_string());
-                            self.data.properties_dirty = true;
-                            self.data.details_dirty = true;
-                            true
-                        }
-                    };
-                    if has_corresponding_unit {
-                        match self.data.exec_ctx.systemd_unit.read(&name).await {
-                            Ok(unit) => {
-                                self.data.unit_name = Some(unit.unit);
-                                self.data.unit_drop_ins = unit.drop_ins;
-                            }
-                            Err(error) => {
-                                log::debug!("Failed to read unit drop-ins for {name}: {error}");
-                                self.data.unit_name =
-                                    crate::nspawn::models::MachineName::new(&name)
-                                        .ok()
-                                        .map(|name| name.systemd_nspawn_unit());
-                                self.data.unit_drop_ins.clear();
-                            }
-                        }
-                    } else {
+                self.data.properties_dirty = true;
+                self.data.details_dirty = true;
+            }
+            DetailRefreshResult::Journal(mut result) => {
+                let Some(name) = completion.ticket.target.name() else {
+                    return;
+                };
+                if let Some(handle) = result.handle.take() {
+                    self.data.log_manager.attach_stream(name, handle);
+                } else if let Some(error) = result.error {
+                    self.data
+                        .log_manager
+                        .push_line(name, format!("Log stream error: {error}"));
+                    if let Some(hint) = result.hint {
+                        self.data.log_manager.push_line(name, hint);
+                    }
+                    self.data.log_manager.mark_stream_failed(name);
+                }
+            }
+            DetailRefreshResult::Config(result) => {
+                let name = completion.ticket.target.name().unwrap_or_default();
+                match result {
+                    Ok(config) => self.apply_config_snapshot(config),
+                    Err(error) => {
+                        log::warn!("Failed to read .nspawn config for {name}: {error}");
+                        self.apply_config_snapshot(None);
+                    }
+                }
+            }
+            DetailRefreshResult::ImageOverview(properties) => {
+                self.data.properties = Ok(properties);
+                self.data.properties_dirty = true;
+                self.data.details_dirty = true;
+            }
+            DetailRefreshResult::ImageUnit(result) => {
+                self.data.properties = match result.properties {
+                    Ok(Some(properties)) => Ok(properties),
+                    Ok(None) => Ok(MachineProperties::default()),
+                    Err(error) => Err(error),
+                };
+                self.data.properties_dirty = true;
+                self.data.details_dirty = true;
+                match result.unit {
+                    Some(Ok(unit)) => {
+                        self.data.unit_name = Some(unit.unit);
+                        self.data.unit_drop_ins = unit.drop_ins;
+                    }
+                    Some(Err(error)) => {
+                        let name = completion.ticket.target.name().unwrap_or_default();
+                        log::debug!("Failed to read unit drop-ins for {name}: {error}");
+                        self.data.unit_name = crate::nspawn::models::MachineName::new(name)
+                            .ok()
+                            .map(|name| name.systemd_nspawn_unit());
+                        self.data.unit_drop_ins.clear();
+                    }
+                    None => {
                         self.data.unit_name = None;
                         self.data.unit_drop_ins.clear();
                     }
-                    self.data.unit_dirty = true;
                 }
-                _ => {}
-            },
-            DetailTarget::Empty => {}
+                self.data.unit_dirty = true;
+            }
         }
     }
 
-    async fn read_nspawn_config(&mut self, name: &str) {
-        let new_config = match self.data.exec_ctx.nspawn.inspect(name).await {
-            Ok(config) => config,
-            Err(error) => {
-                log::warn!("Failed to read .nspawn config for {}: {}", name, error);
-                None
-            }
-        };
-        let new_path = new_config.as_ref().map(|config| config.path.clone());
-        let new_content = new_config.map(|config| config.content);
+    fn apply_config_snapshot(&mut self, config: Option<super::detail_refresh::ConfigSnapshot>) {
+        let new_path = config.as_ref().map(|config| config.path.clone());
+        let new_content = config.map(|config| config.content);
         if self.data.config_content != new_content {
             self.ui.detail_panel.config_scroll = 0;
             self.data.config_dirty = true;
         }
         self.data.config_path = new_path;
         self.data.config_content = new_content;
+    }
+
+    fn detail_refresh_services(&self) -> DetailRefreshServices {
+        DetailRefreshServices {
+            runtime_catalog: self.data.runtime_catalog.clone(),
+            session_service: self.data.session_service.clone(),
+            machine_inspection: self.data.exec_ctx.machine_inspection.clone(),
+            nspawn: self.data.exec_ctx.nspawn.clone(),
+            systemd_unit: self.data.exec_ctx.systemd_unit.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn refresh_detail_now(&mut self) {
+        self.request_detail_refresh();
+        let Some(prepared) = self.prepare_detail_refresh() else {
+            return;
+        };
+        let completion = match prepared {
+            PreparedDetailRefresh::Ready(completion) => completion,
+            PreparedDetailRefresh::Job(job) => job.execute(self.detail_refresh_services()).await,
+        };
+        self.apply_detail_refresh(completion);
     }
 
     fn image_properties(&self, name: &str) -> MachineProperties {
@@ -288,7 +380,7 @@ impl App {
     }
 
     pub(crate) fn image_is_focused(&self) -> bool {
-        self.ui.focus.active_idx == 1
+        self.ui.focus.is_image_list()
     }
 
     pub(crate) fn active_images(&self) -> (&[ImageEntry], usize) {
@@ -311,7 +403,7 @@ impl App {
         if self.image_is_focused() {
             return self.selected_image();
         }
-        if self.ui.focus.active_idx != 2 {
+        if !self.ui.focus.is_inspector() {
             return None;
         }
         let DetailTarget::Image { name, .. } = &self.data.detail_target else {
@@ -797,8 +889,8 @@ impl App {
             };
             entry
         };
-        if self.ui.focus.active_idx != 3 {
-            self.ui.prev_active_idx = self.ui.focus.active_idx.min(2);
+        if !self.ui.focus.is_terminal() {
+            self.ui.prev_focus = self.ui.focus;
         }
         let rows = self.ui.pane_height.max(10);
 
@@ -809,8 +901,8 @@ impl App {
             .await
         {
             Ok(session) => {
-                self.set_focus_idx(3);
-                self.refresh_detail().await;
+                self.set_focus(crate::app::WorkspaceFocus::Terminal);
+                self.request_detail_refresh();
                 let message = match session.attach_kind {
                     crate::domain::session::TerminalAttachmentKind::Login => {
                         format!("Logged into {}", entry.name)
@@ -828,7 +920,7 @@ impl App {
     }
 
     pub fn sync_terminal_to_selected(&mut self) {
-        let was_focused = self.ui.focus.active_idx == 3;
+        let was_focused = self.ui.focus.is_terminal();
         let entry = match self.data.entries.get(self.data.selected) {
             Some(e) => e,
             None => return,
