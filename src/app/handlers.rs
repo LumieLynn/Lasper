@@ -252,24 +252,8 @@ impl App {
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
         // 3a – wizard
         if self.ui.show_wizard {
-            if let Some(wizard) = &mut self.ui.wizard {
-                match wizard.handle_key(key) {
-                    WizardAction::None => {}
-                    WizardAction::Close => {
-                        self.ui.show_wizard = false;
-                        self.ui.wizard = None;
-                    }
-                    WizardAction::Status(msg, level) => {
-                        self.set_status(msg, level);
-                    }
-                    WizardAction::Next | WizardAction::Prev => {}
-                    WizardAction::OpenDialog(dialog) => {
-                        self.ui.active_dialog = Some(dialog);
-                    }
-                    WizardAction::CloseDialog => {
-                        self.ui.active_dialog = None;
-                    }
-                }
+            if let Some(action) = self.ui.wizard.as_mut().map(|wizard| wizard.handle_key(key)) {
+                self.handle_wizard_action(action).await;
             } else {
                 self.ui.show_wizard = false;
             }
@@ -511,26 +495,110 @@ impl App {
         }
 
         let nvidia_installed = crate::nspawn::platform::nvidia::nvidia_ctk_available();
-        if let Some(tx) = &self.ui.backend_tx {
-            let mut wizard = crate::ui::wizard::Wizard::new(
-                self.data.entries.clone(),
-                self.data.images.clone(),
-                nvidia_installed,
-                tx.clone(),
-                self.permissions.level(),
-                self.data.exec_ctx.clone(),
-                self.config.clone(),
-            )
-            .await;
+        let mut wizard = crate::ui::wizard::Wizard::new(
+            self.data.entries.clone(),
+            self.data.images.clone(),
+            nvidia_installed,
+            self.permissions.level(),
+            self.config.clone(),
+        )
+        .await;
 
-            if nvidia_installed {
+        if nvidia_installed {
+            if let Some(tx) = &self.ui.backend_tx {
                 let _ = tx.try_send(crate::nspawn::ops::BackendCommand::DiscoverHardware);
-            } else {
-                wizard.context.passthrough.hardware_scanning = false;
             }
+        } else {
+            wizard.draft.passthrough.hardware_scanning = false;
+        }
 
-            self.ui.wizard = Some(wizard);
-            self.ui.show_wizard = true;
+        self.ui.wizard = Some(wizard);
+        self.ui.show_wizard = true;
+    }
+
+    pub(crate) async fn handle_wizard_action(&mut self, action: WizardAction) {
+        match action {
+            WizardAction::None | WizardAction::Next | WizardAction::Prev => {}
+            WizardAction::Close => {
+                self.ui.pending_deployment_preflight = None;
+                self.ui.show_wizard = false;
+                self.ui.wizard = None;
+            }
+            WizardAction::Status(message, level) => self.set_status(message, level),
+            WizardAction::OpenDialog(dialog) => self.ui.active_dialog = Some(dialog),
+            WizardAction::CloseDialog => self.ui.active_dialog = None,
+            WizardAction::ValidateInterface {
+                name,
+                is_bridge_mode,
+            } => {
+                let result = self.ui.backend_tx.as_ref().map(|tx| {
+                    tx.try_send(crate::nspawn::ops::BackendCommand::ValidateInterface {
+                        name,
+                        is_bridge_mode,
+                    })
+                });
+                if !matches!(result, Some(Ok(()))) {
+                    if let Some(wizard) = &mut self.ui.wizard {
+                        wizard.loading = false;
+                    }
+                    self.set_status(
+                        "Internal error: backend validation channel is unavailable".into(),
+                        StatusLevel::Error,
+                    );
+                }
+            }
+            WizardAction::PreflightDeployment(request) => {
+                self.ui.active_dialog = None;
+                let Some(tx) = self.ui.app_tx.clone() else {
+                    if let Some(wizard) = &mut self.ui.wizard {
+                        wizard.preflight_dispatch_failed();
+                    }
+                    self.set_status(
+                        "Internal error: application event channel is unavailable".into(),
+                        StatusLevel::Error,
+                    );
+                    return;
+                };
+                let preflight_id = self.ui.next_deployment_preflight;
+                self.ui.next_deployment_preflight = self
+                    .ui
+                    .next_deployment_preflight
+                    .checked_add(1)
+                    .unwrap_or(1);
+                self.ui.pending_deployment_preflight = Some(preflight_id);
+                let service = self.data.provisioning.clone();
+                tokio::spawn(async move {
+                    let result = service.preflight(&request).await;
+                    let _ = tx
+                        .send(crate::events::AppEvent::DeploymentPreflightFinished {
+                            preflight_id,
+                            request,
+                            result,
+                        })
+                        .await;
+                });
+            }
+            WizardAction::StartDeployment(submission) => {
+                self.ui.pending_deployment_preflight = None;
+                self.ui.active_dialog = None;
+                match self.data.provisioning.start(submission) {
+                    Ok(handle) => {
+                        log::info!("[DEPLOY] accepted application job {}", handle.id().get());
+                        if let Some(wizard) = &mut self.ui.wizard {
+                            wizard.start_deployment(handle);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(wizard) = &mut self.ui.wizard {
+                            wizard.loading = false;
+                        }
+                        self.set_status(
+                            format!("Deployment rejected: {error}"),
+                            StatusLevel::Error,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -705,15 +773,13 @@ impl App {
                 let result = dialog.handle_key(key);
                 match result {
                     EventResult::Message(msg) => {
-                        let mut close = false;
-                        if let Some(wizard) = &mut self.ui.wizard {
-                            let action = wizard.process_message(msg);
-                            if matches!(action, crate::ui::wizard::StepAction::CloseDialog) {
-                                close = true;
-                            }
-                        }
-                        if close {
-                            self.ui.active_dialog = None;
+                        if let Some(action) = self
+                            .ui
+                            .wizard
+                            .as_mut()
+                            .map(|wizard| wizard.process_message(msg))
+                        {
+                            self.handle_wizard_action(action).await;
                         }
                         true
                     }

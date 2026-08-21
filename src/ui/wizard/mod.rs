@@ -1,6 +1,6 @@
 #[macro_use]
 pub mod core;
-pub use self::core::context;
+pub use self::core::draft;
 pub use self::core::manager;
 pub mod steps;
 
@@ -28,6 +28,9 @@ pub enum StepAction {
     Status(String, crate::ui::StatusLevel),
     OpenDialog(Box<dyn crate::ui::core::Component>),
     CloseDialog,
+    ValidateInterface { name: String, is_bridge_mode: bool },
+    PreflightDeployment(crate::application::provisioning::DeploymentRequest),
+    StartDeployment(crate::application::provisioning::DeploymentSubmission),
 }
 
 impl WizardStep {

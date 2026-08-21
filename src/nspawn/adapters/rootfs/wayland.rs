@@ -1,3 +1,4 @@
+use crate::domain::secret::SecretBytes;
 use crate::nspawn::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{validate_login_shell, validate_login_username};
@@ -79,7 +80,7 @@ async fn write_user_file(
                 target.into(),
                 username.into(),
             ],
-            Some(content),
+            Some(SecretBytes::new(content)),
         )
         .await
         .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
@@ -187,7 +188,7 @@ mod tests {
             .0
             .iter()
             .any(|arg| arg == "/home/alice/.wayland-env"));
-        let env = String::from_utf8(calls[0].1.clone().unwrap()).unwrap();
+        let env = std::str::from_utf8(calls[0].1.as_ref().unwrap().as_slice()).unwrap();
         assert!(env.contains("WAYLAND_DISPLAY=/mnt/wayland-socket"));
         assert!(!env.lines().any(|line| line.starts_with("export DISPLAY=")));
         assert!(!env.contains("host-x11"));
@@ -217,7 +218,7 @@ mod tests {
             .unwrap();
 
         let calls = calls.lock().unwrap();
-        let fish_env = String::from_utf8(calls[1].1.clone().unwrap()).unwrap();
+        let fish_env = std::str::from_utf8(calls[1].1.as_ref().unwrap().as_slice()).unwrap();
         assert!(fish_env.contains("WAYLAND_DISPLAY /mnt/wayland-socket"));
         assert!(!fish_env
             .lines()

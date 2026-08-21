@@ -1,3 +1,4 @@
+use crate::domain::secret::SecretBytes;
 use crate::nspawn::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::sys::log_output;
@@ -160,7 +161,7 @@ async fn write_system_file(
                 "_".into(),
                 target.into(),
             ],
-            Some(content),
+            Some(SecretBytes::new(content)),
         )
         .await
         .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
@@ -328,7 +329,7 @@ mod tests {
         .unwrap();
 
         let calls = calls.lock().unwrap();
-        let content = String::from_utf8(calls[1].1.clone().unwrap()).unwrap();
+        let content = std::str::from_utf8(calls[1].1.as_ref().unwrap().as_slice()).unwrap();
         assert_eq!(content, "LANG=C\nNVIDIA_VISIBLE_DEVICES=void\n");
     }
 

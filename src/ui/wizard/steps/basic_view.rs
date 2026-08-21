@@ -1,6 +1,6 @@
 use crate::ui::core::{Component, EventResult, FocusTracker};
 use crate::ui::widgets::inputs::text_box::TextBox;
-use crate::ui::wizard::context::{BasicConfig, WizardContext};
+use crate::ui::wizard::draft::{BasicConfig, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
@@ -114,7 +114,7 @@ impl Component for BasicStepView {
 }
 
 impl StepComponent for BasicStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.basic.name = self.name.value().to_string();
         if self.show_hostname {
             ctx.basic.hostname = self.hostname.value().to_string();
@@ -123,7 +123,7 @@ impl StepComponent for BasicStepView {
         }
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

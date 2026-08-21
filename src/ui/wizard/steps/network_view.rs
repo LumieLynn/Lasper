@@ -4,7 +4,7 @@ use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::wizard::context::{NetworkConfig, WizardContext};
+use crate::ui::wizard::draft::{NetworkConfig, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
@@ -313,7 +313,7 @@ impl StepComponent for NetworkStepView {
         }
     }
 
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.network.mode = self.mode_selector.selected_idx();
         if self.mode_selector.selected_idx() == 3 {
             if self.is_custom_bridge() {
@@ -339,7 +339,7 @@ impl StepComponent for NetworkStepView {
         ctx.network.port_list = self.port_list.items().to_vec();
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

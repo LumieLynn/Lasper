@@ -10,16 +10,16 @@ pub mod storage_view;
 pub mod user_view;
 
 use crate::ui::core::Component;
-use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::draft::WizardDraft;
 use crate::ui::wizard::WizardStep;
 
 pub trait StepComponent: Component {
-    fn commit_to_context(&self, ctx: &mut WizardContext);
+    fn commit_to_draft(&self, ctx: &mut WizardDraft);
     fn render_step(
         &mut self,
         f: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
-        context: &WizardContext,
+        context: &WizardDraft,
     );
     fn handle_message(
         &mut self,
@@ -29,7 +29,7 @@ pub trait StepComponent: Component {
     }
 }
 
-pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComponent> {
+pub fn build_view(step: WizardStep, context: &WizardDraft) -> Box<dyn StepComponent> {
     match step {
         WizardStep::Source => Box::new(source_view::SourceStepView::new(&context.source)),
 
@@ -41,12 +41,12 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         WizardStep::Basic => Box::new(basic_view::BasicStepView::new(
             &context.basic.extract_config(),
             &context.entries,
-            context.source.kind != crate::ui::wizard::context::SourceKind::Oci,
+            context.source.kind != crate::ui::wizard::draft::SourceKind::Oci,
         )),
 
         WizardStep::Storage => Box::new(storage_view::StorageStepView::new(&context.storage)),
 
-        WizardStep::User => Box::new(user_view::UserStepView::new(&context.user.extract_config())),
+        WizardStep::User => Box::new(user_view::UserStepView::new(&context.user)),
 
         WizardStep::Network => Box::new(network_view::NetworkStepView::new(
             &context.network.extract_config(),
@@ -75,20 +75,7 @@ pub fn build_view(step: WizardStep, context: &WizardContext) -> Box<dyn StepComp
         )),
 
         WizardStep::Deploy => {
-            let rx = context
-                .deploy
-                .log_rx
-                .borrow_mut()
-                .take()
-                .unwrap_or_else(|| context.deploy.log_tx.subscribe());
-            Box::new(deploy_view::DeployStepView::new(
-                rx,
-                context.deploy.done.clone(),
-                context.deploy.success.clone(),
-                context.deploy.cancelled.clone(),
-                context.deploy.rolling_back.clone(),
-                context.deploy.cancellation.clone(),
-            ))
+            unreachable!("the deployment view requires an application-owned job handle")
         }
     }
 }

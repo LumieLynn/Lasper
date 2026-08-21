@@ -10,70 +10,14 @@ pub use bootstrap_operation::BootstrapStore;
 pub use image_operation::ImageImportStore;
 pub use oci_operation::OciPullStore;
 
-use crate::events::AppEvent;
+pub(crate) use crate::application::provisioning::{
+    DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentProgress as DeployProgress,
+};
+use crate::application::provisioning::{DeploymentJobContext, DeploymentSecrets};
 use crate::nspawn::adapters::storage::StorageBackend;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, ContainerConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeployProgress {
-    pub label: String,
-    pub permille: u16,
-}
-
-impl DeployProgress {
-    pub fn new(label: impl Into<String>, permille: u16) -> Self {
-        Self {
-            label: label.into(),
-            permille: permille.min(1000),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DeployLogEvent {
-    Line(String),
-    Progress(DeployProgress),
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct DeploymentCancellation {
-    requested: Arc<AtomicBool>,
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl DeploymentCancellation {
-    pub fn request(&self) {
-        if !self.requested.swap(true, Ordering::SeqCst) {
-            self.notify.notify_waiters();
-        }
-    }
-
-    pub fn is_requested(&self) -> bool {
-        self.requested.load(Ordering::SeqCst)
-    }
-
-    pub fn checkpoint(&self) -> Result<()> {
-        if self.is_requested() {
-            Err(NspawnError::DeploymentCancelled)
-        } else {
-            Ok(())
-        }
-    }
-
-    pub async fn cancelled(&self) {
-        loop {
-            let notified = self.notify.notified();
-            if self.is_requested() {
-                return;
-            }
-            notified.await;
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppliedResource {
@@ -181,17 +125,6 @@ impl ApplyReport {
             .chain(&self.storage_removal_blockers)
             .map(String::as_str)
             .collect()
-    }
-}
-
-/// RAII guard to ensure the 'done' flag is always set, even on panic or early return.
-struct DoneGuard {
-    done: Arc<AtomicBool>,
-}
-
-impl Drop for DoneGuard {
-    fn drop(&mut self) {
-        self.done.store(true, Ordering::SeqCst);
     }
 }
 
@@ -341,45 +274,32 @@ pub(crate) fn process_state_unknown(label: &str, error: std::io::Error) -> Nspaw
     ))
 }
 
-/// Orchestrates the asynchronous deployment of a new container.
+/// Runs one deployment using application-owned job state and event transport.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_deploy_task(
+pub(crate) async fn run_deployment(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
-    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    done: Arc<AtomicBool>,
-    success: Arc<AtomicBool>,
-    cancelled: Arc<AtomicBool>,
-    rolling_back: Arc<AtomicBool>,
-    cancellation: DeploymentCancellation,
-    tx: tokio::sync::mpsc::Sender<AppEvent>,
-) {
-    // 1. Initialize the guard. When this is dropped (at end of function or on panic),
-    // it will unconditionally set done = true, unblocking the UI spinner.
-    let _guard = DoneGuard { done };
-
-    // 2. Perform deployment
-    if let Err(e) = run_deploy_internal(
+    secrets: DeploymentSecrets,
+    job: DeploymentJobContext,
+) -> Result<()> {
+    let logs = job.event_sender();
+    let result = run_deploy_internal(
         deployer,
         storage,
         name.clone(),
         cfg,
         nvidia_profile,
         exec_ctx,
-        logs.clone(),
-        cancellation.clone(),
-        rolling_back,
+        secrets,
+        job,
     )
-    .await
-    {
-        let was_cancelled = is_cancelled_outcome(&e);
-        // Attempt to log the error. We use a non-blocking approach to prevent deadlocks
-        // if the log channel happens to be full.
-        let err_msg = format!("FATAL ERROR: {}", e);
+    .await;
+    if let Err(error) = &result {
+        let err_msg = format!("FATAL ERROR: {error}");
         match logs.try_send(DeployLogEvent::Line(err_msg.clone())) {
             Ok(_) => {}
             Err(_) => {
@@ -391,20 +311,11 @@ pub async fn run_deploy_task(
                 );
             }
         }
-        success.store(false, Ordering::SeqCst);
-        cancelled.store(was_cancelled, Ordering::SeqCst);
-        let response = if was_cancelled {
-            crate::nspawn::ops::BackendResponse::DeployCancelled(e.to_string())
-        } else {
-            crate::nspawn::ops::BackendResponse::DeployFailed(e.to_string())
-        };
-        let _ = tx.send(AppEvent::BackendResult(response)).await;
-    } else {
-        success.store(true, Ordering::SeqCst);
     }
+    result
 }
 
-fn is_cancelled_outcome(error: &NspawnError) -> bool {
+pub(crate) fn is_cancelled_outcome(error: &NspawnError) -> bool {
     matches!(
         error,
         NspawnError::DeploymentCancelled | NspawnError::DeploymentCancellationRollbackIncomplete(_)
@@ -419,10 +330,11 @@ async fn run_deploy_internal(
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile>,
     exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
-    logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-    cancellation: DeploymentCancellation,
-    rolling_back: Arc<AtomicBool>,
+    mut secrets: DeploymentSecrets,
+    job: DeploymentJobContext,
 ) -> Result<()> {
+    let logs = job.event_sender();
+    let cancellation = job.cancellation();
     crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
     let system_operations = exec_ctx.system_operations.clone();
 
@@ -536,12 +448,13 @@ async fn run_deploy_internal(
                 .supports_nspawn_commands(&actual_rootfs_target)
                 .await?;
 
+        let has_account_changes = secrets.has_account_changes();
         if supports_offline_commands {
-            if let Some(pwd) = &cfg.root_password {
+            if let Some(password) = secrets.take_root_password() {
                 push_log!("Setting root password...".to_string());
                 for warning in exec_ctx
                     .rootfs
-                    .set_root_password(&actual_rootfs_target, pwd)
+                    .set_root_password(&actual_rootfs_target, password)
                     .await?
                 {
                     log::warn!("{}", warning);
@@ -552,9 +465,12 @@ async fn run_deploy_internal(
 
             for user in &cfg.users {
                 push_log!(format!("Creating user {}...", user.username));
+                let password = secrets
+                    .take_user_password(&user.username)
+                    .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 for warning in exec_ctx
                     .rootfs
-                    .create_user(&actual_rootfs_target, user)
+                    .create_user(&actual_rootfs_target, user, password)
                     .await?
                 {
                     log::warn!("{}", warning);
@@ -574,7 +490,7 @@ async fn run_deploy_internal(
         } else if !has_os_layout {
             log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
             push_log!("WARNING: Could not verify the rootfs OS layout. Skipping passwords and user creation.".to_string());
-        } else if cfg.root_password.is_some() || !cfg.users.is_empty() {
+        } else if has_account_changes {
             log::warn!("[AUDIT] [Container: {}] rootfs has no /usr tree required by systemd-nspawn offline commands. Skipping account modifications.", name);
             push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());
         }
@@ -774,7 +690,7 @@ async fn run_deploy_internal(
 
     if let Err(error) = result {
         push_log!(format!("Deployment stopped: {}", error));
-        rolling_back.store(true, Ordering::SeqCst);
+        job.set_rolling_back(true);
         push_log!("Rolling back resources created by this deployment...".to_string());
 
         let external_ownership_confirmed = report.owns(AppliedResource::ExternalImage);
@@ -791,7 +707,7 @@ async fn run_deploy_internal(
             push_log!(format!("WARNING: {warning}"));
         }
 
-        rolling_back.store(false, Ordering::SeqCst);
+        job.set_rolling_back(false);
         if rollback_errors.is_empty() {
             push_log!("Rollback complete.".to_string());
             return Err(error);

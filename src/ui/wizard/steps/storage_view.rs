@@ -6,7 +6,7 @@ use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::wizard::context::{StorageState, WizardContext};
+use crate::ui::wizard::draft::{StorageState, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
@@ -425,7 +425,7 @@ impl Component for StorageStepView {
 }
 
 impl StepComponent for StorageStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         if let Some(idx) = self.list.selected_idx() {
             ctx.storage.type_idx = idx;
         }
@@ -442,7 +442,7 @@ impl StepComponent for StorageStepView {
         ctx.storage.disk_root_partition = self.selected_root_partition();
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

@@ -1,13 +1,11 @@
 use crate::nspawn::adapters::config::nspawn_file::nspawn_config_content;
 use crate::nspawn::adapters::config::systemd_unit::systemd_override_content;
-use crate::nspawn::adapters::storage::{StorageBackend, StorageType};
+use crate::nspawn::adapters::storage::StorageType;
 use crate::nspawn::models::{ArtifactSpec, BootstrapMethod, BootstrapSpec};
 use crate::nspawn::models::{
     BindMount, ContainerConfig, CreateUser, NetworkMode, OciNetworkMode, PortForward,
     PrivateUsersMode,
 };
-use crate::nspawn::ops::provision::builders::{bootstrap, clone, image, oci};
-use crate::nspawn::ops::provision::Deployer;
 
 /// The different methods available for acquiring a rootfs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -57,7 +55,6 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UserConfig {
-    pub root_password: Option<String>,
     pub users: Vec<CreateUser>,
 }
 
@@ -123,10 +120,11 @@ impl ContainerConfigBuilder {
             disk_config: None,
         });
 
-        let user = self.user.as_ref().cloned().unwrap_or(UserConfig {
-            root_password: None,
-            users: vec![],
-        });
+        let user = self
+            .user
+            .as_ref()
+            .cloned()
+            .unwrap_or(UserConfig { users: vec![] });
 
         let device_binds = passthrough.device_binds.clone();
 
@@ -150,7 +148,6 @@ impl ContainerConfigBuilder {
             private_users,
             graphics_acceleration: passthrough.graphics_acceleration,
             gpu_passthrough_all: passthrough.gpu_passthrough_all,
-            root_password: user.root_password.clone(),
             users: user.users.clone(),
             wayland_socket: passthrough.wayland_socket.clone(),
             nvidia_gpu: passthrough.nvidia_gpu,
@@ -228,95 +225,6 @@ impl ContainerConfigBuilder {
             preview: content,
             nvidia_profile: passthrough.nvidia_profile.clone(),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn get_deployer_and_storage(
-        &self,
-        system_operations: crate::nspawn::ops::SystemOperationStore,
-        nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
-        systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
-        managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
-        bootstrap: crate::nspawn::ops::provision::BootstrapStore,
-        image_import: crate::nspawn::ops::provision::ImageImportStore,
-        oci_pull: crate::nspawn::ops::provision::OciPullStore,
-        allow_unsafe_remote_tar: bool,
-    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        use crate::nspawn::adapters::storage::*;
-        use crate::nspawn::ops::provision::*;
-
-        let storage_cfg = self.storage.as_ref().cloned().unwrap_or(StorageConfig {
-            storage_type: StorageType::Directory,
-            disk_config: None,
-        });
-
-        let storage: Box<dyn StorageBackend> =
-            match storage_cfg.storage_type {
-                StorageType::Directory => Box::new(DirectoryBackend::new(managed_storage.clone()))
-                    as Box<dyn StorageBackend>,
-                StorageType::Subvolume => Box::new(SubvolumeBackend::new(managed_storage.clone()))
-                    as Box<dyn StorageBackend>,
-                StorageType::DiskImage => Box::new(DiskImageBackend::new(
-                    storage_cfg
-                        .disk_config
-                        .unwrap_or(crate::nspawn::models::DiskImageConfig {
-                            source: crate::nspawn::models::DiskImageSource::CreateNew {
-                                size: "2G".to_string(),
-                                fs_type: crate::nspawn::models::DiskImageFilesystem::Ext4,
-                            },
-                            use_partition_table: true,
-                            root_partition: None,
-                        }),
-                    managed_storage,
-                )) as Box<dyn StorageBackend>,
-            };
-
-        let source = self
-            .source
-            .as_ref()
-            .cloned()
-            .expect("deployment source must be configured");
-
-        let deployer: Box<dyn Deployer> = match source {
-            SourceConfig::Copy { source_name } => Box::new(clone::CloneDeployer {
-                source_name,
-                system_operations,
-                nspawn,
-                systemd_unit,
-            }) as Box<dyn Deployer>,
-            SourceConfig::Oci {
-                reference,
-                read_only,
-                network,
-            } => Box::new(oci::OciDeployer {
-                reference,
-                read_only,
-                network,
-                oci_pull,
-                nspawn,
-            }) as Box<dyn Deployer>,
-            SourceConfig::Artifact(artifact) => Box::new(image::ImageDeployer {
-                source: image::ImageSource::Local(artifact.path.clone()),
-                format: image::ImageFormat::from_artifact(&artifact),
-                image_import: image_import.clone(),
-                allow_unsafe_remote_tar: false,
-            }) as Box<dyn Deployer>,
-            SourceConfig::Pull { url, is_raw } => Box::new(image::ImageDeployer {
-                source: image::ImageSource::Remote(url),
-                format: if is_raw {
-                    image::ImageFormat::Raw
-                } else {
-                    image::ImageFormat::Tar
-                },
-                image_import,
-                allow_unsafe_remote_tar,
-            }) as Box<dyn Deployer>,
-            SourceConfig::Bootstrap(spec) => {
-                Box::new(bootstrap::BootstrapDeployer { spec, bootstrap }) as Box<dyn Deployer>
-            }
-        };
-
-        (deployer, storage)
     }
 }
 

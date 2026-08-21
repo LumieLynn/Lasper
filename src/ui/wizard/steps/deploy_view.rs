@@ -1,10 +1,12 @@
-use crate::nspawn::ops::provision::{DeployLogEvent, DeployProgress, DeploymentCancellation};
+use crate::application::provisioning::{
+    DeploymentEvent, DeploymentJobHandle, DeploymentProgress, DeploymentStatus,
+};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::soft_wrap_text;
 use crate::ui::widgets::dialogs::confirmation::ConfirmationDialog;
 use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
-use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::draft::WizardDraft;
 use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -14,43 +16,19 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Gauge, Paragraph},
     Frame,
 };
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-
-use tokio::sync::broadcast;
-
 pub struct DeployStepView {
-    log_rx: Option<broadcast::Receiver<DeployLogEvent>>,
-    done: Arc<AtomicBool>,
-    success: Arc<AtomicBool>,
-    cancelled: Arc<AtomicBool>,
-    rolling_back: Arc<AtomicBool>,
-    cancellation: DeploymentCancellation,
+    job: DeploymentJobHandle,
     status_block: TextBlock,
     log_list: SelectableList<String>,
     internal_logs: Vec<String>,
-    progress: Option<DeployProgress>,
+    progress: Option<DeploymentProgress>,
     cancel_dialog: Option<ConfirmationDialog>,
 }
 
 impl DeployStepView {
-    pub fn new(
-        log_rx: broadcast::Receiver<DeployLogEvent>,
-        done: Arc<AtomicBool>,
-        success: Arc<AtomicBool>,
-        cancelled: Arc<AtomicBool>,
-        rolling_back: Arc<AtomicBool>,
-        cancellation: DeploymentCancellation,
-    ) -> Self {
+    pub fn new(job: DeploymentJobHandle) -> Self {
         Self {
-            log_rx: Some(log_rx),
-            done,
-            success,
-            cancelled,
-            rolling_back,
-            cancellation,
+            job,
             status_block: TextBlock::new(" Status ", "Deploying...".to_string()),
             log_list: SelectableList::new(" Deployment logs ", vec![], |s| s.clone()),
             internal_logs: vec![],
@@ -61,25 +39,18 @@ impl DeployStepView {
 
     fn update_logs(&mut self) -> bool {
         let mut changed = false;
-        if let Some(rx) = &mut self.log_rx {
-            loop {
-                match rx.try_recv() {
-                    Ok(DeployLogEvent::Line(log)) => {
-                        self.progress = None;
-                        self.internal_logs.push(log);
-                        changed = true;
-                    }
-                    Ok(DeployLogEvent::Progress(progress)) => {
-                        self.progress = Some(progress);
-                        changed = true;
-                    }
-                    Err(broadcast::error::TryRecvError::Lagged(n)) => {
-                        self.internal_logs
-                            .push(format!("[{} logs skipped due to lag]", n));
-                        changed = true;
-                    }
-                    Err(_) => break, // Empty or Closed
+        loop {
+            match self.job.try_recv() {
+                Ok(DeploymentEvent::Line(log)) => {
+                    self.progress = None;
+                    self.internal_logs.push(log);
+                    changed = true;
                 }
+                Ok(DeploymentEvent::Progress(progress)) => {
+                    self.progress = Some(progress);
+                    changed = true;
+                }
+                Err(_) => break,
             }
         }
         changed
@@ -104,26 +75,24 @@ impl Component for DeployStepView {
             ])
             .split(area);
 
-        let done = self.done.load(Ordering::SeqCst);
-        let success = self.success.load(Ordering::SeqCst);
-        let cancelled = self.cancelled.load(Ordering::SeqCst);
-        let rolling_back = self.rolling_back.load(Ordering::SeqCst);
+        let job_status = self.job.status();
+        let done = job_status.is_finished();
         if done {
             self.cancel_dialog = None;
         }
 
-        let status = if rolling_back {
+        let status = if job_status == DeploymentStatus::RollingBack {
             "Rolling back deployment changes...".to_string()
-        } else if !done && self.cancellation.is_requested() {
+        } else if !done && self.job.cancellation_requested() {
             "Cancellation requested; waiting for a safe rollback point...".to_string()
-        } else if !done {
-            "Deploying... please wait.".to_string()
-        } else if success {
-            "SUCCESS: Deployment completed.".to_string()
-        } else if cancelled {
-            "CANCELLED: Deployment stopped; review rollback logs.".to_string()
         } else {
-            "FAILED: Deployment encountered an error.".to_string()
+            match &job_status {
+                DeploymentStatus::Running => "Deploying... please wait.".to_string(),
+                DeploymentStatus::RollingBack => unreachable!(),
+                DeploymentStatus::Succeeded => "SUCCESS: Deployment completed.".to_string(),
+                DeploymentStatus::Cancelled(message) => format!("CANCELLED: {message}"),
+                DeploymentStatus::Failed(message) => format!("FAILED: {message}"),
+            }
         };
         self.status_block.set_content(status);
 
@@ -161,7 +130,7 @@ impl Component for DeployStepView {
 
         let hint = if done {
             " [Enter/q/Esc] Close "
-        } else if self.cancellation.is_requested() {
+        } else if self.job.cancellation_requested() {
             " Cancellation in progress "
         } else {
             " [q/Esc] Cancel deployment "
@@ -178,7 +147,7 @@ impl Component for DeployStepView {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
-        let done = self.done.load(Ordering::SeqCst);
+        let done = self.job.status().is_finished();
         if done {
             self.cancel_dialog = None;
             return match key.code {
@@ -193,7 +162,7 @@ impl Component for DeployStepView {
             return match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => {
                     self.cancel_dialog = None;
-                    self.cancellation.request();
+                    self.job.request_cancel();
                     EventResult::Consumed
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
@@ -208,7 +177,7 @@ impl Component for DeployStepView {
         }
 
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc if !self.cancellation.is_requested() => {
+            KeyCode::Char('q') | KeyCode::Esc if !self.job.cancellation_requested() => {
                 self.cancel_dialog = Some(ConfirmationDialog::new(
                     "Cancel Deployment?",
                     "Stop this deployment and roll back changes created by it?",
@@ -226,11 +195,11 @@ impl Component for DeployStepView {
 }
 
 impl StepComponent for DeployStepView {
-    fn commit_to_context(&self, _ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, _ctx: &mut WizardDraft) {
         // Deploy is terminal state
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }
@@ -238,6 +207,7 @@ impl StepComponent for DeployStepView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::{deployment_job_channel, DeploymentId};
 
     #[test]
     fn long_log_lines_soft_wrap_by_display_width() {
@@ -260,17 +230,9 @@ mod tests {
 
     #[test]
     fn cancellation_requires_confirmation() {
-        let (tx, rx) = broadcast::channel(4);
-        let cancellation = DeploymentCancellation::default();
-        let mut view = DeployStepView::new(
-            rx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            cancellation.clone(),
-        );
-        drop(tx);
+        let (handle, context) = deployment_job_channel(DeploymentId::new(1).unwrap());
+        let cancellation = context.cancellation();
+        let mut view = DeployStepView::new(handle);
 
         let result = view.handle_key(KeyEvent::new(
             KeyCode::Esc,
@@ -293,17 +255,9 @@ mod tests {
 
     #[test]
     fn declining_cancellation_keeps_deployment_running() {
-        let (tx, rx) = broadcast::channel(4);
-        let cancellation = DeploymentCancellation::default();
-        let mut view = DeployStepView::new(
-            rx,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-            cancellation.clone(),
-        );
-        drop(tx);
+        let (handle, context) = deployment_job_channel(DeploymentId::new(1).unwrap());
+        let cancellation = context.cancellation();
+        let mut view = DeployStepView::new(handle);
 
         let _ = view.handle_key(KeyEvent::new(
             KeyCode::Char('q'),

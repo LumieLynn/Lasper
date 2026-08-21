@@ -90,9 +90,8 @@ impl Component for PasswordBox {
     }
 
     fn validate(&mut self) -> Result<(), String> {
-        let val = self.base.input.value().to_string();
         if let Some(validator) = &self.validator {
-            if let Err(e) = validator(&val) {
+            if let Err(e) = validator(self.base.input.value()) {
                 self.base.error_msg = Some(e.clone());
                 return Err(e);
             }

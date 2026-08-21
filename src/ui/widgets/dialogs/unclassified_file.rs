@@ -4,7 +4,7 @@ use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::wizard::core::context::UnclassifiedFile;
+use crate::ui::wizard::core::draft::UnclassifiedFile;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -63,8 +63,8 @@ impl UnclassifiedFileDialog {
             destination: TextBox::new(" Destination Path ", dest),
             category_list,
             readonly: Checkbox::new(" Read-only", file.readonly),
-            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
-            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+            btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", || AppMessage::Wizard(WizardMessage::DialogCancel)),
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
         }

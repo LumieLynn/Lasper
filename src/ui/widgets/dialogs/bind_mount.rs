@@ -70,8 +70,8 @@ impl BindMountBox {
                 ],
                 0,
             ),
-            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
-            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+            btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", || AppMessage::Wizard(WizardMessage::DialogCancel)),
 
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),

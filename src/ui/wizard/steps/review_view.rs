@@ -1,6 +1,6 @@
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::ui::widgets::display::text_block::TextBlock;
-use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::draft::WizardDraft;
 use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -54,11 +54,11 @@ impl Component for ReviewStepView {
 }
 
 impl StepComponent for ReviewStepView {
-    fn commit_to_context(&self, _ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, _ctx: &mut WizardDraft) {
         // Preview is read-only view of context
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardDraft) {
         // Reactive update: ensure preview reflects current context before rendering
         self.preview.set_content(context.build_preview_nspawn());
         self.render(f, area);

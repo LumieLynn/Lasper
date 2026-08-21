@@ -1,8 +1,13 @@
+use crate::application::provisioning::{
+    DeploymentRequest, DeploymentSecrets, DeploymentSource, DeploymentStorage,
+    DeploymentSubmission, UserSecret,
+};
+use crate::domain::secret::zeroize_string;
 pub use crate::nspawn::adapters::config::builder::{
     BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
     PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
 };
-use crate::nspawn::adapters::storage::{StorageBackend, StorageInfo, StorageType};
+use crate::nspawn::adapters::storage::{StorageInfo, StorageType};
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
@@ -11,11 +16,7 @@ use crate::nspawn::models::{
 };
 use crate::nspawn::models::{ContainerEntry, ImageEntry};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
-use crate::nspawn::ops::provision::{DeployLogEvent, Deployer, DeploymentCancellation};
-use crate::nspawn::ops::PermissionLevel;
-use crate::nspawn::sys::ExecutionContext;
-use std::sync::{atomic::AtomicBool, Arc};
-use tokio::sync::broadcast;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfiguredSourceProfile {
@@ -305,22 +306,84 @@ impl StorageState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(PartialEq)]
+pub struct UserDraft {
+    pub username: String,
+    pub password: String,
+    pub sudoer: bool,
+    pub shell: String,
+}
+
+impl UserDraft {
+    pub fn account(&self) -> CreateUser {
+        CreateUser {
+            username: self.username.clone(),
+            sudoer: self.sudoer,
+            shell: self.shell.clone(),
+        }
+    }
+
+    pub fn editing_copy(&self) -> Self {
+        Self {
+            username: self.username.clone(),
+            password: self.password.clone(),
+            sudoer: self.sudoer,
+            shell: self.shell.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for UserDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserDraft")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .field("sudoer", &self.sudoer)
+            .field("shell", &self.shell)
+            .finish()
+    }
+}
+
+impl Drop for UserDraft {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.password);
+    }
+}
+
 pub struct UserState {
     pub root_password: String,
-    pub users: Vec<CreateUser>,
+    pub users: Vec<UserDraft>,
+}
+
+impl std::fmt::Debug for UserState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserState")
+            .field("root_password", &"[REDACTED]")
+            .field("users", &self.users)
+            .finish()
+    }
+}
+
+impl Drop for UserState {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.root_password);
+    }
 }
 
 impl UserState {
     pub fn extract_config(&self) -> UserConfig {
         UserConfig {
-            root_password: if self.root_password.is_empty() {
-                None
-            } else {
-                Some(self.root_password.clone())
-            },
-            users: self.users.clone(),
+            users: self.users.iter().map(UserDraft::account).collect(),
         }
+    }
+
+    fn take_secrets(&mut self) -> DeploymentSecrets {
+        let users = self
+            .users
+            .iter_mut()
+            .map(|user| UserSecret::new(user.username.clone(), std::mem::take(&mut user.password)))
+            .collect();
+        DeploymentSecrets::new(std::mem::take(&mut self.root_password), users)
     }
 }
 
@@ -442,78 +505,23 @@ impl PassthroughState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReviewState {
-    pub preview: String,
-}
-
-use std::cell::RefCell;
-
-pub struct DeployState {
-    pub log_tx: broadcast::Sender<DeployLogEvent>,
-    pub log_rx: RefCell<Option<broadcast::Receiver<DeployLogEvent>>>,
-    pub done: Arc<AtomicBool>,
-    pub success: Arc<AtomicBool>,
-    pub cancelled: Arc<AtomicBool>,
-    pub rolling_back: Arc<AtomicBool>,
-    pub cancellation: DeploymentCancellation,
-}
-
-impl Clone for DeployState {
-    fn clone(&self) -> Self {
-        Self {
-            log_tx: self.log_tx.clone(),
-            log_rx: RefCell::new(Some(self.log_tx.subscribe())),
-            done: self.done.clone(),
-            success: self.success.clone(),
-            cancelled: self.cancelled.clone(),
-            rolling_back: self.rolling_back.clone(),
-            cancellation: self.cancellation.clone(),
-        }
-    }
-}
-
-impl PartialEq for DeployState {
-    fn eq(&self, _other: &Self) -> bool {
-        true
-    }
-}
-
-impl std::fmt::Debug for DeployState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DeployState")
-            .field("done", &self.done)
-            .field("success", &self.success)
-            .field("cancelled", &self.cancelled)
-            .field("rolling_back", &self.rolling_back)
-            .finish_non_exhaustive()
-    }
-}
-
 /// Holds shared data for the multi-step container creation wizard.
-#[derive(Debug, Clone, PartialEq)]
-pub struct WizardContext {
+pub struct WizardDraft {
     pub source: SourceState,
     pub basic: BasicState,
     pub storage: StorageState,
     pub user: UserState,
     pub network: NetworkState,
     pub passthrough: PassthroughState,
-    pub review: ReviewState,
-    pub deploy: DeployState,
     pub entries: Vec<ContainerEntry>,
     pub images: Vec<ImageEntry>,
     pub xdg_runtime: Option<String>,
-    pub permission_level: PermissionLevel,
-    pub exec_ctx: Arc<ExecutionContext>,
 }
 
-impl WizardContext {
+impl WizardDraft {
     pub async fn new(
         entries: Vec<ContainerEntry>,
         images: Vec<ImageEntry>,
-        permission_level: PermissionLevel,
-        exec_ctx: Arc<ExecutionContext>,
         config: Arc<crate::config::AppConfig>,
     ) -> Self {
         let xdg_runtime = crate::nspawn::platform::capabilities::get_xdg_runtime()
@@ -646,26 +654,9 @@ impl WizardContext {
                 unclassified_files: vec![],
                 hardware_scanning: true,
             },
-            review: ReviewState {
-                preview: "".to_string(),
-            },
-            deploy: {
-                let (log_tx, log_rx) = broadcast::channel(1000);
-                DeployState {
-                    log_tx,
-                    log_rx: RefCell::new(Some(log_rx)),
-                    done: Arc::new(AtomicBool::new(false)),
-                    success: Arc::new(AtomicBool::new(false)),
-                    cancelled: Arc::new(AtomicBool::new(false)),
-                    rolling_back: Arc::new(AtomicBool::new(false)),
-                    cancellation: DeploymentCancellation::default(),
-                }
-            },
             entries,
             images,
             xdg_runtime,
-            permission_level,
-            exec_ctx,
         }
     }
 
@@ -686,6 +677,58 @@ impl WizardContext {
 
     pub fn build_preview_nspawn(&self) -> String {
         self.build_config().preview
+    }
+
+    pub fn build_deployment_request(&self) -> DeploymentRequest {
+        let builder = self.builder();
+        let built = builder.build_config(self.xdg_runtime.as_deref());
+        let source = match builder
+            .source
+            .expect("wizard submission requires a configured source")
+        {
+            SourceConfig::Copy { source_name } => DeploymentSource::Copy { source_name },
+            SourceConfig::Oci {
+                reference,
+                read_only,
+                network,
+            } => DeploymentSource::Oci {
+                reference,
+                read_only,
+                network,
+            },
+            SourceConfig::Bootstrap(spec) => DeploymentSource::Bootstrap(spec),
+            SourceConfig::Pull { url, is_raw } => DeploymentSource::Pull { url, is_raw },
+            SourceConfig::Artifact(spec) => DeploymentSource::Artifact(spec),
+        };
+        let storage = match builder
+            .storage
+            .expect("wizard submission requires configured storage")
+        {
+            StorageConfig {
+                storage_type: StorageType::Directory,
+                ..
+            } => DeploymentStorage::Directory,
+            StorageConfig {
+                storage_type: StorageType::Subvolume,
+                ..
+            } => DeploymentStorage::Subvolume,
+            StorageConfig {
+                storage_type: StorageType::DiskImage,
+                disk_config,
+            } => DeploymentStorage::DiskImage(disk_config.unwrap_or_default()),
+        };
+
+        DeploymentRequest {
+            config: built.cfg,
+            source,
+            storage,
+            nvidia_profile: built.nvidia_profile,
+            allow_unsafe_remote_tar: self.source.unsafe_remote_tar_accepted(),
+        }
+    }
+
+    pub fn take_submission(&mut self, request: DeploymentRequest) -> DeploymentSubmission {
+        DeploymentSubmission::new(request, self.user.take_secrets())
     }
 
     fn configured_profiles(
@@ -735,30 +778,6 @@ impl WizardContext {
             default_profiles,
             resolved.default_method,
             resolved.default_profile,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn get_deployer_and_storage(
-        &self,
-        system_operations: crate::nspawn::ops::SystemOperationStore,
-        nspawn: crate::nspawn::adapters::config::NspawnConfigStore,
-        systemd_unit: crate::nspawn::adapters::config::SystemdUnitStore,
-        managed_storage: crate::nspawn::adapters::storage::ManagedStorageStore,
-        bootstrap: crate::nspawn::ops::provision::BootstrapStore,
-        image_import: crate::nspawn::ops::provision::ImageImportStore,
-        oci_pull: crate::nspawn::ops::provision::OciPullStore,
-    ) -> (Box<dyn Deployer>, Box<dyn StorageBackend>) {
-        let allow_unsafe_remote_tar = self.source.unsafe_remote_tar_accepted();
-        self.builder().get_deployer_and_storage(
-            system_operations,
-            nspawn,
-            systemd_unit,
-            managed_storage,
-            bootstrap,
-            image_import,
-            oci_pull,
-            allow_unsafe_remote_tar,
         )
     }
 
@@ -960,7 +979,7 @@ mod tests {
         )
         .unwrap();
         let (profiles, defaults, default_method, default_profile) =
-            WizardContext::configured_profiles(&config);
+            WizardDraft::configured_profiles(&config);
 
         assert!(profiles.is_empty());
         assert_eq!(defaults.len(), 1);
@@ -1028,7 +1047,7 @@ mod tests {
         )
         .unwrap();
 
-        let (profiles, defaults, _, _) = WizardContext::configured_profiles(&config);
+        let (profiles, defaults, _, _) = WizardDraft::configured_profiles(&config);
         assert!(profiles.is_empty());
         assert!(defaults.is_empty());
     }
@@ -1054,6 +1073,30 @@ mod tests {
         state.creation_method_idx = 0;
         let created = state.extract_config().disk_config.unwrap();
         assert_eq!(created.root_partition, None);
+    }
+
+    #[test]
+    fn taking_user_secrets_redacts_debug_and_clears_the_draft() {
+        let mut state = UserState {
+            root_password: "root-sentinel".into(),
+            users: vec![UserDraft {
+                username: "alice".into(),
+                password: "user-sentinel".into(),
+                sudoer: false,
+                shell: "/bin/bash".into(),
+            }],
+        };
+
+        let state_debug = format!("{state:?}");
+        assert!(!state_debug.contains("root-sentinel"));
+        assert!(!state_debug.contains("user-sentinel"));
+
+        let secrets = state.take_secrets();
+        assert!(state.root_password.is_empty());
+        assert!(state.users[0].password.is_empty());
+        let secret_debug = format!("{secrets:?}");
+        assert!(!secret_debug.contains("root-sentinel"));
+        assert!(!secret_debug.contains("user-sentinel"));
     }
 
     #[test]

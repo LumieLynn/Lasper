@@ -1,3 +1,4 @@
+use crate::domain::secret::SecretBytes;
 use crate::nspawn::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
@@ -7,9 +8,13 @@ use std::path::Path;
 pub(crate) async fn create_user_in_container(
     rootfs: &Path,
     user: &CreateUser,
+    password: Option<&str>,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<Vec<String>> {
     user.validate()?;
+    if let Some(password) = password {
+        validate_chpasswd_secret("user password", password)?;
+    }
     let shell = user.login_shell();
 
     let output = runner
@@ -40,8 +45,8 @@ pub(crate) async fn create_user_in_container(
     }
 
     let mut warnings = Vec::new();
-    if !user.password.is_empty() {
-        let output = run_chpasswd(rootfs, &user.username, &user.password, runner).await?;
+    if let Some(password) = password.filter(|password| !password.is_empty()) {
+        let output = run_chpasswd(rootfs, &user.username, password, runner).await?;
         if !output.status.success() {
             warnings.push(format!(
                 "WARNING: chpasswd failed for user '{}': {}",
@@ -82,7 +87,11 @@ async fn run_chpasswd(
     validate_chpasswd_secret("password", password)?;
     let input = format!("{username}:{password}\n").into_bytes();
     let output = runner
-        .run(rootfs, vec!["chpasswd".into()], Some(input))
+        .run(
+            rootfs,
+            vec!["chpasswd".into()],
+            Some(SecretBytes::new(input)),
+        )
         .await
         .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
     log_output("chpasswd", &output);
@@ -154,7 +163,7 @@ async fn configure_sudoer(
                     "_".into(),
                     group.into(),
                 ],
-                Some(sudoers),
+                Some(SecretBytes::new(sudoers)),
             )
             .await
             .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
@@ -222,7 +231,7 @@ mod tests {
             ..Default::default()
         };
 
-        create_user_in_container(Path::new("/tmp/rootfs"), &user, &runner)
+        create_user_in_container(Path::new("/tmp/rootfs"), &user, None, &runner)
             .await
             .unwrap();
     }
@@ -233,12 +242,17 @@ mod tests {
         runner.expect_run().never();
         let user = CreateUser {
             username: "alice".into(),
-            password: "safe\nroot:pwned".into(),
             shell: "/bin/bash".into(),
             sudoer: false,
         };
 
-        let result = create_user_in_container(Path::new("/tmp/rootfs"), &user, &runner).await;
+        let result = create_user_in_container(
+            Path::new("/tmp/rootfs"),
+            &user,
+            Some("safe\nroot:pwned"),
+            &runner,
+        )
+        .await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
     }
@@ -248,7 +262,10 @@ mod tests {
         let mut runner = MockRootfsProcessRunner::new();
         runner.expect_run().once().returning(|_, command, stdin| {
             assert_eq!(command, vec!["chpasswd"]);
-            assert_eq!(stdin.as_deref(), Some(b"root:secret-value\n".as_slice()));
+            assert_eq!(
+                stdin.as_ref().map(SecretBytes::as_slice),
+                Some(b"root:secret-value\n".as_slice())
+            );
             assert!(!command.iter().any(|arg| arg.contains("secret-value")));
             Ok(success_output())
         });
@@ -332,10 +349,13 @@ mod tests {
                     && script.contains("/etc/sudoers does not include /etc/sudoers.d")
                     && script.contains("90-lasper-$1")
                     && script.contains("visudo -cf")
-                    && stdin.as_deref().is_some_and(|policy| {
-                        policy.starts_with(b"# Managed by Lasper:")
-                            && policy.ends_with(b"%wheel ALL=(ALL:ALL) ALL\n")
-                    })
+                    && stdin
+                        .as_ref()
+                        .map(SecretBytes::as_slice)
+                        .is_some_and(|policy| {
+                            policy.starts_with(b"# Managed by Lasper:")
+                                && policy.ends_with(b"%wheel ALL=(ALL:ALL) ALL\n")
+                        })
             })
             .returning(|_, _, _| Ok(success_output()));
 

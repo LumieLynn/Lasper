@@ -5,7 +5,7 @@ use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::checklist::Checklist;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
 use crate::ui::widgets::selectors::radio_group::RadioGroup;
-use crate::ui::wizard::context::{PassthroughConfig, WizardContext};
+use crate::ui::wizard::draft::{PassthroughConfig, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
@@ -482,7 +482,7 @@ impl Component for HostIntegrationStepView {
 }
 
 impl StepComponent for HostIntegrationStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.passthrough.graphics_acceleration = self.graphics_acceleration.checked();
         ctx.passthrough.gpu_passthrough_all =
             self.graphics_acceleration.checked() && self.gpu_all_selected();
@@ -506,7 +506,7 @@ impl StepComponent for HostIntegrationStepView {
         }
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

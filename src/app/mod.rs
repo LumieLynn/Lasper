@@ -10,6 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::application::provisioning::ProvisioningService;
 use crate::application::sessions::SessionService;
 use crate::events::{AppEvent, EventHandler};
 use crate::nspawn::{
@@ -114,6 +115,8 @@ pub struct AppUi {
     pub quit_dialog: Option<crate::ui::widgets::dialogs::confirmation::ConfirmationDialog>,
     pub delete_dialog: Option<PendingImageRemoval>,
     pub active_dialog: Option<Box<dyn Component>>,
+    next_deployment_preflight: u64,
+    pending_deployment_preflight: Option<u64>,
 
     pub resize_mode: ResizeMode,
     pub container_list_pct: u16,
@@ -149,6 +152,8 @@ impl AppUi {
             quit_dialog: None,
             delete_dialog: None,
             active_dialog: None,
+            next_deployment_preflight: 1,
+            pending_deployment_preflight: None,
             resize_mode: ResizeMode::Inactive,
             container_list_pct: 30,
             left_machines_pct: 50,
@@ -203,6 +208,7 @@ pub struct AppData {
     pub runtime_catalog: std::sync::Arc<RuntimeCatalog>,
     pub machine_lifecycle: std::sync::Arc<MachineLifecycleService>,
     pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
+    pub provisioning: std::sync::Arc<ProvisioningService>,
     pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
     pub metrics: HashMap<String, ContainerMetrics>,
@@ -265,6 +271,8 @@ impl App {
                 cli_mode,
                 &exec_ctx,
             );
+        let provisioning =
+            crate::nspawn::ops::provisioning_adapter::compose_provisioning_service(&exec_ctx);
         Self {
             permissions,
             config,
@@ -290,6 +298,7 @@ impl App {
                 runtime_catalog,
                 machine_lifecycle,
                 image_lifecycle,
+                provisioning,
                 exec_ctx,
                 action_cooldown: None,
                 metrics: HashMap::new(),
@@ -481,8 +490,8 @@ impl App {
             .unwrap_or(0)
             .min(self.data.entries.len().saturating_sub(1));
         if let Some(wizard) = &mut self.ui.wizard {
-            wizard.context.entries = self.data.entries.clone();
-            wizard.context.images = self.data.images.clone();
+            wizard.draft.entries = self.data.entries.clone();
+            wizard.draft.images = self.data.images.clone();
         }
     }
 
@@ -527,7 +536,7 @@ impl App {
         self.update_detail_target();
         self.request_detail_refresh();
         if let Some(wizard) = &mut self.ui.wizard {
-            wizard.context.images = self.data.images.clone();
+            wizard.draft.images = self.data.images.clone();
         }
     }
 
@@ -586,6 +595,24 @@ impl App {
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Tick => self.tick().await,
             AppEvent::BackendResult(res) => self.handle_backend_result(res),
+            AppEvent::DeploymentPreflightFinished {
+                preflight_id,
+                request,
+                result,
+            } => {
+                if self.ui.pending_deployment_preflight != Some(preflight_id) {
+                    return;
+                }
+                self.ui.pending_deployment_preflight = None;
+                let action = self
+                    .ui
+                    .wizard
+                    .as_mut()
+                    .map(|wizard| wizard.finish_preflight(request, result));
+                if let Some(action) = action {
+                    self.handle_wizard_action(action).await;
+                }
+            }
             AppEvent::ActionDone(msg, level) => {
                 self.set_status(msg, level);
                 self.refresh().await;
@@ -1222,90 +1249,181 @@ mod tests {
 
     mod tar_risk_confirmation {
         use super::*;
-        use crate::nspawn::ops::{BackendCommand, BackendResponse, PermissionLevel};
+        use crate::application::provisioning::{
+            DeploymentError, DeploymentJobContext, DeploymentPreflight, DeploymentRequest,
+            DeploymentSubmission, ProvisioningPort, ProvisioningService,
+        };
+        use crate::nspawn::ops::PermissionLevel;
+        use crate::ui::core::{AppMessage, WizardMessage};
         use crate::ui::wizard::{Wizard, WizardStep};
+        use async_trait::async_trait;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use std::sync::Arc;
 
-        async fn prepare_confirmation() -> (
-            App,
-            tokio::sync::mpsc::Receiver<crate::nspawn::ops::BackendCommand>,
-        ) {
+        struct TarConfirmationPort;
+
+        #[async_trait]
+        impl ProvisioningPort for TarConfirmationPort {
+            async fn preflight(
+                &self,
+                request: &DeploymentRequest,
+            ) -> Result<DeploymentPreflight, DeploymentError> {
+                Ok(if request.allow_unsafe_remote_tar {
+                    DeploymentPreflight::Ready
+                } else {
+                    DeploymentPreflight::ConfirmationRequired(
+                        "GNU tar 1.34 lacks hard-link confinement".into(),
+                    )
+                })
+            }
+
+            async fn run(
+                &self,
+                _submission: DeploymentSubmission,
+                _context: DeploymentJobContext,
+            ) -> Result<(), DeploymentError> {
+                std::future::pending().await
+            }
+        }
+
+        async fn prepare_confirmation(
+        ) -> (App, tokio::sync::mpsc::Receiver<crate::events::AppEvent>) {
             let mut app = make_app();
-            let (command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+            app.data.provisioning =
+                Arc::new(ProvisioningService::new(Arc::new(TarConfirmationPort)));
+            let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+            app.ui.app_tx = Some(event_tx);
             let mut wizard = Wizard::new(
                 vec![],
                 vec![],
                 false,
-                command_tx,
                 PermissionLevel::User,
-                app.data.exec_ctx.clone(),
                 app.config.clone(),
             )
             .await;
             wizard.step = WizardStep::Review;
-            wizard.context.source.kind = crate::ui::wizard::context::SourceKind::Pull;
-            wizard.context.source.pull_url = "https://example.test/rootfs.tar".into();
-            wizard.context.source.is_pull_raw = false;
-            wizard.context.basic.name = "tar-test".into();
+            wizard.draft.source.kind = crate::ui::wizard::draft::SourceKind::Pull;
+            wizard.draft.source.pull_url = "https://example.test/rootfs.tar".into();
+            wizard.draft.source.is_pull_raw = false;
+            wizard.draft.basic.name = "tar-test".into();
+            wizard.draft.user.root_password = "root-secret".into();
+            wizard
+                .draft
+                .user
+                .users
+                .push(crate::ui::wizard::draft::UserDraft {
+                    username: "alice".into(),
+                    password: "user-secret".into(),
+                    sudoer: false,
+                    shell: "/bin/bash".into(),
+                });
             wizard.active_view = None;
             app.ui.wizard = Some(wizard);
             app.ui.show_wizard = true;
-            app.handle_backend_result(BackendResponse::TarImportRiskConfirmationRequired(
-                "GNU tar 1.34 lacks hard-link confinement".into(),
-            ));
-            (app, command_rx)
+            let action = app
+                .ui
+                .wizard
+                .as_mut()
+                .unwrap()
+                .process_message(AppMessage::Wizard(WizardMessage::Submit));
+            app.handle_wizard_action(action).await;
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            app.handle_event(event).await;
+            (app, event_rx)
         }
 
         #[tokio::test]
         async fn topmost_tar_dialog_consumes_keys_and_decline_never_submits() {
-            let (mut app, mut command_rx) = prepare_confirmation().await;
+            let (mut app, mut event_rx) = prepare_confirmation().await;
             assert!(app.ui.active_dialog.is_some());
 
             app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
                 .await;
             assert!(app.ui.active_dialog.is_some());
             assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
-            assert!(command_rx.try_recv().is_err());
+            assert!(event_rx.try_recv().is_err());
+            assert_eq!(
+                app.ui.wizard.as_ref().unwrap().draft.user.root_password,
+                "root-secret"
+            );
+            assert_eq!(
+                app.ui.wizard.as_ref().unwrap().draft.user.users[0].password,
+                "user-secret"
+            );
 
             app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
                 .await;
             assert!(app.ui.active_dialog.is_none());
             assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Review);
-            assert!(command_rx.try_recv().is_err());
-            assert!(!app
-                .ui
-                .wizard
-                .as_ref()
-                .unwrap()
-                .context
-                .deploy
-                .cancellation
-                .is_requested());
+            assert!(event_rx.try_recv().is_err());
         }
 
         #[tokio::test]
         async fn accepting_tar_risk_submits_once_and_enter_does_not_cancel_deployment() {
-            let (mut app, mut command_rx) = prepare_confirmation().await;
+            let (mut app, mut event_rx) = prepare_confirmation().await;
 
             app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
                 .await;
             assert!(app.ui.active_dialog.is_none());
-            let command = command_rx.try_recv().expect("confirmed deployment command");
-            let BackendCommand::SubmitConfig(context) = command else {
-                panic!("tar confirmation must submit the configured deployment");
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let crate::events::AppEvent::DeploymentPreflightFinished { request, .. } = &event
+            else {
+                panic!("confirmation must run deployment preflight");
             };
-            assert!(context.source.unsafe_remote_tar_accepted());
-            assert!(command_rx.try_recv().is_err());
+            assert!(request.allow_unsafe_remote_tar);
+            app.handle_event(event).await;
+            assert!(event_rx.try_recv().is_err());
 
-            app.handle_backend_result(BackendResponse::DeployStarted);
             assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Deploy);
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .await;
 
             let wizard = app.ui.wizard.as_ref().unwrap();
             assert_eq!(wizard.step, WizardStep::Deploy);
-            assert!(!wizard.context.deploy.cancellation.is_requested());
-            assert!(command_rx.try_recv().is_err());
+            assert!(wizard.draft.user.root_password.is_empty());
+            assert!(wizard.draft.user.users[0].password.is_empty());
+            assert!(event_rx.try_recv().is_err());
+        }
+
+        #[tokio::test]
+        async fn stale_preflight_completion_cannot_consume_wizard_secrets() {
+            let (mut app, mut event_rx) = prepare_confirmation().await;
+            app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .await;
+            let event = tokio::time::timeout(Duration::from_secs(1), event_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let (preflight_id, request) = match &event {
+                crate::events::AppEvent::DeploymentPreflightFinished {
+                    preflight_id,
+                    request,
+                    ..
+                } => (*preflight_id, request.clone()),
+                _ => panic!("confirmation must run deployment preflight"),
+            };
+
+            app.handle_event(crate::events::AppEvent::DeploymentPreflightFinished {
+                preflight_id: preflight_id.wrapping_add(1),
+                request,
+                result: Ok(DeploymentPreflight::Ready),
+            })
+            .await;
+
+            let wizard = app.ui.wizard.as_ref().unwrap();
+            assert_eq!(wizard.step, WizardStep::Review);
+            assert_eq!(wizard.draft.user.root_password, "root-secret");
+            assert_eq!(wizard.draft.user.users[0].password, "user-secret");
+            assert_eq!(app.ui.pending_deployment_preflight, Some(preflight_id));
+
+            app.handle_event(event).await;
+            assert_eq!(app.ui.wizard.as_ref().unwrap().step, WizardStep::Deploy);
         }
     }
 

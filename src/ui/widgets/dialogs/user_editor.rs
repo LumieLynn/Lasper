@@ -1,8 +1,9 @@
 use crate::nspawn::errors::{NspawnError, Result as NspawnResult};
 use crate::nspawn::models::{
-    validate_chpasswd_secret, validate_login_shell, validate_login_username, CreateUser,
+    validate_chpasswd_secret, validate_login_shell, validate_login_username,
 };
 use crate::ui::core::{AppMessage, Component, FocusTracker, WizardMessage};
+use crate::ui::wizard::draft::UserDraft;
 
 use crate::ui::widgets::inputs::button::Button;
 use crate::ui::widgets::inputs::password_box::PasswordBox;
@@ -32,7 +33,7 @@ pub struct UserEditor {
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
-    on_submit: Box<dyn Fn(CreateUser) -> AppMessage>,
+    on_submit: Box<dyn Fn(UserDraft) -> AppMessage>,
 }
 
 fn validation_message(result: NspawnResult<()>) -> Result<(), String> {
@@ -55,7 +56,7 @@ fn validate_shell(shell: &str) -> Result<(), String> {
 }
 
 impl UserEditor {
-    pub fn new(on_submit: impl Fn(CreateUser) -> AppMessage + 'static) -> Self {
+    pub fn new(on_submit: impl Fn(UserDraft) -> AppMessage + 'static) -> Self {
         let mut editor = Self {
             username: TextBox::new(" Username ", String::new()).with_validator(validate_username),
             password: PasswordBox::new(" Password (optional) ", String::new())
@@ -63,8 +64,8 @@ impl UserEditor {
             shell: TextBox::new(" Shell ", "/bin/bash".to_string()).with_validator(validate_shell),
 
             sudoer: Checkbox::new(" Add to sudo/wheel group ", false),
-            btn_ok: Button::new("OK", AppMessage::Wizard(WizardMessage::DialogSubmit)),
-            btn_cancel: Button::new("Cancel", AppMessage::Wizard(WizardMessage::DialogCancel)),
+            btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
+            btn_cancel: Button::new("Cancel", || AppMessage::Wizard(WizardMessage::DialogCancel)),
 
             focus: FocusTracker::new(),
             on_submit: Box::new(on_submit),
@@ -73,7 +74,7 @@ impl UserEditor {
         editor
     }
 
-    pub fn with_user(mut self, user: &CreateUser) -> Self {
+    pub fn with_user(mut self, user: &UserDraft) -> Self {
         self.username =
             TextBox::new(" Username ", user.username.clone()).with_validator(validate_username);
         self.password = PasswordBox::new(" Password (optional) ", user.password.clone())
@@ -99,7 +100,7 @@ impl UserEditor {
         if !valid {
             return None;
         }
-        let user = CreateUser {
+        let user = UserDraft {
             username: self.username.value().to_string(),
             password: self.password.value().to_string(),
             shell: self.shell.value().to_string(),

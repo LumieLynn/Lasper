@@ -1,7 +1,7 @@
 use crate::nspawn::ImageEntry;
 use crate::ui::core::{Component, EventResult};
 use crate::ui::widgets::lists::selectable_list::SelectableList;
-use crate::ui::wizard::context::WizardContext;
+use crate::ui::wizard::draft::WizardDraft;
 use crate::ui::wizard::steps::StepComponent;
 
 use crossterm::event::KeyEvent;
@@ -65,7 +65,7 @@ impl Component for CopySelectStepView {
 }
 
 impl StepComponent for CopySelectStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         if let Some(idx) = self.list.selected_idx() {
             ctx.source.copy_idx = idx;
             if let Some(image) = self.list.selected_item() {
@@ -74,7 +74,7 @@ impl StepComponent for CopySelectStepView {
         }
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         let chunks = ratatui::layout::Layout::default()
             .direction(ratatui::layout::Direction::Vertical)
             .margin(1)

@@ -1,3 +1,4 @@
+use crate::domain::secret::{serde_secret, SecretString};
 use crate::nspawn::adapters::rootfs::network::configure_network_at;
 use crate::nspawn::adapters::rootfs::nvidia::{
     cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
@@ -135,12 +136,12 @@ impl RootfsStore {
     pub(crate) async fn set_root_password(
         &self,
         target: &RootfsTarget,
-        password: &str,
+        password: SecretString,
     ) -> Result<Vec<String>> {
         let result = self
             .execute(RootfsOperation::SetRootPassword(SetRootPasswordRequest {
                 target: target.clone(),
-                password: password.to_string(),
+                password,
             }))
             .await?;
         Ok(result.warnings)
@@ -150,12 +151,13 @@ impl RootfsStore {
         &self,
         target: &RootfsTarget,
         user: &CreateUser,
+        password: Option<SecretString>,
     ) -> Result<Vec<String>> {
         let result = self
             .execute(RootfsOperation::CreateUser(CreateUserRequest {
                 target: target.clone(),
                 username: user.username.clone(),
-                password: user.password.clone(),
+                password,
                 sudoer: user.sudoer,
                 shell: user.shell.clone(),
             }))
@@ -238,7 +240,7 @@ impl Default for RootfsStore {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(tag = "operation", content = "params", rename_all = "snake_case")]
 pub(crate) enum RootfsOperation {
     ProbeOsRelease(TargetRequest),
@@ -259,19 +261,21 @@ pub(crate) struct TargetRequest {
     target: RootfsTarget,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SetRootPasswordRequest {
     target: RootfsTarget,
-    password: String,
+    #[serde(with = "serde_secret")]
+    password: SecretString,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CreateUserRequest {
     target: RootfsTarget,
     username: String,
-    password: String,
+    #[serde(with = "serde_secret::optional")]
+    password: Option<SecretString>,
     sudoer: bool,
     shell: String,
 }
@@ -374,11 +378,12 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::SetRootPassword(request) => {
-            validate_chpasswd_secret("root password", &request.password)?;
+            validate_chpasswd_secret("root password", request.password.expose_secret())?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
             let warnings =
-                users::set_root_password(&path, &request.password, rootfs_runner).await?;
+                users::set_root_password(&path, request.password.expose_secret(), rootfs_runner)
+                    .await?;
             Ok(RootfsResult {
                 warnings,
                 ..Default::default()
@@ -387,14 +392,22 @@ async fn execute_rootfs_operation_with_runners(
         RootfsOperation::CreateUser(request) => {
             let user = CreateUser {
                 username: request.username,
-                password: request.password,
                 sudoer: request.sudoer,
                 shell: request.shell,
             };
             user.validate()?;
+            if let Some(password) = &request.password {
+                validate_chpasswd_secret("user password", password.expose_secret())?;
+            }
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
-            let warnings = users::create_user_in_container(&path, &user, rootfs_runner).await?;
+            let warnings = users::create_user_in_container(
+                &path,
+                &user,
+                request.password.as_ref().map(SecretString::expose_secret),
+                rootfs_runner,
+            )
+            .await?;
             Ok(RootfsResult {
                 warnings,
                 ..Default::default()
@@ -754,7 +767,7 @@ mod tests {
             target: RootfsTarget::Machine {
                 machine: MachineName::new("missing-test-machine").unwrap(),
             },
-            password: "bad\npassword".into(),
+            password: SecretString::new("bad\npassword".into()),
         });
         let command_runner = crate::nspawn::sys::command::MockCommandRunner::new();
         let mut rootfs_runner =

@@ -164,7 +164,6 @@ pub struct BindMount {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUser {
     pub username: String,
-    pub password: String,
     /// If true, add to the `sudo` / `wheel` group.
     pub sudoer: bool,
     /// Login shell (e.g., /bin/bash).
@@ -174,8 +173,7 @@ pub struct CreateUser {
 impl CreateUser {
     pub fn validate(&self) -> Result<()> {
         validate_login_username(&self.username)?;
-        validate_login_shell(&self.shell)?;
-        validate_chpasswd_secret("user password", &self.password)
+        validate_login_shell(&self.shell)
     }
 
     pub fn login_shell(&self) -> &str {
@@ -457,7 +455,6 @@ pub struct ContainerConfig {
     /// Whether to expose the complete host DRM device directory.
     #[serde(default)]
     pub gpu_passthrough_all: bool,
-    pub root_password: Option<String>,
     pub users: Vec<CreateUser>,
     /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.
     pub wayland_socket: Option<String>,
@@ -488,7 +485,6 @@ impl Default for ContainerConfig {
             private_users: None,
             graphics_acceleration: Default::default(),
             gpu_passthrough_all: Default::default(),
-            root_password: Default::default(),
             users: Default::default(),
             wayland_socket: Default::default(),
             nvidia_gpu: Default::default(),
@@ -570,7 +566,6 @@ mod tests {
     fn create_user_accepts_default_shell_and_valid_system_names() {
         let user = CreateUser {
             username: "_svc-user$".into(),
-            password: "secret:with:colons".into(),
             shell: String::new(),
             sudoer: false,
         };

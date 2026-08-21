@@ -1,9 +1,10 @@
+use crate::domain::secret::zeroize_string;
 use crate::nspawn::errors::NspawnError;
-use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
+use crate::nspawn::models::validate_chpasswd_secret;
 use crate::ui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::ui::widgets::inputs::password_box::PasswordBox;
 use crate::ui::widgets::lists::editable_list::EditableList;
-use crate::ui::wizard::context::{UserConfig, WizardContext};
+use crate::ui::wizard::draft::{UserDraft, UserState, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
@@ -27,7 +28,7 @@ impl_wizard_nav!(UserStepView, active_comps);
 
 pub struct UserStepView {
     root_password: PasswordBox,
-    user_list: EditableList<CreateUser>,
+    user_list: EditableList<UserDraft>,
 
     focus: FocusTracker,
 }
@@ -40,13 +41,17 @@ fn validate_root_password(password: &str) -> Result<(), String> {
 }
 
 impl UserStepView {
-    pub fn new(initial_data: &UserConfig) -> Self {
-        let users = initial_data.users.clone();
+    pub fn new(initial_data: &UserState) -> Self {
+        let users = initial_data
+            .users
+            .iter()
+            .map(UserDraft::editing_copy)
+            .collect();
 
         let mut view = Self {
             root_password: PasswordBox::new(
                 " Root Password (optional) ",
-                initial_data.root_password.clone().unwrap_or_default(),
+                initial_data.root_password.clone(),
             )
             .with_validator(validate_root_password),
             user_list: EditableList::new(
@@ -96,7 +101,7 @@ impl Component for UserStepView {
                     if let Some(user) = self.user_list.selected_item() {
                         let idx = self.user_list.selected();
                         return EventResult::Message(AppMessage::Wizard(
-                            WizardMessage::OpenUserEditDialog(idx, user.clone()),
+                            WizardMessage::OpenUserEditDialog(idx, user.editing_copy()),
                         ));
                     }
                 }
@@ -122,24 +127,30 @@ impl Component for UserStepView {
 }
 
 impl StepComponent for UserStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
-        ctx.user.root_password = self.root_password.value().to_string();
-        ctx.user.users = self.user_list.items().to_vec();
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
+        zeroize_string(&mut ctx.user.root_password);
+        ctx.user.root_password.push_str(self.root_password.value());
+        ctx.user.users = self
+            .user_list
+            .items()
+            .iter()
+            .map(UserDraft::editing_copy)
+            .collect();
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 
     fn handle_message(&mut self, msg: &AppMessage) -> StepAction {
         match msg {
             AppMessage::Wizard(WizardMessage::UserAdded(user)) => {
-                self.user_list.add_item(user.clone());
+                self.user_list.add_item(user.editing_copy());
                 self.update_focus();
                 StepAction::CloseDialog
             }
             AppMessage::Wizard(WizardMessage::UserUpdated(idx, user)) => {
-                self.user_list.update_item(*idx, user.clone());
+                self.user_list.update_item(*idx, user.editing_copy());
                 self.update_focus();
                 StepAction::CloseDialog
             }

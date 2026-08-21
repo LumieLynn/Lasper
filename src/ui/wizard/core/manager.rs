@@ -1,6 +1,9 @@
+use crate::application::provisioning::{
+    DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
+};
 use crate::nspawn::{ContainerEntry, ImageEntry};
 use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
-use crate::ui::wizard::core::context::{SourceKind, WizardContext};
+use crate::ui::wizard::core::draft::{SourceKind, WizardDraft};
 use crate::ui::wizard::steps::{self, StepComponent};
 use crate::ui::wizard::{StepAction, WizardStep};
 
@@ -48,13 +51,14 @@ impl Component for TarRiskConfirmationDialog {
 
 pub struct Wizard {
     pub step: WizardStep,
-    pub context: WizardContext,
+    pub draft: WizardDraft,
 
     /// The active view for the current step.
-    /// Recreated on step transitions to ensure fresh data from context.
+    /// Recreated on step transitions to ensure fresh data from the draft.
     pub active_view: Option<Box<dyn StepComponent>>,
 
-    pub command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
+    permission_level: crate::nspawn::ops::PermissionLevel,
+    pending_request: Option<DeploymentRequest>,
     pub loading: bool,
 }
 
@@ -63,28 +67,26 @@ impl Wizard {
         entries: Vec<ContainerEntry>,
         images: Vec<ImageEntry>,
         nvidia_toolkit_installed: bool,
-        command_tx: tokio::sync::mpsc::Sender<crate::nspawn::ops::BackendCommand>,
         permission_level: crate::nspawn::ops::PermissionLevel,
-        exec_ctx: std::sync::Arc<crate::nspawn::sys::ExecutionContext>,
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
-        let mut context =
-            WizardContext::new(entries, images, permission_level, exec_ctx, config).await;
-        context.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
+        let mut draft = WizardDraft::new(entries, images, config).await;
+        draft.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
 
         Self {
             step: WizardStep::Source,
-            context,
+            draft,
             active_view: None,
-            command_tx,
+            permission_level,
+            pending_request: None,
             loading: false,
         }
     }
 
     /// Look for builded view.
     fn sync_view(&mut self) {
-        if self.active_view.is_none() {
-            self.active_view = Some(steps::build_view(self.step, &self.context));
+        if self.active_view.is_none() && self.step != WizardStep::Deploy {
+            self.active_view = Some(steps::build_view(self.step, &self.draft));
         }
     }
 
@@ -131,14 +133,14 @@ impl Wizard {
             .split(inner);
 
         if let Some(view) = &mut self.active_view {
-            // Use the NEW reactive render_step with context
-            view.render_step(f, chunks[0], &self.context);
+            // Render against the current draft so previews remain reactive.
+            view.render_step(f, chunks[0], &self.draft);
         }
     }
 
     pub fn active_flow(&self) -> Vec<WizardStep> {
-        let is_copy = self.context.source.kind == SourceKind::Copy;
-        let is_oci = self.context.source.kind == SourceKind::Oci;
+        let is_copy = self.draft.source.kind == SourceKind::Copy;
+        let is_oci = self.draft.source.kind == SourceKind::Oci;
 
         if is_copy {
             vec![
@@ -167,7 +169,7 @@ impl Wizard {
                 WizardStep::Deploy,
             ];
 
-            if !self.context.source.is_storage_managed_externally() {
+            if !self.draft.source.is_storage_managed_externally() {
                 flow.insert(2, WizardStep::Storage);
             }
             flow
@@ -213,7 +215,7 @@ impl Wizard {
 
         let res = if let Some(view) = &mut self.active_view {
             let result = view.handle_key(key);
-            view.commit_to_context(&mut self.context);
+            view.commit_to_draft(&mut self.draft);
             result
         } else {
             EventResult::Ignored
@@ -241,7 +243,7 @@ impl Wizard {
         }
         if let Some(view) = &mut self.active_view {
             let result = view.handle_mouse(mouse);
-            view.commit_to_context(&mut self.context);
+            view.commit_to_draft(&mut self.draft);
             result
         } else {
             EventResult::Ignored
@@ -254,17 +256,14 @@ impl Wizard {
                 WizardMessage::Close => StepAction::Close,
                 WizardMessage::Submit => self.submit_config(),
                 WizardMessage::AcceptUnsafeRemoteTar => {
-                    if !self.context.source.accept_unsafe_remote_tar() {
+                    if !self.draft.source.accept_unsafe_remote_tar() {
                         return StepAction::Status(
                             "The remote tar source changed before confirmation; review it and try again."
                                 .into(),
                             crate::ui::StatusLevel::Error,
                         );
                     }
-                    match self.submit_config() {
-                        StepAction::None => StepAction::CloseDialog,
-                        action => action,
-                    }
+                    self.submit_config()
                 }
                 WizardMessage::DeclineUnsafeRemoteTar => StepAction::CloseDialog,
                 WizardMessage::OpenUserDialog => {
@@ -322,18 +321,18 @@ impl Wizard {
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenNvidiaConfigDialog => {
-                    let gpu_devices = self.context.passthrough.nvidia_available_devices.clone();
-                    let active_cats = self.context.passthrough.active_nvidia_categories.clone();
-                    let gpu_device = self.context.passthrough.nvidia_gpu_device.clone();
-                    let mode = self.context.passthrough.nvidia_passthrough_mode.clone();
+                    let gpu_devices = self.draft.passthrough.nvidia_available_devices.clone();
+                    let active_cats = self.draft.passthrough.active_nvidia_categories.clone();
+                    let gpu_device = self.draft.passthrough.nvidia_gpu_device.clone();
+                    let mode = self.draft.passthrough.nvidia_passthrough_mode.clone();
                     let saved_dests: Vec<_> = self
-                        .context
+                        .draft
                         .passthrough
                         .nvidia_category_destinations
                         .iter()
                         .map(|(k, v)| (k.clone(), v.clone()))
                         .collect();
-                    let inject_env = self.context.passthrough.nvidia_inject_env;
+                    let inject_env = self.draft.passthrough.nvidia_inject_env;
 
                     let mut dialog =
                         crate::ui::widgets::dialogs::nvidia_config::NvidiaConfigDialog::new(
@@ -367,7 +366,7 @@ impl Wizard {
                     StepAction::OpenDialog(Box::new(dialog))
                 }
                 WizardMessage::NvidiaConfigSaved(ref result) => {
-                    let p = &mut self.context.passthrough;
+                    let p = &mut self.draft.passthrough;
                     p.nvidia_gpu = true;
                     p.nvidia_gpu_device = result.gpu_device.clone();
                     p.nvidia_passthrough_mode = result.mode.clone();
@@ -414,26 +413,12 @@ impl Wizard {
                     crate::nspawn::ops::BackendResponse::ValidationError(e) => {
                         StepAction::Status(format!("Error: {}", e), crate::ui::StatusLevel::Error)
                     }
-                    crate::nspawn::ops::BackendResponse::TarImportRiskConfirmationRequired(
-                        risk,
-                    ) => StepAction::OpenDialog(Box::new(TarRiskConfirmationDialog::new(risk))),
-                    crate::nspawn::ops::BackendResponse::DeployStarted => {
-                        self.move_next();
-                        StepAction::None
-                    }
-                    crate::nspawn::ops::BackendResponse::DeployFailed(e) => StepAction::Status(
-                        format!("Deploy Failed: {}", e),
-                        crate::ui::StatusLevel::Error,
-                    ),
-                    crate::nspawn::ops::BackendResponse::DeployCancelled(message) => {
-                        StepAction::Status(message, crate::ui::StatusLevel::Warn)
-                    }
                     crate::nspawn::ops::BackendResponse::HardwareDiscovered {
                         nvidia_state,
                         nvidia_devices,
                         host_gpus,
                     } => {
-                        self.context
+                        self.draft
                             .update_hardware_data(nvidia_state, nvidia_devices, host_gpus);
                         // Rebuild host-facing steps with the completed discovery data.
                         if self.step == crate::ui::wizard::WizardStep::HostIntegration
@@ -451,7 +436,7 @@ impl Wizard {
                         crate::ui::StatusLevel::Info,
                     ),
                     crate::nspawn::ops::BackendResponse::DiscoveryFailed(e) => {
-                        self.context.passthrough.hardware_scanning = false;
+                        self.draft.passthrough.hardware_scanning = false;
                         StepAction::Status(
                             format!("Hardware discovery failed: {}", e),
                             crate::ui::StatusLevel::Error,
@@ -470,12 +455,12 @@ impl Wizard {
                     if let Err(e) = view.validate() {
                         return StepAction::Status(e, crate::ui::StatusLevel::Error);
                     }
-                    view.commit_to_context(&mut self.context);
+                    view.commit_to_draft(&mut self.draft);
                 }
 
                 // Trigger backend validation for network modes with interfaces
                 if self.step == WizardStep::Network {
-                    let mode = self.context.network.network_mode();
+                    let mode = self.draft.network.network_mode();
                     let (name, is_bridge) = match mode {
                         Some(crate::nspawn::models::NetworkMode::Bridge(n)) => (Some(n), true),
                         Some(crate::nspawn::models::NetworkMode::MacVlan(n))
@@ -488,13 +473,10 @@ impl Wizard {
 
                     if let Some(name) = name {
                         self.loading = true;
-                        let tx = self.command_tx.clone();
-                        let _ =
-                            tx.try_send(crate::nspawn::ops::BackendCommand::ValidateInterface {
-                                name,
-                                is_bridge_mode: is_bridge,
-                            });
-                        return StepAction::None;
+                        return StepAction::ValidateInterface {
+                            name,
+                            is_bridge_mode: is_bridge,
+                        };
                     }
                 }
 
@@ -505,7 +487,7 @@ impl Wizard {
                 if let Some(view) = &mut self.active_view {
                     // Try to save HEARTBEAT data, but don't block navigation if invalid
                     if view.validate().is_ok() {
-                        view.commit_to_context(&mut self.context);
+                        view.commit_to_draft(&mut self.draft);
                     }
                 }
                 self.move_prev();
@@ -516,18 +498,17 @@ impl Wizard {
     }
 
     fn submit_config(&mut self) -> StepAction {
-        if let Some(error) =
-            source_permission_error(&self.context.source.kind, self.context.permission_level)
+        if let Some(error) = source_permission_error(&self.draft.source.kind, self.permission_level)
         {
             return StepAction::Status(
                 format!("Validation Error: {error}"),
                 crate::ui::StatusLevel::Error,
             );
         }
-        if self.context.source.kind == SourceKind::Copy {
-            let source_cfg = self.context.source.clone_source.clone();
+        if self.draft.source.kind == SourceKind::Copy {
+            let source_cfg = self.draft.source.clone_source.clone();
             if !self
-                .context
+                .draft
                 .images
                 .iter()
                 .any(|image| image.name == source_cfg)
@@ -541,14 +522,14 @@ impl Wizard {
                 );
             }
         }
-        let target_name = self.context.basic.name.clone();
+        let target_name = self.draft.basic.name.clone();
         if self
-            .context
+            .draft
             .entries
             .iter()
             .any(|entry| entry.name == target_name)
             || self
-                .context
+                .draft
                 .images
                 .iter()
                 .any(|image| image.name == target_name)
@@ -563,16 +544,57 @@ impl Wizard {
         }
 
         self.loading = true;
-        let command =
-            crate::nspawn::ops::BackendCommand::SubmitConfig(Box::new(self.context.clone()));
-        if self.command_tx.try_send(command).is_err() {
-            self.loading = false;
+        let request = self.draft.build_deployment_request();
+        self.pending_request = Some(request.clone());
+        StepAction::PreflightDeployment(request)
+    }
+
+    pub fn finish_preflight(
+        &mut self,
+        request: DeploymentRequest,
+        result: Result<DeploymentPreflight, DeploymentError>,
+    ) -> StepAction {
+        self.loading = false;
+        if self.pending_request.as_ref() != Some(&request) {
             return StepAction::Status(
-                "Internal error: Backend channel busy or closed".into(),
-                crate::ui::StatusLevel::Error,
+                "Ignored a stale deployment preflight result".into(),
+                crate::ui::StatusLevel::Warn,
             );
         }
-        StepAction::None
+
+        match result {
+            Ok(DeploymentPreflight::Ready) => {
+                let request = self
+                    .pending_request
+                    .take()
+                    .expect("matched deployment preflight must have a pending request");
+                StepAction::StartDeployment(self.draft.take_submission(request))
+            }
+            Ok(DeploymentPreflight::ConfirmationRequired(risk)) => {
+                self.pending_request = None;
+                StepAction::OpenDialog(Box::new(TarRiskConfirmationDialog::new(risk)))
+            }
+            Err(error) => {
+                self.pending_request = None;
+                StepAction::Status(
+                    format!("Deployment preflight failed: {error}"),
+                    crate::ui::StatusLevel::Error,
+                )
+            }
+        }
+    }
+
+    pub fn start_deployment(&mut self, handle: DeploymentJobHandle) {
+        self.loading = false;
+        self.step = WizardStep::Deploy;
+        self.active_view = Some(Box::new(
+            crate::ui::wizard::steps::deploy_view::DeployStepView::new(handle),
+        ));
+    }
+
+    pub fn preflight_dispatch_failed(&mut self) {
+        self.loading = false;
+        self.pending_request = None;
     }
 
     fn move_next(&mut self) {
@@ -609,7 +631,7 @@ mod tests {
     use super::{source_permission_error, TarRiskConfirmationDialog};
     use crate::nspawn::ops::PermissionLevel;
     use crate::ui::core::{AppMessage, Component, EventResult, WizardMessage};
-    use crate::ui::wizard::core::context::SourceKind;
+    use crate::ui::wizard::core::draft::SourceKind;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]

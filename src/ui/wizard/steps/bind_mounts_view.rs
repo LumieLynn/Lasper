@@ -5,7 +5,7 @@ use crate::ui::widgets::display::text_block::TextBlock;
 use crate::ui::widgets::lists::editable_list::EditableList;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::wizard::context::{PassthroughConfig, UnclassifiedFile, WizardContext};
+use crate::ui::wizard::draft::{PassthroughConfig, UnclassifiedFile, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::ui::wizard::StepAction;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
@@ -288,13 +288,13 @@ impl StepComponent for BindMountsStepView {
         }
     }
 
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.passthrough.bind_mounts = self.bind_list.items().to_vec();
         ctx.passthrough.unclassified_files = self.unclassified_list.items().to_vec();
         ctx.passthrough.nvidia_gpu = self.nvidia_enabled;
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

@@ -291,13 +291,11 @@ mod tests {
     use crate::nspawn::models::CreateUser;
 
     #[test]
-    fn config_spec_excludes_provisioning_secrets() {
+    fn config_spec_excludes_account_execution_data() {
         let config = ContainerConfig {
             name: "test".into(),
-            root_password: Some("root-secret".into()),
             users: vec![CreateUser {
                 username: "alice".into(),
-                password: "user-secret".into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -305,8 +303,6 @@ mod tests {
 
         let json = serde_json::to_string(&NspawnConfigSpec::try_from(&config).unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(!json.contains("root-secret"));
-        assert!(!json.contains("user-secret"));
         assert!(value.get("root_password").is_none());
         assert!(value.get("users").is_none());
         assert!(value.get("password").is_none());

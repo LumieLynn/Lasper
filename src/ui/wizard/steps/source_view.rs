@@ -5,7 +5,7 @@ use crate::ui::widgets::inputs::path_box::expand_user_path;
 use crate::ui::widgets::inputs::text_box::TextBox;
 use crate::ui::widgets::lists::selectable_list::SelectableList;
 use crate::ui::widgets::selectors::checkbox::Checkbox;
-use crate::ui::wizard::context::{ConfiguredSourceProfile, SourceKind, SourceState, WizardContext};
+use crate::ui::wizard::draft::{ConfiguredSourceProfile, SourceKind, SourceState, WizardDraft};
 use crate::ui::wizard::steps::StepComponent;
 use crate::{delegate_wizard_navigation, impl_wizard_nav, wizard_set_focus};
 
@@ -405,7 +405,7 @@ impl Component for SourceStepView {
 }
 
 impl StepComponent for SourceStepView {
-    fn commit_to_context(&self, ctx: &mut WizardContext) {
+    fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.source.kind = self.selected_kind();
         ctx.source.oci_url = self.oci_url.value().to_string();
         ctx.source.oci_read_only = self.oci_mode.selected_idx() == 1;
@@ -432,7 +432,7 @@ impl StepComponent for SourceStepView {
         ctx.source.is_pull_raw = self.pull_format.selected_idx() == 1;
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardContext) {
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

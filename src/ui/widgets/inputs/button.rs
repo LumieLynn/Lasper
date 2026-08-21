@@ -10,15 +10,15 @@ use ratatui::{
 pub struct Button {
     label: String,
     focused: bool,
-    msg: AppMessage,
+    message: Box<dyn Fn() -> AppMessage>,
 }
 
 impl Button {
-    pub fn new(label: impl Into<String>, msg: AppMessage) -> Self {
+    pub fn new(label: impl Into<String>, message: impl Fn() -> AppMessage + 'static) -> Self {
         Self {
             label: label.into(),
             focused: false,
-            msg,
+            message: Box::new(message),
         }
     }
 }
@@ -53,7 +53,7 @@ impl Component for Button {
 
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         match key.code {
-            KeyCode::Enter | KeyCode::Char(' ') => EventResult::Message(self.msg.clone()),
+            KeyCode::Enter | KeyCode::Char(' ') => EventResult::Message((self.message)()),
             _ => EventResult::Ignored,
         }
     }

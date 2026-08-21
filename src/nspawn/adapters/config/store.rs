@@ -939,10 +939,13 @@ mod tests {
     }
 
     #[test]
-    fn write_operation_contains_no_container_credentials() {
+    fn write_operation_contains_no_account_execution_data() {
         let config = ContainerConfig {
             name: "test".into(),
-            root_password: Some("secret".into()),
+            users: vec![crate::nspawn::models::CreateUser {
+                username: "alice".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let operation = NspawnConfigOperation::Write(WriteNspawnConfig {
@@ -951,8 +954,9 @@ mod tests {
             nvidia_state: None,
         });
         let json = serde_json::to_string(&operation).unwrap();
-        assert!(!json.contains("secret"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!json.contains("root_password"));
+        assert!(value["params"]["spec"].get("users").is_none());
     }
 
     #[test]

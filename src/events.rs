@@ -16,6 +16,14 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Tick,
     BackendResult(crate::nspawn::ops::BackendResponse),
+    DeploymentPreflightFinished {
+        preflight_id: u64,
+        request: crate::application::provisioning::DeploymentRequest,
+        result: Result<
+            crate::application::provisioning::DeploymentPreflight,
+            crate::application::provisioning::DeploymentError,
+        >,
+    },
     /// Background action execution finished.
     ActionDone(String, crate::ui::StatusLevel),
     /// A machine lifecycle workflow reached a semantic outcome.

@@ -1,3 +1,4 @@
+use crate::domain::secret::SecretBytes;
 use crate::nspawn::sys::new_command;
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
@@ -11,7 +12,7 @@ pub(crate) trait RootfsProcessRunner: Send + Sync {
         &self,
         rootfs: &Path,
         command: Vec<String>,
-        stdin: Option<Vec<u8>>,
+        stdin: Option<SecretBytes>,
     ) -> std::io::Result<Output>;
 }
 
@@ -23,7 +24,7 @@ impl RootfsProcessRunner for DefaultRootfsProcessRunner {
         &self,
         rootfs: &Path,
         command: Vec<String>,
-        stdin: Option<Vec<u8>>,
+        stdin: Option<SecretBytes>,
     ) -> std::io::Result<Output> {
         let mut process = new_command("systemd-nspawn");
         process
@@ -49,7 +50,7 @@ impl RootfsProcessRunner for DefaultRootfsProcessRunner {
                 ))
             })?;
             child_stdin
-                .write_all(&input)
+                .write_all(input.as_slice())
                 .await
                 .map_err(|error| contextual_io_error(rootfs, error))?;
             child_stdin

@@ -1,5 +1,5 @@
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum AppMessage {
     Wizard(WizardMessage),
     Container(ContainerMessage),
@@ -7,7 +7,7 @@ pub enum AppMessage {
     Backend(crate::nspawn::ops::BackendResponse),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum WizardMessage {
     Submit,
     Close,
@@ -18,18 +18,18 @@ pub enum WizardMessage {
 
     // Dialog open requests (add = blank, edit = pre-filled)
     OpenUserDialog,
-    OpenUserEditDialog(usize, crate::nspawn::models::CreateUser),
+    OpenUserEditDialog(usize, crate::ui::wizard::core::draft::UserDraft),
     OpenPortDialog,
     OpenPortEditDialog(usize, crate::nspawn::models::PortForward),
     OpenBindDialog,
     OpenBindEditDialog(usize, crate::nspawn::models::BindMount),
     OpenNvidiaConfigDialog,
     NvidiaConfigSaved(crate::ui::widgets::dialogs::nvidia_config::NvidiaConfigResult),
-    OpenUnclassifiedEditDialog(usize, crate::ui::wizard::core::context::UnclassifiedFile),
+    OpenUnclassifiedEditDialog(usize, crate::ui::wizard::core::draft::UnclassifiedFile),
 
     // Macro-events for atomic data changes
-    UserAdded(crate::nspawn::models::CreateUser),
-    UserUpdated(usize, crate::nspawn::models::CreateUser),
+    UserAdded(crate::ui::wizard::core::draft::UserDraft),
+    UserUpdated(usize, crate::ui::wizard::core::draft::UserDraft),
     UserRemoved(usize),
     PortForwardAdded(crate::nspawn::models::PortForward),
     PortForwardUpdated(usize, crate::nspawn::models::PortForward),
@@ -37,7 +37,7 @@ pub enum WizardMessage {
     BindMountAdded(crate::nspawn::models::BindMount),
     BindMountUpdated(usize, crate::nspawn::models::BindMount),
     BindMountRemoved(usize),
-    UnclassifiedFileUpdated(usize, crate::ui::wizard::core::context::UnclassifiedFile),
+    UnclassifiedFileUpdated(usize, crate::ui::wizard::core::draft::UnclassifiedFile),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,7 +52,7 @@ pub enum ListMessage {
 }
 
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum EventResult {
     Ignored,             // Not handled, bubble up
     Consumed,            // Handled, no further action needed
