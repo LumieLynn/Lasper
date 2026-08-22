@@ -652,7 +652,7 @@ impl App {
                 self.ui.active_dialog = None;
                 match self.data.provisioning.start(submission) {
                     Ok(handle) => {
-                        log::info!("[DEPLOY] accepted application job {}", handle.id().get());
+                        log::info!("[DEPLOY] accepted application job {}", handle.id());
                         if let Some(wizard) = &mut self.ui.wizard {
                             wizard.start_deployment(handle);
                         }
@@ -667,6 +667,31 @@ impl App {
                         );
                     }
                 }
+            }
+            WizardAction::ReleaseUnresolvedDeployment(deployment_id) => {
+                let Some(tx) = self.ui.app_tx.clone() else {
+                    self.set_status(
+                        "Internal error: application event channel is unavailable".into(),
+                        StatusLevel::Error,
+                    );
+                    return;
+                };
+                let Some(wizard_id) = self.ui.wizard.as_ref().map(|wizard| wizard.id()) else {
+                    return;
+                };
+                let service = self.data.provisioning.clone();
+                tokio::spawn(async move {
+                    let result = service.release_unresolved(deployment_id, true).await;
+                    let _ = tx
+                        .send(
+                            crate::tui::events::AppEvent::DeploymentClaimReleaseFinished {
+                                wizard_id,
+                                deployment_id,
+                                result,
+                            },
+                        )
+                        .await;
+                });
             }
         }
     }

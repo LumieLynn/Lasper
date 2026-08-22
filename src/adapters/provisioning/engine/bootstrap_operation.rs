@@ -1,6 +1,5 @@
 //! Typed bootstrap execution shared by direct and elevated modes.
 
-use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::rootfs::RootfsTarget;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -22,49 +21,21 @@ pub(crate) struct BootstrapRequest {
 #[derive(Clone)]
 pub struct BootstrapStore {
     cmd_runner: Arc<dyn CommandRunner>,
-    daemon: Option<Arc<ElevatedDaemon>>,
 }
 
 impl BootstrapStore {
-    pub fn new(cmd_runner: Arc<dyn CommandRunner>, daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { cmd_runner, daemon }
+    pub fn new(cmd_runner: Arc<dyn CommandRunner>) -> Self {
+        Self { cmd_runner }
     }
 
     pub(crate) async fn spawn(&self, request: BootstrapRequest) -> Result<SpawnedProcess> {
-        validate_client_target(&request.target, self.daemon.is_some()).await?;
-
-        if let Some(daemon) = &self.daemon {
-            let cmd_id = daemon.reserve_spawn_id();
-            let stdout_fd = daemon
-                .spawn_bootstrap(cmd_id, request)
-                .await
-                .map_err(|error| NspawnError::Io(PathBuf::from("bootstrap"), error))?;
-            let receiver = crate::adapters::elevated::pipe_reader(stdout_fd)
-                .map_err(|error| NspawnError::Io(PathBuf::from("bootstrap"), error))?;
-            let wait_daemon = daemon.clone();
-            let signal_daemon = daemon.clone();
-            Ok(SpawnedProcess::new_cancellable(
-                Box::new(receiver),
-                async move {
-                    let code = wait_daemon
-                        .wait_command(cmd_id)
-                        .await
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    Ok(std::os::unix::process::ExitStatusExt::from_raw(code))
-                },
-                move |signal| {
-                    let daemon = signal_daemon.clone();
-                    Box::pin(async move { daemon.signal_command(cmd_id, signal).await })
-                },
-            ))
-        } else {
-            let signature_style = self.probe_debootstrap_signature_style(&request).await?;
-            let (program, args) = build_command(&request, signature_style)?;
-            self.cmd_runner
-                .spawn(&program, args)
-                .await
-                .map_err(|error| NspawnError::Io(PathBuf::from(program), error))
-        }
+        validate_target(&request.target).await?;
+        let signature_style = self.probe_debootstrap_signature_style(&request).await?;
+        let (program, args) = build_command(&request, signature_style)?;
+        self.cmd_runner
+            .spawn(&program, args)
+            .await
+            .map_err(|error| NspawnError::Io(PathBuf::from(program), error))
     }
 
     async fn probe_debootstrap_signature_style(
@@ -81,15 +52,6 @@ impl BootstrapStore {
             .await
             .map_err(|error| NspawnError::Io(PathBuf::from("debootstrap --help"), error))?;
         signature_style_from_output(policy, &output.stdout, &output.stderr)
-    }
-}
-
-async fn validate_client_target(target: &RootfsTarget, delegated_to_daemon: bool) -> Result<()> {
-    if delegated_to_daemon {
-        // Elevated targets are root-owned; the daemon validates them before spawning.
-        Ok(())
-    } else {
-        validate_target(target).await
     }
 }
 
@@ -111,20 +73,6 @@ pub(crate) fn build_command(
         BootstrapSpec::Dnf5(_) => "dnf5",
     };
     Ok((program.into(), args))
-}
-
-pub(crate) fn probe_debootstrap_signature_style_sync(
-    request: &BootstrapRequest,
-) -> Result<DebootstrapSignatureOptionStyle> {
-    let policy = debootstrap_signature_policy(request);
-    if policy == DebootstrapReleaseSignaturePolicy::ProviderDefault {
-        return Ok(DebootstrapSignatureOptionStyle::Sig);
-    }
-    let output = crate::adapters::process::new_sync_command("debootstrap")
-        .arg("--help")
-        .output()
-        .map_err(|error| NspawnError::Io(PathBuf::from("debootstrap --help"), error))?;
-    signature_style_from_output(policy, &output.stdout, &output.stderr)
 }
 
 fn debootstrap_signature_policy(request: &BootstrapRequest) -> DebootstrapReleaseSignaturePolicy {
@@ -190,17 +138,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delegated_bootstrap_does_not_probe_target_in_unprivileged_client() {
-        assert!(validate_client_target(&missing_machine_target(), true)
-            .await
-            .is_ok());
-    }
-
-    #[tokio::test]
-    async fn direct_bootstrap_still_validates_target_locally() {
-        assert!(validate_client_target(&missing_machine_target(), false)
-            .await
-            .is_err());
+    async fn bootstrap_validates_its_target_in_the_owning_process() {
+        assert!(validate_target(&missing_machine_target()).await.is_err());
     }
 
     #[test]

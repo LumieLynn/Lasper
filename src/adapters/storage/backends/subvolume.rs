@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn create_rejects_invalid_machine_name_before_external_detection() {
-        let backend = SubvolumeBackend::new(ManagedStorageStore::default());
+        let backend = SubvolumeBackend::new(ManagedStorageStore::new());
         let result = backend.create("../escape").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
@@ -71,7 +71,7 @@ mod tests {
 
     #[tokio::test]
     async fn delete_rejects_invalid_machine_name_before_external_detection() {
-        let backend = SubvolumeBackend::new(ManagedStorageStore::default());
+        let backend = SubvolumeBackend::new(ManagedStorageStore::new());
         let result = backend.delete("bad/name").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
@@ -79,7 +79,7 @@ mod tests {
 
     #[tokio::test]
     async fn mount_rejects_invalid_machine_name() {
-        let backend = SubvolumeBackend::new(ManagedStorageStore::default());
+        let backend = SubvolumeBackend::new(ManagedStorageStore::new());
         let result = backend.mount(".hidden").await;
 
         assert!(matches!(result, Err(NspawnError::Validation(_))));
@@ -87,7 +87,7 @@ mod tests {
 
     #[tokio::test]
     async fn exists_returns_false_for_invalid_machine_name() {
-        let backend = SubvolumeBackend::new(ManagedStorageStore::default());
+        let backend = SubvolumeBackend::new(ManagedStorageStore::new());
 
         assert!(!backend.exists("../escape").await);
     }

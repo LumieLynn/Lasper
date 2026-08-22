@@ -1,20 +1,16 @@
-use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition, MachineName};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 /// Typed access to Lasper-managed storage paths.
-#[derive(Clone)]
-pub struct ManagedStorageStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
-}
+#[derive(Clone, Debug, Default)]
+pub struct ManagedStorageStore;
 
 impl ManagedStorageStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub fn new() -> Self {
+        Self
     }
 
     pub async fn create_directory(&self, name: &str) -> Result<PathBuf> {
@@ -91,14 +87,7 @@ impl ManagedStorageStore {
             .map_err(|error| NspawnError::Io(source.to_path_buf(), error))?;
         crate::adapters::storage::image_ops::validate_import_source(&source_file)?;
 
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .import_raw_image(machine.clone(), source_file)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-        } else {
-            crate::adapters::storage::image_ops::import_raw_image(&machine, source_file).await?;
-        }
+        crate::adapters::storage::image_ops::import_raw_image(&machine, source_file).await?;
         Ok(crate::paths::machine_raw_image(machine.as_str()))
     }
 
@@ -139,28 +128,7 @@ impl ManagedStorageStore {
     }
 
     async fn execute(&self, operation: ManagedStorageOperation) -> Result<ManagedStorageResult> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .managed_storage(operation)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            execute_managed_storage_operation(operation).await
-        }
-    }
-}
-
-impl std::fmt::Debug for ManagedStorageStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ManagedStorageStore")
-            .field("daemon", &self.daemon)
-            .finish()
-    }
-}
-
-impl Default for ManagedStorageStore {
-    fn default() -> Self {
-        Self::new(None)
+        execute_managed_storage_operation(operation).await
     }
 }
 

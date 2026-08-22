@@ -19,16 +19,17 @@ use crate::nspawn::models::ContainerConfig;
 const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ImageSource {
     Local(String),
     Remote(String),
+    Opened(std::sync::Arc<std::fs::File>),
 }
 
 impl ImageSource {
     fn tar_origin(&self) -> TarSourceOrigin {
         match self {
-            Self::Local(_) => TarSourceOrigin::Local,
+            Self::Local(_) | Self::Opened(_) => TarSourceOrigin::Local,
             Self::Remote(_) => TarSourceOrigin::Remote,
         }
     }
@@ -117,6 +118,9 @@ async fn acquire_image_source(
         ImageSource::Local(path) => std::fs::File::open(path)
             .map_err(|error| NspawnError::Io(std::path::PathBuf::from(path), error)),
         ImageSource::Remote(url) => download_image(url, logs, cancellation).await,
+        ImageSource::Opened(source) => source.try_clone().map_err(|error| {
+            NspawnError::Io(std::path::PathBuf::from("artifact source fd"), error)
+        }),
     }
 }
 

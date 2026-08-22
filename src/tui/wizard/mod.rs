@@ -41,6 +41,7 @@ pub enum StepAction {
     ValidateInterface { name: String, is_bridge_mode: bool },
     PreflightDeployment(crate::application::provisioning::DeploymentRequest),
     StartDeployment(crate::application::provisioning::DeploymentSubmission),
+    ReleaseUnresolvedDeployment(crate::application::provisioning::DeploymentId),
 }
 
 impl WizardStep {

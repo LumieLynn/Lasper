@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
+use crate::application::provisioning::DeploymentResource;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, ContainerConfig, MachineName};
 
@@ -62,6 +63,14 @@ impl Deployer for CloneDeployer {
 
     fn requires_post_config(&self) -> bool {
         false
+    }
+
+    fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
+        vec![
+            DeploymentResource::ExternalImage(target.clone()),
+            DeploymentResource::NspawnConfig(target.clone()),
+            DeploymentResource::SystemdOverride(target.clone()),
+        ]
     }
 
     async fn deploy(
@@ -205,6 +214,29 @@ mod tests {
         assert_eq!(
             image_only.summary(),
             "image cloned; .nspawn settings not present; Lasper service override not present"
+        );
+    }
+
+    #[test]
+    fn clone_declares_every_resource_systemd_or_lasper_may_copy() {
+        let target = MachineName::new("test").unwrap();
+        let deployer = CloneDeployer {
+            source_name: "base".into(),
+            system_operations: crate::adapters::system_operation::SystemOperationStore::new(
+                std::sync::Arc::new(crate::adapters::process::DefaultCommandRunner),
+                None,
+            ),
+            nspawn: crate::adapters::config::NspawnConfigStore::new(None),
+            systemd_unit: crate::adapters::config::SystemdUnitStore::new(None),
+        };
+
+        assert_eq!(
+            deployer.source_stage_resources(&target),
+            vec![
+                DeploymentResource::ExternalImage(target.clone()),
+                DeploymentResource::NspawnConfig(target.clone()),
+                DeploymentResource::SystemdOverride(target),
+            ]
         );
     }
 }

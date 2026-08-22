@@ -12,46 +12,60 @@ pub use oci_operation::OciPullStore;
 
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::adapters::platform::nvidia::NvidiaStateStore;
+use crate::adapters::process::CommandRunner;
 use crate::adapters::rootfs::RootfsStore;
 use crate::adapters::storage::StorageBackend;
 use crate::adapters::system_operation::SystemOperationStore;
+use crate::adapters::trusted_state::TrustedStateRoot;
 pub(crate) use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentProgress as DeployProgress,
 };
 use crate::application::provisioning::{DeploymentJobContext, DeploymentSecrets};
+use crate::application::provisioning::{
+    DeploymentResource, DeploymentStage, ResourceDisposition, ResourceLedger,
+};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 use tokio::sync::mpsc::Sender;
 
-/// Concrete host capabilities still used by the legacy deployment pipeline.
+/// Direct host capabilities used by the provisioning implementation.
 ///
-/// Keeping this workflow-specific bundle here prevents the pipeline from
-/// reaching through the process-wide `ExecutionContext`. Each field will be
-/// replaced by its consumer-owned port as the corresponding stage migrates.
+/// The elevated route submits the complete deployment to the daemon, whose
+/// worker constructs this same direct bundle. Keeping this type route-specific
+/// prevents a deployment stage from selecting a daemon transport internally.
 #[derive(Clone)]
-pub(crate) struct DeploymentHost {
-    pub(crate) system_operations: SystemOperationStore,
-    pub(crate) nspawn: NspawnConfigStore,
-    pub(crate) systemd_unit: SystemdUnitStore,
-    pub(crate) rootfs: RootfsStore,
-    pub(crate) nvidia_state: NvidiaStateStore,
+pub(crate) struct DirectProvisioningCapabilities {
+    system_operations: SystemOperationStore,
+    nspawn: NspawnConfigStore,
+    systemd_unit: SystemdUnitStore,
+    rootfs: RootfsStore,
+    nvidia_state: NvidiaStateStore,
 }
 
-impl DeploymentHost {
-    pub(crate) fn new(
-        system_operations: SystemOperationStore,
-        nspawn: NspawnConfigStore,
-        systemd_unit: SystemdUnitStore,
-        rootfs: RootfsStore,
-        nvidia_state: NvidiaStateStore,
+impl DirectProvisioningCapabilities {
+    pub(crate) fn from_direct(
+        command_runner: std::sync::Arc<dyn CommandRunner>,
+        state_root: TrustedStateRoot,
     ) -> Self {
         Self {
-            system_operations,
-            nspawn,
-            systemd_unit,
-            rootfs,
-            nvidia_state,
+            system_operations: SystemOperationStore::new(command_runner, None),
+            nspawn: NspawnConfigStore::new(None),
+            systemd_unit: SystemdUnitStore::new(None),
+            rootfs: RootfsStore::new(None),
+            nvidia_state: NvidiaStateStore::new(None, state_root),
         }
+    }
+
+    pub(crate) fn system_operations(&self) -> &SystemOperationStore {
+        &self.system_operations
+    }
+
+    pub(crate) fn nspawn(&self) -> &NspawnConfigStore {
+        &self.nspawn
+    }
+
+    pub(crate) fn systemd_unit(&self) -> &SystemdUnitStore {
+        &self.systemd_unit
     }
 }
 
@@ -76,18 +90,41 @@ impl AppliedResource {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct ApplyReport {
-    resources: Vec<AppliedResource>,
+    target: crate::domain::machine::MachineName,
+    ledger: ResourceLedger,
     external_image_blockers: Vec<String>,
     storage_removal_blockers: Vec<String>,
 }
 
 impl ApplyReport {
-    pub(crate) fn record_created(&mut self, resource: AppliedResource) {
-        if !self.resources.contains(&resource) {
-            self.resources.push(resource);
+    fn new(target: crate::domain::machine::MachineName) -> Self {
+        Self {
+            target,
+            ledger: ResourceLedger::default(),
+            external_image_blockers: Vec::new(),
+            storage_removal_blockers: Vec::new(),
         }
+    }
+
+    fn typed(&self, resource: AppliedResource) -> DeploymentResource {
+        match resource {
+            AppliedResource::LocalStorage => DeploymentResource::LocalStorage(self.target.clone()),
+            AppliedResource::ExternalImage => {
+                DeploymentResource::ExternalImage(self.target.clone())
+            }
+            AppliedResource::NvidiaState => DeploymentResource::NvidiaState(self.target.clone()),
+            AppliedResource::NspawnConfig => DeploymentResource::NspawnConfig(self.target.clone()),
+            AppliedResource::SystemdOverride => {
+                DeploymentResource::SystemdOverride(self.target.clone())
+            }
+        }
+    }
+
+    pub(crate) fn record_created(&mut self, resource: AppliedResource) {
+        self.ledger
+            .record(self.typed(resource), ResourceDisposition::Created);
     }
 
     pub(crate) fn record_apply(
@@ -97,10 +134,13 @@ impl ApplyReport {
     ) -> Result<()> {
         match status {
             ApplyStatus::Created => {
-                self.record_created(resource);
+                self.ledger
+                    .record(self.typed(resource), ResourceDisposition::Created);
                 Ok(())
             }
             ApplyStatus::Unchanged => {
+                self.ledger
+                    .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("an unchanged .nspawn configuration predates this deployment".into());
@@ -108,6 +148,8 @@ impl ApplyReport {
                 Ok(())
             }
             ApplyStatus::ReplacedOwned => {
+                self.ledger
+                    .record(self.typed(resource), ResourceDisposition::Adopted);
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("a replaced .nspawn configuration cannot be restored".into());
@@ -119,10 +161,11 @@ impl ApplyReport {
                 // A create intent may adopt and replace a stale, proven-owned
                 // sidecar. Rollback removes the replacement instead of
                 // restoring stale state for a target that was not deployed.
-                self.record_created(resource);
                 Ok(())
             }
             ApplyStatus::ConflictUnknownOwner => {
+                self.ledger
+                    .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("an existing .nspawn configuration has unknown ownership".into());
@@ -139,7 +182,39 @@ impl ApplyReport {
     }
 
     fn owns(&self, resource: AppliedResource) -> bool {
-        self.resources.contains(&resource)
+        self.ledger.owns(&self.typed(resource))
+    }
+
+    fn record_typed(&mut self, resource: DeploymentResource, disposition: ResourceDisposition) {
+        self.ledger.record(resource, disposition);
+    }
+
+    fn record_outcome_unknown_if_unclassified(&mut self, resource: DeploymentResource) {
+        if self.ledger.disposition(&resource).is_none() {
+            self.ledger
+                .record(resource, ResourceDisposition::OutcomeUnknown);
+        }
+    }
+
+    fn remove_typed(&mut self, resource: &DeploymentResource) {
+        self.ledger.remove(resource);
+    }
+
+    fn typed_owned_in_reverse(&self) -> Vec<DeploymentResource> {
+        self.ledger
+            .owned_in_reverse()
+            .into_iter()
+            .filter(|resource| {
+                matches!(
+                    resource,
+                    DeploymentResource::LocalStorage(_)
+                        | DeploymentResource::ExternalImage(_)
+                        | DeploymentResource::NvidiaState(_)
+                        | DeploymentResource::NspawnConfig(_)
+                        | DeploymentResource::SystemdOverride(_)
+                )
+            })
+            .collect()
     }
 
     fn block_storage_removal(&mut self, reason: impl Into<String>) {
@@ -162,6 +237,103 @@ impl ApplyReport {
             .map(String::as_str)
             .collect()
     }
+
+    fn application_ledger(&self) -> &ResourceLedger {
+        &self.ledger
+    }
+
+    fn remove_rootfs_dependents(&mut self) {
+        for resource in [
+            DeploymentResource::StorageMount(self.target.clone()),
+            DeploymentResource::RawConfigurationMount(self.target.clone()),
+            DeploymentResource::RootfsAccounts(self.target.clone()),
+            DeploymentResource::RootfsNvidia(self.target.clone()),
+            DeploymentResource::RootfsNetwork(self.target.clone()),
+        ] {
+            self.ledger.remove(&resource);
+        }
+    }
+
+    fn remove_external_image_dependents(&mut self) {
+        self.remove_rootfs_dependents();
+        self.ledger
+            .remove(&DeploymentResource::NspawnConfig(self.target.clone()));
+    }
+
+    fn outcome_unknown_resources(&self) -> Vec<DeploymentResource> {
+        self.ledger
+            .snapshot()
+            .entries()
+            .iter()
+            .filter(|entry| entry.disposition == ResourceDisposition::OutcomeUnknown)
+            .map(|entry| entry.resource.clone())
+            .collect()
+    }
+}
+
+async fn persist_applying(
+    job: &DeploymentJobContext,
+    stage: DeploymentStage,
+    intended_resources: Vec<DeploymentResource>,
+    report: &ApplyReport,
+) -> Result<()> {
+    if let Some(state) = job.state_session() {
+        state
+            .applying(stage, intended_resources, report.application_ledger())
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn persist_committed(
+    job: &DeploymentJobContext,
+    stage: DeploymentStage,
+    report: &ApplyReport,
+) -> Result<()> {
+    if let Some(state) = job.state_session() {
+        state
+            .committed(stage, report.application_ledger())
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn persist_cleanup_pending(job: &DeploymentJobContext, report: &ApplyReport) -> Result<()> {
+    if let Some(state) = job.state_session() {
+        state
+            .cleanup_pending(report.application_ledger())
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn finish_manifest(job: &DeploymentJobContext) -> Result<()> {
+    if let Some(state) = job.state_session() {
+        state
+            .finish()
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
+    }
+    Ok(())
+}
+
+async fn capture_uncommitted_effects(job: &DeploymentJobContext, report: &mut ApplyReport) {
+    let Some(state) = job.state_session() else {
+        return;
+    };
+    for resource in state.current_applying_resources().await {
+        if matches!(resource, DeploymentResource::RawConfigurationMount(_))
+            && report.ledger.disposition(&resource).is_none()
+        {
+            report.block_storage_removal(
+                "raw image configuration mount outcome requires reconciliation",
+            );
+        }
+        report.record_outcome_unknown_if_unclassified(resource);
+    }
 }
 
 #[async_trait::async_trait]
@@ -180,6 +352,22 @@ pub trait Deployer: Send + Sync {
     /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
     fn is_external_storage_managed(&self) -> bool {
         false
+    }
+
+    /// Resources whose outcome may change while the source stage is running.
+    ///
+    /// This list is persisted before dispatch. It may conservatively include
+    /// optional effects, but it must include every effect the deployer can
+    /// create before it returns an authoritative result.
+    fn source_stage_resources(
+        &self,
+        target: &crate::domain::machine::MachineName,
+    ) -> Vec<DeploymentResource> {
+        vec![if self.is_external_storage_managed() {
+            DeploymentResource::ExternalImage(target.clone())
+        } else {
+            DeploymentResource::LocalStorage(target.clone())
+        }]
     }
 
     /// Returns true if this deployer requires post-deployment configuration (passwords, etc).
@@ -319,7 +507,7 @@ pub(crate) async fn run_deployment(
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
-    host: DeploymentHost,
+    host: DirectProvisioningCapabilities,
     secrets: DeploymentSecrets,
     job: DeploymentJobContext,
 ) -> Result<()> {
@@ -368,13 +556,13 @@ async fn run_deploy_internal(
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
-    host: DeploymentHost,
+    host: DirectProvisioningCapabilities,
     mut secrets: DeploymentSecrets,
     job: DeploymentJobContext,
 ) -> Result<()> {
     let logs = job.event_sender();
     let cancellation = job.cancellation();
-    crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
+    let target = crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?.machine;
     let system_operations = host.system_operations.clone();
 
     macro_rules! push_log {
@@ -386,7 +574,7 @@ async fn run_deploy_internal(
     push_log!(format!("=== Deploying '{}' ===", name));
 
     let is_ext = deployer.is_external_storage_managed();
-    let mut report = ApplyReport::default();
+    let mut report = ApplyReport::new(target.clone());
     let mut raw_mount_target: Option<crate::adapters::rootfs::RootfsTarget> = None;
     let mut storage_mount_attempted = false;
     let mut external_provider_started = false;
@@ -409,8 +597,17 @@ async fn run_deploy_internal(
                 "Creating storage (type: {:?})...",
                 storage.get_type()
             ));
+            let local_storage = DeploymentResource::LocalStorage(target.clone());
+            persist_applying(
+                &job,
+                DeploymentStage::StoragePreparation,
+                vec![local_storage],
+                &report,
+            )
+            .await?;
             storage.create(&name).await?;
             report.record_created(AppliedResource::LocalStorage);
+            persist_committed(&job, DeploymentStage::StoragePreparation, &report).await?;
             cancellation.checkpoint()?;
         }
 
@@ -420,8 +617,18 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Mounting storage...".to_string());
+            let storage_mount = DeploymentResource::StorageMount(target.clone());
+            persist_applying(
+                &job,
+                DeploymentStage::StoragePreparation,
+                vec![storage_mount.clone()],
+                &report,
+            )
+            .await?;
             storage_mount_attempted = true;
             let rootfs = storage.mount(&name).await?;
+            report.record_typed(storage_mount, ResourceDisposition::Created);
+            persist_committed(&job, DeploymentStage::StoragePreparation, &report).await?;
             rootfs
         } else {
             // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
@@ -434,6 +641,14 @@ async fn run_deploy_internal(
             name
         );
         external_provider_started = is_ext;
+        let source_resources = deployer.source_stage_resources(&target);
+        persist_applying(
+            &job,
+            DeploymentStage::SourceDeployment,
+            source_resources,
+            &report,
+        )
+        .await?;
         deployer
             .deploy(
                 &name,
@@ -444,6 +659,7 @@ async fn run_deploy_internal(
                 &mut report,
             )
             .await?;
+        persist_committed(&job, DeploymentStage::SourceDeployment, &report).await?;
         cancellation.checkpoint()?;
 
         // 4. Post-deployment configuration
@@ -461,19 +677,24 @@ async fn run_deploy_internal(
             .await?;
         if !rootfs_exists && actual_rootfs_target.supports_raw_fallback() {
             push_log!("Mounting raw image for configuration...".to_string());
+            let raw_mount = DeploymentResource::RawConfigurationMount(target.clone());
+            persist_applying(
+                &job,
+                DeploymentStage::RootfsMutation,
+                vec![raw_mount.clone()],
+                &report,
+            )
+            .await?;
             match host.rootfs.mount_managed_raw(&name).await {
                 Ok(Some(target)) => {
                     actual_rootfs_target = target.clone();
                     raw_mount_target = Some(target);
+                    report.record_typed(raw_mount, ResourceDisposition::Created);
                 }
                 Ok(None) => {}
-                Err(error) => {
-                    push_log!(format!(
-                        "WARNING: Failed to mount raw image with systemd-dissect: {}",
-                        error
-                    ));
-                }
+                Err(error) => return Err(error),
             }
+            persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
             cancellation.checkpoint()?;
         }
 
@@ -489,6 +710,15 @@ async fn run_deploy_internal(
 
         let has_account_changes = secrets.has_account_changes();
         if supports_offline_commands {
+            if has_account_changes {
+                persist_applying(
+                    &job,
+                    DeploymentStage::RootfsMutation,
+                    vec![DeploymentResource::RootfsAccounts(target.clone())],
+                    &report,
+                )
+                .await?;
+            }
             if let Some(password) = secrets.take_root_password() {
                 push_log!("Setting root password...".to_string());
                 for warning in host
@@ -575,6 +805,13 @@ async fn run_deploy_internal(
             cancellation.checkpoint()?;
             resolved_wayland.push(grant);
         }
+        if supports_offline_commands && has_account_changes {
+            report.record_typed(
+                DeploymentResource::RootfsAccounts(target.clone()),
+                ResourceDisposition::Committed,
+            );
+            persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
+        }
 
         let mut initial_nvidia_state = None;
 
@@ -593,8 +830,16 @@ async fn run_deploy_internal(
             cancellation.checkpoint()?;
 
             // Persist the validated snapshot and its profile for lifecycle diffing.
+            persist_applying(
+                &job,
+                DeploymentStage::HostConfiguration,
+                vec![DeploymentResource::NvidiaState(target.clone())],
+                &report,
+            )
+            .await?;
             let state_apply = host.nvidia_state.write_initial(&name, &state).await?;
             report.record_apply(AppliedResource::NvidiaState, state_apply)?;
+            persist_committed(&job, DeploymentStage::HostConfiguration, &report).await?;
             match state_apply {
                 ApplyStatus::ReplacedOwned => {
                     let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
@@ -612,26 +857,26 @@ async fn run_deploy_internal(
 
             // Write ld.so.conf.d and env vars into rootfs (one-time setup)
             if supports_offline_commands {
-                match crate::adapters::platform::nvidia::lifecycle::inject_env_once(
+                let rootfs_nvidia = DeploymentResource::RootfsNvidia(target.clone());
+                persist_applying(
+                    &job,
+                    DeploymentStage::RootfsMutation,
+                    vec![rootfs_nvidia.clone()],
+                    &report,
+                )
+                .await?;
+                for warning in crate::adapters::platform::nvidia::lifecycle::inject_env_once(
                     &actual_rootfs_target,
                     &state,
                     &host.rootfs,
                 )
-                .await
+                .await?
                 {
-                    Ok(warnings) => {
-                        for warning in warnings {
-                            log::warn!("{}", warning);
-                            push_log!(warning);
-                        }
-                    }
-                    Err(error) => {
-                        push_log!(format!(
-                            "WARNING: Failed to inject NVIDIA env/ldconfig: {}",
-                            error
-                        ));
-                    }
+                    log::warn!("{}", warning);
+                    push_log!(warning);
                 }
+                report.record_typed(rootfs_nvidia, ResourceDisposition::Committed);
+                persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
             } else if has_os_layout {
                 push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
             } else {
@@ -652,6 +897,13 @@ async fn run_deploy_internal(
         }
 
         push_log!("Writing .nspawn config...".to_string());
+        persist_applying(
+            &job,
+            DeploymentStage::RuntimeCommit,
+            vec![DeploymentResource::NspawnConfig(target.clone())],
+            &report,
+        )
+        .await?;
         let nspawn_apply = host
             .nspawn
             .write_generated(
@@ -661,6 +913,7 @@ async fn run_deploy_internal(
             )
             .await?;
         report.record_apply(AppliedResource::NspawnConfig, nspawn_apply)?;
+        persist_committed(&job, DeploymentStage::RuntimeCommit, &report).await?;
         cancellation.checkpoint()?;
 
         if !cfg.device_binds.is_empty() || cfg.gpu_passthrough_all {
@@ -669,6 +922,13 @@ async fn run_deploy_internal(
                 name
             );
             push_log!("Writing systemd service override...".to_string());
+            persist_applying(
+                &job,
+                DeploymentStage::RuntimeCommit,
+                vec![DeploymentResource::SystemdOverride(target.clone())],
+                &report,
+            )
+            .await?;
             let override_apply = host
                 .systemd_unit
                 .write_override(
@@ -678,6 +938,7 @@ async fn run_deploy_internal(
                 )
                 .await?;
             report.record_apply(AppliedResource::SystemdOverride, override_apply)?;
+            persist_committed(&job, DeploymentStage::RuntimeCommit, &report).await?;
             match override_apply {
                 ApplyStatus::ReplacedOwned => {
                     let warning = "Replaced an existing Lasper-owned systemd service drop-in for this deployment.";
@@ -703,20 +964,28 @@ async fn run_deploy_internal(
                         "Enabling container network and DNS services (systemd-networkd, systemd-resolved)..."
                             .to_string()
                     );
-                    match host.rootfs.configure_network(&actual_rootfs_target).await {
+                    let rootfs_network = DeploymentResource::RootfsNetwork(target.clone());
+                    persist_applying(
+                        &job,
+                        DeploymentStage::RootfsMutation,
+                        vec![rootfs_network.clone()],
+                        &report,
+                    )
+                    .await?;
+                    let configured = match host.rootfs.configure_network(&actual_rootfs_target).await {
                         Ok(warnings) => {
                             for warning in warnings {
                                 log::warn!("{}", warning);
                                 push_log!(warning);
                             }
+                            true
                         }
-                        Err(error) => {
-                            push_log!(format!(
-                                "WARNING: {} (might not be a systemd container)",
-                                error
-                            ));
-                        }
+                        Err(error) => return Err(error),
+                    };
+                    if configured {
+                        report.record_typed(rootfs_network, ResourceDisposition::Committed);
                     }
+                    persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
                     cancellation.checkpoint()?;
                 }
             }
@@ -726,33 +995,113 @@ async fn run_deploy_internal(
     }
     .await;
 
+    if result.is_err() {
+        capture_uncommitted_effects(&job, &mut report).await;
+    }
+
     if let Err(NspawnError::DeploymentProcessStateUnknown(message)) = &result {
         let warning = format!(
             "could not safely clean up deployment {name:?}: {message}; mounts and resources were preserved for manual inspection"
         );
         log::error!("[DEPLOY] {warning}");
         push_log!(format!("FATAL: {warning}"));
+        if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
+            log::error!("[DEPLOY] could not persist cleanup-pending state: {state_error}");
+        }
         return Err(NspawnError::DeploymentProcessStateUnknown(message.clone()));
     }
 
     let mut cleanup_errors = Vec::new();
+    let mut durable_cleanup_failed = false;
     if let Some(target) = raw_mount_target {
         push_log!("Unmounting raw image...".to_string());
-        if let Err(error) = host.rootfs.unmount_managed_raw(&target).await {
-            let message = format!("raw image configuration mount: {error}");
-            log::warn!("Failed to clean up {message}");
-            report.block_storage_removal(message.clone());
-            cleanup_errors.push(message);
+        let resource = DeploymentResource::RawConfigurationMount(report.target.clone());
+        match persist_applying(
+            &job,
+            DeploymentStage::Cleanup,
+            vec![resource.clone()],
+            &report,
+        )
+        .await
+        {
+            Ok(()) => match host.rootfs.unmount_managed_raw(&target).await {
+                Ok(()) => {
+                    report.remove_typed(&resource);
+                    if let Err(error) =
+                        persist_committed(&job, DeploymentStage::Cleanup, &report).await
+                    {
+                        let message = format!("raw mount cleanup state: {error}");
+                        durable_cleanup_failed = true;
+                        report.record_typed(resource, ResourceDisposition::CleanupPending);
+                        report.block_storage_removal(message.clone());
+                        cleanup_errors.push(message);
+                    }
+                }
+                Err(error) => {
+                    let message = format!("raw image configuration mount: {error}");
+                    log::warn!("Failed to clean up {message}");
+                    report.record_typed(resource, ResourceDisposition::CleanupPending);
+                    report.block_storage_removal(message.clone());
+                    cleanup_errors.push(message);
+                }
+            },
+            Err(error) => {
+                let message = format!("raw mount cleanup was not attempted: {error}");
+                durable_cleanup_failed = true;
+                report.record_typed(resource, ResourceDisposition::CleanupPending);
+                report.block_storage_removal(message.clone());
+                cleanup_errors.push(message);
+            }
         }
     }
 
     if storage_mount_attempted {
         push_log!("Cleaning up storage mount...".to_string());
-        if let Err(error) = storage.unmount(&name).await {
-            let message = format!("storage unmount: {error}");
-            log::warn!("Failed to clean up {message}");
+        let resource = DeploymentResource::StorageMount(report.target.clone());
+        if durable_cleanup_failed {
+            let message =
+                "storage cleanup was not attempted after durable cleanup state failed".to_string();
+            report.record_typed(resource, ResourceDisposition::CleanupPending);
             report.block_storage_removal(message.clone());
             cleanup_errors.push(message);
+        } else {
+            match persist_applying(
+                &job,
+                DeploymentStage::Cleanup,
+                vec![resource.clone()],
+                &report,
+            )
+            .await
+            {
+                Ok(()) => match storage.unmount(&name).await {
+                    Ok(()) => {
+                        report.remove_typed(&resource);
+                        if let Err(error) =
+                            persist_committed(&job, DeploymentStage::Cleanup, &report).await
+                        {
+                            let message = format!("storage cleanup state: {error}");
+                            durable_cleanup_failed = true;
+                            report.record_typed(resource, ResourceDisposition::CleanupPending);
+                            report.block_storage_removal(message.clone());
+                            cleanup_errors.push(message);
+                        }
+                    }
+                    Err(error) => {
+                        let message = format!("storage unmount: {error}");
+                        log::warn!("Failed to clean up {message}");
+                        report.record_typed(resource, ResourceDisposition::CleanupPending);
+                        report.block_storage_removal(message.clone());
+                        cleanup_errors.push(message);
+                    }
+                },
+                Err(error) => {
+                    let message = format!("storage cleanup was not attempted: {error}");
+                    durable_cleanup_failed = true;
+                    report.record_typed(resource, ResourceDisposition::CleanupPending);
+                    report.block_storage_removal(message.clone());
+                    cleanup_errors.push(message);
+                }
+            }
         }
     }
 
@@ -773,9 +1122,15 @@ async fn run_deploy_internal(
 
         let external_ownership_confirmed = report.owns(AppliedResource::ExternalImage);
         let mut rollback_errors = cleanup_errors;
-        rollback_errors.extend(
-            rollback_apply_report(&name, &mut report, storage.as_ref(), &host, &logs).await,
-        );
+        if durable_cleanup_failed {
+            rollback_errors
+                .push("rollback was not attempted after durable cleanup state failed".into());
+        } else {
+            rollback_errors.extend(
+                rollback_apply_report(&name, &mut report, storage.as_ref(), &host, &logs, &job)
+                    .await,
+            );
+        }
 
         if external_provider_started && !external_ownership_confirmed {
             let warning = format!(
@@ -785,10 +1140,34 @@ async fn run_deploy_internal(
             push_log!(format!("WARNING: {warning}"));
         }
 
+        for resource in report.outcome_unknown_resources() {
+            rollback_errors.push(format!(
+                "{} outcome requires authoritative reconciliation",
+                resource.label()
+            ));
+        }
+
         job.set_rolling_back(false);
         if rollback_errors.is_empty() {
             push_log!("Rollback complete.".to_string());
+            if let Err(manifest_error) = finish_manifest(&job).await {
+                let message = format!("deployment crash manifest: {manifest_error}");
+                push_log!(format!("ROLLBACK ERROR: {message}"));
+                return if matches!(error, NspawnError::DeploymentCancelled) {
+                    Err(NspawnError::DeploymentCancellationRollbackIncomplete(
+                        message,
+                    ))
+                } else {
+                    Err(NspawnError::DeploymentRollbackIncomplete(format!(
+                        "{error}; rollback completed but durable state cleanup failed: {message}"
+                    )))
+                };
+            }
             return Err(error);
+        }
+
+        if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
+            rollback_errors.push(format!("deployment cleanup state: {state_error}"));
         }
 
         for rollback_error in &rollback_errors {
@@ -800,7 +1179,7 @@ async fn run_deploy_internal(
                 rollback_errors,
             ))
         } else {
-            Err(NspawnError::DeployError(format!(
+            Err(NspawnError::DeploymentRollbackIncomplete(format!(
                 "{error}; rollback incomplete: {rollback_errors}"
             )))
         };
@@ -811,7 +1190,10 @@ async fn run_deploy_internal(
     Ok(())
 }
 
-async fn inspect_deployment_sidecars(name: &str, host: &DeploymentHost) -> Result<Vec<String>> {
+async fn inspect_deployment_sidecars(
+    name: &str,
+    host: &DirectProvisioningCapabilities,
+) -> Result<Vec<String>> {
     if let Some(config) = host.nspawn.inspect(name).await? {
         return Err(NspawnError::Validation(format!(
             "Deployment target has existing .nspawn configuration: {}",
@@ -859,23 +1241,36 @@ async fn rollback_apply_report(
     name: &str,
     report: &mut ApplyReport,
     storage: &dyn StorageBackend,
-    host: &DeploymentHost,
+    host: &DirectProvisioningCapabilities,
     logs: &Sender<DeployLogEvent>,
+    job: &DeploymentJobContext,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     let mut reload_daemon = false;
 
-    while let Some(resource) = report.resources.pop() {
+    for resource in report.typed_owned_in_reverse() {
         send_deploy_log(logs, format!("Rolling back {}...", resource.label())).await;
-        let result = match resource {
-            AppliedResource::SystemdOverride => {
+        if let Err(error) = persist_applying(
+            job,
+            DeploymentStage::Rollback,
+            vec![resource.clone()],
+            report,
+        )
+        .await
+        {
+            report.record_typed(resource, ResourceDisposition::CleanupPending);
+            errors.push(format!("rollback was not attempted: {error}"));
+            break;
+        }
+        let result = match &resource {
+            DeploymentResource::SystemdOverride(_) => {
                 reload_daemon = true;
                 host.systemd_unit.remove_service_override(name).await
             }
-            AppliedResource::NspawnConfig => host.nspawn.remove(name).await,
-            AppliedResource::NvidiaState => host.nvidia_state.remove(name).await,
-            AppliedResource::ExternalImage => {
-                let blockers = report.removal_blockers(resource);
+            DeploymentResource::NspawnConfig(_) => host.nspawn.remove(name).await,
+            DeploymentResource::NvidiaState(_) => host.nvidia_state.remove(name).await,
+            DeploymentResource::ExternalImage(_) => {
+                let blockers = report.removal_blockers(AppliedResource::ExternalImage);
                 if blockers.is_empty() {
                     host.system_operations.remove_image(name).await
                 } else {
@@ -885,8 +1280,8 @@ async fn rollback_apply_report(
                     )))
                 }
             }
-            AppliedResource::LocalStorage => {
-                let blockers = report.removal_blockers(resource);
+            DeploymentResource::LocalStorage(_) => {
+                let blockers = report.removal_blockers(AppliedResource::LocalStorage);
                 if blockers.is_empty() {
                     storage.delete(name).await
                 } else {
@@ -896,9 +1291,32 @@ async fn rollback_apply_report(
                     )))
                 }
             }
+            _ => continue,
         };
-        if let Err(error) = result {
-            errors.push(format!("{}: {error}", resource.label()));
+        match result {
+            Ok(()) => {
+                report.remove_typed(&resource);
+                match resource {
+                    DeploymentResource::ExternalImage(_) => {
+                        report.remove_external_image_dependents();
+                    }
+                    DeploymentResource::LocalStorage(_) => report.remove_rootfs_dependents(),
+                    _ => {}
+                }
+                if let Err(error) = persist_committed(job, DeploymentStage::Rollback, report).await
+                {
+                    report.record_typed(resource.clone(), ResourceDisposition::CleanupPending);
+                    errors.push(format!(
+                        "{} durable cleanup state: {error}",
+                        resource.label()
+                    ));
+                    break;
+                }
+            }
+            Err(error) => {
+                report.record_typed(resource.clone(), ResourceDisposition::CleanupPending);
+                errors.push(format!("{}: {error}", resource.label()));
+            }
         }
     }
 
@@ -913,6 +1331,15 @@ async fn rollback_apply_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::{
+        deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
+        DeploymentStatePort, DeploymentStateSession, DeploymentStorage, MemoryDeploymentStatePort,
+    };
+    use std::sync::Arc;
+
+    fn apply_report() -> ApplyReport {
+        ApplyReport::new(crate::domain::machine::MachineName::new("test").unwrap())
+    }
 
     #[test]
     fn deploy_stream_classifies_recoverable_bootstrap_diagnostics() {
@@ -945,7 +1372,7 @@ mod tests {
 
     #[test]
     fn apply_report_records_only_resources_created_by_this_attempt() {
-        let mut report = ApplyReport::default();
+        let mut report = apply_report();
         report
             .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
             .unwrap();
@@ -956,12 +1383,13 @@ mod tests {
             .record_apply(AppliedResource::SystemdOverride, ApplyStatus::Unchanged)
             .unwrap();
 
-        assert_eq!(report.resources, vec![AppliedResource::NspawnConfig]);
+        assert!(report.owns(AppliedResource::NspawnConfig));
+        assert!(!report.owns(AppliedResource::SystemdOverride));
     }
 
     #[test]
     fn unknown_nspawn_owner_blocks_external_image_compensation() {
-        let mut report = ApplyReport::default();
+        let mut report = apply_report();
         let error = report
             .record_apply(
                 AppliedResource::NspawnConfig,
@@ -970,13 +1398,13 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("unknown ownership"));
-        assert!(report.resources.is_empty());
+        assert!(!report.owns(AppliedResource::NspawnConfig));
         assert_eq!(report.external_image_blockers.len(), 1);
     }
 
     #[test]
     fn sidecar_conflicts_are_preserved_and_owned_replacements_are_adopted() {
-        let mut report = ApplyReport::default();
+        let mut report = apply_report();
         report
             .record_apply(
                 AppliedResource::NvidiaState,
@@ -987,13 +1415,99 @@ mod tests {
             .record_apply(AppliedResource::SystemdOverride, ApplyStatus::ReplacedOwned)
             .unwrap();
 
-        assert_eq!(report.resources, vec![AppliedResource::SystemdOverride]);
+        assert!(report.owns(AppliedResource::SystemdOverride));
+        assert!(!report.owns(AppliedResource::NvidiaState));
         assert!(report.external_image_blockers.is_empty());
     }
 
     #[test]
+    fn unknown_effects_are_not_rolled_back_as_owned_resources() {
+        let mut report = apply_report();
+        let unknown = DeploymentResource::NspawnConfig(report.target.clone());
+        report.record_outcome_unknown_if_unclassified(unknown.clone());
+
+        assert_eq!(report.outcome_unknown_resources(), vec![unknown]);
+        assert!(!report.owns(AppliedResource::NspawnConfig));
+        assert!(report.typed_owned_in_reverse().is_empty());
+    }
+
+    #[test]
+    fn removing_owned_storage_resolves_unknown_rootfs_effects() {
+        let mut report = apply_report();
+        report.record_created(AppliedResource::LocalStorage);
+        report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsAccounts(
+            report.target.clone(),
+        ));
+        report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsNetwork(
+            report.target.clone(),
+        ));
+        report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsNvidia(
+            report.target.clone(),
+        ));
+
+        report.remove_rootfs_dependents();
+
+        assert!(report.outcome_unknown_resources().is_empty());
+        assert!(report.owns(AppliedResource::LocalStorage));
+    }
+
+    #[tokio::test]
+    async fn interrupted_applying_effect_is_persisted_as_unknown_not_owned() {
+        let plan = DeploymentPlan::build(DeploymentRequest {
+            config: ContainerConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            source: DeploymentSource::Copy {
+                source_name: "base".into(),
+            },
+            storage: DeploymentStorage::Directory,
+            nvidia_profile: None,
+            wayland: Vec::new(),
+            allow_unsafe_remote_tar: false,
+        })
+        .unwrap();
+        let id = DeploymentId::from_u128(42);
+        let state = Arc::new(MemoryDeploymentStatePort::default());
+        let session = DeploymentStateSession::new(state.clone(), id, &plan);
+        session.prepare().await.unwrap();
+        let resource = DeploymentResource::RawConfigurationMount(plan.target().clone());
+        session
+            .applying(
+                DeploymentStage::RootfsMutation,
+                vec![resource.clone()],
+                &ResourceLedger::default(),
+            )
+            .await
+            .unwrap();
+        let (_handle, job) = deployment_job_channel(id);
+        let job = job.with_state_session(session);
+        let mut report = ApplyReport::new(plan.target().clone());
+
+        capture_uncommitted_effects(&job, &mut report).await;
+        persist_cleanup_pending(&job, &report).await.unwrap();
+
+        assert_eq!(
+            report.ledger.disposition(&resource),
+            Some(ResourceDisposition::OutcomeUnknown)
+        );
+        assert!(!report.ledger.owns(&resource));
+        assert_eq!(report.storage_removal_blockers.len(), 1);
+        let manifests = state.unfinished().await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        assert!(matches!(
+            manifests[0].state,
+            crate::application::provisioning::DeploymentManifestState::CleanupPending
+        ));
+        assert_eq!(
+            manifests[0].committed_ledger.entries()[0].disposition,
+            ResourceDisposition::OutcomeUnknown
+        );
+    }
+
+    #[test]
     fn failed_unmount_blocks_local_and_external_storage_compensation() {
-        let mut report = ApplyReport::default();
+        let mut report = apply_report();
         report
             .external_image_blockers
             .push("unknown .nspawn owner".into());

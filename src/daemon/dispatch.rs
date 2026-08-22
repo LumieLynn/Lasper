@@ -1,9 +1,10 @@
 //! Bounded control-channel request pump and typed privileged dispatch.
 
-use super::process_state::{
-    shutdown_daemon_resources, OCI_TRANSFER_CANCELLATIONS, SPAWN_EXIT_CODES, SPAWN_PIDS,
-    SPAWN_WAIT_ERRORS,
+use super::deployment_protocol::{
+    DeploymentJobRequest, DeploymentSubmissionRequest, ProbeDeploymentRecoveryRequest,
+    ProbeDeploymentRecoveryResult, ReleaseUnresolvedDeploymentRequest,
 };
+use super::process_state::shutdown_daemon_resources;
 use super::protocol::{CliInspectMachineRequest, RpcRequest};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
@@ -15,13 +16,16 @@ use crate::adapters::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation,
 };
 use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
+use crate::adapters::provisioning::state::{
+    execute_deployment_state_operation, DeploymentStateOperation,
+};
 use crate::adapters::rootfs::store::{execute_rootfs_operation, RootfsOperation};
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::storage::store::{execute_managed_storage_operation, ManagedStorageOperation};
 use crate::adapters::system_operation::{
     execute_cli_image_remove, execute_dbus_system_operation, execute_system_operation,
     SystemOperation,
 };
+use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::{
     ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
 };
@@ -118,6 +122,7 @@ pub(super) async fn run_rpc_request_pump<R, B>(
     out_tx: &tokio::sync::mpsc::Sender<String>,
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
+    trusted_state_root: TrustedStateRoot,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -129,7 +134,6 @@ where
     }
 
     let request_slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_IN_FLIGHT));
-    let operation_registry = crate::application::OperationRegistry::new();
     loop {
         let Some(mut line) = read_bounded_line(reader, MAX_RPC_FRAME_BYTES).await? else {
             return Ok(());
@@ -160,7 +164,7 @@ where
         };
 
         let reservation = match daemon_resource_claim(&request) {
-            Ok(Some(claim)) => match operation_registry.reserve([claim]) {
+            Ok(Some(claim)) => match server_state.operations.reserve([claim]) {
                 Ok(reservation) => Some(reservation),
                 Err(conflict) => {
                     if !send(
@@ -216,6 +220,7 @@ where
         let dbus = dbus.clone();
         let out_tx = out_tx.clone();
         let server_state = Arc::clone(&server_state);
+        let trusted_state_root = trusted_state_root.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _reservation = reservation;
@@ -226,6 +231,7 @@ where
                 &out_tx,
                 invoking_uid,
                 Arc::clone(&server_state),
+                trusted_state_root,
             )
             .await
             {
@@ -292,6 +298,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
     out_tx: &tokio::sync::mpsc::Sender<String>,
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
+    trusted_state_root: TrustedStateRoot,
 ) -> HandleOutcome {
     let RpcRequest {
         id, method, params, ..
@@ -386,17 +393,18 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let response = match execute_nvidia_state_operation(operation).await {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
+                let response =
+                    match execute_nvidia_state_operation(operation, trusted_state_root).await {
+                        Ok(result) => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
+                        }
+                        Err(error) => {
+                            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                                "code":-1,
+                                "message":error.to_string(),
+                            }})
+                        }
+                    };
                 if let Ok(line) = serde_json::to_string(&response) {
                     let _ = out_tx.send(line).await;
                 }
@@ -404,33 +412,261 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "managed_storage" => {
-            let operation: ManagedStorageOperation = match serde_json::from_value(params) {
+        "deployment_state" => {
+            let operation: DeploymentStateOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
                     return HandleOutcome::Sync(Err(format!(
-                        "invalid managed_storage request: {error}"
+                        "invalid deployment_state request: {error}"
                     )));
                 }
             };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let response = match execute_managed_storage_operation(operation).await {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
+                let result = execute_deployment_state_operation(operation, trusted_state_root)
+                    .await
+                    .unwrap_or_else(
+                        crate::adapters::provisioning::state::DeploymentStateResult::failure,
+                    );
+                let response = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
                 if let Ok(line) = serde_json::to_string(&response) {
                     let _ = out_tx.send(line).await;
                 }
             });
             HandleOutcome::Spawned
+        }
+
+        "deployment_status" => {
+            let request: DeploymentJobRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid deployment_status request: {error}"
+                    )));
+                }
+            };
+            match server_state.deployments.snapshot(request.deployment_id) {
+                Ok(snapshot) => HandleOutcome::Sync(
+                    serde_json::to_value(Some(snapshot)).map_err(|error| error.to_string()),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    HandleOutcome::Sync(Ok(serde_json::Value::Null))
+                }
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "resolve_deployment_submission" => {
+            let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid resolve_deployment_submission request: {error}"
+                    )));
+                }
+            };
+            match server_state
+                .deployments
+                .resolve_submission(request.request_id)
+            {
+                Ok(snapshot) => HandleOutcome::Sync(
+                    serde_json::to_value(Some(snapshot)).map_err(|error| error.to_string()),
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    HandleOutcome::Sync(Ok(serde_json::Value::Null))
+                }
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "acknowledge_deployment_submission" => {
+            let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid acknowledge_deployment_submission request: {error}"
+                    )));
+                }
+            };
+            match server_state
+                .deployments
+                .acknowledge_submission(request.request_id)
+            {
+                Ok(()) => HandleOutcome::Sync(Ok(serde_json::json!({}))),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "cancel_deployment" => {
+            let request: DeploymentJobRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid cancel_deployment request: {error}"
+                    )));
+                }
+            };
+            match server_state.deployments.cancel(request.deployment_id) {
+                Ok(snapshot) => HandleOutcome::Sync(
+                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
+                ),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "acknowledge_deployment" => {
+            let request: DeploymentJobRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid acknowledge_deployment request: {error}"
+                    )));
+                }
+            };
+            match server_state.deployments.acknowledge(request.deployment_id) {
+                Ok(()) => HandleOutcome::Sync(Ok(serde_json::json!({}))),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "probe_deployment_recovery" => {
+            let request: ProbeDeploymentRecoveryRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid probe_deployment_recovery request: {error}"
+                    )));
+                }
+            };
+            let state = crate::adapters::provisioning::state::FilesystemDeploymentState::new(
+                trusted_state_root.clone(),
+            );
+            let manifests =
+                match crate::application::provisioning::DeploymentStatePort::unfinished(&state)
+                    .await
+                {
+                    Ok(manifests) => manifests,
+                    Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+                };
+            let manifest = match manifests
+                .into_iter()
+                .find(|manifest| manifest.deployment_id == request.deployment_id)
+            {
+                Some(manifest) if manifest.revision == request.expected_revision => manifest,
+                Some(manifest) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "deployment {} manifest revision changed from {} to {}",
+                        request.deployment_id, request.expected_revision, manifest.revision
+                    )));
+                }
+                None => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "deployment {} crash manifest is missing",
+                        request.deployment_id
+                    )));
+                }
+            };
+            let _reservation = match server_state.operations.reserve([manifest.recovery_claim()]) {
+                Ok(reservation) => reservation,
+                Err(conflict) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "deployment recovery resource is busy: {:?}",
+                        conflict.key
+                    )));
+                }
+            };
+            let images =
+                if crate::adapters::provisioning::recovery::requires_runtime_image_probe(&manifest)
+                {
+                    recovery_images(dbus).await
+                } else {
+                    Ok(Vec::new())
+                };
+            let observations = crate::adapters::provisioning::recovery::probe_manifest_locally(
+                &manifest,
+                images,
+                trusted_state_root,
+            )
+            .await;
+            let result = ProbeDeploymentRecoveryResult {
+                deployment_id: manifest.deployment_id,
+                manifest_revision: manifest.revision,
+                observations,
+            };
+            HandleOutcome::Sync(serde_json::to_value(result).map_err(|error| error.to_string()))
+        }
+
+        "reconcile_deployment" => {
+            let request: DeploymentJobRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid reconcile_deployment request: {error}"
+                    )));
+                }
+            };
+            let current = match server_state.deployments.snapshot(request.deployment_id) {
+                Ok(snapshot)
+                    if snapshot.claim
+                        == super::deployment_protocol::DeploymentClaimState::ReconciliationRequired =>
+                {
+                    snapshot
+                }
+                Ok(_) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "deployment {} does not require reconciliation",
+                        request.deployment_id
+                    )));
+                }
+                Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+            };
+            let state = crate::adapters::provisioning::state::FilesystemDeploymentState::new(
+                trusted_state_root,
+            );
+            let manifests =
+                match crate::application::provisioning::DeploymentStatePort::unfinished(&state)
+                    .await
+                {
+                    Ok(manifests) => manifests,
+                    Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+                };
+            let manifest_present = manifests
+                .iter()
+                .any(|manifest| manifest.deployment_id == request.deployment_id);
+            log::warn!(
+                "[AUDIT] Reconciled deployment {} revision {} against trusted crash state; manifest_present={manifest_present}",
+                request.deployment_id,
+                current.revision,
+            );
+            match server_state
+                .deployments
+                .reconcile(request.deployment_id, manifest_present)
+            {
+                Ok(snapshot) => HandleOutcome::Sync(
+                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
+                ),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
+        }
+
+        "release_unresolved_deployment" => {
+            let request: ReleaseUnresolvedDeploymentRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid release_unresolved_deployment request: {error}"
+                    )));
+                }
+            };
+            match server_state
+                .deployments
+                .release_unresolved(request.deployment_id, request.confirmed)
+            {
+                Ok(snapshot) => HandleOutcome::Sync(
+                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
+                ),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
         }
 
         "rootfs" => {
@@ -668,72 +904,6 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             None => HandleOutcome::Sync(Ok(serde_json::Value::Bool(false))),
         },
 
-        "wait_command" => {
-            let cmd_id = match params["cmd_id"].as_u64() {
-                Some(id) => id,
-                None => return HandleOutcome::Sync(Err("missing cmd_id".into())),
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    let error = SPAWN_WAIT_ERRORS.lock().remove(&cmd_id);
-                    if let Some(error) = error {
-                        let response = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": {"code": -1, "message": error},
-                        });
-                        let line = serde_json::to_string(&response).unwrap();
-                        let _ = out_tx.send(line).await;
-                        return;
-                    }
-                    let code = SPAWN_EXIT_CODES.lock().remove(&cmd_id);
-                    if let Some(code) = code {
-                        let response = serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": {"exit_code": code},
-                        });
-                        let line = serde_json::to_string(&response).unwrap();
-                        let _ = out_tx.send(line).await;
-                        return;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        "signal_command" => {
-            let Some(cmd_id) = params["cmd_id"].as_u64() else {
-                return HandleOutcome::Sync(Err("missing cmd_id".into()));
-            };
-            let signal = match params["signal"].as_str() {
-                Some("terminate") => libc::SIGTERM,
-                Some("kill") => libc::SIGKILL,
-                _ => return HandleOutcome::Sync(Err("unsupported command signal".into())),
-            };
-            if let Some(cancellation) = OCI_TRANSFER_CANCELLATIONS.lock().get(&cmd_id).cloned() {
-                cancellation.request();
-                return HandleOutcome::Sync(Ok(serde_json::Value::Null));
-            }
-            let Some(pid) = SPAWN_PIDS.lock().get(&cmd_id).copied() else {
-                return HandleOutcome::Sync(Ok(serde_json::Value::Null));
-            };
-            let result = unsafe { libc::kill(-(pid as libc::pid_t), signal) };
-            let error = (result != 0).then(std::io::Error::last_os_error);
-            if result == 0
-                || error.as_ref().and_then(std::io::Error::raw_os_error) == Some(libc::ESRCH)
-            {
-                HandleOutcome::Sync(Ok(serde_json::Value::Null))
-            } else {
-                HandleOutcome::Sync(Err(format!(
-                    "failed to signal command {cmd_id}: {}",
-                    error.expect("failed kill has an OS error")
-                )))
-            }
-        }
-
         "exit" => {
             shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
@@ -741,6 +911,28 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
 
         _ => HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
     }
+}
+
+async fn recovery_images<B: DaemonDbusExecutor>(
+    dbus: &Option<B>,
+) -> Result<Vec<ImageEntry>, String> {
+    if let Some(dbus) = dbus {
+        if dbus.is_available().await {
+            match dbus.list_images().await {
+                Ok(images) => return Ok(images),
+                Err(error) => log::warn!(
+                    "Deployment recovery image probe is falling back from D-Bus: {error}"
+                ),
+            }
+        }
+    }
+
+    let runner: Arc<dyn crate::adapters::process::CommandRunner> =
+        Arc::new(crate::adapters::process::DefaultCommandRunner);
+    let cli = crate::adapters::runtime::cli::CliBackend::new(runner);
+    RuntimeSource::list_images(&cli)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 pub(super) fn request_machine_name(params: &serde_json::Value) -> Result<MachineName, String> {

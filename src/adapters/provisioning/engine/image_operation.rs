@@ -1,6 +1,5 @@
 //! Typed image import operations shared by direct and elevated modes.
 
-use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::rootfs::RootfsTarget;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::MachineName;
@@ -8,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 
 const MAX_TAR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
@@ -38,14 +36,12 @@ pub(crate) struct ImageImportReport {
     pub(crate) warnings: Vec<String>,
 }
 
-#[derive(Clone)]
-pub struct ImageImportStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
-}
+#[derive(Clone, Debug, Default)]
+pub struct ImageImportStore;
 
 impl ImageImportStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn import_raw(
@@ -54,14 +50,7 @@ impl ImageImportStore {
         source: std::fs::File,
     ) -> Result<()> {
         validate_source(&source)?;
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .import_raw_image(machine, source)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            import_raw_system_image(machine, source).await
-        }
+        import_raw_system_image(machine, source).await
     }
 
     pub(crate) async fn import_tar(
@@ -77,29 +66,7 @@ impl ImageImportStore {
             source_origin,
             allow_unsafe_remote,
         };
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .import_tar_image(request, source)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            import_tar_image(request, source).await
-        }
-    }
-
-    pub(crate) async fn assess_tar_runtime(&self) -> Result<TarRuntimeAssessment> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .assess_tar_runtime()
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            tokio::task::spawn_blocking(inspect_tar_runtime)
-                .await
-                .map_err(|error| {
-                    NspawnError::Runtime(format!("tar runtime inspection task failed: {error}"))
-                })?
-        }
+        import_tar_image(request, source).await
     }
 }
 
@@ -140,14 +107,6 @@ async fn remove_failed_raw_import(path: &std::path::Path) {
             path.display(),
             error
         );
-    }
-}
-
-impl std::fmt::Debug for ImageImportStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ImageImportStore")
-            .field("daemon", &self.daemon)
-            .finish()
     }
 }
 

@@ -138,7 +138,7 @@ mod tests {
                 use_partition_table: false,
                 root_partition: None,
             },
-            ManagedStorageStore::default(),
+            ManagedStorageStore::new(),
         );
 
         assert_eq!(
@@ -158,7 +158,7 @@ mod tests {
                 root_partition: None,
             },
             ManagedImageKind::LegacyImg,
-            ManagedStorageStore::default(),
+            ManagedStorageStore::new(),
         );
 
         assert_eq!(

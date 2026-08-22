@@ -21,6 +21,13 @@ const MAX_NVIDIA_BINDS: usize = 16384;
 const LASPER_OCI_CONFIG_MARKER: &str =
     "# Managed by Lasper: promoted systemd OCI runtime configuration";
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NspawnConfigPresence {
+    Absent,
+    Regular,
+    Unsafe,
+}
+
 /// Typed read/write access to `.nspawn` configuration files.
 #[derive(Clone)]
 pub struct NspawnConfigStore {
@@ -360,6 +367,30 @@ fn parse_image_name(name: &str) -> Result<ImageName> {
 
 fn nspawn_path(machine: &MachineName) -> PathBuf {
     NspawnConfig::default_path(machine.as_str())
+}
+
+pub(crate) async fn probe_exact_nspawn_config(
+    machine: &MachineName,
+) -> Result<NspawnConfigPresence> {
+    probe_nspawn_config_at(&nspawn_path(machine)).await
+}
+
+async fn probe_nspawn_config_at(path: &Path) -> Result<NspawnConfigPresence> {
+    let path = path.to_path_buf();
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(NspawnConfigPresence::Absent)
+        }
+        Err(error) => return Err(NspawnError::Io(path, error)),
+    };
+    Ok(
+        if metadata.file_type().is_file() && metadata.len() <= MAX_NSPAWN_CONTENT_BYTES as u64 {
+            NspawnConfigPresence::Regular
+        } else {
+            NspawnConfigPresence::Unsafe
+        },
+    )
 }
 
 fn discovered_nspawn_paths(image: &ImageName) -> [PathBuf; 3] {
@@ -1854,5 +1885,29 @@ Unknown=preserve-me\n";
             .await
             .unwrap_err();
         assert!(error.to_string().contains("changed after discovery"));
+    }
+
+    #[tokio::test]
+    async fn recovery_presence_probe_does_not_follow_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.nspawn");
+        assert_eq!(
+            probe_nspawn_config_at(&missing).await.unwrap(),
+            NspawnConfigPresence::Absent
+        );
+
+        let regular = directory.path().join("regular.nspawn");
+        std::fs::write(&regular, "[Exec]\nBoot=yes\n").unwrap();
+        assert_eq!(
+            probe_nspawn_config_at(&regular).await.unwrap(),
+            NspawnConfigPresence::Regular
+        );
+
+        let symlink = directory.path().join("symlink.nspawn");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert_eq!(
+            probe_nspawn_config_at(&symlink).await.unwrap(),
+            NspawnConfigPresence::Unsafe
+        );
     }
 }

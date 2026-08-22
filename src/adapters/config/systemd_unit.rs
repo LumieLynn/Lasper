@@ -130,6 +130,19 @@ impl SystemdUnitStore {
         })
     }
 
+    pub(crate) async fn probe_owned_overrides(&self, name: &str) -> Result<Vec<ArtifactOwnership>> {
+        let result = self
+            .execute(SystemdUnitOperation::ProbeOwnedOverrides(
+                ReadServiceOverrides {
+                    machine: parse_machine_name(name)?,
+                },
+            ))
+            .await?;
+        result.ownership.ok_or_else(|| {
+            NspawnError::Runtime("override probe returned no ownership evidence".into())
+        })
+    }
+
     async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
         if let Some(daemon) = &self.daemon {
             daemon
@@ -154,6 +167,7 @@ impl std::fmt::Debug for SystemdUnitStore {
 #[serde(tag = "operation", content = "params", rename_all = "snake_case")]
 pub(crate) enum SystemdUnitOperation {
     Read(ReadServiceOverrides),
+    ProbeOwnedOverrides(ReadServiceOverrides),
     WriteOverride(WriteServiceOverride),
     CloneOverride(CloneServiceOverride),
     WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
@@ -231,6 +245,19 @@ pub(crate) async fn execute_systemd_unit_operation(
             drop_ins.sort_by(|left, right| left.path.cmp(&right.path));
             return Ok(SystemdUnitResult {
                 drop_ins,
+                ..Default::default()
+            });
+        }
+        SystemdUnitOperation::ProbeOwnedOverrides(request) => {
+            return Ok(SystemdUnitResult {
+                ownership: Some(
+                    probe_lasper_overrides_at_with_uid(
+                        &service_override_dir(&request.machine),
+                        &transient_service_override_dir(&request.machine),
+                        0,
+                    )
+                    .await?,
+                ),
                 ..Default::default()
             });
         }
@@ -582,6 +609,31 @@ async fn remove_owned_lasper_overrides_at_with_uid(
     Ok(ownership)
 }
 
+async fn probe_lasper_overrides_at_with_uid(
+    persistent_dir: &Path,
+    transient_dir: &Path,
+    expected_uid: u32,
+) -> Result<Vec<ArtifactOwnership>> {
+    let owned_paths = [
+        persistent_dir.join(LASPER_OVERRIDE_FILE),
+        persistent_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+        transient_dir.join(LASPER_NVIDIA_OVERRIDE_FILE),
+    ];
+    let legacy_paths = [
+        persistent_dir.join(LEGACY_OVERRIDE_FILE),
+        persistent_dir.join(LEGACY_NVIDIA_OVERRIDE_FILE),
+        transient_dir.join(LEGACY_NVIDIA_OVERRIDE_FILE),
+    ];
+    let mut ownership = Vec::with_capacity(owned_paths.len() + legacy_paths.len());
+    for path in owned_paths {
+        ownership.push(probe_owned_override_at(&path, expected_uid).await?);
+    }
+    for path in legacy_paths {
+        ownership.push(probe_legacy_override_at(&path).await?);
+    }
+    Ok(ownership)
+}
+
 async fn probe_owned_override_at(path: &Path, expected_uid: u32) -> Result<ArtifactOwnership> {
     let metadata = match tokio::fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
@@ -901,6 +953,32 @@ mod tests {
         assert!(unsafe_mode.exists());
         assert!(persistent.exists());
         assert!(transient.exists());
+    }
+
+    #[tokio::test]
+    async fn recovery_override_probe_is_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let persistent = directory.path().join("etc/systemd-nspawn@test.service.d");
+        let transient = directory.path().join("run/systemd-nspawn@test.service.d");
+        tokio::fs::create_dir_all(&persistent).await.unwrap();
+        let owned = persistent.join(LASPER_OVERRIDE_FILE);
+        tokio::fs::write(&owned, systemd_override_content(&[], true))
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&owned, std::fs::Permissions::from_mode(0o644))
+            .await
+            .unwrap();
+
+        let ownership =
+            probe_lasper_overrides_at_with_uid(&persistent, &transient, uzers::get_current_uid())
+                .await
+                .unwrap();
+
+        assert_eq!(ownership[0], ArtifactOwnership::ProvenOwned);
+        assert!(ownership[1..]
+            .iter()
+            .all(|evidence| *evidence == ArtifactOwnership::NotPresent));
+        assert!(owned.exists());
     }
 
     #[tokio::test]

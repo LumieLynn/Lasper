@@ -14,6 +14,11 @@ pub enum WizardMessage {
     DialogCancel,
     AcceptUnsafeRemoteTar,
     DeclineUnsafeRemoteTar,
+    ReleaseUnresolvedDeployment(crate::application::provisioning::DeploymentId),
+    UnresolvedDeploymentReleaseFinished {
+        deployment_id: crate::application::provisioning::DeploymentId,
+        error: Option<String>,
+    },
 
     // Dialog open requests (add = blank, edit = pre-filled)
     OpenUserDialog,

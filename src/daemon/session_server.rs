@@ -12,6 +12,8 @@ use std::sync::Arc;
 #[derive(Default)]
 pub(super) struct DaemonServerState {
     sessions: parking_lot::Mutex<HashMap<WireSessionId, u32>>,
+    pub(super) deployments: super::deployment_server::DeploymentRegistry,
+    pub(super) operations: Arc<crate::application::OperationRegistry>,
 }
 
 impl DaemonServerState {

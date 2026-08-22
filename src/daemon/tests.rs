@@ -1,16 +1,11 @@
 use super::dispatch::*;
 use super::logging::*;
-use super::process_state::*;
 use super::protocol::*;
 use super::server::*;
 use super::session_protocol::{self, SpawnTerminalParams};
 use super::session_server::DaemonServerState;
 use super::transport::*;
-use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
-use crate::adapters::provisioning::engine::image_operation::{
-    ImageImportReport, ImportTarRequest, TarRuntimeAssessment,
-};
-use crate::adapters::provisioning::engine::oci_operation::OciPullRequest;
+use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTransport};
@@ -19,7 +14,6 @@ use crate::application::machine_lifecycle::{
 };
 use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
 use std::io::Write;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -74,20 +68,6 @@ impl DaemonDbusExecutor for SlowRemoveDbus {
     async fn is_available(&self) -> bool {
         true
     }
-}
-
-#[test]
-fn unhanded_command_is_stopped_and_reaped() {
-    let cmd_id = u64::MAX;
-    let mut command = crate::adapters::process::new_sync_command("sh");
-    command.args(["-c", "exec sleep 30"]).process_group(0);
-    let mut child = command.spawn().unwrap();
-    SPAWN_PIDS.lock().insert(cmd_id, child.id());
-
-    stop_unhanded_command(&mut child, cmd_id, "test");
-
-    assert!(child.try_wait().unwrap().is_some());
-    assert!(!SPAWN_PIDS.lock().contains_key(&cmd_id));
 }
 
 #[test]
@@ -303,6 +283,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
             &out_tx,
             uzers::get_current_uid(),
             server_state,
+            crate::adapters::trusted_state::TrustedStateRoot::production(),
         )
         .await
     });
@@ -377,6 +358,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
             &out_tx,
             uzers::get_current_uid(),
             server_state,
+            crate::adapters::trusted_state::TrustedStateRoot::production(),
         )
         .await
     });
@@ -503,7 +485,7 @@ fn fd_token_requires_exact_session_secret() {
 
 #[test]
 fn fd_request_without_authentication_is_rejected_by_parser() {
-    let request = r#"{"method":"spawn_oci_pull","params":{"cmd_id":1,"request":{"reference":"nginx","machine":"test","read_only":false}}}"#;
+    let request = r#"{"method":"spawn_journalctl","params":{"session_id":1,"name":"test"}}"#;
     assert!(serde_json::from_str::<FdRequest>(request).is_err());
 }
 
@@ -537,132 +519,6 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
         }
         _ => panic!("expected spawn_terminal"),
     }
-}
-
-#[test]
-fn fd_request_round_trip_uses_typed_bootstrap_parameters() {
-    let request = FdRequest {
-        auth_token: TEST_TOKEN.to_string(),
-        operation: FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
-            cmd_id: 7,
-            request: BootstrapRequest {
-                target: crate::adapters::rootfs::RootfsTarget::Machine {
-                    machine: MachineName::new("test-machine").unwrap(),
-                },
-                spec: crate::nspawn::models::BootstrapSpec::Debootstrap(
-                    crate::nspawn::models::DebootstrapSpec::default(),
-                ),
-                include_sudo: true,
-            },
-        })),
-    };
-
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "spawn_bootstrap");
-    assert_eq!(json["params"]["cmd_id"], 7);
-    assert_eq!(json["params"]["request"]["target"]["kind"], "machine");
-    assert_eq!(json["params"]["request"]["spec"]["provider"], "debootstrap");
-    assert!(json["params"].get("program").is_none());
-    assert!(json["params"].get("args").is_none());
-
-    let parsed: FdRequest = serde_json::from_value(json).unwrap();
-    assert!(matches!(parsed.operation, FdOperation::Bootstrap(_)));
-}
-
-#[test]
-fn fd_request_round_trip_uses_typed_oci_parameters() {
-    let request = FdRequest {
-        auth_token: TEST_TOKEN.to_string(),
-        operation: FdOperation::OciPull(Box::new(SpawnOciPullParams {
-            cmd_id: 9,
-            request: OciPullRequest {
-                reference: crate::nspawn::models::OciReference::new(
-                    "docker.io/library/nginx:latest",
-                )
-                .unwrap(),
-                machine: MachineName::new("web-app").unwrap(),
-                read_only: true,
-            },
-        })),
-    };
-
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "spawn_oci_pull");
-    assert_eq!(json["params"]["cmd_id"], 9);
-    assert_eq!(
-        json["params"]["request"]["reference"],
-        "docker.io/library/nginx:latest"
-    );
-    assert_eq!(json["params"]["request"]["machine"], "web-app");
-    assert_eq!(json["params"]["request"]["read_only"], true);
-    assert!(json["params"].get("program").is_none());
-    assert!(json["params"].get("args").is_none());
-
-    let parsed: FdRequest = serde_json::from_value(json).unwrap();
-    assert!(matches!(parsed.operation, FdOperation::OciPull(_)));
-}
-
-#[test]
-fn fd_request_round_trip_for_image_import_contains_no_source_path() {
-    let request = FdRequest {
-        auth_token: TEST_TOKEN.to_string(),
-        operation: FdOperation::ImportRawImage(ImportRawImageParams {
-            machine: MachineName::new("test-machine").unwrap(),
-        }),
-    };
-
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "import_raw_image");
-    assert_eq!(json["params"]["machine"], "test-machine");
-    assert!(json["params"].get("path").is_none());
-    assert!(json["params"].get("source").is_none());
-
-    let parsed: FdRequest = serde_json::from_value(json).unwrap();
-    assert!(matches!(
-        parsed.operation,
-        FdOperation::ImportRawImage(ImportRawImageParams { .. })
-    ));
-
-    let request = FdRequest {
-        auth_token: TEST_TOKEN.to_string(),
-        operation: FdOperation::ImportTarImage(ImportTarRequest {
-            target: crate::adapters::rootfs::RootfsTarget::Machine {
-                machine: MachineName::new("test-machine").unwrap(),
-            },
-            source_origin:
-                crate::adapters::provisioning::engine::image_operation::TarSourceOrigin::Remote,
-            allow_unsafe_remote: true,
-        }),
-    };
-    let json = serde_json::to_value(&request).unwrap();
-    assert_eq!(json["method"], "import_tar_image");
-    assert_eq!(json["params"]["target"]["kind"], "machine");
-    assert_eq!(json["params"]["target"]["machine"], "test-machine");
-    assert_eq!(json["params"]["source_origin"], "remote");
-    assert_eq!(json["params"]["allow_unsafe_remote"], true);
-    assert!(json["params"].get("path").is_none());
-    assert!(json["params"].get("source").is_none());
-}
-
-#[test]
-fn image_import_response_round_trip_preserves_warnings() {
-    let response = image_import_response(Ok(ImageImportReport {
-        warnings: vec!["upgrade tar before importing untrusted archives".into()],
-    }));
-    let json = serde_json::to_string(&response).unwrap();
-    let response: ImportImageResponse = serde_json::from_str(&json).unwrap();
-    assert_eq!(
-        response.warnings,
-        ["upgrade tar before importing untrusted archives"]
-    );
-    assert!(response.error.is_none());
-}
-
-#[test]
-fn image_import_response_defaults_missing_warnings_to_empty() {
-    let response: ImportImageResponse = serde_json::from_str(r#"{"error":null}"#).unwrap();
-    assert!(response.warnings.is_empty());
-    assert!(response.error.is_none());
 }
 
 #[test]
@@ -726,6 +582,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             &out_tx,
             uzers::get_current_uid(),
             Arc::clone(&server_state),
+            crate::adapters::trusted_state::TrustedStateRoot::production(),
         )
         .await,
         HandleOutcome::Spawned
@@ -747,10 +604,103 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             &out_tx,
             uzers::get_current_uid(),
             server_state,
+            crate::adapters::trusted_state::TrustedStateRoot::production(),
         )
         .await,
         HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
     ));
+}
+
+#[tokio::test]
+async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
+    use crate::adapters::provisioning::state::FilesystemDeploymentState;
+    use crate::application::provisioning::{
+        DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
+        DeploymentStatePort, DeploymentStorage,
+    };
+    use crate::daemon::deployment_protocol::{
+        ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
+    };
+    use crate::nspawn::models::ContainerConfig;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root =
+        crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().join("lasper"));
+    let state = FilesystemDeploymentState::new(root.clone());
+    let plan = DeploymentPlan::build(DeploymentRequest {
+        config: ContainerConfig {
+            name: "recovery-target".into(),
+            ..Default::default()
+        },
+        source: DeploymentSource::Copy {
+            source_name: "base".into(),
+        },
+        storage: DeploymentStorage::Directory,
+        nvidia_profile: None,
+        wayland: Vec::new(),
+        allow_unsafe_remote_tar: false,
+    })
+    .unwrap();
+    let deployment_id = DeploymentId::from_u128(88);
+    let manifest = DeploymentCrashManifest::prepared(deployment_id, &plan);
+    state.create(manifest.clone()).await.unwrap();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+    let server_state = Arc::new(DaemonServerState::default());
+
+    let request = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 9,
+        method: "probe_deployment_recovery".into(),
+        params: serde_json::to_value(ProbeDeploymentRecoveryRequest {
+            deployment_id,
+            expected_revision: manifest.revision,
+        })
+        .unwrap(),
+    };
+    let result = match handle_request(
+        request,
+        &None::<crate::adapters::runtime::dbus::DbusBackend>,
+        &out_tx,
+        uzers::get_current_uid(),
+        Arc::clone(&server_state),
+        root.clone(),
+    )
+    .await
+    {
+        HandleOutcome::Sync(Ok(result)) => result,
+        _ => panic!("recovery probe should return synchronously"),
+    };
+    let result: ProbeDeploymentRecoveryResult = serde_json::from_value(result).unwrap();
+    assert_eq!(result.deployment_id, deployment_id);
+    assert_eq!(result.manifest_revision, manifest.revision);
+    assert!(result.observations.is_empty());
+
+    let stale = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 10,
+        method: "probe_deployment_recovery".into(),
+        params: serde_json::to_value(ProbeDeploymentRecoveryRequest {
+            deployment_id,
+            expected_revision: manifest.revision + 1,
+        })
+        .unwrap(),
+    };
+    match handle_request(
+        stale,
+        &None::<crate::adapters::runtime::dbus::DbusBackend>,
+        &out_tx,
+        uzers::get_current_uid(),
+        server_state,
+        root,
+    )
+    .await
+    {
+        HandleOutcome::Sync(Err(error)) => {
+            assert!(error.contains("revision changed"), "{error}")
+        }
+        HandleOutcome::Sync(Ok(result)) => panic!("stale recovery probe succeeded: {result}"),
+        HandleOutcome::Spawned => panic!("stale recovery probe unexpectedly spawned a task"),
+    }
 }
 
 #[tokio::test]

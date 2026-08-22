@@ -1,6 +1,5 @@
 //! Typed systemd-native OCI acquisition shared by direct and elevated modes.
 
-use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::process::SpawnedProcess;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{MachineName, OciReference};
@@ -60,56 +59,16 @@ pub(crate) struct OciPullRequest {
     pub(crate) read_only: bool,
 }
 
-#[derive(Clone)]
-pub struct OciPullStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
-}
+#[derive(Clone, Debug, Default)]
+pub struct OciPullStore;
 
 impl OciPullStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub fn new() -> Self {
+        Self
     }
 
     pub(crate) async fn spawn(&self, request: OciPullRequest) -> Result<SpawnedProcess> {
-        if let Some(daemon) = &self.daemon {
-            let cmd_id = daemon.reserve_spawn_id();
-            let stdout_fd = daemon
-                .spawn_oci_pull(cmd_id, request)
-                .await
-                .map_err(|error| {
-                    NspawnError::Io(PathBuf::from("systemd-importd PullOci"), error)
-                })?;
-            let receiver = crate::adapters::elevated::pipe_reader(stdout_fd).map_err(|error| {
-                NspawnError::Io(PathBuf::from("systemd-importd PullOci"), error)
-            })?;
-            let wait_daemon = daemon.clone();
-            let signal_daemon = daemon.clone();
-            Ok(SpawnedProcess::new_cancellable(
-                Box::new(receiver),
-                async move {
-                    let code = wait_daemon
-                        .wait_command(cmd_id)
-                        .await
-                        .map_err(|error| std::io::Error::other(error.to_string()))?;
-                    Ok(std::os::unix::process::ExitStatusExt::from_raw(code))
-                },
-                move |signal| {
-                    let daemon = signal_daemon.clone();
-                    Box::pin(async move { daemon.signal_command(cmd_id, signal).await })
-                },
-            )
-            .with_completion_wins_cancellation())
-        } else {
-            spawn_local_pull(request)
-        }
-    }
-}
-
-impl std::fmt::Debug for OciPullStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OciPullStore")
-            .field("daemon", &self.daemon)
-            .finish_non_exhaustive()
+        spawn_local_pull(request)
     }
 }
 

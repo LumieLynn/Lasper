@@ -301,6 +301,58 @@ async fn main() -> Result<()> {
     let log_buffer_lines = app_settings.log_buffer_lines;
     let services =
         crate::composition::compose_application_services(pm.level(), want_cli_mode, &exec_ctx);
+    let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
+        None
+    } else {
+        match services.provisioning.unfinished_deployments().await {
+            Ok(reports) if reports.is_empty() => None,
+            Ok(reports) => {
+                log::warn!(
+                    "Found {} unfinished deployment crash manifest(s); automatic replay and rollback are disabled",
+                    reports.len()
+                );
+                for report in &reports {
+                    log::warn!(
+                        "Unfinished deployment {} targets {} at revision {} ({:?})",
+                        report.manifest.deployment_id,
+                        report.manifest.target,
+                        report.manifest.revision,
+                        report.manifest.state,
+                    );
+                    if let Some(error) = &report.probe_error {
+                        log::warn!(
+                            "Deployment {} host evidence could not be collected: {error}",
+                            report.manifest.deployment_id
+                        );
+                    }
+                    for observation in &report.observations {
+                        log::info!(
+                            "Deployment {} recovery evidence: {} = {:?} (recorded={:?}, applying={})",
+                            report.manifest.deployment_id,
+                            observation.subject.resource.label(),
+                            observation.evidence,
+                            observation.subject.recorded_disposition,
+                            observation.subject.applying_when_interrupted,
+                        );
+                    }
+                }
+                Some((
+                    format!(
+                        "{} previous deployment(s) may be incomplete; inspect before cleanup.",
+                        reports.len()
+                    ),
+                    crate::tui::StatusLevel::Warn,
+                ))
+            }
+            Err(error) => {
+                log::error!("Could not inspect deployment recovery state: {error}");
+                Some((
+                    format!("Could not inspect deployment recovery state: {error}"),
+                    crate::tui::StatusLevel::Error,
+                ))
+            }
+        }
+    };
     let mut app = tui::app::App::new(
         pm,
         want_cli_mode,
@@ -316,6 +368,9 @@ async fn main() -> Result<()> {
             crate::tui::StatusLevel::Warn,
             std::time::Duration::from_secs(12),
         );
+    }
+    if let Some((message, level)) = deployment_recovery {
+        app.set_status_for(message, level, std::time::Duration::from_secs(20));
     }
     let result = app.run(&mut terminal).await;
 

@@ -5,8 +5,8 @@ use crate::nspawn::models::{
     ArtifactSpec, BootstrapSpec, ContainerConfig, DiskImageConfig, OciNetworkMode,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
@@ -14,19 +14,92 @@ use tokio::sync::{mpsc, watch};
 pub(crate) const DEPLOYMENT_EVENT_CAPACITY: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct DeploymentId(NonZeroU64);
+pub struct DeploymentId(uuid::Uuid);
 
 impl DeploymentId {
-    pub(crate) fn new(value: u64) -> Option<Self> {
-        NonZeroU64::new(value).map(Self)
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
     }
 
-    pub fn get(self) -> u64 {
-        self.0.get()
+    pub fn as_uuid(self) -> uuid::Uuid {
+        self.0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_u128(value: u128) -> Self {
+        Self(uuid::Uuid::from_u128(value))
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Display for DeploymentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for DeploymentId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeploymentId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        uuid::Uuid::parse_str(&value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct DeploymentRequestId(uuid::Uuid);
+
+impl DeploymentRequestId {
+    pub(crate) fn new() -> Self {
+        Self(uuid::Uuid::new_v4())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_u128(value: u128) -> Self {
+        Self(uuid::Uuid::from_u128(value))
+    }
+}
+
+impl fmt::Display for DeploymentRequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl Serialize for DeploymentRequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for DeploymentRequestId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        uuid::Uuid::parse_str(&value)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeploymentSource {
     Copy {
         source_name: String,
@@ -54,14 +127,15 @@ impl DeploymentSource {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DeploymentStorage {
     Directory,
     Subvolume,
     DiskImage(DiskImageConfig),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentRequest {
     pub config: ContainerConfig,
     pub source: DeploymentSource,
@@ -75,6 +149,11 @@ impl DeploymentRequest {
     pub(crate) fn validate(&self) -> Result<(), DeploymentError> {
         crate::nspawn::models::NspawnConfigSpec::try_from(&self.config)
             .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+        if let DeploymentSource::Copy { source_name } = &self.source {
+            crate::nspawn::models::ImageName::new(source_name).map_err(|error| {
+                DeploymentError::rejected(format!("Invalid clone source: {error}"))
+            })?;
+        }
         for user in &self.config.users {
             user.validate()
                 .map_err(|error| DeploymentError::rejected(error.to_string()))?;
@@ -246,6 +325,66 @@ impl fmt::Debug for DeploymentSecrets {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DeploymentSecretsWire {
+    #[serde(default, with = "crate::domain::secret::serde_secret::optional")]
+    root_password: Option<SecretString>,
+    users: Vec<UserSecretWire>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UserSecretWire {
+    username: String,
+    #[serde(default, with = "crate::domain::secret::serde_secret::optional")]
+    password: Option<SecretString>,
+}
+
+impl DeploymentSecrets {
+    pub(crate) fn into_wire(self) -> DeploymentSecretsWire {
+        DeploymentSecretsWire {
+            root_password: self.root_password,
+            users: self
+                .users
+                .into_iter()
+                .map(|secret| UserSecretWire {
+                    username: secret.username,
+                    password: secret.password,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl DeploymentSecretsWire {
+    pub(crate) fn into_secrets(self) -> DeploymentSecrets {
+        DeploymentSecrets {
+            root_password: self.root_password,
+            users: self
+                .users
+                .into_iter()
+                .map(|secret| UserSecret {
+                    username: secret.username,
+                    password: secret.password,
+                })
+                .collect(),
+        }
+    }
+}
+
+impl fmt::Debug for DeploymentSecretsWire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeploymentSecretsWire")
+            .field(
+                "root_password",
+                &self.root_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("user_count", &self.users.len())
+            .finish()
+    }
+}
+
 pub struct DeploymentSubmission {
     request: DeploymentRequest,
     secrets: DeploymentSecrets,
@@ -298,7 +437,8 @@ pub enum RemoteTarSafety {
     Risk(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeploymentProgress {
     pub label: String,
     pub permille: u16,
@@ -313,25 +453,43 @@ impl DeploymentProgress {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", content = "payload", rename_all = "snake_case")]
 pub enum DeploymentEvent {
     Line(String),
     Progress(DeploymentProgress),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "message", rename_all = "snake_case")]
 pub enum DeploymentStatus {
     Running,
     RollingBack,
     Succeeded,
     Failed(String),
     Cancelled(String),
+    ReconciliationRequired(String),
 }
 
 impl DeploymentStatus {
     pub fn is_finished(&self) -> bool {
-        matches!(self, Self::Succeeded | Self::Failed(_) | Self::Cancelled(_))
+        matches!(
+            self,
+            Self::Succeeded
+                | Self::Failed(_)
+                | Self::Cancelled(_)
+                | Self::ReconciliationRequired(_)
+        )
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeploymentClaimStatus {
+    Held,
+    Released,
+    ReconciliationRequired,
+    Reconciled,
+    ReleasedUnresolved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,6 +497,8 @@ enum DeploymentErrorKind {
     Rejected,
     Failed,
     Cancelled,
+    ReconciliationRequired,
+    ReconciledUnknown,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -370,8 +530,33 @@ impl DeploymentError {
         }
     }
 
+    pub(crate) fn reconciliation_required(message: impl Into<String>) -> Self {
+        Self {
+            kind: DeploymentErrorKind::ReconciliationRequired,
+            message: message.into(),
+        }
+    }
+
+    pub(crate) fn reconciled_unknown(message: impl Into<String>) -> Self {
+        Self {
+            kind: DeploymentErrorKind::ReconciledUnknown,
+            message: message.into(),
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.kind == DeploymentErrorKind::Cancelled
+    }
+
+    pub(crate) fn requires_reconciliation(&self) -> bool {
+        matches!(
+            self.kind,
+            DeploymentErrorKind::ReconciliationRequired | DeploymentErrorKind::ReconciledUnknown
+        )
+    }
+
+    pub(crate) fn retains_resource_claim(&self) -> bool {
+        self.kind == DeploymentErrorKind::ReconciliationRequired
     }
 }
 
@@ -417,12 +602,19 @@ pub(crate) struct DeploymentCancellationRequested;
 
 #[derive(Clone)]
 pub(crate) struct DeploymentJobContext {
+    id: DeploymentId,
     events: mpsc::Sender<DeploymentEvent>,
     status: watch::Sender<DeploymentStatus>,
+    claim_status: watch::Sender<DeploymentClaimStatus>,
     cancellation: DeploymentCancellation,
+    state: Option<super::DeploymentStateSession>,
 }
 
 impl DeploymentJobContext {
+    pub(crate) fn id(&self) -> DeploymentId {
+        self.id
+    }
+
     pub(crate) fn event_sender(&self) -> mpsc::Sender<DeploymentEvent> {
         self.events.clone()
     }
@@ -442,12 +634,26 @@ impl DeploymentJobContext {
     pub(crate) fn status_sender(&self) -> watch::Sender<DeploymentStatus> {
         self.status.clone()
     }
+
+    pub(crate) fn claim_status_sender(&self) -> watch::Sender<DeploymentClaimStatus> {
+        self.claim_status.clone()
+    }
+
+    pub(crate) fn state_session(&self) -> Option<super::DeploymentStateSession> {
+        self.state.clone()
+    }
+
+    pub(crate) fn with_state_session(mut self, state: super::DeploymentStateSession) -> Self {
+        self.state = Some(state);
+        self
+    }
 }
 
 pub struct DeploymentJobHandle {
     id: DeploymentId,
     events: mpsc::Receiver<DeploymentEvent>,
     status: watch::Receiver<DeploymentStatus>,
+    claim_status: watch::Receiver<DeploymentClaimStatus>,
     cancellation: DeploymentCancellation,
 }
 
@@ -464,6 +670,10 @@ impl DeploymentJobHandle {
         self.status.borrow().clone()
     }
 
+    pub fn claim_status(&self) -> DeploymentClaimStatus {
+        *self.claim_status.borrow()
+    }
+
     pub fn request_cancel(&self) {
         self.cancellation.request();
     }
@@ -471,25 +681,50 @@ impl DeploymentJobHandle {
     pub fn cancellation_requested(&self) -> bool {
         self.cancellation.is_requested()
     }
+
+    pub(crate) fn cancellation(&self) -> DeploymentCancellation {
+        self.cancellation.clone()
+    }
+
+    pub(crate) fn into_streams(
+        self,
+    ) -> (
+        mpsc::Receiver<DeploymentEvent>,
+        watch::Receiver<DeploymentStatus>,
+    ) {
+        (self.events, self.status)
+    }
 }
 
 pub(crate) fn deployment_job_channel(
     id: DeploymentId,
 ) -> (DeploymentJobHandle, DeploymentJobContext) {
+    deployment_job_channel_inner(id, None)
+}
+
+fn deployment_job_channel_inner(
+    id: DeploymentId,
+    state: Option<super::DeploymentStateSession>,
+) -> (DeploymentJobHandle, DeploymentJobContext) {
     let (event_tx, event_rx) = mpsc::channel(DEPLOYMENT_EVENT_CAPACITY);
     let (status_tx, status_rx) = watch::channel(DeploymentStatus::Running);
+    let (claim_status_tx, claim_status_rx) = watch::channel(DeploymentClaimStatus::Held);
     let cancellation = DeploymentCancellation::default();
     (
         DeploymentJobHandle {
             id,
             events: event_rx,
             status: status_rx,
+            claim_status: claim_status_rx,
             cancellation: cancellation.clone(),
         },
         DeploymentJobContext {
+            id,
             events: event_tx,
             status: status_tx,
+            claim_status: claim_status_tx,
             cancellation,
+            state,
         },
     )
 }
@@ -503,9 +738,41 @@ pub trait SourcePreflight: Send + Sync + 'static {
 pub trait DeploymentExecutor: Send + Sync + 'static {
     async fn run(
         &self,
-        submission: DeploymentSubmission,
+        plan: super::DeploymentPlan,
+        secrets: DeploymentSecrets,
         context: DeploymentJobContext,
     ) -> Result<(), DeploymentError>;
+}
+
+#[async_trait]
+pub(crate) trait DeploymentClaimControl: Send + Sync + 'static {
+    async fn release_unresolved(
+        &self,
+        deployment_id: DeploymentId,
+        confirmed: bool,
+    ) -> Result<(), DeploymentError>;
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MemoryDeploymentClaimControl;
+
+#[cfg(test)]
+#[async_trait]
+impl DeploymentClaimControl for MemoryDeploymentClaimControl {
+    async fn release_unresolved(
+        &self,
+        _deployment_id: DeploymentId,
+        confirmed: bool,
+    ) -> Result<(), DeploymentError> {
+        if confirmed {
+            Ok(())
+        } else {
+            Err(DeploymentError::rejected(
+                "releasing an unresolved deployment requires explicit confirmation",
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -723,7 +990,7 @@ mod tests {
 
     #[test]
     fn job_event_stream_is_bounded() {
-        let id = DeploymentId::new(1).unwrap();
+        let id = DeploymentId::from_u128(1);
         let (_handle, context) = deployment_job_channel(id);
         let events = context.event_sender();
 
@@ -740,7 +1007,7 @@ mod tests {
 
     #[test]
     fn job_handle_propagates_cancellation_to_the_job_context() {
-        let id = DeploymentId::new(1).unwrap();
+        let id = DeploymentId::from_u128(1);
         let (handle, context) = deployment_job_channel(id);
 
         assert!(!context.cancellation().is_requested());

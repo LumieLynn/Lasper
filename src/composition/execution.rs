@@ -9,11 +9,10 @@ use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::platform::nvidia::NvidiaStateStore;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
-use crate::adapters::provisioning::engine::{BootstrapStore, ImageImportStore, OciPullStore};
 use crate::adapters::rootfs::RootfsStore;
 use crate::adapters::runtime::inspection::MachineInspectionStore;
-use crate::adapters::storage::ManagedStorageStore;
 use crate::adapters::system_operation::SystemOperationStore;
+use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::HostOperationTracker;
 use crate::composition::PermissionLevel;
 use std::sync::Arc;
@@ -28,11 +27,8 @@ pub struct ExecutionContext {
     pub nspawn: NspawnConfigStore,
     pub systemd_unit: SystemdUnitStore,
     pub rootfs: RootfsStore,
-    pub bootstrap: BootstrapStore,
-    pub image_import: ImageImportStore,
-    pub oci_pull: OciPullStore,
-    pub managed_storage: ManagedStorageStore,
     pub nvidia_state: NvidiaStateStore,
+    pub(crate) trusted_state_root: TrustedStateRoot,
     pub host_operations: HostOperationTracker,
     permission_level: PermissionLevel,
     daemon: Option<Arc<ElevatedDaemon>>,
@@ -53,11 +49,8 @@ impl ExecutionContext {
         let nspawn = NspawnConfigStore::new(daemon.clone());
         let systemd_unit = SystemdUnitStore::new(daemon.clone());
         let rootfs = RootfsStore::new(daemon.clone());
-        let bootstrap = BootstrapStore::new(local_cmd.clone(), daemon.clone());
-        let image_import = ImageImportStore::new(daemon.clone());
-        let oci_pull = OciPullStore::new(daemon.clone());
-        let managed_storage = ManagedStorageStore::new(daemon.clone());
-        let nvidia_state = NvidiaStateStore::new(daemon.clone());
+        let trusted_state_root = TrustedStateRoot::production();
+        let nvidia_state = NvidiaStateStore::new(daemon.clone(), trusted_state_root.clone());
         Ok(Self {
             local_cmd,
             system_operations,
@@ -65,11 +58,8 @@ impl ExecutionContext {
             nspawn,
             systemd_unit,
             rootfs,
-            bootstrap,
-            image_import,
-            oci_pull,
-            managed_storage,
             nvidia_state,
+            trusted_state_root,
             host_operations: HostOperationTracker::default(),
             permission_level: level,
             daemon,
@@ -111,11 +101,8 @@ impl std::fmt::Debug for ExecutionContext {
             .field("machine_inspection", &self.machine_inspection)
             .field("systemd_unit", &self.systemd_unit)
             .field("rootfs", &self.rootfs)
-            .field("bootstrap", &"BootstrapStore")
-            .field("image_import", &"ImageImportStore")
-            .field("oci_pull", &"OciPullStore")
-            .field("managed_storage", &self.managed_storage)
             .field("nvidia_state", &self.nvidia_state)
+            .field("trusted_state_root", &self.trusted_state_root)
             .field("host_operations", &self.host_operations)
             .field("permission_level", &self.permission_level)
             .field("daemon", &self.daemon)

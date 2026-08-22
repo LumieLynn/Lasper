@@ -281,6 +281,9 @@ impl Wizard {
                     self.submit_config()
                 }
                 WizardMessage::DeclineUnsafeRemoteTar => StepAction::CloseDialog,
+                WizardMessage::ReleaseUnresolvedDeployment(deployment_id) => {
+                    StepAction::ReleaseUnresolvedDeployment(*deployment_id)
+                }
                 WizardMessage::OpenUserDialog => {
                     let wayland_owner = self
                         .draft
@@ -421,6 +424,7 @@ impl Wizard {
                 | WizardMessage::BindMountAdded(_)
                 | WizardMessage::BindMountUpdated(_, _)
                 | WizardMessage::UnclassifiedFileUpdated(_, _)
+                | WizardMessage::UnresolvedDeploymentReleaseFinished { .. }
                 | WizardMessage::DialogCancel => {
                     if let Some(view) = &mut self.active_view {
                         view.handle_message(&msg)

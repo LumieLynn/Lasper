@@ -17,7 +17,7 @@ impl DirectoryBackend {
 
 impl Default for DirectoryBackend {
     fn default() -> Self {
-        Self::new(ManagedStorageStore::default())
+        Self::new(ManagedStorageStore::new())
     }
 }
 

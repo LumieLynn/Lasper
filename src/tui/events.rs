@@ -37,6 +37,11 @@ pub enum AppEvent {
             crate::application::provisioning::DeploymentError,
         >,
     },
+    DeploymentClaimReleaseFinished {
+        wizard_id: crate::tui::wizard::WizardInstanceId,
+        deployment_id: crate::application::provisioning::DeploymentId,
+        result: Result<(), crate::application::provisioning::DeploymentError>,
+    },
     /// Background action execution finished.
     ActionDone(String, crate::tui::StatusLevel),
     /// A machine lifecycle workflow reached a semantic outcome.

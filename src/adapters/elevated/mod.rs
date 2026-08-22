@@ -5,16 +5,17 @@ mod session;
 use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
 use crate::adapters::config::systemd_unit::{SystemdUnitOperation, SystemdUnitResult};
 use crate::adapters::platform::nvidia::state::{NvidiaStateOperation, NvidiaStateResult};
-use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
-use crate::adapters::provisioning::engine::image_operation::{
-    ImageImportReport, ImportTarRequest, TarRuntimeAssessment,
-};
-use crate::adapters::provisioning::engine::oci_operation::OciPullRequest;
+use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
+use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentStateResult};
 use crate::adapters::rootfs::store::{RootfsOperation, RootfsResult};
-use crate::adapters::storage::store::{ManagedStorageOperation, ManagedStorageResult};
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemoveRequest};
 use crate::application::machine_lifecycle::{MachineControlOutcome, MachineControlRequest};
+use crate::daemon::deployment_protocol::{
+    DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
+    DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
+    ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
+};
 use crate::daemon::protocol::*;
 use crate::daemon::transport::{
     authorize_root_server, connect_rpc_socket, create_fd_socket_dir, get_peer_credentials,
@@ -47,8 +48,6 @@ pub struct ElevatedDaemon {
     fd_sock_path: PathBuf,
     fd_auth_token: Arc<str>,
     _fd_sock_dir: Arc<tempfile::TempDir>,
-    next_spawn_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    spawn_exit_codes: std::sync::Arc<parking_lot::Mutex<std::collections::HashMap<u64, i32>>>,
 }
 
 impl std::fmt::Debug for ElevatedDaemon {
@@ -72,8 +71,6 @@ impl Clone for ElevatedDaemon {
             fd_sock_path: self.fd_sock_path.clone(),
             fd_auth_token: self.fd_auth_token.clone(),
             _fd_sock_dir: self._fd_sock_dir.clone(),
-            next_spawn_id: self.next_spawn_id.clone(),
-            spawn_exit_codes: self.spawn_exit_codes.clone(),
         }
     }
 }
@@ -267,10 +264,6 @@ impl ElevatedDaemon {
             fd_sock_path,
             fd_auth_token,
             _fd_sock_dir: fd_sock_dir,
-            next_spawn_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
-            spawn_exit_codes: std::sync::Arc::new(parking_lot::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
         };
         daemon.ping().await.map_err(|error| {
             std::io::Error::new(
@@ -439,13 +432,133 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn managed_storage(
+    pub(crate) async fn deployment_state(
         &self,
-        operation: ManagedStorageOperation,
-    ) -> std::io::Result<ManagedStorageResult> {
+        operation: DeploymentStateOperation,
+    ) -> std::io::Result<DeploymentStateResult> {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("managed_storage", params).await?;
+        let result = self.rpc_call("deployment_state", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn submit_deployment(
+        &self,
+        params: SubmitDeploymentParams,
+        artifact_source: Option<std::fs::File>,
+    ) -> std::io::Result<RawFd> {
+        let socket = self
+            .open_fd_channel(FdOperation::SubmitDeployment(Box::new(params)))
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            receive_deployment_stream(&socket, artifact_source.as_ref())
+        })
+        .await?
+    }
+
+    pub(crate) async fn deployment_status(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+    ) -> std::io::Result<Option<DeploymentJobSnapshot>> {
+        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("deployment_status", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn resolve_deployment_submission(
+        &self,
+        request_id: crate::application::provisioning::DeploymentRequestId,
+    ) -> std::io::Result<Option<DeploymentSubmissionSnapshot>> {
+        let params = serde_json::to_value(DeploymentSubmissionRequest { request_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self
+            .rpc_call("resolve_deployment_submission", params)
+            .await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn acknowledge_deployment_submission(
+        &self,
+        request_id: crate::application::provisioning::DeploymentRequestId,
+    ) -> std::io::Result<()> {
+        let params = serde_json::to_value(DeploymentSubmissionRequest { request_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.rpc_call("acknowledge_deployment_submission", params)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn cancel_deployment(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+    ) -> std::io::Result<DeploymentJobSnapshot> {
+        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("cancel_deployment", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn acknowledge_deployment(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+    ) -> std::io::Result<()> {
+        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.rpc_call("acknowledge_deployment", params).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn probe_deployment_recovery(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+        expected_revision: u64,
+    ) -> std::io::Result<Vec<crate::application::provisioning::DeploymentRecoveryObservation>> {
+        let params = serde_json::to_value(ProbeDeploymentRecoveryRequest {
+            deployment_id,
+            expected_revision,
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result: ProbeDeploymentRecoveryResult =
+            serde_json::from_value(self.rpc_call("probe_deployment_recovery", params).await?)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if result.deployment_id != deployment_id || result.manifest_revision != expected_revision {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "daemon recovery probe returned a mismatched deployment revision",
+            ));
+        }
+        Ok(result.observations)
+    }
+
+    pub(crate) async fn reconcile_deployment(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+    ) -> std::io::Result<DeploymentJobSnapshot> {
+        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("reconcile_deployment", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn release_unresolved_deployment(
+        &self,
+        deployment_id: crate::application::provisioning::DeploymentId,
+        confirmed: bool,
+    ) -> std::io::Result<DeploymentJobSnapshot> {
+        let params = serde_json::to_value(ReleaseUnresolvedDeploymentRequest {
+            deployment_id,
+            confirmed,
+        })
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self
+            .rpc_call("release_unresolved_deployment", params)
+            .await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -475,126 +588,6 @@ impl ElevatedDaemon {
     // thread for recv_with_fd (sendfd on tokio::UnixStream uses try_io which
     // is unreliable when mixed with prior read/write ops on the same fd).
 
-    pub(crate) async fn import_raw_image(
-        &self,
-        machine: MachineName,
-        source: std::fs::File,
-    ) -> std::io::Result<()> {
-        self.import_image_source(
-            FdOperation::ImportRawImage(ImportRawImageParams { machine }),
-            source,
-        )
-        .await
-        .map(|_| ())
-    }
-
-    pub(crate) async fn import_tar_image(
-        &self,
-        request: ImportTarRequest,
-        source: std::fs::File,
-    ) -> std::io::Result<ImageImportReport> {
-        let warnings = self
-            .import_image_source(FdOperation::ImportTarImage(request), source)
-            .await?;
-        Ok(ImageImportReport { warnings })
-    }
-
-    async fn import_image_source(
-        &self,
-        operation: FdOperation,
-        source: std::fs::File,
-    ) -> std::io::Result<Vec<String>> {
-        let std_sock = self.open_fd_channel(operation).await?;
-        tokio::task::spawn_blocking(move || {
-            use std::io::BufRead;
-
-            let mut reader = std::io::BufReader::new(std_sock.try_clone()?);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            if line.trim() != "ready" {
-                return Err(std::io::Error::other(format!(
-                    "daemon refused image source fd: {}",
-                    line.trim()
-                )));
-            }
-
-            std_sock.send_with_fd(b"source", &[source.as_raw_fd()])?;
-            line.clear();
-            reader.read_line(&mut line)?;
-            let response: ImportImageResponse = serde_json::from_str(line.trim())
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-            match response.error {
-                Some(error) => Err(std::io::Error::other(error)),
-                None => Ok(response.warnings),
-            }
-        })
-        .await?
-    }
-
-    // ── Typed streaming operations ──
-
-    /// Allocate a unique ID for a spawned command.
-    pub fn reserve_spawn_id(&self) -> u64 {
-        self.next_spawn_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub(crate) async fn spawn_bootstrap(
-        &self,
-        cmd_id: u64,
-        request: BootstrapRequest,
-    ) -> std::io::Result<RawFd> {
-        let std_sock = self
-            .open_fd_channel(FdOperation::Bootstrap(Box::new(SpawnBootstrapParams {
-                cmd_id,
-                request,
-            })))
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 256];
-            let mut fds = [0i32 as RawFd; 1];
-            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
-            if fd_count > 0 {
-                Ok(fds[0])
-            } else {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                Err(std::io::Error::other(format!(
-                    "daemon error: {}",
-                    msg.trim()
-                )))
-            }
-        })
-        .await?
-    }
-
-    pub(crate) async fn spawn_oci_pull(
-        &self,
-        cmd_id: u64,
-        request: OciPullRequest,
-    ) -> std::io::Result<RawFd> {
-        let std_sock = self
-            .open_fd_channel(FdOperation::OciPull(Box::new(SpawnOciPullParams {
-                cmd_id,
-                request,
-            })))
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            let mut buf = [0u8; 256];
-            let mut fds = [0i32 as RawFd; 1];
-            let (n, fd_count) = std_sock.recv_with_fd(&mut buf, &mut fds)?;
-            if fd_count > 0 {
-                Ok(fds[0])
-            } else {
-                let msg = String::from_utf8_lossy(&buf[..n]);
-                Err(std::io::Error::other(format!(
-                    "daemon error: {}",
-                    msg.trim()
-                )))
-            }
-        })
-        .await?
-    }
-
     pub(super) async fn open_fd_channel(
         &self,
         operation: FdOperation,
@@ -607,45 +600,58 @@ impl ElevatedDaemon {
             auth_token: self.fd_auth_token.to_string(),
             operation,
         };
-        let mut request_line = serde_json::to_vec(&request)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut request_line = SecretBytes::new(
+            serde_json::to_vec(&request)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+        );
         request_line.push(b'\n');
-        sock.write_all(&request_line).await?;
+        sock.write_all(request_line.as_slice()).await?;
 
         let std_sock = sock.into_std()?;
         std_sock.set_nonblocking(false)?;
         Ok(std_sock)
     }
+}
 
-    /// Poll the daemon for the exit code of a spawned command.
-    pub async fn wait_command(&self, cmd_id: u64) -> std::io::Result<i32> {
-        let result = self
-            .rpc_call("wait_command", serde_json::json!({"cmd_id": cmd_id}))
-            .await?;
-        result["exit_code"]
-            .as_i64()
-            .map(|c| c as i32)
-            .ok_or_else(|| {
-                std::io::Error::other("daemon: missing exit_code in wait_command response")
-            })
+fn receive_deployment_stream(
+    socket: &std::os::unix::net::UnixStream,
+    artifact_source: Option<&std::fs::File>,
+) -> std::io::Result<RawFd> {
+    socket.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+    socket.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
+    if let Some(source) = artifact_source {
+        use std::io::BufRead;
+
+        let mut reader = std::io::BufReader::new(socket.try_clone()?);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        if line.trim() != "artifact-ready" {
+            return Err(std::io::Error::other(format!(
+                "daemon refused deployment artifact fd: {}",
+                line.trim()
+            )));
+        }
+        socket.send_with_fd(b"artifact", &[source.as_raw_fd()])?;
     }
 
-    pub async fn signal_command(&self, cmd_id: u64, signal: i32) -> std::io::Result<()> {
-        let signal = match signal {
-            libc::SIGTERM => "terminate",
-            libc::SIGKILL => "kill",
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "unsupported command signal",
-                ))
-            }
-        };
-        self.rpc_call(
-            "signal_command",
-            serde_json::json!({"cmd_id": cmd_id, "signal": signal}),
-        )
-        .await?;
-        Ok(())
+    let mut buffer = [0u8; 512];
+    let mut fds = [-1 as RawFd; 1];
+    let (read, count) = socket.recv_with_fd(&mut buffer, &mut fds)?;
+    if count != 1 {
+        for fd in fds.into_iter().take(count).filter(|fd| *fd >= 0) {
+            unsafe { libc::close(fd) };
+        }
+        return Err(std::io::Error::other(format!(
+            "daemon deployment submission failed: {}",
+            String::from_utf8_lossy(&buffer[..read]).trim()
+        )));
     }
+    if &buffer[..read] != b"ok" {
+        unsafe { libc::close(fds[0]) };
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "daemon returned an invalid deployment stream response",
+        ));
+    }
+    Ok(fds[0])
 }

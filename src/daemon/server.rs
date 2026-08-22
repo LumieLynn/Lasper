@@ -2,30 +2,17 @@
 
 use super::dispatch::{initialize_dbus_backend, run_rpc_request_pump};
 use super::logging::{initialize_daemon_logging, AuthLogLimiter};
-use super::process_state::{
-    shutdown_daemon_resources, stop_unhanded_command, OCI_TRANSFER_CANCELLATIONS, SPAWN_EXIT_CODES,
-    SPAWN_PIDS, SPAWN_WAIT_ERRORS,
-};
+use super::process_state::shutdown_daemon_resources;
 use super::protocol::*;
 use super::session_server::{self, DaemonServerState};
 use super::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
 };
-use crate::adapters::provisioning::engine::bootstrap_operation::{
-    build_command as build_bootstrap_command, probe_debootstrap_signature_style_sync,
-    validate_target as validate_bootstrap_target,
-};
-use crate::adapters::provisioning::engine::image_operation::ImageImportReport;
-use crate::adapters::provisioning::engine::oci_operation::{
-    run_oci_transfer, OciTransferCancellation, OciTransferOutcome,
-};
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::domain::secret::zeroize_string;
-use sendfd::{RecvWithFd, SendWithFd};
-use std::os::fd::{FromRawFd, OwnedFd};
-use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -278,6 +265,7 @@ pub async fn daemon_main(
     });
 
     let dbus = initialize_dbus_backend(dbus_enabled).await;
+    let trusted_state_root = crate::adapters::trusted_state::TrustedStateRoot::production();
 
     if let Some(ref dbus) = dbus {
         let out_tx_bg = out_tx.clone();
@@ -302,6 +290,7 @@ pub async fn daemon_main(
 
     let fd_slots = Arc::new(tokio::sync::Semaphore::new(MAX_FD_CONNECTIONS));
     let fd_server_state = Arc::clone(&server_state);
+    let fd_state_root = trusted_state_root.clone();
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -323,6 +312,7 @@ pub async fn daemon_main(
                         fd_auth_token.clone(),
                         auth_log.clone(),
                         Arc::clone(&fd_server_state),
+                        fd_state_root.clone(),
                         permit,
                     ));
                 }
@@ -340,6 +330,7 @@ pub async fn daemon_main(
         &out_tx,
         user_uid,
         Arc::clone(&server_state),
+        trusted_state_root,
     )
     .await
     {
@@ -361,6 +352,7 @@ async fn handle_fd_connection(
     expected_auth_token: Arc<str>,
     auth_log: AuthLogLimiter,
     server_state: Arc<DaemonServerState>,
+    trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let actual_peer = match get_peer_credentials(&stream) {
@@ -419,7 +411,13 @@ async fn handle_fd_connection(
             return;
         }
     };
-    if authorize_fd_token(&request.auth_token, &expected_auth_token).is_err() {
+    let FdRequest {
+        mut auth_token,
+        operation,
+    } = request;
+    let authenticated = authorize_fd_token(&auth_token, &expected_auth_token).is_ok();
+    zeroize_string(&mut auth_token);
+    if !authenticated {
         if let Some(message) = auth_log.record(format!(
             "Daemon fd-handler: rejected unauthenticated request from pid {}",
             actual_peer.pid
@@ -429,7 +427,6 @@ async fn handle_fd_connection(
         return;
     }
 
-    let operation = request.operation;
     let stream = buf_reader.into_inner();
 
     // Convert to std stream for blocking send_with_fd.
@@ -455,198 +452,14 @@ async fn handle_fd_connection(
             session_server::spawn_terminal(&mut std_stream, params, server_state);
         }
 
-        FdOperation::Bootstrap(params) => {
-            let SpawnBootstrapParams { cmd_id, request } = *params;
-            if let Err(error) = validate_bootstrap_target(&request.target).await {
-                log::warn!("Daemon: rejected bootstrap target: {}", error);
-                let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
-                return;
-            }
-            let signature_style = match probe_debootstrap_signature_style_sync(&request) {
-                Ok(style) => style,
-                Err(error) => {
-                    log::warn!("Daemon: debootstrap capability probe failed: {}", error);
-                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
-                    return;
-                }
-            };
-            let (program, args) = match build_bootstrap_command(&request, signature_style) {
-                Ok(command) => command,
-                Err(error) => {
-                    log::warn!("Daemon: rejected bootstrap request: {}", error);
-                    let _ = std_stream.send_with_fd(error.to_string().as_bytes(), &[]);
-                    return;
-                }
-            };
-            log::info!(
-                "[AUDIT] [Step: Bootstrap] Starting typed {} operation",
-                program
-            );
-            let mut command = crate::adapters::process::new_sync_command("sh");
-            command
-                .arg("-c")
-                .arg("exec \"$@\" 2>&1")
-                .arg("--")
-                .arg(&program)
-                .args(&args)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .process_group(0);
-            match command.spawn() {
-                Ok(mut child) => {
-                    SPAWN_PIDS.lock().insert(cmd_id, child.id());
-                    let stdout = child.stdout.take().expect("stdout piped");
-                    let raw_fd = stdout.as_raw_fd();
-                    if let Err(error) = std_stream.send_with_fd(b"ok", &[raw_fd]) {
-                        log::error!("Daemon: send_with_fd (spawn_bootstrap) failed: {}", error);
-                        drop(stdout);
-                        stop_unhanded_command(&mut child, cmd_id, "bootstrap");
-                        return;
-                    }
-                    drop(stdout);
-
-                    tokio::task::spawn_blocking(move || {
-                        let status = child.wait();
-                        SPAWN_PIDS.lock().remove(&cmd_id);
-                        if let Ok(status) = status {
-                            SPAWN_EXIT_CODES.lock().insert(cmd_id, status.into_raw());
-                        }
-                    });
-                }
-                Err(error) => {
-                    log::error!("Daemon: typed bootstrap spawn failed: {}", error);
-                    let _ = std_stream.send_with_fd(b"bootstrap spawn failed", &[]);
-                }
-            }
-        }
-
-        FdOperation::OciPull(params) => {
-            let SpawnOciPullParams { cmd_id, request } = *params;
-            log::info!(
-                "[AUDIT] [Step: OCI] Starting typed systemd-importd PullOci transfer for {}",
-                request.machine
-            );
-            let (writer, reader) = match tokio::net::unix::pipe::pipe() {
-                Ok(pipe) => pipe,
-                Err(error) => {
-                    log::error!("Daemon: OCI transfer pipe creation failed: {error}");
-                    let _ = std_stream.send_with_fd(b"OCI transfer pipe failed", &[]);
-                    return;
-                }
-            };
-            let cancellation = OciTransferCancellation::default();
-            OCI_TRANSFER_CANCELLATIONS
-                .lock()
-                .insert(cmd_id, cancellation.clone());
-            if let Err(error) = std_stream.send_with_fd(b"ok", &[reader.as_raw_fd()]) {
-                log::error!("Daemon: send_with_fd (spawn_oci_pull) failed: {error}");
-                OCI_TRANSFER_CANCELLATIONS.lock().remove(&cmd_id);
-                return;
-            }
-            drop(reader);
-
-            tokio::spawn(async move {
-                let result = run_oci_transfer(request, writer, cancellation).await;
-                OCI_TRANSFER_CANCELLATIONS.lock().remove(&cmd_id);
-                match result {
-                    Ok(outcome) => {
-                        if let OciTransferOutcome::Failed(reason) = &outcome {
-                            log::error!("systemd-importd OCI transfer failed: {reason}");
-                        }
-                        SPAWN_EXIT_CODES
-                            .lock()
-                            .insert(cmd_id, outcome.exit_code() << 8);
-                    }
-                    Err(error) => {
-                        SPAWN_WAIT_ERRORS.lock().insert(
-                            cmd_id,
-                            format!("could not confirm systemd-importd transfer state: {error}"),
-                        );
-                    }
-                }
-            });
-        }
-
-        FdOperation::ImportRawImage(ImportRawImageParams { machine }) => {
-            let source = match receive_image_source(&mut std_stream) {
-                Ok(source) => source,
-                Err(error) => {
-                    send_image_import_response(&mut std_stream, Err(error));
-                    return;
-                }
-            };
-
-            let result =
-                crate::adapters::provisioning::engine::image_operation::import_raw_system_image(
-                    machine, source,
-                )
-                .await
-                .map(|_| ImageImportReport::default())
-                .map_err(|error| error.to_string());
-            send_image_import_response(&mut std_stream, result);
-        }
-
-        FdOperation::ImportTarImage(request) => {
-            let source = match receive_image_source(&mut std_stream) {
-                Ok(source) => source,
-                Err(error) => {
-                    send_image_import_response(&mut std_stream, Err(error));
-                    return;
-                }
-            };
-            let result = crate::adapters::provisioning::engine::image_operation::import_tar_image(
-                request, source,
+        FdOperation::SubmitDeployment(params) => {
+            super::deployment_server::submit(
+                &mut std_stream,
+                *params,
+                server_state,
+                trusted_state_root,
             )
-            .await
-            .map_err(|error| error.to_string());
-            send_image_import_response(&mut std_stream, result);
+            .await;
         }
-    }
-}
-
-fn receive_image_source(
-    stream: &mut std::os::unix::net::UnixStream,
-) -> std::result::Result<std::fs::File, String> {
-    use std::io::Write;
-    use std::os::fd::FromRawFd;
-
-    stream
-        .write_all(b"ready\n")
-        .map_err(|error| format!("failed to acknowledge image source fd: {error}"))?;
-    let mut marker = [0u8; 16];
-    let mut fds = [0i32 as RawFd; 1];
-    match stream.recv_with_fd(&mut marker, &mut fds) {
-        Ok((_, 1)) => Ok(unsafe { std::fs::File::from_raw_fd(fds[0]) }),
-        Ok((_, count)) => Err(format!(
-            "expected exactly one image source fd, received {count}"
-        )),
-        Err(error) => Err(format!("failed to receive image source fd: {error}")),
-    }
-}
-
-fn send_image_import_response(
-    stream: &mut std::os::unix::net::UnixStream,
-    result: std::result::Result<ImageImportReport, String>,
-) {
-    use std::io::Write;
-
-    let response = image_import_response(result);
-    if let Ok(line) = serde_json::to_string(&response) {
-        let _ = stream.write_all(format!("{line}\n").as_bytes());
-    }
-}
-
-pub(super) fn image_import_response(
-    result: std::result::Result<ImageImportReport, String>,
-) -> ImportImageResponse {
-    match result {
-        Ok(report) => ImportImageResponse {
-            warnings: report.warnings,
-            error: None,
-        },
-        Err(error) => ImportImageResponse {
-            warnings: Vec::new(),
-            error: Some(error),
-        },
     }
 }

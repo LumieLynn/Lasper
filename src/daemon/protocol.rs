@@ -1,16 +1,14 @@
 //! Private, closed wire types shared by the daemon client and server.
 
-use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
-use crate::adapters::provisioning::engine::image_operation::ImportTarRequest;
-use crate::adapters::provisioning::engine::oci_operation::OciPullRequest;
 use crate::adapters::rootfs::store::RootfsOperation;
 use crate::domain::secret::SecretBytes;
 use crate::nspawn::models::MachineName;
 use serde::{Deserialize, Serialize};
 
+use super::deployment_protocol::SubmitDeploymentParams;
 use super::session_protocol::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 11;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,42 +38,8 @@ pub(crate) enum FdOperation {
     Journalctl(SpawnJournalctlParams),
     #[serde(rename = "spawn_terminal")]
     Terminal(SpawnTerminalParams),
-    #[serde(rename = "spawn_bootstrap")]
-    Bootstrap(Box<SpawnBootstrapParams>),
-    #[serde(rename = "spawn_oci_pull")]
-    OciPull(Box<SpawnOciPullParams>),
-    #[serde(rename = "import_raw_image")]
-    ImportRawImage(ImportRawImageParams),
-    #[serde(rename = "import_tar_image")]
-    ImportTarImage(ImportTarRequest),
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SpawnBootstrapParams {
-    pub cmd_id: u64,
-    pub request: BootstrapRequest,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct SpawnOciPullParams {
-    pub cmd_id: u64,
-    pub request: OciPullRequest,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ImportRawImageParams {
-    pub machine: MachineName,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ImportImageResponse {
-    #[serde(default)]
-    pub warnings: Vec<String>,
-    pub error: Option<String>,
+    #[serde(rename = "submit_deployment")]
+    SubmitDeployment(Box<SubmitDeploymentParams>),
 }
 
 #[derive(Serialize, Deserialize)]

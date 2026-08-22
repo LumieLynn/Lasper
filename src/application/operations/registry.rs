@@ -46,6 +46,13 @@ pub struct ResourceClaim {
 }
 
 impl ResourceClaim {
+    pub fn shared(key: ResourceKey) -> Self {
+        Self {
+            key,
+            access: ResourceAccess::Shared,
+        }
+    }
+
     pub fn exclusive(key: ResourceKey) -> Self {
         Self {
             key,

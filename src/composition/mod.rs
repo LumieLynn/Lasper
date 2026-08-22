@@ -40,12 +40,16 @@ pub(crate) fn compose_application_services(
     ));
     let machine_lifecycle = crate::adapters::lifecycle::machine::compose_machine_lifecycle(
         Arc::clone(&runtime),
-        operations,
+        Arc::clone(&operations),
         level,
         cli_mode,
         execution,
     );
-    let provisioning = crate::adapters::provisioning::compose_provisioning_service(execution);
+    let provisioning = crate::adapters::provisioning::compose_provisioning_service(
+        execution,
+        Arc::clone(&operations),
+        Arc::clone(&runtime),
+    );
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
 

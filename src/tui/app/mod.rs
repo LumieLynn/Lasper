@@ -601,6 +601,27 @@ impl App {
                     self.handle_wizard_action(action).await;
                 }
             }
+            AppEvent::DeploymentClaimReleaseFinished {
+                wizard_id,
+                deployment_id,
+                result,
+            } => {
+                if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
+                    return;
+                }
+                let error = result.err().map(|error| error.to_string());
+                let action = self.ui.wizard.as_mut().map(|wizard| {
+                    wizard.process_message(crate::tui::core::AppMessage::Wizard(
+                        crate::tui::core::WizardMessage::UnresolvedDeploymentReleaseFinished {
+                            deployment_id,
+                            error,
+                        },
+                    ))
+                });
+                if let Some(action) = action {
+                    self.handle_wizard_action(action).await;
+                }
+            }
             AppEvent::ActionDone(msg, level) => {
                 self.set_status(msg, level);
                 self.refresh().await;
@@ -1277,8 +1298,9 @@ mod tests {
     mod tar_risk_confirmation {
         use super::*;
         use crate::application::provisioning::{
-            DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPreflight,
-            DeploymentSubmission, ProvisioningService, RemoteTarSafety, SourcePreflight,
+            DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan,
+            DeploymentPreflight, DeploymentSecrets, ProvisioningService, RemoteTarSafety,
+            SourcePreflight,
         };
         use crate::composition::PermissionLevel;
         use crate::tui::core::{AppMessage, WizardMessage};
@@ -1302,7 +1324,8 @@ mod tests {
         impl DeploymentExecutor for TarConfirmationPort {
             async fn run(
                 &self,
-                _submission: DeploymentSubmission,
+                _plan: DeploymentPlan,
+                _secrets: DeploymentSecrets,
                 _context: DeploymentJobContext,
             ) -> Result<(), DeploymentError> {
                 std::future::pending().await
@@ -1317,6 +1340,10 @@ mod tests {
             app.data.provisioning = Arc::new(ProvisioningService::new(
                 Arc::new(TarConfirmationPort),
                 Arc::new(TarConfirmationPort),
+                Arc::new(crate::application::provisioning::MemoryDeploymentStatePort::default()),
+                Arc::new(crate::application::provisioning::MemoryDeploymentRecoveryProbe),
+                Arc::new(crate::application::provisioning::MemoryDeploymentClaimControl),
+                crate::application::OperationRegistry::new(),
             ));
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
             app.ui.app_tx = Some(event_tx);

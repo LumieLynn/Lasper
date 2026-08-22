@@ -9,6 +9,7 @@ use crate::adapters::provisioning::engine::{
     send_deploy_log, stream_deploy_command, AppliedResource, ApplyReport, DeployLogEvent, Deployer,
     DeploymentCancellation, OciPullStore,
 };
+use crate::application::provisioning::DeploymentResource;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerConfig, MachineName, OciNetworkMode, OciReference};
 
@@ -28,6 +29,13 @@ impl Deployer for OciDeployer {
 
     fn requires_post_config(&self) -> bool {
         false
+    }
+
+    fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
+        vec![
+            DeploymentResource::ExternalImage(target.clone()),
+            DeploymentResource::NspawnConfig(target.clone()),
+        ]
     }
 
     async fn deploy(
@@ -123,11 +131,19 @@ mod tests {
             reference: "docker.io/library/nginx:latest".into(),
             read_only: false,
             network: OciNetworkMode::Host,
-            oci_pull: OciPullStore::new(None),
+            oci_pull: OciPullStore::new(),
             nspawn: crate::adapters::config::NspawnConfigStore::new(None),
         };
 
         assert!(deployer.is_external_storage_managed());
         assert!(!deployer.requires_post_config());
+        let target = MachineName::new("test").unwrap();
+        assert_eq!(
+            deployer.source_stage_resources(&target),
+            vec![
+                DeploymentResource::ExternalImage(target.clone()),
+                DeploymentResource::NspawnConfig(target),
+            ]
+        );
     }
 }

@@ -1,12 +1,12 @@
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
+use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
 use crate::application::image_lifecycle::ArtifactOwnership;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, MachineName};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 const MAX_NVIDIA_STATE_BYTES: usize = 1024 * 1024;
@@ -185,20 +185,16 @@ fn split_host_container(s: &str) -> (String, String) {
         .unwrap_or((s.to_string(), s.to_string()))
 }
 
-#[allow(dead_code)]
-pub(crate) fn get_state_dir() -> PathBuf {
-    crate::paths::state_dir()
-}
-
 /// Typed access to Lasper-managed NVIDIA state files.
 #[derive(Clone)]
 pub struct NvidiaStateStore {
     daemon: Option<Arc<ElevatedDaemon>>,
+    state_root: TrustedStateRoot,
 }
 
 impl NvidiaStateStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub(crate) fn new(daemon: Option<Arc<ElevatedDaemon>>, state_root: TrustedStateRoot) -> Self {
+        Self { daemon, state_root }
     }
 
     pub async fn read(&self, name: &str) -> Result<Option<NvidiaState>> {
@@ -208,6 +204,17 @@ impl NvidiaStateStore {
             }))
             .await?;
         Ok(result.state)
+    }
+
+    pub(crate) async fn probe_owned(&self, name: &str) -> Result<ArtifactOwnership> {
+        let result = self
+            .execute(NvidiaStateOperation::ProbeOwned(ReadNvidiaState {
+                machine: parse_machine_name(name)?,
+            }))
+            .await?;
+        result.ownership.ok_or_else(|| {
+            NspawnError::Runtime("NVIDIA state probe returned no ownership evidence".into())
+        })
     }
 
     pub async fn write(&self, name: &str, state: &NvidiaState) -> Result<()> {
@@ -259,7 +266,7 @@ impl NvidiaStateStore {
                 .await
                 .map_err(|error| NspawnError::Runtime(error.to_string()))
         } else {
-            execute_nvidia_state_operation(operation).await
+            execute_nvidia_state_operation(operation, self.state_root.clone()).await
         }
     }
 }
@@ -268,6 +275,7 @@ impl std::fmt::Debug for NvidiaStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NvidiaStateStore")
             .field("daemon", &self.daemon)
+            .field("state_root", &self.state_root)
             .finish()
     }
 }
@@ -276,6 +284,7 @@ impl std::fmt::Debug for NvidiaStateStore {
 #[serde(tag = "operation", content = "params", rename_all = "snake_case")]
 pub(crate) enum NvidiaStateOperation {
     Read(ReadNvidiaState),
+    ProbeOwned(ReadNvidiaState),
     Write(Box<WriteNvidiaState>),
     WriteInitial(Box<WriteNvidiaState>),
     Remove(RemoveNvidiaState),
@@ -313,30 +322,57 @@ pub(crate) struct NvidiaStateResult {
 
 pub(crate) async fn execute_nvidia_state_operation(
     operation: NvidiaStateOperation,
+    state_root: TrustedStateRoot,
 ) -> Result<NvidiaStateResult> {
+    tokio::task::spawn_blocking(move || {
+        execute_nvidia_state_operation_blocking(operation, state_root)
+    })
+    .await
+    .map_err(|error| NspawnError::Runtime(format!("NVIDIA state task failed: {error}")))?
+}
+
+fn execute_nvidia_state_operation_blocking(
+    operation: NvidiaStateOperation,
+    state_root: TrustedStateRoot,
+) -> Result<NvidiaStateResult> {
+    let directory = state_root.directory(StateDirectory::States)?;
     match operation {
         NvidiaStateOperation::Read(request) => Ok(NvidiaStateResult {
-            state: read_state_at(&state_path(&request.machine)).await?,
+            state: read_state(&directory, &state_file_name(&request.machine))?,
+            ..Default::default()
+        }),
+        NvidiaStateOperation::ProbeOwned(request) => Ok(NvidiaStateResult {
+            ownership: Some(probe_owned_state(
+                &directory,
+                &state_file_name(&request.machine),
+            )?),
             ..Default::default()
         }),
         NvidiaStateOperation::Write(request) => {
-            write_state_at(&state_path(&request.machine), &request.state).await?;
+            write_state(
+                &directory,
+                &state_file_name(&request.machine),
+                &request.state,
+            )?;
             Ok(NvidiaStateResult::default())
         }
         NvidiaStateOperation::WriteInitial(request) => {
-            let apply =
-                write_initial_state_at(&state_path(&request.machine), &request.state).await?;
+            let apply = write_initial_state(
+                &directory,
+                &state_file_name(&request.machine),
+                &request.state,
+            )?;
             Ok(NvidiaStateResult {
                 apply: Some(apply),
                 ..Default::default()
             })
         }
         NvidiaStateOperation::Remove(request) => {
-            remove_state_at(&state_path(&request.machine)).await?;
+            directory.remove_with_lock(&state_file_name(&request.machine))?;
             Ok(NvidiaStateResult::default())
         }
         NvidiaStateOperation::RemoveOwned(request) => {
-            let ownership = remove_owned_state_at(&state_path(&request.machine)).await?;
+            let ownership = remove_owned_state(&directory, &state_file_name(&request.machine))?;
             Ok(NvidiaStateResult {
                 ownership: Some(ownership),
                 ..Default::default()
@@ -349,154 +385,113 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
-fn state_path(machine: &MachineName) -> PathBuf {
-    crate::paths::state_file(machine.as_str())
+fn state_file_name(machine: &MachineName) -> String {
+    format!("{}.json", machine.as_str())
 }
 
-async fn read_state_at(path: &Path) -> Result<Option<NvidiaState>> {
-    let content = match tokio::fs::read_to_string(path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+fn read_state(directory: &TrustedDirectory, name: &str) -> Result<Option<NvidiaState>> {
+    let Some(file) = directory.read_bounded(name, MAX_NVIDIA_STATE_BYTES)? else {
+        return Ok(None);
     };
-    if content.len() > MAX_NVIDIA_STATE_BYTES {
+    if file.uid != directory.expected_uid() || file.mode != 0o600 {
         return Err(NspawnError::Validation(format!(
-            "NVIDIA state exceeds {} bytes",
-            MAX_NVIDIA_STATE_BYTES
+            "NVIDIA state has unsafe ownership or mode: {name}"
         )));
     }
-    let mut state: NvidiaState = serde_json::from_str(&content)?;
+    let mut state: NvidiaState = serde_json::from_slice(&file.bytes)?;
     state.migrate_from_legacy();
     validate_state(&state)?;
     Ok(Some(state))
 }
 
-async fn write_state_at(path: &Path, state: &NvidiaState) -> Result<()> {
+fn write_state(directory: &TrustedDirectory, name: &str, state: &NvidiaState) -> Result<()> {
     validate_state(state)?;
     let mut state = state.clone();
     state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
-    let content = serde_json::to_string_pretty(&state)?;
+    let content = serde_json::to_vec_pretty(&state)?;
     if content.len() > MAX_NVIDIA_STATE_BYTES {
         return Err(NspawnError::Validation(format!(
             "NVIDIA state exceeds {} bytes",
             MAX_NVIDIA_STATE_BYTES
         )));
     }
-    AsyncLockedWriter::write_atomic_with_mode(path, &content, Some(0o600)).await
+    directory.with_exclusive_lock(name, || {
+        if let Some(existing) = directory.read_bounded(name, MAX_NVIDIA_STATE_BYTES)? {
+            if existing.uid != directory.expected_uid() || existing.mode != 0o600 {
+                return Err(NspawnError::Validation(format!(
+                    "Refusing to replace NVIDIA state with unsafe ownership or mode: {name}"
+                )));
+            }
+        }
+        directory.write_atomic(name, &content, 0o600)
+    })
 }
 
-async fn write_initial_state_at(path: &Path, state: &NvidiaState) -> Result<ApplyStatus> {
-    write_initial_state_at_with_uid(path, state, 0).await
-}
-
-async fn write_initial_state_at_with_uid(
-    path: &Path,
+fn write_initial_state(
+    directory: &TrustedDirectory,
+    name: &str,
     state: &NvidiaState,
-    expected_uid: u32,
 ) -> Result<ApplyStatus> {
     validate_state(state)?;
     let mut state = state.clone();
     state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
-    let content = serde_json::to_string_pretty(&state)?;
+    let content = serde_json::to_vec_pretty(&state)?;
     if content.len() > MAX_NVIDIA_STATE_BYTES {
         return Err(NspawnError::Validation(format!(
             "NVIDIA state exceeds {} bytes",
             MAX_NVIDIA_STATE_BYTES
         )));
     }
-    let ownership = probe_owned_state_at_with_uid(path, expected_uid).await?;
-    if ownership == ArtifactOwnership::AmbiguousLegacy {
-        return Ok(ApplyStatus::ConflictUnknownOwner);
-    }
-    AsyncLockedWriter::apply_locked_with_mode(path, 0o600, move |existing| {
-        Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
-            Some(existing)
-                if ownership == ArtifactOwnership::ProvenOwned
-                    && is_owned_state_content(&existing) =>
-            {
-                (Some(content), ApplyStatus::ReplacedOwned)
+    directory.with_exclusive_lock(name, || {
+        let ownership = probe_owned_state(directory, name)?;
+        let existing = directory.read_bounded(name, MAX_NVIDIA_STATE_BYTES)?;
+        match existing {
+            None => {
+                directory.write_atomic(name, &content, 0o600)?;
+                Ok(ApplyStatus::Created)
             }
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
-        })
+            Some(existing) if existing.bytes == content => Ok(ApplyStatus::Unchanged),
+            Some(_existing) if ownership == ArtifactOwnership::ProvenOwned => {
+                directory.write_atomic(name, &content, 0o600)?;
+                Ok(ApplyStatus::ReplacedOwned)
+            }
+            Some(_) => Ok(ApplyStatus::ConflictUnknownOwner),
+        }
     })
-    .await
 }
 
-async fn remove_state_at(path: &Path) -> Result<()> {
-    for target in [
-        path.to_path_buf(),
-        crate::adapters::filesystem::lock_path_for(path),
-    ] {
-        match tokio::fs::remove_file(&target).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(NspawnError::Io(target, error)),
+fn remove_owned_state(directory: &TrustedDirectory, name: &str) -> Result<ArtifactOwnership> {
+    directory.with_exclusive_lock_and_cleanup(name, || {
+        let ownership = probe_owned_state(directory, name)?;
+        if ownership == ArtifactOwnership::ProvenOwned {
+            directory.remove_unlocked(name)?;
         }
-    }
-    Ok(())
+        Ok(ownership)
+    })
 }
 
-async fn remove_owned_state_at(path: &Path) -> Result<ArtifactOwnership> {
-    remove_owned_state_at_with_uid(path, 0).await
-}
-
-async fn remove_owned_state_at_with_uid(
-    path: &Path,
-    expected_uid: u32,
-) -> Result<ArtifactOwnership> {
-    let ownership = probe_owned_state_at_with_uid(path, expected_uid).await?;
-    match ownership {
-        ArtifactOwnership::ProvenOwned => remove_state_at(path).await?,
-        ArtifactOwnership::NotPresent => {
-            remove_optional_lock_at(path).await?;
-        }
-        ArtifactOwnership::AmbiguousLegacy => {}
-    }
-    Ok(ownership)
-}
-
-async fn remove_optional_lock_at(path: &Path) -> Result<()> {
-    let lock_path = crate::adapters::filesystem::lock_path_for(path);
-    AsyncLockedWriter::remove_lock_if_target_absent(path, &lock_path)
-        .await
-        .map(|_| ())
-}
-
-async fn probe_owned_state_at_with_uid(
-    path: &Path,
-    expected_uid: u32,
-) -> Result<ArtifactOwnership> {
-    let metadata = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ArtifactOwnership::NotPresent)
-        }
-        Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+fn probe_owned_state(directory: &TrustedDirectory, name: &str) -> Result<ArtifactOwnership> {
+    let file = match directory.read_bounded(name, MAX_NVIDIA_STATE_BYTES) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(ArtifactOwnership::NotPresent),
+        Err(NspawnError::Validation(_)) => return Ok(ArtifactOwnership::AmbiguousLegacy),
+        Err(error) => return Err(error),
     };
-    if !metadata.file_type().is_file()
-        || metadata.len() > MAX_NVIDIA_STATE_BYTES as u64
-        || std::os::unix::fs::MetadataExt::uid(&metadata) != expected_uid
-        || (std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()) & 0o7777) != 0o600
-    {
+    if file.uid != directory.expected_uid() || file.mode != 0o600 {
         return Ok(ArtifactOwnership::AmbiguousLegacy);
     }
-    let content = tokio::fs::read_to_string(path)
-        .await
-        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
-    Ok(if is_owned_state_content(&content) {
+    Ok(if is_owned_state_content(&file.bytes) {
         ArtifactOwnership::ProvenOwned
     } else {
         ArtifactOwnership::AmbiguousLegacy
     })
 }
 
-fn is_owned_state_content(content: &str) -> bool {
+fn is_owned_state_content(content: &[u8]) -> bool {
     if content.len() > MAX_NVIDIA_STATE_BYTES {
         return false;
     }
-    let Ok(state) = serde_json::from_str::<NvidiaState>(content) else {
+    let Ok(state) = serde_json::from_slice::<NvidiaState>(content) else {
         return false;
     };
     state.ownership_marker.as_deref() == Some(NVIDIA_STATE_MARKER) && validate_state(&state).is_ok()
@@ -995,17 +990,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_state_dir_respects_env() {
-        let original = std::env::var("LASPER_STATE_DIR").ok();
-        std::env::set_var("LASPER_STATE_DIR", "/custom/path");
-        assert_eq!(get_state_dir(), PathBuf::from("/custom/path"));
-        match original {
-            Some(v) => std::env::set_var("LASPER_STATE_DIR", v),
-            None => std::env::remove_var("LASPER_STATE_DIR"),
-        }
-    }
-
-    #[test]
     fn operation_deserialization_rejects_invalid_machine_name() {
         let json = r#"{
             "operation": "read",
@@ -1027,25 +1011,28 @@ mod tests {
         assert!(validate_state(&state).is_err());
     }
 
-    #[tokio::test]
-    async fn initial_state_apply_replaces_owned_and_preserves_unknown_state() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("test.json");
+    fn test_state_directory() -> (tempfile::TempDir, TrustedDirectory) {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = TrustedStateRoot::for_test(temporary.path().join("lasper"));
+        let states = root.directory(StateDirectory::States).unwrap();
+        (temporary, states)
+    }
+
+    #[test]
+    fn initial_state_apply_replaces_owned_and_preserves_unknown_state() {
+        let (temporary, directory) = test_state_directory();
+        let path = temporary.path().join("lasper/states/test.json");
         let state = NvidiaState {
             driver_version: "1".into(),
             ..Default::default()
         };
 
         assert_eq!(
-            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            write_initial_state(&directory, "test.json", &state).unwrap(),
             ApplyStatus::Created
         );
         assert_eq!(
-            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            write_initial_state(&directory, "test.json", &state).unwrap(),
             ApplyStatus::Unchanged
         );
         let different = NvidiaState {
@@ -1053,41 +1040,44 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            write_initial_state_at_with_uid(&path, &different, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            write_initial_state(&directory, "test.json", &different).unwrap(),
             ApplyStatus::ReplacedOwned
         );
         assert_eq!(
-            read_state_at(&path).await.unwrap().unwrap().driver_version,
+            read_state(&directory, "test.json")
+                .unwrap()
+                .unwrap()
+                .driver_version,
             "2"
         );
 
         let mut unmarked = different.clone();
         unmarked.driver_version = "legacy".into();
-        tokio::fs::write(&path, serde_json::to_string(&unmarked).unwrap())
-            .await
-            .unwrap();
+        std::fs::write(&path, serde_json::to_string(&unmarked).unwrap()).unwrap();
         assert_eq!(
-            write_initial_state_at_with_uid(&path, &state, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            write_initial_state(&directory, "test.json", &state).unwrap(),
             ApplyStatus::ConflictUnknownOwner
         );
         assert_eq!(
-            read_state_at(&path).await.unwrap().unwrap().driver_version,
+            read_state(&directory, "test.json")
+                .unwrap()
+                .unwrap()
+                .driver_version,
             "legacy"
         );
 
-        remove_state_at(&path).await.unwrap();
+        directory.remove_with_lock("test.json").unwrap();
         assert!(!path.exists());
-        assert!(!crate::adapters::filesystem::lock_path_for(&path).exists());
+        assert!(!temporary
+            .path()
+            .join("lasper/states/.test.json.lock")
+            .exists());
     }
 
-    #[tokio::test]
-    async fn state_write_read_round_trip_is_atomic_without_persistent_lock() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("test.json");
+    #[test]
+    fn state_write_read_round_trip_is_atomic_and_lock_is_reclaimed_on_remove() {
+        let (temporary, directory) = test_state_directory();
+        let path = temporary.path().join("lasper/states/test.json");
         let state = NvidiaState {
             driver_version: "555.0".into(),
             binds: vec![PassthroughBind {
@@ -1098,87 +1088,79 @@ mod tests {
             ..Default::default()
         };
 
-        write_state_at(&path, &state).await.unwrap();
-        let read = read_state_at(&path).await.unwrap().unwrap();
+        write_state(&directory, "test.json", &state).unwrap();
+        let read = read_state(&directory, "test.json").unwrap().unwrap();
 
         assert_eq!(read.driver_version, "555.0");
         assert_eq!(read.binds, state.binds);
-        assert!(!crate::adapters::filesystem::lock_path_for(&path).exists());
+        assert!(temporary
+            .path()
+            .join("lasper/states/.test.json.lock")
+            .exists());
+        directory.remove_with_lock("test.json").unwrap();
+        assert!(!path.exists());
+        assert!(!temporary
+            .path()
+            .join("lasper/states/.test.json.lock")
+            .exists());
     }
 
-    #[tokio::test]
-    async fn remove_state_ignores_missing_file() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("missing.json");
-        let lock_path = crate::adapters::filesystem::lock_path_for(&path);
-        tokio::fs::write(&lock_path, "").await.unwrap();
+    #[test]
+    fn remove_state_ignores_missing_file() {
+        let (temporary, directory) = test_state_directory();
+        let path = temporary.path().join("lasper/states/missing.json");
+        let lock_path = temporary.path().join("lasper/states/.missing.json.lock");
+        std::fs::write(&lock_path, "").unwrap();
+        std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
-        remove_state_at(&path).await.unwrap();
+        directory.remove_with_lock("missing.json").unwrap();
 
         assert!(!path.exists());
         assert!(!lock_path.exists());
     }
 
-    #[tokio::test]
-    async fn owned_state_cleanup_requires_marker_and_safe_metadata() {
-        let directory = tempfile::tempdir().unwrap();
-        let owned = directory.path().join("state.json");
-        let legacy = directory.path().join("legacy.json");
-        let unsafe_mode = directory.path().join("unsafe.json");
-        let symlink = directory.path().join("symlink.json");
+    #[test]
+    fn owned_state_cleanup_requires_marker_and_safe_metadata() {
+        let (temporary, directory) = test_state_directory();
+        let state_path = temporary.path().join("lasper/states");
+        let owned = state_path.join("state.json");
+        let legacy = state_path.join("legacy.json");
+        let unsafe_mode = state_path.join("unsafe.json");
+        let symlink = state_path.join("symlink.json");
         let state = NvidiaState {
             driver_version: "555.0".into(),
             ..Default::default()
         };
-        write_state_at(&owned, &state).await.unwrap();
-        tokio::fs::write(&legacy, serde_json::to_string(&state).unwrap())
-            .await
-            .unwrap();
+        write_state(&directory, "state.json", &state).unwrap();
+        std::fs::write(&legacy, serde_json::to_string(&state).unwrap()).unwrap();
         let mut marked = state.clone();
         marked.ownership_marker = Some(NVIDIA_STATE_MARKER.into());
-        tokio::fs::write(&unsafe_mode, serde_json::to_string(&marked).unwrap())
-            .await
-            .unwrap();
-        tokio::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o666))
-            .await
-            .unwrap();
+        std::fs::write(&unsafe_mode, serde_json::to_string(&marked).unwrap()).unwrap();
+        std::fs::set_permissions(&unsafe_mode, std::fs::Permissions::from_mode(0o666)).unwrap();
         std::os::unix::fs::symlink(&owned, &symlink).unwrap();
 
         assert_eq!(
-            remove_owned_state_at_with_uid(&owned, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            remove_owned_state(&directory, "state.json").unwrap(),
             ArtifactOwnership::ProvenOwned
         );
         assert!(!owned.exists());
         assert_eq!(
-            remove_owned_state_at_with_uid(&legacy, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            remove_owned_state(&directory, "legacy.json").unwrap(),
             ArtifactOwnership::AmbiguousLegacy
         );
         assert_eq!(
-            remove_owned_state_at_with_uid(&unsafe_mode, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            remove_owned_state(&directory, "unsafe.json").unwrap(),
             ArtifactOwnership::AmbiguousLegacy
         );
         assert_eq!(
-            remove_owned_state_at_with_uid(&symlink, uzers::get_current_uid())
-                .await
-                .unwrap(),
+            remove_owned_state(&directory, "symlink.json").unwrap(),
             ArtifactOwnership::AmbiguousLegacy
         );
         assert!(legacy.exists());
         assert!(unsafe_mode.exists());
         assert!(symlink.symlink_metadata().unwrap().file_type().is_symlink());
         assert_eq!(
-            remove_owned_state_at_with_uid(
-                &directory.path().join("missing.json"),
-                uzers::get_current_uid(),
-            )
-            .await
-            .unwrap(),
+            remove_owned_state(&directory, "missing.json").unwrap(),
             ArtifactOwnership::NotPresent
         );
     }
