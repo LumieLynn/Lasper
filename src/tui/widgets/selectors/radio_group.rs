@@ -32,10 +32,6 @@ impl RadioGroup {
         self
     }
 
-    pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-
     pub fn set_selected_idx(&mut self, idx: usize) {
         if idx < self.options.len() {
             self.selected_idx = idx;

@@ -79,6 +79,12 @@ pub(crate) fn zeroize_string(value: &mut String) {
     unsafe { zeroize_vec_allocation(value.as_mut_vec()) };
 }
 
+pub(crate) fn replace_secret_string(value: &mut String, replacement: &str) {
+    zeroize_string(value);
+    value.clear();
+    value.push_str(replacement);
+}
+
 fn zeroize_vec_allocation(bytes: &mut Vec<u8>) {
     let capacity = bytes.capacity();
     let pointer = bytes.as_mut_ptr();
@@ -157,5 +163,14 @@ mod tests {
         zeroize_string(&mut value);
 
         assert_eq!(value, "\0".repeat(9));
+    }
+
+    #[test]
+    fn secret_replacement_drops_the_zeroized_logical_prefix() {
+        let mut value = "old-secret".to_string();
+        replace_secret_string(&mut value, "NewPassword123");
+
+        assert_eq!(value, "NewPassword123");
+        assert!(!value.chars().any(char::is_control));
     }
 }

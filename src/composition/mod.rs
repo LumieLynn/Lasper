@@ -19,6 +19,8 @@ pub(crate) struct ApplicationServices {
     pub machine_lifecycle: Arc<MachineLifecycleService>,
     pub image_lifecycle: Arc<ImageLifecycleService>,
     pub provisioning: Arc<ProvisioningService>,
+    pub provisioning_preparation:
+        Arc<crate::application::provisioning::ProvisioningPreparationService>,
 }
 
 pub(crate) fn compose_application_services(
@@ -44,6 +46,8 @@ pub(crate) fn compose_application_services(
         execution,
     );
     let provisioning = crate::adapters::provisioning::compose_provisioning_service(execution);
+    let provisioning_preparation =
+        crate::adapters::provisioning::compose_provisioning_preparation_service();
 
     ApplicationServices {
         session,
@@ -51,5 +55,6 @@ pub(crate) fn compose_application_services(
         machine_lifecycle,
         image_lifecycle,
         provisioning,
+        provisioning_preparation,
     }
 }

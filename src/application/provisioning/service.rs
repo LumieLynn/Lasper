@@ -146,6 +146,7 @@ mod tests {
                 },
                 storage: DeploymentStorage::Directory,
                 nvidia_profile: None,
+                wayland: Vec::new(),
                 allow_unsafe_remote_tar: false,
             },
             DeploymentSecrets::new(String::new(), Vec::new()),

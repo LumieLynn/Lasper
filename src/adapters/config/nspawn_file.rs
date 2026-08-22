@@ -1,7 +1,7 @@
+use crate::adapters::wayland::WaylandBind;
+use crate::domain::wayland::WaylandBindPolicy;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ContainerConfig, NspawnConfigSpec, PrivateUsersMode, ALL_DRM_DEVICES_PATH,
-};
+use crate::nspawn::models::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -309,26 +309,14 @@ impl NspawnConfig {
 
 //.nspawn file generation
 
-/// Generate the content of a `.nspawn` container config file using AST.
-pub fn nspawn_config_content(cfg: &ContainerConfig, xdg_runtime: Option<&str>) -> Result<String> {
-    let spec = NspawnConfigSpec::try_from(cfg)?;
-    nspawn_config_content_from_spec(&spec, xdg_runtime)
-}
-
-/// Generate `.nspawn` content from the privilege-safe configuration subset.
-pub fn nspawn_config_content_from_spec(
+pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
     spec: &NspawnConfigSpec,
-    xdg_runtime: Option<&str>,
-) -> Result<String> {
-    nspawn_config_content_from_spec_with_wayland_path(spec, xdg_runtime, None)
-}
-
-pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
-    spec: &NspawnConfigSpec,
-    xdg_runtime: Option<&str>,
-    verified_wayland_socket: Option<&Path>,
+    wayland_binds: &[WaylandBind],
 ) -> Result<String> {
     spec.validate()?;
+    if !wayland_binds.is_empty() {
+        validate_wayland_endpoint_available(spec)?;
+    }
     let passthrough_all_drm = spec.gpu_passthrough_all
         || spec
             .device_binds
@@ -420,7 +408,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     let has_files = !spec.device_binds.is_empty()
         || !spec.readonly_binds.is_empty()
         || !spec.bind_mounts.is_empty()
-        || spec.wayland_socket.is_some()
+        || !wayland_binds.is_empty()
         || passthrough_all_drm
         || spec.nvidia_gpu;
 
@@ -455,21 +443,16 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
             }
         }
 
-        let suffix = if spec.private_users == Some(PrivateUsersMode::No) {
-            ":noidmap"
-        } else {
-            ":idmap"
-        };
-
-        if let Some(socket_name) = &spec.wayland_socket {
-            let socket_path = verified_wayland_socket
-                .map(PathBuf::from)
-                .or_else(|| xdg_runtime.map(|runtime| PathBuf::from(runtime).join(socket_name)));
-            if let Some(socket_path) = socket_path {
-                let socket_path = validated_nspawn_path("Wayland socket path", &socket_path)?;
-                let socket_path = escape_nspawn_bind_path(socket_path);
-                files.append("Bind", format!("{socket_path}:/mnt/wayland-socket{suffix}"));
-            }
+        for wayland_bind in wayland_binds {
+            let suffix = match wayland_bind.policy() {
+                WaylandBindPolicy::Idmap => ":idmap",
+                WaylandBindPolicy::NoIdmap => ":noidmap",
+            };
+            let source = validated_nspawn_path("Wayland socket path", wayland_bind.source())?;
+            let target = validated_nspawn_path("Wayland container path", wayland_bind.target())?;
+            let source = escape_nspawn_bind_path(source);
+            let target = escape_nspawn_bind_path(target);
+            files.append("Bind", format!("{source}:{target}{suffix}"));
         }
 
         // Individual device binds are populated in cfg.device_binds. The
@@ -482,6 +465,50 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_path(
     conf.write_to_policy(&mut buffer, EscapePolicy::Nothing)
         .map_err(|e| NspawnError::Runtime(format!("Failed to serialize INI: {}", e)))?;
     Ok(String::from_utf8_lossy(&buffer).into_owned())
+}
+
+fn validate_wayland_endpoint_available(spec: &NspawnConfigSpec) -> Result<()> {
+    let endpoint =
+        normalized_absolute_path(Path::new(crate::adapters::wayland::CONTAINER_WAYLAND_ROOT))
+            .expect("the adapter-owned Wayland endpoint is an absolute normalized path");
+    let conflict = spec
+        .bind_mounts
+        .iter()
+        .map(|bind| bind.target.as_str())
+        .chain(spec.device_binds.iter().map(String::as_str))
+        .chain(spec.readonly_binds.iter().map(String::as_str))
+        .any(|target| {
+            normalized_absolute_path(Path::new(target)).is_some_and(|target| {
+                target.starts_with(&endpoint) || endpoint.starts_with(&target)
+            })
+        });
+    if conflict {
+        return Err(NspawnError::Validation(format!(
+            "Bind target {} is reserved for the Wayland grant",
+            crate::adapters::wayland::CONTAINER_WAYLAND_ROOT
+        )));
+    }
+    Ok(())
+}
+
+fn normalized_absolute_path(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::from("/");
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Prefix(_) => return None,
+        }
+    }
+    Some(normalized)
 }
 
 fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
@@ -499,7 +526,13 @@ fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{NetworkMode, PortForward};
+    use crate::nspawn::models::ContainerConfig;
+
+    fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
+        let spec = NspawnConfigSpec::try_from(cfg)?;
+        nspawn_config_content_from_spec_with_wayland_binds(&spec, &[])
+    }
+    use crate::nspawn::models::{NetworkMode, PortForward, PrivateUsersMode};
 
     // Validation
 
@@ -652,7 +685,7 @@ mod tests {
             boot: true,
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("[Exec]"));
         assert!(content.contains("Boot=yes"));
     }
@@ -664,7 +697,7 @@ mod tests {
             boot: false,
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("Boot=no"));
     }
 
@@ -675,7 +708,7 @@ mod tests {
             network: Some(NetworkMode::Host),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("VirtualEthernet=no"));
         assert!(content.contains("ResolvConf=bind-host"));
         assert!(!content.contains("BindReadOnly=/etc/resolv.conf"));
@@ -700,7 +733,7 @@ mod tests {
             ],
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("VirtualEthernet=yes"));
         assert!(content.contains("ResolvConf=off"));
         assert!(content.contains("Port=tcp:8080:80"));
@@ -714,7 +747,7 @@ mod tests {
             network: Some(NetworkMode::Bridge("br0".into())),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("Bridge=br0"));
     }
 
@@ -725,7 +758,7 @@ mod tests {
             privileged: true,
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("Capability=all"));
     }
 
@@ -736,7 +769,7 @@ mod tests {
             private_users: Some(PrivateUsersMode::No),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("PrivateUsers=no"));
     }
 
@@ -747,7 +780,7 @@ mod tests {
             private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("PrivateUsers=yes"));
     }
 
@@ -758,7 +791,7 @@ mod tests {
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("PrivateUsers=pick"));
     }
 
@@ -770,7 +803,7 @@ mod tests {
             private_users: Some(PrivateUsersMode::Managed),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("PrivateUsers=managed"));
     }
 
@@ -781,7 +814,7 @@ mod tests {
             private_users: Some(PrivateUsersMode::Identity),
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("PrivateUsers=identity"));
     }
 
@@ -792,7 +825,7 @@ mod tests {
             nvidia_gpu: true,
             ..Default::default()
         };
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(content.contains("X-Lasper-Nvidia-Enabled=true"));
         assert!(content.contains("[Files]"));
         assert!(!content.contains("[General]"));
@@ -804,7 +837,7 @@ mod tests {
             name: "../escape".to_string(),
             ..Default::default()
         };
-        assert!(nspawn_config_content(&cfg, None).is_err());
+        assert!(nspawn_config_content(&cfg).is_err());
     }
 
     // GPU passthrough surgery
@@ -890,7 +923,7 @@ mod tests {
             ..Default::default()
         };
 
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert!(
             content.contains(r"Bind=/dev/dri/by-path/pci-0000\:01\:00.0-card"),
             "{content}"
@@ -915,7 +948,7 @@ mod tests {
             ..Default::default()
         };
 
-        let content = nspawn_config_content(&cfg, None).unwrap();
+        let content = nspawn_config_content(&cfg).unwrap();
         assert_eq!(content.matches("Bind=/dev/dri\n").count(), 1, "{content}");
         assert!(content.contains("Bind=/dev/dri/card0"), "{content}");
     }
@@ -925,19 +958,78 @@ mod tests {
         let cfg = ContainerConfig {
             name: "test".into(),
             network: Some(crate::nspawn::models::NetworkMode::Veth),
-            private_users: Some(PrivateUsersMode::Managed),
-            wayland_socket: Some("wayland-0".into()),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
         let spec = NspawnConfigSpec::try_from(&cfg).unwrap();
         let runtime = Path::new("/run/user/1000/wayland-0");
-        let content =
-            nspawn_config_content_from_spec_with_wayland_path(&spec, None, Some(runtime)).unwrap();
+        let display = crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap();
+        let bind = WaylandBind::new(runtime, 1000, &display, WaylandBindPolicy::Idmap);
+        let content = nspawn_config_content_from_spec_with_wayland_binds(&spec, &[bind]).unwrap();
 
-        assert!(content.contains("Bind=/run/user/1000/wayland-0:/mnt/wayland-socket:idmap"));
+        assert!(content
+            .contains("Bind=/run/user/1000/wayland-0:/run/lasper/wayland/1000/wayland-0:idmap"));
         assert!(!content.contains("X11"));
         assert!(!content.contains("host-x11"));
         assert!(!content.contains("Bind=/dev/dri"));
+    }
+
+    #[test]
+    fn wayland_passthrough_emits_each_selected_display_under_one_user_namespace() {
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+        let first = WaylandBind::new(
+            "/run/user/1000/wayland-0",
+            1000,
+            &crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap(),
+            WaylandBindPolicy::Idmap,
+        );
+        let second = WaylandBind::new(
+            "/run/user/1000/wayland-2",
+            1000,
+            &crate::domain::wayland::WaylandDisplay::new("wayland-2").unwrap(),
+            WaylandBindPolicy::Idmap,
+        );
+
+        let content =
+            nspawn_config_content_from_spec_with_wayland_binds(&spec, &[first, second]).unwrap();
+
+        assert!(content
+            .contains("Bind=/run/user/1000/wayland-0:/run/lasper/wayland/1000/wayland-0:idmap"));
+        assert!(content
+            .contains("Bind=/run/user/1000/wayland-2:/run/lasper/wayland/1000/wayland-2:idmap"));
+        assert_eq!(content.matches("/run/lasper/wayland/1000/").count(), 2);
+    }
+
+    #[test]
+    fn wayland_passthrough_rejects_a_conflicting_custom_bind_target() {
+        let cfg = ContainerConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            bind_mounts: vec![crate::nspawn::models::BindMount {
+                source: "/srv/custom-socket".into(),
+                target: "/run/lasper/wayland/1000/custom".into(),
+                readonly: false,
+                suffix: crate::nspawn::models::IdmapSuffix::Noidmap,
+            }],
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&cfg).unwrap();
+
+        let display = crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap();
+        let bind = WaylandBind::new(
+            "/run/user/1000/wayland-0",
+            1000,
+            &display,
+            WaylandBindPolicy::Idmap,
+        );
+        let error = nspawn_config_content_from_spec_with_wayland_binds(&spec, &[bind]).unwrap_err();
+
+        assert!(error.to_string().contains("reserved for the Wayland grant"));
     }
 
     #[test]

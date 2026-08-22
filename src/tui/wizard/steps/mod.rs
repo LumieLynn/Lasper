@@ -29,9 +29,17 @@ pub trait StepComponent: Component {
     }
 }
 
-pub fn build_view(step: WizardStep, context: &WizardDraft) -> Box<dyn StepComponent> {
+pub fn build_view(
+    step: WizardStep,
+    context: &WizardDraft,
+    preparation: std::sync::Arc<crate::application::provisioning::ProvisioningPreparationService>,
+) -> Box<dyn StepComponent> {
     match step {
-        WizardStep::Source => Box::new(source_view::SourceStepView::new(&context.source)),
+        WizardStep::Source => Box::new(source_view::SourceStepView::new(
+            &context.source,
+            context.host.oci.clone(),
+            context.host.tools.clone(),
+        )),
 
         WizardStep::CopySelect => Box::new(copy_select_view::CopySelectStepView::new(
             &context.images,
@@ -41,10 +49,18 @@ pub fn build_view(step: WizardStep, context: &WizardDraft) -> Box<dyn StepCompon
         WizardStep::Basic => Box::new(basic_view::BasicStepView::new(
             &context.basic.extract_config(),
             &context.entries,
-            context.source.kind != crate::tui::wizard::draft::SourceKind::Oci,
+            !matches!(
+                &context.source.kind,
+                crate::tui::wizard::draft::SourceKind::Copy
+                    | crate::tui::wizard::draft::SourceKind::Oci
+            ),
         )),
 
-        WizardStep::Storage => Box::new(storage_view::StorageStepView::new(&context.storage)),
+        WizardStep::Storage => Box::new(storage_view::StorageStepView::new(
+            &context.storage,
+            preparation.clone(),
+            context.host.tools.clone(),
+        )),
 
         WizardStep::User => Box::new(user_view::UserStepView::new(&context.user)),
 
@@ -58,7 +74,7 @@ pub fn build_view(step: WizardStep, context: &WizardDraft) -> Box<dyn StepCompon
             Box::new(host_integration_view::HostIntegrationStepView::new(
                 &context.passthrough.extract_config(),
                 context.network.network_mode(),
-                context.passthrough.wayland_sockets.clone(),
+                context.user.users.iter().any(|user| user.wayland.is_some()),
                 context.passthrough.discovered_gpus.clone(),
                 context.passthrough.hardware_scanning,
             ))
@@ -71,7 +87,7 @@ pub fn build_view(step: WizardStep, context: &WizardDraft) -> Box<dyn StepCompon
         )),
 
         WizardStep::Review => Box::new(review_view::ReviewStepView::new(
-            context.build_preview_nspawn(),
+            preparation.preview(&context.build_deployment_request()),
         )),
 
         WizardStep::Deploy => {

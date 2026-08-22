@@ -7,6 +7,16 @@ pub mod steps;
 pub use self::manager::Wizard;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WizardInstanceId(u64);
+
+impl WizardInstanceId {
+    pub fn new(value: u64) -> Self {
+        debug_assert!(value != 0);
+        Self(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WizardStep {
     Source,
     CopySelect,

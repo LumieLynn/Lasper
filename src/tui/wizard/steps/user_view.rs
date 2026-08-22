@@ -1,4 +1,4 @@
-use crate::domain::secret::zeroize_string;
+use crate::domain::secret::replace_secret_string;
 use crate::nspawn::errors::NspawnError;
 use crate::nspawn::models::validate_chpasswd_secret;
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
@@ -57,7 +57,13 @@ impl UserStepView {
             user_list: EditableList::new(
                 " Regular Users ",
                 users,
-                |u| format!("  {} {}", u.username, if u.sudoer { "[sudo]" } else { "" }),
+                |u| {
+                    let sudo = if u.sudoer { " [sudo]" } else { "" };
+                    let wayland = u.wayland.as_ref().map_or(String::new(), |access| {
+                        format!(" [wayland:{}]", access.sockets.len())
+                    });
+                    format!("  {}{sudo}{wayland}", u.username)
+                },
                 |idx| AppMessage::Wizard(WizardMessage::UserRemoved(idx)),
             ),
 
@@ -128,8 +134,7 @@ impl Component for UserStepView {
 
 impl StepComponent for UserStepView {
     fn commit_to_draft(&self, ctx: &mut WizardDraft) {
-        zeroize_string(&mut ctx.user.root_password);
-        ctx.user.root_password.push_str(self.root_password.value());
+        replace_secret_string(&mut ctx.user.root_password, self.root_password.value());
         ctx.user.users = self
             .user_list
             .items()
@@ -157,5 +162,35 @@ impl StepComponent for UserStepView {
             AppMessage::Wizard(WizardMessage::DialogCancel) => StepAction::CloseDialog,
             _ => StepAction::None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+    use std::sync::Arc;
+
+    #[test]
+    fn repeated_commits_keep_the_root_password_free_of_zeroized_prefixes() {
+        let mut draft = WizardDraft::new(
+            Vec::new(),
+            Vec::new(),
+            Arc::new(crate::config::AppConfig::default()),
+            crate::application::provisioning::ProvisioningHostSnapshot::default(),
+        );
+        let mut view = UserStepView::new(&draft.user);
+
+        for character in "Password123".chars() {
+            assert_eq!(
+                view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE,)),
+                EventResult::Consumed,
+            );
+            view.commit_to_draft(&mut draft);
+            assert!(!draft.user.root_password.chars().any(char::is_control));
+        }
+
+        assert_eq!(draft.user.root_password, "Password123");
+        assert!(validate_root_password(&draft.user.root_password).is_ok());
     }
 }

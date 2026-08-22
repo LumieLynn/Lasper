@@ -10,3 +10,4 @@ pub(crate) mod runtime;
 pub(crate) mod session;
 pub mod storage;
 pub(crate) mod system_operation;
+pub(crate) mod wayland;

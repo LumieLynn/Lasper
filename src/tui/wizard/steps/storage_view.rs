@@ -1,4 +1,6 @@
-use crate::adapters::storage::StorageType;
+use crate::application::provisioning::{
+    ImagePartitionProbe, ProvisioningPreparationService, StorageBackendKind,
+};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::inputs::path_box::{expand_user_path, PathBox};
@@ -16,6 +18,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use std::sync::Arc;
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -65,18 +68,24 @@ impl RootPartitionChoice {
 }
 
 pub struct StorageStepView {
-    list: SelectableList<(StorageType, bool)>,
+    list: SelectableList<(StorageBackendKind, bool)>,
     creation_method: RadioGroup,
     disk_size: TextBox,
     disk_fs: SelectableList<(DiskImageFilesystem, bool)>,
     partition_table: Checkbox,
     import_path: PathBox,
     root_partition_choices: SelectableList<RootPartitionChoice>,
+    preparation: Arc<ProvisioningPreparationService>,
+    tools: std::collections::BTreeMap<String, bool>,
     focus: FocusTracker,
 }
 
 impl StorageStepView {
-    pub fn new(initial_data: &StorageState) -> Self {
+    pub fn new(
+        initial_data: &StorageState,
+        preparation: Arc<ProvisioningPreparationService>,
+        tools: std::collections::BTreeMap<String, bool>,
+    ) -> Self {
         let info = initial_data.info.clone();
         let types = info.types.clone();
 
@@ -100,18 +109,7 @@ impl StorageStepView {
 
         list.select(selected_idx);
 
-        let fs_options: Vec<(DiskImageFilesystem, bool)> = DiskImageFilesystem::ALL
-            .iter()
-            .map(|fs| {
-                (
-                    *fs,
-                    crate::adapters::provisioning::engine::builders::image::check_tool(
-                        fs.mkfs_tool(),
-                    )
-                    .is_ok(),
-                )
-            })
-            .collect();
+        let fs_options = info.filesystems.clone();
         let mut disk_fs = SelectableList::new(" Filesystem ", fs_options, |(fs, supported)| {
             if *supported {
                 fs.label().to_string()
@@ -189,6 +187,8 @@ impl StorageStepView {
                     Err("Source image path must be a file or block device".into())
                 }),
             root_partition_choices,
+            preparation,
+            tools,
             focus: FocusTracker::new(),
         };
         view.update_focus();
@@ -197,7 +197,7 @@ impl StorageStepView {
 
     fn is_disk_image_selected(&self) -> bool {
         if let Some((st, _)) = self.list.selected_item() {
-            return *st == StorageType::DiskImage;
+            return *st == StorageBackendKind::DiskImage;
         }
         false
     }
@@ -213,24 +213,23 @@ impl StorageStepView {
     }
 
     fn refresh_root_partition_choices(&mut self, path: &std::path::Path) -> Result<(), String> {
-        let probe = crate::adapters::storage::image_ops::probe_image_partitions(path)
+        let probe = self
+            .preparation
+            .probe_image(path)
             .map_err(|error| error.to_string())?;
         self.apply_root_partition_probe(probe)
     }
 
     fn apply_root_partition_probe(
         &mut self,
-        probe: Option<crate::adapters::storage::image_ops::ImagePartitionProbe>,
+        probe: Option<ImagePartitionProbe>,
     ) -> Result<(), String> {
         let previous = self.selected_root_partition();
 
         let mut choices = vec![RootPartitionChoice::automatic()];
         if let Some(probe) = &probe {
             choices.extend(probe.partitions.iter().map(|partition| {
-                RootPartitionChoice::selected(
-                    partition.number,
-                    crate::adapters::storage::image_ops::partition_type_label(&partition.type_id),
-                )
+                RootPartitionChoice::selected(partition.number, partition.type_label.clone())
             }));
         }
         self.root_partition_choices.set_items(choices);
@@ -255,11 +254,7 @@ impl StorageStepView {
         if let Some(probe) = probe {
             let mut roots = Vec::new();
             for partition in &probe.partitions {
-                if crate::adapters::storage::image_ops::is_current_architecture_root_type(
-                    &partition.type_id,
-                )
-                .map_err(|error| error.to_string())?
-                {
+                if partition.current_architecture_root {
                     roots.push(partition.number);
                 }
             }
@@ -408,14 +403,16 @@ impl Component for StorageStepView {
                 }
                 if self.partition_table.checked() {
                     for tool in ["sfdisk", "losetup", "udevadm"] {
-                        crate::adapters::provisioning::engine::builders::image::check_tool(tool)
-                            .map_err(|_| format!("Missing dependency: {}", tool))?;
+                        if !self.tools.get(tool).copied().unwrap_or(false) {
+                            return Err(format!("Missing dependency: {tool}"));
+                        }
                     }
                 }
             } else {
                 self.import_path.validate()?;
-                crate::adapters::provisioning::engine::builders::image::check_tool("sfdisk")
-                    .map_err(|_| "Missing dependency: sfdisk".to_string())?;
+                if !self.tools.get("sfdisk").copied().unwrap_or(false) {
+                    return Err("Missing dependency: sfdisk".into());
+                }
                 let path = expand_user_path(self.import_path.value())?;
                 self.refresh_root_partition_choices(&path)?;
             }
@@ -450,14 +447,63 @@ impl StepComponent for StorageStepView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::storage::image_ops::{ImagePartitionInfo, ImagePartitionProbe};
-    use crate::adapters::storage::StorageInfo;
+    use crate::application::provisioning::{
+        DeploymentError, DeploymentRequest, HostHardwareSnapshot, ImagePartitionInfo,
+        InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort,
+    };
+    use crate::tui::wizard::draft::StorageInfo;
+    use async_trait::async_trait;
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    struct TestPreparation;
+
+    #[async_trait]
+    impl ProvisioningPreparationPort for TestPreparation {
+        async fn inspect_host(&self) -> Result<ProvisioningHostSnapshot, DeploymentError> {
+            unreachable!("host inspection is not used by these tests")
+        }
+
+        async fn discover_hardware(&self) -> Result<HostHardwareSnapshot, DeploymentError> {
+            unreachable!("hardware discovery is not used by these tests")
+        }
+
+        async fn validate_interface(
+            &self,
+            _name: &str,
+            _bridge_mode: bool,
+        ) -> Result<InterfaceValidation, DeploymentError> {
+            unreachable!("interface validation is not used by these tests")
+        }
+
+        fn probe_image(
+            &self,
+            _path: &Path,
+        ) -> Result<Option<ImagePartitionProbe>, DeploymentError> {
+            unreachable!("image probing is not used by these tests")
+        }
+
+        fn preview(&self, _request: &DeploymentRequest) -> String {
+            unreachable!("preview generation is not used by these tests")
+        }
+    }
+
+    fn view() -> StorageStepView {
+        StorageStepView::new(
+            &state(),
+            Arc::new(ProvisioningPreparationService::new(Arc::new(
+                TestPreparation,
+            ))),
+            BTreeMap::new(),
+        )
+    }
 
     fn state() -> StorageState {
         StorageState {
             type_idx: 0,
             info: StorageInfo {
-                types: vec![(StorageType::DiskImage, true)],
+                types: vec![(StorageBackendKind::DiskImage, true)],
+                filesystems: vec![(DiskImageFilesystem::Ext4, true)],
             },
             creation_method_idx: 1,
             disk_size: "2G".into(),
@@ -468,10 +514,11 @@ mod tests {
         }
     }
 
-    fn partition(number: u32, type_id: &str) -> ImagePartitionInfo {
+    fn partition(number: u32, type_label: &str) -> ImagePartitionInfo {
         ImagePartitionInfo {
             number: DiskImagePartition::new(number).unwrap(),
-            type_id: type_id.into(),
+            type_label: type_label.into(),
+            current_architecture_root: false,
         }
     }
 
@@ -484,7 +531,7 @@ mod tests {
                 partition(2, "0FC63DAF-8483-4772-8E79-3D69D8477DE4"),
             ],
         };
-        let mut view = StorageStepView::new(&state());
+        let mut view = view();
 
         let error = view
             .apply_root_partition_probe(Some(probe.clone()))
@@ -505,7 +552,7 @@ mod tests {
                 .map(|number| partition(number, "0FC63DAF-8483-4772-8E79-3D69D8477DE4"))
                 .collect(),
         };
-        let mut view = StorageStepView::new(&state());
+        let mut view = view();
         let _ = view.apply_root_partition_probe(Some(probe));
 
         assert_eq!(view.root_partition_choices.items().len(), 13);

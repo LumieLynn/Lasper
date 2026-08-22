@@ -12,6 +12,7 @@ pub(crate) async fn setup_wayland_shell_env(
     rootfs: &Path,
     username: &str,
     shell: &str,
+    default_socket: &Path,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<()> {
     validate_wayland_config(username, shell)?;
@@ -22,20 +23,13 @@ pub(crate) async fn setup_wayland_shell_env(
         format!("/home/{username}")
     };
     let env_path = format!("{home}/.wayland-env");
-    let script = r#"
-export WAYLAND_DISPLAY=/mnt/wayland-socket
-"#
-    .as_bytes()
-    .to_vec();
+    let script = format!("\nexport WAYLAND_DISPLAY={}\n", default_socket.display()).into_bytes();
     write_user_file(rootfs, username, &env_path, script, runner).await?;
 
     if shell.ends_with("fish") {
         let fish_path = format!("{home}/.config/fish/conf.d/wayland-env.fish");
-        let fish_script = r#"
-set -gx WAYLAND_DISPLAY /mnt/wayland-socket
-"#
-        .as_bytes()
-        .to_vec();
+        let fish_script =
+            format!("\nset -gx WAYLAND_DISPLAY {}\n", default_socket.display()).into_bytes();
         write_user_file(rootfs, username, &fish_path, fish_script, runner).await?;
         return Ok(());
     }
@@ -179,9 +173,15 @@ mod tests {
                 Ok(success_output())
             });
 
-        setup_wayland_shell_env(Path::new("/tmp/rootfs"), "alice", "/usr/bin/zsh", &runner)
-            .await
-            .unwrap();
+        setup_wayland_shell_env(
+            Path::new("/tmp/rootfs"),
+            "alice",
+            "/usr/bin/zsh",
+            Path::new("/run/lasper/wayland/1001/wayland-1"),
+            &runner,
+        )
+        .await
+        .unwrap();
 
         let calls = calls.lock().unwrap();
         assert!(calls[0]
@@ -189,12 +189,12 @@ mod tests {
             .iter()
             .any(|arg| arg == "/home/alice/.wayland-env"));
         let env = std::str::from_utf8(calls[0].1.as_ref().unwrap().as_slice()).unwrap();
-        assert!(env.contains("WAYLAND_DISPLAY=/mnt/wayland-socket"));
+        assert!(env.contains("WAYLAND_DISPLAY=/run/lasper/wayland/1001/wayland-1"));
         assert!(!env.lines().any(|line| line.starts_with("export DISPLAY=")));
         assert!(!env.contains("host-x11"));
         assert!(!env.contains("XDG_RUNTIME_DIR"));
         assert!(!env.contains("mkdir -p"));
-        assert!(!env.contains("ln -sf /mnt/wayland-socket"));
+        assert!(!env.contains("ln -sf /run/lasper/wayland"));
         assert!(calls[1].0.iter().any(|arg| arg == "/home/alice/.zshrc"));
         assert!(calls[1].0.iter().any(|arg| arg.contains(WAYLAND_RC_MARKER)));
         assert!(calls[1].1.is_none());
@@ -213,19 +213,25 @@ mod tests {
                 Ok(success_output())
             });
 
-        setup_wayland_shell_env(Path::new("/tmp/rootfs"), "alice", "/usr/bin/fish", &runner)
-            .await
-            .unwrap();
+        setup_wayland_shell_env(
+            Path::new("/tmp/rootfs"),
+            "alice",
+            "/usr/bin/fish",
+            Path::new("/run/lasper/wayland/1001/wayland-1"),
+            &runner,
+        )
+        .await
+        .unwrap();
 
         let calls = calls.lock().unwrap();
         let fish_env = std::str::from_utf8(calls[1].1.as_ref().unwrap().as_slice()).unwrap();
-        assert!(fish_env.contains("WAYLAND_DISPLAY /mnt/wayland-socket"));
+        assert!(fish_env.contains("WAYLAND_DISPLAY /run/lasper/wayland/1001/wayland-1"));
         assert!(!fish_env
             .lines()
             .any(|line| line.starts_with("set -gx DISPLAY ")));
         assert!(!fish_env.contains("host-x11"));
         assert!(!fish_env.contains("XDG_RUNTIME_DIR"));
         assert!(!fish_env.contains("mkdir -p"));
-        assert!(!fish_env.contains("ln -sf /mnt/wayland-socket"));
+        assert!(!fish_env.contains("ln -sf /run/lasper/wayland"));
     }
 }

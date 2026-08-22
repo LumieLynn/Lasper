@@ -31,7 +31,6 @@ pub struct NspawnConfigSpec {
     pub graphics_acceleration: bool,
     #[serde(default)]
     pub gpu_passthrough_all: bool,
-    pub wayland_socket: Option<String>,
     pub nvidia_gpu: bool,
     pub boot: bool,
 }
@@ -93,18 +92,6 @@ impl NspawnConfigSpec {
             validate_absolute_path("read-only bind", bind)?;
         }
 
-        if let Some(socket) = &self.wayland_socket {
-            validate_text("Wayland socket", socket, false)?;
-            if !socket.starts_with("wayland-")
-                || Path::new(socket).file_name().and_then(|name| name.to_str())
-                    != Some(socket.as_str())
-            {
-                return Err(NspawnError::Validation(format!(
-                    "Invalid Wayland socket name: {socket:?}"
-                )));
-            }
-        }
-
         Ok(())
     }
 }
@@ -132,7 +119,6 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
             private_users: config.private_users,
             graphics_acceleration: config.graphics_acceleration,
             gpu_passthrough_all: config.gpu_passthrough_all,
-            wayland_socket: config.wayland_socket.clone(),
             nvidia_gpu: config.nvidia_gpu,
             boot: config.boot,
         };

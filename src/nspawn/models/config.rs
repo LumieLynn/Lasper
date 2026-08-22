@@ -164,6 +164,10 @@ pub struct BindMount {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUser {
     pub username: String,
+    /// Explicit numeric identity requested for this account. This is used for
+    /// host-session grants whose Unix permissions depend on a stable UID.
+    #[serde(default)]
+    pub uid: Option<u32>,
     /// If true, add to the `sudo` / `wheel` group.
     pub sudoer: bool,
     /// Login shell (e.g., /bin/bash).
@@ -173,6 +177,11 @@ pub struct CreateUser {
 impl CreateUser {
     pub fn validate(&self) -> Result<()> {
         validate_login_username(&self.username)?;
+        if self.uid == Some(0) {
+            return Err(NspawnError::Validation(
+                "Regular users cannot request uid 0".into(),
+            ));
+        }
         validate_login_shell(&self.shell)
     }
 
@@ -456,8 +465,6 @@ pub struct ContainerConfig {
     #[serde(default)]
     pub gpu_passthrough_all: bool,
     pub users: Vec<CreateUser>,
-    /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.
-    pub wayland_socket: Option<String>,
     /// Whether to enable NVIDIA GPU passthrough (JIT managed).
     pub nvidia_gpu: bool,
     /// Disk image specific configuration (only used if storage type is DiskImage).
@@ -486,7 +493,6 @@ impl Default for ContainerConfig {
             graphics_acceleration: Default::default(),
             gpu_passthrough_all: Default::default(),
             users: Default::default(),
-            wayland_socket: Default::default(),
             nvidia_gpu: Default::default(),
             disk_config: Default::default(),
             boot: true,
@@ -566,6 +572,7 @@ mod tests {
     fn create_user_accepts_default_shell_and_valid_system_names() {
         let user = CreateUser {
             username: "_svc-user$".into(),
+            uid: None,
             shell: String::new(),
             sudoer: false,
         };

@@ -15,7 +15,20 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Tick,
-    BackendResult(crate::tui::effects::BackendResponse),
+    WizardHardwareDiscoveryFinished {
+        wizard_id: crate::tui::wizard::WizardInstanceId,
+        result: Result<
+            crate::application::provisioning::HostHardwareSnapshot,
+            crate::application::provisioning::DeploymentError,
+        >,
+    },
+    WizardInterfaceValidationFinished {
+        wizard_id: crate::tui::wizard::WizardInstanceId,
+        result: Result<
+            crate::application::provisioning::InterfaceValidation,
+            crate::application::provisioning::DeploymentError,
+        >,
+    },
     DeploymentPreflightFinished {
         preflight_id: u64,
         request: crate::application::provisioning::DeploymentRequest,

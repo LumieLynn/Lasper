@@ -50,6 +50,7 @@ impl Component for TarRiskConfirmationDialog {
 }
 
 pub struct Wizard {
+    id: crate::tui::wizard::WizardInstanceId,
     pub step: WizardStep,
     pub draft: WizardDraft,
 
@@ -58,35 +59,49 @@ pub struct Wizard {
     pub active_view: Option<Box<dyn StepComponent>>,
 
     permission_level: crate::composition::PermissionLevel,
+    preparation: std::sync::Arc<crate::application::provisioning::ProvisioningPreparationService>,
     pending_request: Option<DeploymentRequest>,
     pub loading: bool,
 }
 
 impl Wizard {
-    pub async fn new(
+    pub fn new(
+        id: crate::tui::wizard::WizardInstanceId,
         entries: Vec<ContainerEntry>,
         images: Vec<ImageEntry>,
-        nvidia_toolkit_installed: bool,
         permission_level: crate::composition::PermissionLevel,
         config: std::sync::Arc<crate::config::AppConfig>,
+        host: crate::application::provisioning::ProvisioningHostSnapshot,
+        preparation: std::sync::Arc<
+            crate::application::provisioning::ProvisioningPreparationService,
+        >,
     ) -> Self {
-        let mut draft = WizardDraft::new(entries, images, config).await;
-        draft.passthrough.nvidia_toolkit_installed = nvidia_toolkit_installed;
+        let draft = WizardDraft::new(entries, images, config, host);
 
         Self {
+            id,
             step: WizardStep::Source,
             draft,
             active_view: None,
             permission_level,
+            preparation,
             pending_request: None,
             loading: false,
         }
     }
 
-    /// Look for builded view.
+    pub fn id(&self) -> crate::tui::wizard::WizardInstanceId {
+        self.id
+    }
+
+    /// Build the current step view on demand.
     fn sync_view(&mut self) {
         if self.active_view.is_none() && self.step != WizardStep::Deploy {
-            self.active_view = Some(steps::build_view(self.step, &self.draft));
+            self.active_view = Some(steps::build_view(
+                self.step,
+                &self.draft,
+                self.preparation.clone(),
+            ));
         }
     }
 
@@ -267,20 +282,37 @@ impl Wizard {
                 }
                 WizardMessage::DeclineUnsafeRemoteTar => StepAction::CloseDialog,
                 WizardMessage::OpenUserDialog => {
-                    let mut editor =
-                        crate::tui::widgets::dialogs::user_editor::UserEditor::new(|u| {
-                            AppMessage::Wizard(WizardMessage::UserAdded(u))
-                        });
+                    let wayland_owner = self
+                        .draft
+                        .user
+                        .users
+                        .iter()
+                        .find(|user| user.wayland.is_some())
+                        .map(|user| user.username.clone());
+                    let mut editor = crate::tui::widgets::dialogs::user_editor::UserEditor::new(
+                        self.draft.passthrough.wayland_sockets.clone(),
+                        wayland_owner.as_deref(),
+                        |u| AppMessage::Wizard(WizardMessage::UserAdded(u)),
+                    );
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
                 WizardMessage::OpenUserEditDialog(idx, ref user) => {
                     let idx = *idx;
-                    let mut editor =
-                        crate::tui::widgets::dialogs::user_editor::UserEditor::new(move |u| {
-                            AppMessage::Wizard(WizardMessage::UserUpdated(idx, u))
-                        })
-                        .with_user(user);
+                    let wayland_owner = self
+                        .draft
+                        .user
+                        .users
+                        .iter()
+                        .enumerate()
+                        .find(|(user_idx, user)| *user_idx != idx && user.wayland.is_some())
+                        .map(|(_, user)| user.username.clone());
+                    let mut editor = crate::tui::widgets::dialogs::user_editor::UserEditor::new(
+                        self.draft.passthrough.wayland_sockets.clone(),
+                        wayland_owner.as_deref(),
+                        move |u| AppMessage::Wizard(WizardMessage::UserUpdated(idx, u)),
+                    )
+                    .with_user(user);
                     editor.set_focus(true);
                     StepAction::OpenDialog(Box::new(editor))
                 }
@@ -399,52 +431,72 @@ impl Wizard {
                 _ => StepAction::None,
             },
 
-            AppMessage::Backend(res) => {
-                self.loading = false;
-                match res {
-                    crate::tui::effects::BackendResponse::ValidationSuccess => {
-                        self.move_next();
-                        StepAction::None
-                    }
-                    crate::tui::effects::BackendResponse::ValidationWarning(w) => {
-                        self.move_next();
-                        StepAction::Status(format!("Warning: {}", w), crate::tui::StatusLevel::Warn)
-                    }
-                    crate::tui::effects::BackendResponse::ValidationError(e) => {
-                        StepAction::Status(format!("Error: {}", e), crate::tui::StatusLevel::Error)
-                    }
-                    crate::tui::effects::BackendResponse::HardwareDiscovered {
-                        nvidia_state,
-                        nvidia_devices,
-                        host_gpus,
-                    } => {
-                        self.draft
-                            .update_hardware_data(nvidia_state, nvidia_devices, host_gpus);
-                        // Rebuild host-facing steps with the completed discovery data.
-                        if self.step == crate::tui::wizard::WizardStep::HostIntegration
-                            || self.step == crate::tui::wizard::WizardStep::BindMounts
-                        {
-                            self.active_view = None;
-                        }
-                        StepAction::Status(
-                            "Hardware discovery complete".into(),
-                            crate::tui::StatusLevel::Info,
-                        )
-                    }
-                    crate::tui::effects::BackendResponse::DiscoveryStarted => StepAction::Status(
-                        "Scanning host hardware...".into(),
+            _ => StepAction::None,
+        }
+    }
+
+    pub fn finish_interface_validation(
+        &mut self,
+        result: Result<
+            crate::application::provisioning::InterfaceValidation,
+            crate::application::provisioning::DeploymentError,
+        >,
+    ) -> StepAction {
+        self.loading = false;
+        match result {
+            Ok(crate::application::provisioning::InterfaceValidation::Valid) => {
+                self.move_next();
+                StepAction::None
+            }
+            Ok(crate::application::provisioning::InterfaceValidation::Warning(warning)) => {
+                self.move_next();
+                StepAction::Status(format!("Warning: {warning}"), crate::tui::StatusLevel::Warn)
+            }
+            Err(error) => StepAction::Status(
+                format!("Interface validation failed: {error}"),
+                crate::tui::StatusLevel::Error,
+            ),
+        }
+    }
+
+    pub fn finish_hardware_discovery(
+        &mut self,
+        result: Result<
+            crate::application::provisioning::HostHardwareSnapshot,
+            crate::application::provisioning::DeploymentError,
+        >,
+    ) -> StepAction {
+        self.draft.passthrough.hardware_scanning = false;
+        match result {
+            Ok(snapshot) => {
+                let warnings = snapshot.warnings.clone();
+                self.draft.update_hardware_data(snapshot);
+                if matches!(
+                    self.step,
+                    crate::tui::wizard::WizardStep::HostIntegration
+                        | crate::tui::wizard::WizardStep::BindMounts
+                ) {
+                    self.active_view = None;
+                }
+                if warnings.is_empty() {
+                    StepAction::Status(
+                        "Hardware discovery complete".into(),
                         crate::tui::StatusLevel::Info,
-                    ),
-                    crate::tui::effects::BackendResponse::DiscoveryFailed(e) => {
-                        self.draft.passthrough.hardware_scanning = false;
-                        StepAction::Status(
-                            format!("Hardware discovery failed: {}", e),
-                            crate::tui::StatusLevel::Error,
-                        )
-                    }
+                    )
+                } else {
+                    StepAction::Status(
+                        format!(
+                            "Hardware discovery completed with warnings: {}",
+                            warnings.join("; ")
+                        ),
+                        crate::tui::StatusLevel::Warn,
+                    )
                 }
             }
-            _ => StepAction::None,
+            Err(error) => StepAction::Status(
+                format!("Hardware discovery failed: {error}"),
+                crate::tui::StatusLevel::Error,
+            ),
         }
     }
 

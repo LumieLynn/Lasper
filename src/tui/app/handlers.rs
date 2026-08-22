@@ -4,6 +4,31 @@ use crate::tui::wizard::StepAction as WizardAction;
 use crate::tui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
+async fn contain_wizard_task<T>(
+    label: &'static str,
+    future: impl std::future::Future<
+        Output = Result<T, crate::application::provisioning::DeploymentError>,
+    >,
+) -> Result<T, crate::application::provisioning::DeploymentError> {
+    use futures_util::FutureExt as _;
+
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("unknown panic");
+            let message = format!("{label} panicked: {detail}");
+            log::error!("{message}");
+            Err(crate::application::provisioning::DeploymentError::failed(
+                message,
+            ))
+        }
+    }
+}
+
 fn quit_confirmation_message(terminal_sessions: usize, host_operations: usize) -> Option<String> {
     if terminal_sessions == 0 && host_operations == 0 {
         return None;
@@ -494,20 +519,50 @@ impl App {
             return;
         }
 
-        let nvidia_installed = crate::adapters::platform::nvidia::nvidia_ctk_available();
+        let host = match contain_wizard_task(
+            "provisioning host inspection",
+            self.data.provisioning_preparation.inspect_host(),
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(error) => {
+                self.set_status(
+                    format!("Could not inspect provisioning capabilities: {error}"),
+                    StatusLevel::Error,
+                );
+                return;
+            }
+        };
+        let wizard_id = crate::tui::wizard::WizardInstanceId::new(self.ui.next_wizard_instance);
+        self.ui.next_wizard_instance = self.ui.next_wizard_instance.checked_add(1).unwrap_or(1);
         let mut wizard = crate::tui::wizard::Wizard::new(
+            wizard_id,
             self.data.entries.clone(),
             self.data.images.clone(),
-            nvidia_installed,
             self.permissions.level(),
             self.config.clone(),
-        )
-        .await;
+            host,
+            self.data.provisioning_preparation.clone(),
+        );
 
-        if nvidia_installed {
-            if let Some(tx) = &self.ui.backend_tx {
-                let _ = tx.try_send(crate::tui::effects::BackendCommand::DiscoverHardware);
-            }
+        if let Some(tx) = self.ui.app_tx.clone() {
+            let preparation = self.data.provisioning_preparation.clone();
+            tokio::spawn(async move {
+                let result = contain_wizard_task(
+                    "provisioning hardware discovery",
+                    preparation.discover_hardware(),
+                )
+                .await;
+                let _ = tx
+                    .send(
+                        crate::tui::events::AppEvent::WizardHardwareDiscoveryFinished {
+                            wizard_id,
+                            result,
+                        },
+                    )
+                    .await;
+            });
         } else {
             wizard.draft.passthrough.hardware_scanning = false;
         }
@@ -531,21 +586,35 @@ impl App {
                 name,
                 is_bridge_mode,
             } => {
-                let result = self.ui.backend_tx.as_ref().map(|tx| {
-                    tx.try_send(crate::tui::effects::BackendCommand::ValidateInterface {
-                        name,
-                        is_bridge_mode,
-                    })
-                });
-                if !matches!(result, Some(Ok(()))) {
+                let Some(tx) = self.ui.app_tx.clone() else {
                     if let Some(wizard) = &mut self.ui.wizard {
                         wizard.loading = false;
                     }
                     self.set_status(
-                        "Internal error: backend validation channel is unavailable".into(),
+                        "Internal error: application event channel is unavailable".into(),
                         StatusLevel::Error,
                     );
-                }
+                    return;
+                };
+                let Some(wizard_id) = self.ui.wizard.as_ref().map(|wizard| wizard.id()) else {
+                    return;
+                };
+                let preparation = self.data.provisioning_preparation.clone();
+                tokio::spawn(async move {
+                    let result = contain_wizard_task(
+                        "provisioning interface validation",
+                        preparation.validate_interface(&name, is_bridge_mode),
+                    )
+                    .await;
+                    let _ = tx
+                        .send(
+                            crate::tui::events::AppEvent::WizardInterfaceValidationFinished {
+                                wizard_id,
+                                result,
+                            },
+                        )
+                        .await;
+                });
             }
             WizardAction::PreflightDeployment(request) => {
                 self.ui.active_dialog = None;
@@ -763,31 +832,24 @@ impl App {
         if self.ui.active_dialog.is_none() {
             return false;
         }
-        match key.code {
-            KeyCode::Esc => {
-                self.ui.active_dialog = None;
+        let mut dialog = self.ui.active_dialog.take().unwrap();
+        let result = dialog.handle_key(key);
+        match result {
+            EventResult::Message(msg) => {
+                if let Some(action) = self
+                    .ui
+                    .wizard
+                    .as_mut()
+                    .map(|wizard| wizard.process_message(msg))
+                {
+                    self.handle_wizard_action(action).await;
+                }
                 true
             }
+            EventResult::Ignored if key.code == KeyCode::Esc => true,
             _ => {
-                let mut dialog = self.ui.active_dialog.take().unwrap();
-                let result = dialog.handle_key(key);
-                match result {
-                    EventResult::Message(msg) => {
-                        if let Some(action) = self
-                            .ui
-                            .wizard
-                            .as_mut()
-                            .map(|wizard| wizard.process_message(msg))
-                        {
-                            self.handle_wizard_action(action).await;
-                        }
-                        true
-                    }
-                    _ => {
-                        self.ui.active_dialog = Some(dialog);
-                        true
-                    }
-                }
+                self.ui.active_dialog = Some(dialog);
+                true
             }
         }
     }
@@ -822,7 +884,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::quit_confirmation_message;
+    use super::{contain_wizard_task, quit_confirmation_message};
 
     #[test]
     fn quit_without_live_resources_needs_no_confirmation() {
@@ -837,5 +899,18 @@ mod tests {
         assert!(message.contains("1 host operation is still running."));
         assert!(message.contains("leave partial host changes"));
         assert!(message.ends_with("Quit anyway?"));
+    }
+
+    #[tokio::test]
+    async fn wizard_task_panics_are_returned_as_typed_failures() {
+        let result: Result<(), crate::application::provisioning::DeploymentError> =
+            contain_wizard_task("hardware discovery", async {
+                panic!("panic sentinel");
+            })
+            .await;
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("hardware discovery panicked"));
+        assert!(error.to_string().contains("panic sentinel"));
     }
 }

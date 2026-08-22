@@ -312,7 +312,6 @@ mod tests {
             private_users: None,
             graphics_acceleration: false,
             gpu_passthrough_all: false,
-            wayland_socket: None,
             nvidia_gpu,
             nvidia_profile: None,
         }

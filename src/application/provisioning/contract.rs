@@ -1,5 +1,6 @@
 use crate::domain::nvidia::NvidiaPassthroughProfile;
 use crate::domain::secret::SecretString;
+use crate::domain::wayland::WaylandGrantIntent;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapSpec, ContainerConfig, DiskImageConfig, OciNetworkMode,
 };
@@ -47,6 +48,10 @@ impl DeploymentSource {
     pub fn is_unacknowledged_remote_tar(&self, acknowledged: bool) -> bool {
         matches!(self, Self::Pull { is_raw: false, .. }) && !acknowledged
     }
+
+    pub fn supports_rootfs_configuration(&self) -> bool {
+        !matches!(self, Self::Copy { .. } | Self::Oci { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +67,7 @@ pub struct DeploymentRequest {
     pub source: DeploymentSource,
     pub storage: DeploymentStorage,
     pub nvidia_profile: Option<NvidiaPassthroughProfile>,
+    pub wayland: Vec<WaylandGrantIntent>,
     pub allow_unsafe_remote_tar: bool,
 }
 
@@ -72,6 +78,55 @@ impl DeploymentRequest {
         for user in &self.config.users {
             user.validate()
                 .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+        }
+        let mut requested_uids = std::collections::HashSet::new();
+        for uid in self.config.users.iter().filter_map(|user| user.uid) {
+            if !requested_uids.insert(uid) {
+                return Err(DeploymentError::rejected(format!(
+                    "multiple users request uid {uid}"
+                )));
+            }
+        }
+        let mut wayland_targets = std::collections::HashSet::new();
+        let mut wayland_sources = std::collections::HashSet::new();
+        for intent in &self.wayland {
+            if !self.source.supports_rootfs_configuration() {
+                return Err(DeploymentError::rejected(
+                    "Wayland grants require a deployment source that supports rootfs user configuration",
+                ));
+            }
+            let Some(user) = self
+                .config
+                .users
+                .iter()
+                .find(|user| user.username == intent.target_username())
+            else {
+                return Err(DeploymentError::rejected(
+                    "Wayland target must be one of the users created by this deployment",
+                ));
+            };
+            if !wayland_targets.insert(intent.target_username()) {
+                return Err(DeploymentError::rejected(
+                    "a container user may have only one Wayland access intent",
+                ));
+            }
+            for source in intent.sources() {
+                if !wayland_sources.insert(source.canonical_path()) {
+                    return Err(DeploymentError::rejected(
+                        "a host Wayland socket may be granted only once",
+                    ));
+                }
+            }
+            user.validate()
+                .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+            if user.uid != Some(intent.required_uid()) {
+                return Err(DeploymentError::rejected(format!(
+                    "Wayland target {} must request host session uid {}",
+                    user.username,
+                    intent.required_uid(),
+                )));
+            }
+            super::wayland::validate_wayland_intent(intent, self.config.private_users)?;
         }
         Ok(())
     }
@@ -210,7 +265,15 @@ impl DeploymentSubmission {
     }
 
     pub(crate) fn validate_secrets(&self) -> Result<(), DeploymentError> {
-        self.secrets.validate_for(&self.request.config)
+        self.secrets.validate_for(&self.request.config)?;
+        if !self.request.source.supports_rootfs_configuration()
+            && self.secrets.has_account_changes()
+        {
+            return Err(DeploymentError::rejected(
+                "This deployment source does not support account configuration",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -448,7 +511,128 @@ pub trait DeploymentExecutor: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::wayland::{
+        HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
+    };
     use crate::nspawn::models::CreateUser;
+
+    fn wayland_intent(target_username: &str) -> WaylandGrantIntent {
+        let source = HostWaylandSocket::from_verified_parts(
+            WaylandDisplay::new("wayland-0").unwrap(),
+            "/run/user/1001".into(),
+            "/run/user/1001/wayland-0".into(),
+            1001,
+            1001,
+            1001,
+            0o755,
+            SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        WaylandGrantIntent::new(
+            target_username,
+            vec![source.clone()],
+            source.display().clone(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wayland_target_must_belong_to_the_deployment_user_set() {
+        let request = DeploymentRequest {
+            config: ContainerConfig {
+                name: "test".into(),
+                users: vec![CreateUser {
+                    username: "alice".into(),
+                    uid: Some(1001),
+                    shell: "/bin/bash".into(),
+                    sudoer: false,
+                }],
+                ..Default::default()
+            },
+            source: DeploymentSource::Pull {
+                url: "https://example.test/rootfs.raw".into(),
+                is_raw: true,
+            },
+            storage: DeploymentStorage::Directory,
+            nvidia_profile: None,
+            wayland: vec![wayland_intent("bob")],
+            allow_unsafe_remote_tar: false,
+        };
+
+        let error = request.validate().unwrap_err();
+        assert!(error.to_string().contains("one of the users created"));
+    }
+
+    #[test]
+    fn wayland_target_must_request_the_host_session_uid() {
+        let request = DeploymentRequest {
+            config: ContainerConfig {
+                name: "test".into(),
+                users: vec![CreateUser {
+                    username: "alice".into(),
+                    uid: Some(1000),
+                    shell: "/bin/bash".into(),
+                    sudoer: false,
+                }],
+                ..Default::default()
+            },
+            source: DeploymentSource::Pull {
+                url: "https://example.test/rootfs.raw".into(),
+                is_raw: true,
+            },
+            storage: DeploymentStorage::Directory,
+            nvidia_profile: None,
+            wayland: vec![wayland_intent("alice")],
+            allow_unsafe_remote_tar: false,
+        };
+
+        let error = request.validate().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("must request host session uid 1001"));
+    }
+
+    #[test]
+    fn wayland_grant_rejects_sources_that_skip_rootfs_configuration() {
+        for source in [
+            DeploymentSource::Copy {
+                source_name: "base".into(),
+            },
+            DeploymentSource::Oci {
+                reference: "docker.io/library/ubuntu:latest".into(),
+                read_only: false,
+                network: OciNetworkMode::Host,
+            },
+        ] {
+            let request = DeploymentRequest {
+                config: ContainerConfig {
+                    name: "test".into(),
+                    users: vec![CreateUser {
+                        username: "alice".into(),
+                        uid: Some(1001),
+                        shell: "/bin/bash".into(),
+                        sudoer: false,
+                    }],
+                    ..Default::default()
+                },
+                source,
+                storage: DeploymentStorage::Directory,
+                nvidia_profile: None,
+                wayland: vec![wayland_intent("alice")],
+                allow_unsafe_remote_tar: false,
+            };
+
+            let error = request.validate().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("supports rootfs user configuration"));
+        }
+    }
 
     #[test]
     fn request_debug_and_serializable_config_contain_no_passwords() {
@@ -457,6 +641,7 @@ mod tests {
                 name: "test".into(),
                 users: vec![CreateUser {
                     username: "alice".into(),
+                    uid: None,
                     shell: "/bin/bash".into(),
                     sudoer: false,
                 }],
@@ -467,6 +652,7 @@ mod tests {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            wayland: Vec::new(),
             allow_unsafe_remote_tar: false,
         };
         let debug = format!("{request:?}");
@@ -493,6 +679,7 @@ mod tests {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            wayland: Vec::new(),
             allow_unsafe_remote_tar: false,
         };
         let submission = DeploymentSubmission::new(
@@ -507,6 +694,31 @@ mod tests {
         assert!(!debug.contains("root-secret"));
         assert!(!debug.contains("user-secret"));
         assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sources_without_rootfs_configuration_reject_account_secrets() {
+        let submission = DeploymentSubmission::new(
+            DeploymentRequest {
+                config: ContainerConfig {
+                    name: "test".into(),
+                    ..Default::default()
+                },
+                source: DeploymentSource::Copy {
+                    source_name: "base".into(),
+                },
+                storage: DeploymentStorage::Directory,
+                nvidia_profile: None,
+                wayland: Vec::new(),
+                allow_unsafe_remote_tar: false,
+            },
+            DeploymentSecrets::new("root-secret".into(), Vec::new()),
+        );
+
+        let error = submission.validate_secrets().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not support account configuration"));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::adapters::platform::gpu::GpuDevice;
+use crate::application::provisioning::HostGpuDevice;
 use crate::nspawn::models::{NetworkMode, PrivateUsersMode};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
@@ -14,10 +14,10 @@ use ratatui::{layout::Rect, widgets::ScrollbarState, Frame};
 #[derive(Clone)]
 enum GpuSelectionItem {
     AllDrm,
-    Device(GpuDevice),
+    Device(HostGpuDevice),
 }
 
-fn is_drm_gpu(gpu: &GpuDevice) -> bool {
+fn is_drm_gpu(gpu: &HostGpuDevice) -> bool {
     gpu.nodes.iter().any(|node| node.starts_with("/dev/dri/"))
 }
 
@@ -32,16 +32,9 @@ fn scrollbar_state(scroll_offset: u16, scroll_max: u16, viewport_height: u16) ->
 macro_rules! layout_items {
     ($self:ident) => {{
         let is_accel = $self.graphics_acceleration.checked();
-        let wayland_checked = $self.wayland_socket.checked();
-        let wayland_selector_active = wayland_checked && !$self.wayland_sockets.is_empty();
         let is_privileged = $self.privileged.checked();
         let has_gpus = !$self.gpu_list.items().is_empty();
-        let has_gpu_access = is_accel && !$self.gpu_list.checked_indices().is_empty();
-        let wayland_without_gpu = wayland_checked && !has_gpu_access;
         let gpu_count = $self.gpu_list.items().len() as u16;
-        let wayland_gpu_note_height = $self
-            .wayland_gpu_note
-            .required_height($self.scroll_area.width.max(20));
         let privilege_warning_height = $self
             .privilege_warning
             .required_height($self.scroll_area.width.max(20));
@@ -59,18 +52,6 @@ macro_rules! layout_items {
             items.push((&mut $self.gpu_list, height, true));
         } else if is_accel && !has_gpus {
             items.push((&mut $self.gpu_empty, 3, false));
-        }
-
-        items.push((&mut $self.wayland_socket, 3, true));
-
-        if wayland_selector_active {
-            items.push((&mut $self.wayland_selector, 3, true));
-        } else if wayland_checked {
-            items.push((&mut $self.wayland_empty, 3, false));
-        }
-
-        if wayland_without_gpu {
-            items.push((&mut $self.wayland_gpu_note, wayland_gpu_note_height, false));
         }
 
         items.push((&mut $self.privileged, 3, true));
@@ -106,11 +87,6 @@ pub struct HostIntegrationStepView {
     gpu_list: Checklist<GpuSelectionItem>,
     gpu_all_index: Option<usize>,
     gpu_empty: TextBlock,
-    wayland_socket: Checkbox,
-    wayland_selector: RadioGroup,
-    wayland_sockets: Vec<String>,
-    wayland_empty: TextBlock,
-    wayland_gpu_note: TextBlock,
 
     privileged: Checkbox,
     private_users: RadioGroup,
@@ -122,32 +98,17 @@ pub struct HostIntegrationStepView {
     scroll_max: u16,
     hardware_scanning: bool,
     private_network: bool,
+    wayland_access_configured: bool,
 }
 
 impl HostIntegrationStepView {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         initial_data: &PassthroughConfig,
         nw_mode: Option<NetworkMode>,
-        wayland_sockets: Vec<String>,
-        discovered_gpus: Vec<GpuDevice>,
+        wayland_access_configured: bool,
+        discovered_gpus: Vec<HostGpuDevice>,
         hardware_scanning: bool,
     ) -> Self {
-        let wayland_options = if wayland_sockets.is_empty() {
-            vec!["No sockets found".to_string()]
-        } else {
-            wayland_sockets.clone()
-        };
-
-        let initial_socket_idx = if let Some(saved_socket) = &initial_data.wayland_socket {
-            wayland_sockets
-                .iter()
-                .position(|s| s == saved_socket)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-
         let has_drm_devices = discovered_gpus
             .iter()
             .flat_map(|gpu| &gpu.nodes)
@@ -207,21 +168,6 @@ impl HostIntegrationStepView {
                 " No GPUs Detected ",
                 "No compatible GPU devices found on the host. Graphics acceleration may not work as expected.",
             ),
-            wayland_socket: Checkbox::new(
-                "Wayland Socket Passthrough",
-                initial_data.wayland_socket.is_some(),
-            ),
-            wayland_selector: RadioGroup::new("Source Socket", wayland_options, initial_socket_idx),
-            wayland_sockets,
-            wayland_empty: TextBlock::new(
-                " No Wayland Sockets Detected ",
-                "No Wayland display sockets found in the host runtime directory. Check if a Wayland compositor is running.",
-            ),
-            wayland_gpu_note: TextBlock::new(
-                " SOCKET ONLY ",
-                "Wayland is exposed without a GPU device. Applications may use software rendering; select a GPU or all DRM devices for hardware acceleration.",
-            ),
-
             privileged: Checkbox::new("Privileged Mode (NOT RECOMMENDED)", initial_data.privileged),
             private_users: RadioGroup::new(
                 "PrivateUsers (User Namespace)",
@@ -252,16 +198,11 @@ impl HostIntegrationStepView {
             scroll_max: 0,
             hardware_scanning,
             private_network: nw_mode.as_ref().is_some_and(NetworkMode::is_private),
+            wayland_access_configured,
         };
 
-        view.update_wayland_state();
         view.update_focus();
         view
-    }
-
-    fn update_wayland_state(&mut self) {
-        let enabled = self.wayland_socket.checked() && !self.wayland_sockets.is_empty();
-        self.wayland_selector.set_enabled(enabled);
     }
 
     fn gpu_all_selected(&self) -> bool {
@@ -430,7 +371,6 @@ impl Component for HostIntegrationStepView {
     fn handle_key(&mut self, key: KeyEvent) -> EventResult {
         if key.code == KeyCode::Char(' ') && self.gpu_list.is_focused() {
             self.toggle_gpu_selection();
-            self.update_wayland_state();
             self.update_focus();
             return EventResult::Consumed;
         }
@@ -441,7 +381,6 @@ impl Component for HostIntegrationStepView {
             key.code,
             KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Left | KeyCode::Right
         ) {
-            self.update_wayland_state();
             self.update_focus();
         }
 
@@ -473,6 +412,9 @@ impl Component for HostIntegrationStepView {
         if self.private_users.selected_idx() == 2 && !self.private_network {
             return Err("PrivateUsers=managed requires a private network mode".into());
         }
+        if self.private_users.selected_idx() == 2 && self.wayland_access_configured {
+            return Err("Wayland access is not supported with PrivateUsers=managed".into());
+        }
         Ok(())
     }
 
@@ -497,13 +439,6 @@ impl StepComponent for HostIntegrationStepView {
         };
 
         ctx.passthrough.selected_gpu_nodes = self.selected_gpu_nodes();
-
-        if self.wayland_socket.checked() && !self.wayland_sockets.is_empty() {
-            let idx = self.wayland_selector.selected_idx();
-            ctx.passthrough.wayland_socket = Some(self.wayland_sockets[idx].clone());
-        } else {
-            ctx.passthrough.wayland_socket = None;
-        }
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
@@ -556,14 +491,13 @@ mod tests {
             private_users: None,
             graphics_acceleration: false,
             gpu_passthrough_all: false,
-            wayland_socket: None,
             nvidia_gpu: false,
             nvidia_profile: None,
         };
         let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Host),
-            Vec::new(),
+            false,
             Vec::new(),
             false,
         );
@@ -595,21 +529,20 @@ mod tests {
             private_users: None,
             graphics_acceleration: true,
             gpu_passthrough_all: false,
-            wayland_socket: Some("wayland-0".into()),
             nvidia_gpu: false,
             nvidia_profile: None,
         };
-        let first_gpu = GpuDevice {
+        let first_gpu = HostGpuDevice {
             display_name: "First DRM GPU".into(),
             driver_type: "DRM/KMS".into(),
             nodes: vec!["/dev/dri/card0".into(), "/dev/dri/renderD128".into()],
         };
-        let second_gpu = GpuDevice {
+        let second_gpu = HostGpuDevice {
             display_name: "Second DRM GPU".into(),
             driver_type: "DRM/KMS".into(),
             nodes: vec!["/dev/dri/card1".into(), "/dev/dri/renderD129".into()],
         };
-        let legacy_gpu = GpuDevice {
+        let legacy_gpu = HostGpuDevice {
             display_name: "Legacy Mali GPU".into(),
             driver_type: "Mali/Proprietary".into(),
             nodes: vec!["/dev/mali".into()],
@@ -618,7 +551,7 @@ mod tests {
         let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Host),
-            vec!["wayland-0".into()],
+            false,
             gpus.clone(),
             false,
         );
@@ -655,8 +588,6 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("All DRM devices (/dev/dri)"));
-        assert!(!rendered.contains("SOCKET ONLY"));
-
         assert_eq!(
             view.handle_key(KeyEvent::new(
                 KeyCode::Down,
@@ -696,55 +627,12 @@ mod tests {
         let restored_view = HostIntegrationStepView::new(
             &restored_config,
             Some(NetworkMode::Host),
-            vec!["wayland-0".into()],
+            false,
             gpus,
             false,
         );
         assert!(restored_view.gpu_all_selected());
         assert_eq!(restored_view.gpu_list.checked_indices().len(), 4);
         assert_eq!(restored_view.selected_gpu_nodes(), vec!["/dev/mali"]);
-    }
-
-    #[test]
-    fn wayland_passthrough_remains_available_with_private_networking() {
-        crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
-        let config = PassthroughConfig {
-            bind_mounts: Vec::new(),
-            device_binds: Vec::new(),
-            privileged: false,
-            private_users: Some(PrivateUsersMode::Managed),
-            graphics_acceleration: false,
-            gpu_passthrough_all: false,
-            wayland_socket: Some("wayland-0".into()),
-            nvidia_gpu: false,
-            nvidia_profile: None,
-        };
-        let mut view = HostIntegrationStepView::new(
-            &config,
-            Some(NetworkMode::Veth),
-            vec!["wayland-0".into()],
-            Vec::new(),
-            false,
-        );
-
-        assert!(view.wayland_socket.checked());
-        assert!(view.wayland_socket.is_enabled());
-
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| view.render(frame, frame.area()))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rendered = (0..buffer.area.height)
-            .map(|row| {
-                (0..buffer.area.width)
-                    .map(|column| buffer[(column, row)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(rendered.contains("Wayland Socket Passthrough"));
-        assert!(!rendered.contains("Requires Host Network"));
     }
 }

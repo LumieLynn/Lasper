@@ -1,6 +1,7 @@
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::domain::secret::SecretBytes;
+use crate::domain::wayland::ContainerUserIdentity;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
 use std::path::Path;
@@ -17,18 +18,14 @@ pub(crate) async fn create_user_in_container(
     }
     let shell = user.login_shell();
 
+    let mut command = vec!["useradd".into(), "-m".into()];
+    if let Some(uid) = user.uid {
+        command.extend(["--uid".into(), uid.to_string()]);
+    }
+    command.extend(["-s".into(), shell.into(), user.username.clone()]);
+
     let output = runner
-        .run(
-            rootfs,
-            vec![
-                "useradd".into(),
-                "-m".into(),
-                "-s".into(),
-                shell.into(),
-                user.username.clone(),
-            ],
-            None,
-        )
+        .run(rootfs, command, None)
         .await
         .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
     log_output("useradd", &output);
@@ -57,6 +54,54 @@ pub(crate) async fn create_user_in_container(
     }
 
     Ok(warnings)
+}
+
+pub(crate) async fn resolve_user_identity(
+    rootfs: &Path,
+    username: &str,
+    runner: &dyn RootfsProcessRunner,
+) -> Result<ContainerUserIdentity> {
+    crate::nspawn::models::validate_login_username(username)?;
+    let uid = query_numeric_identity(rootfs, username, "-u", "uid", runner).await?;
+    let gid = query_numeric_identity(rootfs, username, "-g", "gid", runner).await?;
+    Ok(ContainerUserIdentity {
+        username: username.to_string(),
+        uid,
+        gid,
+    })
+}
+
+async fn query_numeric_identity(
+    rootfs: &Path,
+    username: &str,
+    flag: &str,
+    label: &str,
+    runner: &dyn RootfsProcessRunner,
+) -> Result<u32> {
+    let output = runner
+        .run(
+            rootfs,
+            vec!["id".into(), flag.into(), username.into()],
+            None,
+        )
+        .await
+        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
+    log_output("id", &output);
+    if !output.status.success() {
+        return Err(NspawnError::cmd_failed(
+            "resolve container user identity",
+            format!("systemd-nspawn -D {:?} -- id {flag} {username}", rootfs),
+            &output,
+        ));
+    }
+    let value = std::str::from_utf8(&output.stdout)
+        .map_err(|_| NspawnError::Runtime(format!("container {label} is not valid UTF-8")))?
+        .trim();
+    value.parse::<u32>().map_err(|_| {
+        NspawnError::Runtime(format!(
+            "container {label} lookup returned an invalid value: {value:?}"
+        ))
+    })
 }
 
 pub(crate) async fn set_root_password(
@@ -216,6 +261,59 @@ mod tests {
         }
     }
 
+    fn success_output_with_stdout(stdout: &str) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_identity_is_resolved_from_the_provisioned_rootfs() {
+        let mut sequence = mockall::Sequence::new();
+        let mut runner = MockRootfsProcessRunner::new();
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .withf(|_, command, stdin| {
+                command.iter().map(String::as_str).eq(["id", "-u", "alice"]) && stdin.is_none()
+            })
+            .returning(|_, _, _| Ok(success_output_with_stdout("1001\n")));
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .withf(|_, command, stdin| {
+                command.iter().map(String::as_str).eq(["id", "-g", "alice"]) && stdin.is_none()
+            })
+            .returning(|_, _, _| Ok(success_output_with_stdout("1002\n")));
+
+        let identity = resolve_user_identity(Path::new("/tmp/rootfs"), "alice", &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(identity.username, "alice");
+        assert_eq!(identity.uid, 1001);
+        assert_eq!(identity.gid, 1002);
+    }
+
+    #[tokio::test]
+    async fn malformed_numeric_identity_is_rejected() {
+        let mut runner = MockRootfsProcessRunner::new();
+        runner
+            .expect_run()
+            .once()
+            .returning(|_, _, _| Ok(success_output_with_stdout("not-a-uid\n")));
+
+        let error = resolve_user_identity(Path::new("/tmp/rootfs"), "alice", &runner)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("invalid value"));
+    }
+
     #[tokio::test]
     async fn create_user_uses_default_shell_after_validation() {
         let mut runner = MockRootfsProcessRunner::new();
@@ -237,11 +335,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_user_places_an_explicit_uid_before_the_account_name() {
+        let mut runner = MockRootfsProcessRunner::new();
+        runner.expect_run().once().returning(|_, command, stdin| {
+            assert!(stdin.is_none());
+            assert_eq!(
+                command,
+                vec!["useradd", "-m", "--uid", "1001", "-s", "/bin/bash", "alice"]
+            );
+            Ok(success_output())
+        });
+        let user = CreateUser {
+            username: "alice".into(),
+            uid: Some(1001),
+            shell: "/bin/bash".into(),
+            sudoer: false,
+        };
+
+        create_user_in_container(Path::new("/tmp/rootfs"), &user, None, &runner)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn create_user_rejects_chpasswd_record_injection_before_running() {
         let mut runner = MockRootfsProcessRunner::new();
         runner.expect_run().never();
         let user = CreateUser {
             username: "alice".into(),
+            uid: None,
             shell: "/bin/bash".into(),
             sudoer: false,
         };

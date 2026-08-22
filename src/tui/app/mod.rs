@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::application::provisioning::ProvisioningService;
+use crate::application::provisioning::{ProvisioningPreparationService, ProvisioningService};
 use crate::application::sessions::SessionService;
 use crate::application::{
     ImageLifecycleService, MachineLifecycleService, RuntimeCatalog, RuntimeUpdate,
@@ -110,11 +110,11 @@ pub struct AppUi {
 
     pub status_message: Option<(String, crate::tui::StatusLevel)>,
     pub status_expiry: Option<Instant>,
-    pub backend_tx: Option<tokio::sync::mpsc::Sender<crate::tui::effects::BackendCommand>>,
     pub app_tx: Option<tokio::sync::mpsc::Sender<AppEvent>>,
     pub quit_dialog: Option<crate::tui::widgets::dialogs::confirmation::ConfirmationDialog>,
     pub delete_dialog: Option<PendingImageRemoval>,
     pub active_dialog: Option<Box<dyn Component>>,
+    next_wizard_instance: u64,
     next_deployment_preflight: u64,
     pending_deployment_preflight: Option<u64>,
 
@@ -147,11 +147,11 @@ impl AppUi {
             wizard: None,
             status_message: None,
             status_expiry: None,
-            backend_tx: None,
             app_tx: None,
             quit_dialog: None,
             delete_dialog: None,
             active_dialog: None,
+            next_wizard_instance: 1,
             next_deployment_preflight: 1,
             pending_deployment_preflight: None,
             resize_mode: ResizeMode::Inactive,
@@ -209,6 +209,7 @@ pub struct AppData {
     pub machine_lifecycle: std::sync::Arc<MachineLifecycleService>,
     pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
     pub provisioning: std::sync::Arc<ProvisioningService>,
+    pub provisioning_preparation: std::sync::Arc<ProvisioningPreparationService>,
     pub exec_ctx: std::sync::Arc<ExecutionContext>,
     pub action_cooldown: Option<Instant>,
     pub metrics: HashMap<String, ContainerMetrics>,
@@ -251,6 +252,7 @@ impl App {
             machine_lifecycle,
             image_lifecycle,
             provisioning,
+            provisioning_preparation,
         } = services;
         Self {
             permissions,
@@ -278,6 +280,7 @@ impl App {
                 machine_lifecycle,
                 image_lifecycle,
                 provisioning,
+                provisioning_preparation,
                 exec_ctx,
                 action_cooldown: None,
                 metrics: HashMap::new(),
@@ -535,25 +538,6 @@ impl App {
         self.sync_snapshot(query.value);
     }
 
-    /// Forward backend response to the active wizard/context.
-    fn handle_backend_result(&mut self, res: crate::tui::effects::BackendResponse) {
-        if let Some(wizard) = &mut self.ui.wizard {
-            let action = wizard.process_message(crate::tui::core::AppMessage::Backend(res));
-            match action {
-                crate::tui::wizard::StepAction::Status(msg, level) => {
-                    self.set_status(msg, level);
-                }
-                crate::tui::wizard::StepAction::OpenDialog(dialog) => {
-                    self.ui.active_dialog = Some(dialog);
-                }
-                crate::tui::wizard::StepAction::CloseDialog => {
-                    self.ui.active_dialog = None;
-                }
-                _ => {}
-            }
-        }
-    }
-
     /// Update metrics history for a container.
     fn update_metrics(&mut self, name: String, time_x: f64, cpu: f64, ram: f64) {
         let metrics = self.data.metrics.entry(name).or_default();
@@ -573,7 +557,32 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Tick => self.tick().await,
-            AppEvent::BackendResult(res) => self.handle_backend_result(res),
+            AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
+                if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
+                    return;
+                }
+                let action = self
+                    .ui
+                    .wizard
+                    .as_mut()
+                    .map(|wizard| wizard.finish_hardware_discovery(result));
+                if let Some(action) = action {
+                    self.handle_wizard_action(action).await;
+                }
+            }
+            AppEvent::WizardInterfaceValidationFinished { wizard_id, result } => {
+                if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
+                    return;
+                }
+                let action = self
+                    .ui
+                    .wizard
+                    .as_mut()
+                    .map(|wizard| wizard.finish_interface_validation(result));
+                if let Some(action) = action {
+                    self.handle_wizard_action(action).await;
+                }
+            }
             AppEvent::DeploymentPreflightFinished {
                 preflight_id,
                 request,
@@ -615,12 +624,9 @@ impl App {
 
         let mut events = EventHandler::new(100);
         let (refresh_tx, mut refresh_rx) = tokio::sync::mpsc::channel::<RuntimeUpdate>(4);
-        let (backend_tx, mut backend_rx) =
-            tokio::sync::mpsc::channel::<crate::tui::effects::BackendCommand>(100);
         let (detail_refresh_tx, mut detail_refresh_rx) =
             tokio::sync::mpsc::channel::<detail_refresh::DetailRefreshCompletion>(1);
 
-        self.ui.backend_tx = Some(backend_tx);
         self.ui.app_tx = Some(events.tx.clone());
 
         // Quit signal — the oneshot fires in the select! below so we
@@ -693,9 +699,6 @@ impl App {
                 }
                 Some(completion) = detail_refresh_rx.recv() => {
                     self.apply_detail_refresh(completion);
-                }
-                Some(cmd) = backend_rx.recv() => {
-                    crate::tui::effects::handle_command(cmd, events.tx.clone());
                 }
                 changed = events.mouse_motion_rx.changed() => {
                     if changed.is_ok() {
@@ -849,6 +852,43 @@ mod tests {
             exec_ctx,
             std::sync::Arc::new(crate::config::AppConfig::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn stale_background_result_cannot_mutate_a_reopened_wizard() {
+        let mut app = make_app();
+        let current_id = crate::tui::wizard::WizardInstanceId::new(2);
+        app.ui.wizard = Some(crate::tui::wizard::Wizard::new(
+            current_id,
+            Vec::new(),
+            Vec::new(),
+            crate::composition::PermissionLevel::User,
+            app.config.clone(),
+            Default::default(),
+            app.data.provisioning_preparation.clone(),
+        ));
+        assert!(
+            app.ui
+                .wizard
+                .as_ref()
+                .unwrap()
+                .draft
+                .passthrough
+                .hardware_scanning
+        );
+
+        app.handle_event(AppEvent::WizardHardwareDiscoveryFinished {
+            wizard_id: crate::tui::wizard::WizardInstanceId::new(1),
+            result: Err(crate::application::provisioning::DeploymentError::failed(
+                "stale result",
+            )),
+        })
+        .await;
+
+        let wizard = app.ui.wizard.as_ref().unwrap();
+        assert_eq!(wizard.id(), current_id);
+        assert!(wizard.draft.passthrough.hardware_scanning);
+        assert!(app.ui.status_message.is_none());
     }
 
     mod image_start_transitions {
@@ -1281,13 +1321,14 @@ mod tests {
             let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
             app.ui.app_tx = Some(event_tx);
             let mut wizard = Wizard::new(
+                crate::tui::wizard::WizardInstanceId::new(1),
                 vec![],
                 vec![],
-                false,
                 PermissionLevel::User,
                 app.config.clone(),
-            )
-            .await;
+                Default::default(),
+                app.data.provisioning_preparation.clone(),
+            );
             wizard.step = WizardStep::Review;
             wizard.draft.source.kind = crate::tui::wizard::draft::SourceKind::Pull;
             wizard.draft.source.pull_url = "https://example.test/rootfs.tar".into();
@@ -1303,6 +1344,7 @@ mod tests {
                     password: "user-secret".into(),
                     sudoer: false,
                     shell: "/bin/bash".into(),
+                    wayland: None,
                 });
             wizard.active_view = None;
             app.ui.wizard = Some(wizard);

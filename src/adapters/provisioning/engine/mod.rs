@@ -318,6 +318,7 @@ pub(crate) async fn run_deployment(
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+    wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DeploymentHost,
     secrets: DeploymentSecrets,
     job: DeploymentJobContext,
@@ -329,6 +330,7 @@ pub(crate) async fn run_deployment(
         name.clone(),
         cfg,
         nvidia_profile,
+        wayland_intents,
         host,
         secrets,
         job,
@@ -365,6 +367,7 @@ async fn run_deploy_internal(
     name: String,
     cfg: ContainerConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+    wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DeploymentHost,
     mut secrets: DeploymentSecrets,
     job: DeploymentJobContext,
@@ -499,7 +502,9 @@ async fn run_deploy_internal(
                 cancellation.checkpoint()?;
             }
 
-            for user in &cfg.users {
+            let mut users = cfg.users.iter().collect::<Vec<_>>();
+            users.sort_by_key(|user| user.uid.is_none());
+            for user in users {
                 push_log!(format!("Creating user {}...", user.username));
                 let password = secrets
                     .take_user_password(&user.username)
@@ -513,15 +518,6 @@ async fn run_deploy_internal(
                     push_log!(warning);
                 }
                 cancellation.checkpoint()?;
-
-                if cfg.wayland_socket.is_some() {
-                    push_log!(format!("Setting up wayland env for {}...", user.username));
-                    host
-                        .rootfs
-                        .configure_wayland(&actual_rootfs_target, user)
-                        .await?;
-                    cancellation.checkpoint()?;
-                }
             }
         } else if !has_os_layout {
             log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
@@ -531,9 +527,55 @@ async fn run_deploy_internal(
             push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());
         }
 
-        let xdg_runtime = crate::adapters::platform::capabilities::get_xdg_runtime()
-            .await
-            .ok();
+        let mut resolved_wayland = Vec::with_capacity(wayland_intents.len());
+        for intent in wayland_intents {
+            if !supports_offline_commands {
+                return Err(NspawnError::Validation(
+                    "Wayland grant requires a rootfs that supports user identity lookup".into(),
+                ));
+            }
+            let user = cfg
+                .users
+                .iter()
+                .find(|user| user.username == intent.target_username())
+                .ok_or_else(|| {
+                    NspawnError::Validation(
+                        "Wayland target is not part of this deployment".into(),
+                    )
+                })?;
+            push_log!(format!(
+                "Resolving Wayland target identity for {}...",
+                user.username
+            ));
+            let identity = host
+                .rootfs
+                .resolve_user_identity(&actual_rootfs_target, &user.username)
+                .await?;
+            let grant = crate::application::provisioning::resolve_wayland_grant(
+                intent,
+                identity,
+                cfg.private_users,
+            )
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
+            host.nspawn.validate_wayland(&cfg, &grant).await?;
+            push_log!(format!(
+                "Setting up {} Wayland display(s) for {}...",
+                grant.sockets().len(),
+                user.username,
+            ));
+            host
+                .rootfs
+                .configure_wayland(
+                    &actual_rootfs_target,
+                    grant.target(),
+                    &user.shell,
+                    grant.default_display(),
+                )
+                .await?;
+            cancellation.checkpoint()?;
+            resolved_wayland.push(grant);
+        }
+
         let mut initial_nvidia_state = None;
 
         if cfg.nvidia_gpu {
@@ -614,7 +656,7 @@ async fn run_deploy_internal(
             .nspawn
             .write_generated(
                 &cfg,
-                xdg_runtime.as_deref(),
+                &resolved_wayland,
                 initial_nvidia_state.as_ref(),
             )
             .await?;

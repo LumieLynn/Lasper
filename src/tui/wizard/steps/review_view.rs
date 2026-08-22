@@ -58,9 +58,7 @@ impl StepComponent for ReviewStepView {
         // Preview is read-only view of context
     }
 
-    fn render_step(&mut self, f: &mut Frame, area: Rect, context: &WizardDraft) {
-        // Reactive update: ensure preview reflects current context before rendering
-        self.preview.set_content(context.build_preview_nspawn());
+    fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
         self.render(f, area);
     }
 }

@@ -1,9 +1,10 @@
 use crate::adapters::config::nspawn_file::{
-    nspawn_config_content_from_spec_with_wayland_path, NspawnConfig,
+    nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
+use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
     ApplyStatus, ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
@@ -53,20 +54,36 @@ impl NspawnConfigStore {
     pub async fn write_generated(
         &self,
         config: &ContainerConfig,
-        xdg_runtime: Option<&str>,
+        wayland: &[WaylandGrant],
         nvidia_state: Option<&NvidiaState>,
     ) -> Result<ApplyStatus> {
         let spec = NspawnConfigSpec::try_from(config)?;
         let result = self
-            .execute(NspawnConfigOperation::Write(WriteNspawnConfig {
+            .execute(NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
                 spec,
-                xdg_runtime: xdg_runtime.map(str::to_string),
+                wayland: wayland.to_vec(),
                 nvidia_state: nvidia_state.cloned(),
-            }))
+            })))
             .await?;
         result
             .apply
             .ok_or_else(|| NspawnError::Runtime("nspawn write returned no apply status".into()))
+    }
+
+    pub(crate) async fn validate_wayland(
+        &self,
+        config: &ContainerConfig,
+        grant: &WaylandGrant,
+    ) -> Result<()> {
+        let spec = NspawnConfigSpec::try_from(config)?;
+        self.execute(NspawnConfigOperation::ValidateWayland(Box::new(
+            ValidateWaylandGrant {
+                spec,
+                grant: grant.clone(),
+            },
+        )))
+        .await?;
+        Ok(())
     }
 
     pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<ApplyStatus> {
@@ -97,11 +114,13 @@ impl NspawnConfigStore {
         state: &NvidiaState,
         removed_binds: &[crate::adapters::platform::nvidia::state::PassthroughBind],
     ) -> Result<()> {
-        self.execute(NspawnConfigOperation::UpdateGpu(UpdateNspawnGpu {
-            machine: parse_machine_name(name)?,
-            state: state.clone(),
-            removed_binds: removed_binds.to_vec(),
-        }))
+        self.execute(NspawnConfigOperation::UpdateGpu(Box::new(
+            UpdateNspawnGpu {
+                machine: parse_machine_name(name)?,
+                state: state.clone(),
+                removed_binds: removed_binds.to_vec(),
+            },
+        )))
         .await?;
         Ok(())
     }
@@ -152,10 +171,11 @@ impl std::fmt::Debug for NspawnConfigStore {
 pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
-    Write(WriteNspawnConfig),
+    Write(Box<WriteNspawnConfig>),
+    ValidateWayland(Box<ValidateWaylandGrant>),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
-    UpdateGpu(UpdateNspawnGpu),
+    UpdateGpu(Box<UpdateNspawnGpu>),
     Remove(RemoveNspawnConfig),
     CleanupSidecarLocks(CleanupNspawnSidecarLocks),
 }
@@ -176,8 +196,15 @@ pub(crate) struct InspectNspawnConfig {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WriteNspawnConfig {
     spec: NspawnConfigSpec,
-    xdg_runtime: Option<String>,
+    wayland: Vec<WaylandGrant>,
     nvidia_state: Option<NvidiaState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ValidateWaylandGrant {
+    spec: NspawnConfigSpec,
+    grant: WaylandGrant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -259,7 +286,7 @@ pub(crate) async fn execute_nspawn_config_operation(
             let apply = write_generated_at(
                 &nspawn_path(&request.spec.machine),
                 &request.spec,
-                request.xdg_runtime.as_deref(),
+                &request.wayland,
                 request.nvidia_state.as_ref(),
                 invoking_uid,
             )
@@ -268,6 +295,11 @@ pub(crate) async fn execute_nspawn_config_operation(
                 apply: Some(apply),
                 ..Default::default()
             })
+        }
+        NspawnConfigOperation::ValidateWayland(request) => {
+            request.spec.validate()?;
+            validate_wayland_grant(&request.spec, &request.grant, invoking_uid).await?;
+            Ok(NspawnConfigResult::default())
         }
         NspawnConfigOperation::PromoteOci(request) => {
             let apply = promote_new_oci_config(
@@ -725,22 +757,29 @@ fn oci_managed_network_key(key: &str) -> bool {
 async fn write_generated_at(
     path: &Path,
     spec: &NspawnConfigSpec,
-    xdg_runtime: Option<&str>,
+    wayland: &[WaylandGrant],
     nvidia_state: Option<&NvidiaState>,
     invoking_uid: u32,
 ) -> Result<ApplyStatus> {
     spec.validate()?;
     validate_custom_bind_sources(spec).await?;
-    let wayland_socket = validate_wayland_runtime(spec, xdg_runtime, invoking_uid).await?;
+    let mut wayland_binds = Vec::new();
+    for grant in wayland {
+        let sockets = validate_wayland_grant(spec, grant, invoking_uid).await?;
+        wayland_binds.extend(grant.sockets().iter().zip(sockets).map(|(socket, source)| {
+            crate::adapters::wayland::WaylandBind::new(
+                source,
+                grant.target().uid,
+                socket.source().display(),
+                grant.bind_policy(),
+            )
+        }));
+    }
     if let Some(state) = nvidia_state {
         validate_nvidia_update(state, &[])?;
     }
 
-    let mut content = nspawn_config_content_from_spec_with_wayland_path(
-        spec,
-        xdg_runtime,
-        wayland_socket.as_deref(),
-    )?;
+    let mut content = nspawn_config_content_from_spec_with_wayland_binds(spec, &wayland_binds)?;
     if let Some(state) = nvidia_state {
         content = NspawnConfig::apply_gpu_passthrough_to_content(content, state, &[])?;
     }
@@ -824,26 +863,45 @@ fn validate_absolute_value(label: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-async fn validate_wayland_runtime(
+async fn validate_wayland_grant(
     spec: &NspawnConfigSpec,
-    runtime: Option<&str>,
+    grant: &WaylandGrant,
     invoking_uid: u32,
-) -> Result<Option<PathBuf>> {
-    let Some(socket_name) = spec.wayland_socket.as_deref() else {
-        return Ok(None);
-    };
-    let runtime = runtime.ok_or_else(|| {
-        NspawnError::Validation("Wayland passthrough requires an XDG runtime directory".into())
-    })?;
-    if runtime.chars().any(char::is_control) || !Path::new(runtime).is_absolute() {
+) -> Result<Vec<PathBuf>> {
+    validate_resolved_wayland_policy(spec, grant)?;
+    let mut sockets = Vec::with_capacity(grant.sockets().len());
+    for socket in grant.sockets() {
+        sockets.push(validate_wayland_source(socket.source(), invoking_uid).await?);
+    }
+    Ok(sockets)
+}
+
+async fn validate_wayland_source(
+    source: &crate::domain::wayland::HostWaylandSocket,
+    invoking_uid: u32,
+) -> Result<PathBuf> {
+    if source.session_uid() != invoking_uid || source.owner_uid() != invoking_uid {
         return Err(NspawnError::Validation(format!(
-            "Invalid XDG runtime directory: {runtime:?}"
+            "Wayland grant does not belong to invoking uid {invoking_uid}"
         )));
     }
-
-    let metadata = tokio::fs::symlink_metadata(runtime)
+    let runtime = source.runtime_dir();
+    if !runtime.is_absolute() {
+        return Err(NspawnError::Validation(
+            "Wayland runtime directory must be absolute".into(),
+        ));
+    }
+    let canonical_runtime = tokio::fs::canonicalize(runtime)
         .await
-        .map_err(|error| NspawnError::Io(PathBuf::from(runtime), error))?;
+        .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
+    if canonical_runtime != runtime {
+        return Err(NspawnError::Validation(
+            "Wayland runtime directory evidence is no longer canonical".into(),
+        ));
+    }
+    let metadata = tokio::fs::metadata(runtime)
+        .await
+        .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
     if !metadata.is_dir() || metadata.uid() != invoking_uid {
         return Err(NspawnError::Validation(format!(
             "XDG runtime directory is not owned by uid {invoking_uid}"
@@ -855,23 +913,39 @@ async fn validate_wayland_runtime(
         ));
     }
 
-    let requested_socket = Path::new(runtime).join(socket_name);
-    let socket_metadata = tokio::fs::symlink_metadata(&requested_socket)
+    let display =
+        crate::domain::wayland::WaylandDisplay::new(source.display().as_str().to_string())
+            .map_err(NspawnError::Validation)?;
+    let requested_socket = runtime.join(display.as_str());
+    let canonical_socket = tokio::fs::canonicalize(&requested_socket)
         .await
         .map_err(|error| NspawnError::Io(requested_socket.clone(), error))?;
-    if socket_metadata.file_type().is_symlink() {
-        let target = tokio::fs::canonicalize(&requested_socket)
-            .await
-            .map_err(|error| NspawnError::Io(requested_socket.clone(), error))?;
-        validate_wayland_socket_target(&target).await?;
-        Ok(Some(target))
-    } else {
-        validate_wayland_socket_target(&requested_socket).await?;
-        Ok(Some(requested_socket))
+    if canonical_socket != source.canonical_path() || !canonical_socket.starts_with(runtime) {
+        return Err(NspawnError::Validation(
+            "Wayland socket was replaced or escaped its runtime directory".into(),
+        ));
     }
+    let observed = validate_wayland_socket_target(&canonical_socket).await?;
+    if observed.owner_uid != source.owner_uid()
+        || observed.owner_gid != source.owner_gid()
+        || observed.mode != source.mode()
+        || observed.revision != source.revision()
+    {
+        return Err(NspawnError::Validation(
+            "Wayland socket metadata changed after discovery".into(),
+        ));
+    }
+    Ok(canonical_socket)
 }
 
-async fn validate_wayland_socket_target(path: &Path) -> Result<()> {
+struct ObservedWaylandSocket {
+    owner_uid: u32,
+    owner_gid: u32,
+    mode: u32,
+    revision: SocketRevision,
+}
+
+async fn validate_wayland_socket_target(path: &Path) -> Result<ObservedWaylandSocket> {
     let path_text = path
         .to_str()
         .ok_or_else(|| NspawnError::Validation("Wayland socket path is not valid UTF-8".into()))?;
@@ -890,23 +964,60 @@ async fn validate_wayland_socket_target(path: &Path) -> Result<()> {
             path.display()
         )));
     }
+    Ok(ObservedWaylandSocket {
+        owner_uid: metadata.uid(),
+        owner_gid: metadata.gid(),
+        mode: metadata.permissions().mode() & 0o7777,
+        revision: SocketRevision {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds: metadata.ctime_nsec(),
+        },
+    })
+}
+
+fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGrant) -> Result<()> {
+    let expected_policy = match spec.private_users {
+        Some(crate::nspawn::models::PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
+        None
+        | Some(
+            crate::nspawn::models::PrivateUsersMode::Yes
+            | crate::nspawn::models::PrivateUsersMode::Pick,
+        ) => WaylandBindPolicy::Idmap,
+        Some(
+            crate::nspawn::models::PrivateUsersMode::Managed
+            | crate::nspawn::models::PrivateUsersMode::Identity,
+        ) => {
+            return Err(NspawnError::Validation(
+                "Wayland grant uses an unsupported PrivateUsers mode".into(),
+            ));
+        }
+    };
+    if grant.bind_policy() != expected_policy {
+        return Err(NspawnError::Validation(
+            "Wayland grant idmap policy does not match PrivateUsers".into(),
+        ));
+    }
+    for socket in grant.sockets() {
+        let expected_access = socket.source().write_access_for(grant.target());
+        if expected_access != Some(socket.socket_access()) {
+            return Err(NspawnError::Validation(
+                "Wayland grant does not match socket DAC permissions".into(),
+            ));
+        }
+    }
     Ok(())
 }
 
 fn invoking_uid() -> u32 {
-    if uzers::get_current_uid() == 0 {
-        if let Ok(uid) = std::env::var("SUDO_UID") {
-            if let Ok(uid) = uid.parse() {
-                return uid;
-            }
-        }
-    }
-    uzers::get_current_uid()
+    crate::adapters::platform::capabilities::invoking_uid()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::wayland::WaylandSocketAccess;
     use crate::nspawn::models::IdmapSuffix;
 
     #[test]
@@ -948,11 +1059,11 @@ mod tests {
             }],
             ..Default::default()
         };
-        let operation = NspawnConfigOperation::Write(WriteNspawnConfig {
+        let operation = NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
             spec: NspawnConfigSpec::try_from(&config).unwrap(),
-            xdg_runtime: None,
+            wayland: Vec::new(),
             nvidia_state: None,
-        });
+        }));
         let json = serde_json::to_string(&operation).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!json.contains("root_password"));
@@ -1288,7 +1399,7 @@ Unknown=preserve-me\n";
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
 
-        let created = write_generated_at(&path, &spec, None, None, uzers::get_current_uid())
+        let created = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
         assert_eq!(created, ApplyStatus::Created);
@@ -1298,7 +1409,7 @@ Unknown=preserve-me\n";
         assert!(content.contains("Hostname=test-host"));
         assert!(crate::adapters::filesystem::lock_path_for(&path).exists());
 
-        let unchanged = write_generated_at(&path, &spec, None, None, uzers::get_current_uid())
+        let unchanged = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
         assert_eq!(unchanged, ApplyStatus::Unchanged);
@@ -1309,7 +1420,7 @@ Unknown=preserve-me\n";
             ..Default::default()
         })
         .unwrap();
-        let conflict = write_generated_at(&path, &different, None, None, uzers::get_current_uid())
+        let conflict = write_generated_at(&path, &different, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
         assert_eq!(conflict, ApplyStatus::ConflictUnknownOwner);
@@ -1368,7 +1479,7 @@ Unknown=preserve-me\n";
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
 
-        let error = write_generated_at(&output, &spec, None, None, uzers::get_current_uid())
+        let error = write_generated_at(&output, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap_err();
 
@@ -1402,7 +1513,7 @@ Unknown=preserve-me\n";
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
 
-        write_generated_at(&output, &spec, None, None, uzers::get_current_uid())
+        write_generated_at(&output, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
 
@@ -1483,114 +1594,246 @@ Unknown=preserve-me\n";
         assert!(content.contains("BindReadOnly=/host/libcuda.so:/usr/lib/libcuda.so"));
     }
 
-    #[tokio::test]
-    async fn wayland_runtime_requires_private_user_runtime_and_socket() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let socket_path = directory.path().join("wayland-0");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let config = ContainerConfig {
-            name: "test".into(),
-            wayland_socket: Some("wayland-0".into()),
-            ..Default::default()
+    fn wayland_evidence(
+        runtime: &Path,
+        display: &str,
+    ) -> crate::domain::wayland::HostWaylandSocket {
+        let canonical_runtime = std::fs::canonicalize(runtime).unwrap();
+        let canonical_socket = std::fs::canonicalize(runtime.join(display)).unwrap();
+        let metadata = std::fs::metadata(&canonical_socket).unwrap();
+        crate::domain::wayland::HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new(display).unwrap(),
+            canonical_runtime,
+            canonical_socket,
+            uzers::get_current_uid(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            SocketRevision {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn wayland_grant(runtime: &Path, display: &str) -> WaylandGrant {
+        let source = wayland_evidence(runtime, display);
+        resolved_wayland_grant(source, WaylandBindPolicy::Idmap)
+    }
+
+    fn resolved_wayland_grant(
+        source: crate::domain::wayland::HostWaylandSocket,
+        policy: WaylandBindPolicy,
+    ) -> WaylandGrant {
+        let display = source.display().clone();
+        let target = crate::domain::wayland::ContainerUserIdentity {
+            username: "lumie".into(),
+            uid: source.owner_uid(),
+            gid: source.owner_gid(),
         };
-        let spec = NspawnConfigSpec::try_from(&config).unwrap();
-
-        let resolved =
-            validate_wayland_runtime(&spec, directory.path().to_str(), uzers::get_current_uid())
-                .await
-                .unwrap()
-                .unwrap();
-
-        assert_eq!(resolved, socket_path);
+        WaylandGrant::resolved(
+            target,
+            vec![WaylandGrant::socket(source, WaylandSocketAccess::Owner)],
+            display,
+            policy,
+        )
+        .unwrap()
     }
 
     #[tokio::test]
-    async fn wayland_runtime_allows_leaf_symlink_to_socket() {
+    async fn wayland_grant_revalidates_private_runtime_and_socket_evidence() {
         let runtime = tempfile::tempdir().unwrap();
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let target_dir = tempfile::tempdir().unwrap();
-        let target_socket = target_dir.path().join("wayland-real");
+        let socket_path = runtime.path().join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "test".into(),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+
+        let resolved = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec![socket_path]);
+
+        let mut forged = serde_json::to_value(&grant).unwrap();
+        forged["sockets"][0]["source"]["canonical_path"] = serde_json::json!("/etc/passwd");
+        assert!(serde_json::from_value::<WaylandGrant>(forged).is_err());
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_rejects_evidence_for_a_different_runtime_socket() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let selected_path = runtime.path().join("wayland-0");
+        let other_path = runtime.path().join("wayland-1");
+        let _selected = std::os::unix::net::UnixListener::bind(&selected_path).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&other_path).unwrap();
+        let metadata = std::fs::metadata(&other_path).unwrap();
+        let source = crate::domain::wayland::HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap(),
+            std::fs::canonicalize(runtime.path()).unwrap(),
+            std::fs::canonicalize(&other_path).unwrap(),
+            uzers::get_current_uid(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            SocketRevision {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
+            },
+        )
+        .unwrap();
+        let grant = resolved_wayland_grant(source, WaylandBindPolicy::Idmap);
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "test".into(),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("replaced or escaped"));
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_uses_noidmap_only_when_private_users_is_disabled() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = runtime.path().join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+            name: "test".into(),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::No),
+            ..Default::default()
+        })
+        .unwrap();
+        let idmapped = wayland_grant(runtime.path(), "wayland-0");
+        assert!(
+            validate_wayland_grant(&spec, &idmapped, uzers::get_current_uid())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("idmap policy")
+        );
+
+        let grant = resolved_wayland_grant(
+            idmapped.sockets()[0].source().clone(),
+            WaylandBindPolicy::NoIdmap,
+        );
+        let output = runtime.path().join("test.nspawn");
+        write_generated_at(
+            &output,
+            &spec,
+            std::slice::from_ref(&grant),
+            None,
+            uzers::get_current_uid(),
+        )
+        .await
+        .unwrap();
+
+        let content = tokio::fs::read_to_string(output).await.unwrap();
+        assert!(content.contains(&format!(
+            "Bind={}:/run/lasper/wayland/{}/wayland-0:noidmap",
+            socket_path.display(),
+            uzers::get_current_uid(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_canonicalizes_leaf_symlink_inside_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let target_socket = runtime.path().join(".wayland-real");
         let _listener = std::os::unix::net::UnixListener::bind(&target_socket).unwrap();
         let symlink_path = runtime.path().join("wayland-0");
         std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();
-
-        let config = ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            wayland_socket: Some("wayland-0".into()),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
             ..Default::default()
-        };
-        let spec = NspawnConfigSpec::try_from(&config).unwrap();
-
-        let resolved =
-            validate_wayland_runtime(&spec, runtime.path().to_str(), uzers::get_current_uid())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(
-            resolved,
-            tokio::fs::canonicalize(&target_socket).await.unwrap()
-        );
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
 
         let path = runtime.path().join("test.nspawn");
         write_generated_at(
             &path,
             &spec,
-            runtime.path().to_str(),
+            std::slice::from_ref(&grant),
             None,
             uzers::get_current_uid(),
         )
         .await
         .unwrap();
         let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let resolved = std::fs::canonicalize(&target_socket).unwrap();
         assert!(content.contains(&format!(
-            "Bind={}:/mnt/wayland-socket",
-            resolved.to_str().unwrap()
+            "Bind={}:/run/lasper/wayland/{}/wayland-0:idmap",
+            resolved.display(),
+            uzers::get_current_uid(),
         )));
         assert!(!content.contains(symlink_path.to_str().unwrap()));
     }
 
     #[tokio::test]
-    async fn wayland_runtime_rejects_leaf_symlink_to_regular_file() {
+    async fn wayland_grant_rejects_regular_file_and_world_writable_runtime() {
         let runtime = tempfile::tempdir().unwrap();
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let target_dir = tempfile::tempdir().unwrap();
-        let target_file = target_dir.path().join("not-a-socket");
-        std::fs::write(&target_file, b"not a socket").unwrap();
-        std::os::unix::fs::symlink(&target_file, runtime.path().join("wayland-0")).unwrap();
-
-        let config = ContainerConfig {
+        std::fs::write(runtime.path().join("wayland-0"), b"not a socket").unwrap();
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            wayland_socket: Some("wayland-0".into()),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
             ..Default::default()
-        };
-        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        assert!(
+            validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+                .await
+                .is_err()
+        );
 
-        let result =
-            validate_wayland_runtime(&spec, runtime.path().to_str(), uzers::get_current_uid())
-                .await;
-
+        std::fs::remove_file(runtime.path().join("wayland-0")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(runtime.path().join("wayland-0")).unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let result = validate_wayland_grant(&spec, &grant, uzers::get_current_uid()).await;
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn wayland_runtime_rejects_world_writable_directory() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket_path = directory.path().join("wayland-0");
-        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
-        let config = ContainerConfig {
+    async fn wayland_grant_detects_socket_replacement() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = runtime.path().join("wayland-0");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        drop(listener);
+        std::fs::remove_file(&socket_path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            wayland_socket: Some("wayland-0".into()),
+            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
             ..Default::default()
-        };
-        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+        })
+        .unwrap();
 
-        let result =
-            validate_wayland_runtime(&spec, directory.path().to_str(), uzers::get_current_uid())
-                .await;
-
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(result.is_err());
+        let error = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after discovery"));
     }
 }

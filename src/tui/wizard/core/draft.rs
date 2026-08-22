@@ -1,13 +1,10 @@
-pub use crate::adapters::config::builder::{
-    BasicConfig, ContainerConfigBuilder, ContainerConfigWithPreview, NetworkConfig,
-    PassthroughConfig, SourceConfig, SourceKind, StorageConfig, UserConfig,
-};
-use crate::adapters::storage::{StorageInfo, StorageType};
 use crate::application::provisioning::{
     DeploymentRequest, DeploymentSecrets, DeploymentSource, DeploymentStorage,
-    DeploymentSubmission, UserSecret,
+    DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot, ProvisioningHostSnapshot,
+    StorageBackendKind, UserSecret,
 };
 use crate::domain::secret::zeroize_string;
+use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
@@ -17,6 +14,80 @@ use crate::nspawn::models::{
 use crate::nspawn::models::{ContainerEntry, ImageEntry};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceKind {
+    Copy,
+    Oci,
+    Debootstrap,
+    Pacstrap,
+    Dnf5,
+    Pull,
+    LocalFile,
+    Profile {
+        method: BootstrapMethod,
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceConfig {
+    Copy {
+        source_name: String,
+    },
+    Oci {
+        reference: String,
+        read_only: bool,
+        network: OciNetworkMode,
+    },
+    Bootstrap(BootstrapSpec),
+    Pull {
+        url: String,
+        is_raw: bool,
+    },
+    Artifact(ArtifactSpec),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BasicConfig {
+    pub name: String,
+    pub hostname: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserConfig {
+    pub users: Vec<CreateUser>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageConfig {
+    pub storage_type: StorageBackendKind,
+    pub disk_config: Option<crate::nspawn::models::DiskImageConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StorageInfo {
+    pub types: Vec<(StorageBackendKind, bool)>,
+    pub filesystems: Vec<(DiskImageFilesystem, bool)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NetworkConfig {
+    pub mode: Option<NetworkMode>,
+    pub port_forwards: Vec<PortForward>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PassthroughConfig {
+    pub bind_mounts: Vec<BindMount>,
+    pub device_binds: Vec<String>,
+    pub privileged: bool,
+    pub private_users: Option<PrivateUsersMode>,
+    pub graphics_acceleration: bool,
+    pub gpu_passthrough_all: bool,
+    pub nvidia_gpu: bool,
+    pub nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfiguredSourceProfile {
@@ -278,7 +349,7 @@ impl StorageState {
         let (st, _) = self.info.types[self.type_idx];
         StorageConfig {
             storage_type: st,
-            disk_config: if st == StorageType::DiskImage {
+            disk_config: if st == StorageBackendKind::DiskImage {
                 let source = if self.creation_method_idx == 1 {
                     crate::nspawn::models::DiskImageSource::ImportExisting {
                         path: self.import_path.clone(),
@@ -306,18 +377,48 @@ impl StorageState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaylandAccessDraft {
+    pub sockets: Vec<HostWaylandSocket>,
+    pub default_display: WaylandDisplay,
+}
+
+impl WaylandAccessDraft {
+    pub fn new(
+        sockets: Vec<HostWaylandSocket>,
+        default_display: WaylandDisplay,
+    ) -> Result<Self, String> {
+        WaylandGrantIntent::new("draft-user", sockets.clone(), default_display.clone())?;
+        Ok(Self {
+            sockets,
+            default_display,
+        })
+    }
+
+    pub fn intent_for(&self, username: &str) -> WaylandGrantIntent {
+        WaylandGrantIntent::new(username, self.sockets.clone(), self.default_display.clone())
+            .expect("Wayland draft invariants were checked when it was created")
+    }
+
+    pub fn required_uid(&self) -> u32 {
+        self.sockets[0].owner_uid()
+    }
+}
+
 #[derive(PartialEq)]
 pub struct UserDraft {
     pub username: String,
     pub password: String,
     pub sudoer: bool,
     pub shell: String,
+    pub wayland: Option<WaylandAccessDraft>,
 }
 
 impl UserDraft {
     pub fn account(&self) -> CreateUser {
         CreateUser {
             username: self.username.clone(),
+            uid: self.wayland.as_ref().map(WaylandAccessDraft::required_uid),
             sudoer: self.sudoer,
             shell: self.shell.clone(),
         }
@@ -329,6 +430,7 @@ impl UserDraft {
             password: self.password.clone(),
             sudoer: self.sudoer,
             shell: self.shell.clone(),
+            wayland: self.wayland.clone(),
         }
     }
 }
@@ -340,6 +442,7 @@ impl std::fmt::Debug for UserDraft {
             .field("password", &"[REDACTED]")
             .field("sudoer", &self.sudoer)
             .field("shell", &self.shell)
+            .field("wayland", &self.wayland)
             .finish()
     }
 }
@@ -434,12 +537,11 @@ pub struct PassthroughState {
     pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
     pub gpu_passthrough_all: bool,
-    pub wayland_socket: Option<String>,
-    pub discovered_gpus: Vec<crate::adapters::platform::gpu::GpuDevice>,
+    pub discovered_gpus: Vec<HostGpuDevice>,
     pub nvidia_gpu: bool,
     pub nvidia_toolkit_installed: bool,
     pub selected_gpu_nodes: Vec<String>,
-    pub wayland_sockets: Vec<String>,
+    pub wayland_sockets: Vec<HostWaylandSocket>,
     pub bind_mounts: Vec<BindMount>,
 
     // Advanced NVIDIA passthrough
@@ -463,7 +565,6 @@ impl PassthroughState {
             private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
             gpu_passthrough_all: self.gpu_passthrough_all,
-            wayland_socket: self.wayland_socket.clone(),
             nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
             nvidia_profile: if self.nvidia_gpu {
                 let manual_classifications: Vec<crate::domain::nvidia::ManualClassification> = self
@@ -506,22 +607,16 @@ pub struct WizardDraft {
     pub passthrough: PassthroughState,
     pub entries: Vec<ContainerEntry>,
     pub images: Vec<ImageEntry>,
-    pub xdg_runtime: Option<String>,
+    pub host: ProvisioningHostSnapshot,
 }
 
 impl WizardDraft {
-    pub async fn new(
+    pub fn new(
         entries: Vec<ContainerEntry>,
         images: Vec<ImageEntry>,
         config: Arc<crate::config::AppConfig>,
+        host: ProvisioningHostSnapshot,
     ) -> Self {
-        let xdg_runtime = crate::adapters::platform::capabilities::get_xdg_runtime()
-            .await
-            .ok();
-        let nvidia_toolkit_installed = crate::adapters::platform::nvidia::nvidia_ctk_available();
-        let wayland_sockets =
-            crate::adapters::platform::capabilities::scan_available_wayland_sockets().await;
-
         // NVIDIA and GPU discovery is now offloaded to a background task
         let discovered_gpus = vec![];
         let nvidia_available_devices = vec!["all".to_string()];
@@ -587,7 +682,10 @@ impl WizardDraft {
             },
             storage: StorageState {
                 type_idx: 0,
-                info: crate::adapters::storage::detect::detect_available_storage_types().await,
+                info: StorageInfo {
+                    types: host.storage_backends.clone(),
+                    filesystems: host.filesystems.clone(),
+                },
                 creation_method_idx: 0,
                 disk_size: "2G".to_string(),
                 disk_fs: DiskImageFilesystem::Ext4,
@@ -600,14 +698,13 @@ impl WizardDraft {
                 users: vec![],
             },
             network: {
-                let bridges = crate::adapters::platform::network::detect_bridges().await;
+                let bridges = host.bridges.clone();
                 let default_bridge = bridges
                     .first()
                     .cloned()
                     .unwrap_or_else(|| "br0".to_string());
 
-                let physical_interfaces =
-                    crate::adapters::platform::network::detect_physical_interfaces().await;
+                let physical_interfaces = host.physical_interfaces.clone();
                 let default_interface = physical_interfaces
                     .first()
                     .cloned()
@@ -627,12 +724,11 @@ impl WizardDraft {
                 private_users: None,
                 graphics_acceleration: false,
                 gpu_passthrough_all: false,
-                wayland_socket: None,
                 discovered_gpus,
                 nvidia_gpu: false,
-                nvidia_toolkit_installed,
+                nvidia_toolkit_installed: host.nvidia_toolkit_installed,
                 selected_gpu_nodes: vec![],
-                wayland_sockets,
+                wayland_sockets: host.wayland_sockets.clone(),
                 bind_mounts: vec![],
                 nvidia_passthrough_mode: crate::domain::nvidia::NvidiaPassthroughMode::Mirror,
                 nvidia_gpu_device: "all".to_string(),
@@ -645,36 +741,12 @@ impl WizardDraft {
             },
             entries,
             images,
-            xdg_runtime,
+            host,
         }
-    }
-
-    pub fn builder(&self) -> ContainerConfigBuilder {
-        ContainerConfigBuilder {
-            source: Some(self.source.extract_config()),
-            basic: Some(self.basic.extract_config()),
-            storage: Some(self.storage.extract_config()),
-            user: Some(self.user.extract_config()),
-            network: Some(self.network.extract_config()),
-            passthrough: Some(self.passthrough.extract_config()),
-        }
-    }
-
-    pub fn build_config(&self) -> ContainerConfigWithPreview {
-        self.builder().build_config(self.xdg_runtime.as_deref())
-    }
-
-    pub fn build_preview_nspawn(&self) -> String {
-        self.build_config().preview
     }
 
     pub fn build_deployment_request(&self) -> DeploymentRequest {
-        let builder = self.builder();
-        let built = builder.build_config(self.xdg_runtime.as_deref());
-        let source = match builder
-            .source
-            .expect("wizard submission requires a configured source")
-        {
+        let source = match self.source.extract_config() {
             SourceConfig::Copy { source_name } => DeploymentSource::Copy { source_name },
             SourceConfig::Oci {
                 reference,
@@ -689,35 +761,104 @@ impl WizardDraft {
             SourceConfig::Pull { url, is_raw } => DeploymentSource::Pull { url, is_raw },
             SourceConfig::Artifact(spec) => DeploymentSource::Artifact(spec),
         };
-        let storage = match builder
-            .storage
-            .expect("wizard submission requires configured storage")
-        {
+        let basic = self.basic.extract_config();
+        if !source.supports_rootfs_configuration() {
+            let config = match &source {
+                DeploymentSource::Copy { .. } => crate::nspawn::models::ContainerConfig {
+                    name: basic.name,
+                    ..Default::default()
+                },
+                DeploymentSource::Oci { network, .. } => crate::nspawn::models::ContainerConfig {
+                    name: basic.name,
+                    network: Some(network.into_network_mode()),
+                    private_users: Some(PrivateUsersMode::No),
+                    boot: false,
+                    ..Default::default()
+                },
+                DeploymentSource::Bootstrap(_)
+                | DeploymentSource::Pull { .. }
+                | DeploymentSource::Artifact(_) => unreachable!(
+                    "sources with rootfs configuration must use the full request projection"
+                ),
+            };
+            return DeploymentRequest {
+                config,
+                source,
+                storage: DeploymentStorage::Directory,
+                nvidia_profile: None,
+                wayland: Vec::new(),
+                allow_unsafe_remote_tar: false,
+            };
+        }
+
+        let storage_config = self.storage.extract_config();
+        let storage = match storage_config {
             StorageConfig {
-                storage_type: StorageType::Directory,
+                storage_type: StorageBackendKind::Directory,
                 ..
             } => DeploymentStorage::Directory,
             StorageConfig {
-                storage_type: StorageType::Subvolume,
+                storage_type: StorageBackendKind::Subvolume,
                 ..
             } => DeploymentStorage::Subvolume,
             StorageConfig {
-                storage_type: StorageType::DiskImage,
+                storage_type: StorageBackendKind::DiskImage,
                 disk_config,
             } => DeploymentStorage::DiskImage(disk_config.unwrap_or_default()),
         };
+        let network = self.network.extract_config();
+        let users = self.user.extract_config();
+        let passthrough = self.passthrough.extract_config();
+        let wayland = self
+            .user
+            .users
+            .iter()
+            .filter_map(|user| {
+                user.wayland
+                    .as_ref()
+                    .map(|access| access.intent_for(&user.username))
+            })
+            .collect();
+        let config = crate::nspawn::models::ContainerConfig {
+            name: basic.name,
+            hostname: basic.hostname,
+            network: network.mode,
+            port_forwards: network.port_forwards,
+            bind_mounts: passthrough.bind_mounts,
+            device_binds: passthrough.device_binds,
+            readonly_binds: Vec::new(),
+            privileged: passthrough.privileged,
+            private_users: passthrough.private_users,
+            graphics_acceleration: passthrough.graphics_acceleration,
+            gpu_passthrough_all: passthrough.gpu_passthrough_all,
+            users: users.users,
+            nvidia_gpu: passthrough.nvidia_gpu,
+            disk_config: match &storage {
+                DeploymentStorage::DiskImage(config) => Some(config.clone()),
+                DeploymentStorage::Directory | DeploymentStorage::Subvolume => None,
+            },
+            boot: true,
+        };
 
         DeploymentRequest {
-            config: built.cfg,
+            config,
             source,
             storage,
-            nvidia_profile: built.nvidia_profile,
+            nvidia_profile: passthrough.nvidia_profile,
+            wayland,
             allow_unsafe_remote_tar: self.source.unsafe_remote_tar_accepted(),
         }
     }
 
     pub fn take_submission(&mut self, request: DeploymentRequest) -> DeploymentSubmission {
-        DeploymentSubmission::new(request, self.user.take_secrets())
+        let secrets = self.user.take_secrets();
+        let secrets = if request.source.supports_rootfs_configuration() {
+            secrets
+        } else {
+            drop(secrets);
+            DeploymentSecrets::new(String::new(), Vec::new())
+        };
+        DeploymentSubmission::new(request, secrets)
     }
 
     fn configured_profiles(
@@ -770,34 +911,21 @@ impl WizardDraft {
         )
     }
 
-    pub fn update_hardware_data(
-        &mut self,
-        state: crate::adapters::platform::nvidia::state::NvidiaState,
-        devices: Vec<String>,
-        gpus: Vec<crate::adapters::platform::gpu::GpuDevice>,
-    ) {
+    pub fn update_hardware_data(&mut self, snapshot: HostHardwareSnapshot) {
         self.passthrough.hardware_scanning = false;
-        self.passthrough.discovered_gpus = gpus;
-        self.passthrough.nvidia_available_devices = devices;
-        self.passthrough.active_nvidia_categories =
-            crate::adapters::platform::nvidia::classify::detect_active_categories(
-                &state.classified_entries,
-            );
+        self.passthrough.discovered_gpus = snapshot.gpus;
+        self.passthrough.nvidia_available_devices = snapshot.nvidia_devices;
+        self.passthrough.active_nvidia_categories = snapshot.active_nvidia_categories;
         // Merge fresh unclassified CDI files with existing user reclassifications
-        let fresh_unclassified: Vec<UnclassifiedFile> = state
-            .binds
-            .iter()
-            .filter(|b| {
-                b.readonly
-                    && crate::adapters::platform::nvidia::classify::classify_path(&b.container_path)
-                        .is_none()
-            })
-            .map(|b| UnclassifiedFile {
-                host_path: b.host_path.clone(),
-                default_container_path: b.container_path.clone(),
+        let fresh_unclassified: Vec<UnclassifiedFile> = snapshot
+            .unclassified_nvidia_files
+            .into_iter()
+            .map(|file| UnclassifiedFile {
+                host_path: file.host_path,
+                default_container_path: file.default_container_path,
                 assigned_category: None,
                 custom_destination: String::new(),
-                readonly: true,
+                readonly: file.readonly,
             })
             .collect();
 
@@ -818,6 +946,26 @@ impl WizardDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_wayland_access() -> WaylandAccessDraft {
+        let source = HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap(),
+            "/run/user/1001".into(),
+            "/run/user/1001/wayland-0".into(),
+            1001,
+            1001,
+            1001,
+            0o755,
+            crate::domain::wayland::SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        WaylandAccessDraft::new(vec![source.clone()], source.display().clone()).unwrap()
+    }
 
     fn test_source_state() -> SourceState {
         SourceState {
@@ -1046,7 +1194,8 @@ mod tests {
         let mut state = StorageState {
             type_idx: 0,
             info: StorageInfo {
-                types: vec![(StorageType::DiskImage, true)],
+                types: vec![(StorageBackendKind::DiskImage, true)],
+                filesystems: vec![(DiskImageFilesystem::Ext4, true)],
             },
             creation_method_idx: 1,
             disk_size: "2G".into(),
@@ -1073,6 +1222,7 @@ mod tests {
                 password: "user-sentinel".into(),
                 sudoer: false,
                 shell: "/bin/bash".into(),
+                wayland: None,
             }],
         };
 
@@ -1095,7 +1245,6 @@ mod tests {
             private_users: None,
             graphics_acceleration: true,
             gpu_passthrough_all: true,
-            wayland_socket: Some("wayland-0".into()),
             discovered_gpus: vec![],
             nvidia_gpu: true,
             nvidia_toolkit_installed: true,
@@ -1113,7 +1262,6 @@ mod tests {
         };
 
         let cfg = state.extract_config();
-        assert!(cfg.wayland_socket.is_some());
         assert!(cfg.gpu_passthrough_all);
 
         // Nvidia GPU only if toolkit installed
@@ -1121,5 +1269,69 @@ mod tests {
         state_no_toolkit.nvidia_toolkit_installed = false;
         let cfg = state_no_toolkit.extract_config();
         assert!(!cfg.nvidia_gpu);
+    }
+
+    #[test]
+    fn deployment_request_drops_wayland_grant_for_sources_without_user_setup() {
+        let mut draft = WizardDraft::new(
+            vec![],
+            vec![],
+            Arc::new(crate::config::AppConfig::default()),
+            ProvisioningHostSnapshot::default(),
+        );
+        draft.user.users.push(UserDraft {
+            username: "lumie".into(),
+            password: String::new(),
+            sudoer: false,
+            shell: "/bin/bash".into(),
+            wayland: Some(test_wayland_access()),
+        });
+
+        draft.source.kind = SourceKind::Pacstrap;
+        let request = draft.build_deployment_request();
+        assert_eq!(request.wayland.len(), 1);
+        assert_eq!(request.config.users[0].uid, Some(1001));
+
+        draft.source.kind = SourceKind::Copy;
+        let request = draft.build_deployment_request();
+        assert!(request.wayland.is_empty());
+        assert!(request.config.users.is_empty());
+        assert!(request.config.bind_mounts.is_empty());
+        assert_eq!(request.storage, DeploymentStorage::Directory);
+
+        draft.source.kind = SourceKind::Oci;
+        let request = draft.build_deployment_request();
+        assert!(request.wayland.is_empty());
+        assert!(request.config.users.is_empty());
+        assert!(request.config.bind_mounts.is_empty());
+        assert_eq!(request.config.private_users, Some(PrivateUsersMode::No));
+        assert!(!request.config.boot);
+    }
+
+    #[test]
+    fn copy_submission_discards_hidden_account_secrets() {
+        let mut draft = WizardDraft::new(
+            vec![],
+            vec![],
+            Arc::new(crate::config::AppConfig::default()),
+            ProvisioningHostSnapshot::default(),
+        );
+        draft.source.kind = SourceKind::Copy;
+        draft.user.root_password = "root-sentinel".into();
+        draft.user.users.push(UserDraft {
+            username: "alice".into(),
+            password: "user-sentinel".into(),
+            sudoer: false,
+            shell: "/bin/bash".into(),
+            wayland: None,
+        });
+
+        let request = draft.build_deployment_request();
+        let submission = draft.take_submission(request);
+        assert!(submission.validate_secrets().is_ok());
+        let (_, secrets) = submission.into_parts();
+        assert!(!secrets.has_account_changes());
+        assert!(draft.user.root_password.is_empty());
+        assert!(draft.user.users[0].password.is_empty());
     }
 }

@@ -4,7 +4,6 @@ pub enum AppMessage {
     Wizard(WizardMessage),
     Container(ContainerMessage),
     List(ListMessage),
-    Backend(crate::tui::effects::BackendResponse),
 }
 
 #[derive(Debug, PartialEq)]
@@ -25,6 +24,7 @@ pub enum WizardMessage {
     OpenBindEditDialog(usize, crate::nspawn::models::BindMount),
     OpenNvidiaConfigDialog,
     NvidiaConfigSaved(crate::tui::widgets::dialogs::nvidia_config::NvidiaConfigResult),
+    WaylandAccessConfigured(crate::tui::wizard::core::draft::WaylandAccessDraft),
     OpenUnclassifiedEditDialog(usize, crate::tui::wizard::core::draft::UnclassifiedFile),
 
     // Macro-events for atomic data changes

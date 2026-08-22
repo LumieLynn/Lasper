@@ -1,3 +1,4 @@
+use crate::application::provisioning::HostCapability;
 use crate::nspawn::models::{OciNetworkMode, RootfsSourceSpec};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
@@ -14,6 +15,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     Frame,
 };
+use std::collections::BTreeMap;
 use unicode_width::UnicodeWidthStr;
 
 macro_rules! active_comps {
@@ -73,11 +75,17 @@ pub struct SourceStepView {
     pull_format: crate::tui::widgets::selectors::radio_group::RadioGroup,
     profile_tip: TextBlock,
     profiles: Vec<ConfiguredSourceProfile>,
+    oci: HostCapability,
+    tools: BTreeMap<String, bool>,
     focus: FocusTracker,
 }
 
 impl SourceStepView {
-    pub fn new(initial_data: &SourceState) -> Self {
+    pub fn new(
+        initial_data: &SourceState,
+        oci: HostCapability,
+        tools: BTreeMap<String, bool>,
+    ) -> Self {
         let mut kinds = vec![
             SourceKind::Copy,
             SourceKind::Oci,
@@ -237,6 +245,8 @@ impl SourceStepView {
                 "This source is defined in lasper.toml. Its provider policy is not editable in the wizard.",
             ),
             profiles: initial_data.profiles.clone(),
+            oci,
+            tools,
             focus: FocusTracker::new(),
         };
 
@@ -359,27 +369,32 @@ impl Component for SourceStepView {
     fn validate(&mut self) -> Result<(), String> {
         match self.selected_kind() {
             SourceKind::Oci => {
-                crate::adapters::provisioning::engine::oci_operation::ensure_pull_oci_available()
-                    .map_err(|error| error.to_string())?;
+                if !self.oci.available {
+                    return Err(self
+                        .oci
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "OCI import is unavailable on this host".into()));
+                }
                 self.oci_url.validate()?;
             }
             SourceKind::Debootstrap => {
-                check_tool("debootstrap")?;
+                check_tool(&self.tools, "debootstrap")?;
                 self.deboot_mirror.validate()?;
                 self.deboot_suite.validate()?;
                 self.deboot_pkgs.validate()?;
             }
             SourceKind::Pacstrap => {
-                check_tool("pacstrap")?;
+                check_tool(&self.tools, "pacstrap")?;
                 self.pacstrap_pkgs.validate()?;
             }
             SourceKind::Dnf5 => {
-                check_tool("dnf5")?;
+                check_tool(&self.tools, "dnf5")?;
                 self.dnf_releasever.validate()?;
                 self.dnf_pkgs.validate()?;
             }
             SourceKind::Pull => {
-                check_tool("curl")?;
+                check_tool(&self.tools, "curl")?;
                 self.pull_url.validate()?;
             }
             SourceKind::LocalFile => self.local_path.validate()?,
@@ -388,7 +403,7 @@ impl Component for SourceStepView {
                     .selected_profile(method, &name)
                     .ok_or_else(|| "Configured profile is unavailable".to_string())?;
                 if let Some(tool) = source.required_tool() {
-                    check_tool(tool)?;
+                    check_tool(&self.tools, tool)?;
                 }
                 source.validate().map_err(|error| error.to_string())?;
                 if let RootfsSourceSpec::Artifact(spec) = source {
@@ -493,9 +508,12 @@ fn bootstrap_method_label(method: crate::nspawn::models::BootstrapMethod) -> &'s
     }
 }
 
-fn check_tool(name: &str) -> Result<(), String> {
-    crate::adapters::provisioning::engine::builders::image::check_tool(name)
-        .map_err(|_| format!("Missing dependency: {name}"))
+fn check_tool(tools: &BTreeMap<String, bool>, name: &str) -> Result<(), String> {
+    if tools.get(name).copied().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(format!("Missing dependency: {name}"))
+    }
 }
 
 fn validate_package_text(value: &str) -> Result<(), String> {

@@ -1,4 +1,5 @@
 pub(crate) mod engine;
+mod preparation;
 
 use crate::adapters::provisioning::engine::builders::{bootstrap, clone, image, oci};
 use crate::adapters::provisioning::engine::{
@@ -15,6 +16,15 @@ use crate::application::HostOperationTracker;
 use crate::nspawn::errors::NspawnError;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+pub(crate) fn compose_provisioning_preparation_service(
+) -> Arc<crate::application::provisioning::ProvisioningPreparationService> {
+    Arc::new(
+        crate::application::provisioning::ProvisioningPreparationService::new(Arc::new(
+            preparation::NspawnProvisioningPreparation,
+        )),
+    )
+}
 
 pub(crate) fn compose_provisioning_service(
     exec_ctx: &Arc<crate::composition::ExecutionContext>,
@@ -83,6 +93,7 @@ impl DeploymentExecutor for NspawnProvisioningAdapter {
             source,
             storage,
             nvidia_profile,
+            wayland,
             allow_unsafe_remote_tar,
         } = request;
         let name = config.name.clone();
@@ -95,6 +106,7 @@ impl DeploymentExecutor for NspawnProvisioningAdapter {
             name,
             config,
             nvidia_profile,
+            wayland,
             self.host.clone(),
             secrets,
             job,

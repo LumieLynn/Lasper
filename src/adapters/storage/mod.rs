@@ -33,13 +33,6 @@ impl StorageType {
             Self::DiskImage => "Disk Image (Raw/Block)",
         }
     }
-
-    pub fn get_path(&self, name: &str) -> PathBuf {
-        match self {
-            Self::Directory | Self::Subvolume => crate::paths::machine_root(name),
-            Self::DiskImage => crate::paths::machine_raw_image(name),
-        }
-    }
 }
 
 /// Information about the available storage backends on the host.
@@ -129,17 +122,4 @@ pub async fn get_storage_backend_for(
 
     // 4. Default to DirectoryBackend
     into_backend(DirectoryBackend::new(managed_storage))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn new_disk_image_paths_are_canonical_raw() {
-        assert_eq!(
-            StorageType::DiskImage.get_path("test"),
-            crate::paths::machine_raw_image("test")
-        );
-    }
 }

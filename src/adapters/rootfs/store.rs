@@ -8,6 +8,7 @@ use crate::adapters::rootfs::nvidia::{
 use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
 use crate::adapters::rootfs::{users, wayland};
 use crate::domain::secret::{serde_secret, SecretString};
+use crate::domain::wayland::ContainerUserIdentity;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{validate_chpasswd_secret, CreateUser, MachineName};
 use serde::{Deserialize, Serialize};
@@ -157,6 +158,7 @@ impl RootfsStore {
             .execute(RootfsOperation::CreateUser(CreateUserRequest {
                 target: target.clone(),
                 username: user.username.clone(),
+                uid: user.uid,
                 password,
                 sudoer: user.sudoer,
                 shell: user.shell.clone(),
@@ -168,15 +170,36 @@ impl RootfsStore {
     pub(crate) async fn configure_wayland(
         &self,
         target: &RootfsTarget,
-        user: &CreateUser,
+        identity: &ContainerUserIdentity,
+        shell: &str,
+        default_display: &crate::domain::wayland::WaylandDisplay,
     ) -> Result<()> {
         self.execute(RootfsOperation::ConfigureWayland(ConfigureWaylandRequest {
             target: target.clone(),
-            username: user.username.clone(),
-            shell: user.shell.clone(),
+            identity: identity.clone(),
+            shell: shell.to_string(),
+            default_display: default_display.clone(),
         }))
         .await?;
         Ok(())
+    }
+
+    pub(crate) async fn resolve_user_identity(
+        &self,
+        target: &RootfsTarget,
+        username: &str,
+    ) -> Result<ContainerUserIdentity> {
+        let result = self
+            .execute(RootfsOperation::ResolveUserIdentity(
+                ResolveUserIdentityRequest {
+                    target: target.clone(),
+                    username: username.to_string(),
+                },
+            ))
+            .await?;
+        result.identity.ok_or_else(|| {
+            NspawnError::Runtime("rootfs identity lookup returned no identity".into())
+        })
     }
 
     pub(crate) async fn configure_nvidia(
@@ -250,6 +273,7 @@ pub(crate) enum RootfsOperation {
     ConfigureNetwork(TargetRequest),
     SetRootPassword(SetRootPasswordRequest),
     CreateUser(CreateUserRequest),
+    ResolveUserIdentity(ResolveUserIdentityRequest),
     ConfigureWayland(ConfigureWaylandRequest),
     ConfigureNvidia(ConfigureNvidiaRequest),
     CleanupNvidia(CleanupNvidiaRequest),
@@ -274,6 +298,8 @@ pub(crate) struct SetRootPasswordRequest {
 pub(crate) struct CreateUserRequest {
     target: RootfsTarget,
     username: String,
+    #[serde(default)]
+    uid: Option<u32>,
     #[serde(with = "serde_secret::optional")]
     password: Option<SecretString>,
     sudoer: bool,
@@ -284,8 +310,16 @@ pub(crate) struct CreateUserRequest {
 #[serde(deny_unknown_fields)]
 pub(crate) struct ConfigureWaylandRequest {
     target: RootfsTarget,
-    username: String,
+    identity: ContainerUserIdentity,
     shell: String,
+    default_display: crate::domain::wayland::WaylandDisplay,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResolveUserIdentityRequest {
+    target: RootfsTarget,
+    username: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -310,6 +344,8 @@ pub(crate) struct RootfsResult {
     present: Option<bool>,
     #[serde(default)]
     warnings: Vec<String>,
+    #[serde(default)]
+    identity: Option<ContainerUserIdentity>,
 }
 
 pub(crate) async fn execute_rootfs_operation(operation: RootfsOperation) -> Result<RootfsResult> {
@@ -392,6 +428,7 @@ async fn execute_rootfs_operation_with_runners(
         RootfsOperation::CreateUser(request) => {
             let user = CreateUser {
                 username: request.username,
+                uid: request.uid,
                 sudoer: request.sudoer,
                 shell: request.shell,
             };
@@ -413,14 +450,42 @@ async fn execute_rootfs_operation_with_runners(
                 ..Default::default()
             })
         }
-        RootfsOperation::ConfigureWayland(request) => {
-            wayland::validate_wayland_config(&request.username, &request.shell)?;
+        RootfsOperation::ResolveUserIdentity(request) => {
+            crate::nspawn::models::validate_login_username(&request.username)?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
+            let identity =
+                users::resolve_user_identity(&path, &request.username, rootfs_runner).await?;
+            Ok(RootfsResult {
+                identity: Some(identity),
+                ..Default::default()
+            })
+        }
+        RootfsOperation::ConfigureWayland(request) => {
+            wayland::validate_wayland_config(&request.identity.username, &request.shell)?;
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            let observed =
+                users::resolve_user_identity(&path, &request.identity.username, rootfs_runner)
+                    .await?;
+            if observed != request.identity {
+                return Err(NspawnError::Validation(format!(
+                    "Wayland target identity changed: expected {}:{} for {}, observed {}:{}",
+                    request.identity.uid,
+                    request.identity.gid,
+                    request.identity.username,
+                    observed.uid,
+                    observed.gid,
+                )));
+            }
             wayland::setup_wayland_shell_env(
                 &path,
-                &request.username,
+                &request.identity.username,
                 &request.shell,
+                &crate::adapters::wayland::container_socket_path(
+                    request.identity.uid,
+                    &request.default_display,
+                ),
                 rootfs_runner,
             )
             .await?;
