@@ -917,12 +917,20 @@ async fn validate_wayland_source(
         crate::domain::wayland::WaylandDisplay::new(source.display().as_str().to_string())
             .map_err(NspawnError::Validation)?;
     let requested_socket = runtime.join(display.as_str());
+    if requested_socket.parent() != Some(runtime) {
+        return Err(NspawnError::Validation(
+            "Wayland socket entry escaped its runtime directory".into(),
+        ));
+    }
     let canonical_socket = tokio::fs::canonicalize(&requested_socket)
         .await
         .map_err(|error| NspawnError::Io(requested_socket.clone(), error))?;
-    if canonical_socket != source.canonical_path() || !canonical_socket.starts_with(runtime) {
+    // The requested entry is derived from the verified runtime directory and
+    // validated display basename. Its canonical target may be outside that
+    // directory (for example, a WSLg socket symlink).
+    if canonical_socket != source.canonical_path() {
         return Err(NspawnError::Validation(
-            "Wayland socket was replaced or escaped its runtime directory".into(),
+            "Wayland socket was replaced after discovery".into(),
         ));
     }
     let observed = validate_wayland_socket_target(&canonical_socket).await?;
@@ -1664,7 +1672,12 @@ Unknown=preserve-me\n";
 
         let mut forged = serde_json::to_value(&grant).unwrap();
         forged["sockets"][0]["source"]["canonical_path"] = serde_json::json!("/etc/passwd");
-        assert!(serde_json::from_value::<WaylandGrant>(forged).is_err());
+        let forged = serde_json::from_value::<WaylandGrant>(forged).unwrap();
+        assert!(
+            validate_wayland_grant(&spec, &forged, uzers::get_current_uid())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -1703,7 +1716,7 @@ Unknown=preserve-me\n";
         let error = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("replaced or escaped"));
+        assert!(error.to_string().contains("replaced after discovery"));
     }
 
     #[tokio::test]
@@ -1751,10 +1764,16 @@ Unknown=preserve-me\n";
     }
 
     #[tokio::test]
-    async fn wayland_grant_canonicalizes_leaf_symlink_inside_runtime() {
+    async fn wayland_grant_canonicalizes_leaf_symlink_outside_runtime() {
         let runtime = tempfile::tempdir().unwrap();
+        let target_runtime = tempfile::tempdir().unwrap();
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let target_socket = runtime.path().join(".wayland-real");
+        std::fs::set_permissions(
+            target_runtime.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let target_socket = target_runtime.path().join("wayland-real");
         let _listener = std::os::unix::net::UnixListener::bind(&target_socket).unwrap();
         let symlink_path = runtime.path().join("wayland-0");
         std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();

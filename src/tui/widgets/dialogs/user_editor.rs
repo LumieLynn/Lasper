@@ -75,7 +75,7 @@ impl UserEditor {
     ) -> Self {
         let available = !wayland_sockets.is_empty() && wayland_owner.is_none();
         let label = match (wayland_sockets.is_empty(), wayland_owner) {
-            (true, _) => "Wayland access (no displays)".to_string(),
+            (true, _) => "Wayland access (no sockets found)".to_string(),
             (false, Some(owner)) => format!("Wayland: used by {owner}"),
             (false, None) => "Wayland access".to_string(),
         };

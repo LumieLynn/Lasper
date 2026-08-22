@@ -44,6 +44,10 @@ pub struct SocketRevision {
 }
 
 /// Evidence captured from one host session's Wayland socket.
+///
+/// `runtime_dir` identifies the trusted socket entry namespace; the resolved
+/// `canonical_path` may be outside it on WSLg, where the entry is a symlink to
+/// the compositor socket exported by the host integration layer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostWaylandSocket {
@@ -104,9 +108,6 @@ impl HostWaylandSocket {
     ) -> Result<Self, String> {
         if !runtime_dir.is_absolute() || !canonical_path.is_absolute() {
             return Err("Wayland evidence paths must be absolute".into());
-        }
-        if !canonical_path.starts_with(&runtime_dir) {
-            return Err("Wayland socket must remain inside its runtime directory".into());
         }
         if owner_uid != session_uid {
             return Err("Wayland socket must be owned by its host session user".into());
@@ -209,7 +210,7 @@ impl WaylandGrantIntent {
             return Err("Wayland target username cannot be empty".into());
         }
         if sources.is_empty() {
-            return Err("Wayland access requires at least one display socket".into());
+            return Err("Wayland access requires at least one socket".into());
         }
 
         let owner_uid = sources[0].owner_uid();
@@ -434,7 +435,7 @@ mod tests {
     }
 
     #[test]
-    fn socket_evidence_rejects_unrelated_owner_and_escaped_path() {
+    fn socket_evidence_rejects_unrelated_owner_and_relative_path() {
         let revision = SocketRevision {
             device: 1,
             inode: 2,
@@ -455,7 +456,7 @@ mod tests {
         assert!(HostWaylandSocket::from_verified_parts(
             WaylandDisplay::new("wayland-0").unwrap(),
             "/run/user/1000".into(),
-            "/tmp/wayland-0".into(),
+            "wayland-0".into(),
             1000,
             1000,
             1000,
@@ -467,10 +468,10 @@ mod tests {
 
     #[test]
     fn socket_evidence_deserialization_preserves_path_and_owner_invariants() {
-        let escaped = serde_json::json!({
+        let relative = serde_json::json!({
             "display": "wayland-0",
             "runtime_dir": "/run/user/1000",
-            "canonical_path": "/etc/passwd",
+            "canonical_path": "wayland-0",
             "session_uid": 1000,
             "owner_uid": 1000,
             "owner_gid": 1000,
@@ -482,7 +483,7 @@ mod tests {
                 "ctime_nanoseconds": 4
             }
         });
-        assert!(serde_json::from_value::<HostWaylandSocket>(escaped).is_err());
+        assert!(serde_json::from_value::<HostWaylandSocket>(relative).is_err());
 
         let unrelated_owner = serde_json::json!({
             "display": "wayland-0",
