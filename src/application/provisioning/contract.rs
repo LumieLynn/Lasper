@@ -1,8 +1,8 @@
+use crate::domain::nvidia::NvidiaPassthroughProfile;
 use crate::domain::secret::SecretString;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapSpec, ContainerConfig, DiskImageConfig, OciNetworkMode,
 };
-use crate::nspawn::platform::nvidia::profile::NvidiaPassthroughProfile;
 use async_trait::async_trait;
 use std::fmt;
 use std::num::NonZeroU64;
@@ -230,6 +230,12 @@ pub enum DeploymentPreflight {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteTarSafety {
+    Compatible,
+    Risk(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeploymentProgress {
     pub label: String,
     pub permille: u16,
@@ -323,9 +329,9 @@ impl DeploymentCancellation {
         self.requested.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn checkpoint(&self) -> crate::nspawn::errors::Result<()> {
+    pub(crate) fn checkpoint(&self) -> Result<(), DeploymentCancellationRequested> {
         if self.is_requested() {
-            Err(crate::nspawn::errors::NspawnError::DeploymentCancelled)
+            Err(DeploymentCancellationRequested)
         } else {
             Ok(())
         }
@@ -341,6 +347,10 @@ impl DeploymentCancellation {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("deployment cancellation requested")]
+pub(crate) struct DeploymentCancellationRequested;
 
 #[derive(Clone)]
 pub(crate) struct DeploymentJobContext {
@@ -422,12 +432,12 @@ pub(crate) fn deployment_job_channel(
 }
 
 #[async_trait]
-pub trait ProvisioningPort: Send + Sync + 'static {
-    async fn preflight(
-        &self,
-        request: &DeploymentRequest,
-    ) -> Result<DeploymentPreflight, DeploymentError>;
+pub trait SourcePreflight: Send + Sync + 'static {
+    async fn inspect_remote_tar(&self) -> Result<RemoteTarSafety, DeploymentError>;
+}
 
+#[async_trait]
+pub trait DeploymentExecutor: Send + Sync + 'static {
     async fn run(
         &self,
         submission: DeploymentSubmission,

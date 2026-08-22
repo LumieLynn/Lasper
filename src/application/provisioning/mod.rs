@@ -2,13 +2,16 @@ mod contract;
 mod service;
 
 pub use contract::{
-    DeploymentError, DeploymentEvent, DeploymentId, DeploymentJobHandle, DeploymentPreflight,
-    DeploymentProgress, DeploymentRequest, DeploymentSecrets, DeploymentSource, DeploymentStatus,
-    DeploymentStorage, DeploymentSubmission, ProvisioningPort, UserSecret,
+    DeploymentError, DeploymentEvent, DeploymentExecutor, DeploymentId, DeploymentJobHandle,
+    DeploymentPreflight, DeploymentProgress, DeploymentRequest, DeploymentSecrets,
+    DeploymentSource, DeploymentStatus, DeploymentStorage, DeploymentSubmission, RemoteTarSafety,
+    SourcePreflight, UserSecret,
 };
 pub use service::ProvisioningService;
 
-pub(crate) use contract::{DeploymentCancellation, DeploymentJobContext};
+pub(crate) use contract::{
+    DeploymentCancellation, DeploymentCancellationRequested, DeploymentJobContext,
+};
 
 #[cfg(test)]
 pub(crate) use contract::deployment_job_channel;

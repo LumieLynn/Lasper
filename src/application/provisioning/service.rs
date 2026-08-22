@@ -1,21 +1,26 @@
 use super::contract::{deployment_job_channel, DeploymentError, DeploymentStatus};
 use super::{
-    DeploymentJobHandle, DeploymentPreflight, DeploymentRequest, DeploymentSubmission,
-    ProvisioningPort,
+    DeploymentExecutor, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
+    DeploymentSubmission, RemoteTarSafety, SourcePreflight,
 };
 use futures_util::FutureExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct ProvisioningService {
-    port: Arc<dyn ProvisioningPort>,
+    source_preflight: Arc<dyn SourcePreflight>,
+    executor: Arc<dyn DeploymentExecutor>,
     next_id: AtomicU64,
 }
 
 impl ProvisioningService {
-    pub fn new(port: Arc<dyn ProvisioningPort>) -> Self {
+    pub fn new(
+        source_preflight: Arc<dyn SourcePreflight>,
+        executor: Arc<dyn DeploymentExecutor>,
+    ) -> Self {
         Self {
-            port,
+            source_preflight,
+            executor,
             next_id: AtomicU64::new(1),
         }
     }
@@ -25,7 +30,17 @@ impl ProvisioningService {
         request: &DeploymentRequest,
     ) -> Result<DeploymentPreflight, DeploymentError> {
         request.validate()?;
-        self.port.preflight(request).await
+        if !request
+            .source
+            .is_unacknowledged_remote_tar(request.allow_unsafe_remote_tar)
+        {
+            return Ok(DeploymentPreflight::Ready);
+        }
+
+        Ok(match self.source_preflight.inspect_remote_tar().await? {
+            RemoteTarSafety::Compatible => DeploymentPreflight::Ready,
+            RemoteTarSafety::Risk(reason) => DeploymentPreflight::ConfirmationRequired(reason),
+        })
     }
 
     pub fn start(
@@ -37,10 +52,10 @@ impl ProvisioningService {
 
         let id = self.allocate_id();
         let (handle, context) = deployment_job_channel(id);
-        let port = Arc::clone(&self.port);
+        let executor = Arc::clone(&self.executor);
         let terminal_status = context.status_sender();
         tokio::spawn(async move {
-            let result = std::panic::AssertUnwindSafe(port.run(submission, context))
+            let result = std::panic::AssertUnwindSafe(executor.run(submission, context))
                 .catch_unwind()
                 .await;
             let status = match result {
@@ -84,20 +99,27 @@ mod tests {
     use crate::nspawn::models::ContainerConfig;
     use async_trait::async_trait;
     use parking_lot::Mutex;
+    use std::sync::atomic::AtomicUsize;
 
-    struct RecordingPort {
+    struct RecordingExecutor {
         outcome: Mutex<Option<Result<(), DeploymentError>>>,
     }
 
-    #[async_trait]
-    impl ProvisioningPort for RecordingPort {
-        async fn preflight(
-            &self,
-            _request: &DeploymentRequest,
-        ) -> Result<DeploymentPreflight, DeploymentError> {
-            Ok(DeploymentPreflight::Ready)
-        }
+    struct RecordingPreflight {
+        calls: AtomicUsize,
+        safety: RemoteTarSafety,
+    }
 
+    #[async_trait]
+    impl SourcePreflight for RecordingPreflight {
+        async fn inspect_remote_tar(&self) -> Result<RemoteTarSafety, DeploymentError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.safety.clone())
+        }
+    }
+
+    #[async_trait]
+    impl DeploymentExecutor for RecordingExecutor {
         async fn run(
             &self,
             _submission: DeploymentSubmission,
@@ -130,11 +152,62 @@ mod tests {
         )
     }
 
+    fn executor(outcome: Result<(), DeploymentError>) -> Arc<RecordingExecutor> {
+        Arc::new(RecordingExecutor {
+            outcome: Mutex::new(Some(outcome)),
+        })
+    }
+
+    #[tokio::test]
+    async fn local_source_preflight_does_not_probe_the_host_tar_runtime() {
+        let preflight = Arc::new(RecordingPreflight {
+            calls: AtomicUsize::new(0),
+            safety: RemoteTarSafety::Risk("old tar".into()),
+        });
+        let service = ProvisioningService::new(preflight.clone(), executor(Ok(())));
+        let (request, _) = submission().into_parts();
+
+        assert_eq!(
+            service.preflight(&request).await.unwrap(),
+            DeploymentPreflight::Ready
+        );
+        assert_eq!(preflight.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_tar_risk_is_application_owned_confirmation_policy() {
+        let preflight = Arc::new(RecordingPreflight {
+            calls: AtomicUsize::new(0),
+            safety: RemoteTarSafety::Risk("old tar".into()),
+        });
+        let service = ProvisioningService::new(preflight.clone(), executor(Ok(())));
+        let (mut request, _) = submission().into_parts();
+        request.source = DeploymentSource::Pull {
+            url: "https://example.invalid/rootfs.tar".into(),
+            is_raw: false,
+        };
+
+        assert_eq!(
+            service.preflight(&request).await.unwrap(),
+            DeploymentPreflight::ConfirmationRequired("old tar".into())
+        );
+        assert_eq!(preflight.calls.load(Ordering::Relaxed), 1);
+
+        request.allow_unsafe_remote_tar = true;
+        assert_eq!(
+            service.preflight(&request).await.unwrap(),
+            DeploymentPreflight::Ready
+        );
+        assert_eq!(preflight.calls.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn job_handle_owns_events_and_terminal_status() {
-        let service = ProvisioningService::new(Arc::new(RecordingPort {
-            outcome: Mutex::new(Some(Ok(()))),
-        }));
+        let preflight = Arc::new(RecordingPreflight {
+            calls: AtomicUsize::new(0),
+            safety: RemoteTarSafety::Compatible,
+        });
+        let service = ProvisioningService::new(preflight, executor(Ok(())));
         let mut handle = service.start(submission()).unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -154,9 +227,14 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_port_result_has_a_distinct_terminal_state() {
-        let service = ProvisioningService::new(Arc::new(RecordingPort {
-            outcome: Mutex::new(Some(Err(DeploymentError::cancelled("cancelled")))),
-        }));
+        let preflight = Arc::new(RecordingPreflight {
+            calls: AtomicUsize::new(0),
+            safety: RemoteTarSafety::Compatible,
+        });
+        let service = ProvisioningService::new(
+            preflight,
+            executor(Err(DeploymentError::cancelled("cancelled"))),
+        );
         let handle = service.start(submission()).unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
@@ -175,9 +253,11 @@ mod tests {
 
     #[test]
     fn invalid_secret_capsule_is_rejected_before_a_job_is_allocated() {
-        let service = ProvisioningService::new(Arc::new(RecordingPort {
-            outcome: Mutex::new(Some(Ok(()))),
-        }));
+        let preflight = Arc::new(RecordingPreflight {
+            calls: AtomicUsize::new(0),
+            safety: RemoteTarSafety::Compatible,
+        });
+        let service = ProvisioningService::new(preflight, executor(Ok(())));
         let (request, _) = submission().into_parts();
         let invalid = DeploymentSubmission::new(
             request,

@@ -1,0 +1,295 @@
+use crate::tui::core::{Component, EventResult};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::Rect,
+    style::{Modifier, Style},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState},
+    Frame,
+};
+
+#[allow(clippy::type_complexity)]
+pub struct SelectableList<T> {
+    items: Vec<T>,
+    state: ListState,
+    label: String,
+    focused: bool,
+    enabled: bool,
+    display_fn: Box<dyn Fn(&T) -> String>,
+    is_item_enabled_fn: Option<Box<dyn Fn(&T) -> bool>>,
+}
+
+impl<T> SelectableList<T> {
+    pub fn new(
+        label: impl Into<String>,
+        items: Vec<T>,
+        display_fn: impl Fn(&T) -> String + 'static,
+    ) -> Self {
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(0));
+        }
+        Self {
+            items,
+            state,
+            label: label.into(),
+            focused: false,
+            enabled: true,
+            display_fn: Box::new(display_fn),
+            is_item_enabled_fn: None,
+        }
+    }
+
+    pub fn with_item_enablement(mut self, f: impl Fn(&T) -> bool + 'static) -> Self {
+        self.is_item_enabled_fn = Some(Box::new(f));
+        if self
+            .state
+            .selected()
+            .is_some_and(|index| !self.is_item_enabled(index))
+        {
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
+        }
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn items(&self) -> &[T] {
+        &self.items
+    }
+
+    pub fn selected_idx(&self) -> Option<usize> {
+        self.state.selected()
+    }
+
+    pub fn selected_item(&self) -> Option<&T> {
+        self.state.selected().and_then(|idx| self.items.get(idx))
+    }
+
+    pub fn is_item_enabled(&self, idx: usize) -> bool {
+        if let Some(item) = self.items.get(idx) {
+            if let Some(ref f) = self.is_item_enabled_fn {
+                return f(item);
+            }
+        }
+        true
+    }
+
+    fn first_enabled_index(&self) -> Option<usize> {
+        (0..self.items.len()).find(|index| self.is_item_enabled(*index))
+    }
+
+    pub fn select(&mut self, index: usize) {
+        if index < self.items.len() && self.is_item_enabled(index) {
+            self.state.select(Some(index));
+        }
+    }
+
+    pub fn set_items(&mut self, items: Vec<T>) {
+        self.items = items;
+        if let Some(i) = self.state.selected() {
+            if i >= self.items.len() || !self.is_item_enabled(i) {
+                let first_enabled = self.first_enabled_index();
+                self.state.select(first_enabled);
+            }
+        } else if !self.items.is_empty() {
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
+        }
+    }
+
+    pub fn add_item(&mut self, item: T) {
+        self.items.push(item);
+        if self.state.selected().is_none() {
+            let first_enabled = self.first_enabled_index();
+            self.state.select(first_enabled);
+        }
+    }
+
+    pub fn update_item(&mut self, idx: usize, item: T) {
+        if idx < self.items.len() {
+            self.items[idx] = item;
+        }
+    }
+
+    pub fn remove_item(&mut self, idx: usize) {
+        if idx < self.items.len() {
+            self.items.remove(idx);
+            if let Some(selected) = self.state.selected() {
+                if selected >= self.items.len() && !self.items.is_empty() {
+                    self.state.select(Some(self.items.len() - 1));
+                } else if self.items.is_empty() {
+                    self.state.select(None);
+                }
+            }
+        }
+    }
+
+    pub fn select_last(&mut self) {
+        if !self.items.is_empty() {
+            self.state.select(Some(self.items.len() - 1));
+        }
+    }
+
+    pub fn next(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+
+        let start_idx = self.state.selected().unwrap_or(0);
+        let mut curr = (start_idx + 1) % self.items.len();
+
+        while curr != start_idx {
+            if self.is_item_enabled(curr) {
+                self.state.select(Some(curr));
+                return;
+            }
+            curr = (curr + 1) % self.items.len();
+        }
+    }
+
+    pub fn previous(&mut self) {
+        if self.items.is_empty() {
+            return;
+        }
+
+        let start_idx = self.state.selected().unwrap_or(0);
+        let mut curr = if start_idx == 0 {
+            self.items.len() - 1
+        } else {
+            start_idx - 1
+        };
+
+        while curr != start_idx {
+            if self.is_item_enabled(curr) {
+                self.state.select(Some(curr));
+                return;
+            }
+            curr = if curr == 0 {
+                self.items.len() - 1
+            } else {
+                curr - 1
+            };
+        }
+    }
+
+    /// Inherent method — callers don't need the `Component` trait in scope.
+    pub fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    /// Inherent render method — callers don't need the `Component` trait in scope.
+    pub fn render(&mut self, f: &mut Frame, area: Rect) {
+        let style =
+            Style::default().fg(crate::tui::widget_border_color(self.focused, self.enabled));
+
+        let t = crate::tui::theme::theme();
+        let items: Vec<ListItem> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let content = (self.display_fn)(item);
+                let item_style = if self.is_item_enabled(i) {
+                    Style::default()
+                } else {
+                    Style::default()
+                        .fg(t.list_disabled_item)
+                        .add_modifier(Modifier::DIM)
+                };
+                ListItem::new(content).style(item_style)
+            })
+            .collect();
+
+        let mut list = List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(self.label.as_str())
+                .border_style(style),
+        );
+
+        if self.enabled {
+            list = list
+                .highlight_style(
+                    Style::default()
+                        .fg(t.list_highlight_symbol)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol(">> ");
+        }
+
+        f.render_stateful_widget(list, area, &mut self.state);
+    }
+}
+
+impl<T> Component for SelectableList<T> {
+    fn render(&mut self, f: &mut Frame, area: Rect) {
+        // Delegate to the inherent method — single implementation.
+        SelectableList::render(self, f, area);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if !self.enabled {
+            return EventResult::Ignored;
+        }
+
+        match key.code {
+            KeyCode::Tab => EventResult::FocusNext,
+            KeyCode::BackTab => EventResult::FocusPrev,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.next();
+                EventResult::Consumed
+            }
+
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.previous();
+                EventResult::Consumed
+            }
+
+            _ => EventResult::Ignored,
+        }
+    }
+
+    fn set_focus(&mut self, focused: bool) {
+        SelectableList::set_focus(self, focused);
+    }
+
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disabled_items_cannot_be_selected_programmatically_or_by_navigation() {
+        let mut list = SelectableList::new(
+            "Storage",
+            vec![("unsupported", false), ("supported", true)],
+            |(label, _)| (*label).to_string(),
+        )
+        .with_item_enablement(|(_, supported)| *supported);
+
+        assert_eq!(list.selected_idx(), Some(1));
+        list.select(0);
+        assert_eq!(list.selected_idx(), Some(1));
+        list.next();
+        assert_eq!(list.selected_idx(), Some(1));
+    }
+}

@@ -7,7 +7,7 @@ use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec,
     DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::ui::theme::PartialTheme;
+use crate::tui::theme::PartialTheme;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 

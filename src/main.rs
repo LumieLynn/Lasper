@@ -7,15 +7,15 @@ use crossterm::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
 
-mod app;
+mod adapters;
 mod application;
+mod composition;
 mod config;
+mod daemon;
 mod domain;
-mod events;
 mod nspawn;
 mod paths;
-mod term;
-mod ui;
+mod tui;
 
 use std::path::{Path, PathBuf};
 
@@ -207,7 +207,7 @@ async fn main() -> Result<()> {
 
     // 1b. Internal daemon mode — run as root child process, exit early.
     if options.is_daemon {
-        crate::nspawn::sys::daemon::daemon_main(
+        crate::daemon::daemon_main(
             options.fd_sock,
             options.rpc_sock,
             options.daemon_uid,
@@ -228,16 +228,16 @@ async fn main() -> Result<()> {
     // 3. Permission manager — no full-process elevation.
     //    `-e` / `elevate = true` routes privileged work through a sudo daemon.
     let use_sudo =
-        crate::nspawn::ops::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
-    let pm: std::sync::Arc<dyn crate::nspawn::ops::PermissionManager> = std::sync::Arc::new(
-        crate::nspawn::ops::DefaultPermissionManager::new().with_elevation(use_sudo),
+        crate::composition::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
+    let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
+        crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
     );
 
     // 3b. Spawn elevated daemon before terminal takeover so the sudo
     //     password prompt (if any) appears on the clean terminal.
-    let daemon: Option<std::sync::Arc<crate::nspawn::sys::daemon::ElevatedDaemon>> =
-        if pm.level() == crate::nspawn::ops::PermissionLevel::Elevated {
-            match crate::nspawn::sys::daemon::ElevatedDaemon::spawn(!want_cli_mode).await {
+    let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> =
+        if pm.level() == crate::composition::PermissionLevel::Elevated {
+            match crate::adapters::elevated::ElevatedDaemon::spawn(!want_cli_mode).await {
                 Ok(d) => Some(std::sync::Arc::new(d)),
                 Err(e) => {
                     eprintln!("Failed to start elevated daemon: {}", e);
@@ -253,7 +253,7 @@ async fn main() -> Result<()> {
         };
 
     // 3c. Build execution context — one-time routing for commands and file I/O.
-    let exec_ctx = std::sync::Arc::new(crate::nspawn::sys::ExecutionContext::new(
+    let exec_ctx = std::sync::Arc::new(crate::composition::ExecutionContext::new(
         pm.level(),
         daemon,
     )?);
@@ -299,10 +299,13 @@ async fn main() -> Result<()> {
 
     // 7. Run the application
     let log_buffer_lines = app_settings.log_buffer_lines;
-    let mut app = app::App::new(
+    let services =
+        crate::composition::compose_application_services(pm.level(), want_cli_mode, &exec_ctx);
+    let mut app = tui::app::App::new(
         pm,
         want_cli_mode,
         log_buffer_lines,
+        services,
         exec_ctx.clone(),
         app_config,
     );
@@ -310,7 +313,7 @@ async fn main() -> Result<()> {
         log::warn!("{}", diagnostic.detail);
         app.set_status_for(
             diagnostic.summary,
-            crate::ui::StatusLevel::Warn,
+            crate::tui::StatusLevel::Warn,
             std::time::Duration::from_secs(12),
         );
     }
