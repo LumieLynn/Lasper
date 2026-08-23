@@ -868,18 +868,12 @@ mod tests {
 
     fn make_app() -> App {
         let permissions = std::sync::Arc::new(crate::composition::DefaultPermissionManager::new());
-        let exec_ctx = std::sync::Arc::new(
-            crate::composition::ExecutionContext::new(
-                crate::composition::PermissionLevel::User,
-                None,
-            )
-            .unwrap(),
-        );
-        let services = crate::composition::compose_application_services(
+        let mode = crate::composition::CompositionMode::new(
             crate::composition::PermissionLevel::User,
-            false,
-            &exec_ctx,
-        );
+            None,
+        )
+        .unwrap();
+        let services = crate::composition::compose_application_services(mode, false);
         App::new(
             permissions,
             false, // cli_mode

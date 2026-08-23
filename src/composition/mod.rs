@@ -1,9 +1,9 @@
 //! Production assembly for application services and host adapters.
 
-mod execution;
+mod mode;
 mod permission;
 
-pub(crate) use execution::ExecutionContext;
+pub(crate) use mode::CompositionMode;
 pub(crate) use permission::{DefaultPermissionManager, PermissionLevel, PermissionManager};
 
 use crate::application::operations::ExecutionRoute;
@@ -28,11 +28,53 @@ pub(crate) struct ApplicationServices {
 }
 
 pub(crate) fn compose_application_services(
-    level: PermissionLevel,
+    mode: CompositionMode,
     cli_mode: bool,
-    execution: &Arc<ExecutionContext>,
 ) -> ApplicationServices {
-    let daemon = execution.daemon_ref().cloned();
+    let level = mode.permission_level();
+    let daemon = mode.daemon().cloned();
+    let local_cmd: Arc<dyn crate::adapters::process::CommandRunner> =
+        Arc::new(crate::adapters::process::DefaultCommandRunner);
+    let host_operations = HostOperationTracker::default();
+    let (
+        system_operations,
+        machine_inspection,
+        nspawn,
+        systemd_unit,
+        rootfs,
+        nvidia_state,
+        provisioning_route,
+    ) = match daemon.as_ref() {
+        Some(daemon) => (
+            crate::adapters::system_operation::SystemOperationStore::elevated(Arc::clone(daemon)),
+            crate::adapters::runtime::inspection::MachineInspectionStore::elevated(Arc::clone(
+                daemon,
+            )),
+            crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(daemon)),
+            crate::adapters::config::SystemdUnitStore::elevated(Arc::clone(daemon)),
+            crate::adapters::rootfs::RootfsStore::elevated(Arc::clone(daemon)),
+            crate::adapters::platform::nvidia::NvidiaStateStore::elevated(Arc::clone(daemon)),
+            crate::adapters::provisioning::ProvisioningRoute::Elevated(Arc::clone(daemon)),
+        ),
+        None => {
+            let trusted_state_root = crate::adapters::trusted_state::TrustedStateRoot::production();
+            (
+                crate::adapters::system_operation::SystemOperationStore::direct(local_cmd.clone()),
+                crate::adapters::runtime::inspection::MachineInspectionStore::direct(),
+                crate::adapters::config::NspawnConfigStore::direct(),
+                crate::adapters::config::SystemdUnitStore::direct(),
+                crate::adapters::rootfs::RootfsStore::direct(),
+                crate::adapters::platform::nvidia::NvidiaStateStore::direct(
+                    trusted_state_root.clone(),
+                ),
+                crate::adapters::provisioning::ProvisioningRoute::Direct {
+                    local_cmd: local_cmd.clone(),
+                    host_operations: host_operations.clone(),
+                    trusted_state_root,
+                },
+            )
+        }
+    };
     let session_route = match level {
         PermissionLevel::User => crate::adapters::session::SessionRoute::Direct(
             crate::adapters::session::DirectTerminalPolicy::LoginOnly,
@@ -48,7 +90,7 @@ pub(crate) fn compose_application_services(
         ),
     };
     let session = crate::adapters::session::compose_session_service(session_route);
-    let fallback_inspector = cli_mode.then(|| execution.machine_inspection.clone());
+    let fallback_inspector = cli_mode.then(|| machine_inspection.clone());
     let primary_runtime = if cli_mode {
         crate::adapters::runtime::PrimaryRuntimeRoute::Disabled
     } else {
@@ -67,7 +109,7 @@ pub(crate) fn compose_application_services(
         }
     };
     let runtime = crate::adapters::runtime::compose_runtime_catalog(
-        execution.local_cmd.clone(),
+        local_cmd.clone(),
         fallback_inspector,
         primary_runtime,
     );
@@ -104,11 +146,11 @@ pub(crate) fn compose_application_services(
         Arc::clone(&operations),
         image_route,
         crate::adapters::lifecycle::image::ImageLifecycleAdapters {
-            local_cmd: execution.local_cmd.clone(),
-            system_operations: execution.system_operations.clone(),
-            nspawn: execution.nspawn.clone(),
-            systemd_unit: execution.systemd_unit.clone(),
-            nvidia_state: execution.nvidia_state.clone(),
+            local_cmd: local_cmd.clone(),
+            system_operations: system_operations.clone(),
+            nspawn: nspawn.clone(),
+            systemd_unit: systemd_unit.clone(),
+            nvidia_state: nvidia_state.clone(),
         },
     ));
     let machine_route = match control_route {
@@ -142,22 +184,14 @@ pub(crate) fn compose_application_services(
         Arc::clone(&operations),
         machine_route,
         crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
-            local_cmd: execution.local_cmd.clone(),
-            system_operations: execution.system_operations.clone(),
-            nspawn: execution.nspawn.clone(),
-            systemd_unit: execution.systemd_unit.clone(),
-            nvidia_state: execution.nvidia_state.clone(),
-            rootfs: execution.rootfs.clone(),
+            local_cmd: local_cmd.clone(),
+            system_operations: system_operations.clone(),
+            nspawn: nspawn.clone(),
+            systemd_unit: systemd_unit.clone(),
+            nvidia_state: nvidia_state.clone(),
+            rootfs,
         },
     );
-    let provisioning_route = match daemon {
-        Some(daemon) => crate::adapters::provisioning::ProvisioningRoute::Elevated(daemon),
-        None => crate::adapters::provisioning::ProvisioningRoute::Direct {
-            local_cmd: execution.local_cmd.clone(),
-            host_operations: execution.host_operations.clone(),
-            trusted_state_root: execution.trusted_state_root.clone(),
-        },
-    };
     let provisioning = crate::adapters::provisioning::compose_provisioning_service(
         provisioning_route,
         Arc::clone(&operations),
@@ -166,11 +200,7 @@ pub(crate) fn compose_application_services(
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
     let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
-        crate::adapters::inspection::StoreResourceInspection::new(
-            execution.local_cmd.clone(),
-            execution.nspawn.clone(),
-            execution.systemd_unit.clone(),
-        ),
+        crate::adapters::inspection::StoreResourceInspection::new(local_cmd, nspawn, systemd_unit),
     )));
 
     ApplicationServices {
@@ -181,7 +211,7 @@ pub(crate) fn compose_application_services(
         provisioning,
         provisioning_preparation,
         resource_inspection,
-        host_operations: execution.host_operations.clone(),
+        host_operations,
     }
 }
 

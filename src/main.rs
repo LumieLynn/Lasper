@@ -252,11 +252,8 @@ async fn main() -> Result<()> {
             None
         };
 
-    // 3c. Build execution context — one-time routing for commands and file I/O.
-    let exec_ctx = std::sync::Arc::new(crate::composition::ExecutionContext::new(
-        pm.level(),
-        daemon,
-    )?);
+    // 3c. Validate the authority/daemon pairing before composing host adapters.
+    let composition_mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
 
     // 4. Setup logging — always owned by the current user.
     let log_dir = get_log_dir();
@@ -300,7 +297,7 @@ async fn main() -> Result<()> {
     // 7. Run the application
     let log_buffer_lines = app_settings.log_buffer_lines;
     let services =
-        crate::composition::compose_application_services(pm.level(), want_cli_mode, &exec_ctx);
+        crate::composition::compose_application_services(composition_mode, want_cli_mode);
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
         None
     } else {
@@ -379,7 +376,9 @@ async fn main() -> Result<()> {
     }
 
     log::info!("[lasper] calling daemon.exit()...");
-    exec_ctx.exit_daemon().await;
+    if let Some(daemon) = daemon {
+        daemon.exit().await;
+    }
     log::info!("[lasper] daemon.exit() completed");
 
     log::info!("[lasper] main() returning");
