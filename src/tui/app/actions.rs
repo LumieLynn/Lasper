@@ -13,22 +13,16 @@ enum PreparedDetailRefresh {
 }
 
 impl App {
-    pub async fn refresh(&mut self) {
+    /// Request a runtime refresh without waiting on host I/O.
+    ///
+    /// The runtime observer owns the snapshot query and publishes the result
+    /// back to the main loop. Keeping this call synchronous prevents a slow
+    /// D-Bus or CLI backend from blocking keyboard and mouse dispatch.
+    pub fn refresh(&mut self) {
         if self.ui.show_wizard || self.ui.show_help || self.ui.power_menu.is_some() {
             return;
         }
-        match self.data.runtime_catalog.snapshot().await {
-            Ok(snapshot) => {
-                self.sync_runtime_query(snapshot);
-            }
-            Err(error) => {
-                log::error!("runtime snapshot: {}", error);
-                self.set_status(
-                    format!("Status refresh failed: {}", error),
-                    crate::tui::StatusLevel::Warn,
-                );
-            }
-        }
+        self.data.runtime_catalog.invalidate();
     }
 
     /// Replace any queued detail read with a snapshot of the currently visible

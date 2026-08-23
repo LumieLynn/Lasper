@@ -8,7 +8,7 @@ pub mod modal;
 
 use anyhow::Result;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::application::provisioning::{ProvisioningPreparationService, ProvisioningService};
 use crate::application::sessions::SessionService;
@@ -21,7 +21,7 @@ use crate::nspawn::models::{
     ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
 };
 use crate::tui::core::Component;
-use crate::tui::events::{AppEvent, EventHandler};
+use crate::tui::events::{AppEvent, EventHandler, InputEvent};
 use crate::tui::views::container_list::ContainerListComponent;
 use crate::tui::views::detail_panel::DetailPanel;
 use crate::tui::views::detail_panel::DetailTarget;
@@ -48,7 +48,8 @@ pub const DETAIL_PCT_MIN: u16 = 30;
 pub const DETAIL_PCT_MAX: u16 = 85;
 pub const LEFT_MACHINES_PCT_MIN: u16 = 20;
 pub const LEFT_MACHINES_PCT_MAX: u16 = 80;
-const MAX_EVENTS_PER_FRAME: usize = 64;
+const MAX_INPUT_EVENTS_PER_FRAME: usize = 16;
+const MAX_BACKGROUND_EVENTS_PER_FRAME: usize = 16;
 
 /// Screen-area rects for mouse hit-testing, populated on each render.
 #[derive(Debug, Clone, Copy, Default)]
@@ -557,6 +558,8 @@ impl App {
 
     /// Processes a single application event.
     async fn handle_event(&mut self, event: AppEvent) {
+        let label = event.label();
+        let started = Instant::now();
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
@@ -628,17 +631,25 @@ impl App {
             }
             AppEvent::ActionDone(msg, level) => {
                 self.set_status(msg, level);
-                self.refresh().await;
+                self.refresh();
             }
             AppEvent::MachineActionFinished(outcome) => {
                 let (message, level) = machine_outcome_status(outcome);
-                self.refresh().await;
+                self.refresh();
                 self.set_status(message, level);
             }
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => {
                 self.update_metrics(name, time_x, cpu, ram)
             }
             AppEvent::TerminalRedraw => self.data.terminal.clear_redraw_pending(),
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= Duration::from_millis(250) {
+            log::warn!(
+                "[TUI] event handler '{}' took {} ms",
+                label,
+                elapsed.as_millis()
+            );
         }
     }
 
@@ -669,6 +680,7 @@ impl App {
 
         self.data.runtime_catalog.watch(refresh_tx).await;
 
+        let mut mouse_motion_open = true;
         let loop_result = loop {
             // Drain at most 3 refresh batches per frame so rapid background
             // updates can't starve user-input events from the select! below.
@@ -706,26 +718,20 @@ impl App {
             self.start_detail_refresh(&detail_refresh_tx);
 
             // Render a frame
+            let render_started = Instant::now();
             if let Err(error) = terminal.draw(|f| crate::tui::draw(f, self)) {
                 break Err(anyhow::Error::from(error));
             }
+            let render_elapsed = render_started.elapsed();
+            if render_elapsed >= Duration::from_millis(250) {
+                log::warn!("[TUI] render took {} ms", render_elapsed.as_millis());
+            }
 
             tokio::select! {
+                biased;
                 _ = &mut quit_rx => {
                     log::info!("[lasper] select!: quit_rx fired");
                     break Ok(());
-                }
-                Some(event) = events.rx.recv() => {
-                    self.handle_event(event).await;
-                    // Batch a bounded number of events so a busy PTY cannot
-                    // starve rendering, keyboard input, or the quit signal.
-                    for _ in 1..MAX_EVENTS_PER_FRAME {
-                        let Ok(event) = events.rx.try_recv() else { break };
-                        self.handle_event(event).await;
-                    }
-                }
-                Some(completion) = detail_refresh_rx.recv() => {
-                    self.apply_detail_refresh(completion);
                 }
                 input_result = &mut events.input_done_rx => {
                     let error = match input_result {
@@ -734,6 +740,38 @@ impl App {
                         Err(_) => "terminal input task panicked or was cancelled".into(),
                     };
                     break Err(anyhow::anyhow!(error));
+                }
+                Some(input) = events.input_rx.recv() => {
+                    self.handle_input_event(input).await;
+                    // Foreground input gets its own bounded budget and cannot
+                    // be delayed behind a burst of backend notifications.
+                    for _ in 1..MAX_INPUT_EVENTS_PER_FRAME {
+                        let Ok(input) = events.input_rx.try_recv() else { break };
+                        self.handle_input_event(input).await;
+                    }
+                }
+                Some(event) = events.rx.recv() => {
+                    self.handle_event(event).await;
+                    // Keep backend work bounded so it cannot starve input or
+                    // rendering when several observers report at once.
+                    for _ in 1..MAX_BACKGROUND_EVENTS_PER_FRAME {
+                        let Ok(event) = events.rx.try_recv() else { break };
+                        self.handle_event(event).await;
+                    }
+                }
+                Some(completion) = detail_refresh_rx.recv() => {
+                    self.apply_detail_refresh(completion);
+                }
+                motion_changed = events.mouse_motion_rx.changed(), if mouse_motion_open => {
+                    match motion_changed {
+                        Ok(()) => {
+                            let mouse = events.mouse_motion_rx.borrow_and_update().as_ref().copied();
+                            if let Some(mouse) = mouse {
+                                self.handle_mouse(mouse).await;
+                            }
+                        }
+                        Err(_) => mouse_motion_open = false,
+                    }
                 }
                 else => {
                     log::info!("[lasper] select!: else branch");
@@ -755,6 +793,18 @@ impl App {
         events.shutdown().await;
         log::info!("[lasper] run() returning Ok(())");
         loop_result
+    }
+
+    async fn handle_input_event(&mut self, input: InputEvent) {
+        if input.is_stale() {
+            log::debug!(
+                "[TUI] dropping stale foreground {} input (age={} ms)",
+                input.event.label(),
+                input.age().as_millis()
+            );
+            return;
+        }
+        self.handle_event(input.event).await;
     }
 
     // Tick (auto-refresh + status expiry)

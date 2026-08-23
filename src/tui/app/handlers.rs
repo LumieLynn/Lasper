@@ -406,7 +406,7 @@ impl App {
                 true
             }
             KeyCode::Char('r') => {
-                self.refresh().await;
+                self.refresh();
                 true
             }
             KeyCode::Char('R') => {
