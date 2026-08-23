@@ -1,9 +1,11 @@
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind, MouseEvent};
 use futures_util::Stream;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::interval;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::{interval, MissedTickBehavior};
 use tokio_stream::StreamExt;
+
+const POINTER_MOTION_INTERVAL: Duration = Duration::from_millis(33);
 
 fn coalesces_as_pointer_motion(mouse: &MouseEvent) -> bool {
     mouse.kind == crossterm::event::MouseEventKind::Moved
@@ -57,10 +59,6 @@ pub enum AppEvent {
 pub struct EventHandler {
     pub tx: mpsc::Sender<AppEvent>,
     pub rx: mpsc::Receiver<AppEvent>,
-    /// Pointer motion is lossy by design: only the latest position matters,
-    /// and it must never queue ahead of keyboard or discrete mouse input.
-    pub mouse_motion_rx: watch::Receiver<Option<MouseEvent>>,
-    _mouse_motion_tx: watch::Sender<Option<MouseEvent>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     pub input_done_rx: oneshot::Receiver<Result<(), String>>,
     input_task: Option<tokio::task::JoinHandle<()>>,
@@ -72,18 +70,10 @@ impl EventHandler {
         let (tx, rx) = mpsc::channel(256);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
         let (input_done_tx, input_done_rx) = oneshot::channel();
-        let (mouse_motion_tx, mouse_motion_rx) = watch::channel(None);
 
         let tx_key = tx.clone();
-        let input_motion_tx = mouse_motion_tx.clone();
         let input_task = tokio::spawn(async move {
-            let result = run_input_loop(
-                EventStream::new(),
-                tx_key,
-                input_motion_tx,
-                &mut shutdown_rx,
-            )
-            .await;
+            let result = run_input_loop(EventStream::new(), tx_key, &mut shutdown_rx).await;
             let _ = input_done_tx.send(result);
         });
 
@@ -102,8 +92,6 @@ impl EventHandler {
         Self {
             tx,
             rx,
-            mouse_motion_rx,
-            _mouse_motion_tx: mouse_motion_tx,
             shutdown_tx: Some(shutdown_tx),
             input_done_rx,
             input_task: Some(input_task),
@@ -149,14 +137,23 @@ impl Drop for EventHandler {
 async fn run_input_loop<S>(
     mut reader: S,
     tx: mpsc::Sender<AppEvent>,
-    motion_tx: watch::Sender<Option<MouseEvent>>,
     shutdown_rx: &mut oneshot::Receiver<()>,
 ) -> Result<(), String>
 where
     S: Stream<Item = std::io::Result<CrosstermEvent>> + Unpin,
 {
+    let mut pending_motion = None;
+    let mut motion_tick = interval(POINTER_MOTION_INTERVAL);
+    motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    motion_tick.tick().await;
+
     loop {
         tokio::select! {
+            _ = motion_tick.tick(), if pending_motion.is_some() => {
+                if !flush_pointer_motion(&tx, &mut pending_motion) {
+                    return Ok(());
+                }
+            }
             event = reader.next() => {
                 match event {
                     Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
@@ -171,8 +168,11 @@ where
                     }
                     Some(Ok(CrosstermEvent::Mouse(mouse))) => {
                         if coalesces_as_pointer_motion(&mouse) {
-                            motion_tx.send_replace(Some(mouse));
+                            pending_motion = Some(mouse);
                         } else {
+                            if !flush_pointer_motion(&tx, &mut pending_motion) {
+                                return Ok(());
+                            }
                             tokio::select! {
                                 result = tx.send(AppEvent::Mouse(mouse)) => {
                                     if result.is_err() {
@@ -195,6 +195,19 @@ where
     }
 }
 
+fn flush_pointer_motion(
+    tx: &mpsc::Sender<AppEvent>,
+    pending_motion: &mut Option<MouseEvent>,
+) -> bool {
+    let Some(mouse) = pending_motion.take() else {
+        return true;
+    };
+    match tx.try_send(AppEvent::Mouse(mouse)) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,11 +224,22 @@ mod tests {
 
     #[test]
     fn motion_slot_retains_only_the_latest_position() {
-        let (tx, mut rx) = watch::channel(None);
-        tx.send_replace(Some(mouse(MouseEventKind::Moved, 1)));
-        tx.send_replace(Some(mouse(MouseEventKind::Moved, 9)));
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut pending = None;
+        assert!(pending.replace(mouse(MouseEventKind::Moved, 1)).is_none());
+        assert_eq!(
+            pending
+                .replace(mouse(MouseEventKind::Moved, 9))
+                .unwrap()
+                .column,
+            1
+        );
 
-        assert_eq!(rx.borrow_and_update().as_ref().unwrap().column, 9);
+        assert!(flush_pointer_motion(&tx, &mut pending));
+        let AppEvent::Mouse(mouse) = rx.try_recv().unwrap() else {
+            panic!("expected mouse event");
+        };
+        assert_eq!(mouse.column, 9);
     }
 
     #[test]
@@ -242,10 +266,9 @@ mod tests {
     async fn input_errors_are_reported_instead_of_silently_stopping() {
         let reader = tokio_stream::iter([Err(std::io::Error::other("input failed"))]);
         let (tx, _rx) = mpsc::channel(1);
-        let (motion_tx, _motion_rx) = watch::channel(None);
         let (_shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-        let error = run_input_loop(reader, tx, motion_tx, &mut shutdown_rx)
+        let error = run_input_loop(reader, tx, &mut shutdown_rx)
             .await
             .unwrap_err();
 
@@ -256,13 +279,44 @@ mod tests {
     async fn input_eof_is_reported_instead_of_leaving_a_dead_tui() {
         let reader = tokio_stream::empty();
         let (tx, _rx) = mpsc::channel(1);
-        let (motion_tx, _motion_rx) = watch::channel(None);
         let (_shutdown_tx, mut shutdown_rx) = oneshot::channel();
 
-        let error = run_input_loop(reader, tx, motion_tx, &mut shutdown_rx)
+        let error = run_input_loop(reader, tx, &mut shutdown_rx)
             .await
             .unwrap_err();
 
         assert_eq!(error, "terminal input stream ended unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn pointer_motion_is_bounded_and_keeps_the_latest_position() {
+        let (source_tx, source_rx) = mpsc::unbounded_channel();
+        let reader = tokio_stream::wrappers::UnboundedReceiverStream::new(source_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let input_task =
+            tokio::spawn(async move { run_input_loop(reader, event_tx, &mut shutdown_rx).await });
+
+        for column in 1..=9 {
+            source_tx
+                .send(Ok(CrosstermEvent::Mouse(mouse(
+                    MouseEventKind::Moved,
+                    column,
+                ))))
+                .unwrap();
+        }
+
+        let event = tokio::time::timeout(Duration::from_millis(150), event_rx.recv())
+            .await
+            .expect("coalesced pointer motion was not delivered")
+            .expect("application event channel closed");
+        let AppEvent::Mouse(mouse) = event else {
+            panic!("expected mouse event");
+        };
+        assert_eq!(mouse.column, 9);
+        assert!(event_rx.try_recv().is_err());
+
+        let _ = shutdown_tx.send(());
+        assert!(input_task.await.unwrap().is_ok());
     }
 }

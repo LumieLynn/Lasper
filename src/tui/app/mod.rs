@@ -727,14 +727,6 @@ impl App {
                 Some(completion) = detail_refresh_rx.recv() => {
                     self.apply_detail_refresh(completion);
                 }
-                changed = events.mouse_motion_rx.changed() => {
-                    if changed.is_ok() {
-                        let mouse = *events.mouse_motion_rx.borrow_and_update();
-                        if let Some(mouse) = mouse {
-                            self.handle_mouse(mouse).await;
-                        }
-                    }
-                }
                 input_result = &mut events.input_done_rx => {
                     let error = match input_result {
                         Ok(Err(error)) => error,
