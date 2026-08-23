@@ -1,9 +1,9 @@
 //! Pure NVIDIA passthrough configuration values.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NvidiaFileCategory {
     Lib64,
     Lib32,
@@ -74,7 +74,7 @@ pub enum NvidiaPassthroughMode {
 pub struct NvidiaPassthroughProfile {
     pub gpu_device: String,
     pub mode: NvidiaPassthroughMode,
-    pub category_destinations: HashMap<NvidiaFileCategory, String>,
+    pub category_destinations: BTreeMap<NvidiaFileCategory, String>,
     pub inject_env: bool,
     #[serde(default)]
     pub manual_classifications: Vec<ManualClassification>,
@@ -93,7 +93,7 @@ impl Default for NvidiaPassthroughProfile {
         Self {
             gpu_device: "all".to_string(),
             mode: NvidiaPassthroughMode::Mirror,
-            category_destinations: HashMap::new(),
+            category_destinations: BTreeMap::new(),
             inject_env: false,
             manual_classifications: Vec::new(),
         }
@@ -103,7 +103,7 @@ impl Default for NvidiaPassthroughProfile {
 #[allow(dead_code)]
 pub struct ProfileTemplate {
     pub name: String,
-    pub destinations: HashMap<NvidiaFileCategory, String>,
+    pub destinations: BTreeMap<NvidiaFileCategory, String>,
 }
 
 #[allow(dead_code)]

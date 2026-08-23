@@ -23,10 +23,10 @@ impl DeploymentPlan {
         let target = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
             .map_err(|error| DeploymentError::rejected(error.to_string()))?
             .machine;
-        let normalized = canonical_json(&serde_json::to_value(&request).map_err(|error| {
+        let normalized = serde_json::to_vec(&request).map_err(|error| {
             DeploymentError::failed(format!("Could not normalize deployment plan: {error}"))
-        })?);
-        let digest = Sha256::digest(normalized.as_bytes());
+        })?;
+        let digest = Sha256::digest(&normalized);
         let fingerprint = PlanFingerprint(
             digest
                 .iter()
@@ -63,49 +63,6 @@ impl DeploymentPlan {
         }
         claims
     }
-}
-
-fn canonical_json(value: &serde_json::Value) -> String {
-    fn write(value: &serde_json::Value, output: &mut String) {
-        match value {
-            serde_json::Value::Null => output.push_str("null"),
-            serde_json::Value::Bool(value) => {
-                output.push_str(if *value { "true" } else { "false" })
-            }
-            serde_json::Value::Number(value) => output.push_str(&value.to_string()),
-            serde_json::Value::String(value) => {
-                output.push_str(&serde_json::to_string(value).expect("JSON strings serialize"));
-            }
-            serde_json::Value::Array(values) => {
-                output.push('[');
-                for (index, value) in values.iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
-                    }
-                    write(value, output);
-                }
-                output.push(']');
-            }
-            serde_json::Value::Object(values) => {
-                output.push('{');
-                let mut entries = values.iter().collect::<Vec<_>>();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-                for (index, (key, value)) in entries.into_iter().enumerate() {
-                    if index != 0 {
-                        output.push(',');
-                    }
-                    output.push_str(&serde_json::to_string(key).expect("JSON keys serialize"));
-                    output.push(':');
-                    write(value, output);
-                }
-                output.push('}');
-            }
-        }
-    }
-
-    let mut output = String::new();
-    write(value, &mut output);
-    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -599,6 +556,36 @@ mod tests {
         changed.config.hostname = "different".into();
         let changed = DeploymentPlan::build(changed).unwrap();
         assert_ne!(first.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn plan_fingerprint_is_independent_of_nvidia_destination_insertion_order() {
+        use crate::domain::nvidia::{NvidiaFileCategory, NvidiaPassthroughProfile};
+
+        let mut first_profile = NvidiaPassthroughProfile::default();
+        first_profile
+            .category_destinations
+            .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
+        first_profile
+            .category_destinations
+            .insert(NvidiaFileCategory::Bin, "/opt/nvidia/bin".into());
+        let mut second_profile = NvidiaPassthroughProfile::default();
+        second_profile
+            .category_destinations
+            .insert(NvidiaFileCategory::Bin, "/opt/nvidia/bin".into());
+        second_profile
+            .category_destinations
+            .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
+
+        let mut first_request = request();
+        first_request.nvidia_profile = Some(first_profile);
+        let mut second_request = request();
+        second_request.nvidia_profile = Some(second_profile);
+
+        assert_eq!(
+            DeploymentPlan::build(first_request).unwrap().fingerprint(),
+            DeploymentPlan::build(second_request).unwrap().fingerprint()
+        );
     }
 
     #[test]
