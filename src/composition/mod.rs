@@ -150,8 +150,16 @@ pub(crate) fn compose_application_services(
             rootfs: execution.rootfs.clone(),
         },
     );
+    let provisioning_route = match daemon {
+        Some(daemon) => crate::adapters::provisioning::ProvisioningRoute::Elevated(daemon),
+        None => crate::adapters::provisioning::ProvisioningRoute::Direct {
+            local_cmd: execution.local_cmd.clone(),
+            host_operations: execution.host_operations.clone(),
+            trusted_state_root: execution.trusted_state_root.clone(),
+        },
+    };
     let provisioning = crate::adapters::provisioning::compose_provisioning_service(
-        execution,
+        provisioning_route,
         Arc::clone(&operations),
         Arc::clone(&runtime),
     );

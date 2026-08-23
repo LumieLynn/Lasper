@@ -13,6 +13,23 @@ use crate::application::provisioning::{
 use async_trait::async_trait;
 use std::sync::Arc;
 
+pub(crate) enum ProvisioningRoute {
+    Direct {
+        local_cmd: Arc<dyn crate::adapters::process::CommandRunner>,
+        host_operations: crate::application::HostOperationTracker,
+        trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot,
+    },
+    Elevated(Arc<crate::adapters::elevated::ElevatedDaemon>),
+}
+
+struct ProvisioningPorts {
+    source_preflight: Arc<dyn SourcePreflight>,
+    executor: Arc<dyn crate::application::provisioning::DeploymentExecutor>,
+    deployment_state: Arc<dyn DeploymentStatePort>,
+    recovery: Arc<dyn DeploymentRecoveryProbe>,
+    claim_control: Arc<dyn DeploymentClaimControl>,
+}
+
 pub(crate) fn compose_provisioning_preparation_service(
 ) -> Arc<crate::application::provisioning::ProvisioningPreparationService> {
     Arc::new(
@@ -23,59 +40,59 @@ pub(crate) fn compose_provisioning_preparation_service(
 }
 
 pub(crate) fn compose_provisioning_service(
-    exec_ctx: &Arc<crate::composition::ExecutionContext>,
+    route: ProvisioningRoute,
     operations: Arc<crate::application::OperationRegistry>,
     runtime: Arc<crate::application::RuntimeCatalog>,
 ) -> Arc<ProvisioningService> {
-    let deployment_state: Arc<dyn DeploymentStatePort> = match exec_ctx.daemon_ref() {
-        Some(daemon) => Arc::new(state::ElevatedDeploymentState::new(Arc::clone(daemon))),
-        None => Arc::new(state::FilesystemDeploymentState::new(
-            exec_ctx.trusted_state_root.clone(),
-        )),
-    };
-    let (source_preflight, executor): (
-        Arc<dyn SourcePreflight>,
-        Arc<dyn crate::application::provisioning::DeploymentExecutor>,
-    ) = match exec_ctx.daemon_ref() {
-        Some(daemon) => (
-            Arc::new(ElevatedSourcePreflight {
-                daemon: Arc::clone(daemon),
-            }),
-            Arc::new(elevated::ElevatedProvisioningExecutor::new(Arc::clone(
-                daemon,
-            ))),
-        ),
-        None => (
-            Arc::new(DirectSourcePreflight),
-            Arc::new(direct::DirectProvisioningExecutor::new(
-                Arc::clone(&exec_ctx.local_cmd),
-                exec_ctx.host_operations.clone(),
-                exec_ctx.trusted_state_root.clone(),
-                Arc::clone(&deployment_state),
-            )),
-        ),
-    };
-    let recovery: Arc<dyn DeploymentRecoveryProbe> = match exec_ctx.daemon_ref() {
-        Some(daemon) => Arc::new(recovery::ElevatedDeploymentRecoveryProbe::new(Arc::clone(
-            daemon,
-        ))),
-        None => Arc::new(recovery::DirectDeploymentRecoveryProbe::new(
-            runtime,
-            exec_ctx.trusted_state_root.clone(),
-        )),
-    };
-    let claim_control: Arc<dyn DeploymentClaimControl> = match exec_ctx.daemon_ref() {
-        Some(daemon) => Arc::new(claim::ElevatedDeploymentClaimControl::new(Arc::clone(
-            daemon,
-        ))),
-        None => Arc::new(claim::DirectDeploymentClaimControl),
+    let ports = match route {
+        ProvisioningRoute::Elevated(daemon) => {
+            let deployment_state: Arc<dyn DeploymentStatePort> =
+                Arc::new(state::ElevatedDeploymentState::new(Arc::clone(&daemon)));
+            ProvisioningPorts {
+                source_preflight: Arc::new(ElevatedSourcePreflight {
+                    daemon: Arc::clone(&daemon),
+                }),
+                executor: Arc::new(elevated::ElevatedProvisioningExecutor::new(Arc::clone(
+                    &daemon,
+                ))),
+                deployment_state,
+                recovery: Arc::new(recovery::ElevatedDeploymentRecoveryProbe::new(Arc::clone(
+                    &daemon,
+                ))),
+                claim_control: Arc::new(claim::ElevatedDeploymentClaimControl::new(daemon)),
+            }
+        }
+        ProvisioningRoute::Direct {
+            local_cmd,
+            host_operations,
+            trusted_state_root,
+        } => {
+            let deployment_state: Arc<dyn DeploymentStatePort> = Arc::new(
+                state::FilesystemDeploymentState::new(trusted_state_root.clone()),
+            );
+            ProvisioningPorts {
+                source_preflight: Arc::new(DirectSourcePreflight),
+                executor: Arc::new(direct::DirectProvisioningExecutor::new(
+                    local_cmd,
+                    host_operations,
+                    trusted_state_root.clone(),
+                    Arc::clone(&deployment_state),
+                )),
+                deployment_state,
+                recovery: Arc::new(recovery::DirectDeploymentRecoveryProbe::new(
+                    runtime,
+                    trusted_state_root,
+                )),
+                claim_control: Arc::new(claim::DirectDeploymentClaimControl),
+            }
+        }
     };
     Arc::new(ProvisioningService::new(
-        source_preflight,
-        executor,
-        deployment_state,
-        recovery,
-        claim_control,
+        ports.source_preflight,
+        ports.executor,
+        ports.deployment_state,
+        ports.recovery,
+        ports.claim_control,
         operations,
     ))
 }
