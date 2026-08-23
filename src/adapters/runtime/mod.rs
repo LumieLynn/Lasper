@@ -15,8 +15,6 @@ use crate::adapters::runtime::inspection::MachineInspectionStore;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::operations::ExecutionRoute;
 use crate::application::runtime::{RuntimeCatalog, RuntimePort};
-use crate::composition::ExecutionContext;
-use crate::composition::PermissionLevel;
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{
     ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
@@ -24,53 +22,45 @@ use crate::nspawn::models::{
 use std::sync::Arc;
 
 pub(crate) fn compose_runtime_catalog(
-    level: PermissionLevel,
-    cli_mode: bool,
-    exec_ctx: &ExecutionContext,
+    local_cmd: Arc<dyn crate::adapters::process::CommandRunner>,
+    fallback_inspector: Option<MachineInspectionStore>,
+    primary_route: PrimaryRuntimeRoute,
 ) -> Arc<RuntimeCatalog> {
     let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
-    let cli = CliBackend::new(exec_ctx.local_cmd.clone());
+    let cli = CliBackend::new(local_cmd);
     cli.set_nudge(nudge_rx);
     let fallback_source: Arc<dyn RuntimeSource> = Arc::new(cli);
     let fallback: Arc<dyn RuntimePort> = Arc::new(SourceRuntimePort {
         source: fallback_source,
-        inspector: if cli_mode {
-            RuntimeInspector::Store(exec_ctx.machine_inspection.clone())
-        } else {
-            RuntimeInspector::Source
-        },
+        inspection_route: fallback_inspector
+            .as_ref()
+            .map(MachineInspectionStore::route)
+            .unwrap_or(ExecutionRoute::LocalCli),
+        inspector: fallback_inspector
+            .map(RuntimeInspector::Store)
+            .unwrap_or(RuntimeInspector::Source),
         snapshot_route: ExecutionRoute::LocalCli,
-        inspection_route: if cli_mode && level == PermissionLevel::Elevated {
-            ExecutionRoute::ElevatedCli
-        } else {
-            ExecutionRoute::LocalCli
-        },
     });
 
-    let primary = if cli_mode {
-        None
-    } else {
-        let (source, route): (Arc<dyn RuntimeSource>, ExecutionRoute) = match level {
-            PermissionLevel::Elevated => {
-                let backend = DaemonBackend::new(
-                    exec_ctx
-                        .daemon_ref()
-                        .cloned()
-                        .expect("elevated runtime catalog requires daemon"),
-                );
-                (Arc::new(backend), ExecutionRoute::ElevatedDbus)
-            }
-            PermissionLevel::User | PermissionLevel::Root => {
-                (Arc::new(DbusBackend::new()), ExecutionRoute::DirectDbus)
-            }
-        };
-        Some(Arc::new(SourceRuntimePort {
+    let primary = match primary_route {
+        PrimaryRuntimeRoute::Disabled => None,
+        PrimaryRuntimeRoute::DirectDbus => Some((
+            Arc::new(DbusBackend::new()) as Arc<dyn RuntimeSource>,
+            ExecutionRoute::DirectDbus,
+        )),
+        PrimaryRuntimeRoute::ElevatedDbus(daemon) => Some((
+            Arc::new(DaemonBackend::new(daemon)) as Arc<dyn RuntimeSource>,
+            ExecutionRoute::ElevatedDbus,
+        )),
+    }
+    .map(|(source, route)| {
+        Arc::new(SourceRuntimePort {
             source,
             inspector: RuntimeInspector::Source,
             snapshot_route: route,
             inspection_route: route,
-        }) as Arc<dyn RuntimePort>)
-    };
+        }) as Arc<dyn RuntimePort>
+    });
 
     Arc::new(RuntimeCatalog::new(
         primary,
@@ -81,6 +71,12 @@ pub(crate) fn compose_runtime_catalog(
         ],
         Some(nudge_tx),
     ))
+}
+
+pub(crate) enum PrimaryRuntimeRoute {
+    Disabled,
+    DirectDbus,
+    ElevatedDbus(Arc<crate::adapters::elevated::ElevatedDaemon>),
 }
 
 enum RuntimeInspector {

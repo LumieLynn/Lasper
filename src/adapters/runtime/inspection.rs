@@ -1,6 +1,7 @@
 //! Route-fixed CLI machine inspection.
 
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::application::operations::ExecutionRoute;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
 use std::path::PathBuf;
@@ -29,6 +30,10 @@ impl MachineInspectionStore {
     pub async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
         self.executor.inspect(name, entry).await
     }
+
+    pub(crate) fn route(&self) -> ExecutionRoute {
+        self.executor.route()
+    }
 }
 
 impl std::fmt::Debug for MachineInspectionStore {
@@ -41,7 +46,7 @@ impl std::fmt::Debug for MachineInspectionStore {
 
 #[async_trait::async_trait]
 trait MachineInspectionExecutor: Send + Sync + 'static {
-    fn route(&self) -> &'static str;
+    fn route(&self) -> ExecutionRoute;
 
     async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties>;
 }
@@ -50,8 +55,8 @@ struct DirectMachineInspectionExecutor;
 
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for DirectMachineInspectionExecutor {
-    fn route(&self) -> &'static str {
-        "direct"
+    fn route(&self) -> ExecutionRoute {
+        ExecutionRoute::LocalCli
     }
 
     async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
@@ -65,8 +70,8 @@ struct ElevatedMachineInspectionExecutor {
 
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
-    fn route(&self) -> &'static str {
-        "elevated_rpc"
+    fn route(&self) -> ExecutionRoute {
+        ExecutionRoute::ElevatedCli
     }
 
     async fn inspect(&self, name: &str, _entry: &ContainerEntry) -> Result<MachineProperties> {
@@ -89,8 +94,8 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MachineInspectionExecutor for RecordingInspector {
-        fn route(&self) -> &'static str {
-            "recording"
+        fn route(&self) -> ExecutionRoute {
+            ExecutionRoute::LocalCli
         }
 
         async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
@@ -119,6 +124,6 @@ mod tests {
         store.inspect("test-machine", &entry).await.unwrap();
 
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-        assert!(format!("{store:?}").contains("recording"));
+        assert_eq!(store.route(), ExecutionRoute::LocalCli);
     }
 }

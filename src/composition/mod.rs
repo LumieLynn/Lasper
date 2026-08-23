@@ -31,8 +31,45 @@ pub(crate) fn compose_application_services(
     cli_mode: bool,
     execution: &Arc<ExecutionContext>,
 ) -> ApplicationServices {
-    let session = crate::adapters::session::compose_session_service(level, execution);
-    let runtime = crate::adapters::runtime::compose_runtime_catalog(level, cli_mode, execution);
+    let daemon = execution.daemon_ref().cloned();
+    let session_route = match level {
+        PermissionLevel::User => crate::adapters::session::SessionRoute::Direct(
+            crate::adapters::session::DirectTerminalPolicy::LoginOnly,
+        ),
+        PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct(
+            crate::adapters::session::DirectTerminalPolicy::Automatic,
+        ),
+        PermissionLevel::Elevated => crate::adapters::session::SessionRoute::Elevated(
+            daemon
+                .as_ref()
+                .cloned()
+                .expect("validated elevated composition has a daemon"),
+        ),
+    };
+    let session = crate::adapters::session::compose_session_service(session_route);
+    let fallback_inspector = cli_mode.then(|| execution.machine_inspection.clone());
+    let primary_runtime = if cli_mode {
+        crate::adapters::runtime::PrimaryRuntimeRoute::Disabled
+    } else {
+        match level {
+            PermissionLevel::User | PermissionLevel::Root => {
+                crate::adapters::runtime::PrimaryRuntimeRoute::DirectDbus
+            }
+            PermissionLevel::Elevated => {
+                crate::adapters::runtime::PrimaryRuntimeRoute::ElevatedDbus(
+                    daemon
+                        .as_ref()
+                        .cloned()
+                        .expect("validated elevated composition has a daemon"),
+                )
+            }
+        }
+    };
+    let runtime = crate::adapters::runtime::compose_runtime_catalog(
+        execution.local_cmd.clone(),
+        fallback_inspector,
+        primary_runtime,
+    );
     let operations = OperationRegistry::new();
     let image_lifecycle = Arc::new(crate::adapters::lifecycle::image::compose_image_lifecycle(
         Arc::clone(&runtime),
