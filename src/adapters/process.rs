@@ -172,6 +172,7 @@ impl CommandRunner for DefaultCommandRunner {
             .arg("exec \"$@\" 2>&1")
             .arg("--")
             .args(&argv)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
@@ -189,11 +190,12 @@ impl CommandRunner for DefaultCommandRunner {
 }
 
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set
-/// and stdout/stderr piped by default to prevent leaking output
-/// into the TUI's raw-mode terminal.
+/// with stdin detached and stdout/stderr piped by default so non-interactive
+/// host operations cannot compete with the TUI for its controlling terminal.
 pub fn new_command(program: &str) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(program);
     cmd.env("LC_ALL", "C");
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     install_parent_death_signal(cmd.as_std_mut());
@@ -201,11 +203,12 @@ pub fn new_command(program: &str) -> tokio::process::Command {
 }
 
 /// Creates a new `std::process::Command` with `LC_ALL=C` set
-/// and stdout/stderr piped by default to prevent leaking output
-/// into the TUI's raw-mode terminal.
+/// with stdin detached and stdout/stderr piped by default so non-interactive
+/// host operations cannot compete with the TUI for its controlling terminal.
 pub fn new_sync_command(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     cmd.env("LC_ALL", "C");
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     install_parent_death_signal(&mut cmd);
