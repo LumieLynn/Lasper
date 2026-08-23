@@ -58,7 +58,10 @@ impl ExecutionContext {
             None => RootfsStore::direct(),
         };
         let trusted_state_root = TrustedStateRoot::production();
-        let nvidia_state = NvidiaStateStore::new(daemon.clone(), trusted_state_root.clone());
+        let nvidia_state = match daemon.as_ref() {
+            Some(daemon) => NvidiaStateStore::elevated(Arc::clone(daemon)),
+            None => NvidiaStateStore::direct(trusted_state_root.clone()),
+        };
         Ok(Self {
             local_cmd,
             system_operations,

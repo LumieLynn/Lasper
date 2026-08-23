@@ -188,13 +188,20 @@ fn split_host_container(s: &str) -> (String, String) {
 /// Typed access to Lasper-managed NVIDIA state files.
 #[derive(Clone)]
 pub struct NvidiaStateStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
-    state_root: TrustedStateRoot,
+    executor: Arc<dyn NvidiaStateExecutor>,
 }
 
 impl NvidiaStateStore {
-    pub(crate) fn new(daemon: Option<Arc<ElevatedDaemon>>, state_root: TrustedStateRoot) -> Self {
-        Self { daemon, state_root }
+    pub(crate) fn direct(state_root: TrustedStateRoot) -> Self {
+        Self {
+            executor: Arc::new(DirectNvidiaStateExecutor { state_root }),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedNvidiaStateExecutor { daemon }),
+        }
     }
 
     pub async fn read(&self, name: &str) -> Result<Option<NvidiaState>> {
@@ -260,23 +267,55 @@ impl NvidiaStateStore {
     }
 
     async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .nvidia_state(operation)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            execute_nvidia_state_operation(operation, self.state_root.clone()).await
-        }
+        self.executor.execute(operation).await
     }
 }
 
 impl std::fmt::Debug for NvidiaStateStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NvidiaStateStore")
-            .field("daemon", &self.daemon)
-            .field("state_root", &self.state_root)
+            .field("route", &self.executor.route())
             .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait NvidiaStateExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult>;
+}
+
+struct DirectNvidiaStateExecutor {
+    state_root: TrustedStateRoot,
+}
+
+#[async_trait::async_trait]
+impl NvidiaStateExecutor for DirectNvidiaStateExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
+        execute_nvidia_state_operation(operation, self.state_root.clone()).await
+    }
+}
+
+struct ElevatedNvidiaStateExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl NvidiaStateExecutor for ElevatedNvidiaStateExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
+        self.daemon
+            .nvidia_state(operation)
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))
     }
 }
 
@@ -639,6 +678,38 @@ pub(crate) fn calculate_removed_binds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubNvidiaStateExecutor;
+
+    #[async_trait::async_trait]
+    impl NvidiaStateExecutor for StubNvidiaStateExecutor {
+        fn route(&self) -> &'static str {
+            "test"
+        }
+
+        async fn execute(&self, operation: NvidiaStateOperation) -> Result<NvidiaStateResult> {
+            assert!(matches!(operation, NvidiaStateOperation::Read(_)));
+            Ok(NvidiaStateResult {
+                state: Some(NvidiaState {
+                    driver_version: "test-driver".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let store = NvidiaStateStore {
+            executor: Arc::new(StubNvidiaStateExecutor),
+        };
+
+        let state = store.read("test").await.unwrap().unwrap();
+
+        assert_eq!(state.driver_version, "test-driver");
+        assert!(format!("{store:?}").contains("test"));
+    }
     use std::os::unix::fs::PermissionsExt;
 
     #[test]

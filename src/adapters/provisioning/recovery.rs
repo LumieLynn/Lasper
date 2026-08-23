@@ -89,7 +89,7 @@ pub(crate) async fn probe_manifest_locally(
     state_root: TrustedStateRoot,
 ) -> Vec<DeploymentRecoveryObservation> {
     let systemd_units = SystemdUnitStore::direct();
-    let nvidia_state = NvidiaStateStore::new(None, state_root);
+    let nvidia_state = NvidiaStateStore::direct(state_root);
     let mut observations = Vec::new();
 
     for subject in manifest.recovery_resources() {
