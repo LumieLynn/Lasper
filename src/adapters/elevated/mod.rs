@@ -39,7 +39,7 @@ pub(crate) fn pipe_reader(
 
 // ── Parent-side handle ──
 
-pub struct ElevatedDaemon {
+pub(crate) struct ElevatedDaemon {
     request_tx: tokio::sync::mpsc::Sender<RpcCall>,
     next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
     event_tx: tokio::sync::broadcast::Sender<()>,
@@ -60,29 +60,8 @@ impl std::fmt::Debug for ElevatedDaemon {
     }
 }
 
-impl Clone for ElevatedDaemon {
-    fn clone(&self) -> Self {
-        Self {
-            request_tx: self.request_tx.clone(),
-            next_id: self.next_id.clone(),
-            event_tx: self.event_tx.clone(),
-            pid: self.pid,
-            rpc_sock_path: self.rpc_sock_path.clone(),
-            fd_sock_path: self.fd_sock_path.clone(),
-            fd_auth_token: self.fd_auth_token.clone(),
-            _fd_sock_dir: self._fd_sock_dir.clone(),
-        }
-    }
-}
-
-impl PartialEq for ElevatedDaemon {
-    fn eq(&self, other: &Self) -> bool {
-        self.pid == other.pid
-    }
-}
-
 impl ElevatedDaemon {
-    pub async fn spawn(dbus_enabled: bool) -> std::io::Result<Self> {
+    pub(crate) async fn spawn(dbus_enabled: bool) -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let user_uid = uzers::get_current_uid();
         let parent_pid = std::process::id();
@@ -276,18 +255,13 @@ impl ElevatedDaemon {
         Ok(daemon)
     }
 
-    #[allow(dead_code)]
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    pub fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<()> {
+    pub(super) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<()> {
         self.event_tx.subscribe()
     }
 
     // ── JSON-RPC dispatch ──
 
-    pub async fn rpc_call(
+    pub(super) async fn rpc_call(
         &self,
         method: &str,
         params: serde_json::Value,
@@ -340,12 +314,12 @@ impl ElevatedDaemon {
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }
 
-    pub async fn ping(&self) -> std::io::Result<()> {
+    async fn ping(&self) -> std::io::Result<()> {
         self.rpc_call("ping", serde_json::json!({})).await?;
         Ok(())
     }
 
-    pub async fn exit(&self) {
+    pub(crate) async fn exit(&self) {
         log::info!("[lasper] daemon::exit() sending RPC...");
         // Send exit command and ignore response since daemon will exit immediately
         let _ = self.rpc_call("exit", serde_json::json!({})).await;
@@ -355,7 +329,7 @@ impl ElevatedDaemon {
         log::info!("[lasper] daemon::exit() RPC returned");
     }
 
-    pub(crate) async fn nspawn_config(
+    pub(super) async fn nspawn_config(
         &self,
         operation: NspawnConfigOperation,
     ) -> std::io::Result<NspawnConfigResult> {
@@ -366,14 +340,14 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
+    pub(super) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.rpc_call("system_operation", params).await?;
         Ok(())
     }
 
-    pub(crate) async fn image_remove(
+    pub(super) async fn image_remove(
         &self,
         request: ImageRemoveRequest,
     ) -> std::io::Result<ImageControlOutcome> {
@@ -384,7 +358,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn machine_control(
+    pub(super) async fn machine_control(
         &self,
         request: MachineControlRequest,
     ) -> std::io::Result<MachineControlOutcome> {
@@ -395,7 +369,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn cli_inspect_machine(
+    pub(super) async fn cli_inspect_machine(
         &self,
         name: &str,
     ) -> std::io::Result<MachineProperties> {
@@ -410,7 +384,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn systemd_unit(
+    pub(super) async fn systemd_unit(
         &self,
         operation: SystemdUnitOperation,
     ) -> std::io::Result<SystemdUnitResult> {
@@ -421,7 +395,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn nvidia_state(
+    pub(super) async fn nvidia_state(
         &self,
         operation: NvidiaStateOperation,
     ) -> std::io::Result<NvidiaStateResult> {
@@ -432,7 +406,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn deployment_state(
+    pub(super) async fn deployment_state(
         &self,
         operation: DeploymentStateOperation,
     ) -> std::io::Result<DeploymentStateResult> {
@@ -443,7 +417,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn submit_deployment(
+    pub(super) async fn submit_deployment(
         &self,
         params: SubmitDeploymentParams,
         artifact_source: Option<std::fs::File>,
@@ -457,7 +431,7 @@ impl ElevatedDaemon {
         .await?
     }
 
-    pub(crate) async fn deployment_status(
+    pub(super) async fn deployment_status(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
     ) -> std::io::Result<Option<DeploymentJobSnapshot>> {
@@ -468,7 +442,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn resolve_deployment_submission(
+    pub(super) async fn resolve_deployment_submission(
         &self,
         request_id: crate::application::provisioning::DeploymentRequestId,
     ) -> std::io::Result<Option<DeploymentSubmissionSnapshot>> {
@@ -481,7 +455,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn acknowledge_deployment_submission(
+    pub(super) async fn acknowledge_deployment_submission(
         &self,
         request_id: crate::application::provisioning::DeploymentRequestId,
     ) -> std::io::Result<()> {
@@ -492,7 +466,7 @@ impl ElevatedDaemon {
         Ok(())
     }
 
-    pub(crate) async fn cancel_deployment(
+    pub(super) async fn cancel_deployment(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
     ) -> std::io::Result<DeploymentJobSnapshot> {
@@ -503,7 +477,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn acknowledge_deployment(
+    pub(super) async fn acknowledge_deployment(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
     ) -> std::io::Result<()> {
@@ -513,7 +487,7 @@ impl ElevatedDaemon {
         Ok(())
     }
 
-    pub(crate) async fn probe_deployment_recovery(
+    pub(super) async fn probe_deployment_recovery(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
         expected_revision: u64,
@@ -535,7 +509,7 @@ impl ElevatedDaemon {
         Ok(result.observations)
     }
 
-    pub(crate) async fn reconcile_deployment(
+    pub(super) async fn reconcile_deployment(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
     ) -> std::io::Result<DeploymentJobSnapshot> {
@@ -546,7 +520,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn release_unresolved_deployment(
+    pub(super) async fn release_unresolved_deployment(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
         confirmed: bool,
@@ -563,7 +537,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn rootfs(&self, operation: RootfsOperation) -> std::io::Result<RootfsResult> {
+    pub(super) async fn rootfs(&self, operation: RootfsOperation) -> std::io::Result<RootfsResult> {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -574,7 +548,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(crate) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {
+    pub(super) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {
         let result = self
             .rpc_call("assess_tar_runtime", serde_json::json!({}))
             .await?;
