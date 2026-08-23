@@ -77,6 +77,7 @@ pub(crate) mod app;
 pub mod core;
 pub(crate) mod effects;
 pub(crate) mod events;
+pub(crate) mod launcher;
 pub mod layout;
 pub(crate) mod term;
 pub mod theme;
@@ -90,6 +91,8 @@ use ratatui::{
 };
 
 use crate::tui::app::App;
+
+pub(crate) use launcher::run;
 
 /// Draws the entire application UI to the frame.
 pub fn draw(f: &mut Frame, app: &mut App) {
