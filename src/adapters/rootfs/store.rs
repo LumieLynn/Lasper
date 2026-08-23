@@ -68,12 +68,20 @@ impl RootfsTarget {
 /// Typed access to mutations inside Lasper-managed container root filesystems.
 #[derive(Clone)]
 pub struct RootfsStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
+    executor: Arc<dyn RootfsExecutor>,
 }
 
 impl RootfsStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub(crate) fn direct() -> Self {
+        Self {
+            executor: Arc::new(DirectRootfsExecutor),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedRootfsExecutor { daemon }),
+        }
     }
 
     pub(crate) async fn has_os_release(&self, target: &RootfsTarget) -> Result<bool> {
@@ -233,33 +241,64 @@ impl RootfsStore {
     }
 
     async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .rootfs(operation)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            execute_rootfs_operation_with_runners(
-                operation,
-                &DefaultCommandRunner,
-                &DefaultRootfsProcessRunner,
-            )
-            .await
-        }
+        self.executor.execute(operation).await
     }
 }
 
 impl std::fmt::Debug for RootfsStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RootfsStore")
-            .field("daemon", &self.daemon)
+            .field("route", &self.executor.route())
             .finish()
     }
 }
 
 impl Default for RootfsStore {
     fn default() -> Self {
-        Self::new(None)
+        Self::direct()
+    }
+}
+
+#[async_trait::async_trait]
+trait RootfsExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult>;
+}
+
+struct DirectRootfsExecutor;
+
+#[async_trait::async_trait]
+impl RootfsExecutor for DirectRootfsExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult> {
+        execute_rootfs_operation_with_runners(
+            operation,
+            &DefaultCommandRunner,
+            &DefaultRootfsProcessRunner,
+        )
+        .await
+    }
+}
+
+struct ElevatedRootfsExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl RootfsExecutor for ElevatedRootfsExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult> {
+        self.daemon
+            .rootfs(operation)
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))
     }
 }
 
@@ -766,6 +805,36 @@ fn open_path_in_root(rootfs: &Path, relative_path: &str) -> Result<Option<std::f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubRootfsExecutor;
+
+    #[async_trait::async_trait]
+    impl RootfsExecutor for StubRootfsExecutor {
+        fn route(&self) -> &'static str {
+            "test"
+        }
+
+        async fn execute(&self, operation: RootfsOperation) -> Result<RootfsResult> {
+            assert!(matches!(operation, RootfsOperation::ProbeOsRelease(_)));
+            Ok(RootfsResult {
+                present: Some(true),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_once_to_its_fixed_executor() {
+        let store = RootfsStore {
+            executor: Arc::new(StubRootfsExecutor),
+        };
+        let target = RootfsTarget::Machine {
+            machine: MachineName::new("test").unwrap(),
+        };
+
+        assert!(store.has_os_release(&target).await.unwrap());
+        assert!(format!("{store:?}").contains("test"));
+    }
 
     #[test]
     fn target_deserialization_rejects_invalid_machine_and_mount_ids() {

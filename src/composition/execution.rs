@@ -53,7 +53,10 @@ impl ExecutionContext {
             ),
             None => (NspawnConfigStore::direct(), SystemdUnitStore::direct()),
         };
-        let rootfs = RootfsStore::new(daemon.clone());
+        let rootfs = match daemon.as_ref() {
+            Some(daemon) => RootfsStore::elevated(Arc::clone(daemon)),
+            None => RootfsStore::direct(),
+        };
         let trusted_state_root = TrustedStateRoot::production();
         let nvidia_state = NvidiaStateStore::new(daemon.clone(), trusted_state_root.clone());
         Ok(Self {
