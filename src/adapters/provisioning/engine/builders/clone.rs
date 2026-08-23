@@ -222,9 +222,8 @@ mod tests {
         let target = MachineName::new("test").unwrap();
         let deployer = CloneDeployer {
             source_name: "base".into(),
-            system_operations: crate::adapters::system_operation::SystemOperationStore::new(
+            system_operations: crate::adapters::system_operation::SystemOperationStore::direct(
                 std::sync::Arc::new(crate::adapters::process::DefaultCommandRunner),
-                None,
             ),
             nspawn: crate::adapters::config::NspawnConfigStore::direct(),
             systemd_unit: crate::adapters::config::SystemdUnitStore::direct(),

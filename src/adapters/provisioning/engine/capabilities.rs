@@ -31,7 +31,7 @@ impl DirectProvisioningCapabilities {
         state_root: TrustedStateRoot,
     ) -> Self {
         Self {
-            system_operations: SystemOperationStore::new(command_runner, None),
+            system_operations: SystemOperationStore::direct(command_runner),
             nspawn: NspawnConfigStore::direct(),
             systemd_unit: SystemdUnitStore::direct(),
             rootfs: RootfsStore::direct(),

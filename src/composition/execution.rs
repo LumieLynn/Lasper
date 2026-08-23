@@ -44,7 +44,10 @@ impl ExecutionContext {
         validate_execution_mode(level, daemon.is_some())?;
 
         let local_cmd: Arc<dyn CommandRunner> = Arc::new(DefaultCommandRunner);
-        let system_operations = SystemOperationStore::new(local_cmd.clone(), daemon.clone());
+        let system_operations = match daemon.as_ref() {
+            Some(daemon) => SystemOperationStore::elevated(Arc::clone(daemon)),
+            None => SystemOperationStore::direct(local_cmd.clone()),
+        };
         let machine_inspection = MachineInspectionStore::new(daemon.clone());
         let (nspawn, systemd_unit) = match daemon.as_ref() {
             Some(daemon) => (

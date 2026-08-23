@@ -47,27 +47,24 @@ pub(crate) enum SystemOperation {
 
 #[derive(Clone)]
 pub struct SystemOperationStore {
-    local_runner: Arc<dyn CommandRunner>,
-    daemon: Option<Arc<ElevatedDaemon>>,
+    executor: Arc<dyn SystemOperationExecutor>,
 }
 
 impl SystemOperationStore {
-    pub fn new(local_runner: Arc<dyn CommandRunner>, daemon: Option<Arc<ElevatedDaemon>>) -> Self {
+    pub(crate) fn direct(local_runner: Arc<dyn CommandRunner>) -> Self {
         Self {
-            local_runner,
-            daemon,
+            executor: Arc::new(DirectSystemOperationExecutor { local_runner }),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedSystemOperationExecutor { daemon }),
         }
     }
 
     async fn execute(&self, operation: SystemOperation) -> Result<()> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .system_operation(operation)
-                .await
-                .map_err(|error| NspawnError::Io(PathBuf::from("system operation"), error))
-        } else {
-            execute_system_operation_with_runner(operation, self.local_runner.as_ref()).await
-        }
+        self.executor.execute(operation).await
     }
 
     pub async fn disable(&self, name: &str) -> Result<()> {
@@ -141,8 +138,48 @@ pub(crate) async fn execute_cli_image_remove_with_runner(
 impl std::fmt::Debug for SystemOperationStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SystemOperationStore")
-            .field("daemon", &self.daemon)
-            .finish_non_exhaustive()
+            .field("route", &self.executor.route())
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait SystemOperationExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: SystemOperation) -> Result<()>;
+}
+
+struct DirectSystemOperationExecutor {
+    local_runner: Arc<dyn CommandRunner>,
+}
+
+#[async_trait::async_trait]
+impl SystemOperationExecutor for DirectSystemOperationExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: SystemOperation) -> Result<()> {
+        execute_system_operation_with_runner(operation, self.local_runner.as_ref()).await
+    }
+}
+
+struct ElevatedSystemOperationExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl SystemOperationExecutor for ElevatedSystemOperationExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: SystemOperation) -> Result<()> {
+        self.daemon
+            .system_operation(operation)
+            .await
+            .map_err(|error| NspawnError::Io(PathBuf::from("system operation"), error))
     }
 }
 
@@ -250,6 +287,7 @@ mod tests {
     use crate::adapters::process::MockCommandRunner;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn success() -> Output {
         Output {
@@ -265,6 +303,38 @@ mod tests {
             stdout: vec![],
             stderr: stderr.as_bytes().to_vec(),
         }
+    }
+
+    struct RecordingExecutor {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SystemOperationExecutor for RecordingExecutor {
+        fn route(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn execute(&self, operation: SystemOperation) -> Result<()> {
+            assert!(matches!(operation, SystemOperation::Disable { .. }));
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let executor = Arc::new(RecordingExecutor {
+            calls: AtomicUsize::new(0),
+        });
+        let store = SystemOperationStore {
+            executor: executor.clone(),
+        };
+
+        store.disable("test-machine").await.unwrap();
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(format!("{store:?}").contains("recording"));
     }
 
     #[test]
