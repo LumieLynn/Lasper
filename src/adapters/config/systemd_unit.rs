@@ -34,12 +34,20 @@ pub struct SystemdDropIn {
 /// Typed access to Lasper-managed `systemd-nspawn@.service` overrides.
 #[derive(Clone)]
 pub struct SystemdUnitStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
+    executor: Arc<dyn SystemdUnitExecutor>,
 }
 
 impl SystemdUnitStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub(crate) fn direct() -> Self {
+        Self {
+            executor: Arc::new(DirectSystemdUnitExecutor),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedSystemdUnitExecutor { daemon }),
+        }
     }
 
     pub async fn write_override(
@@ -144,22 +152,53 @@ impl SystemdUnitStore {
     }
 
     async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .systemd_unit(operation)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            execute_systemd_unit_operation(operation).await
-        }
+        self.executor.execute(operation).await
     }
 }
 
 impl std::fmt::Debug for SystemdUnitStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SystemdUnitStore")
-            .field("daemon", &self.daemon)
+            .field("route", &self.executor.route())
             .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait SystemdUnitExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult>;
+}
+
+struct DirectSystemdUnitExecutor;
+
+#[async_trait::async_trait]
+impl SystemdUnitExecutor for DirectSystemdUnitExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
+        execute_systemd_unit_operation(operation).await
+    }
+}
+
+struct ElevatedSystemdUnitExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl SystemdUnitExecutor for ElevatedSystemdUnitExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
+        self.daemon
+            .systemd_unit(operation)
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))
     }
 }
 
@@ -701,6 +740,39 @@ fn is_owned_override_content(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StubSystemdUnitExecutor;
+
+    #[async_trait::async_trait]
+    impl SystemdUnitExecutor for StubSystemdUnitExecutor {
+        fn route(&self) -> &'static str {
+            "test"
+        }
+
+        async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
+            assert!(matches!(operation, SystemdUnitOperation::Read(_)));
+            Ok(SystemdUnitResult {
+                drop_ins: vec![SystemdDropIn {
+                    path: "/etc/systemd/system/systemd-nspawn@test.service.d/90-lasper.conf".into(),
+                    content: "[Service]\nDeviceAllow=char-drm rw\n".into(),
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let store = SystemdUnitStore {
+            executor: Arc::new(StubSystemdUnitExecutor),
+        };
+
+        let inspection = store.read("test").await.unwrap();
+
+        assert_eq!(inspection.unit, "systemd-nspawn@test.service");
+        assert_eq!(inspection.drop_ins.len(), 1);
+        assert!(format!("{store:?}").contains("test"));
+    }
 
     #[test]
     fn test_systemd_override_content_devices() {

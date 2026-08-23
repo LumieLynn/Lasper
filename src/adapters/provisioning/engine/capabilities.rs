@@ -32,8 +32,8 @@ impl DirectProvisioningCapabilities {
     ) -> Self {
         Self {
             system_operations: SystemOperationStore::new(command_runner, None),
-            nspawn: NspawnConfigStore::new(None),
-            systemd_unit: SystemdUnitStore::new(None),
+            nspawn: NspawnConfigStore::direct(),
+            systemd_unit: SystemdUnitStore::direct(),
             rootfs: RootfsStore::new(None),
             nvidia_state: NvidiaStateStore::new(None, state_root),
         }

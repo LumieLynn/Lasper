@@ -84,8 +84,8 @@ mod tests {
     async fn non_machine_image_names_do_not_probe_systemd_unit_drop_ins() {
         let inspection = StoreResourceInspection::new(
             MachineInspectionStore::new(None),
-            NspawnConfigStore::new(None),
-            SystemdUnitStore::new(None),
+            NspawnConfigStore::direct(),
+            SystemdUnitStore::direct(),
         );
 
         let result = inspection.inspect_image_unit("Ubuntu Resolute image").await;

@@ -31,12 +31,20 @@ pub(crate) enum NspawnConfigPresence {
 /// Typed read/write access to `.nspawn` configuration files.
 #[derive(Clone)]
 pub struct NspawnConfigStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
+    executor: Arc<dyn NspawnConfigExecutor>,
 }
 
 impl NspawnConfigStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
+    pub(crate) fn direct() -> Self {
+        Self {
+            executor: Arc::new(DirectNspawnConfigExecutor),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedNspawnConfigExecutor { daemon }),
+        }
     }
 
     pub async fn read(&self, name: &str) -> Result<Option<NspawnConfig>> {
@@ -154,22 +162,53 @@ impl NspawnConfigStore {
     }
 
     async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .nspawn_config(operation)
-                .await
-                .map_err(|error| NspawnError::Runtime(error.to_string()))
-        } else {
-            execute_nspawn_config_operation(operation, invoking_uid()).await
-        }
+        self.executor.execute(operation).await
     }
 }
 
 impl std::fmt::Debug for NspawnConfigStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NspawnConfigStore")
-            .field("daemon", &self.daemon)
+            .field("route", &self.executor.route())
             .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait NspawnConfigExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult>;
+}
+
+struct DirectNspawnConfigExecutor;
+
+#[async_trait::async_trait]
+impl NspawnConfigExecutor for DirectNspawnConfigExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+        execute_nspawn_config_operation(operation, invoking_uid()).await
+    }
+}
+
+struct ElevatedNspawnConfigExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl NspawnConfigExecutor for ElevatedNspawnConfigExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+        self.daemon
+            .nspawn_config(operation)
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))
     }
 }
 
@@ -1058,6 +1097,42 @@ mod tests {
     use super::*;
     use crate::domain::wayland::WaylandSocketAccess;
     use crate::nspawn::models::IdmapSuffix;
+
+    struct StubNspawnConfigExecutor;
+
+    #[async_trait::async_trait]
+    impl NspawnConfigExecutor for StubNspawnConfigExecutor {
+        fn route(&self) -> &'static str {
+            "test"
+        }
+
+        async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+            assert!(matches!(operation, NspawnConfigOperation::Inspect(_)));
+            Ok(NspawnConfigResult {
+                content: Some(NspawnConfigInspection {
+                    path: PathBuf::from("/run/systemd/nspawn/vendor image.nspawn"),
+                    content: "[Exec]\nBoot=yes\n".into(),
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let store = NspawnConfigStore {
+            executor: Arc::new(StubNspawnConfigExecutor),
+        };
+
+        let inspection = store.inspect("vendor image").await.unwrap().unwrap();
+
+        assert_eq!(
+            inspection.path,
+            PathBuf::from("/run/systemd/nspawn/vendor image.nspawn")
+        );
+        assert!(inspection.content.contains("Boot=yes"));
+        assert!(format!("{store:?}").contains("test"));
+    }
 
     #[test]
     fn operation_deserialization_rejects_invalid_names() {

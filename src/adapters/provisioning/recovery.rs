@@ -88,7 +88,7 @@ pub(crate) async fn probe_manifest_locally(
     images: Result<Vec<ImageEntry>, String>,
     state_root: TrustedStateRoot,
 ) -> Vec<DeploymentRecoveryObservation> {
-    let systemd_units = SystemdUnitStore::new(None);
+    let systemd_units = SystemdUnitStore::direct();
     let nvidia_state = NvidiaStateStore::new(None, state_root);
     let mut observations = Vec::new();
 

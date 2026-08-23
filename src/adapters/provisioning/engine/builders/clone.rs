@@ -226,8 +226,8 @@ mod tests {
                 std::sync::Arc::new(crate::adapters::process::DefaultCommandRunner),
                 None,
             ),
-            nspawn: crate::adapters::config::NspawnConfigStore::new(None),
-            systemd_unit: crate::adapters::config::SystemdUnitStore::new(None),
+            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
+            systemd_unit: crate::adapters::config::SystemdUnitStore::direct(),
         };
 
         assert_eq!(

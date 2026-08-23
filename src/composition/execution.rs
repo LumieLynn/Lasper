@@ -46,8 +46,13 @@ impl ExecutionContext {
         let local_cmd: Arc<dyn CommandRunner> = Arc::new(DefaultCommandRunner);
         let system_operations = SystemOperationStore::new(local_cmd.clone(), daemon.clone());
         let machine_inspection = MachineInspectionStore::new(daemon.clone());
-        let nspawn = NspawnConfigStore::new(daemon.clone());
-        let systemd_unit = SystemdUnitStore::new(daemon.clone());
+        let (nspawn, systemd_unit) = match daemon.as_ref() {
+            Some(daemon) => (
+                NspawnConfigStore::elevated(Arc::clone(daemon)),
+                SystemdUnitStore::elevated(Arc::clone(daemon)),
+            ),
+            None => (NspawnConfigStore::direct(), SystemdUnitStore::direct()),
+        };
         let rootfs = RootfsStore::new(daemon.clone());
         let trusted_state_root = TrustedStateRoot::production();
         let nvidia_state = NvidiaStateStore::new(daemon.clone(), trusted_state_root.clone());

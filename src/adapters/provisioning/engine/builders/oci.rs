@@ -132,7 +132,7 @@ mod tests {
             read_only: false,
             network: OciNetworkMode::Host,
             oci_pull: OciPullStore::new(),
-            nspawn: crate::adapters::config::NspawnConfigStore::new(None),
+            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
         };
 
         assert!(deployer.is_external_storage_managed());
