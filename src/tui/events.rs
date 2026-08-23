@@ -1,4 +1,5 @@
 use crossterm::event::{Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind, MouseEvent};
+use futures_util::Stream;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::interval;
@@ -61,55 +62,34 @@ pub struct EventHandler {
     pub mouse_motion_rx: watch::Receiver<Option<MouseEvent>>,
     _mouse_motion_tx: watch::Sender<Option<MouseEvent>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
+    pub input_done_rx: oneshot::Receiver<Result<(), String>>,
+    input_task: Option<tokio::task::JoinHandle<()>>,
+    tick_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl EventHandler {
     pub fn new(tick_rate_ms: u64) -> Self {
         let (tx, rx) = mpsc::channel(256);
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+        let (input_done_tx, input_done_rx) = oneshot::channel();
         let (mouse_motion_tx, mouse_motion_rx) = watch::channel(None);
 
-        // Async keyboard listener — stops immediately on shutdown signal
-        // so the EventStream (and its internal stdin thread) is dropped
-        // while the terminal is still in raw mode.
         let tx_key = tx.clone();
         let input_motion_tx = mouse_motion_tx.clone();
-        tokio::spawn(async move {
-            let mut reader = EventStream::new();
-            loop {
-                tokio::select! {
-                    event = reader.next() => {
-                        match event {
-                            Some(Ok(CrosstermEvent::Key(key)))
-                                if key.kind == KeyEventKind::Press =>
-                            {
-                                if tx_key
-                                    .send(AppEvent::Key(key))
-                                    .await
-                                    .is_err()
-                                {
-                                    break;
-                                }
-                            }
-                            Some(Ok(CrosstermEvent::Mouse(mouse))) => {
-                                if coalesces_as_pointer_motion(&mouse) {
-                                    input_motion_tx.send_replace(Some(mouse));
-                                } else if tx_key.send(AppEvent::Mouse(mouse)).await.is_err() {
-                                    break;
-                                }
-                            }
-                            None => break,
-                            _ => {}
-                        }
-                    }
-                    _ = &mut shutdown_rx => break,
-                }
-            }
+        let input_task = tokio::spawn(async move {
+            let result = run_input_loop(
+                EventStream::new(),
+                tx_key,
+                input_motion_tx,
+                &mut shutdown_rx,
+            )
+            .await;
+            let _ = input_done_tx.send(result);
         });
 
         // Async tick generator (drift-free)
         let tx_tick = tx.clone();
-        tokio::spawn(async move {
+        let tick_task = tokio::spawn(async move {
             let mut ticker = interval(Duration::from_millis(tick_rate_ms));
             loop {
                 ticker.tick().await;
@@ -125,15 +105,92 @@ impl EventHandler {
             mouse_motion_rx,
             _mouse_motion_tx: mouse_motion_tx,
             shutdown_tx: Some(shutdown_tx),
+            input_done_rx,
+            input_task: Some(input_task),
+            tick_task: Some(tick_task),
         }
     }
 
-    /// Signal the keyboard-reader task to drop its EventStream immediately.
-    /// Must be called while the terminal is still in raw mode so the
-    /// internal stdin thread can unblock quickly.
-    pub fn shutdown(&mut self) {
+    /// Drop the EventStream before the caller restores cooked terminal mode.
+    pub async fn shutdown(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(mut task) = self.input_task.take() {
+            if tokio::time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        if let Some(task) = self.tick_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for EventHandler {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(task) = self.input_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.tick_task.take() {
+            task.abort();
+        }
+    }
+}
+
+async fn run_input_loop<S>(
+    mut reader: S,
+    tx: mpsc::Sender<AppEvent>,
+    motion_tx: watch::Sender<Option<MouseEvent>>,
+    shutdown_rx: &mut oneshot::Receiver<()>,
+) -> Result<(), String>
+where
+    S: Stream<Item = std::io::Result<CrosstermEvent>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            event = reader.next() => {
+                match event {
+                    Some(Ok(CrosstermEvent::Key(key))) if key.kind == KeyEventKind::Press => {
+                        tokio::select! {
+                            result = tx.send(AppEvent::Key(key)) => {
+                                if result.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                            _ = &mut *shutdown_rx => return Ok(()),
+                        }
+                    }
+                    Some(Ok(CrosstermEvent::Mouse(mouse))) => {
+                        if coalesces_as_pointer_motion(&mouse) {
+                            motion_tx.send_replace(Some(mouse));
+                        } else {
+                            tokio::select! {
+                                result = tx.send(AppEvent::Mouse(mouse)) => {
+                                    if result.is_err() {
+                                        return Ok(());
+                                    }
+                                }
+                                _ = &mut *shutdown_rx => return Ok(()),
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        return Err(format!("terminal input read failed: {error}"));
+                    }
+                    None => return Err("terminal input stream ended unexpectedly".into()),
+                }
+            }
+            _ = &mut *shutdown_rx => return Ok(()),
         }
     }
 }
@@ -179,5 +236,33 @@ mod tests {
             MouseEventKind::ScrollDown,
             0,
         )));
+    }
+
+    #[tokio::test]
+    async fn input_errors_are_reported_instead_of_silently_stopping() {
+        let reader = tokio_stream::iter([Err(std::io::Error::other("input failed"))]);
+        let (tx, _rx) = mpsc::channel(1);
+        let (motion_tx, _motion_rx) = watch::channel(None);
+        let (_shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        let error = run_input_loop(reader, tx, motion_tx, &mut shutdown_rx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "terminal input read failed: input failed");
+    }
+
+    #[tokio::test]
+    async fn input_eof_is_reported_instead_of_leaving_a_dead_tui() {
+        let reader = tokio_stream::empty();
+        let (tx, _rx) = mpsc::channel(1);
+        let (motion_tx, _motion_rx) = watch::channel(None);
+        let (_shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+        let error = run_input_loop(reader, tx, motion_tx, &mut shutdown_rx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "terminal input stream ended unexpectedly");
     }
 }

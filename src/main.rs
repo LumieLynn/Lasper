@@ -6,6 +6,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 mod adapters;
 mod application;
@@ -22,22 +26,25 @@ use std::path::{Path, PathBuf};
 struct TerminalRestoreGuard<F: FnMut()> {
     restore: F,
     armed: bool,
+    active: Arc<AtomicBool>,
 }
 
 impl<F: FnMut()> TerminalRestoreGuard<F> {
-    fn new(restore: F) -> Self {
+    fn new(restore: F, active: Arc<AtomicBool>) -> Self {
         Self {
             restore,
             armed: false,
+            active,
         }
     }
 
     fn arm(&mut self) {
         self.armed = true;
+        self.active.store(true, Ordering::Release);
     }
 
     fn restore(&mut self) {
-        if std::mem::take(&mut self.armed) {
+        if std::mem::take(&mut self.armed) && self.active.swap(false, Ordering::AcqRel) {
             (self.restore)();
         }
     }
@@ -50,8 +57,17 @@ impl<F: FnMut()> Drop for TerminalRestoreGuard<F> {
 }
 
 fn restore_terminal() {
+    let _ = execute!(io::stdout(), DisableMouseCapture);
+    let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
-    let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+}
+
+fn claim_terminal_restore_for_panic(
+    active: &AtomicBool,
+    terminal_owner: std::thread::ThreadId,
+    panicking_thread: std::thread::ThreadId,
+) -> bool {
+    panicking_thread == terminal_owner && active.swap(false, Ordering::AcqRel)
 }
 
 /// Resolve the log directory.
@@ -277,15 +293,31 @@ async fn main() -> Result<()> {
     log::info!("Elevation mode: {}", use_sudo);
 
     // 5. Install panic hook
+    let terminal_active = Arc::new(AtomicBool::new(false));
+    let terminal_owner = std::thread::current().id();
+    let panic_terminal_active = Arc::clone(&terminal_active);
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-        original_hook(info);
+        let panicking_thread = std::thread::current().id();
+        if panicking_thread == terminal_owner {
+            if claim_terminal_restore_for_panic(
+                &panic_terminal_active,
+                terminal_owner,
+                panicking_thread,
+            ) {
+                restore_terminal();
+            }
+            original_hook(info);
+        } else if panic_terminal_active.load(Ordering::Acquire) {
+            log::error!("background task panicked while the TUI was active: {info}");
+        } else {
+            original_hook(info);
+        }
     }));
 
     // 6. Initialize terminal
-    let mut terminal_restore = TerminalRestoreGuard::new(restore_terminal);
+    let mut terminal_restore =
+        TerminalRestoreGuard::new(restore_terminal, Arc::clone(&terminal_active));
     enable_raw_mode().context("Failed to enable raw mode")?;
     terminal_restore.arm();
     let mut stdout = io::stdout();
@@ -388,20 +420,25 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod terminal_restore_tests {
-    use super::TerminalRestoreGuard;
+    use super::{claim_terminal_restore_for_panic, TerminalRestoreGuard};
     use std::cell::Cell;
+    use std::sync::{atomic::AtomicBool, Arc};
 
     #[test]
     fn armed_guard_restores_on_early_return_and_only_once() {
         let calls = Cell::new(0);
         {
-            let mut guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+            let active = Arc::new(AtomicBool::new(false));
+            let mut guard =
+                TerminalRestoreGuard::new(|| calls.set(calls.get() + 1), active.clone());
             guard.arm();
+            assert!(active.load(std::sync::atomic::Ordering::Acquire));
         }
         assert_eq!(calls.get(), 1);
 
         {
-            let mut guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+            let active = Arc::new(AtomicBool::new(false));
+            let mut guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1), active);
             guard.arm();
             guard.restore();
         }
@@ -412,8 +449,27 @@ mod terminal_restore_tests {
     fn unarmed_guard_does_not_restore() {
         let calls = Cell::new(0);
         {
-            let _guard = TerminalRestoreGuard::new(|| calls.set(calls.get() + 1));
+            let _guard = TerminalRestoreGuard::new(
+                || calls.set(calls.get() + 1),
+                Arc::new(AtomicBool::new(false)),
+            );
         }
         assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn only_the_terminal_owner_claims_panic_restoration() {
+        let owner = std::thread::current().id();
+        let background = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        let active = AtomicBool::new(true);
+
+        assert!(!claim_terminal_restore_for_panic(
+            &active, owner, background
+        ));
+        assert!(active.load(std::sync::atomic::Ordering::Acquire));
+        assert!(claim_terminal_restore_for_panic(&active, owner, owner));
+        assert!(!active.load(std::sync::atomic::Ordering::Acquire));
     }
 }

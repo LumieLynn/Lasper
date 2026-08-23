@@ -669,7 +669,7 @@ impl App {
 
         self.data.runtime_catalog.watch(refresh_tx).await;
 
-        loop {
+        let loop_result = loop {
             // Drain at most 3 refresh batches per frame so rapid background
             // updates can't starve user-input events from the select! below.
             for _ in 0..3 {
@@ -706,12 +706,14 @@ impl App {
             self.start_detail_refresh(&detail_refresh_tx);
 
             // Render a frame
-            terminal.draw(|f| crate::tui::draw(f, self))?;
+            if let Err(error) = terminal.draw(|f| crate::tui::draw(f, self)) {
+                break Err(anyhow::Error::from(error));
+            }
 
             tokio::select! {
                 _ = &mut quit_rx => {
                     log::info!("[lasper] select!: quit_rx fired");
-                    break;
+                    break Ok(());
                 }
                 Some(event) = events.rx.recv() => {
                     self.handle_event(event).await;
@@ -733,26 +735,34 @@ impl App {
                         }
                     }
                 }
+                input_result = &mut events.input_done_rx => {
+                    let error = match input_result {
+                        Ok(Err(error)) => error,
+                        Ok(Ok(())) => "terminal input task stopped unexpectedly".into(),
+                        Err(_) => "terminal input task panicked or was cancelled".into(),
+                    };
+                    break Err(anyhow::anyhow!(error));
+                }
                 else => {
                     log::info!("[lasper] select!: else branch");
-                    break;
+                    break Ok(());
                 }
             }
 
             if self.should_quit {
                 log::info!("[lasper] main loop: should_quit=true, breaking");
-                break;
+                break Ok(());
             }
-        }
+        };
         log::info!("[lasper] run() cleaning up...");
         self.data.terminal.cleanup_all();
         self.data.log_manager.cleanup_all();
         // Shut down the EventStream while the terminal is still in raw mode
         // so the internal stdin thread can unblock quickly instead of
         // blocking on a cooked-mode read after terminal restore.
-        events.shutdown();
+        events.shutdown().await;
         log::info!("[lasper] run() returning Ok(())");
-        Ok(())
+        loop_result
     }
 
     // Tick (auto-refresh + status expiry)
