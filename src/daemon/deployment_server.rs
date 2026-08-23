@@ -751,7 +751,13 @@ async fn write_frame(
         .expect("bounded fallback deployment frame serializes");
     }
     bytes.push(b'\n');
-    writer.write_all(&bytes).await.is_ok()
+    if writer.write_all(&bytes).await.is_err() {
+        return false;
+    }
+    // The client consumes one frame at a time from the pipe. Flush here so
+    // progress output is visible while the deployment is still running,
+    // rather than being held by the BufWriter until the terminal snapshot.
+    writer.flush().await.is_ok()
 }
 
 fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
@@ -768,10 +774,11 @@ fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
 mod tests {
     use super::*;
     use crate::application::provisioning::{
-        DeploymentRequest, DeploymentSource, DeploymentStorage,
+        DeploymentEvent, DeploymentRequest, DeploymentSource, DeploymentStorage,
     };
     use crate::domain::machine::MachineName;
     use crate::nspawn::models::ContainerConfig;
+    use tokio::io::AsyncBufReadExt;
 
     fn plan(target: &str) -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
@@ -808,6 +815,35 @@ mod tests {
             DeploymentCancellation::default(),
             operations,
         )
+    }
+
+    #[tokio::test]
+    async fn deployment_stream_frames_are_flushed_before_terminal_state() {
+        let (reader, writer) = tokio::io::duplex(1024);
+        let mut reader = tokio::io::BufReader::new(reader);
+        let mut writer = tokio::io::BufWriter::new(writer);
+
+        assert!(
+            write_frame(
+                &mut writer,
+                DeploymentStreamFrame::Event(DeploymentEvent::Line("early log".into())),
+            )
+            .await
+        );
+
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("deployment event should be visible before terminal state")
+        .unwrap();
+        assert!(read > 0);
+        assert!(matches!(
+            serde_json::from_str::<DeploymentStreamFrame>(line.trim_end()).unwrap(),
+            DeploymentStreamFrame::Event(DeploymentEvent::Line(message)) if message == "early log"
+        ));
     }
 
     #[test]
