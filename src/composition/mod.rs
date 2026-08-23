@@ -1,5 +1,7 @@
 //! Production assembly for application services and host adapters.
 
+#[cfg(test)]
+mod boundaries;
 mod mode;
 mod permission;
 
