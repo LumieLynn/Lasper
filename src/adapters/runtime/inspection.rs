@@ -1,4 +1,4 @@
-//! Mode-aware CLI machine inspection.
+//! Route-fixed CLI machine inspection.
 
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -10,41 +10,115 @@ use std::sync::Arc;
 /// the application service.
 #[derive(Clone)]
 pub struct MachineInspectionStore {
-    daemon: Option<Arc<ElevatedDaemon>>,
+    executor: Arc<dyn MachineInspectionExecutor>,
 }
 
 impl MachineInspectionStore {
-    pub fn new(daemon: Option<Arc<ElevatedDaemon>>) -> Self {
-        Self { daemon }
-    }
-
-    pub async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
-        if let Some(daemon) = &self.daemon {
-            daemon
-                .cli_inspect_machine(name)
-                .await
-                .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
-        } else {
-            crate::adapters::runtime::state::inspect(name, entry).await
+    pub(crate) fn direct() -> Self {
+        Self {
+            executor: Arc::new(DirectMachineInspectionExecutor),
         }
     }
 
-    /// Inspect the systemd unit associated with an image, if its name can be
-    /// represented as an nspawn machine name. This read-only query runs in the
-    /// caller and never asks machined for a runtime registration.
-    pub async fn inspect_static(&self, name: &str) -> Result<Option<MachineProperties>> {
-        crate::adapters::runtime::cli::get_image_unit_properties_with_runner(
-            name,
-            &crate::adapters::process::DefaultCommandRunner,
-        )
-        .await
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedMachineInspectionExecutor { daemon }),
+        }
+    }
+
+    pub async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+        self.executor.inspect(name, entry).await
     }
 }
 
 impl std::fmt::Debug for MachineInspectionStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MachineInspectionStore")
-            .field("elevated", &self.daemon.is_some())
+            .field("route", &self.executor.route())
             .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait MachineInspectionExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties>;
+}
+
+struct DirectMachineInspectionExecutor;
+
+#[async_trait::async_trait]
+impl MachineInspectionExecutor for DirectMachineInspectionExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+        crate::adapters::runtime::state::inspect(name, entry).await
+    }
+}
+
+struct ElevatedMachineInspectionExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn inspect(&self, name: &str, _entry: &ContainerEntry) -> Result<MachineProperties> {
+        self.daemon
+            .cli_inspect_machine(name)
+            .await
+            .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::nspawn::models::ContainerState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingInspector {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl MachineInspectionExecutor for RecordingInspector {
+        fn route(&self) -> &'static str {
+            "recording"
+        }
+
+        async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+            assert_eq!(name, "test-machine");
+            assert_eq!(entry.name, "test-machine");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MachineProperties::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let executor = Arc::new(RecordingInspector {
+            calls: AtomicUsize::new(0),
+        });
+        let store = MachineInspectionStore {
+            executor: executor.clone(),
+        };
+        let entry = ContainerEntry {
+            name: "test-machine".into(),
+            state: ContainerState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        };
+
+        store.inspect("test-machine", &entry).await.unwrap();
+
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(format!("{store:?}").contains("recording"));
     }
 }

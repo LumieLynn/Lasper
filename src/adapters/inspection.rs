@@ -1,26 +1,27 @@
 //! Host-backed resource detail inspection.
 
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
-use crate::adapters::runtime::inspection::MachineInspectionStore;
+use crate::adapters::process::CommandRunner;
 use crate::application::inspection::{
     ImageUnitInspection, NspawnConfigInspection, ResourceInspectionError, ResourceInspectionPort,
     SystemdDropInInspection, SystemdUnitInspection,
 };
+use std::sync::Arc;
 
 pub(crate) struct StoreResourceInspection {
-    machine: MachineInspectionStore,
+    local_cmd: Arc<dyn CommandRunner>,
     nspawn: NspawnConfigStore,
     systemd_unit: SystemdUnitStore,
 }
 
 impl StoreResourceInspection {
     pub(crate) fn new(
-        machine: MachineInspectionStore,
+        local_cmd: Arc<dyn CommandRunner>,
         nspawn: NspawnConfigStore,
         systemd_unit: SystemdUnitStore,
     ) -> Self {
         Self {
-            machine,
+            local_cmd,
             nspawn,
             systemd_unit,
         }
@@ -46,11 +47,12 @@ impl ResourceInspectionPort for StoreResourceInspection {
     }
 
     async fn inspect_image_unit(&self, name: &str) -> ImageUnitInspection {
-        let properties = self
-            .machine
-            .inspect_static(name)
-            .await
-            .map_err(ResourceInspectionError::backend);
+        let properties = crate::adapters::runtime::cli::get_image_unit_properties_with_runner(
+            name,
+            self.local_cmd.as_ref(),
+        )
+        .await
+        .map_err(ResourceInspectionError::backend);
         let unit = if matches!(properties, Ok(None)) {
             None
         } else {
@@ -83,7 +85,7 @@ mod tests {
     #[tokio::test]
     async fn non_machine_image_names_do_not_probe_systemd_unit_drop_ins() {
         let inspection = StoreResourceInspection::new(
-            MachineInspectionStore::new(None),
+            Arc::new(crate::adapters::process::DefaultCommandRunner),
             NspawnConfigStore::direct(),
             SystemdUnitStore::direct(),
         );

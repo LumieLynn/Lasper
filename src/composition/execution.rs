@@ -48,7 +48,10 @@ impl ExecutionContext {
             Some(daemon) => SystemOperationStore::elevated(Arc::clone(daemon)),
             None => SystemOperationStore::direct(local_cmd.clone()),
         };
-        let machine_inspection = MachineInspectionStore::new(daemon.clone());
+        let machine_inspection = match daemon.as_ref() {
+            Some(daemon) => MachineInspectionStore::elevated(Arc::clone(daemon)),
+            None => MachineInspectionStore::direct(),
+        };
         let (nspawn, systemd_unit) = match daemon.as_ref() {
             Some(daemon) => (
                 NspawnConfigStore::elevated(Arc::clone(daemon)),

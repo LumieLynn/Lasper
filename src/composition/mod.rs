@@ -57,7 +57,7 @@ pub(crate) fn compose_application_services(
         crate::adapters::provisioning::compose_provisioning_preparation_service();
     let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
         crate::adapters::inspection::StoreResourceInspection::new(
-            execution.machine_inspection.clone(),
+            execution.local_cmd.clone(),
             execution.nspawn.clone(),
             execution.systemd_unit.clone(),
         ),
