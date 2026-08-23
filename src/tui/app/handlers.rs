@@ -335,7 +335,7 @@ impl App {
     fn request_quit(&mut self) {
         let message = quit_confirmation_message(
             self.data.terminal.sessions.len(),
-            self.data.exec_ctx.host_operations.active_count(),
+            self.data.host_operations.active_count(),
         );
         if let Some(message) = message {
             self.ui.quit_dialog = Some(

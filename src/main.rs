@@ -353,14 +353,7 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let mut app = tui::app::App::new(
-        pm,
-        want_cli_mode,
-        log_buffer_lines,
-        services,
-        exec_ctx.clone(),
-        app_config,
-    );
+    let mut app = tui::app::App::new(pm, want_cli_mode, log_buffer_lines, services, app_config);
     if let Some(diagnostic) = config_diagnostic {
         log::warn!("{}", diagnostic.detail);
         app.set_status_for(

@@ -236,7 +236,7 @@ impl App {
                 self.data.properties = match result.properties {
                     Ok(Some(properties)) => Ok(properties),
                     Ok(None) => Ok(MachineProperties::default()),
-                    Err(error) => Err(error),
+                    Err(error) => Err(error.to_string()),
                 };
                 self.data.properties_dirty = true;
                 self.data.details_dirty = true;
@@ -263,7 +263,10 @@ impl App {
         }
     }
 
-    fn apply_config_snapshot(&mut self, config: Option<super::detail_refresh::ConfigSnapshot>) {
+    fn apply_config_snapshot(
+        &mut self,
+        config: Option<crate::application::inspection::NspawnConfigInspection>,
+    ) {
         let new_path = config.as_ref().map(|config| config.path.clone());
         let new_content = config.map(|config| config.content);
         if self.data.config_content != new_content {
@@ -278,9 +281,7 @@ impl App {
         DetailRefreshServices {
             runtime_catalog: self.data.runtime_catalog.clone(),
             session_service: self.data.session_service.clone(),
-            machine_inspection: self.data.exec_ctx.machine_inspection.clone(),
-            nspawn: self.data.exec_ctx.nspawn.clone(),
-            systemd_unit: self.data.exec_ctx.systemd_unit.clone(),
+            resource_inspection: self.data.resource_inspection.clone(),
         }
     }
 
@@ -465,7 +466,7 @@ impl App {
         self.apply_machine_projection();
 
         let pm = self.permissions.clone();
-        let host_operation = self.data.exec_ctx.host_operations.begin();
+        let host_operation = self.data.host_operations.begin();
         tokio::spawn(async move {
             let _host_operation = host_operation;
             let audit = match pm
@@ -715,7 +716,7 @@ impl App {
             None => return,
         };
         let pm = self.permissions.clone();
-        let operation = self.data.exec_ctx.host_operations.begin();
+        let operation = self.data.host_operations.begin();
         tokio::spawn(async move {
             let _operation = operation;
             let audit = match pm.request_elevation(format!("Remove image {}", name)).await {

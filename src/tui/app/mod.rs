@@ -13,9 +13,10 @@ use std::time::Instant;
 use crate::application::provisioning::{ProvisioningPreparationService, ProvisioningService};
 use crate::application::sessions::SessionService;
 use crate::application::{
-    ImageLifecycleService, MachineLifecycleService, RuntimeCatalog, RuntimeUpdate,
+    HostOperationTracker, ImageLifecycleService, MachineLifecycleService,
+    ResourceInspectionService, RuntimeCatalog, RuntimeUpdate,
 };
-use crate::composition::{ApplicationServices, ExecutionContext};
+use crate::composition::ApplicationServices;
 use crate::nspawn::models::{
     ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
 };
@@ -202,7 +203,7 @@ pub struct AppData {
     pub config_path: Option<std::path::PathBuf>,
     pub detail_target: DetailTarget,
     pub unit_name: Option<String>,
-    pub unit_drop_ins: Vec<crate::adapters::config::systemd_unit::SystemdDropIn>,
+    pub unit_drop_ins: Vec<crate::application::inspection::SystemdDropInInspection>,
     pub dbus_active: bool,
     pub session_service: std::sync::Arc<SessionService>,
     pub runtime_catalog: std::sync::Arc<RuntimeCatalog>,
@@ -210,7 +211,8 @@ pub struct AppData {
     pub image_lifecycle: std::sync::Arc<ImageLifecycleService>,
     pub provisioning: std::sync::Arc<ProvisioningService>,
     pub provisioning_preparation: std::sync::Arc<ProvisioningPreparationService>,
-    pub exec_ctx: std::sync::Arc<ExecutionContext>,
+    pub resource_inspection: std::sync::Arc<ResourceInspectionService>,
+    pub host_operations: HostOperationTracker,
     pub action_cooldown: Option<Instant>,
     pub metrics: HashMap<String, ContainerMetrics>,
     pub cpu_cores: usize,
@@ -243,7 +245,6 @@ impl App {
         cli_mode: bool,
         log_buffer_lines: usize,
         services: ApplicationServices,
-        exec_ctx: std::sync::Arc<ExecutionContext>,
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
         let ApplicationServices {
@@ -253,6 +254,8 @@ impl App {
             image_lifecycle,
             provisioning,
             provisioning_preparation,
+            resource_inspection,
+            host_operations,
         } = services;
         Self {
             permissions,
@@ -281,7 +284,8 @@ impl App {
                 image_lifecycle,
                 provisioning,
                 provisioning_preparation,
-                exec_ctx,
+                resource_inspection,
+                host_operations,
                 action_cooldown: None,
                 metrics: HashMap::new(),
                 cpu_cores: std::thread::available_parallelism()
@@ -828,6 +832,17 @@ mod tests {
     use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry};
     use std::time::Duration;
 
+    #[test]
+    fn production_app_state_has_no_execution_context_or_adapter_store() {
+        let production = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("application module has a production section");
+
+        assert!(!production.contains("ExecutionContext"));
+        assert!(!production.contains("crate::adapters"));
+    }
+
     fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
         ContainerEntry {
             name: name.to_string(),
@@ -870,7 +885,6 @@ mod tests {
             false, // cli_mode
             0,
             services,
-            exec_ctx,
             std::sync::Arc::new(crate::config::AppConfig::default()),
         )
     }
@@ -983,7 +997,7 @@ mod tests {
                 .expect("start task should finish")
                 .expect("start task should report a result");
             tokio::task::yield_now().await;
-            assert_eq!(app.data.exec_ctx.host_operations.active_count(), 0);
+            assert_eq!(app.data.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
                 AppEvent::MachineActionFinished(outcome)

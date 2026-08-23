@@ -4,14 +4,13 @@
 //! at most one read at a time and applies its result only when the ticket still
 //! describes the visible target and pane.
 
-use crate::adapters::config::systemd_unit::SystemdUnitInspection;
-use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
-use crate::adapters::runtime::inspection::MachineInspectionStore;
+use crate::application::inspection::{
+    ImageUnitInspection, NspawnConfigInspection, ResourceInspectionService,
+};
 use crate::application::sessions::{JournalSessionHandle, SessionService};
 use crate::application::{RuntimeCatalog, RuntimeQuery};
 use crate::nspawn::models::{ContainerEntry, MachineProperties};
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
-use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,9 +72,7 @@ impl DetailRefreshState {
 pub(crate) struct DetailRefreshServices {
     pub runtime_catalog: Arc<RuntimeCatalog>,
     pub session_service: Arc<SessionService>,
-    pub machine_inspection: MachineInspectionStore,
-    pub nspawn: NspawnConfigStore,
-    pub systemd_unit: SystemdUnitStore,
+    pub resource_inspection: Arc<ResourceInspectionService>,
 }
 
 pub(crate) enum DetailRefreshWork {
@@ -117,37 +114,15 @@ impl DetailRefreshJob {
             }
             DetailRefreshWork::Config { name } => {
                 let config = services
-                    .nspawn
-                    .inspect(&name)
+                    .resource_inspection
+                    .inspect_nspawn_config(&name)
                     .await
-                    .map(|config| {
-                        config.map(|config| ConfigSnapshot {
-                            path: config.path,
-                            content: config.content,
-                        })
-                    })
                     .map_err(|error| error.to_string());
                 DetailRefreshResult::Config(config)
             }
-            DetailRefreshWork::ImageUnit { name } => {
-                let properties = services
-                    .machine_inspection
-                    .inspect_static(&name)
-                    .await
-                    .map_err(|error| error.to_string());
-                let unit = if matches!(properties, Ok(None)) {
-                    None
-                } else {
-                    Some(
-                        services
-                            .systemd_unit
-                            .read(&name)
-                            .await
-                            .map_err(|error| error.to_string()),
-                    )
-                };
-                DetailRefreshResult::ImageUnit(ImageUnitRefreshResult { properties, unit })
-            }
+            DetailRefreshWork::ImageUnit { name } => DetailRefreshResult::ImageUnit(
+                services.resource_inspection.inspect_image_unit(&name).await,
+            ),
         };
         DetailRefreshCompletion {
             ticket: self.ticket,
@@ -168,15 +143,9 @@ pub(crate) enum DetailRefreshResult {
     Noop,
     MachineProperties(Result<RuntimeQuery<MachineProperties>, String>),
     Journal(JournalRefreshResult),
-    Config(Result<Option<ConfigSnapshot>, String>),
+    Config(Result<Option<NspawnConfigInspection>, String>),
     ImageOverview(MachineProperties),
-    ImageUnit(ImageUnitRefreshResult),
-}
-
-#[derive(Debug)]
-pub(crate) struct ConfigSnapshot {
-    pub path: PathBuf,
-    pub content: String,
+    ImageUnit(ImageUnitInspection),
 }
 
 pub(crate) struct JournalRefreshResult {
@@ -212,12 +181,6 @@ impl std::fmt::Debug for JournalRefreshResult {
             .field("hint", &self.hint)
             .finish()
     }
-}
-
-#[derive(Debug)]
-pub(crate) struct ImageUnitRefreshResult {
-    pub properties: Result<Option<MachineProperties>, String>,
-    pub unit: Option<Result<SystemdUnitInspection, String>>,
 }
 
 #[cfg(test)]

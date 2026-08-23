@@ -9,7 +9,8 @@ pub(crate) use permission::{DefaultPermissionManager, PermissionLevel, Permissio
 use crate::application::provisioning::ProvisioningService;
 use crate::application::sessions::SessionService;
 use crate::application::{
-    ImageLifecycleService, MachineLifecycleService, OperationRegistry, RuntimeCatalog,
+    HostOperationTracker, ImageLifecycleService, MachineLifecycleService, OperationRegistry,
+    ResourceInspectionService, RuntimeCatalog,
 };
 use std::sync::Arc;
 
@@ -21,6 +22,8 @@ pub(crate) struct ApplicationServices {
     pub provisioning: Arc<ProvisioningService>,
     pub provisioning_preparation:
         Arc<crate::application::provisioning::ProvisioningPreparationService>,
+    pub resource_inspection: Arc<ResourceInspectionService>,
+    pub host_operations: HostOperationTracker,
 }
 
 pub(crate) fn compose_application_services(
@@ -52,6 +55,13 @@ pub(crate) fn compose_application_services(
     );
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
+    let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
+        crate::adapters::inspection::StoreResourceInspection::new(
+            execution.machine_inspection.clone(),
+            execution.nspawn.clone(),
+            execution.systemd_unit.clone(),
+        ),
+    )));
 
     ApplicationServices {
         session,
@@ -60,5 +70,7 @@ pub(crate) fn compose_application_services(
         image_lifecycle,
         provisioning,
         provisioning_preparation,
+        resource_inspection,
+        host_operations: execution.host_operations.clone(),
     }
 }
