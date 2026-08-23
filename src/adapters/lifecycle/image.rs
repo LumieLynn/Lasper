@@ -14,67 +14,63 @@ use crate::application::machine_lifecycle::{
     MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
 };
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::composition::{ExecutionContext, PermissionLevel};
 use crate::nspawn::models::{ContainerEntry, ImageName, MachineName};
 use std::sync::Arc;
+
+pub(crate) struct ImageLifecycleAdapters {
+    pub(crate) local_cmd: Arc<dyn CommandRunner>,
+    pub(crate) system_operations: SystemOperationStore,
+    pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
+    pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
+    pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+}
+
+pub(crate) enum ImageLifecycleRoute {
+    DirectDbus,
+    LocalCli,
+    Elevated {
+        daemon: Arc<ElevatedDaemon>,
+        transport: ImageRemoveTransport,
+    },
+}
 
 pub(crate) fn compose_image_lifecycle(
     runtime_catalog: Arc<RuntimeCatalog>,
     registry: Arc<OperationRegistry>,
-    level: PermissionLevel,
-    cli_mode: bool,
-    exec_ctx: &ExecutionContext,
+    route: ImageLifecycleRoute,
+    adapters: ImageLifecycleAdapters,
 ) -> ImageLifecycleService {
+    let ImageLifecycleAdapters {
+        local_cmd,
+        system_operations,
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+    } = adapters;
     let runtime: Arc<dyn ImageRuntime> = Arc::new(CatalogImageRuntime(runtime_catalog));
-    let route = match select_image_control_route(level, cli_mode) {
-        ImageControlRouteKind::Daemon(transport) => ImageControlRoute::Daemon {
-            daemon: exec_ctx
-                .daemon_ref()
-                .cloned()
-                .expect("elevated image lifecycle requires daemon"),
-            system_operations: exec_ctx.system_operations.clone(),
+    let route = match route {
+        ImageLifecycleRoute::Elevated { daemon, transport } => ImageControlRoute::Daemon {
+            daemon,
+            system_operations: system_operations.clone(),
             transport,
         },
-        ImageControlRouteKind::LocalCli => ImageControlRoute::LocalCli {
-            runner: exec_ctx.local_cmd.clone(),
-            system_operations: exec_ctx.system_operations.clone(),
+        ImageLifecycleRoute::LocalCli => ImageControlRoute::LocalCli {
+            runner: local_cmd.clone(),
+            system_operations: system_operations.clone(),
         },
-        ImageControlRouteKind::DirectDbus => ImageControlRoute::DirectDbus {
+        ImageLifecycleRoute::DirectDbus => ImageControlRoute::DirectDbus {
             dbus: DbusBackend::new(),
-            fallback_runner: exec_ctx.local_cmd.clone(),
-            fallback_operations: exec_ctx.system_operations.clone(),
+            fallback_runner: local_cmd,
+            fallback_operations: system_operations.clone(),
         },
     };
-    let control: Arc<dyn ImageControl> = Arc::new(RoutedImageControl {
-        route,
-        nspawn: exec_ctx.nspawn.clone(),
-    });
+    let control: Arc<dyn ImageControl> = Arc::new(RoutedImageControl { route, nspawn });
     let cleanup: Arc<dyn ManagedArtifactCleanup> = Arc::new(StoreArtifactCleanup {
-        systemd_unit: exec_ctx.systemd_unit.clone(),
-        nvidia_state: exec_ctx.nvidia_state.clone(),
-        system_operations: exec_ctx.system_operations.clone(),
+        systemd_unit,
+        nvidia_state,
+        system_operations,
     });
     ImageLifecycleService::new(runtime, control, cleanup, registry)
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ImageControlRouteKind {
-    DirectDbus,
-    LocalCli,
-    Daemon(ImageRemoveTransport),
-}
-
-fn select_image_control_route(level: PermissionLevel, cli_mode: bool) -> ImageControlRouteKind {
-    match (level, cli_mode) {
-        (PermissionLevel::Elevated, false) => {
-            ImageControlRouteKind::Daemon(ImageRemoveTransport::Dbus)
-        }
-        (PermissionLevel::Elevated, true) => {
-            ImageControlRouteKind::Daemon(ImageRemoveTransport::Cli)
-        }
-        (PermissionLevel::User | PermissionLevel::Root, false) => ImageControlRouteKind::DirectDbus,
-        (PermissionLevel::User | PermissionLevel::Root, true) => ImageControlRouteKind::LocalCli,
-    }
 }
 
 fn direct_remove_may_fallback(outcome: &ImageControlOutcome) -> bool {
@@ -292,34 +288,6 @@ impl ManagedArtifactCleanup for StoreArtifactCleanup {
 mod tests {
     use super::*;
     use crate::application::image_lifecycle::ImageRemovalRejection;
-
-    #[test]
-    fn image_control_route_covers_authority_and_cli_modes() {
-        assert_eq!(
-            select_image_control_route(PermissionLevel::User, false),
-            ImageControlRouteKind::DirectDbus
-        );
-        assert_eq!(
-            select_image_control_route(PermissionLevel::Root, false),
-            ImageControlRouteKind::DirectDbus
-        );
-        assert_eq!(
-            select_image_control_route(PermissionLevel::User, true),
-            ImageControlRouteKind::LocalCli
-        );
-        assert_eq!(
-            select_image_control_route(PermissionLevel::Root, true),
-            ImageControlRouteKind::LocalCli
-        );
-        assert_eq!(
-            select_image_control_route(PermissionLevel::Elevated, false),
-            ImageControlRouteKind::Daemon(ImageRemoveTransport::Dbus)
-        );
-        assert_eq!(
-            select_image_control_route(PermissionLevel::Elevated, true),
-            ImageControlRouteKind::Daemon(ImageRemoveTransport::Cli)
-        );
-    }
 
     #[test]
     fn direct_remove_falls_back_only_when_no_attempt_was_made() {

@@ -16,50 +16,69 @@ use crate::application::machine_lifecycle::{
 };
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::composition::{ExecutionContext, PermissionLevel};
 use crate::nspawn::errors::NspawnError;
 use crate::nspawn::models::{ContainerEntry, MachineName, MachineProperties};
 use std::sync::Arc;
 
+pub(crate) struct MachineLifecycleAdapters {
+    pub(crate) local_cmd: Arc<dyn CommandRunner>,
+    pub(crate) system_operations: SystemOperationStore,
+    pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
+    pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
+    pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    pub(crate) rootfs: crate::adapters::rootfs::RootfsStore,
+}
+
+pub(crate) enum MachineLifecycleRoute {
+    DirectDbus,
+    LocalCli,
+    Elevated {
+        daemon: Arc<ElevatedDaemon>,
+        transport: MachineControlTransport,
+    },
+}
+
 pub(crate) fn compose_machine_lifecycle(
     runtime: Arc<RuntimeCatalog>,
     registry: Arc<OperationRegistry>,
-    level: PermissionLevel,
-    cli_mode: bool,
-    exec_ctx: &ExecutionContext,
+    route: MachineLifecycleRoute,
+    adapters: MachineLifecycleAdapters,
 ) -> Arc<MachineLifecycleService> {
+    let MachineLifecycleAdapters {
+        local_cmd,
+        system_operations,
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+        rootfs,
+    } = adapters;
     let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
-        route: match select_machine_control_route(level, cli_mode) {
-            MachineControlRouteKind::DirectDbus => MachineControlRoute::DirectDbus {
+        route: match route {
+            MachineLifecycleRoute::DirectDbus => MachineControlRoute::DirectDbus {
                 dbus: DbusBackend::new(),
-                fallback_runner: exec_ctx.local_cmd.clone(),
+                fallback_runner: local_cmd.clone(),
             },
-            MachineControlRouteKind::LocalCli => MachineControlRoute::LocalCli {
-                runner: exec_ctx.local_cmd.clone(),
+            MachineLifecycleRoute::LocalCli => MachineControlRoute::LocalCli {
+                runner: local_cmd.clone(),
             },
-            MachineControlRouteKind::Daemon(transport) => MachineControlRoute::Daemon {
-                daemon: exec_ctx
-                    .daemon_ref()
-                    .cloned()
-                    .expect("elevated machine lifecycle requires daemon"),
-                transport,
-            },
+            MachineLifecycleRoute::Elevated { daemon, transport } => {
+                MachineControlRoute::Daemon { daemon, transport }
+            }
         },
     });
     let preparation: Arc<dyn MachineStartPreparation> = Arc::new(StoreStartPreparation {
-        nspawn: exec_ctx.nspawn.clone(),
-        systemd_unit: exec_ctx.systemd_unit.clone(),
-        nvidia_state: exec_ctx.nvidia_state.clone(),
-        rootfs: exec_ctx.rootfs.clone(),
-        system_operations: exec_ctx.system_operations.clone(),
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+        rootfs,
+        system_operations,
         runtime: runtime.clone(),
     });
     let observation: Arc<dyn MachineObservation> = Arc::new(CatalogMachineObservation {
         runtime: runtime.clone(),
     });
-    let diagnostics: Arc<dyn MachineStartDiagnostics> = Arc::new(LocalStartDiagnostics {
-        runner: exec_ctx.local_cmd.clone(),
-    });
+    let diagnostics: Arc<dyn MachineStartDiagnostics> =
+        Arc::new(LocalStartDiagnostics { runner: local_cmd });
     Arc::new(MachineLifecycleService::new(
         control,
         preparation,
@@ -67,28 +86,6 @@ pub(crate) fn compose_machine_lifecycle(
         diagnostics,
         registry,
     ))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MachineControlRouteKind {
-    DirectDbus,
-    LocalCli,
-    Daemon(MachineControlTransport),
-}
-
-fn select_machine_control_route(level: PermissionLevel, cli_mode: bool) -> MachineControlRouteKind {
-    match (level, cli_mode) {
-        (PermissionLevel::Elevated, false) => {
-            MachineControlRouteKind::Daemon(MachineControlTransport::Dbus)
-        }
-        (PermissionLevel::Elevated, true) => {
-            MachineControlRouteKind::Daemon(MachineControlTransport::Cli)
-        }
-        (PermissionLevel::User | PermissionLevel::Root, false) => {
-            MachineControlRouteKind::DirectDbus
-        }
-        (PermissionLevel::User | PermissionLevel::Root, true) => MachineControlRouteKind::LocalCli,
-    }
 }
 
 enum MachineControlRoute {
@@ -385,26 +382,6 @@ mod tests {
             stdout: vec![],
             stderr: vec![],
         }
-    }
-
-    #[test]
-    fn composition_selects_each_execution_route_once() {
-        assert_eq!(
-            select_machine_control_route(PermissionLevel::User, false),
-            MachineControlRouteKind::DirectDbus
-        );
-        assert_eq!(
-            select_machine_control_route(PermissionLevel::Root, true),
-            MachineControlRouteKind::LocalCli
-        );
-        assert_eq!(
-            select_machine_control_route(PermissionLevel::Elevated, false),
-            MachineControlRouteKind::Daemon(MachineControlTransport::Dbus)
-        );
-        assert_eq!(
-            select_machine_control_route(PermissionLevel::Elevated, true),
-            MachineControlRouteKind::Daemon(MachineControlTransport::Cli)
-        );
     }
 
     #[tokio::test]
