@@ -4,7 +4,7 @@ use super::dispatch::{initialize_dbus_backend, run_rpc_request_pump};
 use super::logging::{initialize_daemon_logging, AuthLogLimiter};
 use super::process_state::shutdown_daemon_resources;
 use super::protocol::*;
-use super::session_server::{self, DaemonServerState};
+use super::session_server::DaemonServerState;
 use super::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
@@ -443,28 +443,5 @@ async fn handle_fd_connection(
         }
     };
 
-    log::trace!(
-        "Daemon FD operation {} ({})",
-        operation.wire_name(),
-        operation.family().as_str()
-    );
-    match operation {
-        FdOperation::Journalctl(params) => {
-            session_server::spawn_journal(&mut std_stream, params, server_state);
-        }
-
-        FdOperation::Terminal(params) => {
-            session_server::spawn_terminal(&mut std_stream, params, server_state);
-        }
-
-        FdOperation::SubmitDeployment(params) => {
-            super::deployment_server::submit(
-                &mut std_stream,
-                *params,
-                server_state,
-                trusted_state_root,
-            )
-            .await;
-        }
-    }
+    super::fd::handle(&mut std_stream, operation, server_state, trusted_state_root).await;
 }

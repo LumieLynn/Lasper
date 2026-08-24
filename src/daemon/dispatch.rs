@@ -1,7 +1,6 @@
 //! Bounded control-channel request pump and typed privileged dispatch.
 
 use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
-use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
 use crate::adapters::lifecycle::error::map_machine_control_error;
@@ -340,26 +339,17 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         )
         .await;
     }
-    match method {
-        RpcMethod::CloseSession => {
-            let params: CloseSessionParams = match serde_json::from_value(params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid close_session request: {error}"
-                    )))
-                }
-            };
-            HandleOutcome::Sync(
-                server_state
-                    .close_and_escalate(params.session_id)
-                    .map(|()| serde_json::Value::Null)
-                    .map_err(|error| error.to_string()),
-            )
-        }
-
-        _ => unreachable!("query method escaped query dispatcher"),
+    if method.family() == RpcFamily::Session {
+        return super::session::handle(
+            method,
+            super::session::SessionContext {
+                params,
+                server_state,
+            },
+        )
+        .await;
     }
+    unreachable!("unhandled RPC family escaped dispatcher")
 }
 
 pub(super) fn request_machine_name(params: &serde_json::Value) -> Result<MachineName, String> {
