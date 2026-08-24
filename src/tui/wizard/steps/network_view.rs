@@ -180,6 +180,10 @@ impl NetworkStepView {
     fn is_custom_interface(&self) -> bool {
         self.interface_list.selected_idx() == Some(self.interface_options_len - 1)
     }
+
+    fn supports_port_forwarding(&self) -> bool {
+        matches!(self.mode_selector.selected_idx(), 2 | 3)
+    }
 }
 
 impl Component for NetworkStepView {
@@ -336,7 +340,11 @@ impl StepComponent for NetworkStepView {
                     .unwrap_or_default();
             }
         }
-        ctx.network.port_list = self.port_list.items().to_vec();
+        ctx.network.port_list = if self.supports_port_forwarding() {
+            self.port_list.items().to_vec()
+        } else {
+            Vec::new()
+        };
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {

@@ -32,6 +32,11 @@ impl NetworkMode {
     pub const fn uses_default_guest_network_stack(&self) -> bool {
         matches!(self, Self::Veth | Self::Bridge(_))
     }
+
+    /// Whether Lasper exposes and emits `[Network] Port=` forwarding rules.
+    pub const fn supports_port_forwarding(&self) -> bool {
+        matches!(self, Self::Veth | Self::Bridge(_))
+    }
 }
 
 /// Network modes exposed for system-scoped OCI application imports.
@@ -639,5 +644,16 @@ mod tests {
         assert!(!NetworkMode::MacVlan("eth0".into()).uses_default_guest_network_stack());
         assert!(!NetworkMode::IpVlan("eth0".into()).uses_default_guest_network_stack());
         assert!(!NetworkMode::Interface("eth0".into()).uses_default_guest_network_stack());
+    }
+
+    #[test]
+    fn only_veth_and_bridge_modes_support_port_forwarding() {
+        assert!(NetworkMode::Veth.supports_port_forwarding());
+        assert!(NetworkMode::Bridge("br0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::Host.supports_port_forwarding());
+        assert!(!NetworkMode::None.supports_port_forwarding());
+        assert!(!NetworkMode::MacVlan("eth0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::IpVlan("eth0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::Interface("eth0".into()).supports_port_forwarding());
     }
 }

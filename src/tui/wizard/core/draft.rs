@@ -515,9 +515,14 @@ impl NetworkState {
     }
 
     pub fn extract_config(&self) -> NetworkConfig {
+        let mode = self.network_mode();
         NetworkConfig {
-            mode: self.network_mode(),
-            port_forwards: self.port_list.clone(),
+            port_forwards: mode
+                .as_ref()
+                .filter(|mode| mode.supports_port_forwarding())
+                .map(|_| self.port_list.clone())
+                .unwrap_or_default(),
+            mode,
         }
     }
 }
@@ -1013,6 +1018,32 @@ mod tests {
             state.network_mode(),
             Some(NetworkMode::Bridge("br0".into()))
         );
+    }
+
+    #[test]
+    fn network_state_drops_port_forwards_for_unsupported_modes() {
+        let mut state = NetworkState {
+            mode: 0,
+            bridge_name: "br0".into(),
+            bridge_list: vec![],
+            interface_name: "eth0".into(),
+            physical_interfaces: vec![],
+            port_list: vec![PortForward {
+                host: 8080,
+                container: 80,
+                proto: "tcp".into(),
+            }],
+        };
+
+        for mode in [0, 1, 4, 5, 6] {
+            state.mode = mode;
+            assert!(state.extract_config().port_forwards.is_empty());
+        }
+
+        state.mode = 2;
+        assert_eq!(state.extract_config().port_forwards.len(), 1);
+        state.mode = 3;
+        assert_eq!(state.extract_config().port_forwards.len(), 1);
     }
 
     #[test]
