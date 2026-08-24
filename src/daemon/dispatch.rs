@@ -5,7 +5,7 @@ use super::deployment_protocol::{
     ProbeDeploymentRecoveryResult, ReleaseUnresolvedDeploymentRequest,
 };
 use super::process_state::shutdown_daemon_resources;
-use super::protocol::{error_code, CliInspectMachineRequest, RpcMethod, RpcRequest};
+use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
@@ -15,7 +15,6 @@ use crate::adapters::lifecycle::error::{map_image_control_error, map_machine_con
 use crate::adapters::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation,
 };
-use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
 use crate::adapters::provisioning::state::{
     execute_deployment_state_operation, DeploymentStateOperation,
 };
@@ -330,9 +329,10 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         Some(method) => method,
         None => return HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
     };
+    if method.family() == RpcFamily::Query {
+        return super::query::handle(method, id, params, dbus, out_tx).await;
+    }
     match method {
-        RpcMethod::Ping => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-
         RpcMethod::CloseSession => {
             let params: CloseSessionParams = match serde_json::from_value(params) {
                 Ok(params) => params,
@@ -723,35 +723,6 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        RpcMethod::AssessTarRuntime => {
-            if params != serde_json::json!({}) {
-                return HandleOutcome::Sync(Err(
-                    "assess_tar_runtime does not accept parameters".into()
-                ));
-            }
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = tokio::task::spawn_blocking(inspect_tar_runtime).await;
-                let response = match result {
-                    Ok(Ok(assessment)) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":assessment})
-                    }
-                    Ok(Err(error)) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":-1,
-                        "message":error.to_string(),
-                    }}),
-                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":-1,
-                        "message":format!("tar runtime inspection task failed: {error}"),
-                    }}),
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
         RpcMethod::SystemOperation => {
             let operation: SystemOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
@@ -764,70 +735,6 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             match execute_system_operation(operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
                 Err(error) => HandleOutcome::Sync(Err(error.to_string())),
-            }
-        }
-
-        RpcMethod::CliInspectMachine => {
-            let inspection: CliInspectMachineRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid cli_inspect_machine request: {error}"
-                    )));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match crate::adapters::runtime::cli::get_properties_with_runner(
-                    inspection.machine.as_str(),
-                    &crate::adapters::process::DefaultCommandRunner,
-                )
-                .await
-                {
-                    Ok(properties) => match serde_json::to_value(properties) {
-                        Ok(result) => serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
-                        Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }}),
-                    },
-                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":-1,
-                        "message":error.to_string(),
-                    }}),
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        RpcMethod::DbusListMachines => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            match dbus.list_machines().await {
-                Ok(machines) => match serde_json::to_value(machines) {
-                    Ok(v) => HandleOutcome::Sync(Ok(v)),
-                    Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-                },
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        RpcMethod::DbusListImages => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            match dbus.list_images().await {
-                Ok(images) => match serde_json::to_value(images) {
-                    Ok(v) => HandleOutcome::Sync(Ok(v)),
-                    Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-                },
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
             }
         }
 
@@ -906,35 +813,11 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
 
-        RpcMethod::DbusGetProperties => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            let name = match request_machine_name(&params) {
-                Ok(name) => name,
-                Err(error) => return HandleOutcome::Sync(Err(error)),
-            };
-            match dbus.get_properties(name.as_str()).await {
-                Ok(props) => match serde_json::to_value(props) {
-                    Ok(v) => HandleOutcome::Sync(Ok(v)),
-                    Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-                },
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        RpcMethod::DbusIsAvailable => match dbus {
-            Some(dbus) => {
-                HandleOutcome::Sync(Ok(serde_json::Value::Bool(dbus.is_available().await)))
-            }
-            None => HandleOutcome::Sync(Ok(serde_json::Value::Bool(false))),
-        },
-
         RpcMethod::Exit => {
             shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
         }
+        _ => unreachable!("query method escaped query dispatcher"),
     }
 }
 

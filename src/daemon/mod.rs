@@ -29,6 +29,7 @@ mod dispatch;
 mod logging;
 mod process_state;
 pub(crate) mod protocol;
+mod query;
 mod server;
 pub(crate) mod session_protocol;
 mod session_server;
