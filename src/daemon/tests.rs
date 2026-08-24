@@ -252,9 +252,10 @@ async fn slow_remove_image_does_not_block_independent_requests() {
     let remove = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
-        method: "dbus_system_operation".into(),
-        params: serde_json::to_value(SystemOperation::RemoveImage {
+        method: "image_remove".into(),
+        params: serde_json::to_value(ImageRemoveRequest {
             image: crate::nspawn::models::ImageName::new("slow-image").unwrap(),
+            transport: ImageRemoveTransport::Dbus,
         })
         .unwrap(),
     };
@@ -342,9 +343,11 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let start = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 2,
-        method: "dbus_system_operation".into(),
-        params: serde_json::to_value(SystemOperation::Start {
+        method: "machine_control".into(),
+        params: serde_json::to_value(MachineControlRequest {
             machine: crate::nspawn::models::MachineName::new(image.as_str()).unwrap(),
+            action: MachineAction::Start,
+            transport: MachineControlTransport::Dbus,
         })
         .unwrap(),
     };
@@ -549,7 +552,7 @@ fn rpc_machine_name_validation_runs_on_daemon_request() {
     let valid = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
-        method: "dbus_system_operation".into(),
+        method: "dbus_get_properties".into(),
         params: serde_json::json!({"name": "valid-machine"}),
     };
     assert_eq!(

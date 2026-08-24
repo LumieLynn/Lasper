@@ -202,25 +202,6 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
             }
         }
 
-        RpcMethod::DbusSystemOperation => {
-            let dbus = match dbus.as_ref() {
-                Some(dbus) => dbus,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            let operation: SystemOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid dbus_system_operation request: {error}"
-                    )));
-                }
-            };
-            match dbus.system_operation(operation).await {
-                Ok(()) => HandleOutcome::Sync(Ok(Value::Null)),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
-            }
-        }
-
         RpcMethod::MachineControl => {
             let request: MachineControlRequest = match serde_json::from_value(params) {
                 Ok(request) => request,

@@ -198,7 +198,7 @@ pub(super) fn daemon_resource_claim(
                 .map_err(|error| format!("invalid machine_control request: {error}"))?;
             crate::application::ResourceKey::for_machine(&request.machine)
         }
-        RpcMethod::SystemOperation | RpcMethod::DbusSystemOperation => {
+        RpcMethod::SystemOperation => {
             let operation: SystemOperation = serde_json::from_value(request.params.clone())
                 .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
             match operation {
