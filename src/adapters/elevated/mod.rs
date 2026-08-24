@@ -37,6 +37,16 @@ pub(crate) fn pipe_reader(
     tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
 }
 
+fn configure_sudo_daemon_stdio(command: &mut tokio::process::Command) {
+    // sudo-rs with use_pty relays the controlling terminal for as long as a
+    // foreground command lives. A stdout pipe makes this a non-foreground I/O
+    // path, so the long-lived daemon cannot compete with the TUI for input.
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+}
+
 // ── Parent-side handle ──
 
 pub(crate) struct ElevatedDaemon {
@@ -70,7 +80,8 @@ impl ElevatedDaemon {
         let fd_sock_path = fd_sock_dir.path().join("fd.sock");
         let rpc_sock_path = fd_sock_dir.path().join("rpc.sock");
 
-        let mut child = tokio::process::Command::new("sudo")
+        let mut command = tokio::process::Command::new("sudo");
+        command
             .kill_on_drop(true)
             .arg(&exe)
             .arg("--daemon")
@@ -81,19 +92,22 @@ impl ElevatedDaemon {
             .arg("--daemon-uid")
             .arg(user_uid.to_string())
             .arg("--daemon-pid")
-            .arg(parent_pid.to_string())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!("failed to launch sudo daemon: {}", error),
-                )
-            })?;
+            .arg(parent_pid.to_string());
+        configure_sudo_daemon_stdio(&mut command);
+        let mut child = command.spawn().map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to launch sudo daemon: {}", error),
+            )
+        })?;
 
         let pid = child.id().expect("child has pid");
+        let mut sudo_stdout = child.stdout.take().expect("sudo stdout was piped");
+        let sudo_stdout_task = tokio::spawn(async move {
+            if let Err(error) = tokio::io::copy(&mut sudo_stdout, &mut tokio::io::sink()).await {
+                log::debug!("Failed to drain elevated daemon stdout: {error}");
+            }
+        });
 
         use tokio::io::AsyncWriteExt;
         let mut rpc_stream = connect_rpc_socket(&rpc_sock_path).await?;
@@ -229,6 +243,7 @@ impl ElevatedDaemon {
             );
             drop(writer);
             let _ = child.wait().await;
+            let _ = sudo_stdout_task.await;
             log::info!("[lasper] I/O task done (child reaped)");
         });
 
@@ -628,4 +643,26 @@ fn receive_deployment_stream(
         ));
     }
     Ok(fds[0])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configure_sudo_daemon_stdio;
+
+    #[tokio::test]
+    async fn sudo_daemon_stdio_detaches_input_and_pipes_stdout() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("test ! -t 0 && test -p /proc/self/fd/1");
+        configure_sudo_daemon_stdio(&mut command);
+
+        let mut child = command.spawn().unwrap();
+        let mut stdout = child.stdout.take().expect("stdout must be piped");
+        tokio::io::copy(&mut stdout, &mut tokio::io::sink())
+            .await
+            .unwrap();
+
+        assert!(child.wait().await.unwrap().success());
+    }
 }
