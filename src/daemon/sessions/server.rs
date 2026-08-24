@@ -1,81 +1,15 @@
-use super::session_protocol::{
-    SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionId,
-    WireSessionLifecycle, WireTerminalAttachmentKind,
+use super::super::protocol::session::{
+    SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionLifecycle,
+    WireTerminalAttachmentKind,
 };
+use crate::daemon::server::DaemonServerState;
 use sendfd::SendWithFd;
-use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::sync::Arc;
 
-#[derive(Default)]
-pub(super) struct DaemonServerState {
-    sessions: parking_lot::Mutex<HashMap<WireSessionId, u32>>,
-    pub(super) deployments: super::deployment_server::DeploymentRegistry,
-    pub(super) operations: Arc<crate::application::OperationRegistry>,
-}
-
-impl DaemonServerState {
-    fn register(&self, id: WireSessionId, pid: u32) -> std::io::Result<()> {
-        let mut sessions = self.sessions.lock();
-        if sessions.contains_key(&id) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                format!("session {} is already open", id.get()),
-            ));
-        }
-        sessions.insert(id, pid);
-        Ok(())
-    }
-
-    fn finish(&self, id: WireSessionId, pid: u32) {
-        let mut sessions = self.sessions.lock();
-        if sessions.get(&id) == Some(&pid) {
-            sessions.remove(&id);
-        }
-    }
-
-    pub(super) fn close_and_escalate(self: &Arc<Self>, id: WireSessionId) -> std::io::Result<()> {
-        let Some(pid) = self.sessions.lock().get(&id).copied() else {
-            return Ok(());
-        };
-        if let Err(error) = crate::adapters::process::signal_process_group(pid, libc::SIGTERM) {
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-        }
-        let state = Arc::clone(self);
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-            if state.sessions.lock().get(&id).copied() == Some(pid) {
-                if let Err(error) =
-                    crate::adapters::process::signal_process_group(pid, libc::SIGKILL)
-                {
-                    if error.raw_os_error() != Some(libc::ESRCH) {
-                        log::warn!(
-                            "failed to force-close session {} process group {}: {error}",
-                            id.get(),
-                            pid
-                        );
-                    }
-                }
-            }
-        });
-        Ok(())
-    }
-
-    pub(super) fn pids(&self) -> Vec<u32> {
-        self.sessions.lock().values().copied().collect()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.sessions.lock().len()
-    }
-}
-
-pub(super) fn spawn_journal(
+pub(crate) fn spawn_journal(
     stream: &mut std::os::unix::net::UnixStream,
     params: SpawnJournalctlParams,
     state: Arc<DaemonServerState>,
@@ -142,7 +76,7 @@ pub(super) fn spawn_journal(
     }
 }
 
-pub(super) fn spawn_terminal(
+pub(crate) fn spawn_terminal(
     stream: &mut std::os::unix::net::UnixStream,
     params: SpawnTerminalParams,
     state: Arc<DaemonServerState>,
@@ -288,6 +222,7 @@ fn stop_child(child: &mut std::process::Child, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::protocol::session::WireSessionId;
 
     #[test]
     fn registry_rejects_duplicate_ids_and_removes_only_the_matching_process() {

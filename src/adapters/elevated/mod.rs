@@ -11,13 +11,13 @@ use crate::adapters::rootfs::store::{RootfsOperation, RootfsResult};
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemoveRequest};
 use crate::application::machine_lifecycle::{MachineControlOutcome, MachineControlRequest};
-use crate::daemon::deployment_protocol::{
+use crate::daemon::protocol::deployment::{
     DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
     DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
 };
 use crate::daemon::protocol::*;
-use crate::daemon::transport::{
+use crate::daemon::server::transport::{
     authorize_root_server, connect_rpc_socket, create_fd_socket_dir, get_peer_credentials,
     read_bounded_line, MAX_RPC_FRAME_BYTES,
 };

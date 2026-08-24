@@ -5,8 +5,8 @@
 //! like the other protocol families; this module only owns their dispatch and
 //! wire-result shaping.
 
+use super::super::protocol::{error_code, RpcFamily, RpcMethod};
 use super::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::{error_code, RpcFamily, RpcMethod};
 use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
 use crate::nspawn::models::MachineName;
 use serde_json::Value;
@@ -53,7 +53,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::CliInspectMachine => {
-            let inspection: super::protocol::CliInspectMachineRequest =
+            let inspection: super::super::protocol::CliInspectMachineRequest =
                 match serde_json::from_value(params) {
                     Ok(request) => request,
                     Err(error) => {
@@ -146,7 +146,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
     }
 }
 
-pub(super) fn request_machine_name(params: &Value) -> Result<MachineName, String> {
+pub(crate) fn request_machine_name(params: &Value) -> Result<MachineName, String> {
     let name = params["name"]
         .as_str()
         .ok_or_else(|| "missing name".to_string())?;

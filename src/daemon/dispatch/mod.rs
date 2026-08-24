@@ -1,9 +1,13 @@
 //! Bounded control-channel request pump and typed privileged dispatch.
 
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
+mod command;
+pub(crate) mod handler;
+pub(crate) mod query;
+
+use self::handler::{DaemonDbusExecutor, HandleOutcome};
 use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
-use super::session_server::DaemonServerState;
-use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
+use super::server::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
+use super::server::DaemonServerState;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
@@ -228,12 +232,12 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         None => return HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
     };
     if method.family() == RpcFamily::Query {
-        return super::query::handle(method, id, params, dbus, out_tx).await;
+        return self::query::handle(method, id, params, dbus, out_tx).await;
     }
     if method.family() == RpcFamily::Command {
-        return super::command::handle(
+        return self::command::handle(
             method,
-            super::command::CommandContext {
+            self::command::CommandContext {
                 id,
                 params,
                 dbus,
@@ -246,9 +250,9 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         .await;
     }
     if method.family() == RpcFamily::Job {
-        return super::job::handle(
+        return super::jobs::handle(
             method,
-            super::job::JobContext {
+            super::jobs::JobContext {
                 params,
                 dbus,
                 server_state,
@@ -258,9 +262,9 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         .await;
     }
     if method.family() == RpcFamily::Session {
-        return super::session::handle(
+        return super::sessions::handle(
             method,
-            super::session::SessionContext {
+            super::sessions::SessionContext {
                 params,
                 server_state,
             },

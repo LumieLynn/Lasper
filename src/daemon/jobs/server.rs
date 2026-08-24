@@ -1,11 +1,11 @@
 //! Daemon-owned provisioning job registry and dedicated event stream.
 
-use super::deployment_protocol::{
+use super::super::protocol::deployment::{
     DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
     DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,
     MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
 };
-use super::session_server::DaemonServerState;
+use super::super::server::DaemonServerState;
 use crate::adapters::provisioning::direct::DirectProvisioningExecutor;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::operations::ResourceReservation;
@@ -24,7 +24,7 @@ use std::sync::Arc;
 const MAX_DEPLOYMENT_RECORDS: usize = 64;
 
 #[derive(Default)]
-pub(super) struct DeploymentRegistry {
+pub(crate) struct DeploymentRegistry {
     inner: parking_lot::Mutex<DeploymentRegistryInner>,
     changed: tokio::sync::Notify,
 }
@@ -210,7 +210,7 @@ impl DeploymentRegistry {
         Some(snapshot)
     }
 
-    pub(super) fn snapshot(
+    pub(crate) fn snapshot(
         &self,
         deployment_id: DeploymentId,
     ) -> std::io::Result<DeploymentJobSnapshot> {
@@ -224,7 +224,7 @@ impl DeploymentRegistry {
         Ok(snapshot(deployment_id, record))
     }
 
-    pub(super) fn resolve_submission(
+    pub(crate) fn resolve_submission(
         &self,
         request_id: DeploymentRequestId,
     ) -> std::io::Result<DeploymentSubmissionSnapshot> {
@@ -242,7 +242,7 @@ impl DeploymentRegistry {
         })
     }
 
-    pub(super) fn acknowledge_submission(
+    pub(crate) fn acknowledge_submission(
         &self,
         request_id: DeploymentRequestId,
     ) -> std::io::Result<()> {
@@ -265,7 +265,7 @@ impl DeploymentRegistry {
         Ok(())
     }
 
-    pub(super) fn cancel(
+    pub(crate) fn cancel(
         &self,
         deployment_id: DeploymentId,
     ) -> std::io::Result<DeploymentJobSnapshot> {
@@ -293,7 +293,7 @@ impl DeploymentRegistry {
         Ok(snapshot)
     }
 
-    pub(super) fn acknowledge(&self, deployment_id: DeploymentId) -> std::io::Result<()> {
+    pub(crate) fn acknowledge(&self, deployment_id: DeploymentId) -> std::io::Result<()> {
         let mut inner = self.inner.lock();
         let request_id = {
             let record = inner.jobs.get(&deployment_id).ok_or_else(|| {
@@ -336,7 +336,7 @@ impl DeploymentRegistry {
         Ok(())
     }
 
-    pub(super) fn release_unresolved(
+    pub(crate) fn release_unresolved(
         &self,
         deployment_id: DeploymentId,
         confirmed: bool,
@@ -376,7 +376,7 @@ impl DeploymentRegistry {
         Ok(snapshot)
     }
 
-    pub(super) fn reconcile(
+    pub(crate) fn reconcile(
         &self,
         deployment_id: DeploymentId,
         manifest_present: bool,
@@ -430,7 +430,7 @@ impl DeploymentRegistry {
         }
     }
 
-    pub(super) async fn cancel_all_and_wait(&self, timeout: std::time::Duration) -> bool {
+    pub(crate) async fn cancel_all_and_wait(&self, timeout: std::time::Duration) -> bool {
         self.cancel_all();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -505,7 +505,7 @@ fn evict_one(inner: &mut DeploymentRegistryInner) -> bool {
     true
 }
 
-pub(super) async fn submit(
+pub(crate) async fn submit(
     stream: &mut std::os::unix::net::UnixStream,
     params: SubmitDeploymentParams,
     server_state: Arc<DaemonServerState>,

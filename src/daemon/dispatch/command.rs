@@ -2,11 +2,11 @@
 //!
 //! These operations have one request/response contract. Some implementations
 //! perform external I/O in a spawned task, but they do not expose accepted
-//! job state; long-running stateful work belongs to `deployment_server`.
+//! job state; long-running stateful work belongs to `jobs::server`.
 
+use super::super::protocol::{error_code, RpcFamily, RpcMethod};
+use super::super::server::DaemonServerState;
 use super::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::{error_code, RpcFamily, RpcMethod};
-use super::session_server::DaemonServerState;
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
 use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
 use crate::adapters::platform::nvidia::state::{
@@ -280,7 +280,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::Exit => {
-            super::process_state::shutdown_daemon_resources(&server_state).await;
+            super::super::server::shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
         }
 

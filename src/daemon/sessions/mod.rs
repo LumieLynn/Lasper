@@ -1,22 +1,24 @@
 //! Session-family JSON-RPC handlers.
 //!
-//! Process spawning and session tracking live in `session_server`; this
+//! Process spawning and session tracking live in `sessions::server`; this
 //! module owns only the typed control-plane transition exposed to the RPC
 //! dispatcher.
 
-use super::handler::HandleOutcome;
+pub(crate) mod server;
+
+use super::dispatch::handler::HandleOutcome;
+use super::protocol::session::CloseSessionParams;
 use super::protocol::{RpcFamily, RpcMethod};
-use super::session_protocol::CloseSessionParams;
-use super::session_server::DaemonServerState;
+use super::server::DaemonServerState;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub(super) struct SessionContext {
+pub(crate) struct SessionContext {
     pub(super) params: Value,
     pub(super) server_state: Arc<DaemonServerState>,
 }
 
-pub(super) async fn handle(method: RpcMethod, context: SessionContext) -> HandleOutcome {
+pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> HandleOutcome {
     let SessionContext {
         params,
         server_state,

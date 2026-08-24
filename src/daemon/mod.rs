@@ -23,22 +23,11 @@
 //! session token negotiated after the control connection's peer credentials
 //! have been authenticated.
 
-mod command;
-pub(crate) mod deployment_protocol;
-mod deployment_server;
 mod dispatch;
-mod fd;
-mod handler;
-mod job;
-mod logging;
-mod process_state;
+mod jobs;
 pub(crate) mod protocol;
-mod query;
-mod server;
-mod session;
-pub(crate) mod session_protocol;
-mod session_server;
-pub(crate) mod transport;
+pub(crate) mod server;
+mod sessions;
 
 pub use server::daemon_main;
 

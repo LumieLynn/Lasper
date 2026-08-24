@@ -1,14 +1,18 @@
 //! Root daemon bootstrap, authenticated listeners, and FD-passing handlers.
 
-use super::dispatch::run_rpc_request_pump;
-use super::logging::{initialize_daemon_logging, AuthLogLimiter};
-use super::process_state::shutdown_daemon_resources;
-use super::protocol::*;
-use super::session_server::DaemonServerState;
-use super::transport::{
+mod fd;
+pub(crate) mod logging;
+mod process_state;
+mod state;
+pub(crate) mod transport;
+
+use self::logging::{initialize_daemon_logging, AuthLogLimiter};
+use self::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
 };
+use super::dispatch::run_rpc_request_pump;
+use super::protocol::*;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::domain::secret::zeroize_string;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
@@ -454,5 +458,8 @@ async fn handle_fd_connection(
         }
     };
 
-    super::fd::handle(&mut std_stream, operation, server_state, trusted_state_root).await;
+    self::fd::handle(&mut std_stream, operation, server_state, trusted_state_root).await;
 }
+
+pub(crate) use process_state::shutdown_daemon_resources;
+pub(crate) use state::DaemonServerState;

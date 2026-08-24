@@ -5,8 +5,11 @@ use crate::domain::secret::SecretBytes;
 use crate::nspawn::models::MachineName;
 use serde::{Deserialize, Serialize};
 
-use super::deployment_protocol::SubmitDeploymentParams;
-use super::session_protocol::{SpawnJournalctlParams, SpawnTerminalParams};
+pub(crate) mod deployment;
+pub(crate) mod session;
+
+use self::deployment::SubmitDeploymentParams;
+use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
 pub(crate) const RPC_PROTOCOL_VERSION: u32 = 13;
 
@@ -391,7 +394,7 @@ mod tests {
         assert_eq!(RpcMethod::CloseSession.family(), RpcFamily::Session);
 
         let terminal = FdOperation::Terminal(SpawnTerminalParams {
-            session_id: crate::daemon::session_protocol::WireSessionId::new(1).unwrap(),
+            session_id: crate::daemon::protocol::session::WireSessionId::new(1).unwrap(),
             name: MachineName::new("machine").unwrap(),
             size: crate::nspawn::models::TerminalSize::new(80, 24).unwrap(),
         });

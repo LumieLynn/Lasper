@@ -6,7 +6,7 @@ use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOpe
 use crate::application::machine_lifecycle::{MachineAction, MachineControlOutcome};
 use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
 
-pub(super) enum HandleOutcome {
+pub(crate) enum HandleOutcome {
     Spawned,
     Sync(Result<serde_json::Value, String>),
 }
@@ -17,7 +17,7 @@ pub(super) enum HandleOutcome {
 /// tests to a live system bus while the wider application capability layer is
 /// still being migrated.
 #[async_trait::async_trait]
-pub(super) trait DaemonDbusExecutor: Send + Sync {
+pub(crate) trait DaemonDbusExecutor: Send + Sync {
     async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>>;
     async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>>;
     async fn system_operation(

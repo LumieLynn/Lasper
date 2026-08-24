@@ -1,11 +1,10 @@
+use super::dispatch::handler::*;
 use super::dispatch::*;
-use super::handler::*;
-use super::logging::*;
+use super::protocol::session::{self as session, SpawnTerminalParams};
 use super::protocol::*;
+use super::server::logging::*;
+use super::server::transport::*;
 use super::server::*;
-use super::session_protocol::{self, SpawnTerminalParams};
-use super::session_server::DaemonServerState;
-use super::transport::*;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
 use crate::adapters::system_operation::SystemOperation;
@@ -495,7 +494,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
     let request = FdRequest {
         auth_token: TEST_TOKEN.to_string(),
         operation: FdOperation::Terminal(SpawnTerminalParams {
-            session_id: session_protocol::WireSessionId::new(7).unwrap(),
+            session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
             size: crate::nspawn::models::TerminalSize::new(120, 40).unwrap(),
         }),
@@ -554,7 +553,7 @@ fn rpc_machine_name_validation_runs_on_daemon_request() {
         params: serde_json::json!({"name": "valid-machine"}),
     };
     assert_eq!(
-        super::query::request_machine_name(&valid.params)
+        super::dispatch::query::request_machine_name(&valid.params)
             .unwrap()
             .as_str(),
         "valid-machine"
@@ -564,7 +563,7 @@ fn rpc_machine_name_validation_runs_on_daemon_request() {
         params: serde_json::json!({"name": "../escape"}),
         ..valid
     };
-    assert!(super::query::request_machine_name(&invalid.params).is_err());
+    assert!(super::dispatch::query::request_machine_name(&invalid.params).is_err());
 }
 
 #[tokio::test]
@@ -621,7 +620,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStatePort, DeploymentStorage,
     };
-    use crate::daemon::deployment_protocol::{
+    use crate::daemon::protocol::deployment::{
         ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     };
     use crate::nspawn::models::ContainerConfig;

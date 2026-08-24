@@ -23,7 +23,7 @@ pub(crate) fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::T
     create_fd_socket_dir_from_candidates(user_uid, &candidates)
 }
 
-pub(super) fn create_fd_socket_dir_from_candidates(
+pub(crate) fn create_fd_socket_dir_from_candidates(
     user_uid: u32,
     candidates: &[PathBuf],
 ) -> std::io::Result<tempfile::TempDir> {
@@ -74,7 +74,7 @@ fn create_private_tempdir(parent: Option<&Path>) -> std::io::Result<tempfile::Te
     }
 }
 
-pub(super) fn is_private_writable_runtime_dir(path: &Path, user_uid: u32) -> bool {
+pub(crate) fn is_private_writable_runtime_dir(path: &Path, user_uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
 
     std::fs::symlink_metadata(path).is_ok_and(|metadata| {
@@ -85,7 +85,7 @@ pub(super) fn is_private_writable_runtime_dir(path: &Path, user_uid: u32) -> boo
     })
 }
 
-pub(super) fn runtime_dir_error_allows_fallback(error: &std::io::Error) -> bool {
+pub(crate) fn runtime_dir_error_allows_fallback(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
         std::io::ErrorKind::ReadOnlyFilesystem
@@ -94,7 +94,7 @@ pub(super) fn runtime_dir_error_allows_fallback(error: &std::io::Error) -> bool 
     )
 }
 
-pub(super) fn configure_user_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
+pub(crate) fn configure_user_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let metadata = std::fs::symlink_metadata(path)?;
@@ -161,7 +161,7 @@ pub(crate) struct PeerCredentials {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum FdAuthorizationError {
+pub(crate) enum FdAuthorizationError {
     UnexpectedUid { actual: u32, expected: u32 },
     UnexpectedPid { actual: u32, expected: u32 },
     InvalidToken,
@@ -196,7 +196,7 @@ pub(crate) fn get_peer_credentials(stream: &UnixStream) -> std::io::Result<PeerC
     })
 }
 
-pub(super) fn authorize_fd_peer(
+pub(crate) fn authorize_fd_peer(
     actual: PeerCredentials,
     expected: PeerCredentials,
 ) -> Result<(), FdAuthorizationError> {
@@ -229,7 +229,7 @@ pub(crate) fn authorize_root_server(actual: PeerCredentials) -> std::io::Result<
     }
 }
 
-pub(super) fn authorize_fd_token(actual: &str, expected: &str) -> Result<(), FdAuthorizationError> {
+pub(crate) fn authorize_fd_token(actual: &str, expected: &str) -> Result<(), FdAuthorizationError> {
     if actual.len() != expected.len() {
         return Err(FdAuthorizationError::InvalidToken);
     }

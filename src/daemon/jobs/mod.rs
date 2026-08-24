@@ -4,14 +4,16 @@
 //! deployment executor itself remains in the provisioning application layer;
 //! these handlers only inspect or transition daemon-owned job state.
 
-use super::deployment_protocol::{
+pub(crate) mod server;
+
+use super::dispatch::handler::{DaemonDbusExecutor, HandleOutcome};
+use super::protocol::deployment::{
     DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
     ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest,
 };
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use super::protocol::{RpcFamily, RpcMethod};
-use super::session_server::DaemonServerState;
+use super::server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::DeploymentStatePort;
@@ -19,14 +21,14 @@ use crate::nspawn::models::ImageEntry;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub(super) struct JobContext<'a, B> {
+pub(crate) struct JobContext<'a, B> {
     pub(super) params: Value,
     pub(super) dbus: &'a Option<B>,
     pub(super) server_state: Arc<DaemonServerState>,
     pub(super) trusted_state_root: TrustedStateRoot,
 }
 
-pub(super) async fn handle<B: DaemonDbusExecutor>(
+pub(crate) async fn handle<B: DaemonDbusExecutor>(
     method: RpcMethod,
     context: JobContext<'_, B>,
 ) -> HandleOutcome {

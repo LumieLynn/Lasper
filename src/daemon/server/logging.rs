@@ -4,13 +4,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub(super) const DAEMON_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
-pub(super) const DAEMON_LOG_MAX_SESSIONS: usize = 8;
+pub(crate) const DAEMON_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const DAEMON_LOG_MAX_SESSIONS: usize = 8;
 const DAEMON_LOG_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
 const DAEMON_AUTH_LOG_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone)]
-pub(super) struct SessionLogWriter {
+pub(crate) struct SessionLogWriter {
     state: Arc<parking_lot::Mutex<SessionLogState>>,
 }
 
@@ -26,7 +26,7 @@ impl SessionLogWriter {
         Self::with_limit(file, DAEMON_LOG_MAX_BYTES)
     }
 
-    pub(super) fn with_limit(file: std::fs::File, max_bytes: u64) -> Self {
+    pub(crate) fn with_limit(file: std::fs::File, max_bytes: u64) -> Self {
         Self {
             state: Arc::new(parking_lot::Mutex::new(SessionLogState {
                 file,
@@ -108,7 +108,7 @@ fn utc_log_timestamp() -> String {
     }
 }
 
-pub(super) fn daemon_log_file_name() -> String {
+pub(crate) fn daemon_log_file_name() -> String {
     format!(
         "daemon-{}-p{}-s{}.log",
         utc_log_timestamp(),
@@ -117,7 +117,7 @@ pub(super) fn daemon_log_file_name() -> String {
     )
 }
 
-pub(super) fn daemon_log_file_matches(path: &Path) -> bool {
+pub(crate) fn daemon_log_file_matches(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
@@ -145,7 +145,7 @@ pub(super) fn daemon_log_file_matches(path: &Path) -> bool {
         && session.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-pub(super) fn cleanup_daemon_logs(
+pub(crate) fn cleanup_daemon_logs(
     directory: &Path,
     current: &Path,
     owner_uid: u32,
@@ -246,7 +246,7 @@ fn open_daemon_session_log() -> std::io::Result<(PathBuf, SessionLogWriter)> {
 }
 
 #[derive(Clone, Default)]
-pub(super) struct AuthLogLimiter {
+pub(crate) struct AuthLogLimiter {
     state: Arc<parking_lot::Mutex<AuthLogWindow>>,
 }
 
@@ -257,7 +257,7 @@ struct AuthLogWindow {
 }
 
 impl AuthLogLimiter {
-    pub(super) fn record(&self, message: String) -> Option<String> {
+    pub(crate) fn record(&self, message: String) -> Option<String> {
         let now = std::time::Instant::now();
         let mut state = self.state.lock();
         if state
@@ -277,7 +277,7 @@ impl AuthLogLimiter {
     }
 }
 
-pub(super) fn configure_daemon_log_directory(
+pub(crate) fn configure_daemon_log_directory(
     path: &Path,
     expected_uid: u32,
 ) -> std::io::Result<()> {
@@ -306,7 +306,7 @@ pub(super) fn configure_daemon_log_directory(
     Ok(())
 }
 
-pub(super) fn initialize_daemon_logging() -> std::io::Result<()> {
+pub(crate) fn initialize_daemon_logging() -> std::io::Result<()> {
     let (path, writer) = open_daemon_session_log()?;
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
