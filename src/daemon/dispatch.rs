@@ -4,32 +4,17 @@ use super::deployment_protocol::{
     DeploymentJobRequest, DeploymentSubmissionRequest, ProbeDeploymentRecoveryRequest,
     ProbeDeploymentRecoveryResult, ReleaseUnresolvedDeploymentRequest,
 };
-use super::process_state::shutdown_daemon_resources;
 use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
-use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
-use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
-use crate::adapters::lifecycle::error::{map_image_control_error, map_machine_control_error};
-use crate::adapters::platform::nvidia::state::{
-    execute_nvidia_state_operation, NvidiaStateOperation,
-};
-use crate::adapters::provisioning::state::{
-    execute_deployment_state_operation, DeploymentStateOperation,
-};
-use crate::adapters::rootfs::store::{execute_rootfs_operation, RootfsOperation};
+use crate::adapters::lifecycle::error::map_machine_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::system_operation::{
-    execute_cli_image_remove, execute_dbus_system_operation, execute_system_operation,
-    SystemOperation,
-};
+use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOperation};
 use crate::adapters::trusted_state::TrustedStateRoot;
-use crate::application::image_lifecycle::{
-    ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
-};
+use crate::application::image_lifecycle::ImageRemoveRequest;
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+    MachineAction, MachineControlOutcome, MachineControlRequest,
 };
 use crate::domain::secret::zeroize_string;
 use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
@@ -332,6 +317,21 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
     if method.family() == RpcFamily::Query {
         return super::query::handle(method, id, params, dbus, out_tx).await;
     }
+    if method.family() == RpcFamily::Command {
+        return super::command::handle(
+            method,
+            super::command::CommandContext {
+                id,
+                params,
+                dbus,
+                out_tx,
+                invoking_uid,
+                server_state,
+                trusted_state_root,
+            },
+        )
+        .await;
+    }
     match method {
         RpcMethod::CloseSession => {
             let params: CloseSessionParams = match serde_json::from_value(params) {
@@ -348,119 +348,6 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
                     .map(|()| serde_json::Value::Null)
                     .map_err(|error| error.to_string()),
             )
-        }
-
-        RpcMethod::NspawnConfig => {
-            let operation: NspawnConfigOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid nspawn_config request: {error}"
-                    )));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_nspawn_config_operation(operation, invoking_uid).await
-                {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        RpcMethod::SystemdUnit => {
-            let operation: SystemdUnitOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid systemd_unit request: {error}"
-                    )));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_systemd_unit_operation(operation).await {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        RpcMethod::NvidiaState => {
-            let operation: NvidiaStateOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid nvidia_state request: {error}"
-                    )));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response =
-                    match execute_nvidia_state_operation(operation, trusted_state_root).await {
-                        Ok(result) => {
-                            serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                        }
-                        Err(error) => {
-                            serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                                "code":-1,
-                                "message":error.to_string(),
-                            }})
-                        }
-                    };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        RpcMethod::DeploymentState => {
-            let operation: DeploymentStateOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid deployment_state request: {error}"
-                    )));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let result = execute_deployment_state_operation(operation, trusted_state_root)
-                    .await
-                    .unwrap_or_else(
-                        crate::adapters::provisioning::state::DeploymentStateResult::failure,
-                    );
-                let response = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result});
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
         }
 
         RpcMethod::DeploymentStatus => {
@@ -696,127 +583,6 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        RpcMethod::Rootfs => {
-            let operation: RootfsOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
-                }
-            };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_rootfs_operation(operation).await {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                            "code":-1,
-                            "message":error.to_string(),
-                        }})
-                    }
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
-        }
-
-        RpcMethod::SystemOperation => {
-            let operation: SystemOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid system_operation request: {error}"
-                    )));
-                }
-            };
-            match execute_system_operation(operation).await {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
-            }
-        }
-
-        RpcMethod::DbusSystemOperation => {
-            let dbus = match dbus.as_ref() {
-                Some(d) => d,
-                None => return HandleOutcome::Sync(Err("DBus not available".into())),
-            };
-            let operation: SystemOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid dbus_system_operation request: {error}"
-                    )));
-                }
-            };
-            match dbus.system_operation(operation).await {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
-                Err(e) => HandleOutcome::Sync(Err(e.to_string())),
-            }
-        }
-
-        RpcMethod::MachineControl => {
-            let request: MachineControlRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid machine_control request: {error}"
-                    )))
-                }
-            };
-            let outcome = match request.transport {
-                MachineControlTransport::Dbus => match dbus.as_ref() {
-                    Some(dbus) => dbus.machine_control(request.machine, request.action).await,
-                    None => MachineControlOutcome::NotAttempted {
-                        reason: "D-Bus backend is unavailable".into(),
-                    },
-                },
-                MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_machine_control(
-                        request.machine,
-                        request.action,
-                    )
-                    .await
-                }
-            };
-            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
-        }
-
-        RpcMethod::ImageRemove => {
-            let request: ImageRemoveRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid image_remove request: {error}"
-                    )))
-                }
-            };
-            let outcome = match request.transport {
-                ImageRemoveTransport::Dbus => match dbus.as_ref() {
-                    Some(dbus) => match dbus
-                        .system_operation(SystemOperation::RemoveImage {
-                            image: request.image,
-                        })
-                        .await
-                    {
-                        Ok(()) => ImageControlOutcome::Removed,
-                        Err(error) => map_image_control_error(error),
-                    },
-                    None => ImageControlOutcome::NotAttempted {
-                        reason: "DBus backend is unavailable".into(),
-                    },
-                },
-                ImageRemoveTransport::Cli => execute_cli_image_remove(request.image).await,
-            };
-            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
-        }
-
-        RpcMethod::Exit => {
-            shutdown_daemon_resources(&server_state).await;
-            std::process::exit(0);
-        }
         _ => unreachable!("query method escaped query dispatcher"),
     }
 }
