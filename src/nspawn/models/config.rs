@@ -27,6 +27,16 @@ impl NetworkMode {
     pub fn is_private(&self) -> bool {
         !matches!(self, Self::Host)
     }
+
+    /// Whether Lasper relies on the guest's default networkd/resolved setup.
+    pub const fn uses_default_guest_network_stack(&self) -> bool {
+        matches!(self, Self::Veth | Self::Bridge(_))
+    }
+
+    /// Whether Lasper exposes and emits `[Network] Port=` forwarding rules.
+    pub const fn supports_port_forwarding(&self) -> bool {
+        matches!(self, Self::Veth | Self::Bridge(_))
+    }
 }
 
 /// Network modes exposed for system-scoped OCI application imports.
@@ -159,7 +169,10 @@ pub struct BindMount {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUser {
     pub username: String,
-    pub password: String,
+    /// Explicit numeric identity requested for this account. This is used for
+    /// host-session grants whose Unix permissions depend on a stable UID.
+    #[serde(default)]
+    pub uid: Option<u32>,
     /// If true, add to the `sudo` / `wheel` group.
     pub sudoer: bool,
     /// Login shell (e.g., /bin/bash).
@@ -169,8 +182,12 @@ pub struct CreateUser {
 impl CreateUser {
     pub fn validate(&self) -> Result<()> {
         validate_login_username(&self.username)?;
-        validate_login_shell(&self.shell)?;
-        validate_chpasswd_secret("user password", &self.password)
+        if self.uid == Some(0) {
+            return Err(NspawnError::Validation(
+                "Regular users cannot request uid 0".into(),
+            ));
+        }
+        validate_login_shell(&self.shell)
     }
 
     pub fn login_shell(&self) -> &str {
@@ -449,10 +466,10 @@ pub struct ContainerConfig {
     pub private_users: Option<PrivateUsersMode>,
     /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
     pub graphics_acceleration: bool,
-    pub root_password: Option<String>,
+    /// Whether to expose the complete host DRM device directory.
+    #[serde(default)]
+    pub gpu_passthrough_all: bool,
     pub users: Vec<CreateUser>,
-    /// Specific Wayland socket name (e.g., Some("wayland-0")). If None, passthrough is disabled.
-    pub wayland_socket: Option<String>,
     /// Whether to enable NVIDIA GPU passthrough (JIT managed).
     pub nvidia_gpu: bool,
     /// Disk image specific configuration (only used if storage type is DiskImage).
@@ -479,9 +496,8 @@ impl Default for ContainerConfig {
             privileged: Default::default(),
             private_users: None,
             graphics_acceleration: Default::default(),
-            root_password: Default::default(),
+            gpu_passthrough_all: Default::default(),
             users: Default::default(),
-            wayland_socket: Default::default(),
             nvidia_gpu: Default::default(),
             disk_config: Default::default(),
             boot: true,
@@ -561,7 +577,7 @@ mod tests {
     fn create_user_accepts_default_shell_and_valid_system_names() {
         let user = CreateUser {
             username: "_svc-user$".into(),
-            password: "secret:with:colons".into(),
+            uid: None,
             shell: String::new(),
             sudoer: false,
         };
@@ -617,5 +633,27 @@ mod tests {
             NetworkMode::None
         );
         assert_eq!(OciNetworkMode::Veth.into_network_mode(), NetworkMode::Veth);
+    }
+
+    #[test]
+    fn only_veth_based_modes_use_the_default_guest_network_stack() {
+        assert!(NetworkMode::Veth.uses_default_guest_network_stack());
+        assert!(NetworkMode::Bridge("br0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::Host.uses_default_guest_network_stack());
+        assert!(!NetworkMode::None.uses_default_guest_network_stack());
+        assert!(!NetworkMode::MacVlan("eth0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::IpVlan("eth0".into()).uses_default_guest_network_stack());
+        assert!(!NetworkMode::Interface("eth0".into()).uses_default_guest_network_stack());
+    }
+
+    #[test]
+    fn only_veth_and_bridge_modes_support_port_forwarding() {
+        assert!(NetworkMode::Veth.supports_port_forwarding());
+        assert!(NetworkMode::Bridge("br0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::Host.supports_port_forwarding());
+        assert!(!NetworkMode::None.supports_port_forwarding());
+        assert!(!NetworkMode::MacVlan("eth0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::IpVlan("eth0".into()).supports_port_forwarding());
+        assert!(!NetworkMode::Interface("eth0".into()).supports_port_forwarding());
     }
 }

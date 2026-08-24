@@ -1,55 +1,82 @@
 # Lasper
 
-A terminal user interface (TUI) for managing `systemd-nspawn` system containers, written in Rust. Inspired by [lazydocker](https://github.com/jesseduffield/lazydocker), Lasper provides a guided interface over native systemd resources instead of replacing `machinectl`, `systemd-nspawn`, or `importctl`.
+A terminal user interface (TUI) for managing `systemd-nspawn` system containers.
 
-Lasper is currently alpha software. It is suitable for testing and personal workflows where you understand the caveats, but it is not yet a production-stable container platform.
+Lasper provides a guided interface over native systemd resources. It organizes machines, images, terminals, and provisioning tasks in one place.
 
 ![demo.gif](demo.gif)
 
 ## Features
 
-- **Machine and Image Management**: Running machines and persistent systemd images are shown as separate resources. Start images, control machine lifecycles, and inspect properties, journal logs, and image metadata without treating cached backing layers as stopped containers.
-- **Integrated Terminal**: Open multi-session container terminals through native `machinectl login`, with a typed `nsenter` fallback for running containers that do not provide a system bus.
-- **Creation Wizard**: Interactively generate `.nspawn` configurations and run provisioning tasks.
-- **Image Provisioning**:
-  - Pull OCI registry images through systemd 260+'s `importctl pull-oci` as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
-  - Bootstrap native Debian/Ubuntu or Arch systems via `debootstrap` or `pacstrap`.
-- **Hardware Passthrough**: Integrated NVIDIA GPU device allocation (`nvidia-container-toolkit` required) and automated Wayland/X11 socket mounting for GUI apps.
-- **Storage Backends**: Supports Directory, Btrfs subvolumes, and Raw sparse images.
+- **Machine and image management**: Running machines and persistent systemd images are shown as separate resources. Start images, control machine lifecycles, and inspect properties, journal logs, and image metadata without treating cached backing layers as stopped containers.
+- **Integrated terminal**: Open multi-session container terminals through native `machinectl login`, with a typed `nsenter` fallback for running containers that do not provide a system bus.
+- **Creation wizard**: Interactively generate `.nspawn` configurations and run provisioning tasks.
+- **Image provisioning**:
+  - Pull OCI registry images through `importctl pull-oci` on systemd 260 or newer as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
+  - Bootstrap native Debian, Ubuntu, or Arch systems with `debootstrap` or `pacstrap`.
+- **Hardware passthrough**: Allocate NVIDIA GPU devices (requires `nvidia-container-toolkit`), grant per-user Wayland access, and optionally bind X11 directories for GUI applications.
+- **Storage backends**: Directory, Btrfs subvolume, and raw sparse image support.
+
+## Status
+
+Lasper is in an early functional stage. The current workflow focuses on container creation and lifecycle operations, while configuration management is still evolving.
 
 ## Prerequisites
 
-- `systemd-container` (provides `machinectl` and `systemd-nspawn`)
-- `util-linux` (provides `nsenter` for terminal attachment to containers without a system bus)
-- Permission to perform privileged container operations. The recommended mode
-  is `lasper -e`: the TUI stays unprivileged and starts a separate root daemon
-  through `sudo`. Running the entire TUI with `sudo lasper` remains supported
-  for compatibility but has a larger root attack surface.
-- *Optional*: systemd 260+ (for OCI application images via `importctl pull-oci`)
-- *Optional*: `debootstrap` and `pacstrap` (for native Debian/Ubuntu or Arch image support)
-- *Optional*: GNU tar 1.35+ (recommended for Tar rootfs imports; older versions remain usable with a security warning)
-- *Optional*: `nvidia-container-toolkit` (for NVIDIA GPU passthrough)
+Required:
 
-## ⚠️ Before You Begin – Must Read
+- `systemd-container`: provides `machinectl` and `systemd-nspawn`.
+- `util-linux`: provides `nsenter` for terminal attachment to containers without a system bus.
+- Permission to perform privileged container operations.
 
-Lasper is in **early development**. **All users must read [CAVEATS.md](CAVEATS.md) before using Lasper.**
-The elevated daemon trust model, remaining root-daemon authority, and current dependency exceptions are documented in [SECURITY.md](SECURITY.md).
-Failure to review these caveats may lead to unexpected behavior or data loss.  
-For common questions, see [FAQ.md](FAQ.md).
+Optional:
+
+- systemd 260 or newer for OCI application images through `importctl pull-oci`.
+- `debootstrap` and/or `pacstrap` for native Debian, Ubuntu, or Arch image support.
+- GNU tar 1.35 or newer for tar rootfs imports. Older versions remain usable with a security warning.
+- `nvidia-container-toolkit` for NVIDIA GPU passthrough.
+
+## Security and caveats
+
+Read [CAVEATS.md](CAVEATS.md) and [SECURITY.md](SECURITY.md) before use. They describe host-side effects, experimental providers, the elevated daemon trust model, and current dependency exceptions. For common questions, see [FAQ.md](FAQ.md).
+
+The recommended mode is `lasper -e`. The TUI stays unprivileged and starts a separate root daemon through `sudo`. Running the entire TUI with `sudo lasper` remains supported for compatibility but exposes a larger root attack surface.
 
 ## Installation
 
-To build Lasper from source, ensure you have Rust and Cargo installed, then run:
+### Release binaries
+
+Download a binary for your architecture from the [GitHub Releases](https://github.com/LumieLynn/Lasper/releases) page. Each release provides glibc and musl builds for x86_64 and aarch64. The musl build is recommended for most Linux hosts because it has fewer dependencies on the host's glibc version.
+
+After downloading the binary and `SHA256SUMS`, verify the checksum and place the binary on your `PATH`:
 
 ```bash
-cargo build --release
+sha256sum -c SHA256SUMS --ignore-missing
+install -Dm755 lasper-x86_64-unknown-linux-musl ~/.local/bin/lasper
 ```
 
-The compiled binary will be located at `target/release/lasper`. You can copy it to your path for easy access:
+Replace the filename with the build that matches your architecture. Use `/usr/local/bin/lasper` with `sudo install` if you want a system-wide installation.
+
+### Build from source
+
+Rust and Cargo are required. Build with the locked dependency versions:
 
 ```bash
-sudo cp target/release/lasper /usr/local/bin/
+cargo build --release --locked
+install -Dm755 target/release/lasper ~/.local/bin/lasper
 ```
+
+## Configuration
+
+Lasper reads an optional TOML file from `~/.config/lasper/lasper.toml` once at startup. See [CONFIGURATION.md](CONFIGURATION.md) for the complete reference and examples.
+
+The configuration is typed and can control:
+
+- startup and communication behavior, including `elevate`, `cli-mode`, and the journal `log-buffer-lines` limit;
+- bootstrap defaults, named profiles, provider-specific policies, package inheritance, and local artifact paths for `debootstrap`, `pacstrap`, `dnf5`, and artifact imports;
+- TUI colors and semantic status styling through the `[theme]` section.
+
+Command-line flags take precedence over the corresponding settings. Configuration does not add arbitrary executable paths or arbitrary root commands.
 
 ## Usage
 
@@ -64,47 +91,45 @@ the host policy.
 
 Pass `--version` or `--help` for version info and usage.
 
-You can add a container via the creation wizard. Tap `a` or `n` to open the wizard.
+Press `a` or `n` to open the creation wizard.
 
-You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user_name>@<container_name>`. Containers with a working system bus use `machinectl login`; when Lasper runs as root or with `lasper -e`, a running container without that bus can instead receive a fixed `nsenter` shell through its machined leader PID.
+You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user>@<machine>`. Containers with a working system bus use `machinectl login`. When Lasper runs as root or with `lasper -e`, a running container without that bus can instead receive a fixed `nsenter` shell through its machined leader PID.
 
-**Keybindings:**
-- `j` / `k` or `↓` / `↑` : Navigate
-- `[` / `]` or `Alt + 1-2` while Images is focused: Switch Regular/Internal images
-- `PageUp` / `PageDown` while an Inspector is focused: Scroll the active pane
-- `Enter` / `x` : Open the resource-appropriate action menu
-- `Tab` / `Shift+Tab` : Cycle focus (Machines → Machine Inspector → Images → Image Inspector → Terminal)
-- `n` / `a` : Create a new container (Creation Wizard)
-- `s` : Start the selected machine or image
-- `S` : Poweroff the selected machine
-- `D` : Delete the selected image (while Images is focused)
-- `t` : Open a terminal for the selected running machine or a regular image's same-name running machine
-- `T` : Maximize terminal (when terminal is focused)
-- `r` : Manual refresh
-- `R` : Toggle panel resize mode
-- `[` / `]` or `Alt + 1-5` while an Inspector is focused: Switch its available panes
-- `?` : Show help
-- `q` : Quit
-- `Esc` : Back / Close Overlays
+### Keybindings
 
-## Current Direction
+Navigation:
 
-The next stable milestone is `0.3.0`. The release is not defined by adding more providers or wizard switches. It should mark the point where the alpha feature set has a clearer security boundary and fewer surprising host-side side effects.
+- `j` / `k` or `Up` / `Down`: navigate.
+- `Tab` / `Shift+Tab`: cycle focus through the main panels.
+- `r`: refresh the current data.
+- `R`: toggle panel resize mode.
 
-Before `0.3.0` stable, the project should:
+Actions:
 
-- decompose the largest daemon, provisioning, and UI modules into readable ownership boundaries without widening the typed privilege interface;
-- keep the systemd-native OCI application provider clearly experimental; it does not turn arbitrary OCI images into bootable system containers;
-- preserve unknown `.nspawn` settings instead of rewriting files from only the fields Lasper understands;
-- make long-running provisioning and image operations observable and recoverable enough for normal use;
-- retain fail-closed storage and image conflict behavior while expanding smoke coverage across representative systemd hosts.
+- `Enter` / `x`: open the resource action menu.
+- `n` / `a`: create a new container.
+- `s`: start the selected machine or image.
+- `S`: power off the selected machine.
+- `D`: delete the selected image.
+- `t`: open a terminal for the selected running machine or regular image.
+- `T`: maximize the terminal when it is focused.
 
-Feature work that requires general-purpose root hooks or arbitrary daemon commands is intentionally deferred.
+Panels:
+
+- `[` / `]` or `Alt+1-2` while Images is focused: switch regular and internal images.
+- `[` / `]` or `Alt+1-5` while an Inspector is focused: switch available panes.
+- `PageUp` / `PageDown` while an Inspector is focused: scroll the active pane.
+
+Other:
+
+- `?`: show help.
+- `q`: quit.
+- `Esc`: go back or close an overlay.
 
 ## Credits
 
-The terminal emulator in `src/term/` is ported from [dekit (formerly mprocs)](https://github.com/pvolok/dekit) by Pavel Volokitin. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for its MIT license.
+The terminal emulator in `src/tui/term/` is ported from [dekit (formerly mprocs)](https://github.com/pvolok/dekit) by Pavel Volokitin. See [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for its MIT license.
 
 ## License
 
-GPL V2
+GPL-2.0-only

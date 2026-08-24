@@ -1,0 +1,120 @@
+use crate::tui::core::{Component, EventResult};
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::Rect,
+    style::{Modifier, Style},
+    widgets::{Block, BorderType, Borders, Paragraph},
+    Frame,
+};
+
+pub struct RadioGroup {
+    label: String,
+    options: Vec<String>,
+    selected_idx: usize,
+    focused: bool,
+    enabled: bool,
+}
+
+impl RadioGroup {
+    pub fn new(label: impl Into<String>, options: Vec<String>, initial_idx: usize) -> Self {
+        Self {
+            label: label.into(),
+            options,
+            selected_idx: initial_idx,
+            focused: false,
+            enabled: true,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    pub fn set_selected_idx(&mut self, idx: usize) {
+        if idx < self.options.len() {
+            self.selected_idx = idx;
+        }
+    }
+
+    pub fn selected_idx(&self) -> usize {
+        self.selected_idx
+    }
+
+    pub fn options(&self) -> &[String] {
+        &self.options
+    }
+}
+
+impl Component for RadioGroup {
+    fn render(&mut self, f: &mut Frame, area: Rect) {
+        let style =
+            Style::default().fg(crate::tui::widget_border_color(self.focused, self.enabled));
+
+        let mut spans = vec![];
+        for (i, opt) in self.options.iter().enumerate() {
+            let symbol = if i == self.selected_idx {
+                "(●)"
+            } else {
+                "(○)"
+            };
+            spans.push(format!("{} {}", symbol, opt));
+        }
+
+        let text = spans.join("   ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(self.label.as_str())
+            .border_style(style);
+
+        let text_style = if self.enabled {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(crate::tui::theme::theme().border_disabled)
+                .add_modifier(Modifier::DIM)
+        };
+        let paragraph = Paragraph::new(text).style(text_style).block(block);
+        f.render_widget(paragraph, area);
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> EventResult {
+        if !self.enabled {
+            return EventResult::Ignored;
+        }
+
+        match key.code {
+            KeyCode::Tab => EventResult::FocusNext,
+            KeyCode::BackTab => EventResult::FocusPrev,
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_idx > 0 {
+                    self.selected_idx -= 1;
+                    return EventResult::Consumed;
+                }
+                EventResult::Ignored
+            }
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
+                if self.selected_idx < self.options.len().saturating_sub(1) {
+                    self.selected_idx += 1;
+                    return EventResult::Consumed;
+                }
+                EventResult::Ignored
+            }
+            _ => EventResult::Ignored,
+        }
+    }
+
+    fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+    }
+
+    fn is_focused(&self) -> bool {
+        self.focused
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+}

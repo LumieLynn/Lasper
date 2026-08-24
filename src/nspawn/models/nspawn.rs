@@ -7,6 +7,9 @@ use std::path::Path;
 
 const MAX_CONFIG_ITEMS: usize = 4096;
 
+/// Explicit opt-in path for exposing every host DRM device to a container.
+pub const ALL_DRM_DEVICES_PATH: &str = "/dev/dri";
+
 /// The subset of `ContainerConfig` that is allowed to affect a `.nspawn` file.
 ///
 /// Passwords, users, image sources, and other provisioning-only data are
@@ -26,7 +29,8 @@ pub struct NspawnConfigSpec {
     pub privileged: bool,
     pub private_users: Option<PrivateUsersMode>,
     pub graphics_acceleration: bool,
-    pub wayland_socket: Option<String>,
+    #[serde(default)]
+    pub gpu_passthrough_all: bool,
     pub nvidia_gpu: bool,
     pub boot: bool,
 }
@@ -48,6 +52,17 @@ impl NspawnConfigSpec {
         {
             return Err(NspawnError::Validation(
                 "PrivateUsers=managed requires an explicit private network mode".into(),
+            ));
+        }
+
+        if !self
+            .network
+            .as_ref()
+            .is_some_and(NetworkMode::supports_port_forwarding)
+            && !self.port_forwards.is_empty()
+        {
+            return Err(NspawnError::Validation(
+                "Port forwarding requires Veth or Bridge network mode".into(),
             ));
         }
 
@@ -88,18 +103,6 @@ impl NspawnConfigSpec {
             validate_absolute_path("read-only bind", bind)?;
         }
 
-        if let Some(socket) = &self.wayland_socket {
-            validate_text("Wayland socket", socket, false)?;
-            if !socket.starts_with("wayland-")
-                || Path::new(socket).file_name().and_then(|name| name.to_str())
-                    != Some(socket.as_str())
-            {
-                return Err(NspawnError::Validation(format!(
-                    "Invalid Wayland socket name: {socket:?}"
-                )));
-            }
-        }
-
         Ok(())
     }
 }
@@ -126,7 +129,7 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
             privileged: config.privileged,
             private_users: config.private_users,
             graphics_acceleration: config.graphics_acceleration,
-            wayland_socket: config.wayland_socket.clone(),
+            gpu_passthrough_all: config.gpu_passthrough_all,
             nvidia_gpu: config.nvidia_gpu,
             boot: config.boot,
         };
@@ -285,13 +288,11 @@ mod tests {
     use crate::nspawn::models::CreateUser;
 
     #[test]
-    fn config_spec_excludes_provisioning_secrets() {
+    fn config_spec_excludes_account_execution_data() {
         let config = ContainerConfig {
             name: "test".into(),
-            root_password: Some("root-secret".into()),
             users: vec![CreateUser {
                 username: "alice".into(),
-                password: "user-secret".into(),
                 ..Default::default()
             }],
             ..Default::default()
@@ -299,8 +300,6 @@ mod tests {
 
         let json = serde_json::to_string(&NspawnConfigSpec::try_from(&config).unwrap()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(!json.contains("root-secret"));
-        assert!(!json.contains("user-secret"));
         assert!(value.get("root_password").is_none());
         assert!(value.get("users").is_none());
         assert!(value.get("password").is_none());
@@ -310,6 +309,7 @@ mod tests {
     fn config_spec_rejects_unknown_protocol_and_relative_bind() {
         let bad_protocol = ContainerConfig {
             name: "test".into(),
+            network: Some(NetworkMode::Veth),
             port_forwards: vec![PortForward {
                 host: 8080,
                 container: 80,
@@ -393,6 +393,7 @@ mod tests {
         for (host, container) in [(0, 80), (8080, 0)] {
             let config = ContainerConfig {
                 name: "port-test".into(),
+                network: Some(NetworkMode::Veth),
                 port_forwards: vec![PortForward {
                     host,
                     container,
@@ -405,6 +406,7 @@ mod tests {
 
         let mut spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "wire-port-test".into(),
+            network: Some(NetworkMode::Veth),
             ..Default::default()
         })
         .unwrap();
@@ -414,6 +416,37 @@ mod tests {
             protocol: TransportProtocol::Tcp,
         });
         assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn port_forwards_reject_network_modes_without_forwarding_support() {
+        let unsupported_modes = [
+            None,
+            Some(NetworkMode::Host),
+            Some(NetworkMode::None),
+            Some(NetworkMode::MacVlan("eth0".into())),
+            Some(NetworkMode::IpVlan("eth0".into())),
+            Some(NetworkMode::Interface("eth0".into())),
+        ];
+
+        for network in unsupported_modes {
+            let config = ContainerConfig {
+                name: "unsupported-port-mode".into(),
+                network,
+                port_forwards: vec![PortForward {
+                    host: 8080,
+                    container: 80,
+                    proto: "tcp".into(),
+                }],
+                ..Default::default()
+            };
+
+            assert!(matches!(
+                NspawnConfigSpec::try_from(&config),
+                Err(NspawnError::Validation(message))
+                    if message.contains("requires Veth or Bridge")
+            ));
+        }
     }
 
     #[test]

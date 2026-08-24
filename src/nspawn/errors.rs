@@ -52,6 +52,9 @@ pub enum NspawnError {
     #[error("Deployment process state is unknown: {0}")]
     DeploymentProcessStateUnknown(String),
 
+    #[error("Deployment rollback incomplete: {0}")]
+    DeploymentRollbackIncomplete(String),
+
     #[error("DBus error: {0}")]
     Dbus(#[from] zbus::Error),
 
@@ -98,6 +101,12 @@ impl NspawnError {
 }
 
 pub type Result<T> = std::result::Result<T, NspawnError>;
+
+impl From<crate::application::provisioning::DeploymentCancellationRequested> for NspawnError {
+    fn from(_: crate::application::provisioning::DeploymentCancellationRequested) -> Self {
+        Self::DeploymentCancelled
+    }
+}
 
 #[cfg(test)]
 mod tests {

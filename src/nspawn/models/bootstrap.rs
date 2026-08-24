@@ -10,16 +10,17 @@ use std::path::Path;
 
 pub const DEFAULT_BOOTSTRAP_PROFILE: &str = "default";
 
-/// Packages required for the systemd-nspawn runtime contract. Profile
-/// `packages` are appended to these provider baselines.
-pub const DEBOOTSTRAP_BASE_PACKAGES: &[&str] = &[
+/// Provider defaults for a bootable systemd-nspawn guest. Profiles inherit
+/// these packages unless `inherit_default_packages` is disabled.
+pub const DEBOOTSTRAP_DEFAULT_PACKAGES: &[&str] = &[
     "systemd-sysv",
     "libpam-systemd",
     "dbus",
     "dbus-user-session",
+    "systemd-resolved",
 ];
-pub const PACSTRAP_BASE_PACKAGES: &[&str] = &["base"];
-pub const DNF5_BASE_PACKAGES: &[&str] = &[
+pub const PACSTRAP_DEFAULT_PACKAGES: &[&str] = &["base"];
+pub const DNF5_DEFAULT_PACKAGES: &[&str] = &[
     "systemd",
     "systemd-pam",
     "dbus",
@@ -101,7 +102,7 @@ pub struct DebootstrapPolicy {
     pub allowed_mirror_hosts: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DebootstrapSpec {
     #[serde(default)]
@@ -112,6 +113,8 @@ pub struct DebootstrapSpec {
     pub mirror: Option<String>,
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default = "default_inherit_default_packages")]
+    pub inherit_default_packages: bool,
     #[serde(default)]
     pub exclude_packages: Vec<String>,
     #[serde(default)]
@@ -128,6 +131,26 @@ pub struct DebootstrapSpec {
     pub log_extra_dependencies: bool,
     #[serde(default)]
     pub policy: DebootstrapPolicy,
+}
+
+impl Default for DebootstrapSpec {
+    fn default() -> Self {
+        Self {
+            suite: String::new(),
+            architecture: None,
+            mirror: None,
+            packages: Vec::new(),
+            inherit_default_packages: true,
+            exclude_packages: Vec::new(),
+            extra_suites: Vec::new(),
+            variant: None,
+            components: Vec::new(),
+            usr_merge: DebootstrapUsrMergeMode::default(),
+            dependency_resolution: DebootstrapDependencyMode::default(),
+            log_extra_dependencies: false,
+            policy: DebootstrapPolicy::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,11 +213,13 @@ pub struct PacstrapPolicy {
     pub pacman_config: PacstrapPacmanConfigMode,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PacstrapSpec {
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default = "default_inherit_default_packages")]
+    pub inherit_default_packages: bool,
     #[serde(default)]
     pub cache: PacstrapCacheMode,
     #[serde(default)]
@@ -203,6 +228,19 @@ pub struct PacstrapSpec {
     pub dependency_checks: PacstrapDependencyMode,
     #[serde(default)]
     pub policy: PacstrapPolicy,
+}
+
+impl Default for PacstrapSpec {
+    fn default() -> Self {
+        Self {
+            packages: Vec::new(),
+            inherit_default_packages: true,
+            cache: PacstrapCacheMode::default(),
+            isolation: PacstrapIsolationMode::default(),
+            dependency_checks: PacstrapDependencyMode::default(),
+            policy: PacstrapPolicy::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -270,7 +308,7 @@ pub struct Dnf5Policy {
     pub best_candidate: Dnf5BestCandidatePolicy,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Dnf5Spec {
     #[serde(default)]
@@ -279,6 +317,8 @@ pub struct Dnf5Spec {
     pub architecture: Option<String>,
     #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default = "default_inherit_default_packages")]
+    pub inherit_default_packages: bool,
     #[serde(default)]
     pub exclude_packages: Vec<String>,
     #[serde(default)]
@@ -295,6 +335,28 @@ pub struct Dnf5Spec {
     pub repository: Dnf5RepositorySource,
     #[serde(default)]
     pub policy: Dnf5Policy,
+}
+
+impl Default for Dnf5Spec {
+    fn default() -> Self {
+        Self {
+            releasever: String::new(),
+            architecture: None,
+            packages: Vec::new(),
+            inherit_default_packages: true,
+            exclude_packages: Vec::new(),
+            only_repositories: Vec::new(),
+            enable_repositories: Vec::new(),
+            disable_repositories: Vec::new(),
+            metadata: Dnf5MetadataMode::default(),
+            repository: Dnf5RepositorySource::default(),
+            policy: Dnf5Policy::default(),
+        }
+    }
+}
+
+const fn default_inherit_default_packages() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -452,6 +514,14 @@ impl BootstrapSpec {
             Self::Dnf5(spec) => spec.validate(),
         }
     }
+
+    pub fn inherits_default_packages(&self) -> bool {
+        match self {
+            Self::Debootstrap(spec) => spec.inherit_default_packages,
+            Self::Pacstrap(spec) => spec.inherit_default_packages,
+            Self::Dnf5(spec) => spec.inherit_default_packages,
+        }
+    }
 }
 
 impl DebootstrapSpec {
@@ -505,8 +575,15 @@ impl DebootstrapSpec {
         if let Some(architecture) = &self.architecture {
             args.push(format!("--arch={architecture}"));
         }
-        let packages = effective_packages(DEBOOTSTRAP_BASE_PACKAGES, include_sudo, &self.packages);
-        args.push(format!("--include={}", packages.join(",")));
+        let packages = effective_packages(
+            DEBOOTSTRAP_DEFAULT_PACKAGES,
+            self.inherit_default_packages,
+            include_sudo,
+            &self.packages,
+        );
+        if !packages.is_empty() {
+            args.push(format!("--include={}", packages.join(",")));
+        }
         if !self.exclude_packages.is_empty() {
             args.push(format!("--exclude={}", self.exclude_packages.join(",")));
         }
@@ -587,12 +664,19 @@ impl PacstrapSpec {
         if self.policy.mirrorlist == PacmanMirrorlistMode::DoNotCopy {
             args.push("-M".into());
         }
-        args.push(target.to_string_lossy().into_owned());
-        args.extend(effective_packages(
-            PACSTRAP_BASE_PACKAGES,
+        let packages = effective_packages(
+            PACSTRAP_DEFAULT_PACKAGES,
+            self.inherit_default_packages,
             include_sudo,
             &self.packages,
-        ));
+        );
+        if packages.is_empty() {
+            return Err(validation(
+                "pacstrap requires at least one effective package when default package inheritance is disabled; an empty pacstrap invocation would install base implicitly",
+            ));
+        }
+        args.push(target.to_string_lossy().into_owned());
+        args.extend(packages);
         Ok(args)
     }
 }
@@ -697,23 +781,36 @@ impl Dnf5Spec {
             Dnf5BestCandidatePolicy::Required => args.push("--best".into()),
             Dnf5BestCandidatePolicy::AllowOlder => args.push("--no-best".into()),
         }
-        args.push("--assumeyes".into());
-        args.push("install".into());
-        args.extend(effective_packages(
-            DNF5_BASE_PACKAGES,
+        let packages = effective_packages(
+            DNF5_DEFAULT_PACKAGES,
+            self.inherit_default_packages,
             include_sudo,
             &self.packages,
-        ));
+        );
+        if packages.is_empty() {
+            return Err(validation(
+                "dnf5 requires at least one effective package when default package inheritance is disabled",
+            ));
+        }
+        args.push("--assumeyes".into());
+        args.push("install".into());
+        args.extend(packages);
         Ok(args)
     }
 }
 
-fn effective_packages(baseline: &[&str], include_sudo: bool, additional: &[String]) -> Vec<String> {
+fn effective_packages(
+    defaults: &[&str],
+    inherit_defaults: bool,
+    include_sudo: bool,
+    additional: &[String],
+) -> Vec<String> {
     let mut packages =
-        Vec::with_capacity(baseline.len() + additional.len() + usize::from(include_sudo));
-    for package in baseline
+        Vec::with_capacity(defaults.len() + additional.len() + usize::from(include_sudo));
+    for package in defaults
         .iter()
         .copied()
+        .filter(|_| inherit_defaults)
         .chain(include_sudo.then_some("sudo"))
         .chain(additional.iter().map(String::as_str))
     {
@@ -816,6 +913,7 @@ mod tests {
             architecture: Some("amd64".into()),
             mirror: Some("https://deb.debian.org/debian".into()),
             packages: vec!["zsh".into()],
+            inherit_default_packages: true,
             exclude_packages: vec!["nano".into()],
             extra_suites: vec!["bookworm-updates".into()],
             variant: Some("minbase".into()),
@@ -834,7 +932,7 @@ mod tests {
                 .unwrap(),
             vec![
                 "--arch=amd64",
-                "--include=systemd-sysv,libpam-systemd,dbus,dbus-user-session,sudo,zsh",
+                "--include=systemd-sysv,libpam-systemd,dbus,dbus-user-session,systemd-resolved,sudo,zsh",
                 "--exclude=nano",
                 "--extra-suites=bookworm-updates",
                 "--variant=minbase",
@@ -868,6 +966,7 @@ mod tests {
     fn pacstrap_policy_maps_host_integration_modes() {
         let spec = PacstrapSpec {
             packages: vec!["zsh".into()],
+            inherit_default_packages: true,
             cache: PacstrapCacheMode::Target,
             isolation: PacstrapIsolationMode::Unshare,
             dependency_checks: PacstrapDependencyMode::SkipChecks,
@@ -955,7 +1054,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_baselines_allow_empty_additional_packages_and_remove_duplicates() {
+    fn provider_defaults_allow_empty_additional_packages_and_remove_duplicates() {
         let dnf = Dnf5Spec {
             releasever: "44".into(),
             packages: vec!["systemd-pam".into(), "zsh".into(), "sudo".into()],
@@ -978,7 +1077,9 @@ mod tests {
             .args(Path::new("/var/lib/machines/test"), false)
             .unwrap()
             .iter()
-            .any(|arg| { arg == "--include=systemd-sysv,libpam-systemd,dbus,dbus-user-session" }));
+            .any(|arg| {
+                arg == "--include=systemd-sysv,libpam-systemd,dbus,dbus-user-session,systemd-resolved"
+            }));
 
         let empty_dnf = Dnf5Spec {
             releasever: "44".into(),
@@ -986,6 +1087,110 @@ mod tests {
             ..Dnf5Spec::default()
         };
         assert!(empty_dnf.validate().is_ok());
+    }
+
+    #[test]
+    fn provider_defaults_can_be_disabled_without_dropping_feature_packages() {
+        let debootstrap = DebootstrapSpec {
+            suite: "bullseye".into(),
+            packages: vec!["systemd-sysv".into(), "dbus".into()],
+            inherit_default_packages: false,
+            ..DebootstrapSpec::default()
+        };
+        let debootstrap_args = debootstrap
+            .args(Path::new("/var/lib/machines/test"), true)
+            .unwrap();
+        assert!(debootstrap_args
+            .iter()
+            .any(|arg| arg == "--include=sudo,systemd-sysv,dbus"));
+        assert!(debootstrap_args
+            .iter()
+            .all(|arg| !arg.contains("systemd-resolved")));
+
+        let pacstrap = PacstrapSpec {
+            packages: vec!["zsh".into()],
+            inherit_default_packages: false,
+            ..PacstrapSpec::default()
+        };
+        let pacstrap_args = pacstrap
+            .args(Path::new("/var/lib/machines/test"), false)
+            .unwrap();
+        assert!(pacstrap_args.iter().any(|arg| arg == "zsh"));
+        assert!(pacstrap_args.iter().all(|arg| arg != "base"));
+
+        let dnf = Dnf5Spec {
+            releasever: "43".into(),
+            packages: vec!["fedora-release-container".into()],
+            inherit_default_packages: false,
+            repository: Dnf5RepositorySource::Host,
+            ..Dnf5Spec::default()
+        };
+        let dnf_args = dnf
+            .args(Path::new("/var/lib/machines/test"), false)
+            .unwrap();
+        assert!(dnf_args.iter().any(|arg| arg == "fedora-release-container"));
+        assert!(dnf_args.iter().all(|arg| arg != "systemd"));
+    }
+
+    #[test]
+    fn debootstrap_omits_empty_include_when_defaults_are_disabled() {
+        let spec = DebootstrapSpec {
+            suite: "bullseye".into(),
+            inherit_default_packages: false,
+            ..DebootstrapSpec::default()
+        };
+        let args = spec
+            .args(Path::new("/var/lib/machines/test"), false)
+            .unwrap();
+        assert!(args.iter().all(|arg| !arg.starts_with("--include=")));
+    }
+
+    #[test]
+    fn providers_reject_empty_effective_install_sets_without_reintroducing_defaults() {
+        let spec = PacstrapSpec {
+            inherit_default_packages: false,
+            ..PacstrapSpec::default()
+        };
+        let error = spec
+            .args(Path::new("/var/lib/machines/test"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("install base implicitly"));
+
+        let spec = Dnf5Spec {
+            releasever: "43".into(),
+            inherit_default_packages: false,
+            repository: Dnf5RepositorySource::Host,
+            ..Dnf5Spec::default()
+        };
+        let error = spec
+            .args(Path::new("/var/lib/machines/test"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("at least one effective package"));
+    }
+
+    #[test]
+    fn feature_packages_make_an_empty_explicit_set_installable() {
+        let pacstrap = PacstrapSpec {
+            inherit_default_packages: false,
+            ..PacstrapSpec::default()
+        };
+        let args = pacstrap
+            .args(Path::new("/var/lib/machines/test"), true)
+            .unwrap();
+        assert!(args.iter().any(|arg| arg == "sudo"));
+        assert!(args.iter().all(|arg| arg != "base"));
+
+        let dnf = Dnf5Spec {
+            releasever: "43".into(),
+            inherit_default_packages: false,
+            repository: Dnf5RepositorySource::Host,
+            ..Dnf5Spec::default()
+        };
+        let args = dnf.args(Path::new("/var/lib/machines/test"), true).unwrap();
+        assert!(args.iter().any(|arg| arg == "sudo"));
+        assert!(args.iter().all(|arg| arg != "systemd"));
     }
 
     #[test]

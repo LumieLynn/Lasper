@@ -1,0 +1,130 @@
+//! RuntimeCatalog composition over the current host adapters.
+
+pub(crate) mod cli;
+pub(crate) mod dbus;
+pub(crate) mod elevated;
+pub(crate) mod formatting;
+pub(crate) mod inspection;
+pub(crate) mod source;
+pub(crate) mod state;
+
+use crate::adapters::runtime::cli::CliBackend;
+use crate::adapters::runtime::dbus::DbusBackend;
+use crate::adapters::runtime::elevated::DaemonBackend;
+use crate::adapters::runtime::inspection::MachineInspectionStore;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::application::operations::ExecutionRoute;
+use crate::application::runtime::{RuntimeCatalog, RuntimePort};
+use crate::nspawn::errors::Result;
+use crate::nspawn::models::{
+    ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
+};
+use std::sync::Arc;
+
+pub(crate) fn compose_runtime_catalog(
+    local_cmd: Arc<dyn crate::adapters::process::CommandRunner>,
+    fallback_inspector: Option<MachineInspectionStore>,
+    primary_route: PrimaryRuntimeRoute,
+) -> Arc<RuntimeCatalog> {
+    let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
+    let cli = CliBackend::new(local_cmd);
+    cli.set_nudge(nudge_rx);
+    let fallback_source: Arc<dyn RuntimeSource> = Arc::new(cli);
+    let fallback: Arc<dyn RuntimePort> = Arc::new(SourceRuntimePort {
+        source: fallback_source,
+        inspection_route: fallback_inspector
+            .as_ref()
+            .map(MachineInspectionStore::route)
+            .unwrap_or(ExecutionRoute::LocalCli),
+        inspector: fallback_inspector
+            .map(RuntimeInspector::Store)
+            .unwrap_or(RuntimeInspector::Source),
+        snapshot_route: ExecutionRoute::LocalCli,
+    });
+
+    let primary = match primary_route {
+        PrimaryRuntimeRoute::Disabled => None,
+        PrimaryRuntimeRoute::DirectDbus => Some((
+            Arc::new(DbusBackend::new()) as Arc<dyn RuntimeSource>,
+            ExecutionRoute::DirectDbus,
+        )),
+        PrimaryRuntimeRoute::ElevatedDbus(daemon) => Some((
+            Arc::new(DaemonBackend::new(daemon)) as Arc<dyn RuntimeSource>,
+            ExecutionRoute::ElevatedDbus,
+        )),
+    }
+    .map(|(source, route)| {
+        Arc::new(SourceRuntimePort {
+            source,
+            inspector: RuntimeInspector::Source,
+            snapshot_route: route,
+            inspection_route: route,
+        }) as Arc<dyn RuntimePort>
+    });
+
+    Arc::new(RuntimeCatalog::new(
+        primary,
+        fallback,
+        vec![
+            crate::paths::machines_dir(),
+            crate::paths::runtime_machines_dir(),
+        ],
+        Some(nudge_tx),
+    ))
+}
+
+pub(crate) enum PrimaryRuntimeRoute {
+    Disabled,
+    DirectDbus,
+    ElevatedDbus(Arc<crate::adapters::elevated::ElevatedDaemon>),
+}
+
+enum RuntimeInspector {
+    Source,
+    Store(MachineInspectionStore),
+}
+
+struct SourceRuntimePort {
+    source: Arc<dyn RuntimeSource>,
+    inspector: RuntimeInspector,
+    snapshot_route: ExecutionRoute,
+    inspection_route: ExecutionRoute,
+}
+
+#[async_trait::async_trait]
+impl RuntimePort for SourceRuntimePort {
+    fn snapshot_route(&self) -> ExecutionRoute {
+        self.snapshot_route
+    }
+
+    fn inspection_route(&self) -> ExecutionRoute {
+        self.inspection_route
+    }
+
+    async fn is_available(&self) -> bool {
+        self.source.is_available().await
+    }
+
+    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+        self.source.list_machines().await
+    }
+
+    async fn snapshot(&self) -> Result<RuntimeSnapshot> {
+        self.source.snapshot().await
+    }
+
+    async fn inspect(
+        &self,
+        machine: &MachineName,
+        entry: &ContainerEntry,
+    ) -> Result<MachineProperties> {
+        match &self.inspector {
+            RuntimeInspector::Source => self.source.get_properties(machine.as_str()).await,
+            RuntimeInspector::Store(store) => store.inspect(machine.as_str(), entry).await,
+        }
+    }
+
+    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
+        self.source.watch_events(tx).await
+    }
+}
