@@ -166,7 +166,7 @@ impl ElevatedDaemon {
                                 id,
                                 result: None,
                                 error: Some(RpcError {
-                                    code: -1,
+                                    code: error_code::INTERNAL_ERROR,
                                     message: format!(
                                         "daemon request exceeds {MAX_RPC_FRAME_BYTES} bytes"
                                     ),
@@ -281,6 +281,17 @@ impl ElevatedDaemon {
         method: &str,
         params: serde_json::Value,
     ) -> std::io::Result<serde_json::Value> {
+        let method_kind = RpcMethod::parse(method).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown daemon RPC method: {method}"),
+            )
+        })?;
+        log::trace!(
+            "[lasper] RPC method {} ({})",
+            method_kind.wire_name(),
+            method_kind.family().as_str()
+        );
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

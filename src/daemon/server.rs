@@ -443,6 +443,11 @@ async fn handle_fd_connection(
         }
     };
 
+    log::trace!(
+        "Daemon FD operation {} ({})",
+        operation.wire_name(),
+        operation.family().as_str()
+    );
     match operation {
         FdOperation::Journalctl(params) => {
             session_server::spawn_journal(&mut std_stream, params, server_state);

@@ -5,7 +5,7 @@ use super::deployment_protocol::{
     ProbeDeploymentRecoveryResult, ReleaseUnresolvedDeploymentRequest,
 };
 use super::process_state::shutdown_daemon_resources;
-use super::protocol::{CliInspectMachineRequest, RpcRequest};
+use super::protocol::{error_code, CliInspectMachineRequest, RpcRequest};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
@@ -152,7 +152,7 @@ where
                     out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":null,
-                        "error":{"code":-32700,"message":format!("Parse error: {}", e)}
+                        "error":{"code":error_code::PARSE_ERROR,"message":format!("Parse error: {}", e)}
                     }),
                 )
                 .await
@@ -163,6 +163,29 @@ where
             }
         };
 
+        let method = match request.method_kind() {
+            Ok(method) => method,
+            Err(error) => {
+                if !send(
+                    out_tx,
+                    serde_json::json!({
+                        "jsonrpc":"2.0","id":request.id,
+                        "error":{"code":error.code,"message":error.message}
+                    }),
+                )
+                .await
+                {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        log::trace!(
+            "Daemon RPC: accepted {} method in {} family",
+            method.wire_name(),
+            method.family().as_str()
+        );
+
         let reservation = match daemon_resource_claim(&request) {
             Ok(Some(claim)) => match server_state.operations.reserve([claim]) {
                 Ok(reservation) => Some(reservation),
@@ -171,7 +194,7 @@ where
                         out_tx,
                         serde_json::json!({
                             "jsonrpc":"2.0","id":request.id,
-                            "error":{"code":-32002,"message":format!(
+                            "error":{"code":error_code::RESOURCE_BUSY,"message":format!(
                                 "resource is busy: {:?}", conflict.key
                             )}
                         }),
@@ -189,7 +212,7 @@ where
                     out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":request.id,
-                        "error":{"code":-32602,"message":error}
+                        "error":{"code":error_code::INVALID_PARAMS,"message":error}
                     }),
                 )
                 .await
@@ -206,7 +229,7 @@ where
                     out_tx,
                     serde_json::json!({
                         "jsonrpc":"2.0","id":request.id,
-                        "error":{"code":-32001,"message":"daemon request limit reached"}
+                        "error":{"code":error_code::REQUEST_LIMIT,"message":"daemon request limit reached"}
                     }),
                 )
                 .await
@@ -249,7 +272,7 @@ where
                     let _ = send(
                         &out_tx,
                         serde_json::json!({
-                            "jsonrpc":"2.0","id":response_id,"error":{"code":-1,"message":e}
+                            "jsonrpc":"2.0","id":response_id,"error":{"code":error_code::INTERNAL_ERROR,"message":e}
                         }),
                     )
                     .await;
