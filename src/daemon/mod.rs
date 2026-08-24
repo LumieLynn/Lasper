@@ -27,6 +27,7 @@ mod command;
 pub(crate) mod deployment_protocol;
 mod deployment_server;
 mod dispatch;
+mod job;
 mod logging;
 mod process_state;
 pub(crate) mod protocol;
