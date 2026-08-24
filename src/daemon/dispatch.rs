@@ -5,7 +5,7 @@ use super::deployment_protocol::{
     ProbeDeploymentRecoveryResult, ReleaseUnresolvedDeploymentRequest,
 };
 use super::process_state::shutdown_daemon_resources;
-use super::protocol::{error_code, CliInspectMachineRequest, RpcRequest};
+use super::protocol::{error_code, CliInspectMachineRequest, RpcMethod, RpcRequest};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
@@ -285,32 +285,32 @@ where
 pub(super) fn daemon_resource_claim(
     request: &RpcRequest,
 ) -> Result<Option<crate::application::ResourceClaim>, String> {
-    if !matches!(
-        request.method.as_str(),
-        "system_operation" | "dbus_system_operation" | "image_remove" | "machine_control"
-    ) {
-        return Ok(None);
-    }
-    let key = if request.method == "image_remove" {
-        let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
-            .map_err(|error| format!("invalid image_remove request: {error}"))?;
-        crate::application::ResourceKey::for_image(&request.image)
-    } else if request.method == "machine_control" {
-        let request: MachineControlRequest = serde_json::from_value(request.params.clone())
-            .map_err(|error| format!("invalid machine_control request: {error}"))?;
-        crate::application::ResourceKey::for_machine(&request.machine)
-    } else {
-        let operation: SystemOperation = serde_json::from_value(request.params.clone())
-            .map_err(|error| format!("invalid {} request: {error}", request.method))?;
-        match operation {
-            SystemOperation::Start { machine } => {
-                crate::application::ResourceKey::for_machine(&machine)
-            }
-            SystemOperation::RemoveImage { image } => {
-                crate::application::ResourceKey::for_image(&image)
-            }
-            _ => return Ok(None),
+    let method = request.method_kind().map_err(|error| error.message)?;
+    let key = match method {
+        RpcMethod::ImageRemove => {
+            let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid image_remove request: {error}"))?;
+            crate::application::ResourceKey::for_image(&request.image)
         }
+        RpcMethod::MachineControl => {
+            let request: MachineControlRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid machine_control request: {error}"))?;
+            crate::application::ResourceKey::for_machine(&request.machine)
+        }
+        RpcMethod::SystemOperation | RpcMethod::DbusSystemOperation => {
+            let operation: SystemOperation = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
+            match operation {
+                SystemOperation::Start { machine } => {
+                    crate::application::ResourceKey::for_machine(&machine)
+                }
+                SystemOperation::RemoveImage { image } => {
+                    crate::application::ResourceKey::for_image(&image)
+                }
+                _ => return Ok(None),
+            }
+        }
+        _ => return Ok(None),
     };
     Ok(Some(crate::application::ResourceClaim::exclusive(key)))
 }
@@ -326,10 +326,14 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
     let RpcRequest {
         id, method, params, ..
     } = request;
-    match method.as_str() {
-        "ping" => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
+    let method = match RpcMethod::parse(&method) {
+        Some(method) => method,
+        None => return HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
+    };
+    match method {
+        RpcMethod::Ping => HandleOutcome::Sync(Ok(serde_json::Value::Null)),
 
-        "close_session" => {
+        RpcMethod::CloseSession => {
             let params: CloseSessionParams = match serde_json::from_value(params) {
                 Ok(params) => params,
                 Err(error) => {
@@ -346,7 +350,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             )
         }
 
-        "nspawn_config" => {
+        RpcMethod::NspawnConfig => {
             let operation: NspawnConfigOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -376,7 +380,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "systemd_unit" => {
+        RpcMethod::SystemdUnit => {
             let operation: SystemdUnitOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -405,7 +409,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "nvidia_state" => {
+        RpcMethod::NvidiaState => {
             let operation: NvidiaStateOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -435,7 +439,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "deployment_state" => {
+        RpcMethod::DeploymentState => {
             let operation: DeploymentStateOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -459,7 +463,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "deployment_status" => {
+        RpcMethod::DeploymentStatus => {
             let request: DeploymentJobRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -479,7 +483,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "resolve_deployment_submission" => {
+        RpcMethod::ResolveDeploymentSubmission => {
             let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -502,7 +506,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "acknowledge_deployment_submission" => {
+        RpcMethod::AcknowledgeDeploymentSubmission => {
             let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -520,7 +524,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "cancel_deployment" => {
+        RpcMethod::CancelDeployment => {
             let request: DeploymentJobRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -537,7 +541,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "acknowledge_deployment" => {
+        RpcMethod::AcknowledgeDeployment => {
             let request: DeploymentJobRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -552,7 +556,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "probe_deployment_recovery" => {
+        RpcMethod::ProbeDeploymentRecovery => {
             let request: ProbeDeploymentRecoveryRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -619,7 +623,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Sync(serde_json::to_value(result).map_err(|error| error.to_string()))
         }
 
-        "reconcile_deployment" => {
+        RpcMethod::ReconcileDeployment => {
             let request: DeploymentJobRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -672,7 +676,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "release_unresolved_deployment" => {
+        RpcMethod::ReleaseUnresolvedDeployment => {
             let request: ReleaseUnresolvedDeploymentRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -692,7 +696,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "rootfs" => {
+        RpcMethod::Rootfs => {
             let operation: RootfsOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -719,7 +723,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "assess_tar_runtime" => {
+        RpcMethod::AssessTarRuntime => {
             if params != serde_json::json!({}) {
                 return HandleOutcome::Sync(Err(
                     "assess_tar_runtime does not accept parameters".into()
@@ -748,7 +752,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "system_operation" => {
+        RpcMethod::SystemOperation => {
             let operation: SystemOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,
                 Err(error) => {
@@ -763,7 +767,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "cli_inspect_machine" => {
+        RpcMethod::CliInspectMachine => {
             let inspection: CliInspectMachineRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -799,7 +803,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Spawned
         }
 
-        "dbus_list_machines" => {
+        RpcMethod::DbusListMachines => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
@@ -813,7 +817,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "dbus_list_images" => {
+        RpcMethod::DbusListImages => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
@@ -827,7 +831,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "dbus_system_operation" => {
+        RpcMethod::DbusSystemOperation => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
@@ -846,7 +850,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "machine_control" => {
+        RpcMethod::MachineControl => {
             let request: MachineControlRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -873,7 +877,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
 
-        "image_remove" => {
+        RpcMethod::ImageRemove => {
             let request: ImageRemoveRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
@@ -902,7 +906,7 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
 
-        "dbus_get_properties" => {
+        RpcMethod::DbusGetProperties => {
             let dbus = match dbus.as_ref() {
                 Some(d) => d,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
@@ -920,19 +924,17 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
             }
         }
 
-        "dbus_is_available" => match dbus {
+        RpcMethod::DbusIsAvailable => match dbus {
             Some(dbus) => {
                 HandleOutcome::Sync(Ok(serde_json::Value::Bool(dbus.is_available().await)))
             }
             None => HandleOutcome::Sync(Ok(serde_json::Value::Bool(false))),
         },
 
-        "exit" => {
+        RpcMethod::Exit => {
             shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
         }
-
-        _ => HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
     }
 }
 
