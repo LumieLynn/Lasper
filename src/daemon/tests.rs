@@ -1,4 +1,5 @@
 use super::dispatch::*;
+use super::handler::*;
 use super::logging::*;
 use super::protocol::*;
 use super::server::*;
@@ -553,7 +554,9 @@ fn rpc_machine_name_validation_runs_on_daemon_request() {
         params: serde_json::json!({"name": "valid-machine"}),
     };
     assert_eq!(
-        request_machine_name(&valid.params).unwrap().as_str(),
+        super::query::request_machine_name(&valid.params)
+            .unwrap()
+            .as_str(),
         "valid-machine"
     );
 
@@ -561,7 +564,7 @@ fn rpc_machine_name_validation_runs_on_daemon_request() {
         params: serde_json::json!({"name": "../escape"}),
         ..valid
     };
-    assert!(request_machine_name(&invalid.params).is_err());
+    assert!(super::query::request_machine_name(&invalid.params).is_err());
 }
 
 #[tokio::test]

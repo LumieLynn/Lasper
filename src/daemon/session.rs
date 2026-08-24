@@ -4,7 +4,7 @@
 //! module owns only the typed control-plane transition exposed to the RPC
 //! dispatcher.
 
-use super::dispatch::HandleOutcome;
+use super::handler::HandleOutcome;
 use super::protocol::{RpcFamily, RpcMethod};
 use super::session_protocol::CloseSessionParams;
 use super::session_server::DaemonServerState;

@@ -4,7 +4,7 @@
 //! perform external I/O in a spawned task, but they do not expose accepted
 //! job state; long-running stateful work belongs to `deployment_server`.
 
-use super::dispatch::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use super::protocol::{error_code, RpcFamily, RpcMethod};
 use super::session_server::DaemonServerState;
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};

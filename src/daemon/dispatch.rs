@@ -1,99 +1,17 @@
 //! Bounded control-channel request pump and typed privileged dispatch.
 
+use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
 use super::session_server::DaemonServerState;
 use super::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
-use crate::adapters::lifecycle::error::map_machine_control_error;
-use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOperation};
+use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
-use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlOutcome, MachineControlRequest,
-};
+use crate::application::machine_lifecycle::MachineControlRequest;
 use crate::domain::secret::zeroize_string;
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
 use std::sync::Arc;
 
 const MAX_RPC_IN_FLIGHT: usize = 64;
-
-pub(super) enum HandleOutcome {
-    Spawned,
-    Sync(Result<serde_json::Value, String>),
-}
-
-pub(super) async fn initialize_dbus_backend(
-    enabled: bool,
-) -> Option<crate::adapters::runtime::dbus::DbusBackend> {
-    if !enabled {
-        return None;
-    }
-
-    let dbus = crate::adapters::runtime::dbus::DbusBackend::new();
-    RuntimeSource::is_available(&dbus).await.then_some(dbus)
-}
-
-/// The D-Bus surface used by the RPC dispatcher.
-///
-/// This is intentionally private to the daemon for now. It keeps dispatch
-/// tests independent from a live system bus without pretending that the
-/// application already has a general host capability layer.
-#[async_trait::async_trait]
-pub(super) trait DaemonDbusExecutor: Send + Sync {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>>;
-    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>>;
-    async fn system_operation(
-        &self,
-        operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()>;
-    async fn machine_control(
-        &self,
-        machine: MachineName,
-        action: MachineAction,
-    ) -> MachineControlOutcome {
-        let operation = match action {
-            MachineAction::Start => SystemOperation::Start { machine },
-            MachineAction::Terminate => SystemOperation::Terminate { machine },
-            MachineAction::Poweroff => SystemOperation::Poweroff { machine },
-            MachineAction::Reboot => SystemOperation::Reboot { machine },
-            MachineAction::Enable => SystemOperation::Enable { machine },
-            MachineAction::Disable => SystemOperation::Disable { machine },
-            MachineAction::Kill { signal } => SystemOperation::Kill { machine, signal },
-        };
-        match self.system_operation(operation).await {
-            Ok(()) => MachineControlOutcome::Succeeded,
-            Err(error) => map_machine_control_error(error),
-        }
-    }
-    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties>;
-    async fn is_available(&self) -> bool;
-}
-
-#[async_trait::async_trait]
-impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
-        RuntimeSource::list_machines(self).await
-    }
-
-    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
-        RuntimeSource::list_images(self).await
-    }
-
-    async fn system_operation(
-        &self,
-        operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()> {
-        execute_dbus_system_operation(self, operation).await
-    }
-
-    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties> {
-        RuntimeSource::get_properties(self, name).await
-    }
-
-    async fn is_available(&self) -> bool {
-        RuntimeSource::is_available(self).await
-    }
-}
 
 pub(super) async fn run_rpc_request_pump<R, B>(
     reader: &mut R,
@@ -350,11 +268,4 @@ pub(super) async fn handle_request<B: DaemonDbusExecutor>(
         .await;
     }
     unreachable!("unhandled RPC family escaped dispatcher")
-}
-
-pub(super) fn request_machine_name(params: &serde_json::Value) -> Result<MachineName, String> {
-    let name = params["name"]
-        .as_str()
-        .ok_or_else(|| "missing name".to_string())?;
-    MachineName::try_from(name).map_err(|error| error.to_string())
 }

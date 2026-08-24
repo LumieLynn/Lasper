@@ -9,7 +9,7 @@ use super::deployment_protocol::{
     ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest,
 };
-use super::dispatch::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use super::protocol::{RpcFamily, RpcMethod};
 use super::session_server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;

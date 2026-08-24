@@ -1,6 +1,6 @@
 //! Root daemon bootstrap, authenticated listeners, and FD-passing handlers.
 
-use super::dispatch::{initialize_dbus_backend, run_rpc_request_pump};
+use super::dispatch::run_rpc_request_pump;
 use super::logging::{initialize_daemon_logging, AuthLogLimiter};
 use super::process_state::shutdown_daemon_resources;
 use super::protocol::*;
@@ -18,6 +18,17 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 const MAX_FD_CONNECTIONS: usize = 32;
+
+pub(super) async fn initialize_dbus_backend(
+    enabled: bool,
+) -> Option<crate::adapters::runtime::dbus::DbusBackend> {
+    if !enabled {
+        return None;
+    }
+
+    let dbus = crate::adapters::runtime::dbus::DbusBackend::new();
+    RuntimeSource::is_available(&dbus).await.then_some(dbus)
+}
 
 pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
     if effective_uid == 0 {
