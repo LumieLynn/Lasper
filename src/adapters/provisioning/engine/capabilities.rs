@@ -233,6 +233,7 @@ impl ApplyReport {
         for resource in [
             DeploymentResource::StorageMount(self.target.clone()),
             DeploymentResource::RawConfigurationMount(self.target.clone()),
+            DeploymentResource::RootfsHostname(self.target.clone()),
             DeploymentResource::RootfsAccounts(self.target.clone()),
             DeploymentResource::RootfsNvidia(self.target.clone()),
             DeploymentResource::RootfsNetwork(self.target.clone()),

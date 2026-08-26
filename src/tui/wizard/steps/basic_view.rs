@@ -13,7 +13,7 @@ macro_rules! active_comps {
     ($self:ident) => {{
         let mut comps: Vec<&mut dyn Component> = vec![&mut $self.name];
         if $self.show_hostname {
-            comps.push(&mut $self.hostname);
+            comps.push(&mut $self.guest_hostname);
         }
         comps
     }};
@@ -23,7 +23,7 @@ impl_wizard_nav!(BasicStepView, active_comps);
 
 pub struct BasicStepView {
     name: TextBox,
-    hostname: TextBox,
+    guest_hostname: TextBox,
     show_hostname: bool,
     focus: FocusTracker,
 }
@@ -41,9 +41,9 @@ impl BasicStepView {
         let mut view = Self {
             name: TextBox::new(" Machine name (required) ", initial_data.name.clone())
                 .with_validator(move |value| validate_machine_name(value, &existing_names)),
-            hostname: TextBox::new(
-                " Hostname (optional, defaults to name) ",
-                initial_data.hostname.clone(),
+            guest_hostname: TextBox::new(
+                " Guest hostname (optional, defaults to machine name) ",
+                initial_data.guest_hostname.clone(),
             )
             .with_validator(|value| {
                 crate::nspawn::models::validate_nspawn_hostname(value)
@@ -59,18 +59,7 @@ impl BasicStepView {
 
 fn validate_machine_name(value: &str, existing_names: &HashSet<String>) -> Result<(), String> {
     let name = value.trim();
-    if name.is_empty() {
-        return Err("Name cannot be empty".to_string());
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return Err("Invalid characters: use [a-zA-Z0-9_-]".to_string());
-    }
-    if name.len() > 64 {
-        return Err("Name too long (max 64)".to_string());
-    }
+    crate::nspawn::models::MachineName::new(name).map_err(|error| error.to_string())?;
     if existing_names.contains(name) {
         return Err(format!("Machine image '{}' already exists", name));
     }
@@ -92,7 +81,7 @@ impl Component for BasicStepView {
 
         self.name.render(f, chunks[0]);
         if self.show_hostname {
-            self.hostname.render(f, chunks[1]);
+            self.guest_hostname.render(f, chunks[1]);
         }
     }
 
@@ -107,7 +96,7 @@ impl Component for BasicStepView {
     fn validate(&mut self) -> Result<(), String> {
         self.name.validate()?;
         if self.show_hostname {
-            self.hostname.validate()?;
+            self.guest_hostname.validate()?;
         }
         Ok(())
     }
@@ -117,9 +106,9 @@ impl StepComponent for BasicStepView {
     fn commit_to_draft(&self, ctx: &mut WizardDraft) {
         ctx.basic.name = self.name.value().to_string();
         if self.show_hostname {
-            ctx.basic.hostname = self.hostname.value().to_string();
+            ctx.basic.guest_hostname = self.guest_hostname.value().to_string();
         } else {
-            ctx.basic.hostname.clear();
+            ctx.basic.guest_hostname.clear();
         }
     }
 
@@ -149,5 +138,14 @@ mod tests {
         let existing = ["arch-test".to_string()].into_iter().collect();
 
         assert!(validate_machine_name("new-container", &existing).is_ok());
+    }
+
+    #[test]
+    fn machine_name_uses_the_systemd_nspawn_domain_rules() {
+        let existing = HashSet::new();
+
+        assert!(validate_machine_name("name_with_underscore", &existing).is_err());
+        assert!(validate_machine_name("-leading", &existing).is_err());
+        assert!(validate_machine_name("machine.example", &existing).is_ok());
     }
 }

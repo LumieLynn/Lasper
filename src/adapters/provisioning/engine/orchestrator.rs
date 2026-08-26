@@ -76,7 +76,9 @@ async fn run_deploy_internal(
 ) -> Result<()> {
     let logs = job.event_sender();
     let cancellation = job.cancellation();
-    let target = crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?.machine;
+    let nspawn_spec = crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
+    let target = nspawn_spec.machine;
+    let guest_hostname = nspawn_spec.guest_hostname;
     let system_operations = host.system_operations.clone();
 
     macro_rules! push_log {
@@ -222,6 +224,27 @@ async fn run_deploy_internal(
                 .supports_nspawn_commands(&actual_rootfs_target)
                 .await?;
 
+        if has_os_layout {
+            push_log!(format!(
+                "Setting guest hostname to {}...",
+                guest_hostname.as_str()
+            ));
+            let rootfs_hostname = DeploymentResource::RootfsHostname(target.clone());
+            persist_applying(
+                &job,
+                DeploymentStage::RootfsMutation,
+                vec![rootfs_hostname.clone()],
+                &report,
+            )
+            .await?;
+            host.rootfs
+                .configure_hostname(&actual_rootfs_target, &guest_hostname)
+                .await?;
+            report.record_typed(rootfs_hostname, ResourceDisposition::Committed);
+            persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
+            cancellation.checkpoint()?;
+        }
+
         let has_account_changes = secrets.has_account_changes();
         if supports_offline_commands {
             if has_account_changes {
@@ -265,7 +288,7 @@ async fn run_deploy_internal(
             }
         } else if !has_os_layout {
             log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
-            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping passwords and user creation.".to_string());
+            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping guest hostname, passwords, and user creation.".to_string());
         } else if has_account_changes {
             log::warn!("[AUDIT] [Container: {}] rootfs has no /usr tree required by systemd-nspawn offline commands. Skipping account modifications.", name);
             push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());

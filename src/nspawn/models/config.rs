@@ -452,7 +452,9 @@ impl Default for DiskImageConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContainerConfig {
     pub name: String,
-    pub hostname: String,
+    /// Optional static hostname for the guest. An empty value uses `name`.
+    #[serde(default, alias = "hostname")]
+    pub guest_hostname: String,
     pub network: Option<NetworkMode>,
     pub port_forwards: Vec<PortForward>,
     pub bind_mounts: Vec<BindMount>,
@@ -487,7 +489,7 @@ impl Default for ContainerConfig {
     fn default() -> Self {
         Self {
             name: Default::default(),
-            hostname: Default::default(),
+            guest_hostname: Default::default(),
             network: Default::default(),
             port_forwards: Default::default(),
             bind_mounts: Default::default(),
@@ -515,6 +517,29 @@ mod tests {
         assert!(cfg.boot);
         assert_eq!(cfg.network, None);
         assert_eq!(cfg.private_users, None);
+    }
+
+    #[test]
+    fn legacy_hostname_field_deserializes_as_guest_hostname() {
+        let value = serde_json::json!({
+            "name": "machine",
+            "hostname": "guest.example",
+            "network": null,
+            "port_forwards": [],
+            "bind_mounts": [],
+            "device_binds": [],
+            "readonly_binds": [],
+            "privileged": false,
+            "private_users": null,
+            "graphics_acceleration": false,
+            "users": [],
+            "nvidia_gpu": false,
+            "disk_config": null
+        });
+
+        let config: ContainerConfig = serde_json::from_value(value).unwrap();
+
+        assert_eq!(config.guest_hostname, "guest.example");
     }
 
     #[test]

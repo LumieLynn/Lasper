@@ -51,7 +51,7 @@ pub enum SourceConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicConfig {
     pub name: String,
-    pub hostname: String,
+    pub guest_hostname: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,14 +320,14 @@ fn method_default(
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicState {
     pub name: String,
-    pub hostname: String,
+    pub guest_hostname: String,
 }
 
 impl BasicState {
     pub fn extract_config(&self) -> BasicConfig {
         BasicConfig {
             name: self.name.clone(),
-            hostname: self.hostname.clone(),
+            guest_hostname: self.guest_hostname.clone(),
         }
     }
 }
@@ -683,7 +683,7 @@ impl WizardDraft {
             },
             basic: BasicState {
                 name: "".to_string(),
-                hostname: "".to_string(),
+                guest_hostname: "".to_string(),
             },
             storage: StorageState {
                 type_idx: 0,
@@ -826,7 +826,7 @@ impl WizardDraft {
             .collect();
         let config = crate::nspawn::models::ContainerConfig {
             name: basic.name,
-            hostname: basic.hostname,
+            guest_hostname: basic.guest_hostname,
             network: network.mode,
             port_forwards: network.port_forwards,
             bind_mounts: passthrough.bind_mounts,

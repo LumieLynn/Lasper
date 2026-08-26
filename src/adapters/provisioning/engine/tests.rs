@@ -110,6 +110,9 @@ fn removing_owned_storage_resolves_unknown_rootfs_effects() {
     report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsAccounts(
         report.target.clone(),
     ));
+    report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsHostname(
+        report.target.clone(),
+    ));
     report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsNetwork(
         report.target.clone(),
     ));

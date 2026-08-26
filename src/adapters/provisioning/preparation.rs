@@ -227,11 +227,14 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 crate::paths::machine_raw_image(&request.config.name),
             ),
         };
+        let guest_hostname = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
+            .map(|spec| spec.guest_hostname.into_string())
+            .unwrap_or_else(|_| request.config.guest_hostname.clone());
         let mut content = format!(
-            " [DEPLOYMENT PREVIEW - {}]\n\n Storage: {storage_label} ({})\n Hostname: {}\n",
+            " [DEPLOYMENT PREVIEW - {}]\n\n Storage: {storage_label} ({})\n Guest hostname: {}\n",
             request.config.name,
             storage_path.display(),
-            request.config.hostname,
+            guest_hostname,
         );
         if let DeploymentSource::Bootstrap(spec) = &request.source {
             if spec.inherits_default_packages() {

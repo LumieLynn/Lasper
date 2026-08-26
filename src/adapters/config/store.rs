@@ -1508,7 +1508,7 @@ Unknown=preserve-me\n";
         let path = directory.path().join("test.nspawn");
         let config = ContainerConfig {
             name: "test".into(),
-            hostname: "test-host".into(),
+            guest_hostname: "test-host".into(),
             ..Default::default()
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
@@ -1530,7 +1530,7 @@ Unknown=preserve-me\n";
 
         let different = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            hostname: "different".into(),
+            guest_hostname: "different".into(),
             ..Default::default()
         })
         .unwrap();

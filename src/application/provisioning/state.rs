@@ -98,6 +98,7 @@ pub(crate) enum DeploymentResource {
     NvidiaState(MachineName),
     NspawnConfig(MachineName),
     SystemdOverride(MachineName),
+    RootfsHostname(MachineName),
     RootfsAccounts(MachineName),
     RootfsNvidia(MachineName),
     RootfsNetwork(MachineName),
@@ -113,6 +114,7 @@ impl DeploymentResource {
             Self::NvidiaState(_) => "NVIDIA state",
             Self::NspawnConfig(_) => ".nspawn configuration",
             Self::SystemdOverride(_) => "systemd service override",
+            Self::RootfsHostname(_) => "rootfs hostname state",
             Self::RootfsAccounts(_) => "rootfs account state",
             Self::RootfsNvidia(_) => "rootfs NVIDIA state",
             Self::RootfsNetwork(_) => "rootfs network state",
@@ -128,6 +130,7 @@ impl DeploymentResource {
             | Self::NvidiaState(target)
             | Self::NspawnConfig(target)
             | Self::SystemdOverride(target)
+            | Self::RootfsHostname(target)
             | Self::RootfsAccounts(target)
             | Self::RootfsNvidia(target)
             | Self::RootfsNetwork(target) => target,
@@ -553,7 +556,7 @@ mod tests {
         assert_eq!(first.fingerprint(), second.fingerprint());
 
         let mut changed = request();
-        changed.config.hostname = "different".into();
+        changed.config.guest_hostname = "different".into();
         let changed = DeploymentPlan::build(changed).unwrap();
         assert_ne!(first.fingerprint(), changed.fingerprint());
     }

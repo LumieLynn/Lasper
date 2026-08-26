@@ -1,6 +1,7 @@
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    BindMount, ContainerConfig, MachineName, NetworkMode, PortForward, PrivateUsersMode,
+    BindMount, ContainerConfig, GuestHostname, MachineName, NetworkMode, PortForward,
+    PrivateUsersMode,
 };
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -19,7 +20,7 @@ pub const ALL_DRM_DEVICES_PATH: &str = "/dev/dri";
 #[serde(deny_unknown_fields)]
 pub struct NspawnConfigSpec {
     pub machine: MachineName,
-    pub hostname: String,
+    pub guest_hostname: GuestHostname,
     pub network: Option<NetworkMode>,
     pub resolv_conf: Option<ResolvConfMode>,
     pub port_forwards: Vec<NspawnPortForward>,
@@ -37,8 +38,6 @@ pub struct NspawnConfigSpec {
 
 impl NspawnConfigSpec {
     pub fn validate(&self) -> Result<()> {
-        validate_nspawn_hostname(&self.hostname)?;
-
         let expected_resolv_conf = ResolvConfMode::for_network(self.network.as_ref());
         if self.resolv_conf != expected_resolv_conf {
             return Err(NspawnError::Validation(format!(
@@ -112,10 +111,13 @@ impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
 
     fn try_from(config: &ContainerConfig) -> Result<Self> {
         let resolv_conf = ResolvConfMode::for_network(config.network.as_ref());
+        let machine = MachineName::new(config.name.clone())
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
+        let guest_hostname = GuestHostname::resolve(&config.guest_hostname, &machine)
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
         let spec = Self {
-            machine: MachineName::new(config.name.clone())
-                .map_err(|error| NspawnError::Validation(error.to_string()))?,
-            hostname: config.hostname.clone(),
+            machine,
+            guest_hostname,
             network: config.network.clone(),
             resolv_conf,
             port_forwards: config
@@ -224,23 +226,9 @@ pub(crate) fn validate_nspawn_hostname(value: &str) -> Result<()> {
     if value.is_empty() {
         return Ok(());
     }
-    let valid = value.len() <= 64
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && value.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        });
-    if !valid {
-        return Err(NspawnError::Validation(format!(
-            "Invalid hostname: {value:?}"
-        )));
-    }
-    Ok(())
+    GuestHostname::new(value)
+        .map(|_| ())
+        .map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 pub(crate) fn validate_nspawn_interface_name(value: &str) -> Result<()> {
@@ -468,6 +456,18 @@ mod tests {
             assert!(validate_nspawn_hostname(hostname).is_err(), "{hostname:?}");
         }
         assert!(validate_nspawn_hostname(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn nspawn_spec_resolves_the_default_guest_hostname() {
+        let config = ContainerConfig {
+            name: "machine-name".into(),
+            ..Default::default()
+        };
+
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        assert_eq!(spec.guest_hostname.as_str(), "machine-name");
     }
 
     #[test]

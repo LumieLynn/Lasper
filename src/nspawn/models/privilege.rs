@@ -3,7 +3,9 @@ use std::fmt;
 use std::num::NonZeroU16;
 
 #[allow(unused_imports)]
-pub use crate::domain::machine::{MachineName, MachineNameError};
+pub use crate::domain::machine::{
+    GuestHostname, GuestHostnameError, MachineName, MachineNameError,
+};
 
 /// Signals that Lasper may send through a machine-management backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

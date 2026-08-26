@@ -435,7 +435,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, NspawnError::Validation(_)));
+        assert!(matches!(error, NspawnError::ProtectedImage(_)));
     }
 
     #[tokio::test]

@@ -124,6 +124,7 @@ pub(crate) async fn probe_manifest_locally(
             },
             DeploymentResource::StorageMount(_)
             | DeploymentResource::RawConfigurationMount(_)
+            | DeploymentResource::RootfsHostname(_)
             | DeploymentResource::RootfsAccounts(_)
             | DeploymentResource::RootfsNvidia(_)
             | DeploymentResource::RootfsNetwork(_) => DeploymentRecoveryEvidence::NotProbeable,

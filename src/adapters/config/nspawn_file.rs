@@ -344,8 +344,8 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
         if spec.privileged {
             exec.set("Capability", "all");
         }
-        if !spec.hostname.is_empty() && spec.hostname != spec.machine.as_str() {
-            exec.set("Hostname", &spec.hostname);
+        if spec.guest_hostname.as_str() != spec.machine.as_str() {
+            exec.set("Hostname", spec.guest_hostname.as_str());
         }
     }
 

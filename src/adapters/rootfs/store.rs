@@ -1,12 +1,14 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::process::log_output;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
+use crate::adapters::rootfs::hostname::configure_hostname_at;
 use crate::adapters::rootfs::network::configure_network_at;
 use crate::adapters::rootfs::nvidia::{
     cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
 };
 use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
 use crate::adapters::rootfs::{users, wayland};
+use crate::domain::machine::GuestHostname;
 use crate::domain::secret::{serde_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::nspawn::errors::{NspawnError, Result};
@@ -140,6 +142,21 @@ impl RootfsStore {
             }))
             .await?;
         Ok(result.warnings)
+    }
+
+    pub(crate) async fn configure_hostname(
+        &self,
+        target: &RootfsTarget,
+        hostname: &GuestHostname,
+    ) -> Result<()> {
+        self.execute(RootfsOperation::ConfigureHostname(
+            ConfigureHostnameRequest {
+                target: target.clone(),
+                hostname: hostname.clone(),
+            },
+        ))
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn set_root_password(
@@ -309,6 +326,7 @@ pub(crate) enum RootfsOperation {
     ProbeNspawnCommandSupport(TargetRequest),
     MountManagedRaw(TargetRequest),
     UnmountManagedRaw(TargetRequest),
+    ConfigureHostname(ConfigureHostnameRequest),
     ConfigureNetwork(TargetRequest),
     SetRootPassword(SetRootPasswordRequest),
     CreateUser(CreateUserRequest),
@@ -322,6 +340,13 @@ pub(crate) enum RootfsOperation {
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetRequest {
     target: RootfsTarget,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ConfigureHostnameRequest {
+    target: RootfsTarget,
+    hostname: GuestHostname,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -441,6 +466,12 @@ async fn execute_rootfs_operation_with_runners(
         RootfsOperation::UnmountManagedRaw(request) => {
             let (machine, mount_id) = raw_mount_parts(&request.target)?;
             unmount_managed_raw_at(&machine, &mount_id, runner).await?;
+            Ok(RootfsResult::default())
+        }
+        RootfsOperation::ConfigureHostname(request) => {
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            configure_hostname_at(&path, &request.hostname, runner).await?;
             Ok(RootfsResult::default())
         }
         RootfsOperation::ConfigureNetwork(request) => {
@@ -893,6 +924,15 @@ mod tests {
             }
         }"#;
         assert!(serde_json::from_str::<RootfsOperation>(x11_display).is_err());
+
+        let invalid_hostname = r#"{
+            "operation":"configure_hostname",
+            "params":{
+                "target":{"kind":"machine","machine":"test"},
+                "hostname":"guest_name"
+            }
+        }"#;
+        assert!(serde_json::from_str::<RootfsOperation>(invalid_hostname).is_err());
     }
 
     #[tokio::test]
