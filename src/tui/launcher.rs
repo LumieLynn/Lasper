@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use crossterm::{
+    cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -54,9 +55,13 @@ impl<F: FnMut()> Drop for TerminalRestoreGuard<F> {
 }
 
 fn restore_terminal() {
-    let _ = execute!(io::stdout(), DisableMouseCapture);
-    let _ = execute!(io::stdout(), LeaveAlternateScreen);
     let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        DisableMouseCapture,
+        LeaveAlternateScreen,
+        Show
+    );
 }
 
 fn claim_terminal_restore_for_panic(
@@ -110,7 +115,6 @@ pub(crate) async fn run(app: &mut App) -> Result<()> {
 
     log::info!("[lasper] TUI run() completed, restoring terminal...");
     terminal_restore.restore();
-    let _ = terminal.show_cursor();
     result
 }
 

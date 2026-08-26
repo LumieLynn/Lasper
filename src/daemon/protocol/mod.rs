@@ -228,13 +228,6 @@ impl OutboundRpcRequest {
         }
     }
 
-    pub(crate) fn method(&self) -> &str {
-        match self {
-            Self::General(request) => &request.method,
-            Self::Rootfs { .. } => "rootfs",
-        }
-    }
-
     pub(crate) fn into_wire_bytes(self) -> serde_json::Result<SecretBytes> {
         #[derive(Serialize)]
         struct RootfsEnvelope<'a> {

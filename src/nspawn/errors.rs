@@ -34,6 +34,9 @@ pub enum NspawnError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Image '{0}' is protected and cannot be removed")]
+    ProtectedImage(String),
+
     #[error("Tool '{0}' not found on PATH")]
     ToolNotFound(String),
 
@@ -87,16 +90,34 @@ impl NspawnError {
     /// an operation that requires `auth_self` or `auth_admin`.
     pub fn is_polkit_rejection(&self) -> bool {
         match self {
-            Self::Dbus(e) => {
-                let msg = e.to_string();
-                msg.contains("InteractiveAuthorizationRequired")
-                    || msg.contains("PolicyKit1.Error.NotAuthorized")
-                    || msg.contains("PolicyKit1.Error.Failed")
-                    || msg.contains("PolicyKit1.Error.AuthorizationFailed")
-                    || msg.contains("DBus.Error.AccessDenied")
-            }
+            Self::Dbus(error) => is_permission_dbus_error(error),
             _ => false,
         }
+    }
+}
+
+pub(crate) fn is_permission_dbus_error_name(name: &str) -> bool {
+    matches!(
+        name,
+        "org.freedesktop.DBus.Error.AccessDenied"
+            | "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired"
+            | "org.freedesktop.PolicyKit1.Error.NotAuthorized"
+            | "org.freedesktop.PolicyKit1.Error.AuthorizationFailed"
+            | "org.freedesktop.PolicyKit1.Error.Failed"
+            | "System.Error.EACCES"
+            | "System.Error.EPERM"
+    )
+}
+
+fn is_permission_dbus_error(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => is_permission_dbus_error_name(name.as_str()),
+        zbus::Error::FDO(error) => match error.as_ref() {
+            zbus::fdo::Error::AccessDenied(_) => true,
+            zbus::fdo::Error::ZBus(error) => is_permission_dbus_error(error),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -112,53 +133,37 @@ impl From<crate::application::provisioning::DeploymentCancellationRequested> for
 mod tests {
     use super::*;
 
-    fn dbus_err(msg: &str) -> NspawnError {
-        NspawnError::Dbus(zbus::Error::Failure(msg.into()))
+    #[test]
+    fn permission_errors_are_classified_by_dbus_name() {
+        for name in [
+            "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired",
+            "org.freedesktop.PolicyKit1.Error.NotAuthorized",
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.freedesktop.PolicyKit1.Error.AuthorizationFailed",
+            "org.freedesktop.PolicyKit1.Error.Failed",
+            "System.Error.EACCES",
+            "System.Error.EPERM",
+        ] {
+            assert!(is_permission_dbus_error_name(name));
+        }
+        assert!(!is_permission_dbus_error_name(
+            "org.freedesktop.machine1.NoSuchMachine"
+        ));
     }
 
     #[test]
-    fn test_is_polkit_rejection_interactive_auth() {
-        let err = dbus_err(
-            "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired: \
-             Access denied as the requested operation requires interactive \
-             authentication.",
-        );
-        assert!(err.is_polkit_rejection());
+    fn typed_fdo_access_denied_is_a_permission_rejection() {
+        let error = NspawnError::Dbus(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "not authorized".into(),
+        ))));
+        assert!(error.is_polkit_rejection());
     }
 
     #[test]
-    fn test_is_polkit_rejection_not_authorized() {
-        let err = dbus_err("org.freedesktop.PolicyKit1.Error.NotAuthorized: Not authorized");
-        assert!(err.is_polkit_rejection());
-    }
-
-    #[test]
-    fn test_is_polkit_rejection_access_denied() {
-        let err = dbus_err("org.freedesktop.DBus.Error.AccessDenied: Access denied");
-        assert!(err.is_polkit_rejection());
-    }
-
-    #[test]
-    fn test_is_polkit_rejection_auth_failed() {
-        let err = dbus_err("org.freedesktop.PolicyKit1.Error.AuthorizationFailed: ...");
-        assert!(err.is_polkit_rejection());
-    }
-
-    #[test]
-    fn test_is_polkit_rejection_polkit_failed() {
-        let err = dbus_err("org.freedesktop.PolicyKit1.Error.Failed: Action not allowed");
-        assert!(err.is_polkit_rejection());
-    }
-
-    #[test]
-    fn test_is_polkit_rejection_false_for_other_dbus_error() {
-        let err = dbus_err("org.freedesktop.machine1.NoSuchMachine: No machine 'foo' known");
-        assert!(!err.is_polkit_rejection());
-    }
-
-    #[test]
-    fn test_is_polkit_rejection_false_for_non_dbus_error() {
-        let err = NspawnError::Generic("something else".into());
-        assert!(!err.is_polkit_rejection());
+    fn human_readable_error_text_does_not_drive_permission_classification() {
+        let error = NspawnError::Dbus(zbus::Error::Failure(
+            "org.freedesktop.DBus.Error.AccessDenied: access denied".into(),
+        ));
+        assert!(!error.is_polkit_rejection());
     }
 }

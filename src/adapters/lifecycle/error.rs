@@ -2,19 +2,17 @@
 
 use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemovalRejection};
 use crate::application::machine_lifecycle::{MachineControlOutcome, MachineRejection};
-use crate::nspawn::errors::NspawnError;
+use crate::nspawn::errors::{is_permission_dbus_error_name, NspawnError};
 
 pub(crate) fn map_image_control_error(error: NspawnError) -> ImageControlOutcome {
     let reason = error.to_string();
     match error {
+        NspawnError::ProtectedImage(_) => ImageControlOutcome::Rejected {
+            rejection: ImageRemovalRejection::Protected,
+            reason,
+        },
         NspawnError::Validation(_) => ImageControlOutcome::Rejected {
-            rejection: if reason.contains("host image") {
-                ImageRemovalRejection::Protected
-            } else if reason.to_ascii_lowercase().contains("busy") {
-                ImageRemovalRejection::Busy
-            } else {
-                ImageRemovalRejection::InvalidTarget
-            },
+            rejection: ImageRemovalRejection::InvalidTarget,
             reason,
         },
         NspawnError::ContainerAlreadyRunning(_) => ImageControlOutcome::Rejected {
@@ -92,7 +90,9 @@ fn classify_image_method_error(name: &str) -> Option<ImageRemovalRejection> {
             Some(ImageRemovalRejection::NotFound)
         }
         "System.Error.EBUSY" => Some(ImageRemovalRejection::Busy),
-        name if is_permission_method_error(name) => Some(ImageRemovalRejection::PermissionDenied),
+        name if is_permission_dbus_error_name(name) => {
+            Some(ImageRemovalRejection::PermissionDenied)
+        }
         name if is_invalid_argument_method_error(name) => {
             Some(ImageRemovalRejection::InvalidTarget)
         }
@@ -105,23 +105,10 @@ fn classify_machine_method_error(name: &str) -> Option<MachineRejection> {
         "org.freedesktop.machine1.NoSuchMachine" | "System.Error.ENOENT" => {
             Some(MachineRejection::NotFound)
         }
-        name if is_permission_method_error(name) => Some(MachineRejection::PermissionDenied),
+        name if is_permission_dbus_error_name(name) => Some(MachineRejection::PermissionDenied),
         name if is_invalid_argument_method_error(name) => Some(MachineRejection::InvalidTarget),
         _ => None,
     }
-}
-
-fn is_permission_method_error(name: &str) -> bool {
-    matches!(
-        name,
-        "org.freedesktop.DBus.Error.AccessDenied"
-            | "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired"
-            | "org.freedesktop.PolicyKit1.Error.NotAuthorized"
-            | "org.freedesktop.PolicyKit1.Error.AuthorizationFailed"
-            | "org.freedesktop.PolicyKit1.Error.Failed"
-            | "System.Error.EACCES"
-            | "System.Error.EPERM"
-    )
 }
 
 fn is_invalid_argument_method_error(name: &str) -> bool {
@@ -200,5 +187,25 @@ mod tests {
                 ..
             }
         ));
+        assert!(matches!(
+            map_image_control_error(NspawnError::ProtectedImage(".host".into())),
+            ImageControlOutcome::Rejected {
+                rejection: ImageRemovalRejection::Protected,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validation_messages_do_not_select_semantic_rejections() {
+        for reason in ["busy target", "host image from an invalid source"] {
+            assert!(matches!(
+                map_image_control_error(NspawnError::Validation(reason.into())),
+                ImageControlOutcome::Rejected {
+                    rejection: ImageRemovalRejection::InvalidTarget,
+                    ..
+                }
+            ));
+        }
     }
 }

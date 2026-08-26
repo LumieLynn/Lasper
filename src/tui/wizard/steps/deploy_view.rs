@@ -17,11 +17,52 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Gauge, Paragraph},
     Frame,
 };
+use std::collections::VecDeque;
+
+const MAX_DEPLOYMENT_LOG_LINES: usize = 5000;
+
+struct DeploymentLogs {
+    lines: VecDeque<String>,
+    max_lines: usize,
+    wrapped_width: Option<usize>,
+    dirty: bool,
+}
+
+impl DeploymentLogs {
+    fn new(max_lines: usize) -> Self {
+        let max_lines = max_lines.max(1);
+        Self {
+            lines: VecDeque::with_capacity(max_lines),
+            max_lines,
+            wrapped_width: None,
+            dirty: true,
+        }
+    }
+
+    fn push(&mut self, line: String) {
+        self.lines.push_back(line);
+        while self.lines.len() > self.max_lines {
+            self.lines.pop_front();
+        }
+        self.dirty = true;
+    }
+
+    fn wrapped_if_changed(&mut self, width: usize) -> Option<Vec<String>> {
+        let width = width.max(1);
+        if !self.dirty && self.wrapped_width == Some(width) {
+            return None;
+        }
+        self.dirty = false;
+        self.wrapped_width = Some(width);
+        Some(wrap_log_lines(self.lines.iter(), width))
+    }
+}
+
 pub struct DeployStepView {
     job: DeploymentJobHandle,
     status_block: TextBlock,
     log_list: SelectableList<String>,
-    internal_logs: Vec<String>,
+    logs: DeploymentLogs,
     progress: Option<DeploymentProgress>,
     cancel_dialog: Option<ConfirmationDialog>,
     release_dialog: Option<ConfirmationDialog>,
@@ -34,7 +75,7 @@ impl DeployStepView {
             job,
             status_block: TextBlock::new(" Status ", "Deploying...".to_string()),
             log_list: SelectableList::new(" Deployment logs ", vec![], |s| s.clone()),
-            internal_logs: vec![],
+            logs: DeploymentLogs::new(MAX_DEPLOYMENT_LOG_LINES),
             progress: None,
             cancel_dialog: None,
             release_dialog: None,
@@ -42,28 +83,24 @@ impl DeployStepView {
         }
     }
 
-    fn update_logs(&mut self) -> bool {
-        let mut changed = false;
+    fn update_logs(&mut self) {
         loop {
             match self.job.try_recv() {
                 Ok(DeploymentEvent::Line(log)) => {
                     self.progress = None;
-                    self.internal_logs.push(log);
-                    changed = true;
+                    self.logs.push(log);
                 }
                 Ok(DeploymentEvent::Progress(progress)) => {
                     self.progress = Some(progress);
-                    changed = true;
                 }
                 Err(_) => break,
             }
         }
-        changed
     }
 }
 
-fn wrap_log_lines(logs: &[String], max_width: usize) -> Vec<String> {
-    logs.iter()
+fn wrap_log_lines<'a>(logs: impl IntoIterator<Item = &'a String>, max_width: usize) -> Vec<String> {
+    logs.into_iter()
         .flat_map(|line| soft_wrap_text(line, max_width))
         .collect()
 }
@@ -120,16 +157,18 @@ impl Component for DeployStepView {
         };
         self.status_block.set_content(status);
 
-        let logs_changed = self.update_logs();
+        self.update_logs();
+        let log_list_was_empty = self.log_list.items().is_empty();
         let was_following_tail = self
             .log_list
             .selected_idx()
             .is_some_and(|selected| selected + 1 == self.log_list.items().len());
         let log_width = usize::from(chunks[1].width.saturating_sub(5).max(1));
-        self.log_list
-            .set_items(wrap_log_lines(&self.internal_logs, log_width));
-        if logs_changed || was_following_tail {
-            self.log_list.select_last();
+        if let Some(wrapped) = self.logs.wrapped_if_changed(log_width) {
+            self.log_list.set_items(wrapped);
+            if log_list_was_empty || was_following_tail {
+                self.log_list.select_last();
+            }
         }
 
         if let Some(progress) = self.progress.as_ref().filter(|_| !done) {
@@ -277,8 +316,7 @@ impl StepComponent for DeployStepView {
         self.release_pending = false;
         match error {
             Some(error) => {
-                self.internal_logs
-                    .push(format!("CLAIM RELEASE FAILED: {error}"));
+                self.logs.push(format!("CLAIM RELEASE FAILED: {error}"));
                 crate::tui::wizard::StepAction::Status(
                     format!("Could not release unresolved deployment claim: {error}"),
                     crate::tui::StatusLevel::Error,
@@ -300,20 +338,36 @@ mod tests {
 
     #[test]
     fn long_log_lines_soft_wrap_by_display_width() {
+        let ascii = ["abcdefghij".to_string()];
+        assert_eq!(wrap_log_lines(ascii.iter(), 8), ["abcdefgh", "ij"]);
+        let wide = ["\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}".to_string()];
         assert_eq!(
-            wrap_log_lines(&["abcdefghij".into()], 8),
-            ["abcdefgh", "ij"]
-        );
-        assert_eq!(
-            wrap_log_lines(
-                &["\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}\u{5b8c}\u{6210}".into()],
-                9
-            ),
+            wrap_log_lines(wide.iter(), 9),
             ["\u{5bb9}\u{5668}\u{4e0b}\u{8f7d}", "\u{5b8c}\u{6210}"]
         );
+        let words = ["fatal error with a long explanation".to_string()];
         assert_eq!(
-            wrap_log_lines(&["fatal error with a long explanation".into()], 12),
+            wrap_log_lines(words.iter(), 12),
             ["fatal error", "with a long", "explanation"]
+        );
+    }
+
+    #[test]
+    fn deployment_logs_are_bounded_and_rewrap_only_when_needed() {
+        let mut logs = DeploymentLogs::new(2);
+        logs.push("first".into());
+        logs.push("second".into());
+        logs.push("third".into());
+
+        assert_eq!(
+            logs.lines.iter().cloned().collect::<Vec<_>>(),
+            ["second", "third"]
+        );
+        assert_eq!(logs.wrapped_if_changed(20).unwrap(), ["second", "third"]);
+        assert!(logs.wrapped_if_changed(20).is_none());
+        assert_eq!(
+            logs.wrapped_if_changed(3).unwrap(),
+            ["sec", "ond", "thi", "rd"]
         );
     }
 

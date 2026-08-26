@@ -563,6 +563,7 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
+            AppEvent::Resize => {}
             AppEvent::Tick => self.tick().await,
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
@@ -796,7 +797,7 @@ impl App {
     }
 
     async fn handle_input_event(&mut self, input: InputEvent) {
-        if input.is_stale() {
+        if input.is_stale() && !matches!(&input.event, AppEvent::Resize) {
             log::debug!(
                 "[TUI] dropping stale foreground {} input (age={} ms)",
                 input.event.label(),

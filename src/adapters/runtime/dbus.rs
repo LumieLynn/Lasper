@@ -278,9 +278,7 @@ impl DbusBackend {
 
     pub(crate) async fn remove(&self, name: &str) -> Result<()> {
         if ImageEntry::is_protected_name(name) {
-            return Err(NspawnError::Validation(
-                "the .host image cannot be removed".into(),
-            ));
+            return Err(NspawnError::ProtectedImage(name.into()));
         }
         let name = parse_image_name(name)?;
         let (generation, proxy) = self

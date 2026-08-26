@@ -28,6 +28,59 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const RPC_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+type PendingRpcResponses =
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<RpcResponse>>;
+
+fn rpc_response_timeout(family: RpcFamily) -> std::time::Duration {
+    match family {
+        RpcFamily::Query | RpcFamily::Session => std::time::Duration::from_secs(15),
+        RpcFamily::Job => std::time::Duration::from_secs(30),
+        RpcFamily::Command => std::time::Duration::from_secs(60),
+    }
+}
+
+fn rpc_timeout_error(method: RpcMethod, timeout: std::time::Duration) -> std::io::Error {
+    let consequence = match method.family() {
+        RpcFamily::Query => "the query can be retried",
+        RpcFamily::Session => "the session request was not confirmed",
+        RpcFamily::Job => "deployment state must be reconciled before retrying",
+        RpcFamily::Command => "the operation may still be running and its outcome is unknown",
+    };
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!(
+            "daemon {} '{}' timed out after {}s; {}",
+            method.family().as_str(),
+            method.wire_name(),
+            timeout.as_secs(),
+            consequence
+        ),
+    )
+}
+
+async fn wait_for_rpc_response(
+    response_rx: tokio::sync::oneshot::Receiver<RpcResponse>,
+    method: RpcMethod,
+    timeout: std::time::Duration,
+) -> std::io::Result<RpcResponse> {
+    match tokio::time::timeout(timeout, response_rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "daemon response channel cancelled",
+        )),
+        Err(_) => Err(rpc_timeout_error(method, timeout)),
+    }
+}
+
+fn discard_cancelled_responses(pending: &mut PendingRpcResponses) -> usize {
+    let before = pending.len();
+    pending.retain(|_, response_tx| !response_tx.is_closed());
+    before - pending.len()
+}
+
 pub(crate) fn pipe_reader(
     fd: std::os::fd::RawFd,
 ) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
@@ -137,18 +190,30 @@ impl ElevatedDaemon {
             let mut writer = tokio::io::BufWriter::new(rpc_writer);
             let mut reader = tokio::io::BufReader::new(rpc_reader);
 
-            let mut pending: std::collections::HashMap<
-                u64,
-                tokio::sync::oneshot::Sender<RpcResponse>,
-            > = std::collections::HashMap::new();
+            let mut pending = PendingRpcResponses::new();
+            let mut pending_sweep = tokio::time::interval(std::time::Duration::from_secs(5));
+            pending_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
+                    _ = pending_sweep.tick() => {
+                        let discarded = discard_cancelled_responses(&mut pending);
+                        if discarded > 0 {
+                            log::debug!(
+                                "Daemon I/O: discarded {discarded} cancelled response slots"
+                            );
+                        }
+                    }
+
                     req_opt = request_rx.recv() => {
                         let (request, response_tx) = match req_opt {
                             Some(r) => r,
                             None => break,
                         };
+
+                        if response_tx.is_closed() {
+                            continue;
+                        }
 
                         let id = request.id();
 
@@ -187,7 +252,9 @@ impl ElevatedDaemon {
                             break;
                         }
 
-                        pending.insert(id, response_tx);
+                        if !response_tx.is_closed() {
+                            pending.insert(id, response_tx);
+                        }
                     }
 
                     read_res = read_bounded_line(&mut reader, MAX_RPC_FRAME_BYTES) => {
@@ -304,36 +371,59 @@ impl ElevatedDaemon {
             method: method.into(),
             params,
         };
-        self.send_rpc_request(OutboundRpcRequest::General(request))
+        self.send_rpc_request(OutboundRpcRequest::General(request), method_kind)
             .await
     }
 
     async fn send_rpc_request(
         &self,
         request: OutboundRpcRequest,
+        method_kind: RpcMethod,
     ) -> std::io::Result<serde_json::Value> {
         let id = request.id();
-        let method = request.method();
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        log::trace!("[lasper] rpc_call: sending {} (id={})", method, id);
-        self.request_tx
-            .send((request, response_tx))
-            .await
-            .map_err(|_| {
+        log::trace!(
+            "[lasper] rpc_call: sending {} (id={})",
+            method_kind.wire_name(),
+            id
+        );
+        match tokio::time::timeout(
+            RPC_QUEUE_TIMEOUT,
+            self.request_tx.send((request, response_tx)),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
                 log::warn!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
-                std::io::Error::new(
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "daemon I/O task has stopped",
-                )
-            })?;
+                ));
+            }
+            Err(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "daemon request queue remained full for {}s; '{}' was not submitted",
+                        RPC_QUEUE_TIMEOUT.as_secs(),
+                        method_kind.wire_name()
+                    ),
+                ));
+            }
+        }
         log::trace!("[lasper] rpc_call: waiting for response id={}", id);
-        let response = response_rx.await.map_err(|_| {
-            log::warn!("[lasper] rpc_call: response channel cancelled id={}", id);
-            std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "daemon response channel cancelled",
-            )
-        })?;
+        let timeout = rpc_response_timeout(method_kind.family());
+        let response = wait_for_rpc_response(response_rx, method_kind, timeout)
+            .await
+            .inspect_err(|error| {
+                log::warn!(
+                    "[lasper] rpc_call: response failed id={} method={}: {}",
+                    id,
+                    method_kind.wire_name(),
+                    error
+                );
+            })?;
         if let Some(err) = response.error {
             return Err(std::io::Error::other(format!(
                 "daemon error (code={}): {}",
@@ -571,7 +661,10 @@ impl ElevatedDaemon {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let result = self
-            .send_rpc_request(OutboundRpcRequest::Rootfs { id, operation })
+            .send_rpc_request(
+                OutboundRpcRequest::Rootfs { id, operation },
+                RpcMethod::Rootfs,
+            )
             .await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
@@ -661,7 +754,11 @@ fn receive_deployment_stream(
 
 #[cfg(test)]
 mod tests {
-    use super::configure_sudo_daemon_stdio;
+    use super::{
+        configure_sudo_daemon_stdio, discard_cancelled_responses, rpc_response_timeout,
+        wait_for_rpc_response, PendingRpcResponses,
+    };
+    use crate::daemon::protocol::{RpcFamily, RpcMethod};
 
     #[tokio::test]
     async fn sudo_daemon_stdio_detaches_input_and_pipes_stdout() {
@@ -678,5 +775,59 @@ mod tests {
             .unwrap();
 
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[test]
+    fn rpc_timeout_policy_keeps_commands_longer_than_coordination_calls() {
+        assert_eq!(
+            rpc_response_timeout(RpcFamily::Query),
+            rpc_response_timeout(RpcFamily::Session)
+        );
+        assert!(rpc_response_timeout(RpcFamily::Query) < rpc_response_timeout(RpcFamily::Job));
+        assert!(rpc_response_timeout(RpcFamily::Job) < rpc_response_timeout(RpcFamily::Command));
+    }
+
+    #[tokio::test]
+    async fn mutating_rpc_timeout_reports_an_unknown_outcome() {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let error = wait_for_rpc_response(
+            response_rx,
+            RpcMethod::MachineControl,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("outcome is unknown"));
+        assert!(response_tx.is_closed());
+    }
+
+    #[tokio::test]
+    async fn job_rpc_timeout_requires_reconciliation() {
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        let error = wait_for_rpc_response(
+            response_rx,
+            RpcMethod::CancelDeployment,
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("must be reconciled"));
+        assert!(response_tx.is_closed());
+    }
+
+    #[test]
+    fn pending_rpc_cleanup_removes_only_cancelled_receivers() {
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let (active_tx, _active_rx) = tokio::sync::oneshot::channel();
+        drop(cancelled_rx);
+        let mut pending = PendingRpcResponses::from([(1, cancelled_tx), (2, active_tx)]);
+
+        assert_eq!(discard_cancelled_responses(&mut pending), 1);
+        assert!(!pending.contains_key(&1));
+        assert!(pending.contains_key(&2));
     }
 }

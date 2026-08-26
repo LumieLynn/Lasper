@@ -76,9 +76,7 @@ impl SystemOperationStore {
 
     pub async fn remove_image(&self, name: &str) -> Result<()> {
         if ImageEntry::is_protected_name(name) {
-            return Err(NspawnError::Validation(
-                "the .host image cannot be removed".into(),
-            ));
+            return Err(NspawnError::ProtectedImage(name.into()));
         }
         self.execute(SystemOperation::RemoveImage {
             image: image_name(name)?,
@@ -260,9 +258,7 @@ fn command(operation: &SystemOperation) -> Result<(&'static str, Vec<String>)> {
         ),
         SystemOperation::RemoveImage { image } => {
             if ImageEntry::is_protected_name(image.as_str()) {
-                return Err(NspawnError::Validation(
-                    "the .host image cannot be removed".into(),
-                ));
+                return Err(NspawnError::ProtectedImage(image.as_str().into()));
             }
             ("machinectl", vec!["--", "remove", image.as_str()])
         }
