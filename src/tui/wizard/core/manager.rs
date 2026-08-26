@@ -1,7 +1,7 @@
 use crate::application::provisioning::{
     DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
 };
-use crate::nspawn::{ContainerEntry, ImageEntry};
+use crate::nspawn::{ImageEntry, MachineEntry};
 use crate::tui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::tui::wizard::core::draft::{SourceKind, WizardDraft};
 use crate::tui::wizard::steps::{self, StepComponent};
@@ -67,7 +67,7 @@ pub struct Wizard {
 impl Wizard {
     pub fn new(
         id: crate::tui::wizard::WizardInstanceId,
-        entries: Vec<ContainerEntry>,
+        entries: Vec<MachineEntry>,
         images: Vec<ImageEntry>,
         permission_level: crate::composition::PermissionLevel,
         config: std::sync::Arc<crate::config::AppConfig>,

@@ -1,6 +1,6 @@
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{
-    ContainerEntry, ImageEntry, MachineProperties, RuntimeSnapshot, StatusUpdate,
+    ImageEntry, MachineEntry, MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 
 /// Read-only runtime discovery, inspection, and observation.
@@ -10,7 +10,7 @@ use crate::nspawn::models::{
 #[async_trait::async_trait]
 pub trait RuntimeSource: Send + Sync + 'static {
     async fn is_available(&self) -> bool;
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>>;
     async fn list_images(&self) -> Result<Vec<ImageEntry>>;
     async fn snapshot(&self) -> Result<RuntimeSnapshot> {
         let (machines, images) = tokio::try_join!(self.list_machines(), self.list_images())?;

@@ -17,7 +17,7 @@ use crate::application::operations::ExecutionRoute;
 use crate::application::runtime::{RuntimeCatalog, RuntimePort};
 use crate::nspawn::errors::Result;
 use crate::nspawn::models::{
-    ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
+    MachineEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 use std::sync::Arc;
 
@@ -105,7 +105,7 @@ impl RuntimePort for SourceRuntimePort {
         self.source.is_available().await
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
         self.source.list_machines().await
     }
 
@@ -116,7 +116,7 @@ impl RuntimePort for SourceRuntimePort {
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
     ) -> Result<MachineProperties> {
         match &self.inspector {
             RuntimeInspector::Source => self.source.get_properties(machine.as_str()).await,

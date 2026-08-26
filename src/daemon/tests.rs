@@ -12,7 +12,7 @@ use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTranspo
 use crate::application::machine_lifecycle::{
     MachineAction, MachineControlRequest, MachineControlTransport,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
+use crate::nspawn::models::{ImageEntry, MachineEntry, MachineName, MachineProperties};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,7 +28,7 @@ struct SlowRemoveDbus {
 
 #[async_trait::async_trait]
 impl DaemonDbusExecutor for SlowRemoveDbus {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<MachineEntry>> {
         Err(crate::nspawn::errors::NspawnError::Runtime(
             "slow test backend does not list machines".into(),
         ))
@@ -237,6 +237,11 @@ async fn bounded_protocol_reader_rejects_oversized_frames() {
 #[tokio::test]
 async fn cli_mode_skips_daemon_dbus_initialization() {
     assert!(initialize_dbus_backend(false).await.is_none());
+}
+
+#[tokio::test]
+async fn daemon_keeps_dbus_capability_when_the_bus_is_late() {
+    assert!(initialize_dbus_backend(true).await.is_some());
 }
 
 #[tokio::test]

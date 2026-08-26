@@ -447,9 +447,9 @@ impl App {
             WorkspaceFocus::Machines => {
                 let result = self
                     .ui
-                    .container_list
+                    .machine_list
                     .handle_key(key, self.data.entries.len());
-                self.handle_container_list_result(result).await;
+                self.handle_machine_list_result(result).await;
             }
             WorkspaceFocus::Images => {
                 let was_internal = self.ui.image_list.shows_internal();
@@ -459,7 +459,7 @@ impl App {
                     self.update_detail_target();
                     self.request_detail_refresh();
                 }
-                self.handle_container_list_result(result).await;
+                self.handle_machine_list_result(result).await;
             }
             WorkspaceFocus::MachineInspector | WorkspaceFocus::ImageInspector => {
                 let target = self.data.detail_target.clone();
@@ -473,7 +473,7 @@ impl App {
         }
     }
 
-    async fn handle_container_list_result(&mut self, result: EventResult) {
+    async fn handle_machine_list_result(&mut self, result: EventResult) {
         match result {
             EventResult::Message(AppMessage::List(ListMessage::Next)) => {
                 self.select_next();
@@ -791,17 +791,17 @@ impl App {
                 true
             }
             KeyCode::Char('h') | KeyCode::Left => {
-                self.ui.container_list_pct = self
+                self.ui.machine_list_pct = self
                     .ui
-                    .container_list_pct
+                    .machine_list_pct
                     .saturating_sub(percentage_step)
                     .max(super::CONTAINER_LIST_PCT_MIN);
                 true
             }
             KeyCode::Char('l') | KeyCode::Right => {
-                self.ui.container_list_pct = self
+                self.ui.machine_list_pct = self
                     .ui
-                    .container_list_pct
+                    .machine_list_pct
                     .saturating_add(percentage_step)
                     .min(super::CONTAINER_LIST_PCT_MAX);
                 true

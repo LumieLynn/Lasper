@@ -113,7 +113,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.ui.detail_panel.set_focus(detail_focused);
 
-    let list_pct = app.ui.container_list_pct;
+    let list_pct = app.ui.machine_list_pct;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -178,7 +178,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    app.ui.container_list.render_with_data(
+    app.ui.machine_list.render_with_data(
         f,
         machines_area,
         &app.data.entries,

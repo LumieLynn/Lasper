@@ -7,7 +7,7 @@
 
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, InspectionCompleteness, InspectionSource, MachineName, MachineProperties,
+    InspectionCompleteness, InspectionSource, MachineEntry, MachineName, MachineProperties,
     GROUP_MACHINE,
 };
 use std::collections::HashMap;
@@ -48,7 +48,7 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
 /// containers. This mirrors `sd_get_machine_names()` at the public API level:
 /// names come from the runtime directory, while `unit:` helper symlinks and
 /// invalid machine names are ignored.
-pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<ContainerEntry>> {
+pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<MachineEntry>> {
     let display_path = path.clone();
     tokio::task::spawn_blocking(move || enumerate_machines(&path))
         .await
@@ -58,7 +58,7 @@ pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<ContainerEntry
         .map_err(|error| NspawnError::Io(display_path, error))
 }
 
-fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
+fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
     let mut machines = Vec::new();
     let directory = match std::fs::read_dir(path) {
         Ok(directory) => directory,
@@ -85,9 +85,9 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
         if MachineName::new(&name).is_err() {
             continue;
         }
-        machines.push(ContainerEntry {
+        machines.push(MachineEntry {
             name,
-            state: crate::nspawn::models::ContainerState::Running,
+            state: crate::nspawn::models::MachineState::Running,
             address: None,
             all_addresses: Vec::new(),
         });
@@ -97,7 +97,7 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
 }
 
 /// Inspect one machine without contacting either systemd D-Bus service.
-pub async fn inspect(name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
     let name =
         MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
     inspect_at(
@@ -111,7 +111,7 @@ pub async fn inspect(name: &str, entry: &ContainerEntry) -> Result<MachineProper
 async fn inspect_at(
     path: PathBuf,
     name: MachineName,
-    entry: &ContainerEntry,
+    entry: &MachineEntry,
 ) -> Result<MachineProperties> {
     let mut properties = entry_properties(entry);
     let display_path = path.display().to_string();
@@ -148,7 +148,7 @@ async fn inspect_at(
     Ok(properties)
 }
 
-fn entry_properties(entry: &ContainerEntry) -> MachineProperties {
+fn entry_properties(entry: &MachineEntry) -> MachineProperties {
     let mut properties = MachineProperties::from_inspection(
         InspectionSource::RuntimeState,
         InspectionCompleteness::RuntimeOnly,
@@ -331,13 +331,13 @@ fn insert_runtime_fields(properties: &mut MachineProperties, mut fields: HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::ContainerState;
+    use crate::nspawn::models::MachineState;
     use std::os::unix::fs::symlink;
 
-    fn entry(name: &str) -> ContainerEntry {
-        ContainerEntry {
+    fn entry(name: &str) -> MachineEntry {
+        MachineEntry {
             name: name.into(),
-            state: ContainerState::Running,
+            state: MachineState::Running,
             address: Some("10.0.0.2".into()),
             all_addresses: vec!["10.0.0.2".into()],
         }

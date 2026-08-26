@@ -19,11 +19,11 @@ async fn discover_containers() -> Vec<(String, PathBuf)> {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name_str = entry.file_name().to_string_lossy().to_string();
         if name_str.starts_with("systemd-nspawn@") && name_str.ends_with(".service") {
-            if let Some(container_name) = name_str
+            if let Some(machine_name) = name_str
                 .strip_prefix("systemd-nspawn@")
                 .and_then(|s| s.strip_suffix(".service"))
             {
-                containers.push((container_name.to_string(), entry.path()));
+                containers.push((machine_name.to_string(), entry.path()));
             }
         }
     }

@@ -2,7 +2,7 @@ use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, ImageEntry, InspectionCompleteness, InspectionSource, MachineName,
+    ImageEntry, InspectionCompleteness, InspectionSource, MachineEntry, MachineName,
     MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 use serde::Deserialize;
@@ -106,7 +106,7 @@ impl RuntimeSource for CliBackend {
         which::which("machinectl").is_ok()
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
         crate::adapters::runtime::state::list_machines_at(self.runtime_machines_dir.clone()).await
     }
 
@@ -322,7 +322,7 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 mod tests {
     use super::*;
     use crate::adapters::process::MockCommandRunner;
-    use crate::nspawn::models::ContainerState;
+    use crate::nspawn::models::MachineState;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
 
@@ -336,9 +336,9 @@ mod tests {
 
     fn observer_snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot::new(
-            vec![ContainerEntry {
+            vec![MachineEntry {
                 name: "active".into(),
-                state: ContainerState::Running,
+                state: MachineState::Running,
                 address: None,
                 all_addresses: vec![],
             }],
@@ -400,7 +400,7 @@ mod tests {
 
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].name, "active");
-        assert_eq!(machines[0].state, ContainerState::Running);
+        assert_eq!(machines[0].state, MachineState::Running);
         assert!(machines[0].all_addresses.is_empty());
     }
 

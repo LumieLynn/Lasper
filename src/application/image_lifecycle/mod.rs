@@ -3,7 +3,7 @@
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry, ImageName, MachineName};
+use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -115,7 +115,7 @@ pub enum ImageRemovalOutcome {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait ImageRuntime: Send + Sync + 'static {
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>, String>;
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>, String>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -291,7 +291,7 @@ impl std::fmt::Display for ImageRemovalRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerState, ImageEntry};
+    use crate::nspawn::models::{ImageEntry, MachineState};
 
     fn image(name: &str) -> ImageEntry {
         ImageEntry {
@@ -320,9 +320,9 @@ mod tests {
     async fn running_machine_is_rejected_before_host_mutations() {
         let mut runtime = MockImageRuntime::new();
         runtime.expect_list_machines().returning(|| {
-            Ok(vec![ContainerEntry {
+            Ok(vec![MachineEntry {
                 name: "ubuntu".into(),
-                state: ContainerState::Running,
+                state: MachineState::Running,
                 address: None,
                 all_addresses: vec![],
             }])

@@ -17,7 +17,7 @@ use crate::application::machine_lifecycle::{
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::{OperationRegistry, RuntimeCatalog};
 use crate::nspawn::errors::NspawnError;
-use crate::nspawn::models::{ContainerEntry, MachineName, MachineProperties};
+use crate::nspawn::models::{MachineEntry, MachineName, MachineProperties};
 use std::sync::Arc;
 
 pub(crate) struct MachineLifecycleAdapters {
@@ -301,7 +301,7 @@ impl MachineObservation for CatalogMachineObservation {
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
     ) -> Result<MachineProperties, String> {
         self.runtime
             .inspect(machine.as_str(), entry)

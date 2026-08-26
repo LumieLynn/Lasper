@@ -1,14 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum ContainerState {
+pub enum MachineState {
     Running,
     Starting,
     Exiting,
     Off,
 }
 
-impl ContainerState {
+impl MachineState {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Running => "running",
@@ -26,11 +26,11 @@ impl ContainerState {
 ///
 /// Images are deliberately modeled separately as [`ImageEntry`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ContainerEntry {
+pub struct MachineEntry {
     /// The name used by machinectl
     pub name: String,
     /// Current lifecycle state
-    pub state: ContainerState,
+    pub state: MachineState,
     /// Network address (from list, only when running)
     pub address: Option<String>,
     /// All network addresses
@@ -96,12 +96,12 @@ impl std::error::Error for ImageNameError {}
 /// consumers can compare snapshots without depending on command output order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeSnapshot {
-    pub machines: Vec<ContainerEntry>,
+    pub machines: Vec<MachineEntry>,
     pub images: Vec<ImageEntry>,
 }
 
 impl RuntimeSnapshot {
-    pub fn new(mut machines: Vec<ContainerEntry>, mut images: Vec<ImageEntry>) -> Self {
+    pub fn new(mut machines: Vec<MachineEntry>, mut images: Vec<ImageEntry>) -> Self {
         for machine in &mut machines {
             machine.all_addresses.retain(|address| !address.is_empty());
             machine.all_addresses.sort();
@@ -213,7 +213,7 @@ impl PartialOrd for ImageEntry {
     }
 }
 
-impl Ord for ContainerEntry {
+impl Ord for MachineEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.name
             .cmp(&other.name)
@@ -223,7 +223,7 @@ impl Ord for ContainerEntry {
     }
 }
 
-impl PartialOrd for ContainerEntry {
+impl PartialOrd for MachineEntry {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
@@ -365,14 +365,14 @@ pub enum CpuRepresentation {
 }
 
 #[derive(Debug, Clone)]
-pub struct ContainerMetrics {
+pub struct MachineMetrics {
     /// Time-series for CPU usage: (timestamp_offset_secs, percentage)
     pub cpu_history: Vec<(f64, f64)>,
     /// Time-series for RAM usage: (timestamp_offset_secs, megabytes)
     pub ram_history: Vec<(f64, f64)>,
 }
 
-impl Default for ContainerMetrics {
+impl Default for MachineMetrics {
     fn default() -> Self {
         Self {
             cpu_history: Vec::with_capacity(61),
@@ -386,11 +386,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_container_state_labels() {
-        assert_eq!(ContainerState::Running.label(), "running");
-        assert_eq!(ContainerState::Off.label(), "poweroff");
-        assert_eq!(ContainerState::Starting.label(), "starting");
-        assert_eq!(ContainerState::Exiting.label(), "exiting");
+    fn machine_state_labels() {
+        assert_eq!(MachineState::Running.label(), "running");
+        assert_eq!(MachineState::Off.label(), "poweroff");
+        assert_eq!(MachineState::Starting.label(), "starting");
+        assert_eq!(MachineState::Exiting.label(), "exiting");
     }
 
     #[test]
@@ -459,9 +459,9 @@ mod tests {
 
     #[test]
     fn runtime_snapshot_normalizes_backend_output_order() {
-        let machine = |name: &str, addresses: Vec<&str>| ContainerEntry {
+        let machine = |name: &str, addresses: Vec<&str>| MachineEntry {
             name: name.into(),
-            state: ContainerState::Running,
+            state: MachineState::Running,
             address: addresses.first().map(|address| (*address).into()),
             all_addresses: addresses.into_iter().map(str::to_string).collect(),
         };
@@ -488,15 +488,15 @@ mod tests {
     }
 
     #[test]
-    fn test_container_state_is_running() {
-        assert!(ContainerState::Running.is_running());
-        assert!(ContainerState::Starting.is_running());
-        assert!(ContainerState::Exiting.is_running());
-        assert!(!ContainerState::Off.is_running());
+    fn machine_state_is_running() {
+        assert!(MachineState::Running.is_running());
+        assert!(MachineState::Starting.is_running());
+        assert!(MachineState::Exiting.is_running());
+        assert!(!MachineState::Off.is_running());
     }
 
-    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
-        ContainerEntry {
+    fn make_entry(name: &str, state: MachineState) -> MachineEntry {
+        MachineEntry {
             name: name.to_string(),
             state,
             address: None,
@@ -505,11 +505,11 @@ mod tests {
     }
 
     #[test]
-    fn test_container_entry_ordering() {
+    fn machine_entry_ordering() {
         let mut entries = [
-            make_entry("z", ContainerState::Running),
-            make_entry("a", ContainerState::Running),
-            make_entry("b", ContainerState::Off),
+            make_entry("z", MachineState::Running),
+            make_entry("a", MachineState::Running),
+            make_entry("b", MachineState::Off),
         ];
         entries.sort();
         assert_eq!(entries[0].name, "a");
@@ -518,12 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn test_container_entry_ordering_all_states() {
+    fn machine_entry_ordering_all_states() {
         let mut entries = [
-            make_entry("d", ContainerState::Off),
-            make_entry("c", ContainerState::Exiting),
-            make_entry("a", ContainerState::Running),
-            make_entry("b", ContainerState::Starting),
+            make_entry("d", MachineState::Off),
+            make_entry("c", MachineState::Exiting),
+            make_entry("a", MachineState::Running),
+            make_entry("b", MachineState::Starting),
         ];
         entries.sort();
         assert_eq!(entries[0].name, "a");
@@ -556,8 +556,8 @@ mod tests {
     }
 
     #[test]
-    fn test_container_entry_ordering_empty() {
-        let mut entries: Vec<ContainerEntry> = vec![];
+    fn machine_entry_ordering_empty() {
+        let mut entries: Vec<MachineEntry> = vec![];
         entries.sort();
         assert!(entries.is_empty());
     }

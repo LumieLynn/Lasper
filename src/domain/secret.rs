@@ -1,17 +1,17 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
-use std::sync::atomic::{compiler_fence, Ordering};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Ephemeral secret text which cannot be cloned, debug-printed, or serialized
 /// through an ordinary model derive.
 pub struct SecretString {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 impl SecretString {
     pub fn new(value: String) -> Self {
         Self {
-            bytes: value.into_bytes(),
+            bytes: Zeroizing::new(value.into_bytes()),
         }
     }
 
@@ -32,25 +32,17 @@ impl fmt::Debug for SecretString {
     }
 }
 
-impl Drop for SecretString {
-    fn drop(&mut self) {
-        zeroize_vec_allocation(&mut self.bytes);
-    }
-}
-
 /// Short-lived serialized secret material. This exists so transport buffers
 /// are cleared on every return path, including I/O and size-limit failures.
 pub(crate) struct SecretBytes {
-    bytes: Vec<u8>,
+    bytes: Zeroizing<Vec<u8>>,
 }
 
 impl SecretBytes {
     pub(crate) fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes }
-    }
-
-    pub(crate) fn push(&mut self, byte: u8) {
-        self.bytes.push(byte);
+        Self {
+            bytes: Zeroizing::new(bytes),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -68,32 +60,13 @@ impl fmt::Debug for SecretBytes {
     }
 }
 
-impl Drop for SecretBytes {
-    fn drop(&mut self) {
-        zeroize_vec_allocation(&mut self.bytes);
-    }
-}
-
 pub(crate) fn zeroize_string(value: &mut String) {
-    // SAFETY: replacing every byte with NUL preserves String's UTF-8 invariant.
-    unsafe { zeroize_vec_allocation(value.as_mut_vec()) };
+    value.zeroize();
 }
 
 pub(crate) fn replace_secret_string(value: &mut String, replacement: &str) {
     zeroize_string(value);
-    value.clear();
     value.push_str(replacement);
-}
-
-fn zeroize_vec_allocation(bytes: &mut Vec<u8>) {
-    let capacity = bytes.capacity();
-    let pointer = bytes.as_mut_ptr();
-    for index in 0..capacity {
-        // SAFETY: every address up to the Vec's capacity is writable allocated
-        // storage, and writing a byte also initializes spare capacity.
-        unsafe { std::ptr::write_volatile(pointer.add(index), 0) };
-    }
-    compiler_fence(Ordering::SeqCst);
 }
 
 /// Serde hooks for dedicated secret-bearing wire DTO fields. `SecretString`
@@ -151,18 +124,11 @@ mod tests {
     }
 
     #[test]
-    fn zeroization_clears_every_owned_byte() {
-        let mut bytes = b"sensitive".to_vec();
-        zeroize_vec_allocation(&mut bytes);
-        assert!(bytes.iter().all(|byte| *byte == 0));
-    }
-
-    #[test]
-    fn string_zeroization_preserves_valid_utf8() {
+    fn string_zeroization_clears_the_value() {
         let mut value = "sensitive".to_string();
         zeroize_string(&mut value);
 
-        assert_eq!(value, "\0".repeat(9));
+        assert!(value.is_empty());
     }
 
     #[test]

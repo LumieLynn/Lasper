@@ -31,7 +31,7 @@ pub struct BasicStepView {
 impl BasicStepView {
     pub fn new(
         initial_data: &BasicConfig,
-        existing_entries: &[crate::nspawn::models::ContainerEntry],
+        existing_entries: &[crate::nspawn::models::MachineEntry],
         show_hostname: bool,
     ) -> Self {
         let existing_names: HashSet<String> = existing_entries
@@ -39,8 +39,8 @@ impl BasicStepView {
             .map(|entry| entry.name.clone())
             .collect();
         let mut view = Self {
-            name: TextBox::new(" Container name (required) ", initial_data.name.clone())
-                .with_validator(move |value| validate_container_name(value, &existing_names)),
+            name: TextBox::new(" Machine name (required) ", initial_data.name.clone())
+                .with_validator(move |value| validate_machine_name(value, &existing_names)),
             hostname: TextBox::new(
                 " Hostname (optional, defaults to name) ",
                 initial_data.hostname.clone(),
@@ -57,7 +57,7 @@ impl BasicStepView {
     }
 }
 
-fn validate_container_name(value: &str, existing_names: &HashSet<String>) -> Result<(), String> {
+fn validate_machine_name(value: &str, existing_names: &HashSet<String>) -> Result<(), String> {
     let name = value.trim();
     if name.is_empty() {
         return Err("Name cannot be empty".to_string());
@@ -133,10 +133,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn container_name_rejects_existing_machine() {
+    fn machine_name_rejects_existing_machine() {
         let existing = ["arch-test".to_string()].into_iter().collect();
 
-        let result = validate_container_name("arch-test", &existing);
+        let result = validate_machine_name("arch-test", &existing);
 
         assert_eq!(
             result,
@@ -145,9 +145,9 @@ mod tests {
     }
 
     #[test]
-    fn container_name_accepts_unique_machine() {
+    fn machine_name_accepts_unique_name() {
         let existing = ["arch-test".to_string()].into_iter().collect();
 
-        assert!(validate_container_name("new-container", &existing).is_ok());
+        assert!(validate_machine_name("new-container", &existing).is_ok());
     }
 }

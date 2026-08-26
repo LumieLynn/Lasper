@@ -3,7 +3,7 @@ use super::detail_refresh::{
     DetailRefreshWork,
 };
 use super::App;
-use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry, MachineProperties};
+use crate::nspawn::models::{ImageEntry, MachineEntry, MachineProperties, MachineState};
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
 
@@ -84,9 +84,9 @@ impl App {
                     .iter()
                     .find(|entry| entry.name == *name)
                     .cloned()
-                    .unwrap_or(ContainerEntry {
+                    .unwrap_or(MachineEntry {
                         name: name.clone(),
-                        state: ContainerState::Off,
+                        state: MachineState::Off,
                         address: None,
                         all_addresses: Vec::new(),
                     });
@@ -100,7 +100,7 @@ impl App {
                     ),
                     DetailPane::Logs => {
                         self.data.log_manager.get_or_create(name);
-                        if entry.state == ContainerState::Running
+                        if entry.state == MachineState::Running
                             && self.data.log_manager.can_start_stream(name)
                         {
                             job(
@@ -108,7 +108,7 @@ impl App {
                                 DetailRefreshWork::Journal { name: name.clone() },
                             )
                         } else {
-                            if entry.state != ContainerState::Running
+                            if entry.state != MachineState::Running
                                 && self.data.log_manager.stop_stream(name)
                             {
                                 self.data.log_manager.push_line(name, "[CONTAINER STOPPED]");
@@ -417,7 +417,7 @@ impl App {
                 .data
                 .entries
                 .iter()
-                .any(|entry| entry.name == image.name && entry.state == ContainerState::Running)
+                .any(|entry| entry.name == image.name && entry.state == MachineState::Running)
     }
 
     pub fn check_action_cooldown(&mut self) -> bool {
@@ -434,7 +434,7 @@ impl App {
         &mut self,
         name: String,
         action: crate::application::MachineAction,
-        observed_state: Option<ContainerState>,
+        observed_state: Option<MachineState>,
     ) -> bool {
         if !self.check_action_cooldown() {
             return false;
@@ -865,7 +865,7 @@ impl App {
                 return;
             };
             let machine = self.data.entries[machine_idx].clone();
-            if machine.state != ContainerState::Running {
+            if machine.state != MachineState::Running {
                 self.set_status(
                     format!(
                         "{} is {} and cannot accept a terminal.",

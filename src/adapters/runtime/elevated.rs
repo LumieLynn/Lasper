@@ -8,7 +8,7 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties, StatusUpdate};
+use crate::nspawn::models::{ImageEntry, MachineEntry, MachineProperties, StatusUpdate};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -39,7 +39,7 @@ impl RuntimeSource for DaemonBackend {
             .unwrap_or(false)
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
         let json = self
             .call("dbus_list_machines", serde_json::json!({}))
             .await?;

@@ -11,8 +11,8 @@ use crate::nspawn::models::{
 use crate::nspawn::models::{
     BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry};
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
+use crate::nspawn::models::{ImageEntry, MachineEntry};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,14 +610,14 @@ pub struct WizardDraft {
     pub user: UserState,
     pub network: NetworkState,
     pub passthrough: PassthroughState,
-    pub entries: Vec<ContainerEntry>,
+    pub entries: Vec<MachineEntry>,
     pub images: Vec<ImageEntry>,
     pub host: ProvisioningHostSnapshot,
 }
 
 impl WizardDraft {
     pub fn new(
-        entries: Vec<ContainerEntry>,
+        entries: Vec<MachineEntry>,
         images: Vec<ImageEntry>,
         config: Arc<crate::config::AppConfig>,
         host: ProvisioningHostSnapshot,

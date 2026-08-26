@@ -3,4 +3,4 @@
 pub mod errors;
 pub mod models;
 
-pub use models::{ContainerEntry, ContainerState, ImageEntry};
+pub use models::{ImageEntry, MachineEntry, MachineState};

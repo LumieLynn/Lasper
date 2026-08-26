@@ -7,16 +7,16 @@ use ratatui::{
     Frame,
 };
 
-use crate::nspawn::{ContainerEntry, ContainerState};
+use crate::nspawn::{MachineEntry, MachineState};
 use crate::tui::core::EventResult;
 use crate::tui::theme;
 use crate::tui::widgets::lists::resource_list::{ResourceList, ResourceListRender};
 
-pub struct ContainerListComponent {
+pub struct MachineListComponent {
     list: ResourceList,
 }
 
-impl ContainerListComponent {
+impl MachineListComponent {
     pub fn new() -> Self {
         Self {
             list: ResourceList::new(" Machines "),
@@ -28,7 +28,7 @@ impl ContainerListComponent {
         &mut self,
         f: &mut Frame,
         area: Rect,
-        entries: &[ContainerEntry],
+        entries: &[MachineEntry],
         selected: usize,
         focused: bool,
         resize_mode: bool,
@@ -47,18 +47,18 @@ impl ContainerListComponent {
             },
             |entry, styles| {
                 let icon_style = match &entry.state {
-                    ContainerState::Running | ContainerState::Starting => {
+                    MachineState::Running | MachineState::Starting => {
                         Style::default().fg(t.list_icon_alive)
                     }
-                    ContainerState::Exiting | ContainerState::Off => {
+                    MachineState::Exiting | MachineState::Off => {
                         Style::default().fg(t.list_icon_dead)
                     }
                 };
                 let icon = match &entry.state {
-                    ContainerState::Running => "● ",
-                    ContainerState::Starting => "◑ ",
-                    ContainerState::Exiting => "◐ ",
-                    ContainerState::Off => "○ ",
+                    MachineState::Running => "● ",
+                    MachineState::Starting => "◑ ",
+                    MachineState::Exiting => "◐ ",
+                    MachineState::Off => "○ ",
                 };
                 let mut spans = vec![
                     styles.cursor_span(),

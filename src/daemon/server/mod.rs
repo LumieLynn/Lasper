@@ -26,12 +26,7 @@ const MAX_FD_CONNECTIONS: usize = 32;
 pub(super) async fn initialize_dbus_backend(
     enabled: bool,
 ) -> Option<crate::adapters::runtime::dbus::DbusBackend> {
-    if !enabled {
-        return None;
-    }
-
-    let dbus = crate::adapters::runtime::dbus::DbusBackend::new();
-    RuntimeSource::is_available(&dbus).await.then_some(dbus)
+    enabled.then(crate::adapters::runtime::dbus::DbusBackend::new)
 }
 
 pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
@@ -288,9 +283,20 @@ pub async fn daemon_main(
         tokio::spawn(async move {
             let (ev_tx, mut ev_rx) =
                 tokio::sync::mpsc::channel::<crate::nspawn::models::StatusUpdate>(16);
-            tokio::spawn(async move {
-                if let Err(e) = dbus_bg.watch_events(ev_tx).await {
-                    log::error!("Daemon DBus watcher exited: {}", e);
+            let watcher = tokio::spawn(async move {
+                let mut retry_delay = std::time::Duration::from_secs(1);
+                loop {
+                    match dbus_bg.watch_events(ev_tx.clone()).await {
+                        Ok(()) if ev_tx.is_closed() => break,
+                        Ok(()) => {
+                            log::warn!("Daemon D-Bus watcher stopped; reconnecting");
+                        }
+                        Err(error) => {
+                            log::warn!("Daemon D-Bus watcher unavailable: {error}; reconnecting");
+                        }
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
                 }
             });
             while ev_rx.recv().await.is_some() {
@@ -300,6 +306,7 @@ pub async fn daemon_main(
                     break;
                 }
             }
+            watcher.abort();
         });
     }
 
@@ -447,7 +454,7 @@ async fn handle_fd_connection(
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
     // doesn't return EAGAIN.
-    let mut std_stream = match stream.into_std() {
+    let std_stream = match stream.into_std() {
         Ok(s) => {
             let _ = s.set_nonblocking(false);
             s
@@ -458,7 +465,7 @@ async fn handle_fd_connection(
         }
     };
 
-    self::fd::handle(&mut std_stream, operation, server_state, trusted_state_root).await;
+    self::fd::handle(std_stream, operation, server_state, trusted_state_root).await;
 }
 
 pub(crate) use process_state::shutdown_daemon_resources;

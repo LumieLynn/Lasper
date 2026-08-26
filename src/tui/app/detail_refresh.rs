@@ -9,7 +9,7 @@ use crate::application::inspection::{
 };
 use crate::application::sessions::{JournalSessionHandle, SessionService};
 use crate::application::{RuntimeCatalog, RuntimeQuery};
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{MachineEntry, MachineProperties};
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::sync::Arc;
 
@@ -76,7 +76,7 @@ pub(crate) struct DetailRefreshServices {
 }
 
 pub(crate) enum DetailRefreshWork {
-    MachineProperties { name: String, entry: ContainerEntry },
+    MachineProperties { name: String, entry: MachineEntry },
     Journal { name: String },
     Config { name: String },
     ImageUnit { name: String },

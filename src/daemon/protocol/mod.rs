@@ -49,146 +49,66 @@ impl RpcFamily {
 /// Closed inventory of methods accepted on the authenticated JSON-RPC
 /// channel. Adding a method is an explicit protocol change rather than an
 /// unreviewed string-match branch in dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RpcMethod {
-    Ping,
-    Exit,
-    CloseSession,
-    NspawnConfig,
-    SystemdUnit,
-    NvidiaState,
-    DeploymentState,
-    DeploymentStatus,
-    ResolveDeploymentSubmission,
-    AcknowledgeDeploymentSubmission,
-    CancelDeployment,
-    AcknowledgeDeployment,
-    ProbeDeploymentRecovery,
-    ReconcileDeployment,
-    ReleaseUnresolvedDeployment,
-    Rootfs,
-    AssessTarRuntime,
-    SystemOperation,
-    CliInspectMachine,
-    DbusListMachines,
-    DbusListImages,
-    MachineControl,
-    ImageRemove,
-    DbusGetProperties,
-    DbusIsAvailable,
+macro_rules! rpc_methods {
+    ($( $variant:ident => ($wire_name:literal, $family:ident) ),+ $(,)?) => {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum RpcMethod {
+            $( $variant, )+
+        }
+
+        impl RpcMethod {
+            pub(crate) const ALL: &'static [Self] = &[
+                $( Self::$variant, )+
+            ];
+
+            pub(crate) fn parse(name: &str) -> Option<Self> {
+                match name {
+                    $( $wire_name => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+
+            pub(crate) const fn wire_name(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire_name, )+
+                }
+            }
+
+            pub(crate) const fn family(self) -> RpcFamily {
+                match self {
+                    $( Self::$variant => RpcFamily::$family, )+
+                }
+            }
+        }
+    };
 }
 
-impl RpcMethod {
-    pub(crate) const ALL: &'static [Self] = &[
-        Self::Ping,
-        Self::Exit,
-        Self::CloseSession,
-        Self::NspawnConfig,
-        Self::SystemdUnit,
-        Self::NvidiaState,
-        Self::DeploymentState,
-        Self::DeploymentStatus,
-        Self::ResolveDeploymentSubmission,
-        Self::AcknowledgeDeploymentSubmission,
-        Self::CancelDeployment,
-        Self::AcknowledgeDeployment,
-        Self::ProbeDeploymentRecovery,
-        Self::ReconcileDeployment,
-        Self::ReleaseUnresolvedDeployment,
-        Self::Rootfs,
-        Self::AssessTarRuntime,
-        Self::SystemOperation,
-        Self::CliInspectMachine,
-        Self::DbusListMachines,
-        Self::DbusListImages,
-        Self::MachineControl,
-        Self::ImageRemove,
-        Self::DbusGetProperties,
-        Self::DbusIsAvailable,
-    ];
-
-    pub(crate) fn parse(name: &str) -> Option<Self> {
-        Some(match name {
-            "ping" => Self::Ping,
-            "exit" => Self::Exit,
-            "close_session" => Self::CloseSession,
-            "nspawn_config" => Self::NspawnConfig,
-            "systemd_unit" => Self::SystemdUnit,
-            "nvidia_state" => Self::NvidiaState,
-            "deployment_state" => Self::DeploymentState,
-            "deployment_status" => Self::DeploymentStatus,
-            "resolve_deployment_submission" => Self::ResolveDeploymentSubmission,
-            "acknowledge_deployment_submission" => Self::AcknowledgeDeploymentSubmission,
-            "cancel_deployment" => Self::CancelDeployment,
-            "acknowledge_deployment" => Self::AcknowledgeDeployment,
-            "probe_deployment_recovery" => Self::ProbeDeploymentRecovery,
-            "reconcile_deployment" => Self::ReconcileDeployment,
-            "release_unresolved_deployment" => Self::ReleaseUnresolvedDeployment,
-            "rootfs" => Self::Rootfs,
-            "assess_tar_runtime" => Self::AssessTarRuntime,
-            "system_operation" => Self::SystemOperation,
-            "cli_inspect_machine" => Self::CliInspectMachine,
-            "dbus_list_machines" => Self::DbusListMachines,
-            "dbus_list_images" => Self::DbusListImages,
-            "machine_control" => Self::MachineControl,
-            "image_remove" => Self::ImageRemove,
-            "dbus_get_properties" => Self::DbusGetProperties,
-            "dbus_is_available" => Self::DbusIsAvailable,
-            _ => return None,
-        })
-    }
-
-    pub(crate) const fn wire_name(self) -> &'static str {
-        match self {
-            Self::Ping => "ping",
-            Self::Exit => "exit",
-            Self::CloseSession => "close_session",
-            Self::NspawnConfig => "nspawn_config",
-            Self::SystemdUnit => "systemd_unit",
-            Self::NvidiaState => "nvidia_state",
-            Self::DeploymentState => "deployment_state",
-            Self::DeploymentStatus => "deployment_status",
-            Self::ResolveDeploymentSubmission => "resolve_deployment_submission",
-            Self::AcknowledgeDeploymentSubmission => "acknowledge_deployment_submission",
-            Self::CancelDeployment => "cancel_deployment",
-            Self::AcknowledgeDeployment => "acknowledge_deployment",
-            Self::ProbeDeploymentRecovery => "probe_deployment_recovery",
-            Self::ReconcileDeployment => "reconcile_deployment",
-            Self::ReleaseUnresolvedDeployment => "release_unresolved_deployment",
-            Self::Rootfs => "rootfs",
-            Self::AssessTarRuntime => "assess_tar_runtime",
-            Self::SystemOperation => "system_operation",
-            Self::CliInspectMachine => "cli_inspect_machine",
-            Self::DbusListMachines => "dbus_list_machines",
-            Self::DbusListImages => "dbus_list_images",
-            Self::MachineControl => "machine_control",
-            Self::ImageRemove => "image_remove",
-            Self::DbusGetProperties => "dbus_get_properties",
-            Self::DbusIsAvailable => "dbus_is_available",
-        }
-    }
-
-    pub(crate) const fn family(self) -> RpcFamily {
-        match self {
-            Self::Ping
-            | Self::CliInspectMachine
-            | Self::DbusListMachines
-            | Self::DbusListImages
-            | Self::DbusGetProperties
-            | Self::DbusIsAvailable
-            | Self::AssessTarRuntime => RpcFamily::Query,
-            Self::CloseSession => RpcFamily::Session,
-            Self::DeploymentStatus
-            | Self::ResolveDeploymentSubmission
-            | Self::AcknowledgeDeploymentSubmission
-            | Self::CancelDeployment
-            | Self::AcknowledgeDeployment
-            | Self::ProbeDeploymentRecovery
-            | Self::ReconcileDeployment
-            | Self::ReleaseUnresolvedDeployment => RpcFamily::Job,
-            _ => RpcFamily::Command,
-        }
-    }
+rpc_methods! {
+    Ping => ("ping", Query),
+    Exit => ("exit", Command),
+    CloseSession => ("close_session", Session),
+    NspawnConfig => ("nspawn_config", Command),
+    SystemdUnit => ("systemd_unit", Command),
+    NvidiaState => ("nvidia_state", Command),
+    DeploymentState => ("deployment_state", Command),
+    DeploymentStatus => ("deployment_status", Job),
+    ResolveDeploymentSubmission => ("resolve_deployment_submission", Job),
+    AcknowledgeDeploymentSubmission => ("acknowledge_deployment_submission", Job),
+    CancelDeployment => ("cancel_deployment", Job),
+    AcknowledgeDeployment => ("acknowledge_deployment", Job),
+    ProbeDeploymentRecovery => ("probe_deployment_recovery", Job),
+    ReconcileDeployment => ("reconcile_deployment", Job),
+    ReleaseUnresolvedDeployment => ("release_unresolved_deployment", Job),
+    Rootfs => ("rootfs", Command),
+    AssessTarRuntime => ("assess_tar_runtime", Query),
+    SystemOperation => ("system_operation", Command),
+    CliInspectMachine => ("cli_inspect_machine", Query),
+    DbusListMachines => ("dbus_list_machines", Query),
+    DbusListImages => ("dbus_list_images", Query),
+    MachineControl => ("machine_control", Command),
+    ImageRemove => ("image_remove", Command),
+    DbusGetProperties => ("dbus_get_properties", Query),
+    DbusIsAvailable => ("dbus_is_available", Query),
 }
 
 #[derive(Serialize, Deserialize)]

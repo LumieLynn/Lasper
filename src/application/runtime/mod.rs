@@ -3,7 +3,7 @@
 use super::operations::{ExecutionRoute, RouteFallback};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
+    MachineEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
 };
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -33,12 +33,12 @@ pub(crate) trait RuntimePort: Send + Sync + 'static {
     fn snapshot_route(&self) -> ExecutionRoute;
     fn inspection_route(&self) -> ExecutionRoute;
     async fn is_available(&self) -> bool;
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>>;
     async fn snapshot(&self) -> Result<RuntimeSnapshot>;
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
     ) -> Result<MachineProperties>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
 }
@@ -75,7 +75,7 @@ impl RuntimeCatalog {
         }
     }
 
-    pub async fn machines(&self) -> Result<RuntimeQuery<Vec<ContainerEntry>>> {
+    pub async fn machines(&self) -> Result<RuntimeQuery<Vec<MachineEntry>>> {
         if let Some(primary) = &self.primary {
             if primary.is_available().await {
                 match primary.list_machines().await {
@@ -144,7 +144,7 @@ impl RuntimeCatalog {
     pub async fn inspect(
         &self,
         name: &str,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
     ) -> Result<RuntimeQuery<MachineProperties>> {
         let machine =
             MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
@@ -294,7 +294,7 @@ impl RuntimeCatalog {
         &self,
         from: ExecutionRoute,
         error: NspawnError,
-    ) -> Result<RuntimeQuery<Vec<ContainerEntry>>> {
+    ) -> Result<RuntimeQuery<Vec<MachineEntry>>> {
         let to = self.fallback.snapshot_route();
         let reason = fallback_reason(&error);
         log::warn!(
@@ -333,7 +333,7 @@ impl RuntimeCatalog {
     async fn fallback_inspection(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
         from: ExecutionRoute,
         error: NspawnError,
     ) -> Result<RuntimeQuery<MachineProperties>> {
@@ -362,7 +362,7 @@ fn fallback_reason(error: &NspawnError) -> String {
     }
 }
 
-fn enrich_properties(properties: &mut MachineProperties, entry: &ContainerEntry) {
+fn enrich_properties(properties: &mut MachineProperties, entry: &MachineEntry) {
     if !entry.all_addresses.is_empty() {
         properties.insert(
             crate::nspawn::models::GROUP_MACHINE,
@@ -447,12 +447,12 @@ fn spawn_heartbeat(catalog: Arc<RuntimeCatalog>, fallback_active: Arc<AtomicBool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerState, ImageEntry};
+    use crate::nspawn::models::{ImageEntry, MachineState};
 
-    fn entry(name: &str) -> ContainerEntry {
-        ContainerEntry {
+    fn entry(name: &str) -> MachineEntry {
+        MachineEntry {
             name: name.into(),
-            state: ContainerState::Running,
+            state: MachineState::Running,
             address: None,
             all_addresses: vec![],
         }

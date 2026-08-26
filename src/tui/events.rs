@@ -51,7 +51,7 @@ pub enum AppEvent {
     ActionDone(String, crate::tui::StatusLevel),
     /// A machine lifecycle workflow reached a semantic outcome.
     MachineActionFinished(crate::application::MachineLifecycleOutcome),
-    /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
+    /// Real-time metrics: (machine name, timestamp, CPU percent, RAM MiB)
     MetricsUpdate(String, f64, f64, f64),
     /// Request a UI redraw for the terminal.
     TerminalRedraw,

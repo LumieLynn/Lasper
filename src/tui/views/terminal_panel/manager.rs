@@ -5,7 +5,7 @@ use crate::application::sessions::{
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
-use crate::nspawn::models::ContainerEntry;
+use crate::nspawn::models::MachineEntry;
 use crate::tui::events::AppEvent;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
@@ -26,7 +26,7 @@ pub struct TextSelection {
 }
 
 pub struct TerminalSession {
-    pub container_name: String,
+    pub machine_name: String,
     pub attach_kind: TerminalAttachmentKind,
     pub terminal: Arc<parking_lot::Mutex<crate::tui::term::Parser>>,
     pub input: TerminalSessionInput,
@@ -165,17 +165,17 @@ impl TerminalManager {
     /// Open the terminal attachment selected by the application session service.
     pub async fn spawn(
         &mut self,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
-        if entry.state != crate::nspawn::models::ContainerState::Running {
+        if entry.state != crate::nspawn::models::MachineState::Running {
             return Err(format!("Container {} is not running", entry.name));
         }
 
         // Re-use existing session if one is already open for this container.
         if let Some(idx) = self.sessions.iter().position(|session| {
-            session.container_name == entry.name && session.handle.lifecycle().is_running()
+            session.machine_name == entry.name && session.handle.lifecycle().is_running()
         }) {
             self.active_idx = idx;
             self.show = true;
@@ -187,7 +187,7 @@ impl TerminalManager {
         if let Some(idx) = self
             .sessions
             .iter()
-            .position(|session| session.container_name == entry.name)
+            .position(|session| session.machine_name == entry.name)
         {
             let mut stale = self.sessions.remove(idx);
             stale.handle.close();
@@ -235,7 +235,7 @@ impl TerminalManager {
         );
 
         let session = TerminalSession {
-            container_name: entry.name.clone(),
+            machine_name: entry.name.clone(),
             attach_kind,
             terminal,
             input,
@@ -282,7 +282,7 @@ impl TerminalManager {
         if let Some(idx) = self
             .sessions
             .iter()
-            .position(|s| s.container_name == entry_name)
+            .position(|s| s.machine_name == entry_name)
         {
             self.active_idx = idx;
         } else {
@@ -311,7 +311,7 @@ impl TerminalManager {
     pub fn handle_key(
         &mut self,
         key: KeyEvent,
-        entries: &[ContainerEntry],
+        entries: &[MachineEntry],
         selected: &mut usize,
     ) -> TerminalKeyOutcome {
         if self.sessions.is_empty() {
@@ -336,7 +336,7 @@ impl TerminalManager {
         if let Some(idx) = new_idx {
             if idx < session_count {
                 self.active_idx = idx;
-                let name = self.sessions[idx].container_name.clone();
+                let name = self.sessions[idx].machine_name.clone();
                 if let Some(pos) = entries.iter().position(|e| e.name == name) {
                     *selected = pos;
                 }
@@ -444,7 +444,7 @@ impl TerminalManager {
                 KeyCode::Char('[') => {
                     let cur = self.active_idx;
                     self.active_idx = if cur == 0 { session_count - 1 } else { cur - 1 };
-                    let name = self.sessions[self.active_idx].container_name.clone();
+                    let name = self.sessions[self.active_idx].machine_name.clone();
                     if let Some(pos) = entries.iter().position(|e| e.name == name) {
                         *selected = pos;
                     }
@@ -453,7 +453,7 @@ impl TerminalManager {
                 KeyCode::Char(']') => {
                     let cur = self.active_idx;
                     self.active_idx = (cur + 1) % session_count;
-                    let name = self.sessions[self.active_idx].container_name.clone();
+                    let name = self.sessions[self.active_idx].machine_name.clone();
                     if let Some(pos) = entries.iter().position(|e| e.name == name) {
                         *selected = pos;
                     }
@@ -730,7 +730,7 @@ mod tests {
         terminal_session_channel, SessionService, TERMINAL_COMMAND_CAPACITY,
     };
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
-    use crate::nspawn::models::{ContainerEntry, ContainerState};
+    use crate::nspawn::models::{MachineEntry, MachineState};
     use std::sync::Arc;
 
     fn terminal_channels() -> (
@@ -800,8 +800,8 @@ mod tests {
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut manager = TerminalManager::new(service);
-        for state in [ContainerState::Starting, ContainerState::Exiting] {
-            let entry = ContainerEntry {
+        for state in [MachineState::Starting, MachineState::Exiting] {
+            let entry = MachineEntry {
                 name: "test".into(),
                 state,
                 address: None,

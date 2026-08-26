@@ -14,7 +14,7 @@ use crate::application::machine_lifecycle::{
     MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
 };
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::nspawn::models::{ContainerEntry, ImageName, MachineName};
+use crate::nspawn::models::{ImageName, MachineEntry, MachineName};
 use std::sync::Arc;
 
 pub(crate) struct ImageLifecycleAdapters {
@@ -81,7 +81,7 @@ struct CatalogImageRuntime(Arc<RuntimeCatalog>);
 
 #[async_trait::async_trait]
 impl ImageRuntime for CatalogImageRuntime {
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>, String> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>, String> {
         self.0
             .machines()
             .await

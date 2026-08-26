@@ -18,14 +18,14 @@ use crate::application::{
 };
 use crate::composition::ApplicationServices;
 use crate::nspawn::models::{
-    ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
+    CpuRepresentation, ImageEntry, ImageName, MachineEntry, MachineMetrics, RuntimeSnapshot,
 };
 use crate::tui::core::Component;
 use crate::tui::events::{AppEvent, EventHandler, InputEvent};
-use crate::tui::views::container_list::ContainerListComponent;
 use crate::tui::views::detail_panel::DetailPanel;
 use crate::tui::views::detail_panel::DetailTarget;
 use crate::tui::views::image_list::ImageListComponent;
+use crate::tui::views::machine_list::MachineListComponent;
 use crate::tui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io::Stdout;
@@ -99,7 +99,7 @@ pub struct AppUi {
     pub focus: WorkspaceFocus,
     /// Last non-terminal focus, used when closing or hiding the terminal.
     pub prev_focus: WorkspaceFocus,
-    pub container_list: ContainerListComponent,
+    pub machine_list: MachineListComponent,
     pub image_list: ImageListComponent,
     pub detail_panel: DetailPanel,
 
@@ -121,7 +121,7 @@ pub struct AppUi {
     pending_deployment_preflight: Option<u64>,
 
     pub resize_mode: ResizeMode,
-    pub container_list_pct: u16,
+    pub machine_list_pct: u16,
     pub left_machines_pct: u16,
     pub detail_pct: u16,
 
@@ -139,7 +139,7 @@ impl AppUi {
         Self {
             focus: WorkspaceFocus::Machines,
             prev_focus: WorkspaceFocus::Machines,
-            container_list: ContainerListComponent::new(),
+            machine_list: MachineListComponent::new(),
             image_list: ImageListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
@@ -157,7 +157,7 @@ impl AppUi {
             next_deployment_preflight: 1,
             pending_deployment_preflight: None,
             resize_mode: ResizeMode::Inactive,
-            container_list_pct: 30,
+            machine_list_pct: 30,
             left_machines_pct: 50,
             detail_pct: 45,
             panel_layout: PanelLayout::default(),
@@ -191,7 +191,7 @@ impl AppUi {
 pub struct AppData {
     /// Running systemd-machined instances plus optimistic `Starting` rows.
     /// Persistent images live in `images`.
-    pub entries: Vec<ContainerEntry>,
+    pub entries: Vec<MachineEntry>,
     /// Normally visible images. Hidden dot-prefixed images are kept separate.
     pub images: Vec<ImageEntry>,
     pub internal_images: Vec<ImageEntry>,
@@ -215,7 +215,7 @@ pub struct AppData {
     pub resource_inspection: std::sync::Arc<ResourceInspectionService>,
     pub host_operations: HostOperationTracker,
     pub action_cooldown: Option<Instant>,
-    pub metrics: HashMap<String, ContainerMetrics>,
+    pub metrics: HashMap<String, MachineMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
 
@@ -401,7 +401,7 @@ impl App {
                 .terminal
                 .active_session()
                 .and_then(|session| {
-                    let name = session.container_name.as_str();
+                    let name = session.machine_name.as_str();
                     self.data
                         .entries
                         .iter()
@@ -457,7 +457,7 @@ impl App {
     }
 
     /// Update entries and selection state from a background refresh.
-    fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
+    fn sync_entries(&mut self, entries: Vec<MachineEntry>) {
         let prev_name = self
             .data
             .entries
@@ -881,7 +881,7 @@ fn machine_outcome_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry};
+    use crate::nspawn::models::{ImageEntry, MachineEntry, MachineState};
     use std::time::Duration;
 
     #[test]
@@ -895,8 +895,8 @@ mod tests {
         assert!(!production.contains("crate::adapters"));
     }
 
-    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
-        ContainerEntry {
+    fn make_entry(name: &str, state: MachineState) -> MachineEntry {
+        MachineEntry {
             name: name.to_string(),
             state,
             address: None,
@@ -1035,7 +1035,7 @@ mod tests {
 
             assert_eq!(
                 app.data.entries,
-                vec![make_entry("test", ContainerState::Starting)]
+                vec![make_entry("test", MachineState::Starting)]
             );
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -1053,8 +1053,8 @@ mod tests {
             let resolved = app
                 .data
                 .machine_lifecycle
-                .project_machines(vec![make_entry("test", ContainerState::Running)]);
-            assert_eq!(resolved, vec![make_entry("test", ContainerState::Running)]);
+                .project_machines(vec![make_entry("test", MachineState::Running)]);
+            assert_eq!(resolved, vec![make_entry("test", MachineState::Running)]);
         }
 
         #[tokio::test]
@@ -1112,7 +1112,7 @@ mod tests {
 
             app.action_start();
 
-            assert_eq!(app.data.entries[0].state, ContainerState::Starting);
+            assert_eq!(app.data.entries[0].state, MachineState::Starting);
             assert_eq!(
                 app.ui
                     .status_message
@@ -1550,9 +1550,9 @@ mod tests {
         fn next_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", ContainerState::Off),
-                make_entry("b", ContainerState::Off),
-                make_entry("c", ContainerState::Off),
+                make_entry("a", MachineState::Off),
+                make_entry("b", MachineState::Off),
+                make_entry("c", MachineState::Off),
             ];
             app.data.selected = 2;
 
@@ -1564,9 +1564,9 @@ mod tests {
         fn prev_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", ContainerState::Off),
-                make_entry("b", ContainerState::Off),
-                make_entry("c", ContainerState::Off),
+                make_entry("a", MachineState::Off),
+                make_entry("b", MachineState::Off),
+                make_entry("c", MachineState::Off),
             ];
             app.data.selected = 0;
 
@@ -1595,7 +1595,7 @@ mod tests {
         #[test]
         fn image_navigation_is_independent_from_machine_selection() {
             let mut app = make_app();
-            app.data.entries = vec![make_entry("machine", ContainerState::Running)];
+            app.data.entries = vec![make_entry("machine", MachineState::Running)];
             app.data.images = vec![make_image("a"), make_image("b")];
             app.ui.focus = WorkspaceFocus::Images;
 
@@ -1636,7 +1636,7 @@ mod tests {
 
         fn app_with_machine_and_image() -> App {
             let mut app = make_app();
-            app.data.entries = vec![make_entry("machine", ContainerState::Running)];
+            app.data.entries = vec![make_entry("machine", MachineState::Running)];
             app.data.images = vec![make_image("image")];
             app.set_focus(WorkspaceFocus::Machines);
             app
@@ -1751,7 +1751,7 @@ mod tests {
         fn inspector_keeps_the_last_image_as_its_terminal_resource() {
             let mut app = make_app();
             app.data.images = vec![make_image("workstation")];
-            app.data.entries = vec![make_entry("workstation", ContainerState::Running)];
+            app.data.entries = vec![make_entry("workstation", MachineState::Running)];
 
             app.set_focus(WorkspaceFocus::Images);
             app.set_focus(WorkspaceFocus::ImageInspector);
@@ -1767,13 +1767,13 @@ mod tests {
         fn image_terminal_requires_an_exact_running_machine() {
             let mut app = make_app();
             app.data.images = vec![make_image("workstation")];
-            app.data.entries = vec![make_entry("workstation", ContainerState::Starting)];
+            app.data.entries = vec![make_entry("workstation", MachineState::Starting)];
             app.set_focus(WorkspaceFocus::Images);
 
             let image = app.focused_image_resource().unwrap();
             assert!(!app.image_has_running_machine(image));
 
-            app.data.entries[0].state = ContainerState::Running;
+            app.data.entries[0].state = MachineState::Running;
             let image = app.focused_image_resource().unwrap();
             assert!(app.image_has_running_machine(image));
         }
@@ -1830,8 +1830,8 @@ mod tests {
 
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("first", ContainerState::Running),
-                make_entry("second", ContainerState::Running),
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
             ];
             app.set_focus(WorkspaceFocus::Machines);
             app.request_detail_refresh();

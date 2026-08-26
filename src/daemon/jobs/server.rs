@@ -506,7 +506,7 @@ fn evict_one(inner: &mut DeploymentRegistryInner) -> bool {
 }
 
 pub(crate) async fn submit(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &std::os::unix::net::UnixStream,
     params: SubmitDeploymentParams,
     server_state: Arc<DaemonServerState>,
     state_root: TrustedStateRoot,
@@ -520,7 +520,7 @@ pub(crate) async fn submit(
     let plan = match DeploymentPlan::build(request.clone()) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
     };
@@ -529,7 +529,7 @@ pub(crate) async fn submit(
         deployment_id,
         plan.fingerprint().clone(),
     ) {
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
     let expects_artifact = matches!(
@@ -543,7 +543,7 @@ pub(crate) async fn submit(
                 server_state
                     .deployments
                     .reject_submission(request_id, error.to_string());
-                let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
                 return;
             }
         }
@@ -556,7 +556,7 @@ pub(crate) async fn submit(
         server_state
             .deployments
             .reject_submission(request_id, error.to_string());
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
     let (_, secrets) = submission.into_parts();
@@ -567,7 +567,7 @@ pub(crate) async fn submit(
             server_state
                 .deployments
                 .reject_submission(request_id, error.to_string());
-            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
     };
@@ -582,7 +582,7 @@ pub(crate) async fn submit(
         server_state
             .deployments
             .reject_submission(request_id, error.to_string());
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
 
@@ -601,12 +601,31 @@ pub(crate) async fn submit(
         writer,
         Arc::clone(&server_state),
     ));
-    if let Err(error) = stream.send_with_fd(b"ok", &[reader.as_raw_fd()]) {
+    if let Err(error) = send_fd_payload(stream, b"ok".to_vec(), Some(reader)).await {
         log::error!(
             "Daemon: deployment {deployment_id} was accepted but its stream fd could not be delivered: {error}"
         );
     }
-    drop(reader);
+}
+
+async fn send_fd_payload(
+    stream: &std::os::unix::net::UnixStream,
+    payload: Vec<u8>,
+    fd: Option<OwnedFd>,
+) -> std::io::Result<()> {
+    let stream = stream.try_clone()?;
+    tokio::task::spawn_blocking(move || {
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let result = match fd.as_ref() {
+            Some(fd) => stream.send_with_fd(&payload, &[fd.as_raw_fd()]),
+            None => stream.send_with_fd(&payload, &[]),
+        };
+        let reset = stream.set_write_timeout(None);
+        result?;
+        reset
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("deployment fd worker failed: {error}")))?
 }
 
 async fn receive_artifact_source(

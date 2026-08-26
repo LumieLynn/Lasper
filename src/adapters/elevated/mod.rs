@@ -117,12 +117,12 @@ impl ElevatedDaemon {
             auth_token: fd_auth_token.to_string(),
             dbus_enabled,
         };
-        let mut rpc_bootstrap_line =
+        let rpc_bootstrap_line =
             SecretBytes::new(serde_json::to_vec(&rpc_bootstrap).map_err(|error| {
                 std::io::Error::other(format!("serialize RPC authentication: {error}"))
             })?);
-        rpc_bootstrap_line.push(b'\n');
         rpc_stream.write_all(rpc_bootstrap_line.as_slice()).await?;
+        rpc_stream.write_all(b"\n").await?;
         rpc_stream.flush().await?;
         let (rpc_reader, rpc_writer) = rpc_stream.into_split();
 
@@ -152,15 +152,14 @@ impl ElevatedDaemon {
 
                         let id = request.id();
 
-                        let mut req_line = match request.into_wire_bytes() {
+                        let req_line = match request.into_wire_bytes() {
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 log::error!("Daemon I/O: failed to serialize request: {}", e);
                                 continue;
                             }
                         };
-                        req_line.push(b'\n');
-                        if req_line.len() > MAX_RPC_FRAME_BYTES {
+                        if req_line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
                             let _ = response_tx.send(RpcResponse {
                                 jsonrpc: "2.0".into(),
                                 id,
@@ -177,6 +176,10 @@ impl ElevatedDaemon {
 
                         if let Err(e) = writer.write_all(req_line.as_slice()).await {
                             log::error!("Daemon I/O: failed to write to daemon RPC socket: {}", e);
+                            break;
+                        }
+                        if let Err(e) = writer.write_all(b"\n").await {
+                            log::error!("Daemon I/O: failed to terminate RPC request: {}", e);
                             break;
                         }
                         if let Err(e) = writer.flush().await {
@@ -600,12 +603,12 @@ impl ElevatedDaemon {
             auth_token: self.fd_auth_token.to_string(),
             operation,
         };
-        let mut request_line = SecretBytes::new(
+        let request_line = SecretBytes::new(
             serde_json::to_vec(&request)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
         );
-        request_line.push(b'\n');
         sock.write_all(request_line.as_slice()).await?;
+        sock.write_all(b"\n").await?;
 
         let std_sock = sock.into_std()?;
         std_sock.set_nonblocking(false)?;

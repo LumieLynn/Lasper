@@ -4,7 +4,7 @@ use crate::adapters::lifecycle::error::map_machine_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOperation};
 use crate::application::machine_lifecycle::{MachineAction, MachineControlOutcome};
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
+use crate::nspawn::models::{ImageEntry, MachineEntry, MachineName, MachineProperties};
 
 pub(crate) enum HandleOutcome {
     Spawned,
@@ -18,7 +18,7 @@ pub(crate) enum HandleOutcome {
 /// still being migrated.
 #[async_trait::async_trait]
 pub(crate) trait DaemonDbusExecutor: Send + Sync {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>>;
+    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<MachineEntry>>;
     async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>>;
     async fn system_operation(
         &self,
@@ -49,7 +49,7 @@ pub(crate) trait DaemonDbusExecutor: Send + Sync {
 
 #[async_trait::async_trait]
 impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<MachineEntry>> {
         RuntimeSource::list_machines(self).await
     }
 

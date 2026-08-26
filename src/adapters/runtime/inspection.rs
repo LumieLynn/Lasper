@@ -3,7 +3,7 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::operations::ExecutionRoute;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, MachineProperties};
+use crate::nspawn::models::{MachineEntry, MachineProperties};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ impl MachineInspectionStore {
         }
     }
 
-    pub async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+    pub async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
         self.executor.inspect(name, entry).await
     }
 
@@ -48,7 +48,7 @@ impl std::fmt::Debug for MachineInspectionStore {
 trait MachineInspectionExecutor: Send + Sync + 'static {
     fn route(&self) -> ExecutionRoute;
 
-    async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties>;
+    async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties>;
 }
 
 struct DirectMachineInspectionExecutor;
@@ -59,7 +59,7 @@ impl MachineInspectionExecutor for DirectMachineInspectionExecutor {
         ExecutionRoute::LocalCli
     }
 
-    async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+    async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
         crate::adapters::runtime::state::inspect(name, entry).await
     }
 }
@@ -74,7 +74,7 @@ impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
         ExecutionRoute::ElevatedCli
     }
 
-    async fn inspect(&self, name: &str, _entry: &ContainerEntry) -> Result<MachineProperties> {
+    async fn inspect(&self, name: &str, _entry: &MachineEntry) -> Result<MachineProperties> {
         self.daemon
             .cli_inspect_machine(name)
             .await
@@ -85,7 +85,7 @@ impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::ContainerState;
+    use crate::nspawn::models::MachineState;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingInspector {
@@ -98,7 +98,7 @@ mod tests {
             ExecutionRoute::LocalCli
         }
 
-        async fn inspect(&self, name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+        async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
             assert_eq!(name, "test-machine");
             assert_eq!(entry.name, "test-machine");
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -114,9 +114,9 @@ mod tests {
         let store = MachineInspectionStore {
             executor: executor.clone(),
         };
-        let entry = ContainerEntry {
+        let entry = MachineEntry {
             name: "test-machine".into(),
-            state: ContainerState::Running,
+            state: MachineState::Running,
             address: None,
             all_addresses: Vec::new(),
         };

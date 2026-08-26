@@ -41,7 +41,7 @@ impl TerminalPanel {
                     })
                     .add_modifier(Modifier::BOLD);
             }
-            tab_spans.push(Span::styled(format!(" {} ", s.container_name), style));
+            tab_spans.push(Span::styled(format!(" {} ", s.machine_name), style));
             if i < session_count - 1 {
                 tab_spans.push(Span::raw("-"));
             }

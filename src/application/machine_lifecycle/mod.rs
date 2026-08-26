@@ -5,7 +5,7 @@ use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
 use crate::nspawn::models::{
-    AllowedSignal, ContainerEntry, ContainerState, MachineName, MachineProperties,
+    AllowedSignal, MachineEntry, MachineName, MachineProperties, MachineState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -192,7 +192,7 @@ pub trait MachineObservation: Send + Sync + 'static {
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
     ) -> Result<MachineProperties, String>;
     fn invalidate(&self);
 }
@@ -269,20 +269,20 @@ impl MachineLifecycleService {
         self: &Arc<Self>,
         name: &str,
         action: MachineAction,
-        observed_state: Option<ContainerState>,
+        observed_state: Option<MachineState>,
     ) -> Result<MachineOperation, MachineRejection> {
         let machine = MachineName::new(name).map_err(|_| MachineRejection::InvalidTarget)?;
         if action == MachineAction::Start
             && observed_state
                 .as_ref()
-                .is_some_and(ContainerState::is_running)
+                .is_some_and(MachineState::is_running)
         {
             return Err(MachineRejection::AlreadyRunning);
         }
         if action.requires_running()
             && !observed_state
                 .as_ref()
-                .is_some_and(ContainerState::is_running)
+                .is_some_and(MachineState::is_running)
         {
             return Err(MachineRejection::NotRunning);
         }
@@ -310,7 +310,7 @@ impl MachineLifecycleService {
         })
     }
 
-    pub fn project_machines(&self, mut entries: Vec<ContainerEntry>) -> Vec<ContainerEntry> {
+    pub fn project_machines(&self, mut entries: Vec<MachineEntry>) -> Vec<MachineEntry> {
         let now = Instant::now();
         let mut transitions = self.transitions.lock();
         transitions.retain(|name, transition| {
@@ -325,17 +325,17 @@ impl MachineLifecycleService {
             let entry = entries.iter_mut().find(|entry| entry.name == *name);
             match (&mut transition.kind, entry) {
                 (MachineTransitionKind::Starting, Some(entry))
-                    if entry.state == ContainerState::Running =>
+                    if entry.state == MachineState::Running =>
                 {
                     false
                 }
                 (MachineTransitionKind::Starting, Some(entry)) => {
-                    entry.state = ContainerState::Starting;
+                    entry.state = MachineState::Starting;
                     true
                 }
                 (MachineTransitionKind::Starting, None) => true,
                 (MachineTransitionKind::Stopping, Some(entry)) => {
-                    entry.state = ContainerState::Exiting;
+                    entry.state = MachineState::Exiting;
                     true
                 }
                 (MachineTransitionKind::Stopping, None) => false,
@@ -345,7 +345,7 @@ impl MachineLifecycleService {
                 }
                 (MachineTransitionKind::Rebooting { saw_absent: true }, Some(_)) => false,
                 (MachineTransitionKind::Rebooting { saw_absent: false }, Some(entry)) => {
-                    entry.state = ContainerState::Exiting;
+                    entry.state = MachineState::Exiting;
                     true
                 }
             }
@@ -357,9 +357,9 @@ impl MachineLifecycleService {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         drop(transitions);
-        entries.extend(missing_starts.into_iter().map(|name| ContainerEntry {
+        entries.extend(missing_starts.into_iter().map(|name| MachineEntry {
             name,
-            state: ContainerState::Starting,
+            state: MachineState::Starting,
             address: None,
             all_addresses: Vec::new(),
         }));
@@ -377,9 +377,9 @@ impl MachineLifecycleService {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let entry = ContainerEntry {
+        let entry = MachineEntry {
             name: machine.as_str().to_string(),
-            state: ContainerState::Starting,
+            state: MachineState::Starting,
             address: None,
             all_addresses: Vec::new(),
         };
@@ -603,8 +603,8 @@ fn valid_invocation_id(value: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn entry(name: &str, state: ContainerState) -> ContainerEntry {
-        ContainerEntry {
+    fn entry(name: &str, state: MachineState) -> MachineEntry {
+        MachineEntry {
             name: name.into(),
             state,
             address: None,
@@ -653,11 +653,11 @@ mod tests {
 
         assert_eq!(
             service.project_machines(vec![]),
-            vec![entry("test", ContainerState::Starting)]
+            vec![entry("test", MachineState::Starting)]
         );
         assert_eq!(
-            service.project_machines(vec![entry("test", ContainerState::Running)]),
-            vec![entry("test", ContainerState::Running)]
+            service.project_machines(vec![entry("test", MachineState::Running)]),
+            vec![entry("test", MachineState::Running)]
         );
         drop(operation);
     }
@@ -748,7 +748,7 @@ mod tests {
         ));
         assert_eq!(
             service.project_machines(vec![]),
-            vec![entry("test", ContainerState::Starting)]
+            vec![entry("test", MachineState::Starting)]
         );
     }
 
@@ -788,7 +788,7 @@ mod tests {
         let observation = MockMachineObservation::new();
         let service = service(control, observation);
         assert!(matches!(
-            service.begin("test", MachineAction::Start, Some(ContainerState::Running)),
+            service.begin("test", MachineAction::Start, Some(MachineState::Running)),
             Err(MachineRejection::AlreadyRunning)
         ));
         let first = service.begin("test", MachineAction::Start, None).unwrap();
