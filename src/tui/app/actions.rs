@@ -3,7 +3,9 @@ use super::detail_refresh::{
     DetailRefreshWork,
 };
 use super::App;
-use crate::nspawn::models::{ImageEntry, MachineEntry, MachineProperties, MachineState};
+use crate::application::machine_lifecycle::MachineOperation;
+use crate::application::{MachineLifecycleAction, MachineRuntimeAction, NspawnUnitAction};
+use crate::nspawn::models::{ImageEntry, MachineProperties, MachineState};
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
 
@@ -19,7 +21,7 @@ impl App {
     /// back to the main loop. Keeping this call synchronous prevents a slow
     /// D-Bus or CLI backend from blocking keyboard and mouse dispatch.
     pub fn refresh(&mut self) {
-        if self.ui.show_wizard || self.ui.show_help || self.ui.power_menu.is_some() {
+        if self.ui.show_wizard || self.ui.show_help || self.ui.resource_action_menu.is_some() {
             return;
         }
         self.data.runtime_catalog.invalidate();
@@ -78,18 +80,15 @@ impl App {
         let prepared = match &ticket.target {
             DetailTarget::Empty => ready(ticket.clone(), DetailRefreshResult::Empty),
             DetailTarget::Machine(name) => {
-                let entry = self
+                let Some(entry) = self
                     .data
                     .entries
                     .iter()
                     .find(|entry| entry.name == *name)
                     .cloned()
-                    .unwrap_or(MachineEntry {
-                        name: name.clone(),
-                        state: MachineState::Off,
-                        address: None,
-                        all_addresses: Vec::new(),
-                    });
+                else {
+                    return Some(ready(ticket, DetailRefreshResult::Empty));
+                };
                 match ticket.pane {
                     DetailPane::Properties | DetailPane::Details => job(
                         ticket.clone(),
@@ -411,6 +410,19 @@ impl App {
             .find(|image| &image.name == name)
     }
 
+    pub(crate) fn focused_machine_resource(&self) -> Option<&crate::nspawn::models::MachineEntry> {
+        if self.ui.focus.is_machine_list() {
+            return self.data.entries.get(self.data.selected);
+        }
+        if !self.ui.focus.is_inspector() {
+            return None;
+        }
+        let DetailTarget::Machine(name) = &self.data.detail_target else {
+            return None;
+        };
+        self.data.entries.iter().find(|entry| &entry.name == name)
+    }
+
     pub(crate) fn image_has_running_machine(&self, image: &ImageEntry) -> bool {
         !image.is_hidden()
             && self
@@ -420,29 +432,15 @@ impl App {
                 .any(|entry| entry.name == image.name && entry.state == MachineState::Running)
     }
 
-    fn perform_machine_action(
+    fn submit_machine_operation(
         &mut self,
         name: String,
-        action: crate::application::MachineAction,
-        observed_state: Option<MachineState>,
+        action: MachineLifecycleAction,
+        operation: MachineOperation,
     ) -> bool {
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
             None => return false,
-        };
-        let operation = match self
-            .data
-            .machine_lifecycle
-            .begin(&name, action, observed_state)
-        {
-            Ok(operation) => operation,
-            Err(rejection) => {
-                self.set_status(
-                    format!("{}: {}", name, rejection),
-                    crate::tui::StatusLevel::Warn,
-                );
-                return false;
-            }
         };
         self.apply_machine_projection();
 
@@ -458,7 +456,7 @@ impl App {
                 Err(error) => {
                     drop(operation);
                     let _ = tx
-                        .send(crate::tui::events::AppEvent::MachineActionFinished(
+                        .send(crate::tui::events::AppEvent::MachineLifecycleFinished(
                             crate::application::MachineLifecycleOutcome {
                                 machine: crate::nspawn::models::MachineName::new(name)
                                     .expect("lifecycle operation already validated the name"),
@@ -479,7 +477,9 @@ impl App {
                 .await
                 .expect("machine lifecycle operation returns a semantic outcome");
             let _ = tx
-                .send(crate::tui::events::AppEvent::MachineActionFinished(outcome))
+                .send(crate::tui::events::AppEvent::MachineLifecycleFinished(
+                    outcome,
+                ))
                 .await;
         });
         true
@@ -507,71 +507,60 @@ impl App {
     }
 
     pub fn action_start(&mut self) {
-        if self.image_is_focused() {
-            self.action_start_image();
+        if let Some(name) = self
+            .focused_image_resource()
+            .map(|image| image.name.clone())
+        {
+            self.action_start_image_named(&name);
             return;
         }
-        let Some(entry) = self.data.entries.get(self.data.selected).cloned() else {
-            return;
-        };
-        self.perform_machine_action(
-            entry.name,
-            crate::application::MachineAction::Start,
-            Some(entry.state),
+        self.set_status(
+            "Focus Images to start an image.".into(),
+            crate::tui::StatusLevel::Info,
         );
     }
 
     pub fn action_poweroff(&mut self) {
-        if self.image_is_focused() {
+        if let Some(name) = self
+            .focused_machine_resource()
+            .map(|entry| entry.name.clone())
+        {
+            self.action_runtime_named(&name, MachineRuntimeAction::Poweroff);
             return;
         }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Poweroff,
-                Some(entry.state),
-            );
-        }
+        self.set_status(
+            "Focus Machines to power off a running machine.".into(),
+            crate::tui::StatusLevel::Info,
+        );
     }
 
-    pub fn action_terminate(&mut self) {
-        if self.image_is_focused() {
-            return;
-        }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Terminate,
-                Some(entry.state),
+    pub(crate) fn action_runtime_named(&mut self, name: &str, action: MachineRuntimeAction) {
+        let Some(entry) = self
+            .data
+            .entries
+            .iter()
+            .find(|entry| entry.name == name)
+            .cloned()
+        else {
+            self.set_status(
+                format!("Machine '{}' changed before the action started.", name),
+                crate::tui::StatusLevel::Warn,
             );
-        }
-    }
-
-    pub fn action_reboot(&mut self) {
-        if self.image_is_focused() {
             return;
-        }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Reboot,
-                Some(entry.state),
-            );
-        }
-    }
-
-    pub fn action_kill(&mut self) {
-        if self.image_is_focused() {
-            return;
-        }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Kill {
-                    signal: crate::nspawn::models::AllowedSignal::Kill,
-                },
-                Some(entry.state),
-            );
+        };
+        let name = entry.name.clone();
+        match self.data.machine_lifecycle.begin_runtime(&entry, action) {
+            Ok(operation) => {
+                self.submit_machine_operation(
+                    name,
+                    MachineLifecycleAction::Runtime(action),
+                    operation,
+                );
+            }
+            Err(rejection) => self.set_status(
+                format!("{}: {}", name, rejection),
+                crate::tui::StatusLevel::Warn,
+            ),
         }
     }
 
@@ -586,34 +575,61 @@ impl App {
         );
     }
 
-    fn action_start_image(&mut self) {
-        if self.ui.image_list.shows_internal() {
+    pub(crate) fn action_start_image_named(&mut self, name: &str) {
+        let image = match self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .find(|image| image.name == name)
+            .cloned()
+        {
+            Some(image) => image,
+            None => {
+                self.set_status(
+                    format!("Image '{}' changed before the action started.", name),
+                    crate::tui::StatusLevel::Warn,
+                );
+                return;
+            }
+        };
+        if image.is_hidden() {
             self.set_status(
                 "Internal images cannot be started directly.".into(),
                 crate::tui::StatusLevel::Warn,
             );
             return;
         }
-        let image = match self.data.images.get(self.data.image_selected) {
-            Some(image) => image,
-            None => return,
-        };
         let name = image.name.clone();
         let is_mstack = image.image_type == "mstack";
-        if let Some(state) = self
+        let observed_state = self
             .data
             .entries
             .iter()
-            .find(|entry| entry.name == name && entry.state.is_running())
-            .map(|entry| entry.state.label())
-        {
+            .find(|entry| entry.name == name)
+            .map(|entry| entry.state);
+        if let Some(state) = &observed_state {
             self.set_status(
-                format!("{} is already {}.", name, state),
+                format!("{} is already {}.", name, state.label()),
                 crate::tui::StatusLevel::Info,
             );
             return;
         }
-        if self.perform_machine_action(name.clone(), crate::application::MachineAction::Start, None)
+        let operation = match self
+            .data
+            .machine_lifecycle
+            .begin_launch(&image, observed_state)
+        {
+            Ok(operation) => operation,
+            Err(rejection) => {
+                self.set_status(
+                    format!("{}: {}", name, rejection),
+                    crate::tui::StatusLevel::Warn,
+                );
+                return;
+            }
+        };
+        if self.submit_machine_operation(name.clone(), MachineLifecycleAction::Launch, operation)
             && is_mstack
         {
             self.set_status(
@@ -649,12 +665,7 @@ impl App {
             );
             return;
         }
-        if self
-            .data
-            .entries
-            .iter()
-            .any(|machine| machine.name == name && machine.state.is_running())
-        {
+        if self.data.entries.iter().any(|machine| machine.name == name) {
             self.set_status(
                 format!("Stop machine '{}' before deleting its image.", name),
                 crate::tui::StatusLevel::Warn,
@@ -797,29 +808,33 @@ impl App {
         });
     }
 
-    pub fn action_enable(&mut self) {
-        if self.image_is_focused() {
-            return;
-        }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Enable,
-                Some(entry.state),
+    pub(crate) fn action_unit_named(&mut self, name: &str, action: NspawnUnitAction) {
+        let Some(image) = self
+            .data
+            .images
+            .iter()
+            .find(|image| image.name == name)
+            .cloned()
+        else {
+            self.set_status(
+                format!("Image '{}' changed before the action started.", name),
+                crate::tui::StatusLevel::Warn,
             );
-        }
-    }
-
-    pub fn action_disable(&mut self) {
-        if self.image_is_focused() {
             return;
-        }
-        if let Some(entry) = self.data.entries.get(self.data.selected).cloned() {
-            self.perform_machine_action(
-                entry.name,
-                crate::application::MachineAction::Disable,
-                Some(entry.state),
-            );
+        };
+        let name = image.name.clone();
+        match self.data.machine_lifecycle.begin_unit(&image, action) {
+            Ok(operation) => {
+                self.submit_machine_operation(
+                    name,
+                    MachineLifecycleAction::Unit(action),
+                    operation,
+                );
+            }
+            Err(rejection) => self.set_status(
+                format!("{}: {}", name, rejection),
+                crate::tui::StatusLevel::Warn,
+            ),
         }
     }
 

@@ -50,15 +50,12 @@ impl MachineListComponent {
                     MachineState::Running | MachineState::Starting => {
                         Style::default().fg(t.list_icon_alive)
                     }
-                    MachineState::Exiting | MachineState::Off => {
-                        Style::default().fg(t.list_icon_dead)
-                    }
+                    MachineState::Exiting => Style::default().fg(t.list_icon_dead),
                 };
                 let icon = match &entry.state {
                     MachineState::Running => "● ",
                     MachineState::Starting => "◑ ",
                     MachineState::Exiting => "◐ ",
-                    MachineState::Off => "○ ",
                 };
                 let mut spans = vec![
                     styles.cursor_span(),

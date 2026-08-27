@@ -174,7 +174,7 @@ impl ImageRemovalOperation {
         };
         if machines
             .iter()
-            .any(|entry| entry.name == self.name.as_str() && entry.state.is_running())
+            .any(|entry| entry.name == self.name.as_str())
         {
             return ImageRemovalOutcome::Rejected {
                 rejection: ImageRemovalRejection::AlreadyRunning,
@@ -322,6 +322,8 @@ mod tests {
         runtime.expect_list_machines().returning(|| {
             Ok(vec![MachineEntry {
                 name: "ubuntu".into(),
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
                 address: None,
                 all_addresses: vec![],

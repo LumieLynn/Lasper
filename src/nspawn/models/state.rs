@@ -1,24 +1,24 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum MachineState {
     Running,
     Starting,
     Exiting,
-    Off,
 }
 
 impl MachineState {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Running => "running",
-            Self::Off => "poweroff",
             Self::Starting => "starting",
             Self::Exiting => "exiting",
         }
     }
-    pub fn is_running(&self) -> bool {
-        matches!(self, Self::Running | Self::Starting | Self::Exiting)
+
+    /// Whether the machine is a stable runtime target for lifecycle commands.
+    pub fn accepts_runtime_actions(&self) -> bool {
+        matches!(self, Self::Running)
     }
 }
 
@@ -29,12 +29,32 @@ impl MachineState {
 pub struct MachineEntry {
     /// The name used by machinectl
     pub name: String,
+    /// Registration class reported by systemd-machined, normally `container`.
+    pub class: String,
+    /// Manager that registered the machine, normally `systemd-nspawn`.
+    pub service: String,
     /// Current lifecycle state
     pub state: MachineState,
     /// Network address (from list, only when running)
     pub address: Option<String>,
     /// All network addresses
     pub all_addresses: Vec<String>,
+}
+
+impl MachineEntry {
+    pub const NSPAWN_CLASS: &'static str = "container";
+    pub const NSPAWN_SERVICE: &'static str = "systemd-nspawn";
+
+    pub fn optimistic_nspawn(name: impl Into<String>, state: MachineState) -> Self {
+        Self {
+            name: name.into(),
+            class: Self::NSPAWN_CLASS.into(),
+            service: Self::NSPAWN_SERVICE.into(),
+            state,
+            address: None,
+            all_addresses: Vec::new(),
+        }
+    }
 }
 
 /// A persistent machine image known to systemd-machined.
@@ -217,6 +237,8 @@ impl Ord for MachineEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.name
             .cmp(&other.name)
+            .then(self.class.cmp(&other.class))
+            .then(self.service.cmp(&other.service))
             .then(self.state.cmp(&other.state))
             .then(self.address.cmp(&other.address))
             .then(self.all_addresses.cmp(&other.all_addresses))
@@ -388,7 +410,6 @@ mod tests {
     #[test]
     fn machine_state_labels() {
         assert_eq!(MachineState::Running.label(), "running");
-        assert_eq!(MachineState::Off.label(), "poweroff");
         assert_eq!(MachineState::Starting.label(), "starting");
         assert_eq!(MachineState::Exiting.label(), "exiting");
     }
@@ -461,6 +482,8 @@ mod tests {
     fn runtime_snapshot_normalizes_backend_output_order() {
         let machine = |name: &str, addresses: Vec<&str>| MachineEntry {
             name: name.into(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
             address: addresses.first().map(|address| (*address).into()),
             all_addresses: addresses.into_iter().map(str::to_string).collect(),
@@ -488,20 +511,14 @@ mod tests {
     }
 
     #[test]
-    fn machine_state_is_running() {
-        assert!(MachineState::Running.is_running());
-        assert!(MachineState::Starting.is_running());
-        assert!(MachineState::Exiting.is_running());
-        assert!(!MachineState::Off.is_running());
+    fn only_stable_running_state_accepts_runtime_actions() {
+        assert!(MachineState::Running.accepts_runtime_actions());
+        assert!(!MachineState::Starting.accepts_runtime_actions());
+        assert!(!MachineState::Exiting.accepts_runtime_actions());
     }
 
     fn make_entry(name: &str, state: MachineState) -> MachineEntry {
-        MachineEntry {
-            name: name.to_string(),
-            state,
-            address: None,
-            all_addresses: vec![],
-        }
+        MachineEntry::optimistic_nspawn(name, state)
     }
 
     #[test]
@@ -509,7 +526,7 @@ mod tests {
         let mut entries = [
             make_entry("z", MachineState::Running),
             make_entry("a", MachineState::Running),
-            make_entry("b", MachineState::Off),
+            make_entry("b", MachineState::Exiting),
         ];
         entries.sort();
         assert_eq!(entries[0].name, "a");
@@ -518,9 +535,8 @@ mod tests {
     }
 
     #[test]
-    fn machine_entry_ordering_all_states() {
+    fn machine_entry_ordering_all_runtime_states() {
         let mut entries = [
-            make_entry("d", MachineState::Off),
             make_entry("c", MachineState::Exiting),
             make_entry("a", MachineState::Running),
             make_entry("b", MachineState::Starting),
@@ -529,7 +545,13 @@ mod tests {
         assert_eq!(entries[0].name, "a");
         assert_eq!(entries[1].name, "b");
         assert_eq!(entries[2].name, "c");
-        assert_eq!(entries[3].name, "d");
+    }
+
+    #[test]
+    fn optimistic_launch_preserves_its_registration_source() {
+        let machine = make_entry("test", MachineState::Running);
+        assert_eq!(machine.class, "container");
+        assert_eq!(machine.service, "systemd-nspawn");
     }
 
     #[test]

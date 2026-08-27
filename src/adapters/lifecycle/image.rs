@@ -11,7 +11,7 @@ use crate::application::image_lifecycle::{
     ManagedArtifactCleanup, UnitDisableReport,
 };
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+    MachineControlOutcome, MachineControlTransport, NspawnUnitAction, NspawnUnitControlRequest,
 };
 use crate::application::{OperationRegistry, RuntimeCatalog};
 use crate::nspawn::models::{ImageName, MachineEntry, MachineName};
@@ -209,9 +209,9 @@ async fn disable_unit_via_daemon(
     machine: &MachineName,
 ) -> crate::nspawn::errors::Result<()> {
     let outcome = daemon
-        .machine_control(MachineControlRequest {
+        .nspawn_unit_control(NspawnUnitControlRequest {
             machine: machine.clone(),
-            action: MachineAction::Disable,
+            action: NspawnUnitAction::Disable,
             transport: MachineControlTransport::Dbus,
         })
         .await

@@ -11,7 +11,7 @@ pub(crate) mod session;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 14;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 15;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -105,7 +105,9 @@ rpc_methods! {
     CliInspectMachine => ("cli_inspect_machine", Query),
     DbusListMachines => ("dbus_list_machines", Query),
     DbusListImages => ("dbus_list_images", Query),
-    MachineControl => ("machine_control", Command),
+    NspawnLaunch => ("nspawn_launch", Command),
+    MachineRuntimeControl => ("machine_runtime_control", Command),
+    NspawnUnitControl => ("nspawn_unit_control", Command),
     ImageRemove => ("image_remove", Command),
     DbusGetProperties => ("dbus_get_properties", Query),
     DbusIsAvailable => ("dbus_is_available", Query),

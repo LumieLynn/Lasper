@@ -11,7 +11,9 @@ use super::server::DaemonServerState;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
-use crate::application::machine_lifecycle::MachineControlRequest;
+use crate::application::machine_lifecycle::{
+    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
+};
 use crate::domain::secret::zeroize_string;
 use std::sync::Arc;
 
@@ -193,9 +195,25 @@ pub(super) fn daemon_resource_claim(
                 .map_err(|error| format!("invalid image_remove request: {error}"))?;
             crate::application::ResourceKey::for_image(&request.image)
         }
-        RpcMethod::MachineControl => {
-            let request: MachineControlRequest = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid machine_control request: {error}"))?;
+        RpcMethod::NspawnLaunch => {
+            let request: NspawnLaunchRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid nspawn_launch request: {error}"))?;
+            if !request.validates_same_name_route() {
+                return Err(
+                    "invalid nspawn_launch request: image and machine names must match".into(),
+                );
+            }
+            crate::application::ResourceKey::for_image(&request.image)
+        }
+        RpcMethod::MachineRuntimeControl => {
+            let request: MachineRuntimeControlRequest =
+                serde_json::from_value(request.params.clone())
+                    .map_err(|error| format!("invalid machine_runtime_control request: {error}"))?;
+            crate::application::ResourceKey::for_machine(&request.machine)
+        }
+        RpcMethod::NspawnUnitControl => {
+            let request: NspawnUnitControlRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid nspawn_unit_control request: {error}"))?;
             crate::application::ResourceKey::for_machine(&request.machine)
         }
         RpcMethod::SystemOperation => {

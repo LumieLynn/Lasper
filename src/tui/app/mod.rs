@@ -105,7 +105,7 @@ pub struct AppUi {
 
     pub show_wizard: bool,
     pub show_help: bool,
-    pub power_menu: Option<crate::tui::widgets::power_menu::PowerMenu>,
+    pub resource_action_menu: Option<crate::tui::widgets::resource_action_menu::ResourceActionMenu>,
     pub pane_height: u16,
 
     pub wizard: Option<Wizard>,
@@ -144,7 +144,7 @@ impl AppUi {
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
-            power_menu: None,
+            resource_action_menu: None,
             pane_height: 10,
             wizard: None,
             status_message: None,
@@ -178,8 +178,8 @@ impl AppUi {
             Some(ModalLayer::Help)
         } else if self.show_wizard {
             Some(ModalLayer::Wizard)
-        } else if self.power_menu.is_some() {
-            Some(ModalLayer::PowerMenu)
+        } else if self.resource_action_menu.is_some() {
+            Some(ModalLayer::ResourceActionMenu)
         } else {
             None
         }
@@ -483,11 +483,7 @@ impl App {
     /// Apply the independent machine/image snapshot returned by the backend.
     fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
         let RuntimeSnapshot { machines, images } = snapshot;
-        let running: Vec<_> = machines
-            .into_iter()
-            .filter(|e| e.state.is_running())
-            .collect();
-        self.sync_entries(running);
+        self.sync_entries(machines);
 
         let previous_name = self
             .data
@@ -632,7 +628,7 @@ impl App {
                 self.set_status(msg, level);
                 self.refresh();
             }
-            AppEvent::MachineActionFinished(outcome) => {
+            AppEvent::MachineLifecycleFinished(outcome) => {
                 let (message, level) = machine_outcome_status(outcome);
                 self.refresh();
                 self.set_status(message, level);
@@ -897,6 +893,8 @@ mod tests {
     fn make_entry(name: &str, state: MachineState) -> MachineEntry {
         MachineEntry {
             name: name.to_string(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state,
             address: None,
             all_addresses: vec![],
@@ -987,7 +985,7 @@ mod tests {
             let successful = matches!(control_outcome, MachineControlOutcome::Succeeded);
             let mut control = MockMachineControl::new();
             control
-                .expect_execute()
+                .expect_launch()
                 .once()
                 .returning(move |_, _| RoutedMachineControlOutcome {
                     outcome: control_outcome.clone(),
@@ -1045,7 +1043,7 @@ mod tests {
             assert_eq!(app.data.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
-                AppEvent::MachineActionFinished(outcome)
+                AppEvent::MachineLifecycleFinished(outcome)
                     if outcome.result == MachineLifecycleResult::Succeeded
             ));
 
@@ -1068,7 +1066,7 @@ mod tests {
                 .await
                 .expect("start task should finish")
                 .expect("start task should report a result");
-            let AppEvent::MachineActionFinished(outcome) = event else {
+            let AppEvent::MachineLifecycleFinished(outcome) = event else {
                 panic!("start failure should report a semantic outcome");
             };
             assert_eq!(
@@ -1093,7 +1091,7 @@ mod tests {
                 .await
                 .expect("first start task should finish")
                 .expect("first start task should report a result");
-            assert!(matches!(event, AppEvent::MachineActionFinished(..)));
+            assert!(matches!(event, AppEvent::MachineLifecycleFinished(..)));
             assert_eq!(
                 app.ui
                     .status_message
@@ -1101,6 +1099,39 @@ mod tests {
                     .map(|(message, _)| message.as_str()),
                 Some("test is already starting.")
             );
+        }
+
+        #[tokio::test]
+        async fn image_inspector_action_menu_keeps_its_retained_target() {
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
+            app.data.images.push(make_image("second"));
+            app.data.image_selected = 1;
+            app.data.detail_target = DetailTarget::Image {
+                name: "test".into(),
+                internal: false,
+            };
+            app.ui.focus = WorkspaceFocus::ImageInspector;
+
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .await;
+
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .await;
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("start task should finish")
+                .expect("start task should report a result");
+            let AppEvent::MachineLifecycleFinished(outcome) = event else {
+                panic!("start should report a machine lifecycle outcome");
+            };
+            assert_eq!(outcome.machine.as_str(), "test");
         }
 
         #[tokio::test]
@@ -1125,7 +1156,7 @@ mod tests {
                     .await
                     .expect("mstack start should finish")
                     .expect("mstack start should report a result"),
-                AppEvent::MachineActionFinished(..)
+                AppEvent::MachineLifecycleFinished(..)
             ));
         }
     }
@@ -1548,9 +1579,9 @@ mod tests {
         fn next_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", MachineState::Off),
-                make_entry("b", MachineState::Off),
-                make_entry("c", MachineState::Off),
+                make_entry("a", MachineState::Running),
+                make_entry("b", MachineState::Running),
+                make_entry("c", MachineState::Running),
             ];
             app.data.selected = 2;
 
@@ -1562,9 +1593,9 @@ mod tests {
         fn prev_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", MachineState::Off),
-                make_entry("b", MachineState::Off),
-                make_entry("c", MachineState::Off),
+                make_entry("a", MachineState::Running),
+                make_entry("b", MachineState::Running),
+                make_entry("c", MachineState::Running),
             ];
             app.data.selected = 0;
 
@@ -1645,8 +1676,12 @@ mod tests {
             use crate::tui::widgets::dialogs::confirmation::ConfirmationDialog;
 
             let mut ui = AppUi::new();
-            ui.power_menu = Some(crate::tui::widgets::power_menu::PowerMenu::new(0));
-            assert_eq!(ui.modal_layer(), Some(ModalLayer::PowerMenu));
+            ui.resource_action_menu = Some(
+                crate::tui::widgets::resource_action_menu::ResourceActionMenu::for_machine(
+                    &make_entry("machine", MachineState::Running),
+                ),
+            );
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::ResourceActionMenu));
 
             ui.show_wizard = true;
             assert_eq!(ui.modal_layer(), Some(ModalLayer::Wizard));
@@ -1911,6 +1946,33 @@ mod tests {
         assert_eq!(app.data.internal_image_selected, 1);
     }
 
+    #[test]
+    fn machine_refresh_keeps_every_present_runtime_state() {
+        let mut app = make_app();
+
+        app.sync_snapshot(RuntimeSnapshot::new(
+            vec![
+                make_entry("running", MachineState::Running),
+                make_entry("starting", MachineState::Starting),
+                make_entry("exiting", MachineState::Exiting),
+            ],
+            vec![],
+        ));
+
+        assert_eq!(
+            app.data
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.state))
+                .collect::<Vec<_>>(),
+            [
+                ("exiting", MachineState::Exiting),
+                ("running", MachineState::Running),
+                ("starting", MachineState::Starting),
+            ]
+        );
+    }
+
     mod machine_actions {
         use super::*;
         use crate::application::machine_lifecycle::{
@@ -1922,14 +1984,17 @@ mod tests {
 
         fn prepare_poweroff_app() -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
             let mut control = MockMachineControl::new();
-            control.expect_execute().times(2).returning(|_, action| {
-                assert_eq!(action, crate::application::MachineAction::Poweroff);
-                RoutedMachineControlOutcome {
-                    outcome: MachineControlOutcome::Succeeded,
-                    route: ExecutionRoute::DirectDbus,
-                    fallback: None,
-                }
-            });
+            control
+                .expect_execute_runtime()
+                .times(2)
+                .returning(|_, action| {
+                    assert_eq!(action, crate::application::MachineRuntimeAction::Poweroff);
+                    RoutedMachineControlOutcome {
+                        outcome: MachineControlOutcome::Succeeded,
+                        route: ExecutionRoute::DirectDbus,
+                        fallback: None,
+                    }
+                });
             let preparation = MockMachineStartPreparation::new();
             let mut observation = MockMachineObservation::new();
             observation.expect_invalidate().times(2).return_const(());
@@ -1967,7 +2032,7 @@ mod tests {
                     .await
                     .expect("both poweroff actions should finish")
                     .expect("both poweroff actions should report a result");
-                let AppEvent::MachineActionFinished(outcome) = event else {
+                let AppEvent::MachineLifecycleFinished(outcome) = event else {
                     panic!("poweroff should report a machine lifecycle outcome");
                 };
                 completed.push(outcome.machine.as_str().to_string());

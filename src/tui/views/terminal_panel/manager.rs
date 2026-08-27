@@ -803,6 +803,8 @@ mod tests {
         for state in [MachineState::Starting, MachineState::Exiting] {
             let entry = MachineEntry {
                 name: "test".into(),
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
                 state,
                 address: None,
                 all_addresses: Vec::new(),

@@ -6,7 +6,7 @@
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModalLayer {
-    PowerMenu,
+    ResourceActionMenu,
     Wizard,
     Help,
     QuitConfirmation,

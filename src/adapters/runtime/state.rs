@@ -85,8 +85,24 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
         if MachineName::new(&name).is_err() {
             continue;
         }
+        let fields = match read_runtime_state(&entry.path(), &name) {
+            Ok(fields) => fields,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                log::warn!(
+                    "Ignoring unreadable machined registration {}: {}",
+                    name,
+                    error
+                );
+                continue;
+            }
+        };
+        let class = fields.get("CLASS").cloned().unwrap_or_default();
+        let service = fields.get("SERVICE").cloned().unwrap_or_default();
         machines.push(MachineEntry {
             name,
+            class,
+            service,
             state: crate::nspawn::models::MachineState::Running,
             address: None,
             all_addresses: Vec::new(),
@@ -337,6 +353,8 @@ mod tests {
     fn entry(name: &str) -> MachineEntry {
         MachineEntry {
             name: name.into(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
             address: Some("10.0.0.2".into()),
             all_addresses: vec!["10.0.0.2".into()],
@@ -405,8 +423,21 @@ mod tests {
     #[tokio::test]
     async fn runtime_enumeration_uses_regular_valid_registration_files_only() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("z-machine"), "NAME=z-machine\n").unwrap();
-        std::fs::write(dir.path().join("a-machine"), "NAME=a-machine\n").unwrap();
+        std::fs::write(
+            dir.path().join("z-machine"),
+            "NAME=z-machine\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a-machine"),
+            "NAME=a-machine\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foreign-vm"),
+            "NAME=foreign-vm\nCLASS=vm\nSERVICE=libvirt\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("invalid:name"), "ignored\n").unwrap();
         symlink("a-machine", dir.path().join("unit:machine-a.scope")).unwrap();
         std::fs::create_dir(dir.path().join("directory-entry")).unwrap();
@@ -418,11 +449,17 @@ mod tests {
                 .iter()
                 .map(|machine| machine.name.as_str())
                 .collect::<Vec<_>>(),
-            ["a-machine", "z-machine"]
+            ["a-machine", "foreign-vm", "z-machine"]
         );
         assert!(machines
             .iter()
             .all(|machine| machine.all_addresses.is_empty()));
+        let foreign = machines
+            .iter()
+            .find(|machine| machine.name == "foreign-vm")
+            .unwrap();
+        assert_eq!(foreign.class, "vm");
+        assert_eq!(foreign.service, "libvirt");
     }
 
     #[tokio::test]

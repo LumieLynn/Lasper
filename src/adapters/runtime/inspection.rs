@@ -116,6 +116,8 @@ mod tests {
         };
         let entry = MachineEntry {
             name: "test-machine".into(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
             address: None,
             all_addresses: Vec::new(),

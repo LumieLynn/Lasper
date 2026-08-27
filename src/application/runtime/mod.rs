@@ -452,6 +452,8 @@ mod tests {
     fn entry(name: &str) -> MachineEntry {
         MachineEntry {
             name: name.into(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
             address: None,
             all_addresses: vec![],

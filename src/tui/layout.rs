@@ -27,8 +27,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
-    if let Some(pm) = &mut app.ui.power_menu {
-        pm.render(f, area);
+    if let Some(menu) = &mut app.ui.resource_action_menu {
+        menu.render(f, area);
     }
     if app.ui.show_wizard {
         if let Some(w) = &mut app.ui.wizard {

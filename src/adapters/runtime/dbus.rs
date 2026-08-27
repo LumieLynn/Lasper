@@ -311,7 +311,7 @@ impl RuntimeSource for DbusBackend {
         self.observe_result(generation, &result).await;
         let machines = result.map_err(NspawnError::Dbus)?;
         let mut entries = Vec::new();
-        for (name, _class, _service, _path) in machines {
+        for (name, class, service, _path) in machines {
             if name == ".host" {
                 continue;
             }
@@ -326,6 +326,8 @@ impl RuntimeSource for DbusBackend {
                 .collect();
             entries.push(MachineEntry {
                 name,
+                class,
+                service,
                 state: MachineState::Running,
                 address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
                 all_addresses,

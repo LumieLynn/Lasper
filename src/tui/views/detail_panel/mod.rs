@@ -223,7 +223,7 @@ impl DetailPanel {
                 || data
                     .entries
                     .get(data.selected)
-                    .map(|e| !e.state.is_running())
+                    .map(|e| !e.state.accepts_runtime_actions())
                     .unwrap_or(true);
             vec![
                 " Properties ",

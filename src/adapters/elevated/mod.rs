@@ -10,7 +10,10 @@ use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentS
 use crate::adapters::rootfs::store::{RootfsOperation, RootfsResult};
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemoveRequest};
-use crate::application::machine_lifecycle::{MachineControlOutcome, MachineControlRequest};
+use crate::application::machine_lifecycle::{
+    MachineControlOutcome, MachineRuntimeControlRequest, NspawnLaunchRequest,
+    NspawnUnitControlRequest,
+};
 use crate::daemon::protocol::deployment::{
     DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
     DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
@@ -515,13 +518,35 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(super) async fn machine_control(
+    pub(super) async fn nspawn_launch(
         &self,
-        request: MachineControlRequest,
+        request: NspawnLaunchRequest,
     ) -> std::io::Result<MachineControlOutcome> {
         let params = serde_json::to_value(request)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("machine_control", params).await?;
+        let result = self.rpc_call("nspawn_launch", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(super) async fn machine_runtime_control(
+        &self,
+        request: MachineRuntimeControlRequest,
+    ) -> std::io::Result<MachineControlOutcome> {
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("machine_runtime_control", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(super) async fn nspawn_unit_control(
+        &self,
+        request: NspawnUnitControlRequest,
+    ) -> std::io::Result<MachineControlOutcome> {
+        let params = serde_json::to_value(request)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc_call("nspawn_unit_control", params).await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -871,7 +896,7 @@ mod tests {
         let (response_tx, response_rx) = tokio::sync::oneshot::channel();
         let error = wait_for_rpc_response(
             response_rx,
-            RpcMethod::MachineControl,
+            RpcMethod::MachineRuntimeControl,
             std::time::Duration::from_millis(1),
         )
         .await

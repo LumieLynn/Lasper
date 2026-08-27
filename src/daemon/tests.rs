@@ -10,9 +10,10 @@ use crate::adapters::rootfs::store::RootfsOperation;
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTransport};
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlRequest, MachineControlTransport,
+    MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
+    NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
-use crate::nspawn::models::{ImageEntry, MachineEntry, MachineName, MachineProperties};
+use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -141,14 +142,14 @@ fn rpc_request_rejects_unknown_fields() {
 }
 
 #[test]
-fn machine_control_rpc_is_typed_and_claims_the_machine_resource() {
+fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
     let request = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
-        method: "machine_control".into(),
-        params: serde_json::to_value(MachineControlRequest {
+        method: "machine_runtime_control".into(),
+        params: serde_json::to_value(MachineRuntimeControlRequest {
             machine: MachineName::new("test-machine").unwrap(),
-            action: MachineAction::Kill {
+            action: MachineRuntimeAction::Kill {
                 signal: crate::nspawn::models::AllowedSignal::Kill,
             },
             transport: MachineControlTransport::Dbus,
@@ -164,7 +165,52 @@ fn machine_control_rpc_is_typed_and_claims_the_machine_resource() {
     );
     let mut invalid = request.params;
     invalid["program"] = serde_json::json!("sh");
-    assert!(serde_json::from_value::<MachineControlRequest>(invalid).is_err());
+    assert!(serde_json::from_value::<MachineRuntimeControlRequest>(invalid).is_err());
+}
+
+#[test]
+fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
+    let image = ImageName::new("test-image").unwrap();
+    let machine = MachineName::new("test-image").unwrap();
+    let expected = Some(crate::application::ResourceClaim::exclusive(
+        crate::application::ResourceKey::Nspawn("test-image".into()),
+    ));
+    let launch = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "nspawn_launch".into(),
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image: image.clone(),
+            machine: machine.clone(),
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+    };
+    let unit = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 2,
+        method: "nspawn_unit_control".into(),
+        params: serde_json::to_value(NspawnUnitControlRequest {
+            machine,
+            action: NspawnUnitAction::Enable,
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+    };
+
+    assert_eq!(daemon_resource_claim(&launch).unwrap(), expected);
+    assert_eq!(daemon_resource_claim(&unit).unwrap(), expected);
+
+    let mismatched = RpcRequest {
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image,
+            machine: MachineName::new("another-machine").unwrap(),
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+        ..launch
+    };
+    assert!(daemon_resource_claim(&mismatched).is_err());
 }
 
 #[tokio::test]
@@ -348,10 +394,10 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let start = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 2,
-        method: "machine_control".into(),
-        params: serde_json::to_value(MachineControlRequest {
+        method: "nspawn_launch".into(),
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image: ImageName::new(image.as_str()).unwrap(),
             machine: crate::nspawn::models::MachineName::new(image.as_str()).unwrap(),
-            action: MachineAction::Start,
             transport: MachineControlTransport::Dbus,
         })
         .unwrap(),

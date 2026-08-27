@@ -164,7 +164,7 @@ impl App {
             Some(ModalLayer::Dialog) => self.handle_dialog_key(key).await,
             Some(ModalLayer::DeleteConfirmation) => self.handle_delete_confirm_key(key),
             Some(ModalLayer::QuitConfirmation) => self.handle_quit_confirm_key(key),
-            Some(ModalLayer::Wizard | ModalLayer::Help | ModalLayer::PowerMenu) => {
+            Some(ModalLayer::Wizard | ModalLayer::Help | ModalLayer::ResourceActionMenu) => {
                 self.handle_overlay_key(key).await
             }
             None => false,
@@ -271,7 +271,7 @@ impl App {
     }
 }
 
-// Layer 3: overlays (wizard, help, power menu)
+// Layer 3: overlays (wizard, help, resource actions)
 
 impl App {
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> bool {
@@ -291,35 +291,56 @@ impl App {
             return true;
         }
 
-        // 3c – power menu
-        if let Some(pm) = &mut self.ui.power_menu {
+        // 3c - resource action menu
+        if let Some(menu) = &mut self.ui.resource_action_menu {
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.ui.power_menu = None,
+                KeyCode::Esc | KeyCode::Char('q') => self.ui.resource_action_menu = None,
                 KeyCode::Enter => {
-                    let idx = pm.get_selected();
-                    let image_menu = pm.is_image_menu();
-                    self.ui.power_menu = None;
-                    if image_menu {
-                        match idx {
-                            0 => self.action_start(),
-                            1 => self.show_delete_dialog(),
-                            _ => {}
+                    let action = menu.selected_action();
+                    self.ui.resource_action_menu = None;
+                    use crate::tui::widgets::resource_action_menu::ResourceAction;
+                    match action {
+                        Some(ResourceAction::StartImage { image }) => {
+                            self.action_start_image_named(&image)
                         }
-                    } else {
-                        match idx {
-                            0 => self.action_start(),
-                            1 => self.action_poweroff(),
-                            2 => self.action_reboot(),
-                            3 => self.action_terminate(),
-                            4 => self.action_kill(),
-                            5 => self.action_enable(),
-                            6 => self.action_disable(),
-                            _ => {}
+                        Some(ResourceAction::EnableNspawnUnit { image }) => self.action_unit_named(
+                            &image,
+                            crate::application::NspawnUnitAction::Enable,
+                        ),
+                        Some(ResourceAction::DisableNspawnUnit { image }) => self
+                            .action_unit_named(
+                                &image,
+                                crate::application::NspawnUnitAction::Disable,
+                            ),
+                        Some(ResourceAction::DeleteImage { image }) => {
+                            self.show_delete_dialog_for(&image)
                         }
+                        Some(ResourceAction::PoweroffMachine { machine }) => self
+                            .action_runtime_named(
+                                &machine,
+                                crate::application::MachineRuntimeAction::Poweroff,
+                            ),
+                        Some(ResourceAction::RebootMachine { machine }) => self
+                            .action_runtime_named(
+                                &machine,
+                                crate::application::MachineRuntimeAction::Reboot,
+                            ),
+                        Some(ResourceAction::TerminateMachine { machine }) => self
+                            .action_runtime_named(
+                                &machine,
+                                crate::application::MachineRuntimeAction::Terminate,
+                            ),
+                        Some(ResourceAction::KillMachine { machine }) => self.action_runtime_named(
+                            &machine,
+                            crate::application::MachineRuntimeAction::Kill {
+                                signal: crate::nspawn::models::AllowedSignal::Kill,
+                            },
+                        ),
+                        None => {}
                     }
                 }
                 _ => {
-                    let _ = pm.handle_key(key);
+                    let _ = menu.handle_key(key);
                 }
             }
             return true;
@@ -380,24 +401,31 @@ impl App {
             KeyCode::Char('x') | KeyCode::Enter
                 if !key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
-                if self.image_is_focused() && self.ui.image_list.shows_internal() {
-                    self.set_status(
-                        "Internal images do not expose a start/action menu.".into(),
-                        crate::tui::StatusLevel::Info,
-                    );
-                    return true;
-                }
-                let has_selection = if self.image_is_focused() {
-                    !self.active_images().0.is_empty()
+                let menu = if let Some(image) = self.focused_image_resource().cloned() {
+                    Some({
+                        let machine_present = self
+                            .data
+                            .entries
+                            .iter()
+                            .any(|machine| machine.name == image.name);
+                        let removing = self
+                            .data
+                            .image_lifecycle
+                            .active_images()
+                            .contains(&image.name);
+                        crate::tui::widgets::resource_action_menu::ResourceActionMenu::for_image(
+                            &image,
+                            machine_present,
+                            removing,
+                        )
+                    })
                 } else {
-                    !self.data.entries.is_empty()
+                    self.focused_machine_resource().map(
+                        crate::tui::widgets::resource_action_menu::ResourceActionMenu::for_machine,
+                    )
                 };
-                if has_selection {
-                    self.ui.power_menu = Some(if self.image_is_focused() {
-                        crate::tui::widgets::power_menu::PowerMenu::new_for_images(0)
-                    } else {
-                        crate::tui::widgets::power_menu::PowerMenu::new(0)
-                    });
+                if let Some(menu) = menu {
+                    self.ui.resource_action_menu = Some(menu);
                 }
                 true
             }
@@ -709,63 +737,80 @@ impl App {
     }
 
     pub(super) fn show_delete_dialog(&mut self) {
-        if self.image_is_focused() {
-            let image = match self.selected_image() {
-                Some(image) => image,
-                None => return,
-            };
-            if crate::nspawn::models::ImageEntry::is_protected_name(&image.name) {
-                self.set_status(
-                    "The .host image cannot be removed.".into(),
-                    crate::tui::StatusLevel::Warn,
-                );
-                return;
-            }
-            if self
-                .data
-                .entries
-                .iter()
-                .any(|machine| machine.name == image.name && machine.state.is_running())
-            {
-                self.set_status(
-                    format!("Stop machine '{}' before deleting its image.", image.name),
-                    crate::tui::StatusLevel::Warn,
-                );
-                return;
-            }
-            let detail = if image.is_hidden() {
-                "This hidden image will be removed through systemd's image management path."
-            } else if image.readonly {
-                "This read-only image and its local data will be removed."
-            } else {
-                "This image and its local data will be removed."
-            };
-            let target = match crate::nspawn::models::ImageName::new(image.name.clone()) {
-                Ok(target) => target,
-                Err(error) => {
-                    self.set_status(error.to_string(), crate::tui::StatusLevel::Error);
-                    return;
-                }
-            };
-            let cleanup_supported =
-                !image.is_hidden() && crate::nspawn::models::MachineName::new(&image.name).is_ok();
-            let mut dialog = crate::tui::widgets::dialogs::confirmation::ConfirmationDialog::new(
-                "Delete Image",
-                format!(
-                    "Delete '{}'?\n{}\nsystemd also attempts to remove all same-name .nspawn settings.",
-                    image.name, detail
-                ),
-            );
-            if cleanup_supported {
-                dialog = dialog.with_checkbox("Remove Lasper NVIDIA state and unit drop-ins", true);
-            }
-            self.ui.delete_dialog = Some(super::PendingImageRemoval::new(target, dialog));
+        if let Some(name) = self
+            .focused_image_resource()
+            .map(|image| image.name.clone())
+        {
+            self.show_delete_dialog_for(&name);
             return;
         }
         self.set_status(
             "Focus Images to remove a machine image.".into(),
             crate::tui::StatusLevel::Info,
         );
+    }
+
+    pub(super) fn show_delete_dialog_for(&mut self, name: &str) {
+        let Some(image) = self
+            .data
+            .images
+            .iter()
+            .chain(self.data.internal_images.iter())
+            .find(|image| image.name == name)
+            .cloned()
+        else {
+            self.set_status(
+                format!("Image '{}' changed before the action started.", name),
+                crate::tui::StatusLevel::Warn,
+            );
+            return;
+        };
+        if crate::nspawn::models::ImageEntry::is_protected_name(&image.name) {
+            self.set_status(
+                "The .host image cannot be removed.".into(),
+                crate::tui::StatusLevel::Warn,
+            );
+            return;
+        }
+        if self
+            .data
+            .entries
+            .iter()
+            .any(|machine| machine.name == image.name)
+        {
+            self.set_status(
+                format!("Stop machine '{}' before deleting its image.", image.name),
+                crate::tui::StatusLevel::Warn,
+            );
+            return;
+        }
+        let detail = if image.is_hidden() {
+            "This hidden image will be removed through systemd's image management path."
+        } else if image.readonly {
+            "This read-only image and its local data will be removed."
+        } else {
+            "This image and its local data will be removed."
+        };
+        let target = match crate::nspawn::models::ImageName::new(image.name.clone()) {
+            Ok(target) => target,
+            Err(error) => {
+                self.set_status(error.to_string(), crate::tui::StatusLevel::Error);
+                return;
+            }
+        };
+        let cleanup_supported =
+            !image.is_hidden() && crate::nspawn::models::MachineName::new(&image.name).is_ok();
+        let mut dialog = crate::tui::widgets::dialogs::confirmation::ConfirmationDialog::new(
+            "Delete Image",
+            format!(
+                "Delete '{}'?\n{}\nsystemd also attempts to remove all same-name .nspawn settings.",
+                image.name, detail
+            ),
+        );
+        if cleanup_supported {
+            dialog = dialog.with_checkbox("Remove Lasper NVIDIA state and unit drop-ins", true);
+        }
+        self.ui.delete_dialog = Some(super::PendingImageRemoval::new(target, dialog));
     }
 }
 
@@ -900,7 +945,7 @@ impl App {
                 ModalLayer::DeleteConfirmation
                 | ModalLayer::QuitConfirmation
                 | ModalLayer::Help
-                | ModalLayer::PowerMenu,
+                | ModalLayer::ResourceActionMenu,
             ) => true,
             None => false,
         }

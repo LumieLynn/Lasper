@@ -3,8 +3,10 @@
 use crate::adapters::lifecycle::error::map_machine_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOperation};
-use crate::application::machine_lifecycle::{MachineAction, MachineControlOutcome};
-use crate::nspawn::models::{ImageEntry, MachineEntry, MachineName, MachineProperties};
+use crate::application::machine_lifecycle::{
+    MachineControlOutcome, MachineRejection, MachineRuntimeAction, NspawnUnitAction,
+};
+use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties};
 
 pub(crate) enum HandleOutcome {
     Spawned,
@@ -24,20 +26,44 @@ pub(crate) trait DaemonDbusExecutor: Send + Sync {
         &self,
         operation: SystemOperation,
     ) -> crate::nspawn::errors::Result<()>;
-    async fn machine_control(
+    async fn nspawn_launch(&self, image: ImageName, machine: MachineName) -> MachineControlOutcome {
+        if image.as_str() != machine.as_str() {
+            return MachineControlOutcome::Rejected {
+                rejection: MachineRejection::InvalidTarget,
+                reason: "nspawn launch currently requires matching image and machine names".into(),
+            };
+        }
+        self.machine_control_operation(SystemOperation::Start { machine })
+            .await
+    }
+
+    async fn machine_runtime_control(
         &self,
         machine: MachineName,
-        action: MachineAction,
+        action: MachineRuntimeAction,
     ) -> MachineControlOutcome {
         let operation = match action {
-            MachineAction::Start => SystemOperation::Start { machine },
-            MachineAction::Terminate => SystemOperation::Terminate { machine },
-            MachineAction::Poweroff => SystemOperation::Poweroff { machine },
-            MachineAction::Reboot => SystemOperation::Reboot { machine },
-            MachineAction::Enable => SystemOperation::Enable { machine },
-            MachineAction::Disable => SystemOperation::Disable { machine },
-            MachineAction::Kill { signal } => SystemOperation::Kill { machine, signal },
+            MachineRuntimeAction::Terminate => SystemOperation::Terminate { machine },
+            MachineRuntimeAction::Poweroff => SystemOperation::Poweroff { machine },
+            MachineRuntimeAction::Reboot => SystemOperation::Reboot { machine },
+            MachineRuntimeAction::Kill { signal } => SystemOperation::Kill { machine, signal },
         };
+        self.machine_control_operation(operation).await
+    }
+
+    async fn nspawn_unit_control(
+        &self,
+        machine: MachineName,
+        action: NspawnUnitAction,
+    ) -> MachineControlOutcome {
+        let operation = match action {
+            NspawnUnitAction::Enable => SystemOperation::Enable { machine },
+            NspawnUnitAction::Disable => SystemOperation::Disable { machine },
+        };
+        self.machine_control_operation(operation).await
+    }
+
+    async fn machine_control_operation(&self, operation: SystemOperation) -> MachineControlOutcome {
         match self.system_operation(operation).await {
             Ok(()) => MachineControlOutcome::Succeeded,
             Err(error) => map_machine_control_error(error),

@@ -5,7 +5,8 @@ use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
 use crate::nspawn::models::{
-    AllowedSignal, MachineEntry, MachineName, MachineProperties, MachineState,
+    AllowedSignal, ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties,
+    MachineState,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,25 +20,19 @@ const OTHER_TRANSITION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
-pub enum MachineAction {
-    Start,
+pub enum MachineRuntimeAction {
     Terminate,
     Poweroff,
     Reboot,
-    Enable,
-    Disable,
     Kill { signal: AllowedSignal },
 }
 
-impl MachineAction {
+impl MachineRuntimeAction {
     pub fn success_label(self) -> &'static str {
         match self {
-            Self::Start => "Started",
             Self::Terminate => "Terminated",
             Self::Poweroff => "Powered off",
             Self::Reboot => "Rebooting",
-            Self::Enable => "Enabled",
-            Self::Disable => "Disabled",
             Self::Kill {
                 signal: AllowedSignal::Kill,
             } => "Sent SIGKILL to",
@@ -49,12 +44,9 @@ impl MachineAction {
 
     pub fn audit_label(self) -> &'static str {
         match self {
-            Self::Start => "Start",
             Self::Terminate => "Terminate",
             Self::Poweroff => "Power off",
             Self::Reboot => "Reboot",
-            Self::Enable => "Enable",
-            Self::Disable => "Disable",
             Self::Kill {
                 signal: AllowedSignal::Kill,
             } => "Send SIGKILL to",
@@ -64,19 +56,59 @@ impl MachineAction {
         }
     }
 
-    fn requires_running(self) -> bool {
-        matches!(
-            self,
-            Self::Terminate | Self::Poweroff | Self::Reboot | Self::Kill { .. }
-        )
-    }
-
     fn transition(self) -> Option<MachineTransitionKind> {
         match self {
-            Self::Start => Some(MachineTransitionKind::Starting),
             Self::Terminate | Self::Poweroff => Some(MachineTransitionKind::Stopping),
             Self::Reboot => Some(MachineTransitionKind::Rebooting { saw_absent: false }),
-            Self::Enable | Self::Disable | Self::Kill { .. } => None,
+            Self::Kill { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NspawnUnitAction {
+    Enable,
+    Disable,
+}
+
+impl NspawnUnitAction {
+    pub fn success_label(self) -> &'static str {
+        match self {
+            Self::Enable => "Enabled at boot",
+            Self::Disable => "Disabled at boot",
+        }
+    }
+
+    pub fn audit_label(self) -> &'static str {
+        match self {
+            Self::Enable => "Enable at boot",
+            Self::Disable => "Disable at boot",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MachineLifecycleAction {
+    Launch,
+    Runtime(MachineRuntimeAction),
+    Unit(NspawnUnitAction),
+}
+
+impl MachineLifecycleAction {
+    pub fn success_label(self) -> &'static str {
+        match self {
+            Self::Launch => "Started",
+            Self::Runtime(action) => action.success_label(),
+            Self::Unit(action) => action.success_label(),
+        }
+    }
+
+    pub fn audit_label(self) -> &'static str {
+        match self {
+            Self::Launch => "Start image",
+            Self::Runtime(action) => action.audit_label(),
+            Self::Unit(action) => action.audit_label(),
         }
     }
 }
@@ -90,9 +122,31 @@ pub(crate) enum MachineControlTransport {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct MachineControlRequest {
+pub(crate) struct NspawnLaunchRequest {
+    pub image: ImageName,
     pub machine: MachineName,
-    pub action: MachineAction,
+    pub transport: MachineControlTransport,
+}
+
+impl NspawnLaunchRequest {
+    pub(crate) fn validates_same_name_route(&self) -> bool {
+        self.image.as_str() == self.machine.as_str()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct MachineRuntimeControlRequest {
+    pub machine: MachineName,
+    pub action: MachineRuntimeAction,
+    pub transport: MachineControlTransport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NspawnUnitControlRequest {
+    pub machine: MachineName,
+    pub action: NspawnUnitAction,
     pub transport: MachineControlTransport,
 }
 
@@ -164,7 +218,7 @@ pub enum MachineLifecycleResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MachineLifecycleOutcome {
     pub machine: MachineName,
-    pub action: MachineAction,
+    pub action: MachineLifecycleAction,
     pub result: MachineLifecycleResult,
     pub route: Option<ExecutionRoute>,
     pub fallback: Option<RouteFallback>,
@@ -173,10 +227,19 @@ pub struct MachineLifecycleOutcome {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait MachineControl: Send + Sync + 'static {
-    async fn execute(
+    async fn launch(&self, image: &ImageName, machine: &MachineName)
+        -> RoutedMachineControlOutcome;
+
+    async fn execute_runtime(
         &self,
         machine: &MachineName,
-        action: MachineAction,
+        action: MachineRuntimeAction,
+    ) -> RoutedMachineControlOutcome;
+
+    async fn execute_unit(
+        &self,
+        machine: &MachineName,
+        action: NspawnUnitAction,
     ) -> RoutedMachineControlOutcome;
 }
 
@@ -265,32 +328,69 @@ impl MachineLifecycleService {
         self
     }
 
-    pub fn begin(
+    pub fn begin_launch(
         self: &Arc<Self>,
-        name: &str,
-        action: MachineAction,
+        image: &ImageEntry,
         observed_state: Option<MachineState>,
     ) -> Result<MachineOperation, MachineRejection> {
-        let machine = MachineName::new(name).map_err(|_| MachineRejection::InvalidTarget)?;
-        if action == MachineAction::Start
-            && observed_state
-                .as_ref()
-                .is_some_and(MachineState::is_running)
-        {
+        let (image, machine) = launch_target(image)?;
+        if observed_state.is_some() {
             return Err(MachineRejection::AlreadyRunning);
         }
-        if action.requires_running()
-            && !observed_state
-                .as_ref()
-                .is_some_and(MachineState::is_running)
-        {
+        let resource_key = ResourceKey::for_image(&image);
+        self.begin_operation(
+            machine,
+            MachineOperationKind::Launch { image },
+            Some(MachineTransitionKind::Starting),
+            resource_key,
+        )
+    }
+
+    pub fn begin_runtime(
+        self: &Arc<Self>,
+        entry: &MachineEntry,
+        action: MachineRuntimeAction,
+    ) -> Result<MachineOperation, MachineRejection> {
+        if !entry.state.accepts_runtime_actions() {
             return Err(MachineRejection::NotRunning);
         }
+        let machine = MachineName::new(&entry.name).map_err(|_| MachineRejection::InvalidTarget)?;
+        let transition = action.transition();
+        let resource_key = ResourceKey::for_machine(&machine);
+        self.begin_operation(
+            machine,
+            MachineOperationKind::Runtime(action),
+            transition,
+            resource_key,
+        )
+    }
+
+    pub fn begin_unit(
+        self: &Arc<Self>,
+        image: &ImageEntry,
+        action: NspawnUnitAction,
+    ) -> Result<MachineOperation, MachineRejection> {
+        let (image, machine) = launch_target(image)?;
+        let resource_key = ResourceKey::for_image(&image);
+        self.begin_operation(
+            machine,
+            MachineOperationKind::Unit(action),
+            None,
+            resource_key,
+        )
+    }
+
+    fn begin_operation(
+        self: &Arc<Self>,
+        machine: MachineName,
+        kind: MachineOperationKind,
+        transition: Option<MachineTransitionKind>,
+        resource_key: ResourceKey,
+    ) -> Result<MachineOperation, MachineRejection> {
         let reservation = self
             .registry
-            .reserve([ResourceClaim::exclusive(ResourceKey::for_machine(&machine))])
+            .reserve([ResourceClaim::exclusive(resource_key)])
             .map_err(|ResourceConflict { .. }| MachineRejection::Busy)?;
-        let transition = action.transition();
         if let Some(kind) = transition.clone() {
             self.transitions.lock().insert(
                 machine.as_str().to_string(),
@@ -303,7 +403,7 @@ impl MachineLifecycleService {
         Ok(MachineOperation {
             service: Arc::clone(self),
             machine,
-            action,
+            kind,
             transition,
             retain_transition: false,
             _reservation: reservation,
@@ -357,12 +457,11 @@ impl MachineLifecycleService {
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
         drop(transitions);
-        entries.extend(missing_starts.into_iter().map(|name| MachineEntry {
-            name,
-            state: MachineState::Starting,
-            address: None,
-            all_addresses: Vec::new(),
-        }));
+        entries.extend(
+            missing_starts
+                .into_iter()
+                .map(|name| MachineEntry::optimistic_nspawn(name, MachineState::Starting)),
+        );
         entries.sort();
         entries
     }
@@ -377,12 +476,7 @@ impl MachineLifecycleService {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let entry = MachineEntry {
-            name: machine.as_str().to_string(),
-            state: MachineState::Starting,
-            address: None,
-            all_addresses: Vec::new(),
-        };
+        let entry = MachineEntry::optimistic_nspawn(machine.as_str(), MachineState::Starting);
         let mut last_observation = "systemd unit properties unavailable".to_string();
         let mut last_invocation_id = None;
         loop {
@@ -465,30 +559,70 @@ impl MachineLifecycleService {
     }
 }
 
+fn launch_target(image: &ImageEntry) -> Result<(ImageName, MachineName), MachineRejection> {
+    if image.is_hidden() {
+        return Err(MachineRejection::InvalidTarget);
+    }
+    let image = ImageName::new(&image.name).map_err(|_| MachineRejection::InvalidTarget)?;
+    let machine = MachineName::new(image.as_str()).map_err(|_| MachineRejection::InvalidTarget)?;
+    Ok((image, machine))
+}
+
 pub struct MachineOperation {
     service: Arc<MachineLifecycleService>,
     machine: MachineName,
-    action: MachineAction,
+    kind: MachineOperationKind,
     transition: Option<MachineTransitionKind>,
     retain_transition: bool,
     _reservation: ResourceReservation,
 }
 
+#[derive(Clone, Debug)]
+enum MachineOperationKind {
+    Launch { image: ImageName },
+    Runtime(MachineRuntimeAction),
+    Unit(NspawnUnitAction),
+}
+
+impl MachineOperationKind {
+    fn lifecycle_action(&self) -> MachineLifecycleAction {
+        match self {
+            Self::Launch { .. } => MachineLifecycleAction::Launch,
+            Self::Runtime(action) => MachineLifecycleAction::Runtime(*action),
+            Self::Unit(action) => MachineLifecycleAction::Unit(*action),
+        }
+    }
+}
+
 impl MachineOperation {
     pub async fn run(mut self) -> MachineLifecycleOutcome {
-        if self.action == MachineAction::Start {
+        if matches!(self.kind, MachineOperationKind::Launch { .. }) {
             if let Err(reason) = self.service.preparation.prepare(&self.machine).await {
                 return self.outcome(MachineLifecycleResult::Failed(reason), None, None);
             }
         }
 
-        let routed = self
-            .service
-            .control
-            .execute(&self.machine, self.action)
-            .await;
+        let routed = match &self.kind {
+            MachineOperationKind::Launch { image } => {
+                self.service.control.launch(image, &self.machine).await
+            }
+            MachineOperationKind::Runtime(action) => {
+                self.service
+                    .control
+                    .execute_runtime(&self.machine, *action)
+                    .await
+            }
+            MachineOperationKind::Unit(action) => {
+                self.service
+                    .control
+                    .execute_unit(&self.machine, *action)
+                    .await
+            }
+        };
         let result = match routed.outcome {
-            MachineControlOutcome::Succeeded if self.action == MachineAction::Start => {
+            MachineControlOutcome::Succeeded
+                if matches!(self.kind, MachineOperationKind::Launch { .. }) =>
+            {
                 match self.service.confirm_start(&self.machine).await {
                     StartConfirmation::Started => {
                         self.retain_transition = self.transition.is_some();
@@ -529,7 +663,7 @@ impl MachineOperation {
     ) -> MachineLifecycleOutcome {
         MachineLifecycleOutcome {
             machine: self.machine.clone(),
-            action: self.action,
+            action: self.kind.lifecycle_action(),
             result,
             route,
             fallback,
@@ -604,11 +738,16 @@ mod tests {
     use super::*;
 
     fn entry(name: &str, state: MachineState) -> MachineEntry {
-        MachineEntry {
+        MachineEntry::optimistic_nspawn(name, state)
+    }
+
+    fn image(name: &str) -> ImageEntry {
+        ImageEntry {
             name: name.into(),
-            state,
-            address: None,
-            all_addresses: vec![],
+            image_type: "directory".into(),
+            readonly: false,
+            usage: None,
+            dbus_object_path: None,
         }
     }
 
@@ -649,7 +788,7 @@ mod tests {
         let control = MockMachineControl::new();
         let observation = MockMachineObservation::new();
         let service = service(control, observation);
-        let operation = service.begin("test", MachineAction::Start, None).unwrap();
+        let operation = service.begin_launch(&image("test"), None).unwrap();
 
         assert_eq!(
             service.project_machines(vec![]),
@@ -667,7 +806,7 @@ mod tests {
         let control = MockMachineControl::new();
         let observation = MockMachineObservation::new();
         let service = service(control, observation);
-        let operation = service.begin("test", MachineAction::Start, None).unwrap();
+        let operation = service.begin_launch(&image("test"), None).unwrap();
         drop(operation);
 
         assert!(service.project_machines(vec![]).is_empty());
@@ -677,7 +816,7 @@ mod tests {
     async fn successful_start_is_confirmed_through_observation() {
         let mut control = MockMachineControl::new();
         control
-            .expect_execute()
+            .expect_launch()
             .returning(|_, _| RoutedMachineControlOutcome {
                 outcome: MachineControlOutcome::Succeeded,
                 route: ExecutionRoute::DirectDbus,
@@ -689,7 +828,7 @@ mod tests {
             .returning(|_, _| Ok(active_properties()));
         observation.expect_invalidate().once().return_const(());
         let service = service(control, observation);
-        let operation = service.begin("test", MachineAction::Start, None).unwrap();
+        let operation = service.begin_launch(&image("test"), None).unwrap();
 
         let outcome = operation.run().await;
 
@@ -698,10 +837,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unit_policy_does_not_run_start_preparation_or_confirmation() {
+        let mut control = MockMachineControl::new();
+        control
+            .expect_execute_unit()
+            .withf(|machine, action| {
+                machine.as_str() == "test" && *action == NspawnUnitAction::Enable
+            })
+            .once()
+            .returning(|_, _| RoutedMachineControlOutcome {
+                outcome: MachineControlOutcome::Succeeded,
+                route: ExecutionRoute::LocalCli,
+                fallback: None,
+            });
+        let mut preparation = MockMachineStartPreparation::new();
+        preparation.expect_prepare().never();
+        let mut observation = MockMachineObservation::new();
+        observation.expect_inspect().never();
+        observation.expect_invalidate().once().return_const(());
+        let diagnostics = MockMachineStartDiagnostics::new();
+        let service = Arc::new(MachineLifecycleService::new(
+            Arc::new(control),
+            Arc::new(preparation),
+            Arc::new(observation),
+            Arc::new(diagnostics),
+            OperationRegistry::new(),
+        ));
+
+        let outcome = service
+            .begin_unit(&image("test"), NspawnUnitAction::Enable)
+            .unwrap()
+            .run()
+            .await;
+
+        assert_eq!(outcome.result, MachineLifecycleResult::Succeeded);
+        assert_eq!(
+            outcome.action,
+            MachineLifecycleAction::Unit(NspawnUnitAction::Enable)
+        );
+    }
+
+    #[tokio::test]
     async fn start_confirmation_timeout_is_outcome_unknown_and_keeps_projection() {
         let mut control = MockMachineControl::new();
         control
-            .expect_execute()
+            .expect_launch()
             .returning(|_, _| RoutedMachineControlOutcome {
                 outcome: MachineControlOutcome::Succeeded,
                 route: ExecutionRoute::DirectDbus,
@@ -738,7 +918,7 @@ mod tests {
             )
             .with_start_timing(Duration::ZERO, Duration::ZERO),
         );
-        let operation = service.begin("test", MachineAction::Start, None).unwrap();
+        let operation = service.begin_launch(&image("test"), None).unwrap();
 
         let outcome = operation.run().await;
 
@@ -756,7 +936,7 @@ mod tests {
     async fn rejected_control_clears_transition_without_fallback_replay() {
         let mut control = MockMachineControl::new();
         control
-            .expect_execute()
+            .expect_launch()
             .returning(|_, _| RoutedMachineControlOutcome {
                 outcome: MachineControlOutcome::Rejected {
                     rejection: MachineRejection::PermissionDenied,
@@ -768,7 +948,7 @@ mod tests {
         let mut observation = MockMachineObservation::new();
         observation.expect_invalidate().once().return_const(());
         let service = service(control, observation);
-        let operation = service.begin("test", MachineAction::Start, None).unwrap();
+        let operation = service.begin_launch(&image("test"), None).unwrap();
 
         let outcome = operation.run().await;
 
@@ -788,12 +968,12 @@ mod tests {
         let observation = MockMachineObservation::new();
         let service = service(control, observation);
         assert!(matches!(
-            service.begin("test", MachineAction::Start, Some(MachineState::Running)),
+            service.begin_launch(&image("test"), Some(MachineState::Running)),
             Err(MachineRejection::AlreadyRunning)
         ));
-        let first = service.begin("test", MachineAction::Start, None).unwrap();
+        let first = service.begin_launch(&image("test"), None).unwrap();
         assert!(matches!(
-            service.begin("test", MachineAction::Start, None),
+            service.begin_launch(&image("test"), None),
             Err(MachineRejection::Busy)
         ));
         drop(first);
@@ -806,21 +986,45 @@ mod tests {
         let service = service(control, observation);
 
         let first = service
-            .begin(
-                "first",
-                MachineAction::Poweroff,
-                Some(MachineState::Running),
+            .begin_runtime(
+                &entry("first", MachineState::Running),
+                MachineRuntimeAction::Poweroff,
             )
             .unwrap();
         let second = service
-            .begin(
-                "second",
-                MachineAction::Poweroff,
-                Some(MachineState::Running),
+            .begin_runtime(
+                &entry("second", MachineState::Running),
+                MachineRuntimeAction::Poweroff,
             )
             .unwrap();
 
         drop((first, second));
+    }
+
+    #[test]
+    fn runtime_and_unit_entrypoints_enforce_distinct_target_semantics() {
+        let service = service(MockMachineControl::new(), MockMachineObservation::new());
+
+        assert!(matches!(
+            service.begin_runtime(
+                &entry("test", MachineState::Starting),
+                MachineRuntimeAction::Poweroff,
+            ),
+            Err(MachineRejection::NotRunning)
+        ));
+        assert!(service
+            .begin_unit(&image("test"), NspawnUnitAction::Enable)
+            .is_ok());
+        let mut foreign = entry("foreign", MachineState::Running);
+        foreign.class = "vm".into();
+        foreign.service = "custom-manager".into();
+        assert!(service
+            .begin_runtime(&foreign, MachineRuntimeAction::Poweroff)
+            .is_ok());
+        assert!(matches!(
+            service.begin_launch(&image("image with spaces"), None),
+            Err(MachineRejection::InvalidTarget)
+        ));
     }
 
     #[test]

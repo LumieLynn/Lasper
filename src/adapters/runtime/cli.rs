@@ -338,6 +338,8 @@ mod tests {
         RuntimeSnapshot::new(
             vec![MachineEntry {
                 name: "active".into(),
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
                 address: None,
                 all_addresses: vec![],
@@ -392,7 +394,11 @@ mod tests {
             r
         });
         let runtime = tempfile::tempdir().unwrap();
-        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        std::fs::write(
+            runtime.path().join("active"),
+            "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
@@ -497,7 +503,11 @@ mod tests {
             runner
         });
         let runtime = tempfile::tempdir().unwrap();
-        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        std::fs::write(
+            runtime.path().join("active"),
+            "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 

@@ -24,7 +24,8 @@ use crate::application::image_lifecycle::{
     ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
 };
 use crate::application::machine_lifecycle::{
-    MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+    MachineControlOutcome, MachineControlTransport, MachineRuntimeControlRequest,
+    NspawnLaunchRequest, NspawnUnitControlRequest,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -202,24 +203,89 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
             }
         }
 
-        RpcMethod::MachineControl => {
-            let request: MachineControlRequest = match serde_json::from_value(params) {
+        RpcMethod::NspawnLaunch => {
+            let request: NspawnLaunchRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
                     return HandleOutcome::Sync(Err(format!(
-                        "invalid machine_control request: {error}"
+                        "invalid nspawn_launch request: {error}"
                     )));
                 }
             };
+            if !request.validates_same_name_route() {
+                return HandleOutcome::Sync(Err(
+                    "invalid nspawn_launch request: image and machine names must match".into(),
+                ));
+            }
             let outcome = match request.transport {
                 MachineControlTransport::Dbus => match dbus.as_ref() {
-                    Some(dbus) => dbus.machine_control(request.machine, request.action).await,
+                    Some(dbus) => dbus.nspawn_launch(request.image, request.machine).await,
                     None => MachineControlOutcome::NotAttempted {
                         reason: "D-Bus backend is unavailable".into(),
                     },
                 },
                 MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_machine_control(
+                    crate::adapters::lifecycle::machine::execute_cli_nspawn_launch(
+                        request.image,
+                        request.machine,
+                    )
+                    .await
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
+        }
+
+        RpcMethod::MachineRuntimeControl => {
+            let request: MachineRuntimeControlRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid machine_runtime_control request: {error}"
+                    )));
+                }
+            };
+            let outcome = match request.transport {
+                MachineControlTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => {
+                        dbus.machine_runtime_control(request.machine, request.action)
+                            .await
+                    }
+                    None => MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    },
+                },
+                MachineControlTransport::Cli => {
+                    crate::adapters::lifecycle::machine::execute_cli_machine_runtime(
+                        request.machine,
+                        request.action,
+                    )
+                    .await
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
+        }
+
+        RpcMethod::NspawnUnitControl => {
+            let request: NspawnUnitControlRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid nspawn_unit_control request: {error}"
+                    )));
+                }
+            };
+            let outcome = match request.transport {
+                MachineControlTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => {
+                        dbus.nspawn_unit_control(request.machine, request.action)
+                            .await
+                    }
+                    None => MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    },
+                },
+                MachineControlTransport::Cli => {
+                    crate::adapters::lifecycle::machine::execute_cli_nspawn_unit(
                         request.machine,
                         request.action,
                     )

@@ -51,7 +51,7 @@ pub enum AppEvent {
     /// Background action execution finished.
     ActionDone(String, crate::tui::StatusLevel),
     /// A machine lifecycle workflow reached a semantic outcome.
-    MachineActionFinished(crate::application::MachineLifecycleOutcome),
+    MachineLifecycleFinished(crate::application::MachineLifecycleOutcome),
     /// Real-time metrics: (machine name, timestamp, CPU percent, RAM MiB)
     MetricsUpdate(String, f64, f64, f64),
     /// Request a UI redraw for the terminal.
@@ -70,7 +70,7 @@ impl AppEvent {
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",
             Self::DeploymentClaimReleaseFinished { .. } => "deployment-claim-release",
             Self::ActionDone(_, _) => "action-done",
-            Self::MachineActionFinished(_) => "machine-action-finished",
+            Self::MachineLifecycleFinished(_) => "machine-lifecycle-finished",
             Self::MetricsUpdate(_, _, _, _) => "metrics-update",
             Self::TerminalRedraw => "terminal-redraw",
         }
