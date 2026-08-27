@@ -166,7 +166,7 @@ impl CommandRunner for DefaultCommandRunner {
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
         let mut argv = vec![program.to_string()];
         argv.extend(args);
-        let mut command = tokio::process::Command::new("sh");
+        let mut command = new_command("sh");
         command
             .arg("-c")
             .arg("exec \"$@\" 2>&1")
@@ -176,7 +176,6 @@ impl CommandRunner for DefaultCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        install_parent_death_signal(command.as_std_mut());
         command.as_std_mut().process_group(0);
         let mut child = command.spawn()?;
         let pid = child.id().expect("spawned command has pid");
@@ -299,6 +298,22 @@ mod tests {
 
         assert!(!status.success());
         assert!(destination.metadata().unwrap().len() <= 1024);
+    }
+
+    #[tokio::test]
+    async fn streamed_commands_use_the_stable_locale() {
+        use tokio::io::AsyncReadExt;
+
+        let mut spawned = DefaultCommandRunner
+            .spawn("sh", vec!["-c".into(), "printf '%s' \"$LC_ALL\"".into()])
+            .await
+            .unwrap();
+        let mut output = String::new();
+        spawned.stdout.read_to_string(&mut output).await.unwrap();
+        let status = spawned.wait().await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(output, "C");
     }
 
     #[tokio::test]

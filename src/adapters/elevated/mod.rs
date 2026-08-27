@@ -18,8 +18,8 @@ use crate::daemon::protocol::deployment::{
 };
 use crate::daemon::protocol::*;
 use crate::daemon::server::transport::{
-    authorize_root_server, connect_rpc_socket, create_fd_socket_dir, get_peer_credentials,
-    read_bounded_line, MAX_RPC_FRAME_BYTES,
+    authorize_root_server, create_fd_socket_dir, get_peer_credentials, read_bounded_line,
+    MAX_RPC_FRAME_BYTES,
 };
 use crate::domain::secret::SecretBytes;
 use crate::nspawn::models::{MachineName, MachineProperties};
@@ -100,6 +100,44 @@ fn configure_sudo_daemon_stdio(command: &mut tokio::process::Command) {
         .stderr(std::process::Stdio::inherit());
 }
 
+fn rpc_socket_may_not_be_ready(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::Interrupted
+            | std::io::ErrorKind::WouldBlock
+    )
+}
+
+async fn wait_for_daemon_rpc_socket(
+    path: &std::path::Path,
+    sudo_child: &mut tokio::process::Child,
+) -> std::io::Result<tokio::net::UnixStream> {
+    loop {
+        match tokio::net::UnixStream::connect(path).await {
+            Ok(stream) => return Ok(stream),
+            Err(connect_error) => {
+                if let Some(status) = sudo_child.try_wait().map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("failed to inspect sudo daemon process: {error}"),
+                    )
+                })? {
+                    return Err(std::io::Error::other(format!(
+                        "sudo daemon exited before its RPC socket became ready ({status}); \
+                         last connection error: {connect_error}"
+                    )));
+                }
+                if !rpc_socket_may_not_be_ready(&connect_error) {
+                    return Err(connect_error);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 // ── Parent-side handle ──
 
 pub(crate) struct ElevatedDaemon {
@@ -163,7 +201,7 @@ impl ElevatedDaemon {
         });
 
         use tokio::io::AsyncWriteExt;
-        let mut rpc_stream = connect_rpc_socket(&rpc_sock_path).await?;
+        let mut rpc_stream = wait_for_daemon_rpc_socket(&rpc_sock_path, &mut child).await?;
         authorize_root_server(get_peer_credentials(&rpc_stream)?)?;
         let rpc_bootstrap = RpcBootstrap {
             protocol_version: RPC_PROTOCOL_VERSION,
@@ -756,7 +794,7 @@ fn receive_deployment_stream(
 mod tests {
     use super::{
         configure_sudo_daemon_stdio, discard_cancelled_responses, rpc_response_timeout,
-        wait_for_rpc_response, PendingRpcResponses,
+        wait_for_daemon_rpc_socket, wait_for_rpc_response, PendingRpcResponses,
     };
     use crate::daemon::protocol::{RpcFamily, RpcMethod};
 
@@ -775,6 +813,47 @@ mod tests {
             .unwrap();
 
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_socket_wait_outlives_the_old_sudo_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("rpc.sock");
+        let listener_path = socket_path.clone();
+        let listener = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            tokio::net::UnixListener::bind(listener_path).unwrap()
+        });
+        let mut sudo_child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+
+        let stream = wait_for_daemon_rpc_socket(&socket_path, &mut sudo_child)
+            .await
+            .unwrap();
+
+        drop(stream);
+        drop(listener.await.unwrap());
+        sudo_child.start_kill().unwrap();
+        let _ = sudo_child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daemon_socket_wait_reports_an_early_sudo_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("rpc.sock");
+        let mut sudo_child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 23"])
+            .spawn()
+            .unwrap();
+
+        let error = wait_for_daemon_rpc_socket(&socket_path, &mut sudo_child)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("exit status: 23"));
     }
 
     #[test]

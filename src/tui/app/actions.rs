@@ -420,25 +420,12 @@ impl App {
                 .any(|entry| entry.name == image.name && entry.state == MachineState::Running)
     }
 
-    pub fn check_action_cooldown(&mut self) -> bool {
-        if let Some(time) = self.data.action_cooldown {
-            if Instant::now().duration_since(time) < Duration::from_secs(2) {
-                return false;
-            }
-        }
-        self.data.action_cooldown = Some(Instant::now());
-        true
-    }
-
     fn perform_machine_action(
         &mut self,
         name: String,
         action: crate::application::MachineAction,
         observed_state: Option<MachineState>,
     ) -> bool {
-        if !self.check_action_cooldown() {
-            return false;
-        }
         let tx = match &self.ui.app_tx {
             Some(tx) => tx.clone(),
             None => return false,
@@ -640,9 +627,6 @@ impl App {
     }
 
     fn action_remove_image(&mut self) {
-        if !self.check_action_cooldown() {
-            return;
-        }
         let pending = match self.ui.delete_dialog.take() {
             Some(pending) => pending,
             None => return,

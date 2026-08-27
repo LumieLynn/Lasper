@@ -214,7 +214,6 @@ pub struct AppData {
     pub provisioning_preparation: std::sync::Arc<ProvisioningPreparationService>,
     pub resource_inspection: std::sync::Arc<ResourceInspectionService>,
     pub host_operations: HostOperationTracker,
-    pub action_cooldown: Option<Instant>,
     pub metrics: HashMap<String, MachineMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
@@ -287,7 +286,6 @@ impl App {
                 provisioning_preparation,
                 resource_inspection,
                 host_operations,
-                action_cooldown: None,
                 metrics: HashMap::new(),
                 cpu_cores: std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -1089,7 +1087,6 @@ mod tests {
             let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
 
             app.action_start();
-            app.data.action_cooldown = None;
             app.action_start();
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -1914,20 +1911,70 @@ mod tests {
         assert_eq!(app.data.internal_image_selected, 1);
     }
 
-    mod action_cooldown {
+    mod machine_actions {
         use super::*;
+        use crate::application::machine_lifecycle::{
+            MachineControlOutcome, MockMachineControl, MockMachineObservation,
+            MockMachineStartDiagnostics, MockMachineStartPreparation, RoutedMachineControlOutcome,
+        };
+        use crate::application::operations::route::ExecutionRoute;
+        use crate::application::OperationRegistry;
 
-        #[test]
-        fn allows_first() {
+        fn prepare_poweroff_app() -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let mut control = MockMachineControl::new();
+            control.expect_execute().times(2).returning(|_, action| {
+                assert_eq!(action, crate::application::MachineAction::Poweroff);
+                RoutedMachineControlOutcome {
+                    outcome: MachineControlOutcome::Succeeded,
+                    route: ExecutionRoute::DirectDbus,
+                    fallback: None,
+                }
+            });
+            let preparation = MockMachineStartPreparation::new();
+            let mut observation = MockMachineObservation::new();
+            observation.expect_invalidate().times(2).return_const(());
+            let diagnostics = MockMachineStartDiagnostics::new();
+            let lifecycle = std::sync::Arc::new(MachineLifecycleService::new(
+                std::sync::Arc::new(control),
+                std::sync::Arc::new(preparation),
+                std::sync::Arc::new(observation),
+                std::sync::Arc::new(diagnostics),
+                OperationRegistry::new(),
+            ));
             let mut app = make_app();
-            assert!(app.check_action_cooldown());
+            app.data.machine_lifecycle = lifecycle;
+            app.data.entries = vec![
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
+            ];
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            app.ui.app_tx = Some(tx);
+            (app, rx)
         }
 
-        #[test]
-        fn blocks_within_2s() {
-            let mut app = make_app();
-            assert!(app.check_action_cooldown());
-            assert!(!app.check_action_cooldown());
+        #[tokio::test]
+        async fn different_machines_accept_back_to_back_poweroff_actions() {
+            let (mut app, mut rx) = prepare_poweroff_app();
+
+            app.data.selected = 0;
+            app.action_poweroff();
+            app.data.selected = 1;
+            app.action_poweroff();
+
+            let mut completed = Vec::new();
+            for _ in 0..2 {
+                let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("both poweroff actions should finish")
+                    .expect("both poweroff actions should report a result");
+                let AppEvent::MachineActionFinished(outcome) = event else {
+                    panic!("poweroff should report a machine lifecycle outcome");
+                };
+                completed.push(outcome.machine.as_str().to_string());
+            }
+            completed.sort();
+
+            assert_eq!(completed, ["first", "second"]);
         }
     }
 

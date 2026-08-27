@@ -800,6 +800,30 @@ mod tests {
     }
 
     #[test]
+    fn distinct_machines_can_reserve_lifecycle_operations_concurrently() {
+        let control = MockMachineControl::new();
+        let observation = MockMachineObservation::new();
+        let service = service(control, observation);
+
+        let first = service
+            .begin(
+                "first",
+                MachineAction::Poweroff,
+                Some(MachineState::Running),
+            )
+            .unwrap();
+        let second = service
+            .begin(
+                "second",
+                MachineAction::Poweroff,
+                Some(MachineState::Running),
+            )
+            .unwrap();
+
+        drop((first, second));
+    }
+
+    #[test]
     fn start_observation_distinguishes_active_pending_and_failed() {
         assert_eq!(
             observe_start(&active_properties()),
