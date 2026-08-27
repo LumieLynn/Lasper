@@ -4,7 +4,7 @@ pub mod panes;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear},
@@ -14,6 +14,10 @@ use ratatui::{
 use crate::handle_nav;
 use crate::tui::app::AppData;
 use crate::tui::core::{AppMessage, ContainerMessage, EventResult};
+use crate::tui::views::title_tabs::{
+    bordered_title_tab_hitboxes, clicked_title_tab, TitleTabHitbox,
+};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DetailTarget {
@@ -101,8 +105,30 @@ impl DetailPane {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPaneContext {
+    Machine,
+    Image,
+    InternalImage,
+}
+
+impl DetailPaneContext {
+    fn for_target(target: &DetailTarget) -> Self {
+        match target {
+            DetailTarget::Image { internal: true, .. } => Self::InternalImage,
+            DetailTarget::Image {
+                internal: false, ..
+            } => Self::Image,
+            DetailTarget::Empty | DetailTarget::Machine(_) => Self::Machine,
+        }
+    }
+}
+
 pub struct DetailPanel {
-    pub active_pane: DetailPane,
+    active_pane: DetailPane,
+    remembered_machine_pane: DetailPane,
+    remembered_image_pane: DetailPane,
+    pane_context: DetailPaneContext,
     pub details_scroll: u16,
     pub properties_scroll: u16,
     pub log_scroll: u16,
@@ -120,12 +146,16 @@ pub struct DetailPanel {
     pub(crate) last_rendered_width: u16,
     pub(crate) log_cache: core::scrolling::LogRenderCache,
     scroll_area: Rect,
+    tab_hitboxes: Vec<TitleTabHitbox<DetailPane>>,
 }
 
 impl DetailPanel {
     pub fn new() -> Self {
         Self {
             active_pane: DetailPane::Properties,
+            remembered_machine_pane: DetailPane::Properties,
+            remembered_image_pane: DetailPane::ImageOverview,
+            pane_context: DetailPaneContext::Machine,
             details_scroll: 0,
             properties_scroll: 0,
             log_scroll: 0,
@@ -143,11 +173,16 @@ impl DetailPanel {
             last_rendered_width: 0,
             log_cache: core::scrolling::LogRenderCache::new(),
             scroll_area: Rect::default(),
+            tab_hitboxes: Vec::new(),
         }
     }
 
     pub fn set_focus(&mut self, focused: bool) {
         self.focused = focused;
+    }
+
+    pub fn active_pane(&self) -> DetailPane {
+        self.active_pane
     }
 
     pub fn render_with_data(
@@ -161,7 +196,16 @@ impl DetailPanel {
         let border_color = crate::tui::panel_border_color(resize_mode, self.focused, false);
 
         self.ensure_pane_for_target(&data.detail_target);
-        let tabs_line = self.get_tabs_line(data);
+        let labels = Self::tab_labels(data);
+        let tabs = DetailPane::tabs_for(&data.detail_target);
+        debug_assert_eq!(tabs.len(), labels.len());
+        let tab_widths = tabs
+            .iter()
+            .copied()
+            .zip(labels.iter().map(|label| label.width()))
+            .collect::<Vec<_>>();
+        self.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
+        let tabs_line = self.get_tabs_line(data, &labels);
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -208,13 +252,8 @@ impl DetailPanel {
         core::scrolling::render_scrollbar(self, f, area);
     }
 
-    fn get_tabs_line(&self, data: &AppData) -> Line<'static> {
-        let tabs = DetailPane::tabs_for(&data.detail_target);
-        let selected = tabs
-            .iter()
-            .position(|pane| pane == &self.active_pane)
-            .unwrap_or(0);
-        let labels: Vec<&str> = if data.detail_target.is_internal_image() {
+    fn tab_labels(data: &AppData) -> Vec<&'static str> {
+        if data.detail_target.is_internal_image() {
             vec![" Overview "]
         } else if data.detail_target.is_image() {
             vec![" Overview ", " Config ", " Unit "]
@@ -236,7 +275,15 @@ impl DetailPanel {
                 " Config ",
                 " Metrics ",
             ]
-        };
+        }
+    }
+
+    fn get_tabs_line(&self, data: &AppData, labels: &[&'static str]) -> Line<'static> {
+        let tabs = DetailPane::tabs_for(&data.detail_target);
+        let selected = tabs
+            .iter()
+            .position(|pane| pane == &self.active_pane)
+            .unwrap_or(0);
 
         let mut spans = Vec::new();
 
@@ -262,20 +309,35 @@ impl DetailPanel {
     }
 
     pub fn ensure_pane_for_target(&mut self, target: &DetailTarget) {
-        if !DetailPane::tabs_for(target).contains(&self.active_pane) {
-            self.active_pane = DetailPane::tabs_for(target)[0];
-            self.details_scroll = 0;
-            self.config_scroll = 0;
-            self.unit_scroll = 0;
+        let context = DetailPaneContext::for_target(target);
+        if context == self.pane_context && DetailPane::tabs_for(target).contains(&self.active_pane)
+        {
+            return;
         }
+
+        self.pane_context = context;
+        self.active_pane = match context {
+            DetailPaneContext::Machine => self.remembered_machine_pane,
+            DetailPaneContext::Image => self.remembered_image_pane,
+            DetailPaneContext::InternalImage => DetailPane::ImageOverview,
+        };
+        debug_assert!(DetailPane::tabs_for(target).contains(&self.active_pane));
     }
 
     fn page_step(&self) -> u16 {
         (self.pane_height / 2).max(1)
     }
 
-    fn switch_pane(&mut self, pane: DetailPane) -> EventResult {
+    fn switch_pane(&mut self, pane: DetailPane, target: &DetailTarget) -> EventResult {
+        debug_assert!(DetailPane::tabs_for(target).contains(&pane));
+        let context = DetailPaneContext::for_target(target);
+        self.pane_context = context;
         self.active_pane = pane;
+        match context {
+            DetailPaneContext::Machine => self.remembered_machine_pane = pane,
+            DetailPaneContext::Image => self.remembered_image_pane = pane,
+            DetailPaneContext::InternalImage => {}
+        }
         match self.active_pane {
             DetailPane::Properties => self.properties_scroll = 0,
             DetailPane::Details => self.details_scroll = 0,
@@ -295,17 +357,18 @@ impl DetailPanel {
     /// Handles all keyboard input for the detail panel.
     /// Returns Consumed for scroll/navigation, Message for pane switches.
     pub fn handle_key(&mut self, key: KeyEvent, target: &DetailTarget) -> EventResult {
+        self.ensure_pane_for_target(target);
         let step = self.page_step();
 
         match key.code {
             // Pane switching
             KeyCode::Char('[') => {
                 let next = self.active_pane.prev_for(target);
-                return self.switch_pane(next);
+                return self.switch_pane(next, target);
             }
             KeyCode::Char(']') => {
                 let next = self.active_pane.next_for(target);
-                return self.switch_pane(next);
+                return self.switch_pane(next, target);
             }
             KeyCode::Char(c)
                 if c.is_ascii_digit()
@@ -313,7 +376,7 @@ impl DetailPanel {
             {
                 let idx = (c.to_digit(10).unwrap() as usize).saturating_sub(1);
                 if let Some(pane) = DetailPane::from_index(idx, target) {
-                    return self.switch_pane(pane);
+                    return self.switch_pane(pane, target);
                 }
             }
 
@@ -387,8 +450,15 @@ impl DetailPanel {
         EventResult::Ignored
     }
 
-    /// Scroll the active detail pane when the pointer is over its content.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> EventResult {
+    /// Switch tabs or scroll the active detail pane.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, target: &DetailTarget) -> EventResult {
+        self.ensure_pane_for_target(target);
+        if let Some(pane) = clicked_title_tab(&self.tab_hitboxes, mouse) {
+            if DetailPane::tabs_for(target).contains(&pane) {
+                return self.switch_pane(pane, target);
+            }
+        }
+
         if mouse.column < self.scroll_area.x
             || mouse.column >= self.scroll_area.x.saturating_add(self.scroll_area.width)
             || mouse.row < self.scroll_area.y
@@ -445,31 +515,57 @@ mod tests {
     #[test]
     fn detail_mouse_scroll_is_clamped_and_area_bound() {
         let mut panel = DetailPanel::new();
+        let target = DetailTarget::Machine("workstation".into());
         panel.scroll_area = Rect::new(2, 3, 12, 8);
         panel.pane_height = 4;
         panel.properties_len = 20;
         panel.properties_scroll = 5;
 
         assert_eq!(
-            panel.handle_mouse(mouse(MouseEventKind::ScrollUp, 4, 5)),
+            panel.handle_mouse(mouse(MouseEventKind::ScrollUp, 4, 5), &target),
             EventResult::Consumed
         );
         assert_eq!(panel.properties_scroll, 2);
 
         assert_eq!(
-            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 5)),
+            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 5), &target),
             EventResult::Consumed
         );
         assert_eq!(panel.properties_scroll, 5);
 
         panel.properties_scroll = u16::MAX;
-        panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 5));
+        panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 4, 5), &target);
         assert_eq!(panel.properties_scroll, 16);
 
         assert_eq!(
-            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 5)),
+            panel.handle_mouse(mouse(MouseEventKind::ScrollDown, 1, 5), &target),
             EventResult::Ignored
         );
+    }
+
+    #[test]
+    fn detail_tab_click_switches_the_active_pane() {
+        let mut panel = DetailPanel::new();
+        let target = DetailTarget::Machine("workstation".into());
+        panel.tab_hitboxes = vec![TitleTabHitbox {
+            value: DetailPane::Details,
+            area: Rect::new(12, 3, 9, 1),
+        }];
+
+        assert_eq!(
+            panel.handle_mouse(
+                mouse(
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    15,
+                    3,
+                ),
+                &target,
+            ),
+            EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(
+                DetailPane::Details,
+            )))
+        );
+        assert_eq!(panel.active_pane(), DetailPane::Details);
     }
 
     #[test]
@@ -491,13 +587,32 @@ mod tests {
     }
 
     #[test]
-    fn switching_target_resets_machine_pane_to_image_overview() {
+    fn machine_and_image_panes_are_remembered_independently() {
         let mut panel = DetailPanel::new();
-        panel.active_pane = DetailPane::Metrics;
-        panel.ensure_pane_for_target(&DetailTarget::Image {
+        let machine = DetailTarget::Machine("workstation".into());
+        let image = DetailTarget::Image {
             name: "workstation".into(),
             internal: false,
-        });
+        };
+        let internal_image = DetailTarget::Image {
+            name: ".oci-layer".into(),
+            internal: true,
+        };
+
+        panel.handle_key(
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::ALT),
+            &machine,
+        );
+        panel.ensure_pane_for_target(&image);
         assert_eq!(panel.active_pane, DetailPane::ImageOverview);
+
+        panel.handle_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT), &image);
+        panel.ensure_pane_for_target(&machine);
+        assert_eq!(panel.active_pane, DetailPane::Metrics);
+
+        panel.ensure_pane_for_target(&internal_image);
+        assert_eq!(panel.active_pane, DetailPane::ImageOverview);
+        panel.ensure_pane_for_target(&image);
+        assert_eq!(panel.active_pane, DetailPane::ImageUnit);
     }
 }

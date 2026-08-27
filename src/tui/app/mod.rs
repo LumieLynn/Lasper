@@ -1821,8 +1821,9 @@ mod tests {
                 internal: false,
             };
             app.ui.focus = WorkspaceFocus::ImageInspector;
-            app.ui.detail_panel.active_pane =
-                crate::tui::views::detail_panel::DetailPane::ImageOverview;
+            app.ui
+                .detail_panel
+                .ensure_pane_for_target(&app.data.detail_target);
 
             app.refresh_detail_now().await;
 
@@ -1847,8 +1848,16 @@ mod tests {
             };
             app.data.unit_name = Some("systemd-nspawn@stale.service".into());
             app.ui.focus = WorkspaceFocus::ImageInspector;
-            app.ui.detail_panel.active_pane =
-                crate::tui::views::detail_panel::DetailPane::ImageUnit;
+            app.ui
+                .detail_panel
+                .ensure_pane_for_target(&app.data.detail_target);
+            app.ui.detail_panel.handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('3'),
+                    crossterm::event::KeyModifiers::ALT,
+                ),
+                &app.data.detail_target,
+            );
 
             app.refresh_detail_now().await;
 

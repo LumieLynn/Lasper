@@ -1,19 +1,24 @@
 use crate::nspawn::ImageEntry;
 use crate::tui::core::EventResult;
 use crate::tui::theme;
+use crate::tui::views::title_tabs::{
+    bordered_title_tab_hitboxes, clicked_title_tab, clip_title_tabs_before, TitleTabHitbox,
+};
 use crate::tui::widgets::lists::resource_list::{ResourceList, ResourceListRender};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use ratatui::{
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::ListItem,
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub struct ImageListComponent {
     list: ResourceList,
     active_tab: ImageListTab,
+    tab_hitboxes: Vec<TitleTabHitbox<ImageListTab>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +32,7 @@ impl ImageListComponent {
         Self {
             list: ResourceList::new(" Images "),
             active_tab: ImageListTab::Regular,
+            tab_hitboxes: Vec::new(),
         }
     }
 
@@ -64,6 +70,13 @@ impl ImageListComponent {
         self.list.handle_key(key, len)
     }
 
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> EventResult {
+        match clicked_title_tab(&self.tab_hitboxes, mouse) {
+            Some(tab) => self.switch_tab(tab),
+            None => EventResult::Ignored,
+        }
+    }
+
     pub fn render(
         &mut self,
         f: &mut Frame,
@@ -74,7 +87,22 @@ impl ImageListComponent {
         resize_mode: bool,
     ) {
         let t = theme::theme();
-        let trailing_title = self.tab_title(area.width);
+        let labels = Self::tab_labels(area.width);
+        self.tab_hitboxes = bordered_title_tab_hitboxes(
+            area,
+            Alignment::Right,
+            &[
+                (ImageListTab::Regular, labels[0].width()),
+                (ImageListTab::Internal, labels[1].width()),
+            ],
+            1,
+        );
+        let first_unobscured = area
+            .x
+            .saturating_add(1)
+            .saturating_add(u16::try_from(" Images ".width()).unwrap_or(u16::MAX));
+        clip_title_tabs_before(&mut self.tab_hitboxes, first_unobscured);
+        let trailing_title = self.tab_title(labels);
         let empty_message = if self.shows_internal() {
             "No internal images found"
         } else {
@@ -111,13 +139,16 @@ impl ImageListComponent {
         );
     }
 
-    fn tab_title(&self, width: u16) -> Line<'static> {
-        let t = theme::theme();
-        let labels = if width >= 32 {
+    fn tab_labels(width: u16) -> [&'static str; 2] {
+        if width >= 32 {
             [" Regular ", " Internal "]
         } else {
             [" Reg ", " Int "]
-        };
+        }
+    }
+
+    fn tab_title(&self, labels: [&'static str; 2]) -> Line<'static> {
+        let t = theme::theme();
         let mut spans = Vec::with_capacity(3);
         for (index, (tab, label)) in [ImageListTab::Regular, ImageListTab::Internal]
             .into_iter()
@@ -148,6 +179,9 @@ impl ImageListComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    use ratatui::{backend::TestBackend, Terminal};
+    use std::collections::HashSet;
 
     #[test]
     fn image_tabs_switch_even_when_the_current_tab_is_empty() {
@@ -158,5 +192,33 @@ mod tests {
             EventResult::Consumed
         );
         assert_eq!(list.active_tab, ImageListTab::Internal);
+    }
+
+    #[test]
+    fn rendered_image_tabs_are_clickable() {
+        crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
+        let mut list = ImageListComponent::new();
+        let mut terminal = Terminal::new(TestBackend::new(40, 5)).unwrap();
+
+        terminal
+            .draw(|frame| list.render(frame, frame.area(), &[], 0, &HashSet::new(), false))
+            .unwrap();
+        let internal = list
+            .tab_hitboxes
+            .iter()
+            .find(|hitbox| hitbox.value == ImageListTab::Internal)
+            .unwrap()
+            .area;
+
+        assert_eq!(
+            list.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: internal.x,
+                row: internal.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            EventResult::Consumed
+        );
+        assert!(list.shows_internal());
     }
 }

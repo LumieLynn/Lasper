@@ -1,5 +1,6 @@
 use super::{App, ModalLayer, WorkspaceFocus};
 use crate::tui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
+use crate::tui::views::detail_panel::DetailTarget;
 use crate::tui::wizard::StepAction as WizardAction;
 use crate::tui::StatusLevel;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
@@ -110,7 +111,19 @@ impl App {
         } else if in_rect(col, row, layout.images) {
             Some(WorkspaceFocus::Images)
         } else if !maximized && in_rect(col, row, layout.detail) {
-            Some(WorkspaceFocus::for_panel(self.ui.focus, 2))
+            Some(match &self.data.detail_target {
+                DetailTarget::Image { .. } => WorkspaceFocus::ImageInspector,
+                DetailTarget::Machine(_) => WorkspaceFocus::MachineInspector,
+                DetailTarget::Empty
+                    if matches!(
+                        self.ui.focus,
+                        WorkspaceFocus::Images | WorkspaceFocus::ImageInspector
+                    ) =>
+                {
+                    WorkspaceFocus::ImageInspector
+                }
+                DetailTarget::Empty => WorkspaceFocus::MachineInspector,
+            })
         } else if layout.terminal.is_some_and(|r| in_rect(col, row, r)) {
             Some(WorkspaceFocus::Terminal)
         } else {
@@ -129,8 +142,43 @@ impl App {
             }
         }
 
+        if in_rect(col, row, layout.images) {
+            let was_internal = self.ui.image_list.shows_internal();
+            let result = self.ui.image_list.handle_mouse(mouse);
+            if !matches!(result, EventResult::Ignored) {
+                if focus_changed || was_internal != self.ui.image_list.shows_internal() {
+                    self.request_detail_refresh();
+                }
+                return;
+            }
+        }
+
         if !maximized && in_rect(col, row, layout.detail) {
-            let _ = self.ui.detail_panel.handle_mouse(mouse);
+            let target = self.data.detail_target.clone();
+            let result = self.ui.detail_panel.handle_mouse(mouse, &target);
+            let consumed = !matches!(&result, EventResult::Ignored);
+            let pane_changed = matches!(
+                &result,
+                EventResult::Message(AppMessage::Container(ContainerMessage::PaneChanged(_)))
+            );
+            self.handle_detail_panel_result(result).await;
+            if consumed {
+                if focus_changed && !pane_changed {
+                    self.request_detail_refresh();
+                }
+                return;
+            }
+        }
+
+        if layout.terminal.is_some_and(|r| in_rect(col, row, r))
+            && self.data.terminal.handle_tab_click(
+                mouse,
+                &self.data.entries,
+                &mut self.data.selected,
+            )
+        {
+            self.request_detail_refresh();
+            return;
         }
 
         if focus_changed {

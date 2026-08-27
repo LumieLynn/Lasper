@@ -33,7 +33,7 @@ impl App {
         self.update_detail_target();
         self.data.detail_refresh.request(
             self.data.detail_target.clone(),
-            self.ui.detail_panel.active_pane,
+            self.ui.detail_panel.active_pane(),
         );
     }
 
@@ -64,7 +64,7 @@ impl App {
     fn prepare_detail_refresh(&mut self) -> Option<PreparedDetailRefresh> {
         let ticket = self.data.detail_refresh.take_pending()?;
         if ticket.target != self.data.detail_target
-            || ticket.pane != self.ui.detail_panel.active_pane
+            || ticket.pane != self.ui.detail_panel.active_pane()
         {
             return Some(PreparedDetailRefresh::Ready(DetailRefreshCompletion {
                 ticket,
@@ -153,7 +153,7 @@ impl App {
             return;
         }
         if completion.ticket.target != self.data.detail_target
-            || completion.ticket.pane != self.ui.detail_panel.active_pane
+            || completion.ticket.pane != self.ui.detail_panel.active_pane()
         {
             return;
         }

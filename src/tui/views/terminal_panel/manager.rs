@@ -7,6 +7,7 @@ use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::nspawn::models::MachineEntry;
 use crate::tui::events::AppEvent;
+use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +115,8 @@ pub struct TerminalManager {
     pub maximized: bool,
     /// Inner content area (after borders), set during render for mouse coord conversion.
     pub term_area: Rect,
+    /// Last rendered title-tab areas, used before terminal mouse forwarding.
+    pub(super) tab_hitboxes: Vec<TitleTabHitbox<usize>>,
     /// Long-lived clipboard instance so data survives on Linux (ownership model).
     pub clipboard: Option<arboard::Clipboard>,
     session_service: Arc<SessionService>,
@@ -135,6 +138,7 @@ impl TerminalManager {
             show: false,
             maximized: false,
             term_area: Rect::default(),
+            tab_hitboxes: Vec::new(),
             clipboard: None,
             session_service,
             redraw_gate: RedrawGate::new(),
@@ -190,6 +194,7 @@ impl TerminalManager {
             .position(|session| session.machine_name == entry.name)
         {
             let mut stale = self.sessions.remove(idx);
+            self.tab_hitboxes.clear();
             stale.handle.close();
             stale.output_task.abort();
             if self.active_idx > idx {
@@ -250,6 +255,7 @@ impl TerminalManager {
             mouse_capture: false,
         };
         self.sessions.push(session);
+        self.tab_hitboxes.clear();
         self.active_idx = self.sessions.len() - 1;
         self.show = true;
         Ok(SpawnedTerminalSession { attach_kind })
@@ -259,10 +265,12 @@ impl TerminalManager {
         if self.sessions.is_empty() {
             self.show = false;
             self.maximized = false;
+            self.tab_hitboxes.clear();
             return;
         }
 
         let mut session = self.sessions.remove(self.active_idx);
+        self.tab_hitboxes.clear();
         session.handle.close();
         session.output_task.abort();
 
@@ -273,6 +281,7 @@ impl TerminalManager {
         if self.sessions.is_empty() {
             self.show = false;
             self.maximized = false;
+            self.tab_hitboxes.clear();
         }
     }
 
@@ -299,6 +308,7 @@ impl TerminalManager {
         }
         self.show = false;
         self.maximized = false;
+        self.tab_hitboxes.clear();
         self.redraw_gate.clear();
     }
 
@@ -334,12 +344,7 @@ impl TerminalManager {
         };
 
         if let Some(idx) = new_idx {
-            if idx < session_count {
-                self.active_idx = idx;
-                let name = self.sessions[idx].machine_name.clone();
-                if let Some(pos) = entries.iter().position(|e| e.name == name) {
-                    *selected = pos;
-                }
+            if self.select_session(idx, entries, selected) {
                 return TerminalKeyOutcome::ConsumedAndRefreshDetail;
             }
             return TerminalKeyOutcome::Consumed;
@@ -443,20 +448,14 @@ impl TerminalManager {
 
                 KeyCode::Char('[') => {
                     let cur = self.active_idx;
-                    self.active_idx = if cur == 0 { session_count - 1 } else { cur - 1 };
-                    let name = self.sessions[self.active_idx].machine_name.clone();
-                    if let Some(pos) = entries.iter().position(|e| e.name == name) {
-                        *selected = pos;
-                    }
+                    let idx = if cur == 0 { session_count - 1 } else { cur - 1 };
+                    self.select_session(idx, entries, selected);
                     TerminalKeyOutcome::ConsumedAndRefreshDetail
                 }
                 KeyCode::Char(']') => {
                     let cur = self.active_idx;
-                    self.active_idx = (cur + 1) % session_count;
-                    let name = self.sessions[self.active_idx].machine_name.clone();
-                    if let Some(pos) = entries.iter().position(|e| e.name == name) {
-                        *selected = pos;
-                    }
+                    let idx = (cur + 1) % session_count;
+                    self.select_session(idx, entries, selected);
                     TerminalKeyOutcome::ConsumedAndRefreshDetail
                 }
 
@@ -474,6 +473,44 @@ impl TerminalManager {
     }
 
     // mouse dispatch
+
+    /// Select a rendered terminal tab before the event can reach the PTY.
+    pub fn handle_tab_click(
+        &mut self,
+        mouse: MouseEvent,
+        entries: &[MachineEntry],
+        selected: &mut usize,
+    ) -> bool {
+        let Some(idx) = clicked_title_tab(&self.tab_hitboxes, mouse) else {
+            return false;
+        };
+        self.select_session(idx, entries, selected);
+        true
+    }
+
+    fn select_session(
+        &mut self,
+        idx: usize,
+        entries: &[MachineEntry],
+        selected: &mut usize,
+    ) -> bool {
+        let Some(machine_name) = self
+            .sessions
+            .get(idx)
+            .map(|session| session.machine_name.clone())
+        else {
+            return false;
+        };
+        if let Some(active) = self.sessions.get_mut(self.active_idx) {
+            active.mouse_capture = false;
+            active.selection.active = false;
+        }
+        self.active_idx = idx;
+        if let Some(pos) = entries.iter().position(|entry| entry.name == machine_name) {
+            *selected = pos;
+        }
+        true
+    }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) -> TerminalInputStatus {
         let idx = self.active_idx;
@@ -724,6 +761,7 @@ pub enum TerminalKeyOutcome {
 mod tests {
     use super::{
         queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalManager,
+        TerminalSession, TextSelection,
     };
     use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
     use crate::application::sessions::{
@@ -731,6 +769,9 @@ mod tests {
     };
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use crate::nspawn::models::{MachineEntry, MachineState};
+    use crate::tui::views::title_tabs::TitleTabHitbox;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::layout::Rect;
     use std::sync::Arc;
 
     fn terminal_channels() -> (
@@ -738,6 +779,38 @@ mod tests {
         crate::application::sessions::TerminalSessionEndpoint,
     ) {
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login)
+    }
+
+    fn test_session(
+        id: u64,
+        machine_name: &str,
+    ) -> (
+        TerminalSession,
+        crate::application::sessions::TerminalSessionEndpoint,
+    ) {
+        let (handle, endpoint) =
+            terminal_session_channel(SessionId::new(id).unwrap(), TerminalAttachmentKind::Login);
+        let input = handle.input();
+        (
+            TerminalSession {
+                machine_name: machine_name.into(),
+                attach_kind: TerminalAttachmentKind::Login,
+                terminal: Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
+                    24, 80, 100,
+                ))),
+                input,
+                handle,
+                output_task: tokio::spawn(async {}),
+                scroll_offset: 0,
+                insert_mode: true,
+                selection: TextSelection::default(),
+                yanked: false,
+                queued_size: None,
+                resize_channel_closed: false,
+                mouse_capture: false,
+            },
+            endpoint,
+        )
     }
 
     #[test]
@@ -815,5 +888,52 @@ mod tests {
                 .expect_err("transitional state must not open a terminal");
             assert!(error.contains("not running"));
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_tab_click_selects_the_session_and_machine() {
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+        ))));
+        let mut manager = TerminalManager::new(service);
+        let (first, _first_endpoint) = test_session(1, "first");
+        let (second, _second_endpoint) = test_session(2, "second");
+        manager.sessions = vec![first, second];
+        manager.tab_hitboxes = vec![TitleTabHitbox {
+            value: 1,
+            area: Rect::new(12, 3, 8, 1),
+        }];
+        let entries = vec![
+            MachineEntry {
+                name: "first".into(),
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
+                state: MachineState::Running,
+                address: None,
+                all_addresses: Vec::new(),
+            },
+            MachineEntry {
+                name: "second".into(),
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
+                state: MachineState::Running,
+                address: None,
+                all_addresses: Vec::new(),
+            },
+        ];
+        let mut selected = 0;
+
+        assert!(manager.handle_tab_click(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 14,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            },
+            &entries,
+            &mut selected,
+        ));
+        assert_eq!(manager.active_idx, 1);
+        assert_eq!(selected, 1);
     }
 }
