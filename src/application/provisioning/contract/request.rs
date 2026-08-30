@@ -1,8 +1,9 @@
 use crate::domain::nvidia::NvidiaPassthroughProfile;
 use crate::domain::provisioning::OciNetworkMode;
+use crate::domain::source::ArtifactSpec;
 use crate::domain::storage::DiskImageConfig;
 use crate::domain::wayland::WaylandGrantIntent;
-use crate::nspawn::models::{ArtifactSpec, BootstrapSpec, ContainerConfig};
+use crate::nspawn::models::{BootstrapSpec, ContainerConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

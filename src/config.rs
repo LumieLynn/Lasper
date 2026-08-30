@@ -3,9 +3,9 @@
 //! Reads `~/.config/lasper/lasper.toml`, which holds `[theme]` color overrides,
 //! `[settings]` for general application options, and typed bootstrap profiles.
 
+use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::nspawn::models::{
-    ArtifactSpec, BootstrapMethod, DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec,
-    DEFAULT_BOOTSTRAP_PROFILE,
+    DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
 use crate::tui::theme::PartialTheme;
 use std::collections::BTreeMap;

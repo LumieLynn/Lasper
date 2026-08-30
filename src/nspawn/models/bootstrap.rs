@@ -4,6 +4,7 @@
 //! elevated bootstrap operation.  They deliberately describe provider
 //! semantics instead of accepting arbitrary command-line arguments.
 
+use crate::domain::source::ArtifactSpec;
 use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -30,26 +31,6 @@ pub const DNF5_DEFAULT_PACKAGES: &[&str] = &[
     "systemd-networkd",
     "systemd-resolved",
 ];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BootstrapMethod {
-    Debootstrap,
-    Pacstrap,
-    Dnf5,
-    Artifact,
-}
-
-impl BootstrapMethod {
-    pub fn required_tool(self) -> Option<&'static str> {
-        match self {
-            Self::Debootstrap => Some("debootstrap"),
-            Self::Pacstrap => Some("pacstrap"),
-            Self::Dnf5 => Some("dnf5"),
-            Self::Artifact => None,
-        }
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -359,97 +340,6 @@ const fn default_inherit_default_packages() -> bool {
     true
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArtifactFormat {
-    #[default]
-    Auto,
-    Tar,
-    Raw,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ArtifactSpec {
-    pub path: String,
-    #[serde(default)]
-    pub format: ArtifactFormat,
-}
-
-impl ArtifactSpec {
-    pub fn from_path(path: impl Into<String>) -> Self {
-        let path = path.into();
-        let format = if looks_like_raw_artifact(&path) {
-            ArtifactFormat::Raw
-        } else {
-            ArtifactFormat::Tar
-        };
-        Self { path, format }
-    }
-
-    pub fn validate(&self) -> Result<()> {
-        if self.path.trim().is_empty() {
-            return Err(validation("Artifact path cannot be empty"));
-        }
-        if self.path.chars().any(char::is_control) {
-            return Err(validation("Artifact path contains control characters"));
-        }
-        let looks_raw = looks_like_raw_artifact(&self.path);
-        let looks_tar = looks_like_tar_artifact(&self.path);
-        if (self.format == ArtifactFormat::Raw && looks_tar)
-            || (self.format == ArtifactFormat::Tar && looks_raw)
-        {
-            return Err(validation(
-                "Artifact format does not match its file extension",
-            ));
-        }
-        Ok(())
-    }
-
-    pub fn expanded_path(&self) -> String {
-        if self.path == "~" || self.path.starts_with("~/") {
-            if let Some(home) = dirs::home_dir() {
-                return if self.path == "~" {
-                    home.to_string_lossy().into_owned()
-                } else {
-                    home.join(&self.path[2..]).to_string_lossy().into_owned()
-                };
-            }
-        }
-        self.path.clone()
-    }
-
-    pub fn is_external_storage(&self) -> bool {
-        self.resolved_format() == ArtifactFormat::Raw
-    }
-
-    pub fn resolved_format(&self) -> ArtifactFormat {
-        match self.format {
-            ArtifactFormat::Auto if looks_like_raw_artifact(&self.path) => ArtifactFormat::Raw,
-            ArtifactFormat::Auto => ArtifactFormat::Tar,
-            explicit => explicit,
-        }
-    }
-}
-
-fn artifact_basename_without_compression(path: &str) -> String {
-    let lower = path.to_ascii_lowercase();
-    [".gz", ".xz", ".zst", ".bz2"]
-        .iter()
-        .find_map(|suffix| lower.strip_suffix(suffix).map(str::to_string))
-        .unwrap_or(lower)
-}
-
-fn looks_like_raw_artifact(path: &str) -> bool {
-    let base = artifact_basename_without_compression(path);
-    base.ends_with(".raw") || base.ends_with(".img")
-}
-
-fn looks_like_tar_artifact(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    artifact_basename_without_compression(path).ends_with(".tar") || lower.ends_with(".tgz")
-}
-
 /// A source that can be selected as a configured profile in `lasper.toml`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "provider", content = "config", rename_all = "snake_case")]
@@ -466,7 +356,9 @@ impl RootfsSourceSpec {
             Self::Debootstrap(spec) => spec.validate(),
             Self::Pacstrap(spec) => spec.validate(),
             Self::Dnf5(spec) => spec.validate(),
-            Self::Artifact(spec) => spec.validate(),
+            Self::Artifact(spec) => spec
+                .validate()
+                .map_err(|error| validation(error.to_string())),
         }
     }
 
@@ -476,7 +368,9 @@ impl RootfsSourceSpec {
             Self::Debootstrap(spec) => spec.validate_default_preset(),
             Self::Pacstrap(spec) => spec.validate(),
             Self::Dnf5(spec) => spec.validate_default_preset(),
-            Self::Artifact(spec) => spec.validate(),
+            Self::Artifact(spec) => spec
+                .validate()
+                .map_err(|error| validation(error.to_string())),
         }
     }
 
@@ -485,15 +379,11 @@ impl RootfsSourceSpec {
     }
 
     pub fn required_tool(&self) -> Option<&'static str> {
-        self.method().required_tool()
-    }
-
-    pub fn method(&self) -> BootstrapMethod {
         match self {
-            Self::Debootstrap(_) => BootstrapMethod::Debootstrap,
-            Self::Pacstrap(_) => BootstrapMethod::Pacstrap,
-            Self::Dnf5(_) => BootstrapMethod::Dnf5,
-            Self::Artifact(_) => BootstrapMethod::Artifact,
+            Self::Debootstrap(_) => Some("debootstrap"),
+            Self::Pacstrap(_) => Some("pacstrap"),
+            Self::Dnf5(_) => Some("dnf5"),
+            Self::Artifact(_) => None,
         }
     }
 }
@@ -904,6 +794,7 @@ fn validation(message: impl Into<String>) -> NspawnError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::source::ArtifactFormat;
     use std::path::Path;
 
     #[test]

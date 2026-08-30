@@ -14,6 +14,7 @@ use crate::adapters::provisioning::engine::{
     AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
 use crate::domain::machine::MachineName;
+use crate::domain::source::{ArtifactFormat, ArtifactSpec};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
 
@@ -43,11 +44,11 @@ pub enum ImageFormat {
 }
 
 impl ImageFormat {
-    pub fn from_artifact(artifact: &crate::nspawn::models::ArtifactSpec) -> Self {
+    pub fn from_artifact(artifact: &ArtifactSpec) -> Self {
         match artifact.resolved_format() {
-            crate::nspawn::models::ArtifactFormat::Tar => Self::Tar,
-            crate::nspawn::models::ArtifactFormat::Raw => Self::Raw,
-            crate::nspawn::models::ArtifactFormat::Auto => unreachable!("format was resolved"),
+            ArtifactFormat::Tar => Self::Tar,
+            ArtifactFormat::Raw => Self::Raw,
+            ArtifactFormat::Auto => unreachable!("format was resolved"),
         }
     }
 }
@@ -517,16 +518,16 @@ mod tests {
     #[test]
     fn artifact_format_is_resolved_before_privileged_import() {
         assert_eq!(
-            ImageFormat::from_artifact(&crate::nspawn::models::ArtifactSpec {
+            ImageFormat::from_artifact(&ArtifactSpec {
                 path: "rootfs.raw.xz".into(),
-                format: crate::nspawn::models::ArtifactFormat::Auto,
+                format: ArtifactFormat::Auto,
             }),
             ImageFormat::Raw
         );
         assert_eq!(
-            ImageFormat::from_artifact(&crate::nspawn::models::ArtifactSpec {
+            ImageFormat::from_artifact(&ArtifactSpec {
                 path: "rootfs.tar.xz".into(),
-                format: crate::nspawn::models::ArtifactFormat::Auto,
+                format: ArtifactFormat::Auto,
             }),
             ImageFormat::Tar
         );

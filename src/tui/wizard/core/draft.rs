@@ -8,13 +8,12 @@ use crate::domain::provisioning::{
 };
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::domain::secret::zeroize_string;
+use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::domain::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
-use crate::nspawn::models::{
-    ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
-};
+use crate::nspawn::models::{BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
