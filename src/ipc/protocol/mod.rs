@@ -8,6 +8,7 @@ pub(crate) mod deployment;
 pub(crate) mod rootfs;
 pub(crate) mod session;
 pub(crate) mod system;
+pub(crate) mod systemd_unit;
 
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};

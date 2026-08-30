@@ -202,14 +202,14 @@ impl SystemdUnitExecutor for ElevatedSystemdUnitExecutor {
 
     async fn execute(&self, operation: SystemdUnitOperation) -> Result<SystemdUnitResult> {
         self.daemon
-            .systemd_unit(operation)
+            .systemd_unit(crate::ipc::protocol::systemd_unit::SystemdUnitOperation::from(operation))
             .await
+            .map(SystemdUnitResult::from)
             .map_err(|error| NspawnError::Runtime(error.to_string()))
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "operation", content = "params", rename_all = "snake_case")]
+#[derive(Clone, Debug)]
 pub(crate) enum SystemdUnitOperation {
     Read(ReadServiceOverrides),
     ProbeOwnedOverrides(ReadServiceOverrides),
@@ -220,62 +220,182 @@ pub(crate) enum SystemdUnitOperation {
     RemoveOwnedOverrides(RemoveServiceOverrides),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ReadServiceOverrides {
     machine: MachineName,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct WriteServiceOverride {
     machine: MachineName,
     spec: ServiceOverrideSpec,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct CloneServiceOverride {
     source: MachineName,
     destination: MachineName,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct WriteNvidiaDeviceAllow {
     machine: MachineName,
     device_paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct RemoveServiceOverrides {
     machine: MachineName,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct RemoveServiceOverride {
     machine: MachineName,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ServiceOverrideSpec {
     device_binds: Vec<String>,
-    #[serde(default)]
     gpu_passthrough_all: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SystemdUnitResult {
-    #[serde(default)]
     drop_ins: Vec<SystemdDropIn>,
-    #[serde(default)]
     apply: Option<ResourceApplyStatus>,
-    #[serde(default)]
     ownership: Option<Vec<ArtifactOwnership>>,
+}
+
+impl From<SystemdUnitOperation> for crate::ipc::protocol::systemd_unit::SystemdUnitOperation {
+    fn from(operation: SystemdUnitOperation) -> Self {
+        use crate::ipc::protocol::systemd_unit as wire;
+
+        match operation {
+            SystemdUnitOperation::Read(request) => Self::Read(wire::ReadServiceOverrides {
+                machine: request.machine,
+            }),
+            SystemdUnitOperation::ProbeOwnedOverrides(request) => {
+                Self::ProbeOwnedOverrides(wire::ReadServiceOverrides {
+                    machine: request.machine,
+                })
+            }
+            SystemdUnitOperation::WriteOverride(request) => {
+                Self::WriteOverride(wire::WriteServiceOverride {
+                    machine: request.machine,
+                    spec: wire::ServiceOverrideSpec {
+                        device_binds: request.spec.device_binds,
+                        gpu_passthrough_all: request.spec.gpu_passthrough_all,
+                    },
+                })
+            }
+            SystemdUnitOperation::CloneOverride(request) => {
+                Self::CloneOverride(wire::CloneServiceOverride {
+                    source: request.source,
+                    destination: request.destination,
+                })
+            }
+            SystemdUnitOperation::WriteNvidiaDeviceAllow(request) => {
+                Self::WriteNvidiaDeviceAllow(wire::WriteNvidiaDeviceAllow {
+                    machine: request.machine,
+                    device_paths: request.device_paths,
+                })
+            }
+            SystemdUnitOperation::RemoveOverride(request) => {
+                Self::RemoveOverride(wire::RemoveServiceOverride {
+                    machine: request.machine,
+                })
+            }
+            SystemdUnitOperation::RemoveOwnedOverrides(request) => {
+                Self::RemoveOwnedOverrides(wire::RemoveServiceOverrides {
+                    machine: request.machine,
+                })
+            }
+        }
+    }
+}
+
+impl From<crate::ipc::protocol::systemd_unit::SystemdUnitOperation> for SystemdUnitOperation {
+    fn from(operation: crate::ipc::protocol::systemd_unit::SystemdUnitOperation) -> Self {
+        use crate::ipc::protocol::systemd_unit as wire;
+
+        match operation {
+            wire::SystemdUnitOperation::Read(request) => Self::Read(ReadServiceOverrides {
+                machine: request.machine,
+            }),
+            wire::SystemdUnitOperation::ProbeOwnedOverrides(request) => {
+                Self::ProbeOwnedOverrides(ReadServiceOverrides {
+                    machine: request.machine,
+                })
+            }
+            wire::SystemdUnitOperation::WriteOverride(request) => {
+                Self::WriteOverride(WriteServiceOverride {
+                    machine: request.machine,
+                    spec: ServiceOverrideSpec {
+                        device_binds: request.spec.device_binds,
+                        gpu_passthrough_all: request.spec.gpu_passthrough_all,
+                    },
+                })
+            }
+            wire::SystemdUnitOperation::CloneOverride(request) => {
+                Self::CloneOverride(CloneServiceOverride {
+                    source: request.source,
+                    destination: request.destination,
+                })
+            }
+            wire::SystemdUnitOperation::WriteNvidiaDeviceAllow(request) => {
+                Self::WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow {
+                    machine: request.machine,
+                    device_paths: request.device_paths,
+                })
+            }
+            wire::SystemdUnitOperation::RemoveOverride(request) => {
+                Self::RemoveOverride(RemoveServiceOverride {
+                    machine: request.machine,
+                })
+            }
+            wire::SystemdUnitOperation::RemoveOwnedOverrides(request) => {
+                Self::RemoveOwnedOverrides(RemoveServiceOverrides {
+                    machine: request.machine,
+                })
+            }
+        }
+    }
+}
+
+impl From<SystemdUnitResult> for crate::ipc::protocol::systemd_unit::SystemdUnitResult {
+    fn from(result: SystemdUnitResult) -> Self {
+        Self {
+            drop_ins: result
+                .drop_ins
+                .into_iter()
+                .map(
+                    |drop_in| crate::ipc::protocol::systemd_unit::SystemdDropIn {
+                        path: drop_in.path,
+                        content: drop_in.content,
+                    },
+                )
+                .collect(),
+            apply: result.apply,
+            ownership: result.ownership,
+        }
+    }
+}
+
+impl From<crate::ipc::protocol::systemd_unit::SystemdUnitResult> for SystemdUnitResult {
+    fn from(result: crate::ipc::protocol::systemd_unit::SystemdUnitResult) -> Self {
+        Self {
+            drop_ins: result
+                .drop_ins
+                .into_iter()
+                .map(|drop_in| SystemdDropIn {
+                    path: drop_in.path,
+                    content: drop_in.content,
+                })
+                .collect(),
+            apply: result.apply,
+            ownership: result.ownership,
+        }
+    }
 }
 
 pub(crate) async fn execute_systemd_unit_operation(
@@ -828,7 +948,10 @@ mod tests {
             "operation": "remove_owned_overrides",
             "params": {"machine": "../escape"}
         }"#;
-        assert!(serde_json::from_str::<SystemdUnitOperation>(json).is_err());
+        assert!(
+            serde_json::from_str::<crate::ipc::protocol::systemd_unit::SystemdUnitOperation>(json)
+                .is_err()
+        );
     }
 
     #[test]

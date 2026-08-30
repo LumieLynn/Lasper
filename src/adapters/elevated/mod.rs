@@ -3,7 +3,6 @@
 mod session;
 
 use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
-use crate::adapters::config::systemd_unit::{SystemdUnitOperation, SystemdUnitResult};
 use crate::adapters::platform::nvidia::state::{NvidiaStateOperation, NvidiaStateResult};
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentStateResult};
@@ -23,6 +22,7 @@ use crate::ipc::protocol::deployment::{
     ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
 };
 use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
 use crate::ipc::protocol::*;
 use crate::ipc::transport::{
     authorize_root_server, create_fd_socket_dir, get_peer_credentials, read_bounded_line,
@@ -572,8 +572,8 @@ impl ElevatedDaemon {
 
     pub(super) async fn systemd_unit(
         &self,
-        operation: SystemdUnitOperation,
-    ) -> std::io::Result<SystemdUnitResult> {
+        operation: systemd_unit_wire::SystemdUnitOperation,
+    ) -> std::io::Result<systemd_unit_wire::SystemdUnitResult> {
         let params = serde_json::to_value(operation)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self.rpc_call("systemd_unit", params).await?;

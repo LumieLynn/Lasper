@@ -29,6 +29,7 @@ use crate::application::machine_lifecycle::{
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
 use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
 use std::sync::Arc;
@@ -88,18 +89,21 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
         }
 
         RpcMethod::SystemdUnit => {
-            let operation: SystemdUnitOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid systemd_unit request: {error}"
-                    )));
-                }
-            };
+            let wire_operation: systemd_unit_wire::SystemdUnitOperation =
+                match serde_json::from_value(params) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid systemd_unit request: {error}"
+                        )));
+                    }
+                };
+            let operation = SystemdUnitOperation::from(wire_operation);
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let response = match execute_systemd_unit_operation(operation).await {
                     Ok(result) => {
+                        let result = systemd_unit_wire::SystemdUnitResult::from(result);
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }
                     Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
