@@ -1,6 +1,7 @@
 //! Directory-FD based access to Lasper's privileged durable state.
 
 use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::locking::{is_contention, remaining, timeout_error, LockWaitPolicy};
 use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs::File;
@@ -391,6 +392,18 @@ impl TrustedDirectory {
     }
 
     fn acquire_stable_lock(&self, name: &CStr, create: bool) -> Result<Option<File>> {
+        self.acquire_stable_lock_with_policy(name, create, LockWaitPolicy::default())
+    }
+
+    fn acquire_stable_lock_with_policy(
+        &self,
+        name: &CStr,
+        create: bool,
+        policy: LockWaitPolicy,
+    ) -> Result<Option<File>> {
+        let path = self.path.join(name.to_str().unwrap());
+        let started = std::time::Instant::now();
+        let mut attempts = 0usize;
         loop {
             let mut flags = libc::O_RDWR | libc::O_CLOEXEC | libc::O_NOFOLLOW;
             if create {
@@ -417,13 +430,41 @@ impl TrustedDirectory {
             }
             file.set_permissions(std::fs::Permissions::from_mode(LOCK_MODE))
                 .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
-            file.lock_exclusive()
-                .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+            match file.try_lock_exclusive() {
+                Ok(()) => {}
+                Err(error) if is_contention(&error) => {
+                    attempts = attempts.saturating_add(1);
+                    wait_for_lock_retry_sync(&path, started, attempts, policy)?;
+                    continue;
+                }
+                Err(error) => return Err(NspawnError::Io(path.clone(), error)),
+            }
             if same_opened_entry(&file, self.file.as_raw_fd(), name)? {
                 return Ok(Some(file));
             }
             let _ = FileExt::unlock(&file);
+            attempts = attempts.saturating_add(1);
+            wait_for_lock_retry_sync(&path, started, attempts, policy)?;
         }
+    }
+}
+
+fn wait_for_lock_retry_sync(
+    lock_path: &Path,
+    started: std::time::Instant,
+    attempts: usize,
+    policy: LockWaitPolicy,
+) -> Result<()> {
+    let Some(wait_budget) = remaining(policy, started) else {
+        return Err(timeout_error(lock_path, started, attempts));
+    };
+    if wait_budget.is_zero() {
+        return Err(timeout_error(lock_path, started, attempts));
+    }
+    std::thread::sleep(policy.retry_delay.min(wait_budget));
+    match remaining(policy, started) {
+        Some(wait_budget) if !wait_budget.is_zero() => Ok(()),
+        _ => Err(timeout_error(lock_path, started, attempts)),
     }
 }
 
@@ -668,6 +709,42 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(first.contains(&"deployment-one.json".to_string()));
+    }
+
+    #[test]
+    fn trusted_state_lock_contention_has_a_deadline() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = TrustedStateRoot::for_test(temporary.path().join("lasper"));
+        let states = root.directory(StateDirectory::States).unwrap();
+        let lock_name = CString::new(".machine.json.lock").unwrap();
+        let holder = states
+            .acquire_stable_lock(&lock_name, true)
+            .unwrap()
+            .unwrap();
+
+        let error = states
+            .acquire_stable_lock_with_policy(
+                &lock_name,
+                true,
+                LockWaitPolicy {
+                    timeout: std::time::Duration::from_millis(30),
+                    retry_delay: std::time::Duration::from_millis(5),
+                },
+            )
+            .unwrap_err();
+
+        match error {
+            NspawnError::Io(path, source) => {
+                assert_eq!(
+                    path,
+                    temporary.path().join("lasper/states/.machine.json.lock")
+                );
+                assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+                assert!(source.to_string().contains("attempts"));
+            }
+            other => panic!("unexpected trusted state lock error: {other}"),
+        }
+        holder.unlock().unwrap();
     }
 
     #[test]

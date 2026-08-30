@@ -1,4 +1,5 @@
 use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::locking::{is_contention, remaining, timeout_error, LockWaitPolicy};
 use fs2::FileExt;
 use std::ffi::OsString;
 use std::fs::File;
@@ -6,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::time::{sleep, Duration};
+use tokio::time::sleep;
 
 pub(crate) fn lock_path_for(path: &Path) -> std::path::PathBuf {
     let Some(file_name) = path.file_name() else {
@@ -22,9 +23,6 @@ pub(crate) fn lock_path_for(path: &Path) -> std::path::PathBuf {
 pub struct AsyncLockedWriter;
 
 impl AsyncLockedWriter {
-    const MAX_LOCK_ATTEMPTS: usize = 100;
-    const LOCK_RETRY_DELAY: Duration = Duration::from_millis(10);
-
     /// Performs a transactional write operation on a file.
     ///
     /// The process follows these safety rules:
@@ -83,9 +81,12 @@ impl AsyncLockedWriter {
 
         // Keep the guard alive until the atomic update and directory sync
         // complete; dropping it releases the advisory lock.
-        let _lock_file = Self::acquire_stable_lock(&lock_path, true)
-            .await?
-            .expect("create=true always returns a lock file");
+        let Some(_lock_file) = Self::acquire_stable_lock(&lock_path, true).await? else {
+            return Err(NspawnError::Runtime(format!(
+                "lock path {} disappeared while preparing a write",
+                lock_path.display()
+            )));
+        };
 
         // Read existing content - FIX: Direct read to avoid TOCTOU
         let existing_content = match fs::read_to_string(&path_buf).await {
@@ -166,7 +167,16 @@ impl AsyncLockedWriter {
     }
 
     async fn acquire_stable_lock(lock_path: &Path, create: bool) -> Result<Option<File>> {
-        let mut attempts = 0;
+        Self::acquire_stable_lock_with_policy(lock_path, create, LockWaitPolicy::default()).await
+    }
+
+    async fn acquire_stable_lock_with_policy(
+        lock_path: &Path,
+        create: bool,
+        policy: LockWaitPolicy,
+    ) -> Result<Option<File>> {
+        let started = std::time::Instant::now();
+        let mut attempts = 0usize;
         'open: loop {
             let lock_file = match std::fs::OpenOptions::new()
                 .read(true)
@@ -185,15 +195,12 @@ impl AsyncLockedWriter {
             loop {
                 match lock_file.try_lock_exclusive() {
                     Ok(()) => break,
-                    Err(_) if attempts < Self::MAX_LOCK_ATTEMPTS => {
-                        attempts += 1;
-                        sleep(Self::LOCK_RETRY_DELAY).await;
-                    }
                     Err(error) => {
-                        return Err(NspawnError::Runtime(format!(
-                            "Could not acquire lock on {:?} after {} attempts: {}",
-                            lock_path, attempts, error
-                        )))
+                        if !is_contention(&error) {
+                            return Err(NspawnError::Io(lock_path.to_path_buf(), error));
+                        }
+                        attempts = attempts.saturating_add(1);
+                        wait_for_lock_retry(lock_path, started, attempts, policy).await?;
                     }
                 }
             }
@@ -203,14 +210,8 @@ impl AsyncLockedWriter {
             }
 
             let _ = fs2::FileExt::unlock(&lock_file);
-            if attempts >= Self::MAX_LOCK_ATTEMPTS {
-                return Err(NspawnError::Runtime(format!(
-                    "Lock path {:?} kept changing while it was acquired",
-                    lock_path
-                )));
-            }
-            attempts += 1;
-            sleep(Self::LOCK_RETRY_DELAY).await;
+            attempts = attempts.saturating_add(1);
+            wait_for_lock_retry(lock_path, started, attempts, policy).await?;
             continue 'open;
         }
     }
@@ -296,6 +297,25 @@ impl AsyncLockedWriter {
     }
 }
 
+async fn wait_for_lock_retry(
+    lock_path: &Path,
+    started: std::time::Instant,
+    attempts: usize,
+    policy: LockWaitPolicy,
+) -> Result<()> {
+    let Some(wait_budget) = remaining(policy, started) else {
+        return Err(timeout_error(lock_path, started, attempts));
+    };
+    if wait_budget.is_zero() {
+        return Err(timeout_error(lock_path, started, attempts));
+    }
+    sleep(policy.retry_delay.min(wait_budget)).await;
+    match remaining(policy, started) {
+        Some(wait_budget) if !wait_budget.is_zero() => Ok(()),
+        _ => Err(timeout_error(lock_path, started, attempts)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +344,45 @@ mod tests {
                 .unwrap()
         );
         assert!(!lock.exists());
+    }
+
+    #[tokio::test]
+    async fn lock_contention_reports_a_bounded_targeted_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let lock = directory.path().join(".settings.conf.lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock)
+            .unwrap();
+        holder.lock_exclusive().unwrap();
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            AsyncLockedWriter::acquire_stable_lock_with_policy(
+                &lock,
+                true,
+                LockWaitPolicy {
+                    timeout: std::time::Duration::from_millis(30),
+                    retry_delay: std::time::Duration::from_millis(5),
+                },
+            ),
+        )
+        .await
+        .expect("lock acquisition ignored its deadline")
+        .unwrap_err();
+
+        match error {
+            NspawnError::Io(path, source) => {
+                assert_eq!(path, lock);
+                assert_eq!(source.kind(), std::io::ErrorKind::TimedOut);
+                assert!(source.to_string().contains("attempts"));
+            }
+            other => panic!("unexpected lock error: {other}"),
+        }
+        holder.unlock().unwrap();
     }
 
     #[test]
