@@ -6,8 +6,8 @@ pub mod mount;
 use super::super::{
     ImageMountSource, ManagedImageKind, ManagedStorageStore, StorageBackend, StorageType,
 };
+use crate::adapters::error::{NspawnError, Result};
 use crate::domain::storage::DiskImageConfig;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::PathBuf;
 
 pub struct DiskImageBackend {

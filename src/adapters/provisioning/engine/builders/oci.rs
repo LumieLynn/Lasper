@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::oci_operation::{
     ensure_pull_oci_available, OciPullRequest,
 };
@@ -13,7 +14,6 @@ use crate::application::provisioning::{DeploymentResource, MachineProvisioningCo
 use crate::domain::machine::MachineName;
 use crate::domain::oci::OciReference;
 use crate::domain::provisioning::OciNetworkMode;
-use crate::nspawn::errors::{NspawnError, Result};
 
 pub struct OciDeployer {
     pub reference: String,

@@ -4,7 +4,7 @@ use super::server::logging::*;
 use super::server::*;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
-use crate::adapters::system_operation::SystemOperation;
+use crate::adapters::system_operation::{SystemOperation, SystemOperationError};
 use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTransport};
 use crate::application::machine_lifecycle::{
     MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
@@ -64,14 +64,14 @@ impl DaemonSystemExecutor for SlowRemoveDbus {
     async fn system_operation(
         &self,
         operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()> {
+    ) -> crate::adapters::system_operation::SystemOperationResult<()> {
         match operation {
             SystemOperation::RemoveImage { .. } => {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(())
             }
-            _ => Err(crate::nspawn::errors::NspawnError::Runtime(
+            _ => Err(SystemOperationError::Backend(
                 "slow test backend only handles image removal".into(),
             )),
         }

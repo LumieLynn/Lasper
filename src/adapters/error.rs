@@ -1,6 +1,11 @@
 use std::path::PathBuf;
 use thiserror::Error;
 
+/// Transitional host-adapter error.
+///
+/// This type remains intentionally private to adapters while individual
+/// adapter contracts migrate to narrower error enums.  It is no longer a
+/// shared `nspawn` model and must not be imported by application or TUI code.
 #[allow(dead_code)]
 #[derive(Error, Debug)]
 pub enum NspawnError {
@@ -8,7 +13,7 @@ pub enum NspawnError {
     PermissionDenied,
 
     #[error("Command Failed ({0}): {1}. Output: {2}")]
-    CommandFailed(String, String, String), // Context, Command, Error Output
+    CommandFailed(String, String, String),
 
     #[error("{0}")]
     Generic(String),
@@ -72,7 +77,7 @@ pub enum NspawnError {
 }
 
 impl NspawnError {
-    pub fn cmd_failed(
+    pub(crate) fn cmd_failed(
         context: impl Into<String>,
         cmd: impl Into<String>,
         output: &std::process::Output,
@@ -84,11 +89,8 @@ impl NspawnError {
         )
     }
 
-    /// Whether this error is a polkit authorization rejection from DBus.
-    ///
-    /// systemd-machined returns these DBus error names when polkit blocks
-    /// an operation that requires `auth_self` or `auth_admin`.
-    pub fn is_polkit_rejection(&self) -> bool {
+    /// Whether this error is a polkit authorization rejection from D-Bus.
+    pub(crate) fn is_polkit_rejection(&self) -> bool {
         match self {
             Self::Dbus(error) => is_permission_dbus_error(error),
             _ => false,

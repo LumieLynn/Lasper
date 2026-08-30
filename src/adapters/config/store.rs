@@ -3,6 +3,7 @@ use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
 use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
@@ -10,7 +11,6 @@ use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;

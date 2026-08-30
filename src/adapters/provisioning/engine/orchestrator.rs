@@ -4,6 +4,7 @@ use super::{
     persist_committed, send_deploy_log, AppliedResource, ApplyReport, Deployer,
     DirectProvisioningCapabilities,
 };
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::StorageBackend;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
@@ -11,7 +12,6 @@ use crate::application::provisioning::{
     DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
 };
 use crate::domain::provisioning::PrivateUsersMode;
-use crate::nspawn::errors::{NspawnError, Result};
 
 /// Runs one deployment using application-owned job state and event transport.
 #[allow(clippy::too_many_arguments)]

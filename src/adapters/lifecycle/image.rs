@@ -1,10 +1,11 @@
 //! Runtime composition for the image lifecycle vertical slice.
 
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::lifecycle::error::map_system_operation_image_error;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::system_operation::SystemOperationStore;
+use crate::adapters::system_operation::{SystemOperationError, SystemOperationStore};
 use crate::application::image_lifecycle::{
     ArtifactCleanupReport, ArtifactOwnership, ImageControl, ImageControlOutcome,
     ImageLifecycleService, ImageRemoveRequest, ImageRemoveTransport, ImageRuntime,
@@ -151,22 +152,22 @@ impl ImageControl for RoutedImageControl {
                 fallback_runner,
                 ..
             } => match dbus.remove_image_outcome(image).await {
-                outcome if direct_remove_may_fallback(&outcome) => {
+                outcome if direct_remove_may_fallback(&outcome) => map_cli_image_remove(
                     crate::adapters::system_operation::execute_cli_image_remove_with_runner(
                         image.clone(),
                         fallback_runner.as_ref(),
                     )
-                    .await
-                }
+                    .await,
+                ),
                 outcome => outcome,
             },
-            ImageControlRoute::LocalCli { runner, .. } => {
+            ImageControlRoute::LocalCli { runner, .. } => map_cli_image_remove(
                 crate::adapters::system_operation::execute_cli_image_remove_with_runner(
                     image.clone(),
                     runner.as_ref(),
                 )
-                .await
-            }
+                .await,
+            ),
             ImageControlRoute::Daemon {
                 daemon, transport, ..
             } => {
@@ -202,10 +203,17 @@ impl ImageControl for RoutedImageControl {
     }
 }
 
+fn map_cli_image_remove(result: Result<(), SystemOperationError>) -> ImageControlOutcome {
+    match result {
+        Ok(()) => ImageControlOutcome::Removed,
+        Err(error) => map_system_operation_image_error(error),
+    }
+}
+
 async fn disable_unit_via_daemon(
     daemon: &ElevatedDaemon,
     machine: &MachineName,
-) -> crate::nspawn::errors::Result<()> {
+) -> crate::adapters::error::Result<()> {
     let outcome = daemon
         .nspawn_unit_control(NspawnUnitControlRequest {
             machine: machine.clone(),
@@ -213,10 +221,10 @@ async fn disable_unit_via_daemon(
             transport: MachineControlTransport::Dbus,
         })
         .await
-        .map_err(|error| crate::nspawn::errors::NspawnError::Runtime(error.to_string()))?;
+        .map_err(|error| crate::adapters::error::NspawnError::Runtime(error.to_string()))?;
     match outcome {
         MachineControlOutcome::Succeeded => Ok(()),
-        other => Err(crate::nspawn::errors::NspawnError::Runtime(format!(
+        other => Err(crate::adapters::error::NspawnError::Runtime(format!(
             "disable unit was not completed: {other:?}"
         ))),
     }

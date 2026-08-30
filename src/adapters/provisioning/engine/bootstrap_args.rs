@@ -1,5 +1,6 @@
 //! Host command projections for typed bootstrap intent.
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::domain::bootstrap::{
     BootstrapValidationError, DebootstrapDependencyMode, DebootstrapReleaseSignaturePolicy,
     DebootstrapSpec, DebootstrapUsrMergeMode, Dnf5BestCandidatePolicy, Dnf5DocumentationPolicy,
@@ -7,7 +8,6 @@ use crate::domain::bootstrap::{
     Dnf5WeakDependencyPolicy, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
     PacstrapDependencyMode, PacstrapIsolationMode, PacstrapPacmanConfigMode, PacstrapSpec,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::Path;
 
 /// Provider defaults for a bootable systemd-nspawn guest. Profiles inherit

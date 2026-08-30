@@ -8,6 +8,7 @@ pub(crate) mod inspection;
 pub(crate) mod source;
 pub(crate) mod state;
 
+use crate::adapters::error::NspawnError;
 use crate::adapters::runtime::cli::CliBackend;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::elevated::DaemonBackend;
@@ -18,7 +19,6 @@ use crate::application::runtime::{RuntimeCatalog, RuntimeError, RuntimePort, Run
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
-use crate::nspawn::errors::NspawnError;
 use std::sync::Arc;
 
 pub(crate) fn compose_runtime_catalog(

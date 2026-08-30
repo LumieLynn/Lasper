@@ -1,9 +1,9 @@
 //! Typed systemd-native OCI acquisition shared by direct and elevated modes.
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::SpawnedProcess;
 use crate::domain::machine::MachineName;
 use crate::domain::oci::OciReference;
-use crate::nspawn::errors::{NspawnError, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::os::unix::process::ExitStatusExt;

@@ -1,8 +1,10 @@
 //! Shared contracts used by the daemon's RPC family handlers.
 
-use crate::adapters::lifecycle::error::map_machine_control_error;
+use crate::adapters::lifecycle::error::map_system_operation_machine_error;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOperation};
+use crate::adapters::system_operation::{
+    execute_dbus_system_operation, SystemOperation, SystemOperationResult,
+};
 use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineRejection, MachineRuntimeAction, NspawnUnitAction,
 };
@@ -36,10 +38,7 @@ pub(crate) trait DaemonRuntimeQueries: Send + Sync {
 /// turning it into a catch-all daemon capability.
 #[async_trait::async_trait]
 pub(crate) trait DaemonSystemExecutor: Send + Sync {
-    async fn system_operation(
-        &self,
-        operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()>;
+    async fn system_operation(&self, operation: SystemOperation) -> SystemOperationResult<()>;
     async fn nspawn_launch(&self, image: ImageName, machine: MachineName) -> MachineControlOutcome {
         if image.as_str() != machine.as_str() {
             return MachineControlOutcome::Rejected {
@@ -80,7 +79,7 @@ pub(crate) trait DaemonSystemExecutor: Send + Sync {
     async fn machine_control_operation(&self, operation: SystemOperation) -> MachineControlOutcome {
         match self.system_operation(operation).await {
             Ok(()) => MachineControlOutcome::Succeeded,
-            Err(error) => map_machine_control_error(error),
+            Err(error) => map_system_operation_machine_error(error),
         }
     }
 }
@@ -112,10 +111,7 @@ impl DaemonRuntimeQueries for crate::adapters::runtime::dbus::DbusBackend {
 
 #[async_trait::async_trait]
 impl DaemonSystemExecutor for crate::adapters::runtime::dbus::DbusBackend {
-    async fn system_operation(
-        &self,
-        operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()> {
+    async fn system_operation(&self, operation: SystemOperation) -> SystemOperationResult<()> {
         execute_dbus_system_operation(self, operation).await
     }
 }

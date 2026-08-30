@@ -1,5 +1,5 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 

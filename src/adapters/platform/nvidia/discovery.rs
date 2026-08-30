@@ -2,9 +2,9 @@ use super::cdi::{CdiDeviceNode, CdiMount, CdiSpec};
 use super::classify::{self, ClassifiedEntry};
 use super::resolve::{get_ldconfig_cache, resolve_so_aliases};
 use super::state::{NvidiaState, PassthroughBind};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::new_command;
 use crate::domain::nvidia::{NvidiaPassthroughMode, NvidiaPassthroughProfile};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 

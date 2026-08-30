@@ -1,4 +1,4 @@
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::adapters::error::{NspawnError, Result};
 use fs2::FileExt;
 use std::ffi::OsString;
 use std::fs::File;

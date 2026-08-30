@@ -1,5 +1,6 @@
 #![allow(clippy::type_complexity)]
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
@@ -8,7 +9,6 @@ use crate::domain::inspection::{
 };
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};

@@ -1,9 +1,9 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::Deserialize;
 use std::time::Duration;
 

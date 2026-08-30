@@ -1,7 +1,7 @@
 use super::DiskImageBackend;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::ManagedImageKind;
 use crate::domain::storage::DiskImageSource;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::{Path, PathBuf};
 
 impl DiskImageBackend {

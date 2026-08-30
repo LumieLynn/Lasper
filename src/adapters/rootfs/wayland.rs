@@ -1,8 +1,8 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::domain::provisioning::{validate_login_shell, validate_login_username};
 use crate::domain::secret::SecretBytes;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::Path;
 
 const WAYLAND_RC_MARKER: &str = "# Added by Lasper: Wayland passthrough";

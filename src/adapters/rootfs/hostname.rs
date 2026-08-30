@@ -1,6 +1,6 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
 use crate::domain::machine::GuestHostname;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::{Path, PathBuf};
 
 /// Persist the guest's static hostname using systemd's own offline writer.

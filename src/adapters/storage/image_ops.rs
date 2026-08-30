@@ -1,8 +1,8 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
 use crate::adapters::storage::{ImageMountSource, ManagedImageKind};
 use crate::domain::machine::MachineName;
 use crate::domain::storage::{DiskImageFilesystem, DiskImagePartition, MAX_DISK_IMAGE_SIZE_BYTES};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;

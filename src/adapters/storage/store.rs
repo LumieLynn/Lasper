@@ -1,7 +1,7 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::domain::machine::MachineName;
 use crate::domain::storage::{parse_disk_image_size, DiskImageFilesystem, DiskImagePartition};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 

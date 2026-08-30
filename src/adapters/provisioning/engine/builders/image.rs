@@ -7,6 +7,7 @@ use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::provisioning::engine::image_operation::TarSourceOrigin;
 use crate::adapters::provisioning::engine::{
@@ -16,7 +17,6 @@ use crate::adapters::provisioning::engine::{
 use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::MachineName;
 use crate::domain::source::{ArtifactFormat, ArtifactSpec};
-use crate::nspawn::errors::{NspawnError, Result};
 
 const MAX_IMAGE_BYTES: u64 = crate::domain::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;

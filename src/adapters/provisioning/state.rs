@@ -1,10 +1,10 @@
 //! Durable deployment crash manifests under the composed trusted state root.
 
+use crate::adapters::error::NspawnError;
 use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
 use crate::application::provisioning::{
     DeploymentCrashManifest, DeploymentId, DeploymentStateError, DeploymentStatePort,
 };
-use crate::nspawn::errors::NspawnError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;

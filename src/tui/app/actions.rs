@@ -469,7 +469,7 @@ impl App {
                 .request_elevation(format!("{} {}", action.audit_label(), name))
                 .await
             {
-                Ok(a) => a,
+                Ok(audit) => audit,
                 Err(error) => {
                     drop(operation);
                     let _ = tx
@@ -489,10 +489,7 @@ impl App {
                     return;
                 }
             };
-            let outcome = audit
-                .run(async move { Ok(operation.run().await) })
-                .await
-                .expect("machine lifecycle operation returns a semantic outcome");
+            let outcome = audit.run(async move { operation.run().await }).await;
             let _ = tx
                 .send(crate::tui::events::AppEvent::MachineLifecycleFinished(
                     outcome,
@@ -737,19 +734,15 @@ impl App {
                     return;
                 }
             };
-            let result = audit.run(async { Ok(removal.run().await) }).await;
+            let result = audit.run(async { removal.run().await }).await;
             let event = match result {
-                Err(error) => crate::tui::events::AppEvent::ActionDone(
-                    format!("Remove failed: {}", error),
-                    crate::tui::StatusLevel::Error,
-                ),
-                Ok(crate::application::ImageRemovalOutcome::NotAttempted { reason, .. }) => {
+                crate::application::ImageRemovalOutcome::NotAttempted { reason, .. } => {
                     crate::tui::events::AppEvent::ActionDone(
                         format!("Remove was not attempted: {}", reason),
                         crate::tui::StatusLevel::Warn,
                     )
                 }
-                Ok(crate::application::ImageRemovalOutcome::Removed(report)) => {
+                crate::application::ImageRemovalOutcome::Removed(report) => {
                     let unit_warning = match &report.unit {
                         crate::application::image_lifecycle::UnitDisableReport::Failed(reason) => {
                             Some(reason.clone())
@@ -802,19 +795,19 @@ impl App {
                         },
                     }
                 }
-                Ok(crate::application::ImageRemovalOutcome::Rejected { reason, .. }) => {
+                crate::application::ImageRemovalOutcome::Rejected { reason, .. } => {
                     crate::tui::events::AppEvent::ActionDone(
                         format!("Remove rejected: {}", reason),
                         crate::tui::StatusLevel::Warn,
                     )
                 }
-                Ok(crate::application::ImageRemovalOutcome::Failed { reason, .. }) => {
+                crate::application::ImageRemovalOutcome::Failed { reason, .. } => {
                     crate::tui::events::AppEvent::ActionDone(
                         format!("Remove failed: {}", reason),
                         crate::tui::StatusLevel::Error,
                     )
                 }
-                Ok(crate::application::ImageRemovalOutcome::OutcomeUnknown { reason, .. }) => {
+                crate::application::ImageRemovalOutcome::OutcomeUnknown { reason, .. } => {
                     crate::tui::events::AppEvent::ActionDone(
                         format!("Removal outcome unknown: {}", reason),
                         crate::tui::StatusLevel::Warn,

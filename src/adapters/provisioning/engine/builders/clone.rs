@@ -2,13 +2,13 @@
 
 use async_trait::async_trait;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::{
     send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
-use crate::nspawn::errors::{NspawnError, Result};
 
 pub struct CloneDeployer {
     pub source_name: String,

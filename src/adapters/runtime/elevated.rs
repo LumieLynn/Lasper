@@ -6,10 +6,10 @@
 //! read-only here; machine and image mutations use typed lifecycle requests.
 
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::domain::inspection::MachineProperties;
 use crate::domain::runtime::{ImageEntry, MachineEntry, StatusUpdate};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::sync::Arc;
 
 #[derive(Clone)]

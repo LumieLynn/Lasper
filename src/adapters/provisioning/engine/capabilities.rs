@@ -1,4 +1,5 @@
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::platform::nvidia::NvidiaStateStore;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::rootfs::RootfsStore;
@@ -9,7 +10,6 @@ use crate::application::provisioning::{
     DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceApplyStatus,
     ResourceDisposition, ResourceLedger,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 
 /// Direct host capabilities used by the provisioning implementation.
 ///

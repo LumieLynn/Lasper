@@ -8,6 +8,7 @@ use super::super::server::DaemonServerState;
 use super::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
 use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
+use crate::adapters::lifecycle::error::map_system_operation_image_error;
 use crate::adapters::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation,
 };
@@ -337,15 +338,16 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                         .await
                     {
                         Ok(()) => ImageControlOutcome::Removed,
-                        Err(error) => {
-                            crate::adapters::lifecycle::error::map_image_control_error(error)
-                        }
+                        Err(error) => map_system_operation_image_error(error),
                     },
                     None => ImageControlOutcome::NotAttempted {
                         reason: "DBus backend is unavailable".into(),
                     },
                 },
-                ImageRemoveTransport::Cli => execute_cli_image_remove(request.image).await,
+                ImageRemoveTransport::Cli => match execute_cli_image_remove(request.image).await {
+                    Ok(()) => ImageControlOutcome::Removed,
+                    Err(error) => map_system_operation_image_error(error),
+                },
             };
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }

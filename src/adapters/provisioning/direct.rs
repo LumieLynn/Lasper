@@ -5,6 +5,7 @@ use super::engine::{
     BootstrapStore, Deployer, DirectProvisioningCapabilities, ImageImportStore, OciPullStore,
 };
 use super::state::FilesystemDeploymentState;
+use crate::adapters::error::NspawnError;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::adapters::storage::{
     DirectoryBackend, DiskImageBackend, StorageBackend, SubvolumeBackend,
@@ -16,7 +17,6 @@ use crate::application::provisioning::{
     DeploymentStorage,
 };
 use crate::application::HostOperationTracker;
-use crate::nspawn::errors::NspawnError;
 use async_trait::async_trait;
 use std::sync::Arc;
 

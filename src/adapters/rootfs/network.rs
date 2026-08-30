@@ -1,5 +1,5 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 

@@ -1,5 +1,6 @@
 use super::stream::is_high_signal_deploy_stream;
 use super::*;
+use crate::adapters::error::{NspawnError, Result};
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
@@ -7,7 +8,6 @@ use crate::application::provisioning::{
     DeploymentStorage, MachineProvisioningConfig, MemoryDeploymentStatePort, ResourceDisposition,
     ResourceLedger,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 use std::sync::Arc;
 
 fn apply_report() -> ApplyReport {

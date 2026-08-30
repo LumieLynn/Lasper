@@ -1,6 +1,6 @@
 //! Resource-budget validation for uncompressed tar archives.
 
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::adapters::error::{NspawnError, Result};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 

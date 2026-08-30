@@ -1,14 +1,107 @@
 //! Typed host system operations shared by direct and elevated modes.
 
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::lifecycle::error::map_image_control_error;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
-use crate::application::image_lifecycle::ImageControlOutcome;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Source evidence for a typed machinectl/systemctl operation.
+///
+/// This error stays inside the host adapter.  Daemon handlers map it to an
+/// application outcome, while older adapter stores may explicitly convert it
+/// to the transitional `NspawnError` until their contracts are migrated.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SystemOperationError {
+    #[error("invalid target: {0}")]
+    InvalidTarget(String),
+
+    #[error("image '{0}' is protected and cannot be removed")]
+    ProtectedImage(String),
+
+    #[error("permission denied")]
+    PermissionDenied,
+
+    #[error("command failed ({context}): {command}. Output: {output}")]
+    CommandFailed {
+        context: String,
+        command: String,
+        output: String,
+    },
+
+    #[error("I/O error in {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("D-Bus error: {0}")]
+    Dbus(#[source] zbus::Error),
+
+    #[error("system operation failed: {0}")]
+    Backend(String),
+}
+
+pub(crate) type SystemOperationResult<T> = std::result::Result<T, SystemOperationError>;
+
+impl SystemOperationError {
+    fn cmd_failed(
+        context: impl Into<String>,
+        command: impl Into<String>,
+        output: &std::process::Output,
+    ) -> Self {
+        Self::CommandFailed {
+            context: context.into(),
+            command: command.into(),
+            output: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        }
+    }
+}
+
+impl From<SystemOperationError> for NspawnError {
+    fn from(error: SystemOperationError) -> Self {
+        match error {
+            SystemOperationError::InvalidTarget(message) => Self::Validation(message),
+            SystemOperationError::ProtectedImage(image) => Self::ProtectedImage(image),
+            SystemOperationError::PermissionDenied => Self::PermissionDenied,
+            SystemOperationError::CommandFailed {
+                context,
+                command,
+                output,
+            } => Self::CommandFailed(context, command, output),
+            SystemOperationError::Io { path, source } => Self::Io(path, source),
+            SystemOperationError::Dbus(error) => Self::Dbus(error),
+            SystemOperationError::Backend(message) => Self::Runtime(message),
+        }
+    }
+}
+
+fn legacy_system_operation_error(error: NspawnError) -> SystemOperationError {
+    match error {
+        NspawnError::Validation(message) | NspawnError::InvalidConfig(message) => {
+            SystemOperationError::InvalidTarget(message)
+        }
+        NspawnError::ProtectedImage(image) => SystemOperationError::ProtectedImage(image),
+        NspawnError::PermissionDenied => SystemOperationError::PermissionDenied,
+        NspawnError::CommandFailed(context, command, output) => {
+            SystemOperationError::CommandFailed {
+                context,
+                command,
+                output,
+            }
+        }
+        NspawnError::Io(path, source) => SystemOperationError::Io { path, source },
+        NspawnError::GenericIo(source) => SystemOperationError::Io {
+            path: PathBuf::from("system operation"),
+            source,
+        },
+        NspawnError::Dbus(error) => SystemOperationError::Dbus(error),
+        other => SystemOperationError::Backend(other.to_string()),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum SystemOperation {
@@ -113,7 +206,10 @@ impl SystemOperationStore {
     }
 
     async fn execute(&self, operation: SystemOperation) -> Result<()> {
-        self.executor.execute(operation).await
+        self.executor
+            .execute(operation)
+            .await
+            .map_err(NspawnError::from)
     }
 
     pub async fn disable(&self, name: &str) -> Result<()> {
@@ -146,39 +242,33 @@ impl SystemOperationStore {
     }
 }
 
-pub(crate) async fn execute_cli_image_remove(image: ImageName) -> ImageControlOutcome {
+pub(crate) async fn execute_cli_image_remove(image: ImageName) -> SystemOperationResult<()> {
     execute_cli_image_remove_with_runner(image, &DefaultCommandRunner).await
 }
 
 pub(crate) async fn execute_cli_image_remove_with_runner(
     image: ImageName,
     runner: &dyn CommandRunner,
-) -> ImageControlOutcome {
+) -> SystemOperationResult<()> {
     let operation = SystemOperation::RemoveImage { image };
-    let (program, args) = match command(&operation) {
-        Ok(command) => command,
-        Err(error) => return map_image_control_error(error),
-    };
-    let output = match runner.run(program, args.clone()).await {
-        Ok(output) => output,
-        Err(error) => {
-            return ImageControlOutcome::NotAttempted {
-                reason: format!("failed to launch {program}: {error}"),
-            }
-        }
-    };
+    let (program, args) = command(&operation)?;
+    let output =
+        runner
+            .run(program, args.clone())
+            .await
+            .map_err(|source| SystemOperationError::Io {
+                path: PathBuf::from(program),
+                source,
+            })?;
     crate::adapters::process::log_output(program, &output);
     if output.status.success() {
-        ImageControlOutcome::Removed
+        Ok(())
     } else {
-        ImageControlOutcome::Failed {
-            reason: NspawnError::cmd_failed(
-                "typed image removal",
-                format!("{} {}", program, args.join(" ")),
-                &output,
-            )
-            .to_string(),
-        }
+        Err(SystemOperationError::cmd_failed(
+            "typed image removal",
+            format!("{} {}", program, args.join(" ")),
+            &output,
+        ))
     }
 }
 
@@ -194,7 +284,7 @@ impl std::fmt::Debug for SystemOperationStore {
 trait SystemOperationExecutor: Send + Sync + 'static {
     fn route(&self) -> &'static str;
 
-    async fn execute(&self, operation: SystemOperation) -> Result<()>;
+    async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()>;
 }
 
 struct DirectSystemOperationExecutor {
@@ -207,7 +297,7 @@ impl SystemOperationExecutor for DirectSystemOperationExecutor {
         "direct"
     }
 
-    async fn execute(&self, operation: SystemOperation) -> Result<()> {
+    async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
         execute_system_operation_with_runner(operation, self.local_runner.as_ref()).await
     }
 }
@@ -222,11 +312,14 @@ impl SystemOperationExecutor for ElevatedSystemOperationExecutor {
         "elevated_rpc"
     }
 
-    async fn execute(&self, operation: SystemOperation) -> Result<()> {
+    async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
         self.daemon
             .system_operation(operation)
             .await
-            .map_err(|error| NspawnError::Io(PathBuf::from("system operation"), error))
+            .map_err(|source| SystemOperationError::Io {
+                path: PathBuf::from("system operation"),
+                source,
+            })
     }
 }
 
@@ -238,15 +331,17 @@ fn image_name(name: &str) -> Result<ImageName> {
     ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
-pub(crate) async fn execute_system_operation(operation: SystemOperation) -> Result<()> {
+pub(crate) async fn execute_system_operation(
+    operation: SystemOperation,
+) -> SystemOperationResult<()> {
     execute_system_operation_with_runner(operation, &DefaultCommandRunner).await
 }
 
 pub(crate) async fn execute_dbus_system_operation(
     dbus: &crate::adapters::runtime::dbus::DbusBackend,
     operation: SystemOperation,
-) -> Result<()> {
-    match operation {
+) -> SystemOperationResult<()> {
+    let result = match operation {
         SystemOperation::Start { machine } => dbus.start(machine.as_str()).await,
         SystemOperation::Terminate { machine } => dbus.terminate(machine.as_str()).await,
         SystemOperation::Poweroff { machine } => dbus.poweroff(machine.as_str()).await,
@@ -259,23 +354,28 @@ pub(crate) async fn execute_dbus_system_operation(
         SystemOperation::CloneImage { .. } => Err(NspawnError::Validation(
             "image cloning is not a machined D-Bus operation".into(),
         )),
-    }
+    };
+    result.map_err(legacy_system_operation_error)
 }
 
 pub(crate) async fn execute_system_operation_with_runner(
     operation: SystemOperation,
     runner: &dyn CommandRunner,
-) -> Result<()> {
+) -> SystemOperationResult<()> {
     let (program, args) = command(&operation)?;
-    let output = runner
-        .run(program, args.clone())
-        .await
-        .map_err(|error| NspawnError::Io(PathBuf::from(program), error))?;
+    let output =
+        runner
+            .run(program, args.clone())
+            .await
+            .map_err(|source| SystemOperationError::Io {
+                path: PathBuf::from(program),
+                source,
+            })?;
     crate::adapters::process::log_output(program, &output);
     if output.status.success() {
         Ok(())
     } else {
-        Err(NspawnError::cmd_failed(
+        Err(SystemOperationError::cmd_failed(
             "typed system operation",
             format!("{} {}", program, args.join(" ")),
             &output,
@@ -283,7 +383,7 @@ pub(crate) async fn execute_system_operation_with_runner(
     }
 }
 
-fn command(operation: &SystemOperation) -> Result<(&'static str, Vec<String>)> {
+fn command(operation: &SystemOperation) -> SystemOperationResult<(&'static str, Vec<String>)> {
     let command = match operation {
         SystemOperation::Start { machine } => ("machinectl", vec!["--", "start", machine.as_str()]),
         SystemOperation::Terminate { machine } => {
@@ -307,7 +407,7 @@ fn command(operation: &SystemOperation) -> Result<(&'static str, Vec<String>)> {
         ),
         SystemOperation::RemoveImage { image } => {
             if ImageEntry::is_protected_name(image.as_str()) {
-                return Err(NspawnError::ProtectedImage(image.as_str().into()));
+                return Err(SystemOperationError::ProtectedImage(image.as_str().into()));
             }
             ("machinectl", vec!["--", "remove", image.as_str()])
         }
@@ -360,7 +460,7 @@ mod tests {
             "recording"
         }
 
-        async fn execute(&self, operation: SystemOperation) -> Result<()> {
+        async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
             assert!(matches!(operation, SystemOperation::Disable { .. }));
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -457,9 +557,10 @@ mod tests {
         let mut runner = MockCommandRunner::new();
         runner.expect_run().once().returning(|_, _| Ok(success()));
 
-        assert_eq!(
-            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
-            ImageControlOutcome::Removed
+        assert!(
+            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,)
+                .await
+                .is_ok()
         );
     }
 
@@ -475,7 +576,7 @@ mod tests {
 
         assert!(matches!(
             execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
-            ImageControlOutcome::NotAttempted { .. }
+            Err(SystemOperationError::Io { .. })
         ));
     }
 
@@ -489,7 +590,7 @@ mod tests {
 
         assert!(matches!(
             execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
-            ImageControlOutcome::Failed { .. }
+            Err(SystemOperationError::CommandFailed { .. })
         ));
     }
 
@@ -506,7 +607,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, NspawnError::ProtectedImage(_)));
+        assert!(matches!(error, SystemOperationError::ProtectedImage(_)));
     }
 
     #[tokio::test]

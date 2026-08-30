@@ -1,13 +1,14 @@
 //! Runtime composition for the machine lifecycle vertical slice.
 
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::lifecycle::error::map_machine_control_error;
+use crate::adapters::error::NspawnError;
+use crate::adapters::lifecycle::error::map_system_operation_machine_error;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::system_operation::{
     execute_dbus_system_operation, execute_system_operation_with_runner, SystemOperation,
-    SystemOperationStore,
+    SystemOperationError, SystemOperationStore,
 };
 use crate::application::machine_lifecycle::{
     MachineControl, MachineControlOutcome, MachineControlTransport, MachineLifecycleService,
@@ -22,7 +23,6 @@ use crate::application::{OperationRegistry, RuntimeCatalog};
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageName, MachineEntry};
-use crate::nspawn::errors::NspawnError;
 use std::sync::Arc;
 
 pub(crate) struct MachineLifecycleAdapters {
@@ -303,7 +303,7 @@ async fn execute_dbus_machine_control(
 ) -> MachineControlOutcome {
     match execute_dbus_system_operation(dbus, system_operation(machine, intent)).await {
         Ok(()) => MachineControlOutcome::Succeeded,
-        Err(error) => map_machine_control_error(error),
+        Err(error) => map_system_operation_machine_error(error),
     }
 }
 
@@ -353,10 +353,12 @@ async fn execute_cli_machine_control_with_runner(
 ) -> MachineControlOutcome {
     match execute_system_operation_with_runner(system_operation(machine, intent), runner).await {
         Ok(()) => MachineControlOutcome::Succeeded,
-        Err(NspawnError::Io(_, error)) => MachineControlOutcome::NotAttempted {
-            reason: format!("failed to launch machine control command: {error}"),
-        },
-        Err(error) => map_machine_control_error(error),
+        Err(SystemOperationError::Io { source: error, .. }) => {
+            MachineControlOutcome::NotAttempted {
+                reason: format!("failed to launch machine control command: {error}"),
+            }
+        }
+        Err(error) => map_system_operation_machine_error(error),
     }
 }
 

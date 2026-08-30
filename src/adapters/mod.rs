@@ -1,5 +1,6 @@
 pub mod config;
 pub(crate) mod elevated;
+pub(crate) mod error;
 pub(crate) mod filesystem;
 pub(crate) mod inspection;
 pub(crate) mod lifecycle;

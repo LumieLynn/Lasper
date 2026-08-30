@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, stream_deploy_command, ApplyReport, BootstrapStore, DeployLogEvent, Deployer,
@@ -13,7 +14,6 @@ use crate::domain::bootstrap::{
     BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
     Dnf5RepositorySource, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 
 pub struct BootstrapDeployer {
     pub spec: BootstrapSpec,

@@ -1,7 +1,7 @@
 use super::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::wayland::WaylandBind;
 use crate::domain::wayland::WaylandBindPolicy;
-use crate::nspawn::errors::{NspawnError, Result};
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};

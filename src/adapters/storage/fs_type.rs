@@ -1,7 +1,7 @@
 //! Filesystem type detection utilities.
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::CommandLogged;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::Path;
 
 /// Detects the filesystem type of a given path using 'stat -f -c %T'.

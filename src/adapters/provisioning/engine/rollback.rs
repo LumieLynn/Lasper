@@ -2,12 +2,12 @@ use super::{
     persist_applying, persist_committed, send_deploy_log, AppliedResource, ApplyReport,
     DirectProvisioningCapabilities,
 };
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::StorageBackend;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentStage,
     ResourceDisposition,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 use tokio::sync::mpsc::Sender;
 
 pub(super) async fn inspect_deployment_sidecars(

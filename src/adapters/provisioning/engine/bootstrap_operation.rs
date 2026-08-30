@@ -4,10 +4,10 @@ use super::bootstrap_args::{
     debootstrap_args_with_signature_style, dnf5_args, pacstrap_args,
     DebootstrapSignatureOptionStyle,
 };
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::rootfs::RootfsTarget;
 use crate::domain::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

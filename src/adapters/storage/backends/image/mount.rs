@@ -1,5 +1,5 @@
 use super::DiskImageBackend;
-use crate::nspawn::errors::Result;
+use crate::adapters::error::Result;
 use std::path::PathBuf;
 
 impl DiskImageBackend {

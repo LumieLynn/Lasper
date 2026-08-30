@@ -1,6 +1,6 @@
+use crate::adapters::error::Result;
 use crate::domain::inspection::MachineProperties;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
-use crate::nspawn::errors::Result;
 
 /// Read-only runtime discovery, inspection, and observation.
 ///

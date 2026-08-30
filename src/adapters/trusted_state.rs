@@ -1,6 +1,6 @@
 //! Directory-FD based access to Lasper's privileged durable state.
 
-use crate::nspawn::errors::{NspawnError, Result};
+use crate::adapters::error::{NspawnError, Result};
 use fs2::FileExt;
 use std::ffi::{CStr, CString};
 use std::fs::File;

@@ -1,7 +1,7 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::{GuestHostname, MachineName};
 use crate::domain::provisioning::{BindMount, NetworkMode, PortForward, PrivateUsersMode};
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

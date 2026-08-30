@@ -1,10 +1,10 @@
 use super::ALL_DRM_DEVICES_PATH;
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::image_lifecycle::ArtifactOwnership;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::domain::machine::MachineName;
-use crate::nspawn::errors::{NspawnError, Result};
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

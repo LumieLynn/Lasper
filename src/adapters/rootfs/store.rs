@@ -1,4 +1,5 @@
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::adapters::rootfs::hostname::configure_hostname_at;
@@ -14,7 +15,6 @@ use crate::domain::provisioning::CreateUser;
 use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::ipc::protocol::rootfs as rootfs_wire;
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;

@@ -1,8 +1,8 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::SpawnedProcess;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentProgress as DeployProgress,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 use tokio::sync::mpsc::Sender;
 
 pub(crate) async fn send_deploy_log(logs: &Sender<DeployLogEvent>, message: impl Into<String>) {

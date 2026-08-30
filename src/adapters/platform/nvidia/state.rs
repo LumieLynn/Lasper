@@ -1,10 +1,10 @@
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
 use crate::application::image_lifecycle::ArtifactOwnership;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::domain::machine::MachineName;
-use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
