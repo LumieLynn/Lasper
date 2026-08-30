@@ -44,8 +44,8 @@ pub(crate) fn compose_runtime_catalog(
 
     let primary = match primary_route {
         PrimaryRuntimeRoute::Disabled => None,
-        PrimaryRuntimeRoute::DirectDbus => Some((
-            Arc::new(DbusBackend::new()) as Arc<dyn RuntimeSource>,
+        PrimaryRuntimeRoute::DirectDbus(dbus) => Some((
+            Arc::new(dbus) as Arc<dyn RuntimeSource>,
             ExecutionRoute::DirectDbus,
         )),
         PrimaryRuntimeRoute::ElevatedDbus(daemon) => Some((
@@ -75,7 +75,7 @@ pub(crate) fn compose_runtime_catalog(
 
 pub(crate) enum PrimaryRuntimeRoute {
     Disabled,
-    DirectDbus,
+    DirectDbus(DbusBackend),
     ElevatedDbus(Arc<crate::adapters::elevated::ElevatedDaemon>),
 }
 

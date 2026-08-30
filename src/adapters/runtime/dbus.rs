@@ -621,6 +621,14 @@ mod tests {
     }
 
     #[test]
+    fn backend_clones_share_one_connection_cache() {
+        let backend = DbusBackend::new();
+        let clone = backend.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&backend.conn, &clone.conn));
+    }
+
+    #[test]
     fn only_transport_failures_invalidate_connections() {
         let io_error = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,

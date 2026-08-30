@@ -35,7 +35,7 @@ pub(crate) struct MachineLifecycleAdapters {
 }
 
 pub(crate) enum MachineLifecycleRoute {
-    DirectDbus,
+    DirectDbus(DbusBackend),
     LocalCli,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
@@ -59,8 +59,8 @@ pub(crate) fn compose_machine_lifecycle(
     } = adapters;
     let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
         route: match route {
-            MachineLifecycleRoute::DirectDbus => MachineControlRoute::DirectDbus {
-                dbus: DbusBackend::new(),
+            MachineLifecycleRoute::DirectDbus(dbus) => MachineControlRoute::DirectDbus {
+                dbus,
                 fallback_runner: local_cmd.clone(),
             },
             MachineLifecycleRoute::LocalCli => MachineControlRoute::LocalCli {

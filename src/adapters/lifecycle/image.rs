@@ -29,7 +29,7 @@ pub(crate) struct ImageLifecycleAdapters {
 }
 
 pub(crate) enum ImageLifecycleRoute {
-    DirectDbus,
+    DirectDbus(DbusBackend),
     LocalCli,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
@@ -61,8 +61,8 @@ pub(crate) fn compose_image_lifecycle(
             runner: local_cmd.clone(),
             system_operations: system_operations.clone(),
         },
-        ImageLifecycleRoute::DirectDbus => ImageControlRoute::DirectDbus {
-            dbus: DbusBackend::new(),
+        ImageLifecycleRoute::DirectDbus(dbus) => ImageControlRoute::DirectDbus {
+            dbus,
             fallback_runner: local_cmd,
             fallback_operations: system_operations.clone(),
         },
