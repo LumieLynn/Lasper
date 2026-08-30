@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) mod deployment;
 pub(crate) mod rootfs;
 pub(crate) mod session;
+pub(crate) mod system;
 
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};

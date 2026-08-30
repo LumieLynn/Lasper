@@ -217,8 +217,10 @@ pub(super) fn daemon_resource_claim(
             crate::application::ResourceKey::for_machine(&request.machine)
         }
         RpcMethod::SystemOperation => {
-            let operation: SystemOperation = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
+            let wire_operation: crate::ipc::protocol::system::SystemOperation =
+                serde_json::from_value(request.params.clone())
+                    .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
+            let operation = SystemOperation::from(wire_operation);
             match operation {
                 SystemOperation::Start { machine } => {
                     crate::application::ResourceKey::for_machine(&machine)

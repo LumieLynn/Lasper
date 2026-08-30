@@ -7,12 +7,10 @@ use crate::application::image_lifecycle::ImageControlOutcome;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName};
 use crate::nspawn::errors::{NspawnError, Result};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) enum SystemOperation {
     Start {
         machine: MachineName,
@@ -44,6 +42,56 @@ pub(crate) enum SystemOperation {
         destination: ImageName,
     },
     ReloadDaemon,
+}
+
+impl From<SystemOperation> for crate::ipc::protocol::system::SystemOperation {
+    fn from(operation: SystemOperation) -> Self {
+        use crate::ipc::protocol::system::SystemOperation as Wire;
+
+        match operation {
+            SystemOperation::Start { machine } => Wire::Start { machine },
+            SystemOperation::Terminate { machine } => Wire::Terminate { machine },
+            SystemOperation::Poweroff { machine } => Wire::Poweroff { machine },
+            SystemOperation::Reboot { machine } => Wire::Reboot { machine },
+            SystemOperation::Enable { machine } => Wire::Enable { machine },
+            SystemOperation::Disable { machine } => Wire::Disable { machine },
+            SystemOperation::Kill { machine, signal } => Wire::Kill { machine, signal },
+            SystemOperation::RemoveImage { image } => Wire::RemoveImage { image },
+            SystemOperation::CloneImage {
+                source,
+                destination,
+            } => Wire::CloneImage {
+                source,
+                destination,
+            },
+            SystemOperation::ReloadDaemon => Wire::ReloadDaemon,
+        }
+    }
+}
+
+impl From<crate::ipc::protocol::system::SystemOperation> for SystemOperation {
+    fn from(operation: crate::ipc::protocol::system::SystemOperation) -> Self {
+        use crate::ipc::protocol::system::SystemOperation as Wire;
+
+        match operation {
+            Wire::Start { machine } => Self::Start { machine },
+            Wire::Terminate { machine } => Self::Terminate { machine },
+            Wire::Poweroff { machine } => Self::Poweroff { machine },
+            Wire::Reboot { machine } => Self::Reboot { machine },
+            Wire::Enable { machine } => Self::Enable { machine },
+            Wire::Disable { machine } => Self::Disable { machine },
+            Wire::Kill { machine, signal } => Self::Kill { machine, signal },
+            Wire::RemoveImage { image } => Self::RemoveImage { image },
+            Wire::CloneImage {
+                source,
+                destination,
+            } => Self::CloneImage {
+                source,
+                destination,
+            },
+            Wire::ReloadDaemon => Self::ReloadDaemon,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -337,10 +385,16 @@ mod tests {
     #[test]
     fn operation_deserialization_rejects_untyped_arguments() {
         let traversal = r#"{"operation":"remove_image","image":"../host"}"#;
-        assert!(serde_json::from_str::<SystemOperation>(traversal).is_err());
+        assert!(
+            serde_json::from_str::<crate::ipc::protocol::system::SystemOperation>(traversal)
+                .is_err()
+        );
 
         let arbitrary = r#"{"operation":"start","machine":"valid","program":"sh"}"#;
-        assert!(serde_json::from_str::<SystemOperation>(arbitrary).is_err());
+        assert!(
+            serde_json::from_str::<crate::ipc::protocol::system::SystemOperation>(arbitrary)
+                .is_err()
+        );
     }
 
     #[test]
@@ -349,13 +403,29 @@ mod tests {
             machine: MachineName::new("test-machine").unwrap(),
             signal: AllowedSignal::Kill,
         };
-        let value = serde_json::to_value(operation).unwrap();
+        let value = serde_json::to_value(crate::ipc::protocol::system::SystemOperation::from(
+            operation,
+        ))
+        .unwrap();
 
         assert_eq!(value["operation"], "kill");
         assert_eq!(value["machine"], "test-machine");
         assert_eq!(value["signal"], "SIGKILL");
         assert!(value.get("program").is_none());
         assert!(value.get("args").is_none());
+    }
+
+    #[test]
+    fn adapter_operation_maps_to_the_private_wire_contract() {
+        let operation = SystemOperation::Kill {
+            machine: MachineName::new("test-machine").unwrap(),
+            signal: AllowedSignal::Kill,
+        };
+        let wire = crate::ipc::protocol::system::SystemOperation::from(operation.clone());
+        let round_trip = SystemOperation::from(wire.clone());
+        let round_trip_wire = crate::ipc::protocol::system::SystemOperation::from(round_trip);
+
+        assert_eq!(wire, round_trip_wire);
     }
 
     #[tokio::test]

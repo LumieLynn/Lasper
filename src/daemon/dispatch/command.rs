@@ -200,14 +200,16 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
         }
 
         RpcMethod::SystemOperation => {
-            let operation: SystemOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid system_operation request: {error}"
-                    )));
-                }
-            };
+            let wire_operation: crate::ipc::protocol::system::SystemOperation =
+                match serde_json::from_value(params) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid system_operation request: {error}"
+                        )));
+                    }
+                };
+            let operation = SystemOperation::from(wire_operation);
             match execute_system_operation(operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(Value::Null)),
                 Err(error) => HandleOutcome::Sync(Err(error.to_string())),

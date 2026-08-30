@@ -503,8 +503,10 @@ impl ElevatedDaemon {
     }
 
     pub(super) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let params = serde_json::to_value(crate::ipc::protocol::system::SystemOperation::from(
+            operation,
+        ))
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.rpc_call("system_operation", params).await?;
         Ok(())
     }
