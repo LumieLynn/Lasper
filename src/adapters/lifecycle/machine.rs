@@ -497,7 +497,7 @@ impl MachineStartDiagnostics for LocalStartDiagnostics {
         ]);
         let journal = self
             .runner
-            .run("journalctl", args)
+            .run_bounded("journalctl", args, std::time::Duration::from_secs(5))
             .await
             .ok()
             .filter(|output| output.status.success())

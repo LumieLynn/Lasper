@@ -176,6 +176,17 @@ pub trait CommandRunner: Send + Sync {
     /// Run a command, capturing stdout/stderr after it exits.
     async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output>;
 
+    /// Run a short host query with an explicit completion deadline.
+    ///
+    /// Implementations must terminate the child process group when the
+    /// deadline expires and wait for the child before returning `TimedOut`.
+    async fn run_bounded(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Output>;
+
     /// Spawn a command for streaming.  Stderr merged into stdout.
     /// Use [`SpawnedProcess::wait`] for the exit status.
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess>;
@@ -189,6 +200,15 @@ impl CommandRunner for DefaultCommandRunner {
     async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output> {
         let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         new_command(program).args(&args_refs).output().await
+    }
+
+    async fn run_bounded(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Output> {
+        run_bounded_command(program, args, timeout).await
     }
 
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
@@ -214,6 +234,49 @@ impl CommandRunner for DefaultCommandRunner {
             move |signal| Box::pin(async move { signal_process_group(pid, signal) }),
         ))
     }
+}
+
+const BOUNDED_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn run_bounded_command(
+    program: &str,
+    args: Vec<String>,
+    timeout: std::time::Duration,
+) -> std::io::Result<Output> {
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut command = new_command(program);
+    command
+        .args(&args_refs)
+        .kill_on_drop(true)
+        .as_std_mut()
+        .process_group(0);
+    let child = command.spawn()?;
+    let pid = child.id().ok_or_else(|| {
+        std::io::Error::other(format!("bounded command {program} has no process id"))
+    })?;
+    let mut wait = Box::pin(child.wait_with_output());
+
+    if let Ok(result) = tokio::time::timeout(timeout, &mut wait).await {
+        return result;
+    }
+
+    log::warn!(
+        "bounded command {program} exceeded its {}ms deadline; terminating process group {pid}",
+        timeout.as_millis()
+    );
+    let _ = signal_process_group(pid, libc::SIGTERM);
+    if tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait)
+        .await
+        .is_err()
+    {
+        let _ = signal_process_group(pid, libc::SIGKILL);
+        let _ = tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait).await;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("command {program} exceeded its completion deadline"),
+    ))
 }
 
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set
@@ -380,5 +443,34 @@ mod tests {
         let status = spawned.terminate_and_wait().await.unwrap();
 
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn bounded_commands_return_output_before_the_deadline() {
+        let output = DefaultCommandRunner
+            .run_bounded(
+                "sh",
+                vec!["-c".into(), "printf ready".into()],
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+    }
+
+    #[tokio::test]
+    async fn bounded_commands_terminate_their_process_group_on_timeout() {
+        let error = DefaultCommandRunner
+            .run_bounded(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                std::time::Duration::from_millis(25),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 }

@@ -8,6 +8,7 @@ use serde::Deserialize;
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HOST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 struct MachinectlImageRow {
@@ -112,7 +113,7 @@ impl RuntimeSource for CliBackend {
     async fn list_images(&self) -> Result<Vec<ImageEntry>> {
         let out = self
             .cmd_runner
-            .run(
+            .run_bounded(
                 "machinectl",
                 vec![
                     "--no-ask-password".to_string(),
@@ -122,6 +123,7 @@ impl RuntimeSource for CliBackend {
                     "--".to_string(),
                     "list-images".to_string(),
                 ],
+                HOST_QUERY_TIMEOUT,
             )
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
@@ -197,7 +199,7 @@ pub(crate) async fn get_properties_with_runner(
         MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
 
     let machine_out = cmd_runner
-        .run(
+        .run_bounded(
             "machinectl",
             vec![
                 "--no-ask-password".to_string(),
@@ -205,6 +207,7 @@ pub(crate) async fn get_properties_with_runner(
                 "show".to_string(),
                 name.as_str().to_string(),
             ],
+            HOST_QUERY_TIMEOUT,
         )
         .await;
 
@@ -272,7 +275,7 @@ async fn append_systemd_unit_properties(
         unit.clone(),
     ];
     let system_out = cmd_runner
-        .run("systemctl", args.clone())
+        .run_bounded("systemctl", args.clone(), HOST_QUERY_TIMEOUT)
         .await
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("systemctl"), error))?;
 
@@ -413,15 +416,16 @@ mod tests {
     async fn list_images_preserves_systemd_image_names() {
         let runner = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run()
-                .withf(|program, args| {
+            r.expect_run_bounded()
+                .withf(|program, args, timeout| {
                     program == "machinectl"
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
                         && args.get(1).is_some_and(|arg| arg == "--output=json")
                         && args.get(4).is_some_and(|arg| arg == "--")
                         && args.get(5).is_some_and(|arg| arg == "list-images")
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|_, _| {
+                .returning(|_, _, _| {
                     Ok(mock_output(
                         true,
                         r#"[
@@ -478,9 +482,9 @@ mod tests {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut runner = MockCommandRunner::new();
             runner
-                .expect_run()
+                .expect_run_bounded()
                 .times(1)
-                .withf(|program, args| {
+                .withf(|program, args, timeout| {
                     program == "machinectl"
                         && args
                             == &[
@@ -491,8 +495,9 @@ mod tests {
                                 "--".to_string(),
                                 "list-images".to_string(),
                             ]
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|_, _| {
+                .returning(|_, _, _| {
                     Ok(mock_output(
                         true,
                         r#"[{"name":"active","type":"directory","ro":false,"usage":20971520}]"#,
@@ -524,14 +529,15 @@ mod tests {
     async fn test_get_properties_parses_machinectl_and_systemctl_output() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run()
-                .withf(|program, args| {
+            r.expect_run_bounded()
+                .withf(|program, args, timeout| {
                     matches!(program, "machinectl" | "systemctl")
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
                         && args.get(1).is_some_and(|arg| arg == "--")
                         && args.get(2).is_some_and(|arg| arg == "show")
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|program, _args| {
+                .returning(|program, _args, _timeout| {
                     if program == "systemctl" {
                         Ok(mock_output(
                             true,
@@ -562,8 +568,10 @@ mod tests {
             let mut r = MockCommandRunner::new();
             let out1 = mock_output(false, "", "");
             let out2 = mock_output(false, "", "");
-            r.expect_run().returning(move |_, _| Ok(out1.clone()));
-            r.expect_run().returning(move |_, _| Ok(out2.clone()));
+            r.expect_run_bounded()
+                .returning(move |_, _, _| Ok(out1.clone()));
+            r.expect_run_bounded()
+                .returning(move |_, _, _| Ok(out2.clone()));
             r
         });
         let provider = CliBackend::with_runner(runner);
@@ -576,9 +584,9 @@ mod tests {
     async fn image_unit_inspection_runs_only_systemctl() {
         let mut runner = MockCommandRunner::new();
         runner
-            .expect_run()
+            .expect_run_bounded()
             .times(1)
-            .withf(|program, args| {
+            .withf(|program, args, timeout| {
                 program == "systemctl"
                     && args
                         == &[
@@ -587,8 +595,9 @@ mod tests {
                             "show".to_string(),
                             "systemd-nspawn@test-image.service".to_string(),
                         ]
+                    && *timeout == HOST_QUERY_TIMEOUT
             })
-            .returning(|_, _| {
+            .returning(|_, _, _| {
                 Ok(mock_output(
                     true,
                     "ActiveState=inactive\nLoadState=loaded\n",
