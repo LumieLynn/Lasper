@@ -1,6 +1,7 @@
 pub mod inspection;
 pub mod machine;
 pub mod nvidia;
+pub mod oci;
 pub mod runtime;
 pub mod secret;
 pub mod session;

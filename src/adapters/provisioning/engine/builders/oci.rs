@@ -11,8 +11,9 @@ use crate::adapters::provisioning::engine::{
 };
 use crate::application::provisioning::DeploymentResource;
 use crate::domain::machine::MachineName;
+use crate::domain::oci::OciReference;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, OciNetworkMode, OciReference};
+use crate::nspawn::models::{ContainerConfig, OciNetworkMode};
 
 pub struct OciDeployer {
     pub reference: String,

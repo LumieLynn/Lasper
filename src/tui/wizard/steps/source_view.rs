@@ -1,4 +1,5 @@
 use crate::application::provisioning::HostCapability;
+use crate::domain::oci::OciReference;
 use crate::nspawn::models::{OciNetworkMode, RootfsSourceSpec};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
@@ -122,7 +123,7 @@ impl SourceStepView {
             )
             .with_validator(|v| {
                 let v = v.trim();
-                crate::nspawn::models::OciReference::new(v)
+                OciReference::new(v)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }),
