@@ -14,8 +14,7 @@ use crate::ipc::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
 };
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -37,28 +36,6 @@ pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
             "lasper daemon must run as root",
         ))
     }
-}
-
-pub(super) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
-    let pid = libc::pid_t::try_from(pid).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "parent PID is out of range",
-        )
-    })?;
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-    let flags = unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(pidfd)
 }
 
 fn monitor_parent(pidfd: OwnedFd, state: Arc<DaemonServerState>) -> std::io::Result<()> {
@@ -186,7 +163,7 @@ pub async fn daemon_main(
         std::process::exit(1);
     }
     let server_state = Arc::new(DaemonServerState::default());
-    let parent_pidfd = match open_pidfd(expected_parent_pid) {
+    let parent_pidfd = match crate::adapters::process::open_pidfd(expected_parent_pid) {
         Ok(pidfd) => pidfd,
         Err(error) => {
             log::error!("Daemon: failed to pin launching TUI process: {error}");

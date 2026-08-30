@@ -2,6 +2,7 @@ use super::dispatch::handler::*;
 use super::dispatch::*;
 use super::server::logging::*;
 use super::server::*;
+use crate::adapters::process::open_pidfd;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
 use crate::adapters::system_operation::{SystemOperation, SystemOperationError};

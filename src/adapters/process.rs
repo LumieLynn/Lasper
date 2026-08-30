@@ -1,6 +1,7 @@
 //! Command builder helpers.
 
 use std::future::Future;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
@@ -139,6 +140,33 @@ pub(crate) fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()>
             Err(error)
         }
     }
+}
+
+/// Open a pidfd that pins the kernel identity of `pid`.
+///
+/// The descriptor is useful for liveness checks and parent monitoring. It does
+/// not make a later `kill(-pid, ...)` process-group operation atomic; callers
+/// must keep that residual race explicit in their ownership policy.
+pub(crate) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process PID is out of range",
+        )
+    })?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let flags = unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pidfd)
 }
 
 /// Trait abstracting over command execution.

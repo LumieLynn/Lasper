@@ -16,7 +16,7 @@ Each daemon session uses:
 - Mutually authenticated control and FD-passing Unix sockets owned by the invoking user with mode `0600`.
 - Kernel `SO_PEERCRED` checks: the daemon requires the exact launching TUI PID/UID, while the TUI requires a root daemon peer.
 - A random per-session token negotiated only after the control connection is authenticated and required on FD-passing requests.
-- A Linux pidfd monitor that terminates the daemon and its tracked child process groups when the launching TUI exits; direct command children also receive a kernel parent-death signal.
+- A Linux pidfd monitor that terminates the daemon and its tracked child process groups when the launching TUI exits; direct command children also receive a kernel parent-death signal. Session pidfds pin the tracked leader for liveness checks, while process-group escalation still uses a separately revalidated numeric group ID and is not an atomic replacement for cgroup ownership.
 - Bounded protocol frames, authenticated FD setup timeouts, a concurrent FD-connection limit, and rate-limited authentication diagnostics.
 - Structured request messages instead of delimiter-based command strings.
 
