@@ -6,6 +6,7 @@ use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOpe
 use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineRejection, MachineRuntimeAction, NspawnUnitAction,
 };
+use crate::application::runtime::RuntimeResult;
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
@@ -22,8 +23,8 @@ pub(crate) enum HandleOutcome {
 /// still being migrated.
 #[async_trait::async_trait]
 pub(crate) trait DaemonDbusExecutor: Send + Sync {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<MachineEntry>>;
-    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>>;
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
+    async fn list_images(&self) -> RuntimeResult<Vec<ImageEntry>>;
     async fn system_operation(
         &self,
         operation: SystemOperation,
@@ -71,18 +72,22 @@ pub(crate) trait DaemonDbusExecutor: Send + Sync {
             Err(error) => map_machine_control_error(error),
         }
     }
-    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties>;
+    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties>;
     async fn is_available(&self) -> bool;
 }
 
 #[async_trait::async_trait]
 impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<MachineEntry>> {
-        RuntimeSource::list_machines(self).await
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
+        RuntimeSource::list_machines(self)
+            .await
+            .map_err(crate::adapters::runtime::map_runtime_error)
     }
 
-    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
-        RuntimeSource::list_images(self).await
+    async fn list_images(&self) -> RuntimeResult<Vec<ImageEntry>> {
+        RuntimeSource::list_images(self)
+            .await
+            .map_err(crate::adapters::runtime::map_runtime_error)
     }
 
     async fn system_operation(
@@ -92,8 +97,10 @@ impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
         execute_dbus_system_operation(self, operation).await
     }
 
-    async fn get_properties(&self, name: &str) -> crate::nspawn::errors::Result<MachineProperties> {
-        RuntimeSource::get_properties(self, name).await
+    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties> {
+        RuntimeSource::get_properties(self, name)
+            .await
+            .map_err(crate::adapters::runtime::map_runtime_error)
     }
 
     async fn is_available(&self) -> bool {

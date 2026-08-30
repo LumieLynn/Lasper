@@ -139,7 +139,7 @@ impl RuntimePort for SourceRuntimePort {
     }
 }
 
-fn map_runtime_error(error: NspawnError) -> RuntimeError {
+pub(crate) fn map_runtime_error(error: NspawnError) -> RuntimeError {
     let message = error.to_string();
     if error.is_polkit_rejection() {
         RuntimeError::permission_denied(message)
