@@ -25,6 +25,7 @@ pub(crate) fn map_system_operation_image_error(error: SystemOperationError) -> I
             reason,
         },
         SystemOperationError::Io { .. } => ImageControlOutcome::NotAttempted { reason },
+        SystemOperationError::OutcomeUnknown(_) => ImageControlOutcome::OutcomeUnknown { reason },
         SystemOperationError::CommandFailed { .. } | SystemOperationError::Backend(_) => {
             ImageControlOutcome::Failed { reason }
         }
@@ -47,6 +48,7 @@ pub(crate) fn map_system_operation_machine_error(
             reason,
         },
         SystemOperationError::Io { .. } => MachineControlOutcome::NotAttempted { reason },
+        SystemOperationError::OutcomeUnknown(_) => MachineControlOutcome::OutcomeUnknown { reason },
         SystemOperationError::CommandFailed { .. } | SystemOperationError::Backend(_) => {
             MachineControlOutcome::Failed { reason }
         }
@@ -90,7 +92,10 @@ pub(crate) fn map_image_control_error(error: NspawnError) -> ImageControlOutcome
                 None => ImageControlOutcome::Failed { reason },
             }
         }
-        NspawnError::Io(_, _) | NspawnError::GenericIo(_) | NspawnError::Dbus(_) => {
+        NspawnError::Io(_, _)
+        | NspawnError::GenericIo(_)
+        | NspawnError::Dbus(_)
+        | NspawnError::SystemOperationOutcomeUnknown(_) => {
             ImageControlOutcome::OutcomeUnknown { reason }
         }
         _ => ImageControlOutcome::Failed { reason },
@@ -267,6 +272,21 @@ mod tests {
         assert!(matches!(
             map_system_operation_image_error(error),
             ImageControlOutcome::Failed { .. }
+        ));
+    }
+
+    #[test]
+    fn mutation_timeout_is_never_treated_as_not_attempted() {
+        let error = SystemOperationError::OutcomeUnknown("deadline exceeded".into());
+        assert!(matches!(
+            map_system_operation_machine_error(error),
+            MachineControlOutcome::OutcomeUnknown { .. }
+        ));
+
+        let error = SystemOperationError::OutcomeUnknown("deadline exceeded".into());
+        assert!(matches!(
+            map_system_operation_image_error(error),
+            ImageControlOutcome::OutcomeUnknown { .. }
         ));
     }
 

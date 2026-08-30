@@ -20,6 +20,7 @@ type EnableUnitFilesBody<'a> = (Vec<&'a str>, bool, bool);
 
 const DBUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DBUS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DBUS_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
     (vec![unit], false, false)
@@ -182,6 +183,34 @@ impl DbusBackend {
         result
     }
 
+    async fn mutation_with_deadline<T, F>(
+        &self,
+        generation: u64,
+        label: &str,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+    {
+        match tokio::time::timeout(DBUS_MUTATION_TIMEOUT, future).await {
+            Ok(result) => {
+                self.observe_result(generation, &result).await;
+                result.map_err(NspawnError::Dbus)
+            }
+            Err(_) => {
+                log::warn!(
+                    "D-Bus mutation {label} exceeded its {}s deadline; its outcome is unknown",
+                    DBUS_MUTATION_TIMEOUT.as_secs()
+                );
+                self.invalidate_connection(generation).await;
+                Err(NspawnError::SystemOperationOutcomeUnknown(format!(
+                    "D-Bus mutation {label} timed out after {}s; reconcile host state before retrying",
+                    DBUS_MUTATION_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
     async fn manager_proxy(&self) -> Option<(u64, ManagerProxy<'static>)> {
         let (generation, connection) = self.connection_lease().await?;
         let result = self
@@ -196,6 +225,10 @@ impl DbusBackend {
                 reason: "systemd-machined D-Bus endpoint is unavailable".into(),
             };
         };
+        // RemoveImage is intentionally exempt from the short-mutation
+        // deadline: machined reports completion only after its potentially
+        // long-running removal helper exits. The image operation holds its
+        // resource claim while this future is pending.
         let result = proxy.remove_image(image.as_str()).await;
         self.observe_result(generation, &result).await;
         match result {
@@ -216,20 +249,27 @@ impl DbusBackend {
             .connection_lease()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let proxy_result = zbus::proxy::Proxy::new(
-            &conn,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .await;
-        self.observe_result(generation, &proxy_result).await;
-        let proxy = proxy_result.map_err(NspawnError::Dbus)?;
-        let result = proxy
-            .call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body)
+        let proxy_result = self
+            .query_with_deadline(
+                generation,
+                "systemd1 manager proxy",
+                zbus::proxy::Proxy::new(
+                    &conn,
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                ),
+            )
             .await;
-        self.observe_result(generation, &result).await;
-        let _: R = result.map_err(NspawnError::Dbus)?.ok_or_else(|| {
+        let proxy = proxy_result.map_err(NspawnError::Dbus)?;
+        let result = self
+            .mutation_with_deadline(
+                generation,
+                method,
+                proxy.call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body),
+            )
+            .await?;
+        let _: R = result.ok_or_else(|| {
             NspawnError::Dbus(zbus::Error::Failure(format!(
                 "no reply from systemd1.Manager.{}",
                 method
@@ -251,9 +291,12 @@ impl DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let result = proxy.terminate_machine(name.as_str()).await;
-        self.observe_result(generation, &result).await;
-        result.map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "TerminateMachine",
+            proxy.terminate_machine(name.as_str()),
+        )
+        .await?;
         Ok(())
     }
 
@@ -263,11 +306,12 @@ impl DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let result = proxy
-            .kill_machine(name.as_str(), "leader", libc::SIGRTMIN() + 4)
-            .await;
-        self.observe_result(generation, &result).await;
-        result.map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine(poweroff)",
+            proxy.kill_machine(name.as_str(), "leader", libc::SIGRTMIN() + 4),
+        )
+        .await?;
         Ok(())
     }
 
@@ -277,11 +321,12 @@ impl DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let result = proxy
-            .kill_machine(name.as_str(), "leader", libc::SIGINT)
-            .await;
-        self.observe_result(generation, &result).await;
-        result.map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine(reboot)",
+            proxy.kill_machine(name.as_str(), "leader", libc::SIGINT),
+        )
+        .await?;
         Ok(())
     }
 
@@ -309,11 +354,12 @@ impl DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let result = proxy
-            .kill_machine(name.as_str(), "all", allowed_signal_number(signal))
-            .await;
-        self.observe_result(generation, &result).await;
-        result.map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine",
+            proxy.kill_machine(name.as_str(), "all", allowed_signal_number(signal)),
+        )
+        .await?;
         Ok(())
     }
 
@@ -326,6 +372,8 @@ impl DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        // See remove_image_outcome: this is an explicitly long operation and
+        // must not turn normal slow removal into a fabricated timeout failure.
         let result = proxy.remove_image(name.as_str()).await;
         self.observe_result(generation, &result).await;
         result.map_err(NspawnError::Dbus)?;

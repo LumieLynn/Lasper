@@ -7,6 +7,9 @@ use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+const SYSTEM_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Source evidence for a typed machinectl/systemctl operation.
 ///
@@ -41,6 +44,9 @@ pub(crate) enum SystemOperationError {
     #[error("D-Bus error: {0}")]
     Dbus(#[source] zbus::Error),
 
+    #[error("system operation outcome is unknown: {0}")]
+    OutcomeUnknown(String),
+
     #[error("system operation failed: {0}")]
     Backend(String),
 }
@@ -74,6 +80,9 @@ impl From<SystemOperationError> for NspawnError {
             } => Self::CommandFailed(context, command, output),
             SystemOperationError::Io { path, source } => Self::Io(path, source),
             SystemOperationError::Dbus(error) => Self::Dbus(error),
+            SystemOperationError::OutcomeUnknown(message) => {
+                Self::SystemOperationOutcomeUnknown(message)
+            }
             SystemOperationError::Backend(message) => Self::Runtime(message),
         }
     }
@@ -99,6 +108,9 @@ fn legacy_system_operation_error(error: NspawnError) -> SystemOperationError {
             source,
         },
         NspawnError::Dbus(error) => SystemOperationError::Dbus(error),
+        NspawnError::SystemOperationOutcomeUnknown(message) => {
+            SystemOperationError::OutcomeUnknown(message)
+        }
         other => SystemOperationError::Backend(other.to_string()),
     }
 }
@@ -250,26 +262,12 @@ pub(crate) async fn execute_cli_image_remove_with_runner(
     image: ImageName,
     runner: &dyn CommandRunner,
 ) -> SystemOperationResult<()> {
-    let operation = SystemOperation::RemoveImage { image };
-    let (program, args) = command(&operation)?;
-    let output =
-        runner
-            .run(program, args.clone())
-            .await
-            .map_err(|source| SystemOperationError::Io {
-                path: PathBuf::from(program),
-                source,
-            })?;
-    crate::adapters::process::log_output(program, &output);
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(SystemOperationError::cmd_failed(
-            "typed image removal",
-            format!("{} {}", program, args.join(" ")),
-            &output,
-        ))
-    }
+    execute_system_operation_with_context(
+        SystemOperation::RemoveImage { image },
+        runner,
+        "typed image removal",
+    )
+    .await
 }
 
 impl std::fmt::Debug for SystemOperationStore {
@@ -362,24 +360,79 @@ pub(crate) async fn execute_system_operation_with_runner(
     operation: SystemOperation,
     runner: &dyn CommandRunner,
 ) -> SystemOperationResult<()> {
+    execute_system_operation_with_context(operation, runner, "typed system operation").await
+}
+
+async fn execute_system_operation_with_context(
+    operation: SystemOperation,
+    runner: &dyn CommandRunner,
+    context: &str,
+) -> SystemOperationResult<()> {
+    let completion = completion_policy(&operation);
     let (program, args) = command(&operation)?;
-    let output =
-        runner
-            .run(program, args.clone())
-            .await
-            .map_err(|source| SystemOperationError::Io {
+    let (output, deadline) = match completion {
+        CommandCompletionPolicy::Bounded(timeout) => (
+            runner.run_bounded(program, args.clone(), timeout).await,
+            Some(timeout),
+        ),
+        CommandCompletionPolicy::WaitForAuthoritativeCompletion => {
+            (runner.run(program, args.clone()).await, None)
+        }
+    };
+    let output = output.map_err(|source| {
+        if source.kind() == std::io::ErrorKind::TimedOut {
+            let timing = deadline
+                .map(|timeout| format!(" exceeded its {}s completion deadline", timeout.as_secs()))
+                .unwrap_or_else(|| " lost its authoritative completion result".into());
+            SystemOperationError::OutcomeUnknown(format!(
+                "{} {}{}; reconcile host state before retrying",
+                program,
+                args.join(" "),
+                timing
+            ))
+        } else {
+            SystemOperationError::Io {
                 path: PathBuf::from(program),
                 source,
-            })?;
+            }
+        }
+    })?;
     crate::adapters::process::log_output(program, &output);
     if output.status.success() {
         Ok(())
     } else {
         Err(SystemOperationError::cmd_failed(
-            "typed system operation",
+            context,
             format!("{} {}", program, args.join(" ")),
             &output,
         ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandCompletionPolicy {
+    Bounded(Duration),
+    WaitForAuthoritativeCompletion,
+}
+
+fn completion_policy(operation: &SystemOperation) -> CommandCompletionPolicy {
+    match operation {
+        // machined intentionally permits image removal to take arbitrarily
+        // long, while clone duration scales with image size. Both are run by
+        // background operations whose resource claims prevent local races.
+        SystemOperation::RemoveImage { .. } | SystemOperation::CloneImage { .. } => {
+            CommandCompletionPolicy::WaitForAuthoritativeCompletion
+        }
+        SystemOperation::Start { .. }
+        | SystemOperation::Terminate { .. }
+        | SystemOperation::Poweroff { .. }
+        | SystemOperation::Reboot { .. }
+        | SystemOperation::Enable { .. }
+        | SystemOperation::Disable { .. }
+        | SystemOperation::Kill { .. }
+        | SystemOperation::ReloadDaemon => {
+            CommandCompletionPolicy::Bounded(SYSTEM_MUTATION_TIMEOUT)
+        }
     }
 }
 
@@ -480,6 +533,30 @@ mod tests {
 
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
         assert!(format!("{store:?}").contains("recording"));
+    }
+
+    #[test]
+    fn completion_policy_separates_short_mutations_from_long_operations() {
+        let machine = MachineName::new("test-machine").unwrap();
+        assert_eq!(
+            completion_policy(&SystemOperation::Start {
+                machine: machine.clone(),
+            }),
+            CommandCompletionPolicy::Bounded(SYSTEM_MUTATION_TIMEOUT)
+        );
+        assert_eq!(
+            completion_policy(&SystemOperation::RemoveImage {
+                image: ImageName::new("test-image").unwrap(),
+            }),
+            CommandCompletionPolicy::WaitForAuthoritativeCompletion
+        );
+        assert_eq!(
+            completion_policy(&SystemOperation::CloneImage {
+                source: ImageName::new("base").unwrap(),
+                destination: ImageName::new("clone").unwrap(),
+            }),
+            CommandCompletionPolicy::WaitForAuthoritativeCompletion
+        );
     }
 
     #[test]
@@ -591,6 +668,39 @@ mod tests {
         assert!(matches!(
             execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
             Err(SystemOperationError::CommandFailed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn short_cli_mutation_timeout_preserves_unknown_outcome() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
+                program == "systemctl"
+                    && args.iter().map(String::as_str).eq(["--", "daemon-reload"])
+                    && *timeout == SYSTEM_MUTATION_TIMEOUT
+            })
+            .returning(|_, _, _| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "deadline exceeded",
+                ))
+            });
+
+        assert!(matches!(
+            execute_system_operation_with_runner(SystemOperation::ReloadDaemon, &runner).await,
+            Err(SystemOperationError::OutcomeUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_unknown_outcome_keeps_its_semantics() {
+        assert!(matches!(
+            legacy_system_operation_error(NspawnError::SystemOperationOutcomeUnknown(
+                "deadline exceeded".into()
+            )),
+            SystemOperationError::OutcomeUnknown(_)
         ));
     }
 

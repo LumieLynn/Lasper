@@ -60,6 +60,9 @@ pub enum NspawnError {
     #[error("Deployment process state is unknown: {0}")]
     DeploymentProcessStateUnknown(String),
 
+    #[error("System operation outcome is unknown: {0}")]
+    SystemOperationOutcomeUnknown(String),
+
     #[error("Deployment rollback incomplete: {0}")]
     DeploymentRollbackIncomplete(String),
 

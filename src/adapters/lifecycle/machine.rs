@@ -529,12 +529,13 @@ mod tests {
     async fn cli_control_uses_fixed_typed_command() {
         let mut runner = MockCommandRunner::new();
         runner
-            .expect_run()
-            .withf(|program, args| {
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
                 program == "machinectl"
                     && args.iter().map(String::as_str).eq(["--", "start", "test"])
+                    && *timeout == std::time::Duration::from_secs(60)
             })
-            .returning(|_, _| Ok(success()));
+            .returning(|_, _, _| Ok(success()));
 
         let outcome = execute_cli_machine_control_with_runner(
             MachineName::new("test").unwrap(),
@@ -551,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn cli_launch_failure_is_explicitly_not_attempted() {
         let mut runner = MockCommandRunner::new();
-        runner.expect_run().returning(|_, _| {
+        runner.expect_run_bounded().returning(|_, _, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "machinectl missing",
@@ -570,6 +571,29 @@ mod tests {
         assert!(matches!(
             outcome,
             MachineControlOutcome::NotAttempted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cli_mutation_timeout_has_unknown_outcome() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run_bounded().returning(|_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline exceeded",
+            ))
+        });
+
+        let outcome = execute_cli_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff),
+            &runner,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            MachineControlOutcome::OutcomeUnknown { .. }
         ));
     }
 
