@@ -5,10 +5,11 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
 use crate::domain::machine::MachineName;
+use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig, NspawnConfigSpec, OciNetworkMode};
+use crate::nspawn::models::{ApplyStatus, ContainerConfig, NspawnConfigSpec};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -1057,16 +1058,9 @@ async fn validate_wayland_socket_target(path: &Path) -> Result<ObservedWaylandSo
 
 fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGrant) -> Result<()> {
     let expected_policy = match spec.private_users {
-        Some(crate::nspawn::models::PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
-        None
-        | Some(
-            crate::nspawn::models::PrivateUsersMode::Yes
-            | crate::nspawn::models::PrivateUsersMode::Pick,
-        ) => WaylandBindPolicy::Idmap,
-        Some(
-            crate::nspawn::models::PrivateUsersMode::Managed
-            | crate::nspawn::models::PrivateUsersMode::Identity,
-        ) => {
+        Some(PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
+        None | Some(PrivateUsersMode::Yes | PrivateUsersMode::Pick) => WaylandBindPolicy::Idmap,
+        Some(PrivateUsersMode::Managed | PrivateUsersMode::Identity) => {
             return Err(NspawnError::Validation(
                 "Wayland grant uses an unsupported PrivateUsers mode".into(),
             ));
@@ -1095,8 +1089,8 @@ fn invoking_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::provisioning::{BindMount, IdmapSuffix};
     use crate::domain::wayland::WaylandSocketAccess;
-    use crate::nspawn::models::IdmapSuffix;
 
     struct StubNspawnConfigExecutor;
 
@@ -1583,7 +1577,7 @@ Unknown=preserve-me\n";
         let missing = directory.path().join("missing");
         let config = ContainerConfig {
             name: "test".into(),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            bind_mounts: vec![BindMount {
                 source: missing.to_string_lossy().into_owned(),
                 target: "/srv/data".into(),
                 readonly: false,
@@ -1616,8 +1610,8 @@ Unknown=preserve-me\n";
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
         let config = ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Yes),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            private_users: Some(PrivateUsersMode::Yes),
+            bind_mounts: vec![BindMount {
                 source: symlink.to_string_lossy().into_owned(),
                 target: "/srv/data".into(),
                 readonly: true,
@@ -1765,7 +1759,7 @@ Unknown=preserve-me\n";
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1814,7 +1808,7 @@ Unknown=preserve-me\n";
         let grant = resolved_wayland_grant(source, WaylandBindPolicy::Idmap);
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1833,7 +1827,7 @@ Unknown=preserve-me\n";
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::No),
+            private_users: Some(PrivateUsersMode::No),
             ..Default::default()
         })
         .unwrap();
@@ -1885,7 +1879,7 @@ Unknown=preserve-me\n";
         std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1918,7 +1912,7 @@ Unknown=preserve-me\n";
         std::fs::write(runtime.path().join("wayland-0"), b"not a socket").unwrap();
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1951,7 +1945,7 @@ Unknown=preserve-me\n";
         let _replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let spec = NspawnConfigSpec::try_from(&ContainerConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();

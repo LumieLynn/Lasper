@@ -1,3 +1,5 @@
+use crate::domain::provisioning::{BindMount, PortForward};
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, PartialEq)]
 pub enum AppMessage {
@@ -24,9 +26,9 @@ pub enum WizardMessage {
     OpenUserDialog,
     OpenUserEditDialog(usize, crate::tui::wizard::core::draft::UserDraft),
     OpenPortDialog,
-    OpenPortEditDialog(usize, crate::nspawn::models::PortForward),
+    OpenPortEditDialog(usize, PortForward),
     OpenBindDialog,
-    OpenBindEditDialog(usize, crate::nspawn::models::BindMount),
+    OpenBindEditDialog(usize, BindMount),
     OpenNvidiaConfigDialog,
     NvidiaConfigSaved(crate::tui::widgets::dialogs::nvidia_config::NvidiaConfigResult),
     WaylandAccessConfigured(crate::tui::wizard::core::draft::WaylandAccessDraft),
@@ -36,11 +38,11 @@ pub enum WizardMessage {
     UserAdded(crate::tui::wizard::core::draft::UserDraft),
     UserUpdated(usize, crate::tui::wizard::core::draft::UserDraft),
     UserRemoved(usize),
-    PortForwardAdded(crate::nspawn::models::PortForward),
-    PortForwardUpdated(usize, crate::nspawn::models::PortForward),
+    PortForwardAdded(PortForward),
+    PortForwardUpdated(usize, PortForward),
     PortForwardRemoved(usize),
-    BindMountAdded(crate::nspawn::models::BindMount),
-    BindMountUpdated(usize, crate::nspawn::models::BindMount),
+    BindMountAdded(BindMount),
+    BindMountUpdated(usize, BindMount),
     BindMountRemoved(usize),
     UnclassifiedFileUpdated(usize, crate::tui::wizard::core::draft::UnclassifiedFile),
 }

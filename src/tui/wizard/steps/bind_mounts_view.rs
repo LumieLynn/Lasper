@@ -1,5 +1,5 @@
 use crate::domain::nvidia::NvidiaPassthroughMode;
-use crate::nspawn::models::{BindMount, IdmapSuffix};
+use crate::domain::provisioning::{BindMount, IdmapSuffix};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::dialogs::bind_mount::idmap_suffix_label;
 use crate::tui::widgets::display::text_block::TextBlock;

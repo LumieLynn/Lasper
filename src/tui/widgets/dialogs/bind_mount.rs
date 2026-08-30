@@ -1,4 +1,4 @@
-use crate::nspawn::models::{BindMount, IdmapSuffix};
+use crate::domain::provisioning::{BindMount, IdmapSuffix};
 use crate::tui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::tui::widgets::inputs::button::Button;

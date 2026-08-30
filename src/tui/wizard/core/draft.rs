@@ -3,14 +3,15 @@ use crate::application::provisioning::{
     DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot, ProvisioningHostSnapshot,
     StorageBackendKind, UserSecret,
 };
+use crate::domain::provisioning::{
+    BindMount, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
+};
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::domain::secret::zeroize_string;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
+use crate::nspawn::models::CreateUser;
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
-};
-use crate::nspawn::models::{
-    BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
 };
 use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use std::sync::Arc;

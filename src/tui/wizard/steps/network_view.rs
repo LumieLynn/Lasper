@@ -1,4 +1,4 @@
-use crate::nspawn::models::{NetworkMode, PortForward};
+use crate::domain::provisioning::{NetworkMode, PortForward};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::inputs::text_box::TextBox;
 use crate::tui::widgets::lists::editable_list::EditableList;

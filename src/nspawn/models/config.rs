@@ -1,137 +1,7 @@
+use crate::domain::provisioning::{BindMount, NetworkMode, PortForward, PrivateUsersMode};
 use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path};
-
-/// Represents the network configuration for a container.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-pub enum NetworkMode {
-    /// Share the host's network namespace.
-    Host,
-    /// Private network namespace with no connectivity (unless manually configured).
-    None,
-    /// Virtual Ethernet pair (veth).
-    #[default]
-    Veth,
-    /// Connect to a specific host bridge.
-    Bridge(String),
-    /// MACVLAN mode (virtual independent MAC).
-    MacVlan(String),
-    /// IPVLAN mode (sharing host MAC).
-    IpVlan(String),
-    /// Physical interface passthrough.
-    Interface(String),
-}
-
-impl NetworkMode {
-    /// Whether this mode creates or joins a network namespace separate from the host.
-    pub fn is_private(&self) -> bool {
-        !matches!(self, Self::Host)
-    }
-
-    /// Whether Lasper relies on the guest's default networkd/resolved setup.
-    pub const fn uses_default_guest_network_stack(&self) -> bool {
-        matches!(self, Self::Veth | Self::Bridge(_))
-    }
-
-    /// Whether Lasper exposes and emits `[Network] Port=` forwarding rules.
-    pub const fn supports_port_forwarding(&self) -> bool {
-        matches!(self, Self::Veth | Self::Bridge(_))
-    }
-}
-
-/// Network modes exposed for system-scoped OCI application imports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum OciNetworkMode {
-    /// Share the host network namespace.
-    #[default]
-    Host,
-    /// Create a private network namespace with loopback only.
-    Isolated,
-    /// Create a veth pair connected to a private network namespace.
-    Veth,
-}
-
-impl OciNetworkMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::Isolated => "isolated",
-            Self::Veth => "veth",
-        }
-    }
-
-    pub fn into_network_mode(self) -> NetworkMode {
-        match self {
-            Self::Host => NetworkMode::Host,
-            Self::Isolated => NetworkMode::None,
-            Self::Veth => NetworkMode::Veth,
-        }
-    }
-}
-
-/// User namespace modes accepted by systemd-nspawn's `PrivateUsers=` setting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PrivateUsersMode {
-    Yes,
-    No,
-    Pick,
-    Identity,
-    Managed,
-}
-
-impl PrivateUsersMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Yes => "yes",
-            Self::No => "no",
-            Self::Pick => "pick",
-            Self::Identity => "identity",
-            Self::Managed => "managed",
-        }
-    }
-}
-
-/// A port forwarding rule (host -> container).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PortForward {
-    pub host: u16,
-    pub container: u16,
-    pub proto: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum IdmapSuffix {
-    #[default]
-    None,
-    Noidmap,
-    Idmap,
-    Rootidmap,
-    Owneridmap,
-}
-
-impl std::fmt::Display for IdmapSuffix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IdmapSuffix::None => write!(f, ""),
-            IdmapSuffix::Noidmap => write!(f, ":noidmap"),
-            IdmapSuffix::Idmap => write!(f, ":idmap"),
-            IdmapSuffix::Rootidmap => write!(f, ":rootidmap"),
-            IdmapSuffix::Owneridmap => write!(f, ":owneridmap"),
-        }
-    }
-}
-
-/// A host path to bind-mount into the container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BindMount {
-    pub source: String,
-    pub target: String,
-    pub readonly: bool,
-    #[serde(default)]
-    pub suffix: IdmapSuffix,
-}
 
 /// User configuration to be applied after the container is bootstrapped.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,15 +381,6 @@ mod tests {
     }
 
     #[test]
-    fn test_idmap_suffix_display() {
-        assert_eq!(IdmapSuffix::None.to_string(), "");
-        assert_eq!(IdmapSuffix::Idmap.to_string(), ":idmap");
-        assert_eq!(IdmapSuffix::Noidmap.to_string(), ":noidmap");
-        assert_eq!(IdmapSuffix::Rootidmap.to_string(), ":rootidmap");
-        assert_eq!(IdmapSuffix::Owneridmap.to_string(), ":owneridmap");
-    }
-
-    #[test]
     fn disk_image_size_parser_accepts_bounded_integer_units() {
         assert_eq!(parse_disk_image_size("500M").unwrap(), 500 * 1024 * 1024);
         assert_eq!(
@@ -606,37 +467,5 @@ mod tests {
         let json = serde_json::to_string(&cfg).unwrap();
         let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, cfg2);
-    }
-
-    #[test]
-    fn oci_network_mode_maps_to_supported_nspawn_modes() {
-        assert_eq!(OciNetworkMode::Host.into_network_mode(), NetworkMode::Host);
-        assert_eq!(
-            OciNetworkMode::Isolated.into_network_mode(),
-            NetworkMode::None
-        );
-        assert_eq!(OciNetworkMode::Veth.into_network_mode(), NetworkMode::Veth);
-    }
-
-    #[test]
-    fn only_veth_based_modes_use_the_default_guest_network_stack() {
-        assert!(NetworkMode::Veth.uses_default_guest_network_stack());
-        assert!(NetworkMode::Bridge("br0".into()).uses_default_guest_network_stack());
-        assert!(!NetworkMode::Host.uses_default_guest_network_stack());
-        assert!(!NetworkMode::None.uses_default_guest_network_stack());
-        assert!(!NetworkMode::MacVlan("eth0".into()).uses_default_guest_network_stack());
-        assert!(!NetworkMode::IpVlan("eth0".into()).uses_default_guest_network_stack());
-        assert!(!NetworkMode::Interface("eth0".into()).uses_default_guest_network_stack());
-    }
-
-    #[test]
-    fn only_veth_and_bridge_modes_support_port_forwarding() {
-        assert!(NetworkMode::Veth.supports_port_forwarding());
-        assert!(NetworkMode::Bridge("br0".into()).supports_port_forwarding());
-        assert!(!NetworkMode::Host.supports_port_forwarding());
-        assert!(!NetworkMode::None.supports_port_forwarding());
-        assert!(!NetworkMode::MacVlan("eth0".into()).supports_port_forwarding());
-        assert!(!NetworkMode::IpVlan("eth0".into()).supports_port_forwarding());
-        assert!(!NetworkMode::Interface("eth0".into()).supports_port_forwarding());
     }
 }

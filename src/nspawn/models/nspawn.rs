@@ -1,8 +1,7 @@
+use super::config::ContainerConfig;
 use crate::domain::machine::{GuestHostname, MachineName};
+use crate::domain::provisioning::{BindMount, NetworkMode, PortForward, PrivateUsersMode};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BindMount, ContainerConfig, NetworkMode, PortForward, PrivateUsersMode,
-};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 

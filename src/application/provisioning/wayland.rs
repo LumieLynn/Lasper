@@ -1,8 +1,8 @@
 use super::DeploymentError;
+use crate::domain::provisioning::PrivateUsersMode;
 use crate::domain::wayland::{
     ContainerUserIdentity, WaylandBindPolicy, WaylandGrant, WaylandGrantIntent,
 };
-use crate::nspawn::models::PrivateUsersMode;
 
 pub(crate) fn validate_wayland_intent(
     intent: &WaylandGrantIntent,

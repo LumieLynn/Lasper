@@ -1,6 +1,7 @@
 use crate::application::provisioning::{
     DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
 };
+use crate::domain::provisioning::NetworkMode;
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::tui::wizard::core::draft::{SourceKind, WizardDraft};
@@ -518,12 +519,10 @@ impl Wizard {
                 if self.step == WizardStep::Network {
                     let mode = self.draft.network.network_mode();
                     let (name, is_bridge) = match mode {
-                        Some(crate::nspawn::models::NetworkMode::Bridge(n)) => (Some(n), true),
-                        Some(crate::nspawn::models::NetworkMode::MacVlan(n))
-                        | Some(crate::nspawn::models::NetworkMode::IpVlan(n))
-                        | Some(crate::nspawn::models::NetworkMode::Interface(n)) => {
-                            (Some(n), false)
-                        }
+                        Some(NetworkMode::Bridge(n)) => (Some(n), true),
+                        Some(NetworkMode::MacVlan(n))
+                        | Some(NetworkMode::IpVlan(n))
+                        | Some(NetworkMode::Interface(n)) => (Some(n), false),
                         _ => (None, false),
                     };
 

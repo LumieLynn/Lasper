@@ -1,5 +1,5 @@
 use crate::application::provisioning::HostGpuDevice;
-use crate::nspawn::models::{NetworkMode, PrivateUsersMode};
+use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::lists::checklist::Checklist;

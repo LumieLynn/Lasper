@@ -351,7 +351,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
 
     //[Network]
     if let Some(mode) = &spec.network {
-        use crate::nspawn::models::NetworkMode;
+        use crate::domain::provisioning::NetworkMode;
         match mode {
             NetworkMode::Host => {
                 conf.with_section(Some("Network"))
@@ -526,13 +526,14 @@ fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::provisioning::{BindMount, IdmapSuffix};
     use crate::nspawn::models::ContainerConfig;
 
     fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
         let spec = NspawnConfigSpec::try_from(cfg)?;
         nspawn_config_content_from_spec_with_wayland_binds(&spec, &[])
     }
-    use crate::nspawn::models::{NetworkMode, PortForward, PrivateUsersMode};
+    use crate::domain::provisioning::{NetworkMode, PortForward, PrivateUsersMode};
 
     // Validation
 
@@ -799,7 +800,7 @@ mod tests {
     fn test_nspawn_config_content_private_users_managed() {
         let cfg = ContainerConfig {
             name: "test".to_string(),
-            network: Some(crate::nspawn::models::NetworkMode::None),
+            network: Some(NetworkMode::None),
             private_users: Some(PrivateUsersMode::Managed),
             ..Default::default()
         };
@@ -908,7 +909,7 @@ mod tests {
 
     #[test]
     fn ordinary_binds_escape_colons_and_backslashes() {
-        use crate::nspawn::models::{BindMount, IdmapSuffix};
+        use crate::domain::provisioning::{BindMount, IdmapSuffix};
 
         let cfg = ContainerConfig {
             name: "test".into(),
@@ -957,7 +958,7 @@ mod tests {
     fn wayland_passthrough_binds_only_the_verified_socket() {
         let cfg = ContainerConfig {
             name: "test".into(),
-            network: Some(crate::nspawn::models::NetworkMode::Veth),
+            network: Some(NetworkMode::Veth),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
@@ -1010,11 +1011,11 @@ mod tests {
         let cfg = ContainerConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            bind_mounts: vec![BindMount {
                 source: "/srv/custom-socket".into(),
                 target: "/run/lasper/wayland/1000/custom".into(),
                 readonly: false,
-                suffix: crate::nspawn::models::IdmapSuffix::Noidmap,
+                suffix: IdmapSuffix::Noidmap,
             }],
             ..Default::default()
         };

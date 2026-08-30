@@ -9,6 +9,7 @@ use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
     DeploymentStage, ResourceDisposition,
 };
+use crate::domain::provisioning::PrivateUsersMode;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 
@@ -423,7 +424,7 @@ async fn run_deploy_internal(
             cancellation.checkpoint()?;
         }
 
-        if cfg.private_users == Some(crate::nspawn::models::PrivateUsersMode::No) {
+        if cfg.private_users == Some(PrivateUsersMode::No) {
             log::warn!("[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled.", name);
             push_log!("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
         }
