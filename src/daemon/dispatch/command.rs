@@ -23,9 +23,11 @@ use crate::application::image_lifecycle::{
     ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
 };
 use crate::application::machine_lifecycle::{
-    MachineControlOutcome, MachineControlTransport, MachineRuntimeControlRequest,
-    NspawnLaunchRequest, NspawnUnitControlRequest,
+    validate_nspawn_runtime_entry, MachineControlOutcome, MachineControlTransport,
+    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
 };
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::MachineEntry;
 use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
@@ -253,6 +255,13 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
                     )));
                 }
             };
+            if let Err(outcome) =
+                validate_runtime_target(&request.machine, request.transport, dbus).await
+            {
+                return HandleOutcome::Sync(
+                    serde_json::to_value(outcome).map_err(|error| error.to_string()),
+                );
+            }
             let outcome = match request.transport {
                 MachineControlTransport::Dbus => match dbus.as_ref() {
                     Some(dbus) => {
@@ -344,9 +353,74 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
     }
 }
 
+/// Re-read the machined registration at the privileged boundary before a
+/// runtime mutation. A client-provided machine name is not proof that the
+/// target is an nspawn container; VM and foreign-provider registrations must
+/// remain visible but read-only even if a caller bypasses the TUI.
+async fn validate_runtime_target<B: DaemonDbusExecutor>(
+    machine: &MachineName,
+    transport: MachineControlTransport,
+    dbus: &Option<B>,
+) -> Result<(), MachineControlOutcome> {
+    let entries = match transport {
+        MachineControlTransport::Dbus => {
+            let Some(dbus) = dbus.as_ref() else {
+                return Err(MachineControlOutcome::NotAttempted {
+                    reason: "D-Bus backend is unavailable".into(),
+                });
+            };
+            dbus.list_machines()
+                .await
+                .map_err(|error| MachineControlOutcome::NotAttempted {
+                    reason: format!("could not verify machine registration: {error}"),
+                })?
+        }
+        MachineControlTransport::Cli => {
+            crate::adapters::runtime::state::list_machines_at(crate::paths::runtime_machines_dir())
+                .await
+                .map_err(|error| MachineControlOutcome::NotAttempted {
+                    reason: format!("could not verify machine registration: {error}"),
+                })?
+        }
+    };
+
+    validate_runtime_entries(&entries, machine)
+}
+
+fn validate_runtime_entries(
+    entries: &[MachineEntry],
+    machine: &MachineName,
+) -> Result<(), MachineControlOutcome> {
+    let Some(entry) = entries.iter().find(|entry| entry.name == machine.as_str()) else {
+        return Err(MachineControlOutcome::Rejected {
+            rejection: crate::application::machine_lifecycle::MachineRejection::NotFound,
+            reason: format!("machine '{}' is not registered with machined", machine),
+        });
+    };
+
+    validate_nspawn_runtime_entry(entry).map_err(|rejection| MachineControlOutcome::Rejected {
+        reason: format!(
+            "machine '{}' cannot be controlled by nspawn route: {rejection}",
+            machine
+        ),
+        rejection,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn machine(name: &str, class: &str, service: &str) -> MachineEntry {
+        MachineEntry {
+            name: name.into(),
+            class: class.into(),
+            service: service.into(),
+            state: crate::domain::runtime::MachineState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        }
+    }
 
     #[test]
     fn command_inventory_excludes_query_job_and_session_methods() {
@@ -367,5 +441,40 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn runtime_validation_rejects_foreign_registrations_without_host_calls() {
+        let target = MachineName::new("guest").unwrap();
+        let vm = machine("guest", "vm", "systemd-vmspawn");
+        let result = validate_runtime_entries(&[vm], &target);
+        assert!(matches!(
+            result,
+            Err(MachineControlOutcome::Rejected {
+                rejection: crate::application::machine_lifecycle::MachineRejection::Unsupported,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn runtime_validation_accepts_only_the_exact_nspawn_registration() {
+        let target = MachineName::new("guest").unwrap();
+        let nspawn = machine("guest", "container", "systemd-nspawn");
+        assert!(validate_runtime_entries(&[nspawn], &target).is_ok());
+    }
+
+    #[test]
+    fn runtime_validation_distinguishes_an_unregistered_machine() {
+        let target = MachineName::new("missing").unwrap();
+        let result =
+            validate_runtime_entries(&[machine("other", "container", "systemd-nspawn")], &target);
+        assert!(matches!(
+            result,
+            Err(MachineControlOutcome::Rejected {
+                rejection: crate::application::machine_lifecycle::MachineRejection::NotFound,
+                ..
+            })
+        ));
     }
 }

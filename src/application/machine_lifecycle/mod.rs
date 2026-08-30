@@ -350,12 +350,7 @@ impl MachineLifecycleService {
         entry: &MachineEntry,
         action: MachineRuntimeAction,
     ) -> Result<MachineOperation, MachineRejection> {
-        if !entry.is_nspawn() {
-            return Err(MachineRejection::Unsupported);
-        }
-        if !entry.state.accepts_runtime_actions() {
-            return Err(MachineRejection::NotRunning);
-        }
+        validate_nspawn_runtime_entry(entry)?;
         let machine = entry
             .validated_name()
             .map_err(|_| MachineRejection::InvalidTarget)?;
@@ -561,6 +556,21 @@ impl MachineLifecycleService {
             machine, details, evidence.journal_command
         )
     }
+}
+
+/// Validate the observed registration before a nspawn-only runtime mutation.
+///
+/// This helper is shared by the application service and the privileged
+/// dispatcher. The latter receives a wire request without the TUI's snapshot,
+/// so it must independently obtain and validate the current registration.
+pub(crate) fn validate_nspawn_runtime_entry(entry: &MachineEntry) -> Result<(), MachineRejection> {
+    if !entry.access().is_nspawn() {
+        return Err(MachineRejection::Unsupported);
+    }
+    if !entry.state.accepts_runtime_actions() {
+        return Err(MachineRejection::NotRunning);
+    }
+    Ok(())
 }
 
 fn launch_target(image: &ImageEntry) -> Result<(ImageName, MachineName), MachineRejection> {

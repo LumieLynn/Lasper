@@ -328,10 +328,6 @@ impl MachineEntry {
         self.identity().map(|identity| identity.name().clone())
     }
 
-    pub fn is_nspawn(&self) -> bool {
-        self.access().is_nspawn()
-    }
-
     pub fn access(&self) -> MachineAccess {
         self.identity()
             .map(|identity| identity.access())
@@ -584,7 +580,7 @@ mod tests {
             address: None,
             all_addresses: Vec::new(),
         };
-        assert!(entry.is_nspawn());
+        assert!(entry.access().is_nspawn());
         assert_eq!(entry.identity().unwrap().name().as_str(), "guest");
         assert_eq!(entry.access(), MachineAccess::Nspawn);
     }
