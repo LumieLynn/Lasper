@@ -111,38 +111,6 @@ pub enum IdmapSuffix {
     Owneridmap,
 }
 
-impl IdmapSuffix {
-    pub fn to_index(&self) -> usize {
-        match self {
-            IdmapSuffix::None => 0,
-            IdmapSuffix::Noidmap => 1,
-            IdmapSuffix::Idmap => 2,
-            IdmapSuffix::Rootidmap => 3,
-            IdmapSuffix::Owneridmap => 4,
-        }
-    }
-
-    pub fn from_index(idx: usize) -> Self {
-        match idx {
-            1 => IdmapSuffix::Noidmap,
-            2 => IdmapSuffix::Idmap,
-            3 => IdmapSuffix::Rootidmap,
-            4 => IdmapSuffix::Owneridmap,
-            _ => IdmapSuffix::None,
-        }
-    }
-
-    pub fn label(&self) -> &str {
-        match self {
-            IdmapSuffix::None => "None",
-            IdmapSuffix::Noidmap => "noidmap",
-            IdmapSuffix::Idmap => "idmap",
-            IdmapSuffix::Rootidmap => "rootidmap",
-            IdmapSuffix::Owneridmap => "owneridmap",
-        }
-    }
-}
-
 impl std::fmt::Display for IdmapSuffix {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -549,16 +517,6 @@ mod tests {
         assert_eq!(IdmapSuffix::Noidmap.to_string(), ":noidmap");
         assert_eq!(IdmapSuffix::Rootidmap.to_string(), ":rootidmap");
         assert_eq!(IdmapSuffix::Owneridmap.to_string(), ":owneridmap");
-    }
-
-    #[test]
-    fn test_idmap_suffix_from_index() {
-        assert_eq!(IdmapSuffix::from_index(0), IdmapSuffix::None);
-        assert_eq!(IdmapSuffix::from_index(1), IdmapSuffix::Noidmap);
-        assert_eq!(IdmapSuffix::from_index(2), IdmapSuffix::Idmap);
-        assert_eq!(IdmapSuffix::from_index(3), IdmapSuffix::Rootidmap);
-        assert_eq!(IdmapSuffix::from_index(4), IdmapSuffix::Owneridmap);
-        assert_eq!(IdmapSuffix::from_index(99), IdmapSuffix::None);
     }
 
     #[test]

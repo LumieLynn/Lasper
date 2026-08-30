@@ -1,6 +1,7 @@
 use crate::domain::nvidia::NvidiaPassthroughMode;
 use crate::nspawn::models::{BindMount, IdmapSuffix};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
+use crate::tui::widgets::dialogs::bind_mount::idmap_suffix_label;
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::lists::editable_list::EditableList;
 use crate::tui::widgets::lists::selectable_list::SelectableList;
@@ -72,7 +73,7 @@ impl BindMountsStepView {
                 let suffix_display = if bm.suffix == IdmapSuffix::None {
                     String::new()
                 } else {
-                    format!(" [{}]", bm.suffix.label())
+                    format!(" [{}]", idmap_suffix_label(&bm.suffix))
                 };
                 format!(
                     "  {}:{} ({}){}",
