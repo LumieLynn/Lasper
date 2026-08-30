@@ -20,9 +20,8 @@ pub struct DeploymentPlan {
 impl DeploymentPlan {
     pub(crate) fn build(request: DeploymentRequest) -> Result<Self, DeploymentError> {
         request.validate()?;
-        let target = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?
-            .machine;
+        let target = MachineName::new(request.config.name.clone())
+            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
         let normalized = serde_json::to_vec(&request).map_err(|error| {
             DeploymentError::failed(format!("Could not normalize deployment plan: {error}"))
         })?;

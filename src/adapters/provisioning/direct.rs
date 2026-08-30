@@ -190,6 +190,7 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
                 "deployment plan target no longer matches its configuration",
             ));
         }
+        super::validate_nspawn_config(&config)?;
         let name = config.name.clone();
         let DeploymentBackends { deployer, storage } =
             self.backends(source, storage, allow_unsafe_remote_tar)?;

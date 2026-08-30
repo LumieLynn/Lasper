@@ -1,4 +1,5 @@
 use crate::domain::bootstrap::BootstrapSpec;
+use crate::domain::machine::{GuestHostname, MachineName};
 use crate::domain::nvidia::NvidiaPassthroughProfile;
 use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::source::ArtifactSpec;
@@ -56,7 +57,9 @@ pub struct DeploymentRequest {
 
 impl DeploymentRequest {
     pub(crate) fn validate(&self) -> Result<(), super::job::DeploymentError> {
-        crate::nspawn::models::NspawnConfigSpec::try_from(&self.config)
+        let machine = MachineName::new(self.config.name.clone())
+            .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
+        GuestHostname::resolve(&self.config.guest_hostname, &machine)
             .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
         if let DeploymentSource::Copy { source_name } = &self.source {
             crate::domain::runtime::ImageName::new(source_name).map_err(|error| {

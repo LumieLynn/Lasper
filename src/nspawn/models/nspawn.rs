@@ -84,7 +84,8 @@ impl NspawnConfigSpec {
                 | NetworkMode::MacVlan(name)
                 | NetworkMode::IpVlan(name)
                 | NetworkMode::Interface(name) => {
-                    validate_nspawn_interface_name(name)?;
+                    crate::domain::provisioning::validate_network_interface_name(name)
+                        .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 }
                 NetworkMode::Host | NetworkMode::None | NetworkMode::Veth => {}
             }
@@ -219,32 +220,6 @@ impl TransportProtocol {
             Self::Udp => "udp",
         }
     }
-}
-
-pub(crate) fn validate_nspawn_hostname(value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    GuestHostname::new(value)
-        .map(|_| ())
-        .map_err(|error| NspawnError::Validation(error.to_string()))
-}
-
-pub(crate) fn validate_nspawn_interface_name(value: &str) -> Result<()> {
-    let bytes = value.as_bytes();
-    let valid = !bytes.is_empty()
-        && bytes.len() <= 15
-        && !matches!(value, "." | ".." | "all" | "default")
-        && !bytes.iter().all(u8::is_ascii_digit)
-        && bytes
-            .iter()
-            .all(|byte| (33..=126).contains(byte) && !matches!(*byte, b':' | b'/' | b'%'));
-    if !valid {
-        return Err(NspawnError::Validation(format!(
-            "Invalid network interface name: {value:?}"
-        )));
-    }
-    Ok(())
 }
 
 fn validate_text(label: &str, value: &str, allow_empty: bool) -> Result<()> {
@@ -439,9 +414,12 @@ mod tests {
     #[test]
     fn hostname_validation_matches_nspawn_hostname_rules() {
         for hostname in ["", "host", "Host-01", "host.example"] {
-            assert!(validate_nspawn_hostname(hostname).is_ok(), "{hostname:?}");
+            assert!(
+                GuestHostname::validate_optional(hostname).is_ok(),
+                "{hostname:?}"
+            );
         }
-        assert!(validate_nspawn_hostname(&"a".repeat(64)).is_ok());
+        assert!(GuestHostname::validate_optional(&"a".repeat(64)).is_ok());
 
         for hostname in [
             "host name",
@@ -452,9 +430,12 @@ mod tests {
             "-host",
             "host-",
         ] {
-            assert!(validate_nspawn_hostname(hostname).is_err(), "{hostname:?}");
+            assert!(
+                GuestHostname::validate_optional(hostname).is_err(),
+                "{hostname:?}"
+            );
         }
-        assert!(validate_nspawn_hostname(&"a".repeat(65)).is_err());
+        assert!(GuestHostname::validate_optional(&"a".repeat(65)).is_err());
     }
 
     #[test]
@@ -473,20 +454,24 @@ mod tests {
     fn interface_validation_matches_systemd_ifname_rules() {
         for interface in ["eth0", "br-test", "veth.0", "name@peer"] {
             assert!(
-                validate_nspawn_interface_name(interface).is_ok(),
+                crate::domain::provisioning::validate_network_interface_name(interface).is_ok(),
                 "{interface:?}"
             );
         }
-        assert!(validate_nspawn_interface_name(&"a".repeat(15)).is_ok());
+        assert!(
+            crate::domain::provisioning::validate_network_interface_name(&"a".repeat(15)).is_ok()
+        );
 
         for interface in [
             "", ".", "..", "all", "default", "123", "eth 0", "eth/0", "eth:0", "eth%0", "接口0",
         ] {
             assert!(
-                validate_nspawn_interface_name(interface).is_err(),
+                crate::domain::provisioning::validate_network_interface_name(interface).is_err(),
                 "{interface:?}"
             );
         }
-        assert!(validate_nspawn_interface_name(&"a".repeat(16)).is_err());
+        assert!(
+            crate::domain::provisioning::validate_network_interface_name(&"a".repeat(16)).is_err()
+        );
     }
 }

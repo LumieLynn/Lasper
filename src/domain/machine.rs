@@ -122,6 +122,16 @@ impl GuestHostname {
         }
     }
 
+    /// Validate the optional form used by provisioning forms. An empty value
+    /// means that the machine identity supplies the guest hostname later.
+    pub fn validate_optional(value: &str) -> Result<(), GuestHostnameError> {
+        if value.is_empty() {
+            Ok(())
+        } else {
+            Self::new(value).map(|_| ())
+        }
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

@@ -192,6 +192,7 @@ fn tui_production_does_not_hold_host_transport_or_composition_mode() {
         &[
             "crate::adapters::",
             "crate::daemon::",
+            "crate::nspawn::",
             "ElevatedDaemon",
             "ExecutionContext",
             "CompositionMode",
@@ -199,6 +200,17 @@ fn tui_production_does_not_hold_host_transport_or_composition_mode() {
             "std::os::fd::RawFd",
             "std::os::fd::OwnedFd",
         ],
+    );
+}
+
+#[test]
+fn provisioning_contract_does_not_depend_on_nspawn_models() {
+    let sources = rust_sources("src/application/provisioning");
+
+    assert_absent(
+        "provisioning application contract",
+        &sources,
+        &["crate::nspawn::"],
     );
 }
 

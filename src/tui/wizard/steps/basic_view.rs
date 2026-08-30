@@ -48,7 +48,7 @@ impl BasicStepView {
                 initial_data.guest_hostname.clone(),
             )
             .with_validator(|value| {
-                crate::nspawn::models::validate_nspawn_hostname(value)
+                crate::domain::machine::GuestHostname::validate_optional(value)
                     .map_err(|error| error.to_string())
             }),
             show_hostname,

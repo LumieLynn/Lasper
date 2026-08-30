@@ -517,6 +517,10 @@ pub(crate) async fn submit(
         request,
         secrets,
     } = params;
+    if let Err(error) = crate::adapters::provisioning::validate_nspawn_config(&request.config) {
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
+        return;
+    }
     let plan = match DeploymentPlan::build(request.clone()) {
         Ok(plan) => plan,
         Err(error) => {

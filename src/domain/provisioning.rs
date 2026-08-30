@@ -44,6 +44,36 @@ impl NetworkMode {
     }
 }
 
+/// Validate a host network interface name before it reaches a provider
+/// renderer. Linux interface names are at most fifteen bytes and reserve a
+/// small set of pseudo-device names.
+pub fn validate_network_interface_name(value: &str) -> Result<(), NetworkInterfaceNameError> {
+    let bytes = value.as_bytes();
+    let valid = !bytes.is_empty()
+        && bytes.len() <= 15
+        && !matches!(value, "." | ".." | "all" | "default")
+        && !bytes.iter().all(u8::is_ascii_digit)
+        && bytes
+            .iter()
+            .all(|byte| (33..=126).contains(byte) && !matches!(*byte, b':' | b'/' | b'%'));
+    if valid {
+        Ok(())
+    } else {
+        Err(NetworkInterfaceNameError(value.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkInterfaceNameError(String);
+
+impl fmt::Display for NetworkInterfaceNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Invalid network interface name: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for NetworkInterfaceNameError {}
+
 /// Network modes supported by the system-scoped OCI import operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -312,6 +342,19 @@ mod tests {
         assert!(!NetworkMode::MacVlan("eth0".into()).supports_port_forwarding());
         assert!(!NetworkMode::IpVlan("eth0".into()).supports_port_forwarding());
         assert!(!NetworkMode::Interface("eth0".into()).supports_port_forwarding());
+    }
+
+    #[test]
+    fn network_interface_names_follow_linux_constraints() {
+        for interface in ["eth0", "br-test", "veth.0", "name@peer"] {
+            assert!(validate_network_interface_name(interface).is_ok());
+        }
+        for interface in [
+            "", ".", "..", "all", "default", "123", "eth 0", "eth/0", "eth:0", "eth%0", "接口0",
+        ] {
+            assert!(validate_network_interface_name(interface).is_err());
+        }
+        assert!(validate_network_interface_name(&"a".repeat(16)).is_err());
     }
 
     #[test]
