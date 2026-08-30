@@ -1,5 +1,9 @@
 //! Application-owned machine lifecycle workflow and transition projection.
 
+mod error;
+
+pub use error::MachinePreparationError;
+
 use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
@@ -246,7 +250,7 @@ pub trait MachineControl: Send + Sync + 'static {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait MachineStartPreparation: Send + Sync + 'static {
-    async fn prepare(&self, machine: &MachineName) -> Result<(), String>;
+    async fn prepare(&self, machine: &MachineName) -> Result<(), MachinePreparationError>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -612,8 +616,22 @@ impl MachineOperationKind {
 impl MachineOperation {
     pub async fn run(mut self) -> MachineLifecycleOutcome {
         if matches!(self.kind, MachineOperationKind::Launch { .. }) {
-            if let Err(reason) = self.service.preparation.prepare(&self.machine).await {
-                return self.outcome(MachineLifecycleResult::Failed(reason), None, None);
+            if let Err(error) = self.service.preparation.prepare(&self.machine).await {
+                let reason = error.to_string();
+                let result = if error.is_permission_denied() {
+                    MachineLifecycleResult::Rejected {
+                        rejection: MachineRejection::PermissionDenied,
+                        reason,
+                    }
+                } else if error.is_invalid_configuration() {
+                    MachineLifecycleResult::Rejected {
+                        rejection: MachineRejection::InvalidTarget,
+                        reason,
+                    }
+                } else {
+                    MachineLifecycleResult::Failed(reason)
+                };
+                return self.outcome(result, None, None);
             }
         }
 
@@ -971,6 +989,37 @@ mod tests {
             }
         ));
         assert!(service.project_machines(vec![]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn preparation_permission_is_reported_as_a_rejection() {
+        let mut preparation = MockMachineStartPreparation::new();
+        preparation.expect_prepare().once().returning(|_| {
+            Err(MachinePreparationError::permission_denied(
+                "GPU configuration permission denied",
+            ))
+        });
+        let service = Arc::new(MachineLifecycleService::new(
+            Arc::new(MockMachineControl::new()),
+            Arc::new(preparation),
+            Arc::new(MockMachineObservation::new()),
+            Arc::new(MockMachineStartDiagnostics::new()),
+            OperationRegistry::new(),
+        ));
+
+        let outcome = service
+            .begin_launch(&image("test"), None)
+            .unwrap()
+            .run()
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            MachineLifecycleResult::Rejected {
+                rejection: MachineRejection::PermissionDenied,
+                ..
+            }
+        ));
     }
 
     #[test]

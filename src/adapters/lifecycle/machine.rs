@@ -11,9 +11,10 @@ use crate::adapters::system_operation::{
 };
 use crate::application::machine_lifecycle::{
     MachineControl, MachineControlOutcome, MachineControlTransport, MachineLifecycleService,
-    MachineObservation, MachineRuntimeAction, MachineRuntimeControlRequest,
-    MachineStartDiagnostics, MachineStartPreparation, NspawnLaunchRequest, NspawnUnitAction,
-    NspawnUnitControlRequest, RoutedMachineControlOutcome, StartFailureEvidence,
+    MachineObservation, MachinePreparationError, MachineRuntimeAction,
+    MachineRuntimeControlRequest, MachineStartDiagnostics, MachineStartPreparation,
+    NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest, RoutedMachineControlOutcome,
+    StartFailureEvidence,
 };
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::runtime::RuntimeResult;
@@ -392,7 +393,7 @@ struct StoreStartPreparation {
 
 #[async_trait::async_trait]
 impl MachineStartPreparation for StoreStartPreparation {
-    async fn prepare(&self, machine: &MachineName) -> Result<(), String> {
+    async fn prepare(&self, machine: &MachineName) -> Result<(), MachinePreparationError> {
         let result = crate::adapters::platform::nvidia::ensure_gpu_passthrough(
             machine.as_str(),
             &self.nspawn,
@@ -402,7 +403,7 @@ impl MachineStartPreparation for StoreStartPreparation {
         )
         .await;
         self.runtime.invalidate();
-        result.map_err(|error| error.to_string())?;
+        result.map_err(map_machine_preparation_error)?;
         if let Err(error) = self.system_operations.reload_daemon().await {
             log::warn!(
                 "systemd daemon reload after pre-start reconciliation failed for {}: {}",
@@ -411,6 +412,23 @@ impl MachineStartPreparation for StoreStartPreparation {
             );
         }
         Ok(())
+    }
+}
+
+fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError {
+    let permission_denied =
+        error.is_polkit_rejection() || matches!(&error, NspawnError::PermissionDenied);
+    let invalid_configuration = matches!(
+        &error,
+        NspawnError::Validation(_) | NspawnError::InvalidConfig(_)
+    );
+    let message = error.to_string();
+    if permission_denied {
+        MachinePreparationError::permission_denied(message)
+    } else if invalid_configuration {
+        MachinePreparationError::invalid_configuration(message)
+    } else {
+        MachinePreparationError::failed(message)
     }
 }
 
@@ -551,5 +569,21 @@ mod tests {
             outcome,
             MachineControlOutcome::NotAttempted { .. }
         ));
+    }
+
+    #[test]
+    fn preparation_errors_keep_host_semantics_at_the_adapter_boundary() {
+        let permission = map_machine_preparation_error(NspawnError::PermissionDenied);
+        assert!(permission.is_permission_denied());
+        assert!(!permission.is_invalid_configuration());
+
+        let invalid = map_machine_preparation_error(NspawnError::InvalidConfig("bad unit".into()));
+        assert!(invalid.is_invalid_configuration());
+        assert!(!invalid.is_permission_denied());
+
+        let failed = map_machine_preparation_error(NspawnError::Runtime("probe failed".into()));
+        assert!(!failed.is_invalid_configuration());
+        assert!(!failed.is_permission_denied());
+        assert_eq!(failed.to_string(), "Runtime error: probe failed");
     }
 }
