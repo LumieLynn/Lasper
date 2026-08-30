@@ -79,7 +79,8 @@ pub(crate) struct DetailRefreshServices {
 pub(crate) enum DetailRefreshWork {
     MachineProperties { name: String, entry: MachineEntry },
     Journal { name: String },
-    Config { name: String },
+    MachineConfig { entry: MachineEntry },
+    ImageConfig { name: String },
     ImageUnit { name: String },
 }
 
@@ -113,12 +114,18 @@ impl DetailRefreshJob {
                 };
                 DetailRefreshResult::Journal(result)
             }
-            DetailRefreshWork::Config { name } => {
+            DetailRefreshWork::MachineConfig { entry } => {
                 let config = services
                     .resource_inspection
-                    .inspect_nspawn_config(&name)
-                    .await
-                    .map_err(|error| error.to_string());
+                    .inspect_machine_nspawn_config(&entry)
+                    .await;
+                DetailRefreshResult::Config(config)
+            }
+            DetailRefreshWork::ImageConfig { name } => {
+                let config = services
+                    .resource_inspection
+                    .inspect_image_nspawn_config(&name)
+                    .await;
                 DetailRefreshResult::Config(config)
             }
             DetailRefreshWork::ImageUnit { name } => DetailRefreshResult::ImageUnit(
@@ -144,7 +151,12 @@ pub(crate) enum DetailRefreshResult {
     Noop,
     MachineProperties(Result<RuntimeQuery<MachineProperties>, String>),
     Journal(JournalRefreshResult),
-    Config(Result<Option<NspawnConfigInspection>, String>),
+    Config(
+        Result<
+            Option<NspawnConfigInspection>,
+            crate::application::inspection::ResourceInspectionError,
+        >,
+    ),
     ImageOverview(MachineProperties),
     ImageUnit(ImageUnitInspection),
 }

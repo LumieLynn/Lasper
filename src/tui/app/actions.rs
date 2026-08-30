@@ -117,10 +117,9 @@ impl App {
                             ready(ticket.clone(), DetailRefreshResult::Noop)
                         }
                     }
-                    DetailPane::Config => job(
-                        ticket.clone(),
-                        DetailRefreshWork::Config { name: name.clone() },
-                    ),
+                    DetailPane::Config => {
+                        job(ticket.clone(), DetailRefreshWork::MachineConfig { entry })
+                    }
                     DetailPane::Metrics
                     | DetailPane::ImageOverview
                     | DetailPane::ImageConfig
@@ -134,7 +133,7 @@ impl App {
                 ),
                 DetailPane::ImageConfig => job(
                     ticket.clone(),
-                    DetailRefreshWork::Config { name: name.clone() },
+                    DetailRefreshWork::ImageConfig { name: name.clone() },
                 ),
                 DetailPane::ImageUnit => job(
                     ticket.clone(),
@@ -214,13 +213,14 @@ impl App {
             }
             DetailRefreshResult::Config(result) => {
                 let name = completion.ticket.target.name().unwrap_or_default();
-                match result {
-                    Ok(config) => self.apply_config_snapshot(config),
-                    Err(error) => {
+                if let Err(error) = &result {
+                    if error.is_unsupported() {
+                        log::debug!("No nspawn config route for {name}: {error}");
+                    } else {
                         log::warn!("Failed to read .nspawn config for {name}: {error}");
-                        self.apply_config_snapshot(None);
                     }
                 }
+                self.apply_config_result(result);
             }
             DetailRefreshResult::ImageOverview(properties) => {
                 self.data.properties = Ok(properties);
@@ -262,14 +262,29 @@ impl App {
         &mut self,
         config: Option<crate::application::inspection::NspawnConfigInspection>,
     ) {
+        self.apply_config_result(Ok(config));
+    }
+
+    fn apply_config_result(
+        &mut self,
+        result: Result<
+            Option<crate::application::inspection::NspawnConfigInspection>,
+            crate::application::inspection::ResourceInspectionError,
+        >,
+    ) {
+        let (config, error) = match result {
+            Ok(config) => (config, None),
+            Err(error) => (None, Some(error.to_string())),
+        };
         let new_path = config.as_ref().map(|config| config.path.clone());
         let new_content = config.map(|config| config.content);
-        if self.data.config_content != new_content {
+        if self.data.config_content != new_content || self.data.config_error != error {
             self.ui.detail_panel.config_scroll = 0;
             self.data.config_dirty = true;
         }
         self.data.config_path = new_path;
         self.data.config_content = new_content;
+        self.data.config_error = error;
     }
 
     fn detail_refresh_services(&self) -> DetailRefreshServices {

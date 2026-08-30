@@ -201,6 +201,7 @@ pub struct AppData {
     pub log_manager: crate::tui::views::detail_panel::log_manager::LogManager,
     pub config_content: Option<String>,
     pub config_path: Option<std::path::PathBuf>,
+    pub config_error: Option<String>,
     pub detail_target: DetailTarget,
     pub unit_name: Option<String>,
     pub unit_drop_ins: Vec<crate::application::inspection::SystemdDropInInspection>,
@@ -273,6 +274,7 @@ impl App {
                 ),
                 config_content: None,
                 config_path: None,
+                config_error: None,
                 detail_target: DetailTarget::Empty,
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
@@ -422,6 +424,7 @@ impl App {
             self.data.unit_dirty = true;
             self.data.config_content = None;
             self.data.config_path = None;
+            self.data.config_error = None;
             self.data.unit_name = None;
             self.data.unit_drop_ins.clear();
         }

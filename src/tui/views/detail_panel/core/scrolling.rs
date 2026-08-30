@@ -132,8 +132,17 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                     .sum()
             })
             .unwrap_or(0);
-        panel.config_len =
-            content_len.saturating_add(if data.config_path.is_some() { 2 } else { 1 });
+        let error_len = data
+            .config_error
+            .as_deref()
+            .map(|error| {
+                crate::tui::soft_wrap_text(&format!("Configuration unavailable: {error}"), width)
+                    .len()
+            })
+            .unwrap_or(0);
+        panel.config_len = content_len
+            .max(error_len)
+            .saturating_add(if data.config_path.is_some() { 2 } else { 1 });
         data.config_dirty = false;
     }
 

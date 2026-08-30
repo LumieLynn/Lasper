@@ -6,6 +6,7 @@ use crate::application::inspection::{
     ImageUnitInspection, NspawnConfigInspection, ResourceInspectionError, ResourceInspectionPort,
     SystemdDropInInspection, SystemdUnitInspection,
 };
+use crate::domain::runtime::MachineEntry;
 use std::sync::Arc;
 
 pub(crate) struct StoreResourceInspection {
@@ -30,7 +31,29 @@ impl StoreResourceInspection {
 
 #[async_trait::async_trait]
 impl ResourceInspectionPort for StoreResourceInspection {
-    async fn inspect_nspawn_config(
+    async fn inspect_machine_nspawn_config(
+        &self,
+        machine: &MachineEntry,
+    ) -> Result<Option<NspawnConfigInspection>, ResourceInspectionError> {
+        if !machine.access().is_nspawn() {
+            return Err(ResourceInspectionError::unsupported(format!(
+                "machine '{}' is read-only and has no Lasper nspawn configuration",
+                machine.name
+            )));
+        }
+        self.nspawn
+            .read(&machine.name)
+            .await
+            .map(|config| {
+                config.map(|config| NspawnConfigInspection {
+                    path: config.path,
+                    content: config.content,
+                })
+            })
+            .map_err(ResourceInspectionError::backend)
+    }
+
+    async fn inspect_image_nspawn_config(
         &self,
         name: &str,
     ) -> Result<Option<NspawnConfigInspection>, ResourceInspectionError> {
@@ -81,6 +104,7 @@ impl ResourceInspectionPort for StoreResourceInspection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::runtime::{MachineState, ReadOnlyReason};
 
     #[tokio::test]
     async fn non_machine_image_names_do_not_probe_systemd_unit_drop_ins() {
@@ -94,5 +118,33 @@ mod tests {
 
         assert!(matches!(result.properties, Ok(None)));
         assert!(result.unit.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_machine_cannot_enter_the_nspawn_config_reader() {
+        let inspection = StoreResourceInspection::new(
+            Arc::new(crate::adapters::process::DefaultCommandRunner),
+            NspawnConfigStore::direct(),
+            SystemdUnitStore::direct(),
+        );
+        let machine = MachineEntry {
+            name: "guest".into(),
+            class: "vm".into(),
+            service: "systemd-vmspawn".into(),
+            state: MachineState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        };
+
+        let error = inspection
+            .inspect_machine_nspawn_config(&machine)
+            .await
+            .unwrap_err();
+
+        assert!(error.is_unsupported());
+        assert!(matches!(
+            machine.access(),
+            crate::domain::runtime::MachineAccess::ReadOnly(ReadOnlyReason::VirtualMachine)
+        ));
     }
 }

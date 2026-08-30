@@ -29,7 +29,7 @@ pub struct ResourceActionMenu {
 
 impl ResourceActionMenu {
     pub fn for_machine(machine: &MachineEntry) -> Self {
-        let enabled = machine.state.accepts_runtime_actions();
+        let enabled = machine.access().is_nspawn() && machine.state.accepts_runtime_actions();
         let name = machine.name.clone();
         Self::new(
             " [ Machine Actions ] ",
@@ -187,6 +187,22 @@ mod tests {
     #[test]
     fn transitioning_machine_has_no_available_runtime_action() {
         let machine = MachineEntry::optimistic_nspawn("ubuntu", MachineState::Exiting);
+        assert_eq!(
+            ResourceActionMenu::for_machine(&machine).selected_action(),
+            None
+        );
+    }
+
+    #[test]
+    fn foreign_machine_has_no_nspawn_runtime_actions() {
+        let machine = MachineEntry {
+            name: "ubuntu-vm".into(),
+            class: "vm".into(),
+            service: "systemd-vmspawn".into(),
+            state: MachineState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        };
         assert_eq!(
             ResourceActionMenu::for_machine(&machine).selected_action(),
             None

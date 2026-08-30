@@ -98,6 +98,33 @@ impl MachineProvider {
     }
 }
 
+/// The operation surface Lasper may use for a registered machine.
+///
+/// machined is a shared observation plane. A machine can therefore be
+/// visible to Lasper without being an nspawn resource that Lasper may mutate.
+/// The reason is intentionally semantic data; presentation maps it to text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MachineAccess {
+    Nspawn,
+    ReadOnly(ReadOnlyReason),
+}
+
+impl MachineAccess {
+    pub fn is_nspawn(&self) -> bool {
+        matches!(self, Self::Nspawn)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadOnlyReason {
+    VirtualMachine,
+    Host,
+    UnknownClass(String),
+    UnknownProvider(String),
+    UnsupportedCombination { class: String, provider: String },
+    InvalidIdentity,
+}
+
 impl Serialize for MachineProvider {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -158,6 +185,26 @@ impl MachineRuntimeIdentity {
     /// Only this exact pair is eligible for nspawn-specific operations.
     pub fn is_nspawn(&self) -> bool {
         self.class().is_container() && self.provider().is_nspawn()
+    }
+
+    pub fn access(&self) -> MachineAccess {
+        if self.is_nspawn() {
+            return MachineAccess::Nspawn;
+        }
+
+        let reason = match (self.class(), self.provider()) {
+            (MachineClass::Vm, _) | (_, MachineProvider::Vmspawn) => ReadOnlyReason::VirtualMachine,
+            (MachineClass::Host, _) => ReadOnlyReason::Host,
+            (MachineClass::Unknown(class), _) => ReadOnlyReason::UnknownClass(class.clone()),
+            (_, MachineProvider::Unknown(provider)) => {
+                ReadOnlyReason::UnknownProvider(provider.clone())
+            }
+            (class, provider) => ReadOnlyReason::UnsupportedCombination {
+                class: class.to_string(),
+                provider: provider.to_string(),
+            },
+        };
+        MachineAccess::ReadOnly(reason)
     }
 }
 
@@ -282,7 +329,13 @@ impl MachineEntry {
     }
 
     pub fn is_nspawn(&self) -> bool {
-        self.identity().is_ok_and(|identity| identity.is_nspawn())
+        self.access().is_nspawn()
+    }
+
+    pub fn access(&self) -> MachineAccess {
+        self.identity()
+            .map(|identity| identity.access())
+            .unwrap_or(MachineAccess::ReadOnly(ReadOnlyReason::InvalidIdentity))
     }
 }
 
@@ -533,5 +586,40 @@ mod tests {
         };
         assert!(entry.is_nspawn());
         assert_eq!(entry.identity().unwrap().name().as_str(), "guest");
+        assert_eq!(entry.access(), MachineAccess::Nspawn);
+    }
+
+    #[test]
+    fn non_nspawn_runtime_identities_are_read_only_with_lossless_reasons() {
+        let vm = MachineRuntimeIdentity::new("guest", "vm", "systemd-vmspawn").unwrap();
+        assert_eq!(
+            vm.access(),
+            MachineAccess::ReadOnly(ReadOnlyReason::VirtualMachine)
+        );
+
+        let foreign = MachineRuntimeIdentity::new("guest", "container", "libvirt").unwrap();
+        assert_eq!(
+            foreign.access(),
+            MachineAccess::ReadOnly(ReadOnlyReason::UnknownProvider("libvirt".into()))
+        );
+
+        let host = MachineRuntimeIdentity::new("host", "host", "systemd-nspawn").unwrap();
+        assert_eq!(host.access(), MachineAccess::ReadOnly(ReadOnlyReason::Host));
+    }
+
+    #[test]
+    fn malformed_machine_entries_never_gain_nspawn_access() {
+        let entry = MachineEntry {
+            name: "not a machine".into(),
+            class: "container".into(),
+            service: "systemd-nspawn".into(),
+            state: MachineState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        };
+        assert_eq!(
+            entry.access(),
+            MachineAccess::ReadOnly(ReadOnlyReason::InvalidIdentity)
+        );
     }
 }

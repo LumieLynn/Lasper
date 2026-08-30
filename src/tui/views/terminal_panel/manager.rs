@@ -173,8 +173,14 @@ impl TerminalManager {
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
+        if !entry.access().is_nspawn() {
+            return Err(format!(
+                "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
+                entry.name
+            ));
+        }
         if entry.state != crate::domain::runtime::MachineState::Running {
-            return Err(format!("Container {} is not running", entry.name));
+            return Err(format!("Machine {} is not running", entry.name));
         }
 
         // Re-use existing session if one is already open for this container.
