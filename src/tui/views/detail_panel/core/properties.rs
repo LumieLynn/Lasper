@@ -6,6 +6,7 @@ const IMPORTANT_KEYS: &[&str] = &[
     "Name",
     "State",
     "Class",
+    "Service",
     "Enabled",
     "IPAddresses",
     "MainPID",

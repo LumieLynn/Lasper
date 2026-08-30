@@ -62,9 +62,20 @@ impl RuntimeSource for DaemonBackend {
         })
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
         let json = self
-            .call("dbus_get_properties", serde_json::json!({"name": name}))
+            .call(
+                "dbus_get_properties",
+                serde_json::to_value(crate::ipc::protocol::InspectMachineRequest {
+                    machine: crate::domain::machine::MachineName::new(name)
+                        .map_err(|error| NspawnError::Validation(error.to_string()))?,
+                    include_nspawn_unit,
+                })?,
+            )
             .await?;
         serde_json::from_value(json).map_err(|e| {
             NspawnError::Dbus(zbus::Error::Failure(format!(

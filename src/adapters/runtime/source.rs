@@ -15,6 +15,10 @@ pub trait RuntimeSource: Send + Sync + 'static {
         let (machines, images) = tokio::try_join!(self.list_machines(), self.list_images())?;
         Ok(RuntimeSnapshot::new(machines, images))
     }
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties>;
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties>;
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
 }

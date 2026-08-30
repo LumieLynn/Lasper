@@ -121,7 +121,7 @@ impl RuntimePort for SourceRuntimePort {
         match &self.inspector {
             RuntimeInspector::Source => self
                 .source
-                .get_properties(machine.as_str())
+                .get_properties(machine.as_str(), entry.access().is_nspawn())
                 .await
                 .map_err(map_runtime_error),
             RuntimeInspector::Store(store) => store
@@ -145,5 +145,38 @@ pub(crate) fn map_runtime_error(error: NspawnError) -> RuntimeError {
         RuntimeError::permission_denied(message)
     } else {
         RuntimeError::failed(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::runtime::{MachineClass, MachineProvider, MachineState};
+
+    #[tokio::test]
+    async fn foreign_runtime_identity_disables_nspawn_unit_inspection() {
+        let mut source = crate::adapters::runtime::source::MockRuntimeSource::new();
+        source
+            .expect_get_properties()
+            .withf(|name, include_nspawn_unit| name == "guest-vm" && !include_nspawn_unit)
+            .once()
+            .returning(|_, _| Ok(MachineProperties::default()));
+        let port = SourceRuntimePort {
+            source: Arc::new(source),
+            inspector: RuntimeInspector::Source,
+            snapshot_route: ExecutionRoute::DirectDbus,
+            inspection_route: ExecutionRoute::DirectDbus,
+        };
+        let entry = MachineEntry {
+            name: "guest-vm".into(),
+            class: MachineClass::Vm,
+            service: MachineProvider::Vmspawn,
+            state: MachineState::Running,
+            addresses: Default::default(),
+        };
+
+        port.inspect(&MachineName::new("guest-vm").unwrap(), &entry)
+            .await
+            .unwrap();
     }
 }

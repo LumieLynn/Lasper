@@ -8,7 +8,9 @@ use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
 use crate::domain::machine::{AllowedSignal, MachineName};
-use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
+use crate::domain::runtime::{
+    ImageEntry, ImageName, MachineAddressObservation, MachineEntry, MachineState, StatusUpdate,
+};
 use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
@@ -412,37 +414,43 @@ impl RuntimeSource for DbusBackend {
             if name == ".host" {
                 continue;
             }
-            let address_result = self
-                .query_with_deadline(
-                    generation,
-                    "GetMachineAddresses",
-                    proxy.get_machine_addresses(&name),
-                )
-                .await;
-            let addrs = match address_result {
-                Ok(addresses) => addresses,
-                Err(error) => {
-                    log::warn!(
-                        "D-Bus GetMachineAddresses failed for machine '{}'; retaining the machine without address data: {}",
-                        name,
-                        error
-                    );
-                    Vec::new()
+            let class = crate::domain::runtime::MachineClass::from(class);
+            let service = crate::domain::runtime::MachineProvider::from(service);
+            let addresses = if class.is_container() {
+                let address_result = self
+                    .query_with_deadline(
+                        generation,
+                        "GetMachineAddresses",
+                        proxy.get_machine_addresses(&name),
+                    )
+                    .await;
+                match address_result {
+                    Ok(addrs) => MachineAddressObservation::available(addrs.into_iter().map(
+                        |(family, data)| {
+                            crate::adapters::runtime::formatting::format_ip_address(family, &data)
+                        },
+                    )),
+                    Err(error) => {
+                        let observation = classify_address_error(error);
+                        log::warn!(
+                            "D-Bus GetMachineAddresses did not provide data for machine '{}': {}",
+                            name,
+                            observation.property_value()
+                        );
+                        observation
+                    }
                 }
+            } else {
+                MachineAddressObservation::Unsupported(format!(
+                    "address observation is not available for machine class {class}"
+                ))
             };
-            let all_addresses: Vec<String> = addrs
-                .into_iter()
-                .map(|(family, data)| {
-                    crate::adapters::runtime::formatting::format_ip_address(family, &data)
-                })
-                .collect();
             entries.push(MachineEntry {
                 name,
-                class: class.into(),
-                service: service.into(),
+                class,
+                service,
                 state: MachineState::Running,
-                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
-                all_addresses,
+                addresses,
             });
         }
         entries.sort();
@@ -475,7 +483,11 @@ impl RuntimeSource for DbusBackend {
         Ok(images)
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
         let name = parse_machine_name(name)?;
         let (generation, conn) = self
             .connection_lease()
@@ -502,17 +514,21 @@ impl RuntimeSource for DbusBackend {
             }
         }
 
-        // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
-        let systemd_result = self
-            .query_with_deadline(
-                generation,
-                "systemd unit properties",
-                get_systemd1_properties(&conn, &name),
-            )
-            .await;
-        if let Ok(sd_props) = systemd_result {
-            for (k, v) in sd_props {
-                crate::adapters::runtime::formatting::insert_systemd_property(&mut props, k, v);
+        // Only an exact nspawn identity may be associated with the generated
+        // systemd-nspawn@ unit. Foreign machined registrations can share the
+        // same name without referring to that unit.
+        if include_nspawn_unit {
+            let systemd_result = self
+                .query_with_deadline(
+                    generation,
+                    "systemd unit properties",
+                    get_systemd1_properties(&conn, &name),
+                )
+                .await;
+            if let Ok(sd_props) = systemd_result {
+                for (k, v) in sd_props {
+                    crate::adapters::runtime::formatting::insert_systemd_property(&mut props, k, v);
+                }
             }
         }
 
@@ -575,6 +591,30 @@ impl RuntimeSource for DbusBackend {
                 }
             }
         }
+    }
+}
+
+const NO_PRIVATE_NETWORKING_ERROR: &str = "org.freedesktop.machine1.NoPrivateNetworking";
+const NOT_SUPPORTED_ERROR: &str = "org.freedesktop.DBus.Error.NotSupported";
+
+fn classify_address_error(error: zbus::Error) -> MachineAddressObservation {
+    match error {
+        zbus::Error::MethodError(name, detail, _)
+            if name.as_str() == NO_PRIVATE_NETWORKING_ERROR =>
+        {
+            MachineAddressObservation::Unsupported(
+                detail.unwrap_or_else(|| "machine does not use private networking".into()),
+            )
+        }
+        zbus::Error::MethodError(name, detail, _) if name.as_str() == NOT_SUPPORTED_ERROR => {
+            MachineAddressObservation::Unsupported(detail.unwrap_or_else(|| {
+                "address observation is supported only for container machines".into()
+            }))
+        }
+        zbus::Error::Unsupported => MachineAddressObservation::Unsupported(
+            "the D-Bus client does not support address observation".into(),
+        ),
+        error => MachineAddressObservation::Unavailable(error.to_string()),
     }
 }
 
@@ -725,5 +765,46 @@ mod tests {
         );
         assert!(parse_image_name(".#temporary").is_err());
         assert!(parse_image_name("../escape").is_err());
+    }
+
+    fn method_error(name: &str, detail: &str) -> zbus::Error {
+        let error_name = zbus::names::ErrorName::try_from(name)
+            .expect("test error name")
+            .to_owned()
+            .into();
+        let message = zbus::Message::method("/test", "Failure")
+            .expect("test method message")
+            .build(&())
+            .expect("test message body");
+        zbus::Error::MethodError(error_name, Some(detail.into()), message)
+    }
+
+    #[test]
+    fn address_observation_classifies_provider_limits_without_text_matching() {
+        let no_private = classify_address_error(method_error(
+            NO_PRIVATE_NETWORKING_ERROR,
+            "machine does not use private networking",
+        ));
+        assert!(matches!(
+            no_private,
+            MachineAddressObservation::Unsupported(reason)
+                if reason == "machine does not use private networking"
+        ));
+
+        let virtual_machine = classify_address_error(method_error(
+            NOT_SUPPORTED_ERROR,
+            "address data is only supported on container machines",
+        ));
+        assert!(matches!(
+            virtual_machine,
+            MachineAddressObservation::Unsupported(reason)
+                if reason == "address data is only supported on container machines"
+        ));
+
+        let failure = classify_address_error(zbus::Error::Failure("temporary failure".into()));
+        assert_eq!(
+            failure,
+            MachineAddressObservation::Unavailable("temporary failure".into())
+        );
     }
 }

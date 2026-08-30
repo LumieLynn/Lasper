@@ -333,8 +333,7 @@ mod tests {
                 class: MachineEntry::NSPAWN_CLASS.into(),
                 service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
-                address: None,
-                all_addresses: vec![],
+                addresses: Default::default(),
             }])
         });
         let mut control = MockImageControl::new();

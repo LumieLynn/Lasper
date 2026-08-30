@@ -75,9 +75,9 @@ impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
         ExecutionRoute::ElevatedCli
     }
 
-    async fn inspect(&self, name: &str, _entry: &MachineEntry) -> Result<MachineProperties> {
+    async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
         self.daemon
-            .cli_inspect_machine(name)
+            .cli_inspect_machine(name, entry.access().is_nspawn())
             .await
             .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
     }
@@ -120,8 +120,7 @@ mod tests {
             class: MachineEntry::NSPAWN_CLASS.into(),
             service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: Default::default(),
         };
 
         store.inspect("test-machine", &entry).await.unwrap();

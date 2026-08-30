@@ -10,7 +10,7 @@ use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
 use crate::domain::machine::MachineName;
-use crate::domain::runtime::{MachineEntry, MachineState};
+use crate::domain::runtime::{MachineAddressObservation, MachineEntry, MachineState};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -105,8 +105,9 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
             class: class.into(),
             service: service.into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: MachineAddressObservation::Unsupported(
+                "runtime-state observation does not query addresses".into(),
+            ),
         });
     }
     machines.sort();
@@ -176,13 +177,13 @@ fn entry_properties(entry: &MachineEntry) -> MachineProperties {
         "State".into(),
         entry.state.label().to_string(),
     );
-    if !entry.all_addresses.is_empty() {
-        properties.insert(
-            GROUP_MACHINE,
-            "IPAddresses".into(),
-            entry.all_addresses.join(", "),
-        );
-    }
+    properties.insert(GROUP_MACHINE, "Class".into(), entry.class.to_string());
+    properties.insert(GROUP_MACHINE, "Service".into(), entry.service.to_string());
+    properties.insert(
+        GROUP_MACHINE,
+        "IPAddresses".into(),
+        entry.addresses.property_value(),
+    );
     properties
 }
 
@@ -357,8 +358,7 @@ mod tests {
             class: MachineEntry::NSPAWN_CLASS.into(),
             service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
-            address: Some("10.0.0.2".into()),
-            all_addresses: vec!["10.0.0.2".into()],
+            addresses: MachineAddressObservation::available(["10.0.0.2".into()]),
         }
     }
 
@@ -454,7 +454,7 @@ mod tests {
         );
         assert!(machines
             .iter()
-            .all(|machine| machine.all_addresses.is_empty()));
+            .all(|machine| matches!(machine.addresses, MachineAddressObservation::Unsupported(_))));
         let foreign = machines
             .iter()
             .find(|machine| machine.name == "foreign-vm")

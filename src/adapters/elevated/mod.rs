@@ -558,10 +558,12 @@ impl ElevatedDaemon {
     pub(super) async fn cli_inspect_machine(
         &self,
         name: &str,
+        include_nspawn_unit: bool,
     ) -> std::io::Result<MachineProperties> {
-        let request = CliInspectMachineRequest {
+        let request = InspectMachineRequest {
             machine: MachineName::new(name)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+            include_nspawn_unit,
         };
         let params = serde_json::to_value(request)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;

@@ -366,13 +366,13 @@ fn fallback_reason(error: &RuntimeError) -> String {
 }
 
 fn enrich_properties(properties: &mut MachineProperties, entry: &MachineEntry) {
-    if !entry.all_addresses.is_empty() {
-        properties.insert(
-            GROUP_MACHINE,
-            "IPAddresses".into(),
-            entry.all_addresses.join(", "),
-        );
-    }
+    properties.insert(GROUP_MACHINE, "Class".into(), entry.class.to_string());
+    properties.insert(GROUP_MACHINE, "Service".into(), entry.service.to_string());
+    properties.insert(
+        GROUP_MACHINE,
+        "IPAddresses".into(),
+        entry.addresses.property_value(),
+    );
     if let Some(unit_file_state) = properties
         .get_group(GROUP_SYSTEMD_UNIT)
         .and_then(|group| group.get("UnitFileState"))
@@ -454,8 +454,7 @@ mod tests {
             class: MachineEntry::NSPAWN_CLASS.into(),
             service: MachineEntry::NSPAWN_SERVICE.into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: vec![],
+            addresses: Default::default(),
         }
     }
 
@@ -540,7 +539,10 @@ mod tests {
         });
         let catalog = RuntimeCatalog::new(None, Arc::new(fallback), vec![], None);
         let mut machine = entry("test");
-        machine.all_addresses = vec!["10.0.0.2".into(), "fd00::2".into()];
+        machine.addresses = crate::domain::runtime::MachineAddressObservation::available([
+            "10.0.0.2".into(),
+            "fd00::2".into(),
+        ]);
 
         let query = catalog.inspect("test", &machine).await.unwrap();
 

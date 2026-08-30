@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 15;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 16;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -125,8 +125,9 @@ pub(crate) struct RpcBootstrap {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct CliInspectMachineRequest {
+pub(crate) struct InspectMachineRequest {
     pub machine: MachineName,
+    pub include_nspawn_unit: bool,
 }
 
 #[derive(Serialize, Deserialize)]

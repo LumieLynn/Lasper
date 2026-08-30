@@ -145,8 +145,12 @@ impl RuntimeSource for CliBackend {
         parse_list_images_json(&out.stdout)
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        get_properties_with_runner(name, self.cmd_runner.as_ref()).await
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
+        get_properties_with_runner(name, include_nspawn_unit, self.cmd_runner.as_ref()).await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
@@ -198,6 +202,7 @@ impl RuntimeSource for CliBackend {
 /// Fixed, non-interactive CLI inspection shared with the elevated daemon.
 pub(crate) async fn get_properties_with_runner(
     name: &str,
+    include_nspawn_unit: bool,
     cmd_runner: &dyn CommandRunner,
 ) -> Result<MachineProperties> {
     let name = parse_machine_name(name)?;
@@ -231,24 +236,37 @@ pub(crate) async fn get_properties_with_runner(
         Err(error) => failures.push(format!("machinectl: {error}")),
     }
 
-    let unit = name.systemd_nspawn_unit();
-    match append_systemd_unit_properties(&name, cmd_runner, &mut props).await {
-        Ok(UnitInspection::Present) => {}
-        Ok(UnitInspection::NotFound(diagnostic)) => {
-            if props.groups.is_empty() {
-                failures.push(format!("systemctl: {diagnostic}"));
+    if include_nspawn_unit {
+        match append_systemd_unit_properties(&name, cmd_runner, &mut props).await {
+            Ok(UnitInspection::Present) => {}
+            Ok(UnitInspection::NotFound(diagnostic)) => {
+                if props.groups.is_empty() {
+                    failures.push(format!("systemctl: {diagnostic}"));
+                }
             }
+            Err(error) => failures.push(format!("systemctl: {error}")),
         }
-        Err(error) => failures.push(format!("systemctl: {error}")),
     }
 
     if props.groups.is_empty() {
+        let (operation, command) = if include_nspawn_unit {
+            let unit = name.systemd_nspawn_unit();
+            (
+                format!("machinectl/systemctl show {}", name.as_str()),
+                format!("{machine_command}; systemctl show {unit}"),
+            )
+        } else {
+            (
+                format!("machinectl show {}", name.as_str()),
+                machine_command.clone(),
+            )
+        };
         return Err(NspawnError::CommandFailed(
-            format!("machinectl/systemctl show {}", name.as_str()),
-            format!("{machine_command}; systemctl show {unit}"),
+            operation,
+            command,
             if failures.is_empty() {
-                "The target machine might not exist or systemd-nspawn is not managing it."
-                    .to_string()
+                "The target machine might not exist or its provider did not expose properties."
+                    .into()
             } else {
                 failures.join("; ")
             },
@@ -402,8 +420,7 @@ mod tests {
                 class: MachineEntry::NSPAWN_CLASS.into(),
                 service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
-                address: None,
-                all_addresses: vec![],
+                addresses: Default::default(),
             }],
             vec![ImageEntry {
                 name: "active".into(),
@@ -468,7 +485,10 @@ mod tests {
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].name, "active");
         assert_eq!(machines[0].state, MachineState::Running);
-        assert!(machines[0].all_addresses.is_empty());
+        assert!(matches!(
+            machines[0].addresses,
+            crate::domain::runtime::MachineAddressObservation::Unsupported(_)
+        ));
     }
 
     #[tokio::test]
@@ -611,7 +631,7 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let props = RuntimeSource::get_properties(&provider, "test-ctr")
+        let props = RuntimeSource::get_properties(&provider, "test-ctr", true)
             .await
             .unwrap();
 
@@ -635,7 +655,7 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let result = RuntimeSource::get_properties(&provider, "missing-ctr").await;
+        let result = RuntimeSource::get_properties(&provider, "missing-ctr", true).await;
         assert!(result.is_err());
     }
 
@@ -665,7 +685,7 @@ mod tests {
                 ))
             });
 
-        let error = get_properties_with_runner("missing-ctr", &runner)
+        let error = get_properties_with_runner("missing-ctr", true, &runner)
             .await
             .unwrap_err()
             .to_string();
@@ -696,7 +716,7 @@ mod tests {
                 ))
             });
 
-        let properties = get_properties_with_runner("test-ctr", &runner)
+        let properties = get_properties_with_runner("test-ctr", true, &runner)
             .await
             .unwrap();
 
@@ -706,6 +726,37 @@ mod tests {
                 .and_then(|group| group.get("State"))
                 .map(String::as_str),
             Some("running")
+        );
+        assert!(properties
+            .get_group(crate::domain::inspection::GROUP_SYSTEMD_UNIT)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_machine_inspection_never_queries_an_nspawn_unit() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Name=guest-vm\nClass=vm\nService=systemd-vmspawn\nState=running\n",
+                    "",
+                ))
+            });
+
+        let properties = get_properties_with_runner("guest-vm", false, &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            properties
+                .get_group(crate::domain::inspection::GROUP_MACHINE)
+                .and_then(|group| group.get("Service"))
+                .map(String::as_str),
+            Some("systemd-vmspawn")
         );
         assert!(properties
             .get_group(crate::domain::inspection::GROUP_SYSTEMD_UNIT)

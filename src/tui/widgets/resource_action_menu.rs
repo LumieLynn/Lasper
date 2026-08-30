@@ -200,8 +200,7 @@ mod tests {
             class: "vm".into(),
             service: "systemd-vmspawn".into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: Default::default(),
         };
         assert_eq!(
             ResourceActionMenu::for_machine(&machine).selected_action(),

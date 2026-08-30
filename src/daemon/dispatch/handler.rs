@@ -27,7 +27,11 @@ pub(crate) enum HandleOutcome {
 pub(crate) trait DaemonRuntimeQueries: Send + Sync {
     async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
     async fn list_images(&self) -> RuntimeResult<Vec<ImageEntry>>;
-    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties>;
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> RuntimeResult<MachineProperties>;
     async fn is_available(&self) -> bool;
 }
 
@@ -98,8 +102,12 @@ impl DaemonRuntimeQueries for crate::adapters::runtime::dbus::DbusBackend {
             .map_err(crate::adapters::runtime::map_runtime_error)
     }
 
-    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties> {
-        RuntimeSource::get_properties(self, name)
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> RuntimeResult<MachineProperties> {
+        RuntimeSource::get_properties(self, name, include_nspawn_unit)
             .await
             .map_err(crate::adapters::runtime::map_runtime_error)
     }

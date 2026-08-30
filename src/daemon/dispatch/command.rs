@@ -425,8 +425,7 @@ mod tests {
             class: class.into(),
             service: service.into(),
             state: crate::domain::runtime::MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: Default::default(),
         }
     }
 

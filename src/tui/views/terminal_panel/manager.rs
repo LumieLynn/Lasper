@@ -885,8 +885,7 @@ mod tests {
                 class: MachineEntry::NSPAWN_CLASS.into(),
                 service: MachineEntry::NSPAWN_SERVICE.into(),
                 state,
-                address: None,
-                all_addresses: Vec::new(),
+                addresses: Default::default(),
             };
             let error = manager
                 .spawn(&entry, 24, &Some(tx.clone()))
@@ -915,16 +914,14 @@ mod tests {
                 class: MachineEntry::NSPAWN_CLASS.into(),
                 service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
-                address: None,
-                all_addresses: Vec::new(),
+                addresses: Default::default(),
             },
             MachineEntry {
                 name: "second".into(),
                 class: MachineEntry::NSPAWN_CLASS.into(),
                 service: MachineEntry::NSPAWN_SERVICE.into(),
                 state: MachineState::Running,
-                address: None,
-                all_addresses: Vec::new(),
+                addresses: Default::default(),
             },
         ];
         let mut selected = 0;

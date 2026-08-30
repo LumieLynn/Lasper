@@ -309,6 +309,58 @@ impl<'de> Deserialize<'de> for MachineState {
     }
 }
 
+/// The result of observing a machine's addresses through machined.
+///
+/// An empty successful result is different from a query that could not be
+/// completed, and both are different from a machine/provider that does not
+/// expose address data. Keeping those cases typed prevents callers from
+/// mistaking missing information for a machine with no addresses.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "status", content = "value")]
+pub enum MachineAddressObservation {
+    Available(Vec<String>),
+    Unavailable(String),
+    Unsupported(String),
+}
+
+impl MachineAddressObservation {
+    pub fn available(addresses: impl IntoIterator<Item = String>) -> Self {
+        let mut observation = Self::Available(addresses.into_iter().collect());
+        observation.normalize();
+        observation
+    }
+
+    pub fn primary(&self) -> Option<&str> {
+        match self {
+            Self::Available(addresses) => addresses.first().map(String::as_str),
+            Self::Unavailable(_) | Self::Unsupported(_) => None,
+        }
+    }
+
+    pub fn property_value(&self) -> String {
+        match self {
+            Self::Available(addresses) if addresses.is_empty() => "available (none)".into(),
+            Self::Available(addresses) => addresses.join(", "),
+            Self::Unavailable(reason) => format!("unavailable ({reason})"),
+            Self::Unsupported(reason) => format!("unsupported ({reason})"),
+        }
+    }
+
+    fn normalize(&mut self) {
+        if let Self::Available(addresses) = self {
+            addresses.retain(|address| !address.is_empty());
+            addresses.sort();
+            addresses.dedup();
+        }
+    }
+}
+
+impl Default for MachineAddressObservation {
+    fn default() -> Self {
+        Self::Unavailable("address data was not queried".into())
+    }
+}
+
 /// A machine registered with systemd-machined.
 ///
 /// The `class` and `service` values retain their lossless string representation
@@ -321,8 +373,7 @@ pub struct MachineEntry {
     pub class: MachineClass,
     pub service: MachineProvider,
     pub state: MachineState,
-    pub address: Option<String>,
-    pub all_addresses: Vec<String>,
+    pub addresses: MachineAddressObservation,
 }
 
 impl MachineEntry {
@@ -335,8 +386,9 @@ impl MachineEntry {
             class: Self::NSPAWN_CLASS.into(),
             service: Self::NSPAWN_SERVICE.into(),
             state,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: MachineAddressObservation::Unavailable(
+                "machine is not registered yet".into(),
+            ),
         }
     }
 
@@ -436,10 +488,7 @@ pub struct RuntimeSnapshot {
 impl RuntimeSnapshot {
     pub fn new(mut machines: Vec<MachineEntry>, mut images: Vec<ImageEntry>) -> Self {
         for machine in &mut machines {
-            machine.all_addresses.retain(|address| !address.is_empty());
-            machine.all_addresses.sort();
-            machine.all_addresses.dedup();
-            machine.address = machine.all_addresses.first().cloned();
+            machine.addresses.normalize();
         }
         machines.sort();
         images.sort();
@@ -542,8 +591,7 @@ impl Ord for MachineEntry {
             .then(self.class.cmp(&other.class))
             .then(self.service.cmp(&other.service))
             .then(self.state.cmp(&other.state))
-            .then(self.address.cmp(&other.address))
-            .then(self.all_addresses.cmp(&other.all_addresses))
+            .then(self.addresses.cmp(&other.addresses))
     }
 }
 
@@ -611,8 +659,7 @@ mod tests {
             class: "container".into(),
             service: "systemd-nspawn".into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: MachineAddressObservation::default(),
         };
         assert!(entry.access().is_nspawn());
         assert_eq!(entry.identity().unwrap().name().as_str(), "guest");
@@ -644,8 +691,7 @@ mod tests {
             class: "container".into(),
             service: "systemd-nspawn".into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: MachineAddressObservation::default(),
         };
         assert_eq!(
             entry.access(),
@@ -660,13 +706,55 @@ mod tests {
             class: MachineClass::Unknown("container-like".into()),
             service: MachineProvider::Unknown("custom-runner".into()),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: MachineAddressObservation::default(),
         };
         let json = serde_json::to_value(&entry).unwrap();
         assert_eq!(json["class"], "container-like");
         assert_eq!(json["service"], "custom-runner");
         let decoded: MachineEntry = serde_json::from_value(json).unwrap();
         assert_eq!(decoded, entry);
+    }
+
+    #[test]
+    fn address_observation_preserves_empty_unavailable_and_unsupported_states() {
+        let empty = MachineAddressObservation::available(Vec::new());
+        assert_eq!(empty, MachineAddressObservation::Available(Vec::new()));
+        assert_eq!(empty.property_value(), "available (none)");
+
+        let unavailable = MachineAddressObservation::Unavailable("query timed out".into());
+        assert_eq!(
+            unavailable.property_value(),
+            "unavailable (query timed out)"
+        );
+
+        let unsupported = MachineAddressObservation::Unsupported("virtual machine provider".into());
+        assert_eq!(
+            unsupported.property_value(),
+            "unsupported (virtual machine provider)"
+        );
+    }
+
+    #[test]
+    fn runtime_snapshot_normalizes_only_successful_address_observations() {
+        let mut available = MachineEntry::optimistic_nspawn("available", MachineState::Running);
+        available.addresses = MachineAddressObservation::Available(vec![
+            "fd00::2".into(),
+            "".into(),
+            "10.0.0.2".into(),
+            "fd00::2".into(),
+        ]);
+        let mut unavailable = MachineEntry::optimistic_nspawn("unavailable", MachineState::Running);
+        unavailable.addresses = MachineAddressObservation::Unavailable("temporary failure".into());
+
+        let snapshot = RuntimeSnapshot::new(vec![unavailable, available], Vec::new());
+
+        assert_eq!(
+            snapshot.machines[0].addresses,
+            MachineAddressObservation::Available(vec!["10.0.0.2".into(), "fd00::2".into()])
+        );
+        assert_eq!(
+            snapshot.machines[1].addresses,
+            MachineAddressObservation::Unavailable("temporary failure".into())
+        );
     }
 }

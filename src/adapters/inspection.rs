@@ -132,8 +132,7 @@ mod tests {
             class: "vm".into(),
             service: "systemd-vmspawn".into(),
             state: MachineState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            addresses: Default::default(),
         };
 
         let error = inspection

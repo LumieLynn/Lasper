@@ -901,8 +901,7 @@ mod tests {
             class: MachineEntry::NSPAWN_CLASS.into(),
             service: MachineEntry::NSPAWN_SERVICE.into(),
             state,
-            address: None,
-            all_addresses: vec![],
+            addresses: Default::default(),
         }
     }
 
@@ -1033,7 +1032,10 @@ mod tests {
 
             assert_eq!(
                 app.data.entries,
-                vec![make_entry("test", MachineState::Starting)]
+                vec![MachineEntry::optimistic_nspawn(
+                    "test",
+                    MachineState::Starting
+                )]
             );
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())

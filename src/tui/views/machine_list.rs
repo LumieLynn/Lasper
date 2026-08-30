@@ -66,7 +66,7 @@ impl MachineListComponent {
                     Span::styled(entry.name.as_str(), styles.text),
                     Span::styled(format!(" ({})", entry.state.label()), styles.text),
                 ];
-                if let Some(address) = &entry.address {
+                if let Some(address) = entry.addresses.primary() {
                     spans.push(Span::styled(
                         format!(" - {address}"),
                         Style::default().fg(t.list_addr).add_modifier(Modifier::DIM),

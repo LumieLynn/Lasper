@@ -49,6 +49,7 @@ impl DaemonRuntimeQueries for SlowRemoveDbus {
     async fn get_properties(
         &self,
         _name: &str,
+        _include_nspawn_unit: bool,
     ) -> crate::application::runtime::RuntimeResult<MachineProperties> {
         Err(crate::application::runtime::RuntimeError::failed(
             "slow test backend does not inspect machines",
@@ -469,19 +470,27 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
 }
 
 #[test]
-fn cli_inspection_rpc_accepts_only_a_typed_machine_name() {
-    let valid: CliInspectMachineRequest =
-        serde_json::from_value(serde_json::json!({"machine": "test-machine"})).unwrap();
+fn machine_inspection_rpc_accepts_only_a_typed_target() {
+    let valid: InspectMachineRequest = serde_json::from_value(serde_json::json!({
+        "machine": "test-machine",
+        "include_nspawn_unit": true
+    }))
+    .unwrap();
     assert_eq!(valid.machine.as_str(), "test-machine");
+    assert!(valid.include_nspawn_unit);
 
-    assert!(serde_json::from_value::<CliInspectMachineRequest>(
-        serde_json::json!({"machine": "../escape"})
+    assert!(serde_json::from_value::<InspectMachineRequest>(
+        serde_json::json!({"machine": "../escape", "include_nspawn_unit": true})
     )
     .is_err());
-    assert!(serde_json::from_value::<CliInspectMachineRequest>(
-        serde_json::json!({"machine": "test-machine", "unexpected": true})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<InspectMachineRequest>(serde_json::json!({
+            "machine": "test-machine",
+            "include_nspawn_unit": false,
+            "unexpected": true
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -610,25 +619,21 @@ fn fd_request_rejects_invalid_machine_name_and_terminal_size() {
 }
 
 #[test]
-fn rpc_machine_name_validation_runs_on_daemon_request() {
-    let valid = RpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 1,
-        method: "dbus_get_properties".into(),
-        params: serde_json::json!({"name": "valid-machine"}),
-    };
-    assert_eq!(
-        super::dispatch::query::request_machine_name(&valid.params)
-            .unwrap()
-            .as_str(),
-        "valid-machine"
-    );
+fn dbus_inspection_request_revalidates_machine_name() {
+    let valid: InspectMachineRequest = serde_json::from_value(serde_json::json!({
+        "machine": "valid-machine",
+        "include_nspawn_unit": false
+    }))
+    .unwrap();
+    assert_eq!(valid.machine.as_str(), "valid-machine");
 
-    let invalid = RpcRequest {
-        params: serde_json::json!({"name": "../escape"}),
-        ..valid
-    };
-    assert!(super::dispatch::query::request_machine_name(&invalid.params).is_err());
+    assert!(
+        serde_json::from_value::<InspectMachineRequest>(serde_json::json!({
+            "machine": "../escape",
+            "include_nspawn_unit": false
+        }))
+        .is_err()
+    );
 }
 
 #[tokio::test]
