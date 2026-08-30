@@ -1,10 +1,10 @@
 //! Provider-neutral bootstrap intent values.
 //!
-//! These structures describe what should be installed. Provider command
-//! validation and argument construction remain in the nspawn adapter while
-//! this module owns the serialized provisioning data.
+//! These structures describe what should be installed and enforce the
+//! provider-neutral invariants of that intent. Host command argument
+//! construction remains in the provisioning adapter.
 
-use crate::domain::source::ArtifactSpec;
+use crate::domain::source::{ArtifactSpec, ArtifactValidationError};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BOOTSTRAP_PROFILE: &str = "default";
@@ -327,4 +327,285 @@ pub enum BootstrapSpec {
     Debootstrap(DebootstrapSpec),
     Pacstrap(PacstrapSpec),
     Dnf5(Dnf5Spec),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum BootstrapValidationError {
+    #[error("Invalid bootstrap {field}")]
+    InvalidToken { field: &'static str },
+    #[error("Invalid bootstrap package '{0}'")]
+    InvalidPackage(String),
+    #[error("Invalid dnf5 repository selector '{0}'")]
+    InvalidRepositorySelector(String),
+    #[error("https-only bootstrap policy requires an explicit mirror")]
+    HttpsMirrorRequired,
+    #[error("Invalid bootstrap mirror: {0}")]
+    InvalidMirror(String),
+    #[error("Bootstrap mirror must use https")]
+    InsecureMirror,
+    #[error("Bootstrap mirror has no host")]
+    MissingMirrorHost,
+    #[error("Bootstrap mirror host '{0}' is not in the source allowlist")]
+    MirrorHostNotAllowed(String),
+    #[error("Bootstrap source allowlist requires an explicit mirror")]
+    MirrorAllowlistRequiresMirror,
+    #[error(
+        "dnf5 requires repository=\"host\" until typed repository configuration is implemented"
+    )]
+    UnsupportedDnf5Repository,
+    #[error(
+        "dnf5 only_repositories cannot be combined with enable_repositories or disable_repositories"
+    )]
+    ConflictingDnf5RepositorySelection,
+    #[error(transparent)]
+    Artifact(#[from] ArtifactValidationError),
+}
+
+impl RootfsSourceSpec {
+    pub fn validate(&self) -> Result<(), BootstrapValidationError> {
+        match self {
+            Self::Debootstrap(spec) => spec.validate(),
+            Self::Pacstrap(spec) => spec.validate(),
+            Self::Dnf5(spec) => spec.validate(),
+            Self::Artifact(spec) => spec.validate().map_err(Into::into),
+        }
+    }
+
+    /// Validate a partial preset for the wizard's editable `default` form.
+    pub fn validate_default_preset(&self) -> Result<(), BootstrapValidationError> {
+        match self {
+            Self::Debootstrap(spec) => spec.validate_default_preset(),
+            Self::Pacstrap(spec) => spec.validate(),
+            Self::Dnf5(spec) => spec.validate_default_preset(),
+            Self::Artifact(spec) => spec.validate().map_err(Into::into),
+        }
+    }
+
+    pub fn is_external_storage(&self) -> bool {
+        matches!(self, Self::Artifact(spec) if spec.is_external_storage())
+    }
+
+    pub fn required_tool(&self) -> Option<&'static str> {
+        match self {
+            Self::Debootstrap(_) => Some("debootstrap"),
+            Self::Pacstrap(_) => Some("pacstrap"),
+            Self::Dnf5(_) => Some("dnf5"),
+            Self::Artifact(_) => None,
+        }
+    }
+}
+
+impl BootstrapSpec {
+    pub fn validate(&self) -> Result<(), BootstrapValidationError> {
+        match self {
+            Self::Debootstrap(spec) => spec.validate(),
+            Self::Pacstrap(spec) => spec.validate(),
+            Self::Dnf5(spec) => spec.validate(),
+        }
+    }
+
+    pub fn inherits_default_packages(&self) -> bool {
+        match self {
+            Self::Debootstrap(spec) => spec.inherit_default_packages,
+            Self::Pacstrap(spec) => spec.inherit_default_packages,
+            Self::Dnf5(spec) => spec.inherit_default_packages,
+        }
+    }
+}
+
+impl DebootstrapSpec {
+    pub fn validate(&self) -> Result<(), BootstrapValidationError> {
+        validate_token("suite", &self.suite)?;
+        self.validate_optional_fields()
+    }
+
+    fn validate_default_preset(&self) -> Result<(), BootstrapValidationError> {
+        if !self.suite.is_empty() {
+            validate_token("suite", &self.suite)?;
+        }
+        self.validate_optional_fields()
+    }
+
+    fn validate_optional_fields(&self) -> Result<(), BootstrapValidationError> {
+        if let Some(architecture) = &self.architecture {
+            validate_token("architecture", architecture)?;
+        }
+        for package in &self.packages {
+            validate_package(package)?;
+        }
+        for package in &self.exclude_packages {
+            validate_package(package)?;
+        }
+        for suite in &self.extra_suites {
+            validate_token("extra suite", suite)?;
+        }
+        for component in &self.components {
+            validate_token("component", component)?;
+        }
+        if let Some(variant) = &self.variant {
+            validate_token("variant", variant)?;
+        }
+        validate_debootstrap_policy(&self.policy, self.mirror.as_deref())
+    }
+}
+
+impl PacstrapSpec {
+    pub fn validate(&self) -> Result<(), BootstrapValidationError> {
+        for package in &self.packages {
+            validate_package(package)?;
+        }
+        Ok(())
+    }
+}
+
+impl Dnf5Spec {
+    pub fn validate(&self) -> Result<(), BootstrapValidationError> {
+        validate_token("releasever", &self.releasever)?;
+        if self.repository != Dnf5RepositorySource::Host {
+            return Err(BootstrapValidationError::UnsupportedDnf5Repository);
+        }
+        self.validate_optional_fields()
+    }
+
+    fn validate_default_preset(&self) -> Result<(), BootstrapValidationError> {
+        if !self.releasever.is_empty() {
+            validate_token("releasever", &self.releasever)?;
+        }
+        self.validate_optional_fields()
+    }
+
+    fn validate_optional_fields(&self) -> Result<(), BootstrapValidationError> {
+        if let Some(architecture) = &self.architecture {
+            validate_token("architecture", architecture)?;
+        }
+        for package in self.packages.iter().chain(&self.exclude_packages) {
+            validate_package(package)?;
+        }
+        for repository in self
+            .only_repositories
+            .iter()
+            .chain(&self.enable_repositories)
+            .chain(&self.disable_repositories)
+        {
+            validate_repository_selector(repository)?;
+        }
+        if !self.only_repositories.is_empty()
+            && (!self.enable_repositories.is_empty() || !self.disable_repositories.is_empty())
+        {
+            return Err(BootstrapValidationError::ConflictingDnf5RepositorySelection);
+        }
+        Ok(())
+    }
+}
+
+fn validate_debootstrap_policy(
+    policy: &DebootstrapPolicy,
+    mirror: Option<&str>,
+) -> Result<(), BootstrapValidationError> {
+    if policy.transport == DebootstrapTransportPolicy::HttpsOnly && mirror.is_none() {
+        return Err(BootstrapValidationError::HttpsMirrorRequired);
+    }
+    if let Some(mirror) = mirror {
+        let parsed = url::Url::parse(mirror)
+            .map_err(|error| BootstrapValidationError::InvalidMirror(error.to_string()))?;
+        if policy.transport == DebootstrapTransportPolicy::HttpsOnly && parsed.scheme() != "https" {
+            return Err(BootstrapValidationError::InsecureMirror);
+        }
+        if !policy.allowed_mirror_hosts.is_empty() {
+            let host = parsed
+                .host_str()
+                .ok_or(BootstrapValidationError::MissingMirrorHost)?;
+            if !policy
+                .allowed_mirror_hosts
+                .iter()
+                .any(|allowed| allowed == host)
+            {
+                return Err(BootstrapValidationError::MirrorHostNotAllowed(
+                    host.to_string(),
+                ));
+            }
+        }
+    } else if !policy.allowed_mirror_hosts.is_empty() {
+        return Err(BootstrapValidationError::MirrorAllowlistRequiresMirror);
+    }
+    Ok(())
+}
+
+fn validate_token(field: &'static str, value: &str) -> Result<(), BootstrapValidationError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._:+/@".contains(&byte))
+    {
+        return Err(BootstrapValidationError::InvalidToken { field });
+    }
+    Ok(())
+}
+
+fn validate_package(value: &str) -> Result<(), BootstrapValidationError> {
+    if value.is_empty()
+        || value.len() > 256
+        || value.starts_with('-')
+        || value.chars().any(|c| c.is_control() || c.is_whitespace())
+        || value
+            .chars()
+            .any(|c| matches!(c, ';' | '|' | '&' | '`' | '\'' | '"'))
+    {
+        return Err(BootstrapValidationError::InvalidPackage(value.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_repository_selector(value: &str) -> Result<(), BootstrapValidationError> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.starts_with('-')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-._*?".contains(&byte))
+    {
+        return Err(BootstrapValidationError::InvalidRepositorySelector(
+            value.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_validation_is_owned_by_the_intent_model() {
+        let invalid_package = PacstrapSpec {
+            packages: vec!["--config=/tmp/host-pacman.conf".into()],
+            ..PacstrapSpec::default()
+        };
+        assert!(matches!(
+            invalid_package.validate(),
+            Err(BootstrapValidationError::InvalidPackage(_))
+        ));
+
+        let missing_repository = Dnf5Spec {
+            releasever: "43".into(),
+            ..Dnf5Spec::default()
+        };
+        assert_eq!(
+            missing_repository.validate(),
+            Err(BootstrapValidationError::UnsupportedDnf5Repository)
+        );
+    }
+
+    #[test]
+    fn source_metadata_does_not_depend_on_a_host_adapter() {
+        assert_eq!(
+            RootfsSourceSpec::Debootstrap(DebootstrapSpec::default()).required_tool(),
+            Some("debootstrap")
+        );
+        assert!(
+            RootfsSourceSpec::Artifact(ArtifactSpec::from_path("rootfs.raw")).is_external_storage()
+        );
+    }
 }

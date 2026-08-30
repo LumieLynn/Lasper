@@ -2,9 +2,9 @@ use super::ALL_DRM_DEVICES_PATH;
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::image_lifecycle::ArtifactOwnership;
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -57,9 +57,9 @@ impl SystemdUnitStore {
         name: &str,
         device_binds: &[String],
         gpu_passthrough_all: bool,
-    ) -> Result<ApplyStatus> {
+    ) -> Result<ResourceApplyStatus> {
         if device_binds.is_empty() && !gpu_passthrough_all {
-            return Ok(ApplyStatus::Unchanged);
+            return Ok(ResourceApplyStatus::Unchanged);
         }
 
         let result = self
@@ -76,7 +76,11 @@ impl SystemdUnitStore {
         })
     }
 
-    pub async fn clone_override(&self, source: &str, destination: &str) -> Result<ApplyStatus> {
+    pub async fn clone_override(
+        &self,
+        source: &str,
+        destination: &str,
+    ) -> Result<ResourceApplyStatus> {
         let result = self
             .execute(SystemdUnitOperation::CloneOverride(CloneServiceOverride {
                 source: parse_machine_name(source)?,
@@ -269,7 +273,7 @@ pub(crate) struct SystemdUnitResult {
     #[serde(default)]
     drop_ins: Vec<SystemdDropIn>,
     #[serde(default)]
-    apply: Option<ApplyStatus>,
+    apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     ownership: Option<Vec<ArtifactOwnership>>,
 }
@@ -322,7 +326,7 @@ pub(crate) async fn execute_systemd_unit_operation(
                 validate_content_size(&content)?;
                 apply_new_override_at(&service_override_path(&request.destination), content).await?
             } else {
-                ApplyStatus::Unchanged
+                ResourceApplyStatus::Unchanged
             };
             return Ok(SystemdUnitResult {
                 apply: Some(apply),
@@ -526,7 +530,7 @@ async fn write_override_at(path: &Path, content: &str) -> Result<()> {
     AsyncLockedWriter::write_atomic_with_mode(path, content, Some(0o644)).await
 }
 
-async fn apply_new_override_at(path: &Path, content: String) -> Result<ApplyStatus> {
+async fn apply_new_override_at(path: &Path, content: String) -> Result<ResourceApplyStatus> {
     apply_new_override_at_with_uid(path, content, 0).await
 }
 
@@ -534,22 +538,22 @@ async fn apply_new_override_at_with_uid(
     path: &Path,
     content: String,
     expected_uid: u32,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     let ownership = probe_owned_override_at(path, expected_uid).await?;
     if ownership == ArtifactOwnership::AmbiguousLegacy {
-        return Ok(ApplyStatus::ConflictUnknownOwner);
+        return Ok(ResourceApplyStatus::ConflictUnknownOwner);
     }
     AsyncLockedWriter::apply_locked_with_mode(path, 0o644, move |existing| {
         Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
             Some(existing)
                 if ownership == ArtifactOwnership::ProvenOwned
                     && is_owned_override_content(&existing) =>
             {
-                (Some(content), ApplyStatus::ReplacedOwned)
+                (Some(content), ResourceApplyStatus::ReplacedOwned)
             }
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
         })
     })
     .await
@@ -877,20 +881,20 @@ mod tests {
             apply_new_override_at_with_uid(&path, content.clone(), uzers::get_current_uid())
                 .await
                 .unwrap(),
-            ApplyStatus::Created
+            ResourceApplyStatus::Created
         );
         assert_eq!(
             apply_new_override_at_with_uid(&path, content.clone(), uzers::get_current_uid())
                 .await
                 .unwrap(),
-            ApplyStatus::Unchanged
+            ResourceApplyStatus::Unchanged
         );
         let replacement = systemd_override_content(&["/dev/dri/card0".into()], false);
         assert_eq!(
             apply_new_override_at_with_uid(&path, replacement.clone(), uzers::get_current_uid(),)
                 .await
                 .unwrap(),
-            ApplyStatus::ReplacedOwned
+            ResourceApplyStatus::ReplacedOwned
         );
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), replacement);
 
@@ -905,7 +909,7 @@ mod tests {
             )
             .await
             .unwrap(),
-            ApplyStatus::ConflictUnknownOwner
+            ResourceApplyStatus::ConflictUnknownOwner
         );
         assert_eq!(
             tokio::fs::read_to_string(&path).await.unwrap(),

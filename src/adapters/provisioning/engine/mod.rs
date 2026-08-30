@@ -1,5 +1,6 @@
 //! Deployment trait and orchestrator.
 
+mod bootstrap_args;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 mod capabilities;

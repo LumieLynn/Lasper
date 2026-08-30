@@ -2,6 +2,7 @@ mod config;
 mod identity;
 mod job;
 mod request;
+mod resource;
 mod secrets;
 
 pub use config::MachineProvisioningConfig;
@@ -17,6 +18,7 @@ pub use job::{
     RemoteTarSafety, SourcePreflight,
 };
 pub use request::{DeploymentRequest, DeploymentSource, DeploymentStorage};
+pub(crate) use resource::ResourceApplyStatus;
 pub(crate) use secrets::DeploymentSecretsWire;
 pub use secrets::{DeploymentSecrets, DeploymentSubmission, UserSecret};
 

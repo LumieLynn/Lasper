@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 
 pub struct CloneDeployer {
     pub source_name: String,
@@ -37,16 +37,16 @@ impl ClonedConfigStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CloneApplyResult {
     config: ClonedConfigStatus,
-    service_override: Option<ApplyStatus>,
+    service_override: Option<ResourceApplyStatus>,
 }
 
 impl CloneApplyResult {
     fn summary(self) -> String {
         let service_override = match self.service_override {
-            Some(ApplyStatus::Created) => "cloned",
-            Some(ApplyStatus::Unchanged) => "already identical",
-            Some(ApplyStatus::ReplacedOwned) => "replaced",
-            Some(ApplyStatus::ConflictUnknownOwner) => "conflict",
+            Some(ResourceApplyStatus::Created) => "cloned",
+            Some(ResourceApplyStatus::Unchanged) => "already identical",
+            Some(ResourceApplyStatus::ReplacedOwned) => "replaced",
+            Some(ResourceApplyStatus::ConflictUnknownOwner) => "conflict",
             None => "not present",
         };
         format!(
@@ -201,7 +201,7 @@ mod tests {
     fn clone_result_distinguishes_provider_and_lasper_artifacts() {
         let complete = CloneApplyResult {
             config: ClonedConfigStatus::ClonedBySystemd,
-            service_override: Some(ApplyStatus::Created),
+            service_override: Some(ResourceApplyStatus::Created),
         };
         assert_eq!(
             complete.summary(),

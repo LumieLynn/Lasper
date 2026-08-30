@@ -335,12 +335,8 @@ mod tests {
             panic!("expected debootstrap profile");
         };
         assert_eq!(
-            spec.args(std::path::Path::new("/tmp/rootfs"), false)
-                .unwrap()
-                .iter()
-                .find(|arg| arg.as_str() == "--no-check-sig")
-                .map(String::as_str),
-            Some("--no-check-sig")
+            spec.policy.release_signatures,
+            DebootstrapReleaseSignaturePolicy::Disabled
         );
     }
 

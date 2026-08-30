@@ -31,7 +31,9 @@ impl Deployer for BootstrapDeployer {
         cancellation: &DeploymentCancellation,
         _report: &mut ApplyReport,
     ) -> Result<()> {
-        self.spec.validate()?;
+        self.spec
+            .validate()
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
         if signature_verification_disabled(&self.spec) {
             send_deploy_log(
                 &logs,

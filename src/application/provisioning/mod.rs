@@ -24,6 +24,7 @@ pub(crate) use contract::MemoryDeploymentClaimControl;
 pub(crate) use contract::{
     deployment_job_channel, DeploymentCancellation, DeploymentCancellationRequested,
     DeploymentClaimControl, DeploymentJobContext, DeploymentRequestId, DeploymentSecretsWire,
+    ResourceApplyStatus,
 };
 pub(crate) use recovery::{
     DeploymentRecoveryEvidence, DeploymentRecoveryObservation, DeploymentRecoveryProbe,

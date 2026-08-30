@@ -5,13 +5,12 @@ use crate::adapters::config::nspawn_file::{
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
-use crate::application::provisioning::MachineProvisioningConfig;
+use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -74,7 +73,7 @@ impl NspawnConfigStore {
         config: &MachineProvisioningConfig,
         wayland: &[WaylandGrant],
         nvidia_state: Option<&NvidiaState>,
-    ) -> Result<ApplyStatus> {
+    ) -> Result<ResourceApplyStatus> {
         let spec = NspawnConfigSpec::try_from(config)?;
         let result = self
             .execute(NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
@@ -104,7 +103,11 @@ impl NspawnConfigStore {
         Ok(())
     }
 
-    pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<ApplyStatus> {
+    pub async fn promote_oci(
+        &self,
+        name: &str,
+        network: OciNetworkMode,
+    ) -> Result<ResourceApplyStatus> {
         let result = self
             .execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
                 machine: parse_machine_name(name)?,
@@ -282,7 +285,7 @@ pub(crate) struct UpdateNspawnGpu {
 pub(crate) struct NspawnConfigResult {
     content: Option<NspawnConfigInspection>,
     #[serde(default)]
-    apply: Option<ApplyStatus>,
+    apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     sidecars_cleaned: Option<bool>,
 }
@@ -532,12 +535,12 @@ async fn apply_new_content_at(
     path: &Path,
     content: String,
     mode: Option<u32>,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     let apply = move |existing: Option<String>| {
         Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
         })
     };
     match mode {
@@ -553,7 +556,7 @@ async fn promote_oci_config(
     machines_dir: &Path,
     admin_dir: &Path,
     runtime_dir: &Path,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     promote_oci_config_inner(machine, network, machines_dir, admin_dir, runtime_dir, true).await
 }
 
@@ -563,7 +566,7 @@ async fn promote_new_oci_config(
     machines_dir: &Path,
     admin_dir: &Path,
     runtime_dir: &Path,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     promote_oci_config_inner(
         machine,
         network,
@@ -582,7 +585,7 @@ async fn promote_oci_config_inner(
     admin_dir: &Path,
     runtime_dir: &Path,
     replace_owned: bool,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     validate_oci_promotion_target(machine, admin_dir, runtime_dir).await?;
     let filename = format!("{}.nspawn", machine.as_str());
     let source = machines_dir.join(&filename);
@@ -593,14 +596,14 @@ async fn promote_oci_config_inner(
     validate_content_size(&content)?;
     AsyncLockedWriter::apply_locked_with_mode(&destination, 0o640, move |existing| {
         Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
             Some(existing)
                 if replace_owned && existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) =>
             {
-                (Some(content), ApplyStatus::ReplacedOwned)
+                (Some(content), ResourceApplyStatus::ReplacedOwned)
             }
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
         })
     })
     .await
@@ -833,7 +836,7 @@ async fn write_generated_at(
     wayland: &[WaylandGrant],
     nvidia_state: Option<&NvidiaState>,
     invoking_uid: u32,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     spec.validate()?;
     validate_custom_bind_sources(spec).await?;
     let mut wayland_binds = Vec::new();
@@ -1309,7 +1312,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
-        assert_eq!(first_apply, ApplyStatus::Created);
+        assert_eq!(first_apply, ResourceApplyStatus::Created);
         let first = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(first.contains("PrivateUsers=no"));
         assert!(first.contains("ResolvConf=bind-host"));
@@ -1342,7 +1345,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
-        assert_eq!(second_apply, ApplyStatus::ReplacedOwned);
+        assert_eq!(second_apply, ResourceApplyStatus::ReplacedOwned);
         let second = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(second.contains("PrivateUsers=no"));
         assert!(second.contains("ResolvConf=off"));
@@ -1513,7 +1516,7 @@ Unknown=preserve-me\n";
         let created = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(created, ApplyStatus::Created);
+        assert_eq!(created, ResourceApplyStatus::Created);
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Boot=yes"));
@@ -1523,7 +1526,7 @@ Unknown=preserve-me\n";
         let unchanged = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(unchanged, ApplyStatus::Unchanged);
+        assert_eq!(unchanged, ResourceApplyStatus::Unchanged);
 
         let different = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
@@ -1534,7 +1537,7 @@ Unknown=preserve-me\n";
         let conflict = write_generated_at(&path, &different, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(conflict, ApplyStatus::ConflictUnknownOwner);
+        assert_eq!(conflict, ResourceApplyStatus::ConflictUnknownOwner);
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
     }
 

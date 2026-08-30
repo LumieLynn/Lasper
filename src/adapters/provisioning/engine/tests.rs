@@ -1,5 +1,6 @@
 use super::stream::is_high_signal_deploy_stream;
 use super::*;
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
     DeploymentSource, DeploymentStage, DeploymentStatePort, DeploymentStateSession,
@@ -7,7 +8,6 @@ use crate::application::provisioning::{
     ResourceLedger,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 use std::sync::Arc;
 
 fn apply_report() -> ApplyReport {
@@ -47,13 +47,16 @@ fn deploy_stream_distinguishes_normal_output_from_warnings() {
 fn apply_report_records_only_resources_created_by_this_attempt() {
     let mut report = apply_report();
     report
-        .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+        .record_apply(AppliedResource::NspawnConfig, ResourceApplyStatus::Created)
         .unwrap();
     report
-        .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+        .record_apply(AppliedResource::NspawnConfig, ResourceApplyStatus::Created)
         .unwrap();
     report
-        .record_apply(AppliedResource::SystemdOverride, ApplyStatus::Unchanged)
+        .record_apply(
+            AppliedResource::SystemdOverride,
+            ResourceApplyStatus::Unchanged,
+        )
         .unwrap();
 
     assert!(report.owns(AppliedResource::NspawnConfig));
@@ -66,7 +69,7 @@ fn unknown_nspawn_owner_blocks_external_image_compensation() {
     let error = report
         .record_apply(
             AppliedResource::NspawnConfig,
-            ApplyStatus::ConflictUnknownOwner,
+            ResourceApplyStatus::ConflictUnknownOwner,
         )
         .unwrap_err();
 
@@ -81,11 +84,14 @@ fn sidecar_conflicts_are_preserved_and_owned_replacements_are_adopted() {
     report
         .record_apply(
             AppliedResource::NvidiaState,
-            ApplyStatus::ConflictUnknownOwner,
+            ResourceApplyStatus::ConflictUnknownOwner,
         )
         .unwrap();
     report
-        .record_apply(AppliedResource::SystemdOverride, ApplyStatus::ReplacedOwned)
+        .record_apply(
+            AppliedResource::SystemdOverride,
+            ResourceApplyStatus::ReplacedOwned,
+        )
         .unwrap();
 
     assert!(report.owns(AppliedResource::SystemdOverride));

@@ -5,13 +5,13 @@ use super::{
     DirectProvisioningCapabilities,
 };
 use crate::adapters::storage::StorageBackend;
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
     DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
 };
 use crate::domain::provisioning::PrivateUsersMode;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 
 /// Runs one deployment using application-owned job state and event transport.
 #[allow(clippy::too_many_arguments)]
@@ -379,17 +379,17 @@ async fn run_deploy_internal(
             report.record_apply(AppliedResource::NvidiaState, state_apply)?;
             persist_committed(&job, DeploymentStage::HostConfiguration, &report).await?;
             match state_apply {
-                ApplyStatus::ReplacedOwned => {
+                ResourceApplyStatus::ReplacedOwned => {
                     let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
                     log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::ConflictUnknownOwner => {
+                ResourceApplyStatus::ConflictUnknownOwner => {
                     let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
                     log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
             }
             cancellation.checkpoint()?;
 
@@ -478,17 +478,17 @@ async fn run_deploy_internal(
             report.record_apply(AppliedResource::SystemdOverride, override_apply)?;
             persist_committed(&job, DeploymentStage::RuntimeCommit, &report).await?;
             match override_apply {
-                ApplyStatus::ReplacedOwned => {
+                ResourceApplyStatus::ReplacedOwned => {
                     let warning = "Replaced an existing Lasper-owned systemd service drop-in for this deployment.";
                     log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::ConflictUnknownOwner => {
+                ResourceApplyStatus::ConflictUnknownOwner => {
                     let warning = "Preserved the existing systemd service drop-in because Lasper could not prove ownership; requested device allowances were not written there.";
                     log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
             }
 
             system_operations.reload_daemon().await?;

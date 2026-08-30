@@ -6,11 +6,10 @@ use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentJobContext,
-    DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
-    ResourceLedger,
+    DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceApplyStatus,
+    ResourceDisposition, ResourceLedger,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ApplyStatus;
 
 /// Direct host capabilities used by the provisioning implementation.
 ///
@@ -114,15 +113,15 @@ impl ApplyReport {
     pub(crate) fn record_apply(
         &mut self,
         resource: AppliedResource,
-        status: ApplyStatus,
+        status: ResourceApplyStatus,
     ) -> Result<()> {
         match status {
-            ApplyStatus::Created => {
+            ResourceApplyStatus::Created => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::Created);
                 Ok(())
             }
-            ApplyStatus::Unchanged => {
+            ResourceApplyStatus::Unchanged => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
@@ -131,7 +130,7 @@ impl ApplyReport {
                 }
                 Ok(())
             }
-            ApplyStatus::ReplacedOwned => {
+            ResourceApplyStatus::ReplacedOwned => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::Adopted);
                 if resource == AppliedResource::NspawnConfig {
@@ -147,7 +146,7 @@ impl ApplyReport {
                 // restoring stale state for a target that was not deployed.
                 Ok(())
             }
-            ApplyStatus::ConflictUnknownOwner => {
+            ResourceApplyStatus::ConflictUnknownOwner => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
