@@ -3,6 +3,7 @@
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
+use crate::application::runtime::RuntimeResult;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use serde::{Deserialize, Serialize};
@@ -116,7 +117,7 @@ pub enum ImageRemovalOutcome {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait ImageRuntime: Send + Sync + 'static {
-    async fn list_machines(&self) -> Result<Vec<MachineEntry>, String>;
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -171,7 +172,12 @@ impl ImageRemovalOperation {
 
         let machines = match self.runtime.list_machines().await {
             Ok(machines) => machines,
-            Err(reason) => return ImageRemovalOutcome::Failed { reason, report },
+            Err(reason) => {
+                return ImageRemovalOutcome::Failed {
+                    reason: reason.to_string(),
+                    report,
+                }
+            }
         };
         if machines
             .iter()

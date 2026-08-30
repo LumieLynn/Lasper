@@ -4,6 +4,7 @@ use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
+use crate::application::runtime::RuntimeResult;
 use crate::domain::inspection::{MachineProperties, GROUP_SYSTEMD_UNIT};
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState};
@@ -255,7 +256,7 @@ pub trait MachineObservation: Send + Sync + 'static {
         &self,
         machine: &MachineName,
         entry: &MachineEntry,
-    ) -> Result<MachineProperties, String>;
+    ) -> RuntimeResult<MachineProperties>;
     fn invalidate(&self);
 }
 
@@ -507,7 +508,7 @@ impl MachineLifecycleService {
                         }
                     }
                 }
-                Err(error) => last_observation = error,
+                Err(error) => last_observation = error.to_string(),
             }
             if started_at.elapsed() >= self.start_timeout {
                 let details = format!(

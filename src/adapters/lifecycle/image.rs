@@ -13,6 +13,7 @@ use crate::application::image_lifecycle::{
 use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineControlTransport, NspawnUnitAction, NspawnUnitControlRequest,
 };
+use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageName, MachineEntry};
@@ -82,12 +83,8 @@ struct CatalogImageRuntime(Arc<RuntimeCatalog>);
 
 #[async_trait::async_trait]
 impl ImageRuntime for CatalogImageRuntime {
-    async fn list_machines(&self) -> Result<Vec<MachineEntry>, String> {
-        self.0
-            .machines()
-            .await
-            .map(|query| query.value)
-            .map_err(|error| error.to_string())
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
+        self.0.machines().await.map(|query| query.value)
     }
 }
 

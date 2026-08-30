@@ -16,6 +16,7 @@ use crate::application::machine_lifecycle::{
     NspawnUnitControlRequest, RoutedMachineControlOutcome, StartFailureEvidence,
 };
 use crate::application::operations::{ExecutionRoute, RouteFallback};
+use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
@@ -423,12 +424,11 @@ impl MachineObservation for CatalogMachineObservation {
         &self,
         machine: &MachineName,
         entry: &MachineEntry,
-    ) -> Result<MachineProperties, String> {
+    ) -> RuntimeResult<MachineProperties> {
         self.runtime
             .inspect(machine.as_str(), entry)
             .await
             .map(|query| query.value)
-            .map_err(|error| error.to_string())
     }
 
     fn invalidate(&self) {
