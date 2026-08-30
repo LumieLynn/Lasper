@@ -4,14 +4,68 @@ use crate::adapters::runtime::state as runtime_state;
 use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
 use portable_pty::CommandBuilder;
+use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const NAMESPACE_NAMES: [&str; 6] = ["user", "mnt", "uts", "ipc", "net", "pid"];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NamespaceSnapshot {
+    leader: u32,
+    process: PathBuf,
+    start_time: u64,
+    namespaces: [FileIdentity; NAMESPACE_NAMES.len()],
+    root: FileIdentity,
+}
+
+impl NamespaceSnapshot {
+    fn capture(leader: u32, process: &Path) -> io::Result<Self> {
+        let namespaces =
+            NAMESPACE_NAMES.map(|namespace| file_identity(&process.join("ns").join(namespace)));
+        let namespaces = namespaces.into_iter().collect::<io::Result<Vec<_>>>()?;
+        let namespaces = namespaces.try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid namespace snapshot")
+        })?;
+        Ok(Self {
+            leader,
+            process: process.to_path_buf(),
+            start_time: process_start_time(process)?,
+            namespaces,
+            root: file_identity(&process.join("root"))?,
+        })
+    }
+
+    fn verify(&self) -> io::Result<()> {
+        let current_start_time = process_start_time(&self.process)?;
+        if current_start_time != self.start_time {
+            return Err(snapshot_changed(self.leader, "process start time"));
+        }
+        for (namespace, expected) in NAMESPACE_NAMES.iter().zip(self.namespaces) {
+            let current = file_identity(&self.process.join("ns").join(namespace))?;
+            if current != expected {
+                return Err(snapshot_changed(self.leader, namespace));
+            }
+        }
+        if file_identity(&self.process.join("root"))? != self.root {
+            return Err(snapshot_changed(self.leader, "root filesystem"));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalAttachCommand {
     kind: TerminalAttachKind,
     program: String,
     args: Vec<String>,
+    namespace_snapshot: Option<NamespaceSnapshot>,
 }
 
 impl TerminalAttachCommand {
@@ -29,10 +83,19 @@ impl TerminalAttachCommand {
         &self.args
     }
 
-    pub fn into_pty_command(self) -> CommandBuilder {
-        let mut command = CommandBuilder::new(&self.program);
-        command.args(&self.args);
-        if self.kind == TerminalAttachKind::Namespace {
+    pub fn into_pty_command(self) -> io::Result<CommandBuilder> {
+        let Self {
+            kind,
+            program,
+            args,
+            namespace_snapshot,
+        } = self;
+        if let Some(snapshot) = namespace_snapshot {
+            snapshot.verify()?;
+        }
+        let mut command = CommandBuilder::new(program);
+        command.args(args);
+        if kind == TerminalAttachKind::Namespace {
             // Do not copy sudo/daemon environment variables into a root shell
             // inside a potentially untrusted container.
             command.env_clear();
@@ -45,7 +108,7 @@ impl TerminalAttachCommand {
             command.env("LOGNAME", "root");
             command.env("TERM", "xterm-256color");
         }
-        command
+        Ok(command)
     }
 }
 
@@ -109,6 +172,7 @@ fn login_command(name: &MachineName) -> TerminalAttachCommand {
         kind: TerminalAttachKind::Login,
         program: "machinectl".to_string(),
         args: vec!["--".to_string(), "login".to_string(), name.to_string()],
+        namespace_snapshot: None,
     }
 }
 
@@ -117,7 +181,7 @@ pub(crate) fn login(name: &MachineName) -> TerminalAttachCommand {
 }
 
 fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAttachCommand> {
-    for namespace in ["user", "mnt", "uts", "ipc", "net", "pid"] {
+    for namespace in NAMESPACE_NAMES {
         let path = process.join("ns").join(namespace);
         std::fs::symlink_metadata(&path).map_err(|error| {
             std::io::Error::new(
@@ -137,6 +201,7 @@ fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAtt
     let enter_user_namespace = !same_namespace(&current_user_namespace, &target_user_namespace)?;
     let root = process.join("root");
     let shell = select_shell(&root)?;
+    let snapshot = NamespaceSnapshot::capture(leader, process)?;
     let mut args = vec!["--target".to_string(), leader.to_string()];
     if enter_user_namespace {
         args.extend([
@@ -166,7 +231,52 @@ fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAtt
         kind: TerminalAttachKind::Namespace,
         program: "nsenter".to_string(),
         args,
+        namespace_snapshot: Some(snapshot),
     })
+}
+
+fn file_identity(path: &Path) -> io::Result<FileIdentity> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+fn process_start_time(process: &Path) -> io::Result<u64> {
+    let stat = std::fs::read_to_string(process.join("stat"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "container leader stat has no command terminator",
+            )
+        })?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "container leader stat has no start time",
+            )
+        })?
+        .parse()
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("container leader start time is invalid: {error}"),
+            )
+        })
+}
+
+fn snapshot_changed(leader: u32, part: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("container leader {leader} {part} changed during terminal setup"),
+    )
 }
 
 fn same_namespace(left: &Path, right: &Path) -> std::io::Result<bool> {
@@ -209,9 +319,17 @@ mod tests {
         std::fs::create_dir_all(process.join("ns")).unwrap();
         std::fs::create_dir_all(proc_root.join("self/ns")).unwrap();
         std::fs::write(proc_root.join("self/ns/user"), []).unwrap();
-        for namespace in ["user", "mnt", "uts", "ipc", "net", "pid"] {
+        for namespace in NAMESPACE_NAMES {
             std::fs::write(process.join("ns").join(namespace), []).unwrap();
         }
+        let mut stat_fields = vec!["S".to_string()];
+        stat_fields.extend((0..18).map(|_| "0".to_string()));
+        stat_fields.push("12345".to_string());
+        std::fs::write(
+            process.join("stat"),
+            format!("4242 (fixture) {}\n", stat_fields.join(" ")),
+        )
+        .unwrap();
         let shell = if with_bash { "bash" } else { "sh" };
         let shell_path = process.join("root/bin").join(shell);
         std::fs::write(&shell_path, []).unwrap();
@@ -306,6 +424,25 @@ mod tests {
 
         assert_eq!(command.args().last().map(String::as_str), Some("-i"));
         assert!(command.args().iter().any(|argument| argument == "/bin/sh"));
+    }
+
+    #[test]
+    fn namespace_attach_rejects_a_changed_leader_before_spawn() {
+        let (_directory, state, proc_root) = fixture(true);
+        let name = MachineName::new("test-machine").unwrap();
+        let command = select_at(&name, &state, &proc_root, false).unwrap();
+
+        let mut stat_fields = vec!["S".to_string()];
+        stat_fields.extend((0..18).map(|_| "0".to_string()));
+        stat_fields.push("54321".to_string());
+        std::fs::write(
+            proc_root.join("4242/stat"),
+            format!("4242 (fixture) {}\n", stat_fields.join(" ")),
+        )
+        .unwrap();
+
+        let error = command.into_pty_command().unwrap_err();
+        assert!(error.to_string().contains("start time changed"));
     }
 
     #[test]

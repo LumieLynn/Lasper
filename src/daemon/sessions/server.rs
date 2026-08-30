@@ -116,7 +116,15 @@ pub(crate) fn spawn_terminal(
     };
     let attachment_kind = attachment.kind();
     let terminal_name = name.to_string();
-    match pair.slave.spawn_command(attachment.into_pty_command()) {
+    let command = match attachment.into_pty_command() {
+        Ok(command) => command,
+        Err(error) => {
+            log::warn!("Daemon: terminal attachment validation failed: {error}");
+            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            return;
+        }
+    };
+    match pair.slave.spawn_command(command) {
         Ok(mut child) => {
             drop(pair.slave);
             let Some(child_pid) = child.process_id() else {

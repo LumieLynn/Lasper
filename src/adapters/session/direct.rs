@@ -40,8 +40,11 @@ impl SessionPort for DirectSessionAdapter {
             .map_err(|error| SessionError::new(format!("plan terminal attachment: {error}")))?,
         };
         let kind = attachment.kind();
+        let command = attachment
+            .into_pty_command()
+            .map_err(|error| SessionError::new(format!("validate terminal attachment: {error}")))?;
         crate::adapters::session::pty::spawn_direct_terminal(
-            attachment.into_pty_command(),
+            command,
             request.id,
             kind,
             request.size,
