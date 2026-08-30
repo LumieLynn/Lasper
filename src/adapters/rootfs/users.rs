@@ -1,10 +1,9 @@
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::domain::provisioning::{validate_login_username, CreateUser};
-use crate::domain::secret::SecretBytes;
+use crate::domain::secret::{validate_chpasswd_secret, SecretBytes};
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::validate_chpasswd_secret;
 use std::path::Path;
 
 pub(crate) async fn create_user_in_container(
@@ -16,7 +15,8 @@ pub(crate) async fn create_user_in_container(
     user.validate()
         .map_err(|error| NspawnError::Validation(error.to_string()))?;
     if let Some(password) = password {
-        validate_chpasswd_secret("user password", password)?;
+        validate_chpasswd_secret(password)
+            .map_err(|error| NspawnError::Validation(error.message("user password")))?;
     }
     let shell = user.login_shell();
 
@@ -132,7 +132,8 @@ async fn run_chpasswd(
     password: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<std::process::Output> {
-    validate_chpasswd_secret("password", password)?;
+    validate_chpasswd_secret(password)
+        .map_err(|error| NspawnError::Validation(error.message("password")))?;
     let input = format!("{username}:{password}\n").into_bytes();
     let output = runner
         .run(

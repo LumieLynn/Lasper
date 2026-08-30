@@ -11,11 +11,10 @@ use crate::adapters::rootfs::{users, wayland};
 use crate::domain::machine::GuestHostname;
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::CreateUser;
-use crate::domain::secret::SecretString;
+use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::validate_chpasswd_secret;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
@@ -695,7 +694,8 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::SetRootPassword(request) => {
-            validate_chpasswd_secret("root password", request.password.expose_secret())?;
+            validate_chpasswd_secret(request.password.expose_secret())
+                .map_err(|error| NspawnError::Validation(error.message("root password")))?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
             let warnings =
@@ -716,7 +716,8 @@ async fn execute_rootfs_operation_with_runners(
             user.validate()
                 .map_err(|error| NspawnError::Validation(error.to_string()))?;
             if let Some(password) = &request.password {
-                validate_chpasswd_secret("user password", password.expose_secret())?;
+                validate_chpasswd_secret(password.expose_secret())
+                    .map_err(|error| NspawnError::Validation(error.message("user password")))?;
             }
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;

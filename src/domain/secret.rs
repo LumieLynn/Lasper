@@ -2,6 +2,46 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
+pub const MAX_CHPASSWD_SECRET_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretValidationError {
+    TooLong,
+    ContainsControlCharacter,
+}
+
+impl SecretValidationError {
+    pub fn message(self, label: &str) -> String {
+        match self {
+            Self::TooLong => format!("{label} cannot exceed {MAX_CHPASSWD_SECRET_BYTES} bytes"),
+            Self::ContainsControlCharacter => {
+                format!("{label} cannot contain control characters")
+            }
+        }
+    }
+}
+
+impl fmt::Display for SecretValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::TooLong => "secret exceeds the maximum supported length",
+            Self::ContainsControlCharacter => "secret contains a control character",
+        })
+    }
+}
+
+impl std::error::Error for SecretValidationError {}
+
+pub fn validate_chpasswd_secret(secret: &str) -> Result<(), SecretValidationError> {
+    if secret.len() > MAX_CHPASSWD_SECRET_BYTES {
+        return Err(SecretValidationError::TooLong);
+    }
+    if secret.chars().any(char::is_control) {
+        return Err(SecretValidationError::ContainsControlCharacter);
+    }
+    Ok(())
+}
+
 /// Ephemeral secret text which cannot be cloned, debug-printed, or serialized
 /// through an ordinary model derive.
 pub struct SecretString {
@@ -138,5 +178,21 @@ mod tests {
 
         assert_eq!(value, "NewPassword123");
         assert!(!value.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn chpasswd_secret_validation_is_domain_owned() {
+        assert_eq!(
+            validate_chpasswd_secret(&"x".repeat(MAX_CHPASSWD_SECRET_BYTES + 1)),
+            Err(SecretValidationError::TooLong)
+        );
+        assert_eq!(
+            validate_chpasswd_secret("safe\nvalue"),
+            Err(SecretValidationError::ContainsControlCharacter)
+        );
+        assert_eq!(
+            SecretValidationError::ContainsControlCharacter.message("Root password"),
+            "Root password cannot contain control characters"
+        );
     }
 }

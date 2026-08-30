@@ -3,20 +3,6 @@ use crate::domain::provisioning::{
 };
 use crate::nspawn::errors::{NspawnError, Result};
 use serde::{Deserialize, Serialize};
-pub fn validate_chpasswd_secret(label: &str, secret: &str) -> Result<()> {
-    if secret.len() > 4096 {
-        return Err(NspawnError::Validation(format!(
-            "{label} cannot exceed 4096 bytes"
-        )));
-    }
-    if secret.chars().any(char::is_control) {
-        return Err(NspawnError::Validation(format!(
-            "{label} cannot contain control characters"
-        )));
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum DiskImageFilesystem {

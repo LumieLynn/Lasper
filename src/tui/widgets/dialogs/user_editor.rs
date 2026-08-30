@@ -1,7 +1,6 @@
 use crate::domain::provisioning::{validate_login_shell, validate_login_username};
+use crate::domain::secret::validate_chpasswd_secret;
 use crate::domain::wayland::HostWaylandSocket;
-use crate::nspawn::errors::{NspawnError, Result as NspawnResult};
-use crate::nspawn::models::validate_chpasswd_secret;
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::dialogs::wayland_access::WaylandAccessDialog;
 use crate::tui::widgets::inputs::button::Button;
@@ -47,19 +46,12 @@ pub struct UserEditor {
     on_submit: Box<dyn Fn(UserDraft) -> AppMessage>,
 }
 
-fn validation_message(result: NspawnResult<()>) -> Result<(), String> {
-    result.map_err(|error| match error {
-        NspawnError::Validation(message) => message,
-        other => other.to_string(),
-    })
-}
-
 fn validate_username(name: &str) -> Result<(), String> {
     validate_login_username(name).map_err(|error| error.to_string())
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
-    validation_message(validate_chpasswd_secret("Password", password))
+    validate_chpasswd_secret(password).map_err(|error| error.message("Password"))
 }
 
 fn validate_shell(shell: &str) -> Result<(), String> {
