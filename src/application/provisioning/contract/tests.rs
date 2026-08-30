@@ -1,10 +1,11 @@
 use super::job::DEPLOYMENT_EVENT_CAPACITY;
 use super::*;
+use crate::domain::provisioning::CreateUser;
 use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::wayland::{
     HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
 };
-use crate::nspawn::models::{ContainerConfig, CreateUser};
+use crate::nspawn::models::ContainerConfig;
 use tokio::sync::mpsc;
 
 fn wayland_intent(target_username: &str) -> WaylandGrantIntent {

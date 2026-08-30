@@ -309,11 +309,12 @@ fn tool_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::provisioning::CreateUser;
     use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
     use crate::domain::wayland::{
         HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
     };
-    use crate::nspawn::models::{ContainerConfig, CreateUser};
+    use crate::nspawn::models::ContainerConfig;
 
     fn request(private_users: PrivateUsersMode) -> DeploymentRequest {
         let source = HostWaylandSocket::from_verified_parts(

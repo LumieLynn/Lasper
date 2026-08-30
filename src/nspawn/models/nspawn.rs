@@ -272,7 +272,7 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::CreateUser;
+    use crate::domain::provisioning::CreateUser;
 
     #[test]
     fn config_spec_excludes_account_execution_data() {

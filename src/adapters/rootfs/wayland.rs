@@ -1,8 +1,8 @@
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::domain::provisioning::{validate_login_shell, validate_login_username};
 use crate::domain::secret::SecretBytes;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{validate_login_shell, validate_login_username};
 use std::path::Path;
 
 const WAYLAND_RC_MARKER: &str = "# Added by Lasper: Wayland passthrough";
@@ -43,8 +43,9 @@ pub(crate) async fn setup_wayland_shell_env(
 }
 
 pub(crate) fn validate_wayland_config(username: &str, shell: &str) -> Result<()> {
-    validate_login_username(username)?;
-    validate_login_shell(shell)
+    validate_login_username(username)
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
+    validate_login_shell(shell).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 async fn write_user_file(

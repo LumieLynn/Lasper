@@ -1089,6 +1089,7 @@ fn invoking_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::provisioning::CreateUser;
     use crate::domain::provisioning::{BindMount, IdmapSuffix};
     use crate::domain::wayland::WaylandSocketAccess;
 
@@ -1161,7 +1162,7 @@ mod tests {
     fn write_operation_contains_no_account_execution_data() {
         let config = ContainerConfig {
             name: "test".into(),
-            users: vec![crate::nspawn::models::CreateUser {
+            users: vec![CreateUser {
                 username: "alice".into(),
                 ..Default::default()
             }],

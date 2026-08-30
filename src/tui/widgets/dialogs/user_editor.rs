@@ -1,8 +1,7 @@
+use crate::domain::provisioning::{validate_login_shell, validate_login_username};
 use crate::domain::wayland::HostWaylandSocket;
 use crate::nspawn::errors::{NspawnError, Result as NspawnResult};
-use crate::nspawn::models::{
-    validate_chpasswd_secret, validate_login_shell, validate_login_username,
-};
+use crate::nspawn::models::validate_chpasswd_secret;
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::dialogs::wayland_access::WaylandAccessDialog;
 use crate::tui::widgets::inputs::button::Button;
@@ -56,7 +55,7 @@ fn validation_message(result: NspawnResult<()>) -> Result<(), String> {
 }
 
 fn validate_username(name: &str) -> Result<(), String> {
-    validation_message(validate_login_username(name))
+    validate_login_username(name).map_err(|error| error.to_string())
 }
 
 fn validate_password(password: &str) -> Result<(), String> {
@@ -64,7 +63,7 @@ fn validate_password(password: &str) -> Result<(), String> {
 }
 
 fn validate_shell(shell: &str) -> Result<(), String> {
-    validation_message(validate_login_shell(shell))
+    validate_login_shell(shell).map_err(|error| error.to_string())
 }
 
 impl UserEditor {

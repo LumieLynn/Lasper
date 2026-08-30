@@ -1,9 +1,10 @@
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::domain::provisioning::{validate_login_username, CreateUser};
 use crate::domain::secret::SecretBytes;
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
+use crate::nspawn::models::validate_chpasswd_secret;
 use std::path::Path;
 
 pub(crate) async fn create_user_in_container(
@@ -12,7 +13,8 @@ pub(crate) async fn create_user_in_container(
     password: Option<&str>,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<Vec<String>> {
-    user.validate()?;
+    user.validate()
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
     if let Some(password) = password {
         validate_chpasswd_secret("user password", password)?;
     }
@@ -61,7 +63,8 @@ pub(crate) async fn resolve_user_identity(
     username: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<ContainerUserIdentity> {
-    crate::nspawn::models::validate_login_username(username)?;
+    validate_login_username(username)
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
     let uid = query_numeric_identity(rootfs, username, "-u", "uid", runner).await?;
     let gid = query_numeric_identity(rootfs, username, "-g", "gid", runner).await?;
     Ok(ContainerUserIdentity {
