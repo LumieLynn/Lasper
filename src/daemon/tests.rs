@@ -32,7 +32,7 @@ struct SlowRemoveDbus {
 }
 
 #[async_trait::async_trait]
-impl DaemonDbusExecutor for SlowRemoveDbus {
+impl DaemonRuntimeQueries for SlowRemoveDbus {
     async fn list_machines(&self) -> crate::application::runtime::RuntimeResult<Vec<MachineEntry>> {
         Err(crate::application::runtime::RuntimeError::failed(
             "slow test backend does not list machines",
@@ -45,6 +45,22 @@ impl DaemonDbusExecutor for SlowRemoveDbus {
         ))
     }
 
+    async fn get_properties(
+        &self,
+        _name: &str,
+    ) -> crate::application::runtime::RuntimeResult<MachineProperties> {
+        Err(crate::application::runtime::RuntimeError::failed(
+            "slow test backend does not inspect machines",
+        ))
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait::async_trait]
+impl DaemonSystemExecutor for SlowRemoveDbus {
     async fn system_operation(
         &self,
         operation: SystemOperation,
@@ -59,19 +75,6 @@ impl DaemonDbusExecutor for SlowRemoveDbus {
                 "slow test backend only handles image removal".into(),
             )),
         }
-    }
-
-    async fn get_properties(
-        &self,
-        _name: &str,
-    ) -> crate::application::runtime::RuntimeResult<MachineProperties> {
-        Err(crate::application::runtime::RuntimeError::failed(
-            "slow test backend does not inspect machines",
-        ))
-    }
-
-    async fn is_available(&self) -> bool {
-        true
     }
 }
 

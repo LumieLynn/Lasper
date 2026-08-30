@@ -4,7 +4,7 @@ mod command;
 pub(crate) mod handler;
 pub(crate) mod query;
 
-use self::handler::{DaemonDbusExecutor, HandleOutcome};
+use self::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use super::server::DaemonServerState;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
@@ -29,7 +29,7 @@ pub(super) async fn run_rpc_request_pump<R, B>(
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
-    B: DaemonDbusExecutor + Clone + 'static,
+    B: DaemonRuntimeQueries + DaemonSystemExecutor + Clone + 'static,
 {
     async fn send(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) -> bool {
         let line = serde_json::to_string(&json).expect("JSON-RPC values are serializable");
@@ -234,7 +234,7 @@ pub(super) fn daemon_resource_claim(
     Ok(Some(crate::application::ResourceClaim::exclusive(key)))
 }
 
-pub(super) async fn handle_request<B: DaemonDbusExecutor>(
+pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
     request: RpcRequest,
     dbus: &Option<B>,
     out_tx: &tokio::sync::mpsc::Sender<String>,

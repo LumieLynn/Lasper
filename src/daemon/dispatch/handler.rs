@@ -16,15 +16,26 @@ pub(crate) enum HandleOutcome {
     Sync(Result<serde_json::Value, String>),
 }
 
-/// The D-Bus surface exposed to RPC handlers.
+/// Read-only runtime queries exposed to daemon handlers.
 ///
-/// Keeping this testable seam local to the daemon avoids coupling handler
-/// tests to a live system bus while the wider application capability layer is
-/// still being migrated.
+/// Keeping this testable seam local to the daemon avoids coupling query
+/// handlers to a live system bus while the wider application capability layer
+/// is still being migrated.
 #[async_trait::async_trait]
-pub(crate) trait DaemonDbusExecutor: Send + Sync {
+pub(crate) trait DaemonRuntimeQueries: Send + Sync {
     async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
     async fn list_images(&self) -> RuntimeResult<Vec<ImageEntry>>;
+    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties>;
+    async fn is_available(&self) -> bool;
+}
+
+/// Host mutation surface exposed to command handlers.
+///
+/// Query and job handlers should not depend on this trait. Keeping the
+/// mutation defaults here also makes the D-Bus executor seam explicit without
+/// turning it into a catch-all daemon capability.
+#[async_trait::async_trait]
+pub(crate) trait DaemonSystemExecutor: Send + Sync {
     async fn system_operation(
         &self,
         operation: SystemOperation,
@@ -72,12 +83,10 @@ pub(crate) trait DaemonDbusExecutor: Send + Sync {
             Err(error) => map_machine_control_error(error),
         }
     }
-    async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties>;
-    async fn is_available(&self) -> bool;
 }
 
 #[async_trait::async_trait]
-impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
+impl DaemonRuntimeQueries for crate::adapters::runtime::dbus::DbusBackend {
     async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
         RuntimeSource::list_machines(self)
             .await
@@ -90,13 +99,6 @@ impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
             .map_err(crate::adapters::runtime::map_runtime_error)
     }
 
-    async fn system_operation(
-        &self,
-        operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()> {
-        execute_dbus_system_operation(self, operation).await
-    }
-
     async fn get_properties(&self, name: &str) -> RuntimeResult<MachineProperties> {
         RuntimeSource::get_properties(self, name)
             .await
@@ -105,5 +107,15 @@ impl DaemonDbusExecutor for crate::adapters::runtime::dbus::DbusBackend {
 
     async fn is_available(&self) -> bool {
         RuntimeSource::is_available(self).await
+    }
+}
+
+#[async_trait::async_trait]
+impl DaemonSystemExecutor for crate::adapters::runtime::dbus::DbusBackend {
+    async fn system_operation(
+        &self,
+        operation: SystemOperation,
+    ) -> crate::nspawn::errors::Result<()> {
+        execute_dbus_system_operation(self, operation).await
     }
 }

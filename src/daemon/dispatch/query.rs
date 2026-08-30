@@ -5,13 +5,13 @@
 //! like the other protocol families; this module only owns their dispatch and
 //! wire-result shaping.
 
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonRuntimeQueries, HandleOutcome};
 use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
 use crate::domain::machine::MachineName;
 use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
 
-pub(super) async fn handle<B: DaemonDbusExecutor>(
+pub(super) async fn handle<B: DaemonRuntimeQueries>(
     method: RpcMethod,
     id: u64,
     params: Value,

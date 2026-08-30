@@ -5,7 +5,7 @@
 //! job state; long-running stateful work belongs to `jobs::server`.
 
 use super::super::server::DaemonServerState;
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
 use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
 use crate::adapters::platform::nvidia::state::{
@@ -43,7 +43,7 @@ pub(super) struct CommandContext<'a, B> {
     pub(super) trusted_state_root: TrustedStateRoot,
 }
 
-pub(super) async fn handle<B: DaemonDbusExecutor>(
+pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
     method: RpcMethod,
     context: CommandContext<'_, B>,
 ) -> HandleOutcome {
@@ -357,7 +357,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
 /// runtime mutation. A client-provided machine name is not proof that the
 /// target is an nspawn container; VM and foreign-provider registrations must
 /// remain visible but read-only even if a caller bypasses the TUI.
-async fn validate_runtime_target<B: DaemonDbusExecutor>(
+async fn validate_runtime_target<B: DaemonRuntimeQueries>(
     machine: &MachineName,
     transport: MachineControlTransport,
     dbus: &Option<B>,
