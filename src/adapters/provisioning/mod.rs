@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub(crate) fn validate_nspawn_config(
     config: &MachineProvisioningConfig,
 ) -> Result<(), DeploymentError> {
-    crate::nspawn::models::NspawnConfigSpec::try_from(config)
+    crate::adapters::config::NspawnConfigSpec::try_from(config)
         .map(|_| ())
         .map_err(|error| DeploymentError::rejected(error.to_string()))
 }

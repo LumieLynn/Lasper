@@ -1,3 +1,4 @@
+use super::nspawn_spec::NspawnConfigSpec;
 use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
@@ -10,7 +11,7 @@ use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, NspawnConfigSpec};
+use crate::nspawn::models::ApplyStatus;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;

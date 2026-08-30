@@ -236,7 +236,7 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 crate::paths::machine_raw_image(&request.config.name),
             ),
         };
-        let guest_hostname = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
+        let guest_hostname = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
             .map(|spec| spec.guest_hostname.into_string())
             .unwrap_or_else(|_| request.config.guest_hostname.clone());
         let mut content = format!(
@@ -267,7 +267,7 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
         }
         let rendered = (|| -> Result<String, String> {
             request.validate().map_err(|error| error.to_string())?;
-            let spec = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
+            let spec = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
                 .map_err(|error| error.to_string())?;
             let wayland_binds = if request.wayland.is_empty() {
                 Vec::new()

@@ -1,3 +1,4 @@
+use super::ALL_DRM_DEVICES_PATH;
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::image_lifecycle::ArtifactOwnership;
@@ -359,17 +360,15 @@ pub(crate) async fn execute_systemd_unit_operation(
 
 /// Generate the content for a systemd service override.
 pub fn systemd_override_content(device_binds: &[String], gpu_passthrough_all: bool) -> String {
-    let passthrough_all_drm = gpu_passthrough_all
-        || device_binds
-            .iter()
-            .any(|path| path == crate::nspawn::models::ALL_DRM_DEVICES_PATH);
+    let passthrough_all_drm =
+        gpu_passthrough_all || device_binds.iter().any(|path| path == ALL_DRM_DEVICES_PATH);
     let mut conf = Ini::new();
     conf.with_section(Some("Service")).set("__placeholder", "");
     let s = conf.section_mut(Some("Service")).unwrap();
     s.remove("__placeholder");
 
     for dev in device_binds {
-        if dev == crate::nspawn::models::ALL_DRM_DEVICES_PATH {
+        if dev == ALL_DRM_DEVICES_PATH {
             continue;
         }
         s.append("DeviceAllow", format!("{} rw", dev));
@@ -791,8 +790,7 @@ mod tests {
         assert!(!content.contains("DeviceAllow=/dev/dri rw"));
         assert!(is_owned_override_content(&content));
 
-        let legacy_explicit_path =
-            systemd_override_content(&[crate::nspawn::models::ALL_DRM_DEVICES_PATH.into()], false);
+        let legacy_explicit_path = systemd_override_content(&[ALL_DRM_DEVICES_PATH.into()], false);
         assert!(legacy_explicit_path.contains("DeviceAllow=char-drm rw"));
         assert!(!legacy_explicit_path.contains("DeviceAllow=/dev/dri rw"));
     }

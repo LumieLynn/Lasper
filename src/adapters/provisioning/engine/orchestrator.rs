@@ -77,7 +77,7 @@ async fn run_deploy_internal(
 ) -> Result<()> {
     let logs = job.event_sender();
     let cancellation = job.cancellation();
-    let nspawn_spec = crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?;
+    let nspawn_spec = crate::adapters::config::NspawnConfigSpec::try_from(&cfg)?;
     let target = nspawn_spec.machine;
     let guest_hostname = nspawn_spec.guest_hostname;
     let system_operations = host.system_operations.clone();
