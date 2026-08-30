@@ -95,29 +95,33 @@ pub fn render_unit(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                 .style(Style::default().fg(t.text_secondary)),
         );
     }
-    if let Ok(properties) = &data.properties {
-        for group in &properties.groups {
-            if group.properties.is_empty() {
-                continue;
+    match &data.properties {
+        Ok(properties) => {
+            for group in &properties.groups {
+                if group.properties.is_empty() {
+                    continue;
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    format!("[ {} ]", group.name.to_uppercase()),
+                    Style::default()
+                        .fg(t.highlight)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+                let mut pairs: Vec<_> = group.properties.iter().collect();
+                pairs.sort_by_key(|(key, _)| key.as_str());
+                for (key, value) in pairs {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{} = ", key), Style::default().fg(t.config_key)),
+                        Span::styled(value.clone(), Style::default().fg(t.config_value)),
+                    ]));
+                }
+                lines.push(Line::from(""));
             }
-            lines.push(Line::from(vec![Span::styled(
-                format!("[ {} ]", group.name.to_uppercase()),
-                Style::default()
-                    .fg(t.highlight)
-                    .add_modifier(Modifier::BOLD),
-            )]));
-            let mut pairs: Vec<_> = group.properties.iter().collect();
-            pairs.sort_by_key(|(key, _)| key.as_str());
-            for (key, value) in pairs {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{} = ", key), Style::default().fg(t.config_key)),
-                    Span::styled(value.clone(), Style::default().fg(t.config_value)),
-                ]));
-            }
-            lines.push(Line::from(""));
         }
-    } else {
-        lines.push(Line::from("Unit properties unavailable.").style(Style::default().fg(t.error)));
+        Err(error) => lines.push(
+            Line::from(format!("Unit properties unavailable: {error}"))
+                .style(Style::default().fg(t.error)),
+        ),
     }
     for drop_in in &data.unit_drop_ins {
         lines.push(Line::from(vec![Span::styled(

@@ -10,6 +10,12 @@ use std::time::Duration;
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HOST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnitInspection {
+    Present,
+    NotFound(String),
+}
+
 #[derive(Deserialize)]
 struct MachinectlImageRow {
     name: String,
@@ -198,47 +204,63 @@ pub(crate) async fn get_properties_with_runner(
     let mut props =
         MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
 
+    let machine_args = vec![
+        "--no-ask-password".to_string(),
+        "--".to_string(),
+        "show".to_string(),
+        name.as_str().to_string(),
+    ];
+    let machine_command = format!("machinectl {}", machine_args.join(" "));
+    let mut failures = Vec::new();
+
     let machine_out = cmd_runner
-        .run_bounded(
-            "machinectl",
-            vec![
-                "--no-ask-password".to_string(),
-                "--".to_string(),
-                "show".to_string(),
-                name.as_str().to_string(),
-            ],
-            HOST_QUERY_TIMEOUT,
-        )
+        .run_bounded("machinectl", machine_args.clone(), HOST_QUERY_TIMEOUT)
         .await;
 
-    if let Ok(out) = machine_out {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    let key = k.trim();
-                    let val = v.trim();
-                    let formatted = crate::adapters::runtime::formatting::format_property(
-                        key,
-                        &zbus::zvariant::Value::Str(val.into()),
-                    );
-                    props.insert(
-                        crate::domain::inspection::GROUP_MACHINE,
-                        key.to_string(),
-                        formatted,
-                    );
-                }
+    match machine_out {
+        Ok(out) if out.status.success() => {
+            let inserted = insert_machine_properties(&mut props, &out.stdout);
+            if inserted == 0 {
+                failures.push("machinectl returned no machine properties".to_string());
             }
         }
+        Ok(out) => failures.push(format!(
+            "machinectl: {}",
+            crate::adapters::process::command_diagnostic(&out)
+        )),
+        Err(error) => failures.push(format!("machinectl: {error}")),
     }
 
-    let _ = append_systemd_unit_properties(&name, cmd_runner, &mut props).await;
+    let unit = name.systemd_nspawn_unit();
+    match append_systemd_unit_properties(&name, cmd_runner, &mut props).await {
+        Ok(UnitInspection::Present) => {}
+        Ok(UnitInspection::NotFound(diagnostic)) => {
+            if props.groups.is_empty() {
+                failures.push(format!("systemctl: {diagnostic}"));
+            }
+        }
+        Err(error) => failures.push(format!("systemctl: {error}")),
+    }
 
     if props.groups.is_empty() {
         return Err(NspawnError::CommandFailed(
             format!("machinectl/systemctl show {}", name.as_str()),
-            "No properties found".to_string(),
-            "The target machine might not exist or systemd-nspawn is not managing it.".to_string(),
+            format!("{machine_command}; systemctl show {unit}"),
+            if failures.is_empty() {
+                "The target machine might not exist or systemd-nspawn is not managing it."
+                    .to_string()
+            } else {
+                failures.join("; ")
+            },
         ));
+    }
+
+    if !failures.is_empty() {
+        log::warn!(
+            "partial CLI inspection for {}: {}",
+            name,
+            failures.join("; ")
+        );
     }
 
     Ok(props)
@@ -258,15 +280,45 @@ pub(crate) async fn get_image_unit_properties_with_runner(
     };
     let mut props =
         MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
-    append_systemd_unit_properties(&name, cmd_runner, &mut props).await?;
-    Ok(Some(props))
+    match append_systemd_unit_properties(&name, cmd_runner, &mut props).await? {
+        UnitInspection::Present => Ok(Some(props)),
+        UnitInspection::NotFound(diagnostic) => {
+            let unit = name.systemd_nspawn_unit();
+            Err(NspawnError::CommandFailed(
+                format!("systemctl show {unit}"),
+                format!("systemctl --no-ask-password -- show {unit}"),
+                diagnostic,
+            ))
+        }
+    }
+}
+
+fn insert_machine_properties(props: &mut MachineProperties, output: &[u8]) -> usize {
+    let mut inserted = 0usize;
+    for (key, val) in parse_property_lines(output) {
+        let formatted = crate::adapters::runtime::formatting::format_property(
+            &key,
+            &zbus::zvariant::Value::Str(val.as_str().into()),
+        );
+        props.insert(crate::domain::inspection::GROUP_MACHINE, key, formatted);
+        inserted = inserted.saturating_add(1);
+    }
+    inserted
+}
+
+fn parse_property_lines(output: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
 }
 
 async fn append_systemd_unit_properties(
     name: &MachineName,
     cmd_runner: &dyn CommandRunner,
     props: &mut MachineProperties,
-) -> Result<()> {
+) -> Result<UnitInspection> {
     let unit = name.systemd_nspawn_unit();
     let args = vec![
         "--no-ask-password".to_string(),
@@ -287,25 +339,24 @@ async fn append_systemd_unit_properties(
         ));
     }
 
-    let mut inserted = 0usize;
-    for line in String::from_utf8_lossy(&system_out.stdout).lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let key = k.trim();
-            let val = v.trim();
-            let formatted = crate::adapters::runtime::formatting::format_property(
-                key,
-                &zbus::zvariant::Value::Str(val.into()),
-            );
-            crate::adapters::runtime::formatting::insert_systemd_property(
-                props,
-                key.to_string(),
-                formatted,
-            );
-            inserted = inserted.saturating_add(1);
-        }
+    let properties = parse_property_lines(&system_out.stdout);
+    if properties
+        .iter()
+        .any(|(key, value)| key == "LoadState" && value == "not-found")
+    {
+        let load_error = properties
+            .iter()
+            .find(|(key, _)| key == "LoadError")
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty());
+        let diagnostic = match load_error {
+            Some(load_error) => format!("LoadState=not-found; LoadError={load_error}"),
+            None => format!("Unit {unit} was not found (LoadState=not-found)"),
+        };
+        return Ok(UnitInspection::NotFound(diagnostic));
     }
 
-    if inserted == 0 {
+    if properties.is_empty() {
         return Err(NspawnError::CommandFailed(
             format!("systemctl show {unit}"),
             format!("systemctl {}", args.join(" ")),
@@ -313,7 +364,15 @@ async fn append_systemd_unit_properties(
         ));
     }
 
-    Ok(())
+    for (key, val) in properties {
+        let formatted = crate::adapters::runtime::formatting::format_property(
+            &key,
+            &zbus::zvariant::Value::Str(val.as_str().into()),
+        );
+        crate::adapters::runtime::formatting::insert_systemd_property(props, key, formatted);
+    }
+
+    Ok(UnitInspection::Present)
 }
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
@@ -581,6 +640,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn machine_inspection_preserves_both_cli_failure_reasons() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    false,
+                    "",
+                    "Could not get path to machine: No machine 'missing-ctr' known\n",
+                ))
+            });
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@missing-ctr.service\nLoadState=not-found\nLoadError=org.freedesktop.systemd1.NoSuchUnit \"Unit missing\"\n",
+                    "",
+                ))
+            });
+
+        let error = get_properties_with_runner("missing-ctr", &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("No machine 'missing-ctr' known"));
+        assert!(error.contains("LoadState=not-found"));
+        assert!(error.contains("org.freedesktop.systemd1.NoSuchUnit"));
+        assert!(!error.contains("The target machine might not exist"));
+    }
+
+    #[tokio::test]
+    async fn machine_inspection_keeps_machine_properties_when_unit_is_not_found() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| Ok(mock_output(true, "State=running\nLeader=12345\n", "")));
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@test-ctr.service\nLoadState=not-found\n",
+                    "",
+                ))
+            });
+
+        let properties = get_properties_with_runner("test-ctr", &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            properties
+                .get_group(crate::domain::inspection::GROUP_MACHINE)
+                .and_then(|group| group.get("State"))
+                .map(String::as_str),
+            Some("running")
+        );
+        assert!(properties
+            .get_group(crate::domain::inspection::GROUP_SYSTEMD_UNIT)
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn image_unit_inspection_runs_only_systemctl() {
         let mut runner = MockCommandRunner::new();
         runner
@@ -616,6 +748,47 @@ mod tests {
             Some("inactive")
         );
         assert_eq!(systemd.get("LoadState").map(String::as_str), Some("loaded"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_rejects_systemctl_not_found_state() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@test-image.service\nLoadState=not-found\nLoadError=org.freedesktop.systemd1.NoSuchUnit \"Unit missing\"\n",
+                    "",
+                ))
+            });
+
+        let error = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("LoadState=not-found"));
+        assert!(error.contains("org.freedesktop.systemd1.NoSuchUnit"));
+        assert!(error.contains("systemd-nspawn@test-image.service"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_preserves_stdout_only_systemctl_failure() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .returning(|_, _, _| Ok(mock_output(false, "inactive\n", "")));
+
+        let error = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("inactive"));
     }
 
     #[tokio::test]

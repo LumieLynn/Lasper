@@ -371,7 +371,17 @@ impl RuntimeSource for DbusBackend {
                     proxy.get_machine_addresses(&name),
                 )
                 .await;
-            let addrs = address_result.unwrap_or_default();
+            let addrs = match address_result {
+                Ok(addresses) => addresses,
+                Err(error) => {
+                    log::warn!(
+                        "D-Bus GetMachineAddresses failed for machine '{}'; retaining the machine without address data: {}",
+                        name,
+                        error
+                    );
+                    Vec::new()
+                }
+            };
             let all_addresses: Vec<String> = addrs
                 .into_iter()
                 .map(|(family, data)| {

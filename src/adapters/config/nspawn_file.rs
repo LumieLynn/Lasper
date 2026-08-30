@@ -124,22 +124,23 @@ impl NspawnConfig {
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
-    pub fn is_gpu_enabled(&self) -> bool {
-        let conf = match Ini::load_from_str(&self.content) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+    pub fn is_gpu_enabled(&self) -> Result<bool> {
+        let conf = Ini::load_from_str(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!(
+                "failed to parse {} while checking NVIDIA passthrough: {error}",
+                self.path.display()
+            ))
+        })?;
         // Read legacy marker locations as well as the current [Files] location.
         let enabled_msg = "X-Lasper-Nvidia-Enabled";
         let in_files = conf.get_from(Some("Files"), enabled_msg);
         let in_general = conf.get_from(Some("General"), enabled_msg);
         let in_global = conf.get_from(None::<&str>, enabled_msg);
 
-        in_files
+        Ok(in_files
             .or(in_general)
             .or(in_global)
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")))
     }
 
     /// Scans the raw content for markers and removes the block.
@@ -586,7 +587,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nX-Lasper-Nvidia-Enabled=true".to_string(),
         };
-        assert!(config.is_gpu_enabled());
+        assert!(config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -595,7 +596,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nX-Lasper-Nvidia-Enabled=false".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -604,7 +605,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nSomeOther=value".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -613,7 +614,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -622,7 +623,9 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "not valid ini [[[[".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        let error = config.is_gpu_enabled().unwrap_err().to_string();
+        assert!(error.contains("failed to parse test.nspawn"));
+        assert!(error.contains("NVIDIA passthrough"));
     }
 
     // Purge nvidia block

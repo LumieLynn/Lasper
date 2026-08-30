@@ -85,7 +85,7 @@ impl NspawnError {
         Self::CommandFailed(
             context.into(),
             cmd.into(),
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            crate::adapters::process::command_diagnostic(output),
         )
     }
 

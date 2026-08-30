@@ -142,6 +142,26 @@ pub(crate) fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()>
     }
 }
 
+/// Return the most useful diagnostic emitted by a completed command.
+///
+/// Most systemd client errors are written to stderr, but a few status-style
+/// commands communicate failure state through stdout instead. Keep stderr as
+/// the authoritative stream when it is present, then retain the other stream
+/// and finally the exit status rather than returning an empty error message.
+pub(crate) fn command_diagnostic(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    format!("process exited with {}", output.status)
+}
+
 /// Open a pidfd that pins the kernel identity of `pid`.
 ///
 /// The descriptor is useful for liveness checks and parent monitoring. It does
@@ -472,5 +492,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn command_diagnostic_prefers_stderr_then_stdout_then_status() {
+        let stderr = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: b"stdout diagnostic".to_vec(),
+            stderr: b"stderr diagnostic\n".to_vec(),
+        };
+        assert_eq!(command_diagnostic(&stderr), "stderr diagnostic");
+
+        let stdout = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: b"stdout diagnostic\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(command_diagnostic(&stdout), "stdout diagnostic");
+
+        let status = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(command_diagnostic(&status).contains("exit status"));
     }
 }

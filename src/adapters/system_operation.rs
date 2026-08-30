@@ -56,7 +56,7 @@ impl SystemOperationError {
         Self::CommandFailed {
             context: context.into(),
             command: command.into(),
-            output: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            output: crate::adapters::process::command_diagnostic(output),
         }
     }
 }

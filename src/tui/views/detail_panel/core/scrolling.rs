@@ -149,7 +149,13 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
 
     if data.unit_dirty || width_changed {
         let unit_header_len = usize::from(data.unit_name.is_some()).saturating_mul(2);
-        let unit_properties_len = panel.details_len;
+        let unit_properties_len = match &data.properties {
+            Ok(_) => panel.details_len,
+            Err(error) => {
+                crate::tui::soft_wrap_text(&format!("Unit properties unavailable: {error}"), width)
+                    .len()
+            }
+        };
         let unit_drop_ins_len = data
             .unit_drop_ins
             .iter()

@@ -128,7 +128,7 @@ pub async fn ensure_gpu_passthrough(
         Some(c) => c,
         None => return Ok(()),
     };
-    if !config.is_gpu_enabled() {
+    if !config.is_gpu_enabled()? {
         return Ok(());
     }
 
