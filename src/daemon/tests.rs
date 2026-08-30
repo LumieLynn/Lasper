@@ -1,9 +1,6 @@
 use super::dispatch::handler::*;
 use super::dispatch::*;
-use super::protocol::session::{self as session, SpawnTerminalParams};
-use super::protocol::*;
 use super::server::logging::*;
-use super::server::transport::*;
 use super::server::*;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
@@ -13,6 +10,10 @@ use crate::application::machine_lifecycle::{
     MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
     NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
+use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
+use crate::ipc::protocol::*;
+use crate::ipc::transport::*;
 use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties};
 use std::io::Write;
 use std::path::Path;
@@ -108,7 +109,7 @@ fn rpc_bootstrap_carries_transport_mode_and_session_secret() {
 
 #[test]
 fn rootfs_rpc_uses_the_typed_outbound_envelope() {
-    let operation: RootfsOperation = serde_json::from_value(serde_json::json!({
+    let wire_operation: rootfs_wire::RootfsOperation = serde_json::from_value(serde_json::json!({
         "operation": "set_root_password",
         "params": {
             "target": {"kind": "machine", "machine": "test"},
@@ -116,9 +117,15 @@ fn rootfs_rpc_uses_the_typed_outbound_envelope() {
         }
     }))
     .unwrap();
-    let bytes = OutboundRpcRequest::Rootfs { id: 41, operation }
-        .into_wire_bytes()
-        .unwrap();
+    let operation = RootfsOperation::try_from(wire_operation).unwrap();
+    let bytes = OutboundRpcRequest::General(RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 41,
+        method: "rootfs".into(),
+        params: serde_json::to_value(rootfs_wire::RootfsOperation::from(operation)).unwrap(),
+    })
+    .into_wire_bytes()
+    .unwrap();
     let request: RpcRequest = serde_json::from_slice(bytes.as_slice()).unwrap();
 
     assert_eq!(request.id, 41);
@@ -674,7 +681,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStatePort, DeploymentStorage,
     };
-    use crate::daemon::protocol::deployment::{
+    use crate::ipc::protocol::deployment::{
         ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     };
     use crate::nspawn::models::ContainerConfig;

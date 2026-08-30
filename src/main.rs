@@ -7,6 +7,7 @@ mod composition;
 mod config;
 mod daemon;
 mod domain;
+mod ipc;
 mod logging;
 mod nspawn;
 mod paths;

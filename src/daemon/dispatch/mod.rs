@@ -5,8 +5,6 @@ pub(crate) mod handler;
 pub(crate) mod query;
 
 use self::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
-use super::server::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
 use super::server::DaemonServerState;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
@@ -15,6 +13,8 @@ use crate::application::machine_lifecycle::{
     MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
 };
 use crate::domain::secret::zeroize_string;
+use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
+use crate::ipc::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
 use std::sync::Arc;
 
 const MAX_RPC_IN_FLIGHT: usize = 64;

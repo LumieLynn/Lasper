@@ -7,9 +7,9 @@
 pub(crate) mod server;
 
 use super::dispatch::handler::HandleOutcome;
-use super::protocol::session::CloseSessionParams;
-use super::protocol::{RpcFamily, RpcMethod};
 use super::server::DaemonServerState;
+use crate::ipc::protocol::session::CloseSessionParams;
+use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use serde_json::Value;
 use std::sync::Arc;
 

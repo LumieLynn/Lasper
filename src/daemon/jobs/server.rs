@@ -1,10 +1,5 @@
 //! Daemon-owned provisioning job registry and dedicated event stream.
 
-use super::super::protocol::deployment::{
-    DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
-    DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,
-    MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
-};
 use super::super::server::DaemonServerState;
 use crate::adapters::provisioning::direct::DirectProvisioningExecutor;
 use crate::adapters::trusted_state::TrustedStateRoot;
@@ -15,6 +10,11 @@ use crate::application::provisioning::{
     PlanFingerprint,
 };
 use crate::application::{OperationRegistry, ResourceClaim};
+use crate::ipc::protocol::deployment::{
+    DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
+    DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,
+    MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
+};
 use sendfd::{RecvWithFd, SendWithFd};
 use std::collections::HashMap;
 use std::io::Write;

@@ -1,8 +1,8 @@
-use super::super::protocol::session::{
+use crate::daemon::server::DaemonServerState;
+use crate::ipc::protocol::session::{
     SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionLifecycle,
     WireTerminalAttachmentKind,
 };
-use crate::daemon::server::DaemonServerState;
 use sendfd::SendWithFd;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -222,7 +222,7 @@ fn stop_child(child: &mut std::process::Child, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::session::WireSessionId;
+    use crate::ipc::protocol::session::WireSessionId;
 
     #[test]
     fn registry_rejects_duplicate_ids_and_removes_only_the_matching_process() {

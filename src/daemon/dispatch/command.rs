@@ -4,7 +4,6 @@
 //! perform external I/O in a spawned task, but they do not expose accepted
 //! job state; long-running stateful work belongs to `jobs::server`.
 
-use super::super::protocol::{error_code, RpcFamily, RpcMethod};
 use super::super::server::DaemonServerState;
 use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
@@ -27,6 +26,8 @@ use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineControlTransport, MachineRuntimeControlRequest,
     NspawnLaunchRequest, NspawnUnitControlRequest,
 };
+use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -164,7 +165,14 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::Rootfs => {
-            let operation: RootfsOperation = match serde_json::from_value(params) {
+            let wire_operation: rootfs_wire::RootfsOperation = match serde_json::from_value(params)
+            {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
+                }
+            };
+            let operation = match RootfsOperation::try_from(wire_operation) {
                 Ok(operation) => operation,
                 Err(error) => {
                     return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
@@ -174,6 +182,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
             tokio::spawn(async move {
                 let response = match execute_rootfs_operation(operation).await {
                     Ok(result) => {
+                        let result = rootfs_wire::RootfsResult::from(result);
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }
                     Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{

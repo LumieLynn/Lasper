@@ -1,11 +1,11 @@
 //! Private, closed wire types shared by the daemon client and server.
 
-use crate::adapters::rootfs::store::RootfsOperation;
 use crate::domain::secret::SecretBytes;
 use crate::nspawn::models::MachineName;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod deployment;
+pub(crate) mod rootfs;
 pub(crate) mod session;
 
 use self::deployment::SubmitDeploymentParams;
@@ -219,34 +219,18 @@ impl RpcError {
 
 pub(crate) enum OutboundRpcRequest {
     General(RpcRequest),
-    Rootfs { id: u64, operation: RootfsOperation },
 }
 
 impl OutboundRpcRequest {
     pub(crate) fn id(&self) -> u64 {
         match self {
             Self::General(request) => request.id,
-            Self::Rootfs { id, .. } => *id,
         }
     }
 
     pub(crate) fn into_wire_bytes(self) -> serde_json::Result<SecretBytes> {
-        #[derive(Serialize)]
-        struct RootfsEnvelope<'a> {
-            jsonrpc: &'static str,
-            id: u64,
-            method: &'static str,
-            params: &'a RootfsOperation,
-        }
-
         let bytes = match self {
             Self::General(request) => serde_json::to_vec(&request)?,
-            Self::Rootfs { id, operation } => serde_json::to_vec(&RootfsEnvelope {
-                jsonrpc: "2.0",
-                id,
-                method: "rootfs",
-                params: &operation,
-            })?,
         };
         Ok(SecretBytes::new(bytes))
     }
@@ -305,7 +289,7 @@ mod tests {
         assert_eq!(RpcMethod::CloseSession.family(), RpcFamily::Session);
 
         let terminal = FdOperation::Terminal(SpawnTerminalParams {
-            session_id: crate::daemon::protocol::session::WireSessionId::new(1).unwrap(),
+            session_id: crate::ipc::protocol::session::WireSessionId::new(1).unwrap(),
             name: MachineName::new("machine").unwrap(),
             size: crate::nspawn::models::TerminalSize::new(80, 24).unwrap(),
         });

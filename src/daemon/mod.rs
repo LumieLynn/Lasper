@@ -25,7 +25,6 @@
 
 mod dispatch;
 mod jobs;
-pub(crate) mod protocol;
 pub(crate) mod server;
 mod sessions;
 

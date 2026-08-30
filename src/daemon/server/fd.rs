@@ -4,10 +4,10 @@
 //! routes an authenticated typed operation to the subsystem that owns it.
 
 use super::super::jobs;
-use super::super::protocol::FdOperation;
 use super::super::sessions;
 use super::DaemonServerState;
 use crate::adapters::trusted_state::TrustedStateRoot;
+use crate::ipc::protocol::FdOperation;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 

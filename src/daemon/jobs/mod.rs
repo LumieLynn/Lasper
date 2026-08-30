@@ -7,16 +7,16 @@
 pub(crate) mod server;
 
 use super::dispatch::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::deployment::{
-    DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
-    ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
-    ReleaseUnresolvedDeploymentRequest,
-};
-use super::protocol::{RpcFamily, RpcMethod};
 use super::server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::DeploymentStatePort;
+use crate::ipc::protocol::deployment::{
+    DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
+    ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
+    ReleaseUnresolvedDeploymentRequest,
+};
+use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use crate::nspawn::models::ImageEntry;
 use serde_json::Value;
 use std::sync::Arc;

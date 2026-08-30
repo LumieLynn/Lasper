@@ -4,17 +4,16 @@ mod fd;
 pub(crate) mod logging;
 mod process_state;
 mod state;
-pub(crate) mod transport;
 
 use self::logging::{initialize_daemon_logging, AuthLogLimiter};
-use self::transport::{
+use super::dispatch::run_rpc_request_pump;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::domain::secret::zeroize_string;
+use crate::ipc::protocol::*;
+use crate::ipc::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
 };
-use super::dispatch::run_rpc_request_pump;
-use super::protocol::*;
-use crate::adapters::runtime::source::RuntimeSource;
-use crate::domain::secret::zeroize_string;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;

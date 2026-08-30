@@ -1,11 +1,11 @@
 use super::ElevatedDaemon;
-use crate::daemon::protocol::session::{
+use crate::domain::machine::MachineName;
+use crate::domain::session::{SessionLifecycle, TerminalAttachmentKind};
+use crate::ipc::protocol::session::{
     CloseSessionParams, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
     WireSessionId, WireSessionLifecycle,
 };
-use crate::daemon::protocol::FdOperation;
-use crate::domain::machine::MachineName;
-use crate::domain::session::{SessionLifecycle, TerminalAttachmentKind};
+use crate::ipc::protocol::FdOperation;
 use crate::nspawn::models::TerminalSize;
 use sendfd::RecvWithFd;
 use std::os::fd::RawFd;

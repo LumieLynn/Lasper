@@ -14,17 +14,18 @@ use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineRuntimeControlRequest, NspawnLaunchRequest,
     NspawnUnitControlRequest,
 };
-use crate::daemon::protocol::deployment::{
+use crate::domain::secret::SecretBytes;
+use crate::ipc::protocol::deployment::{
     DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
     DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
 };
-use crate::daemon::protocol::*;
-use crate::daemon::server::transport::{
+use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::*;
+use crate::ipc::transport::{
     authorize_root_server, create_fd_socket_dir, get_peer_credentials, read_bounded_line,
     MAX_RPC_FRAME_BYTES,
 };
-use crate::domain::secret::SecretBytes;
 use crate::nspawn::models::{MachineName, MachineProperties};
 use sendfd::{RecvWithFd, SendWithFd};
 use std::os::fd::{AsRawFd, RawFd};
@@ -723,14 +724,22 @@ impl ElevatedDaemon {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let params = serde_json::to_value(rootfs_wire::RootfsOperation::from(operation))
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         let result = self
             .send_rpc_request(
-                OutboundRpcRequest::Rootfs { id, operation },
+                OutboundRpcRequest::General(RpcRequest {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    method: RpcMethod::Rootfs.wire_name().into(),
+                    params,
+                }),
                 RpcMethod::Rootfs,
             )
             .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+        let result: rootfs_wire::RootfsResult = serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        Ok(result.into())
     }
 
     pub(super) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {
@@ -821,7 +830,7 @@ mod tests {
         configure_sudo_daemon_stdio, discard_cancelled_responses, rpc_response_timeout,
         wait_for_daemon_rpc_socket, wait_for_rpc_response, PendingRpcResponses,
     };
-    use crate::daemon::protocol::{RpcFamily, RpcMethod};
+    use crate::ipc::protocol::{RpcFamily, RpcMethod};
 
     #[tokio::test]
     async fn sudo_daemon_stdio_detaches_input_and_pipes_stdout() {

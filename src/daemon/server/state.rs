@@ -1,7 +1,7 @@
 //! Shared daemon-owned state used by the server, jobs, and sessions.
 
 use crate::daemon::jobs::server::DeploymentRegistry;
-use crate::daemon::protocol::session::WireSessionId;
+use crate::ipc::protocol::session::WireSessionId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
