@@ -320,6 +320,7 @@ impl<'de> Deserialize<'de> for MachineState {
 pub enum MachineAddressObservation {
     Available(Vec<String>),
     Unavailable(String),
+    NotPrivate(String),
     Unsupported(String),
 }
 
@@ -333,15 +334,26 @@ impl MachineAddressObservation {
     pub fn primary(&self) -> Option<&str> {
         match self {
             Self::Available(addresses) => addresses.first().map(String::as_str),
-            Self::Unavailable(_) | Self::Unsupported(_) => None,
+            Self::Unavailable(_) | Self::NotPrivate(_) | Self::Unsupported(_) => None,
         }
     }
 
     pub fn property_value(&self) -> String {
         match self {
+            Self::Available(addresses) if addresses.is_empty() => "(None)".into(),
+            Self::Available(addresses) => addresses.join(", "),
+            Self::Unavailable(_) => "(Unavailable)".into(),
+            Self::NotPrivate(_) => "(Not Private)".into(),
+            Self::Unsupported(_) => "(Unsupported)".into(),
+        }
+    }
+
+    pub fn diagnostic_value(&self) -> String {
+        match self {
             Self::Available(addresses) if addresses.is_empty() => "available (none)".into(),
             Self::Available(addresses) => addresses.join(", "),
             Self::Unavailable(reason) => format!("unavailable ({reason})"),
+            Self::NotPrivate(reason) => format!("not private ({reason})"),
             Self::Unsupported(reason) => format!("unsupported ({reason})"),
         }
     }
@@ -719,17 +731,27 @@ mod tests {
     fn address_observation_preserves_empty_unavailable_and_unsupported_states() {
         let empty = MachineAddressObservation::available(Vec::new());
         assert_eq!(empty, MachineAddressObservation::Available(Vec::new()));
-        assert_eq!(empty.property_value(), "available (none)");
+        assert_eq!(empty.property_value(), "(None)");
 
         let unavailable = MachineAddressObservation::Unavailable("query timed out".into());
+        assert_eq!(unavailable.property_value(), "(Unavailable)");
         assert_eq!(
-            unavailable.property_value(),
+            unavailable.diagnostic_value(),
             "unavailable (query timed out)"
         );
 
-        let unsupported = MachineAddressObservation::Unsupported("virtual machine provider".into());
+        let not_private =
+            MachineAddressObservation::NotPrivate("machine uses host networking".into());
+        assert_eq!(not_private.property_value(), "(Not Private)");
         assert_eq!(
-            unsupported.property_value(),
+            not_private.diagnostic_value(),
+            "not private (machine uses host networking)"
+        );
+
+        let unsupported = MachineAddressObservation::Unsupported("virtual machine provider".into());
+        assert_eq!(unsupported.property_value(), "(Unsupported)");
+        assert_eq!(
+            unsupported.diagnostic_value(),
             "unsupported (virtual machine provider)"
         );
     }

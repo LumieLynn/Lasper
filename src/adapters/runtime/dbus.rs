@@ -435,7 +435,7 @@ impl RuntimeSource for DbusBackend {
                         log::warn!(
                             "D-Bus GetMachineAddresses did not provide data for machine '{}': {}",
                             name,
-                            observation.property_value()
+                            observation.diagnostic_value()
                         );
                         observation
                     }
@@ -602,7 +602,7 @@ fn classify_address_error(error: zbus::Error) -> MachineAddressObservation {
         zbus::Error::MethodError(name, detail, _)
             if name.as_str() == NO_PRIVATE_NETWORKING_ERROR =>
         {
-            MachineAddressObservation::Unsupported(
+            MachineAddressObservation::NotPrivate(
                 detail.unwrap_or_else(|| "machine does not use private networking".into()),
             )
         }
@@ -787,7 +787,7 @@ mod tests {
         ));
         assert!(matches!(
             no_private,
-            MachineAddressObservation::Unsupported(reason)
+            MachineAddressObservation::NotPrivate(reason)
                 if reason == "machine does not use private networking"
         ));
 

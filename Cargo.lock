@@ -1136,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "lasper"
-version = "0.3.0-alpha.7"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "arboard",
