@@ -813,7 +813,7 @@ impl App {
             );
             return;
         };
-        if crate::nspawn::models::ImageEntry::is_protected_name(&image.name) {
+        if crate::domain::runtime::ImageEntry::is_protected_name(&image.name) {
             self.set_status(
                 "The .host image cannot be removed.".into(),
                 crate::tui::StatusLevel::Warn,
@@ -839,7 +839,7 @@ impl App {
         } else {
             "This image and its local data will be removed."
         };
-        let target = match crate::nspawn::models::ImageName::new(image.name.clone()) {
+        let target = match crate::domain::runtime::ImageName::new(image.name.clone()) {
             Ok(target) => target,
             Err(error) => {
                 self.set_status(error.to_string(), crate::tui::StatusLevel::Error);
@@ -847,7 +847,7 @@ impl App {
             }
         };
         let cleanup_supported =
-            !image.is_hidden() && crate::nspawn::models::MachineName::new(&image.name).is_ok();
+            !image.is_hidden() && crate::domain::machine::MachineName::new(&image.name).is_ok();
         let mut dialog = crate::tui::widgets::dialogs::confirmation::ConfirmationDialog::new(
             "Delete Image",
             format!(

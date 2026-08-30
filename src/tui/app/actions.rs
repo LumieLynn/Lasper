@@ -5,7 +5,9 @@ use super::detail_refresh::{
 use super::App;
 use crate::application::machine_lifecycle::MachineOperation;
 use crate::application::{MachineLifecycleAction, MachineRuntimeAction, NspawnUnitAction};
-use crate::nspawn::models::{ImageEntry, MachineProperties, MachineState};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, MachineState};
+use crate::nspawn::models::MachineProperties;
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
 
@@ -241,7 +243,7 @@ impl App {
                     Some(Err(error)) => {
                         let name = completion.ticket.target.name().unwrap_or_default();
                         log::debug!("Failed to read unit drop-ins for {name}: {error}");
-                        self.data.unit_name = crate::nspawn::models::MachineName::new(name)
+                        self.data.unit_name = MachineName::new(name)
                             .ok()
                             .map(|name| name.systemd_nspawn_unit());
                         self.data.unit_drop_ins.clear();
@@ -410,7 +412,7 @@ impl App {
             .find(|image| &image.name == name)
     }
 
-    pub(crate) fn focused_machine_resource(&self) -> Option<&crate::nspawn::models::MachineEntry> {
+    pub(crate) fn focused_machine_resource(&self) -> Option<&crate::domain::runtime::MachineEntry> {
         if self.ui.focus.is_machine_list() {
             return self.data.entries.get(self.data.selected);
         }
@@ -458,7 +460,7 @@ impl App {
                     let _ = tx
                         .send(crate::tui::events::AppEvent::MachineLifecycleFinished(
                             crate::application::MachineLifecycleOutcome {
-                                machine: crate::nspawn::models::MachineName::new(name)
+                                machine: MachineName::new(name)
                                     .expect("lifecycle operation already validated the name"),
                                 action,
                                 result: crate::application::MachineLifecycleResult::NotAttempted(
@@ -607,7 +609,7 @@ impl App {
             .entries
             .iter()
             .find(|entry| entry.name == name)
-            .map(|entry| entry.state);
+            .map(|entry| entry.state.clone());
         if let Some(state) = &observed_state {
             self.set_status(
                 format!("{} is already {}.", name, state.label()),

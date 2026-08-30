@@ -1,7 +1,7 @@
 use crate::application::provisioning::{
     DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
 };
-use crate::nspawn::{ImageEntry, MachineEntry};
+use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::tui::wizard::core::draft::{SourceKind, WizardDraft};
 use crate::tui::wizard::steps::{self, StepComponent};

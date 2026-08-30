@@ -517,7 +517,7 @@ mod tests {
         );
         let handle = service.start(submission()).unwrap();
         let target = crate::domain::machine::MachineName::new("test").unwrap();
-        let source = crate::nspawn::models::ImageName::new("base").unwrap();
+        let source = crate::domain::runtime::ImageName::new("base").unwrap();
 
         assert!(registry
             .reserve([crate::application::ResourceClaim::exclusive(

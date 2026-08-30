@@ -5,7 +5,8 @@
 //! while a request is still active and gives presentation a stable operation
 //! projection.
 
-use crate::nspawn::models::{ImageName, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::ImageName;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

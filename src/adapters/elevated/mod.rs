@@ -14,6 +14,7 @@ use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineRuntimeControlRequest, NspawnLaunchRequest,
     NspawnUnitControlRequest,
 };
+use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretBytes;
 use crate::ipc::protocol::deployment::{
     DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
@@ -26,7 +27,7 @@ use crate::ipc::transport::{
     authorize_root_server, create_fd_socket_dir, get_peer_credentials, read_bounded_line,
     MAX_RPC_FRAME_BYTES,
 };
-use crate::nspawn::models::{MachineName, MachineProperties};
+use crate::nspawn::models::MachineProperties;
 use sendfd::{RecvWithFd, SendWithFd};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;

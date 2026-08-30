@@ -1,10 +1,9 @@
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ImageEntry, InspectionCompleteness, InspectionSource, MachineEntry, MachineName,
-    MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::nspawn::models::{InspectionCompleteness, InspectionSource, MachineProperties};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -322,7 +321,7 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 mod tests {
     use super::*;
     use crate::adapters::process::MockCommandRunner;
-    use crate::nspawn::models::MachineState;
+    use crate::domain::runtime::MachineState;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
 

@@ -10,7 +10,7 @@ use crate::application::provisioning::{
     DeploymentRecoveryObservation, DeploymentRecoveryProbe, DeploymentResource,
 };
 use crate::application::RuntimeCatalog;
-use crate::nspawn::models::ImageEntry;
+use crate::domain::runtime::ImageEntry;
 use async_trait::async_trait;
 use std::sync::Arc;
 

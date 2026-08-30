@@ -1,3 +1,5 @@
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::MachineEntry;
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::inputs::text_box::TextBox;
 use crate::tui::wizard::draft::{BasicConfig, WizardDraft};
@@ -31,7 +33,7 @@ pub struct BasicStepView {
 impl BasicStepView {
     pub fn new(
         initial_data: &BasicConfig,
-        existing_entries: &[crate::nspawn::models::MachineEntry],
+        existing_entries: &[MachineEntry],
         show_hostname: bool,
     ) -> Self {
         let existing_names: HashSet<String> = existing_entries
@@ -59,7 +61,7 @@ impl BasicStepView {
 
 fn validate_machine_name(value: &str, existing_names: &HashSet<String>) -> Result<(), String> {
     let name = value.trim();
-    crate::nspawn::models::MachineName::new(name).map_err(|error| error.to_string())?;
+    MachineName::new(name).map_err(|error| error.to_string())?;
     if existing_names.contains(name) {
         return Err(format!("Machine image '{}' already exists", name));
     }

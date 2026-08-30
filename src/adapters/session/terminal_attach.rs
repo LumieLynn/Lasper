@@ -1,8 +1,8 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
 use crate::adapters::runtime::state as runtime_state;
+use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
-use crate::nspawn::models::MachineName;
 use portable_pty::CommandBuilder;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::Path;

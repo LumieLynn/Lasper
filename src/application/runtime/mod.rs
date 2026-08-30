@@ -1,10 +1,10 @@
 //! Application-owned runtime discovery and observation.
 
 use super::operations::{ExecutionRoute, RouteFallback};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    MachineEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::nspawn::models::MachineProperties;
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -447,7 +447,7 @@ fn spawn_heartbeat(catalog: Arc<RuntimeCatalog>, fallback_active: Arc<AtomicBool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ImageEntry, MachineState};
+    use crate::domain::runtime::{ImageEntry, MachineState};
 
     fn entry(name: &str) -> MachineEntry {
         MachineEntry {

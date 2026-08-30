@@ -1,4 +1,5 @@
-use crate::nspawn::models::{ImageEntry, MachineEntry, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::core::{Component, EventResult};
 use crate::tui::widgets::lists::selectable_list::SelectableList;
 use ratatui::{layout::Rect, Frame};
@@ -144,7 +145,7 @@ impl Component for ResourceActionMenu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::MachineState;
+    use crate::domain::runtime::MachineState;
 
     fn image(name: &str) -> ImageEntry {
         ImageEntry {

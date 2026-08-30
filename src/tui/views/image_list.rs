@@ -1,4 +1,4 @@
-use crate::nspawn::ImageEntry;
+use crate::domain::runtime::ImageEntry;
 use crate::tui::core::EventResult;
 use crate::tui::theme;
 use crate::tui::views::title_tabs::{

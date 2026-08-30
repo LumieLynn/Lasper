@@ -7,7 +7,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::nspawn::{MachineEntry, MachineState};
+use crate::domain::runtime::{MachineEntry, MachineState};
 use crate::tui::core::EventResult;
 use crate::tui::theme;
 use crate::tui::widgets::lists::resource_list::{ResourceList, ResourceListRender};
@@ -50,12 +50,15 @@ impl MachineListComponent {
                     MachineState::Running | MachineState::Starting => {
                         Style::default().fg(t.list_icon_alive)
                     }
-                    MachineState::Exiting => Style::default().fg(t.list_icon_dead),
+                    MachineState::Exiting | MachineState::Unknown(_) => {
+                        Style::default().fg(t.list_icon_dead)
+                    }
                 };
                 let icon = match &entry.state {
                     MachineState::Running => "● ",
                     MachineState::Starting => "◑ ",
                     MachineState::Exiting => "◐ ",
+                    MachineState::Unknown(_) => "? ",
                 };
                 let mut spans = vec![
                     styles.cursor_span(),

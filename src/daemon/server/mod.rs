@@ -281,7 +281,7 @@ pub async fn daemon_main(
         let dbus_bg = dbus.clone();
         tokio::spawn(async move {
             let (ev_tx, mut ev_rx) =
-                tokio::sync::mpsc::channel::<crate::nspawn::models::StatusUpdate>(16);
+                tokio::sync::mpsc::channel::<crate::domain::runtime::StatusUpdate>(16);
             let watcher = tokio::spawn(async move {
                 let mut retry_delay = std::time::Duration::from_secs(1);
                 loop {

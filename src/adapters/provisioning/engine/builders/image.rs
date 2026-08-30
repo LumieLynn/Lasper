@@ -13,6 +13,7 @@ use crate::adapters::provisioning::engine::{
     process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
     AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
 
@@ -80,7 +81,7 @@ impl Deployer for ImageDeployer {
         match self.format {
             ImageFormat::Raw => {
                 send_deploy_log(&logs, "Importing typed RAW machine image...").await;
-                let machine = crate::nspawn::models::MachineName::new(name)
+                let machine = MachineName::new(name)
                     .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 self.image_import.import_raw(machine, source).await?;
                 report.record_created(AppliedResource::ExternalImage);

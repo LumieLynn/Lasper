@@ -11,13 +11,13 @@ use super::server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::DeploymentStatePort;
+use crate::domain::runtime::ImageEntry;
 use crate::ipc::protocol::deployment::{
     DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
     ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest,
 };
 use crate::ipc::protocol::{RpcFamily, RpcMethod};
-use crate::nspawn::models::ImageEntry;
 use serde_json::Value;
 use std::sync::Arc;
 

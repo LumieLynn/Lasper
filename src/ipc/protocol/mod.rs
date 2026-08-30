@@ -1,7 +1,7 @@
 //! Private, closed wire types shared by the daemon client and server.
 
+use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretBytes;
-use crate::nspawn::models::MachineName;
 use serde::{Deserialize, Serialize};
 
 pub(crate) mod deployment;

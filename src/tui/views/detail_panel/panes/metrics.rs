@@ -15,7 +15,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         None => return,
     };
     let machine_name = &entry.name;
-    let is_running = entry.state == crate::nspawn::models::MachineState::Running;
+    let is_running = entry.state == crate::domain::runtime::MachineState::Running;
 
     let metrics = match data.metrics.get(machine_name) {
         Some(m) => m,

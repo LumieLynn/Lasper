@@ -2,8 +2,9 @@
 
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::operations::ExecutionRoute;
+use crate::domain::runtime::MachineEntry;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{MachineEntry, MachineProperties};
+use crate::nspawn::models::MachineProperties;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -85,7 +86,7 @@ impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::MachineState;
+    use crate::domain::runtime::MachineState;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingInspector {

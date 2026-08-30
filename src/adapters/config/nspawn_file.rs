@@ -113,7 +113,7 @@ pub struct NspawnConfig {
 /// must not trust inputs blindly in case of restricted-sudo environments.
 #[cfg(test)]
 fn validate_machine_name(name: &str) -> Result<()> {
-    crate::nspawn::models::MachineName::new(name)
+    crate::domain::machine::MachineName::new(name)
         .map(|_| ())
         .map_err(|error| NspawnError::Validation(error.to_string()))
 }

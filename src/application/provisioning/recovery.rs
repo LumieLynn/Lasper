@@ -114,7 +114,8 @@ mod tests {
         DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource, DeploymentStage,
         DeploymentStorage, ResourceLedger,
     };
-    use crate::nspawn::models::{ContainerConfig, MachineName};
+    use crate::domain::machine::MachineName;
+    use crate::nspawn::models::ContainerConfig;
 
     fn manifest() -> DeploymentCrashManifest {
         let plan = DeploymentPlan::build(DeploymentRequest {

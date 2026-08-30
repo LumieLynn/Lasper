@@ -4,8 +4,8 @@ use crate::application::sessions::{
     SessionSendStatus, SessionService, TerminalSessionHandle, TerminalSessionInput,
 };
 use crate::domain::machine::MachineName;
+use crate::domain::runtime::MachineEntry;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
-use crate::nspawn::models::MachineEntry;
 use crate::tui::events::AppEvent;
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -173,7 +173,7 @@ impl TerminalManager {
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
-        if entry.state != crate::nspawn::models::MachineState::Running {
+        if entry.state != crate::domain::runtime::MachineState::Running {
             return Err(format!("Container {} is not running", entry.name));
         }
 
@@ -767,8 +767,8 @@ mod tests {
     use crate::application::sessions::{
         terminal_session_channel, SessionService, TERMINAL_COMMAND_CAPACITY,
     };
+    use crate::domain::runtime::{MachineEntry, MachineState};
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
-    use crate::nspawn::models::{MachineEntry, MachineState};
     use crate::tui::views::title_tabs::TitleTabHitbox;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;

@@ -3,11 +3,10 @@
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ImageEntry, ImageName, InspectionCompleteness, InspectionSource, MachineEntry, MachineName,
-    MachineProperties, MachineState, StatusUpdate,
-};
+use crate::nspawn::models::{InspectionCompleteness, InspectionSource, MachineProperties};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};

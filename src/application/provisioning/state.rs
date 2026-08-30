@@ -57,7 +57,7 @@ impl DeploymentPlan {
             &self.target,
         ))];
         if let super::DeploymentSource::Copy { source_name } = &self.request.source {
-            let source = crate::nspawn::models::ImageName::new(source_name.clone())
+            let source = crate::domain::runtime::ImageName::new(source_name.clone())
                 .expect("validated deployment plan has a valid clone source");
             claims.push(ResourceClaim::shared(ResourceKey::for_image(&source)));
         }

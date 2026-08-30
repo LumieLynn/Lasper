@@ -1,8 +1,9 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::image_lifecycle::ArtifactOwnership;
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, MachineName};
+use crate::nspawn::models::ApplyStatus;
 use ini::Ini;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

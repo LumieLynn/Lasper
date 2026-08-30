@@ -7,8 +7,9 @@
 
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::domain::runtime::{ImageEntry, MachineEntry, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ImageEntry, MachineEntry, MachineProperties, StatusUpdate};
+use crate::nspawn::models::MachineProperties;
 use std::sync::Arc;
 
 #[derive(Clone)]

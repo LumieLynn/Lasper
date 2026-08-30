@@ -17,9 +17,8 @@ use crate::application::{
     ResourceInspectionService, RuntimeCatalog, RuntimeUpdate,
 };
 use crate::composition::ApplicationServices;
-use crate::nspawn::models::{
-    CpuRepresentation, ImageEntry, ImageName, MachineEntry, MachineMetrics, RuntimeSnapshot,
-};
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, RuntimeSnapshot};
+use crate::nspawn::models::{CpuRepresentation, MachineMetrics};
 use crate::tui::core::Component;
 use crate::tui::events::{AppEvent, EventHandler, InputEvent};
 use crate::tui::views::detail_panel::DetailPanel;
@@ -876,7 +875,7 @@ fn machine_outcome_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ImageEntry, MachineEntry, MachineState};
+    use crate::domain::runtime::{ImageEntry, MachineEntry, MachineState};
     use std::time::Duration;
 
     #[test]
@@ -1972,7 +1971,7 @@ mod tests {
             app.data
                 .entries
                 .iter()
-                .map(|entry| (entry.name.as_str(), entry.state))
+                .map(|entry| (entry.name.as_str(), entry.state.clone()))
                 .collect::<Vec<_>>(),
             [
                 ("exiting", MachineState::Exiting),

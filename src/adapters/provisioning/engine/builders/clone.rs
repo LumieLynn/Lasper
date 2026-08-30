@@ -6,8 +6,9 @@ use crate::adapters::provisioning::engine::{
     send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
 use crate::application::provisioning::DeploymentResource;
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig, MachineName};
+use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 
 pub struct CloneDeployer {
     pub source_name: String,

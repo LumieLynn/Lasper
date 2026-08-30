@@ -2,8 +2,8 @@
 
 use super::super::{StorageBackend, StorageType};
 use crate::adapters::storage::ManagedStorageStore;
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
 use std::path::PathBuf;
 
 pub struct SubvolumeBackend {

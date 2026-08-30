@@ -5,10 +5,11 @@
 //! only by explicit CLI mode so opening the details pane cannot invoke a D-Bus
 //! client indirectly through `machinectl show` or `systemctl show`.
 
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineEntry, MachineState};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    InspectionCompleteness, InspectionSource, MachineEntry, MachineName, MachineProperties,
-    GROUP_MACHINE,
+    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
@@ -103,7 +104,7 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
             name,
             class,
             service,
-            state: crate::nspawn::models::MachineState::Running,
+            state: MachineState::Running,
             address: None,
             all_addresses: Vec::new(),
         });
@@ -347,7 +348,7 @@ fn insert_runtime_fields(properties: &mut MachineProperties, mut fields: HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::MachineState;
+    use crate::domain::runtime::MachineState;
     use std::os::unix::fs::symlink;
 
     fn entry(name: &str) -> MachineEntry {

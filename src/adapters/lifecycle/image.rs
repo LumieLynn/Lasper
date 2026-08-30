@@ -14,7 +14,8 @@ use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineControlTransport, NspawnUnitAction, NspawnUnitControlRequest,
 };
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::nspawn::models::{ImageName, MachineEntry, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
 use std::sync::Arc;
 
 pub(crate) struct ImageLifecycleAdapters {

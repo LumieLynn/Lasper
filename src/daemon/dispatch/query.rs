@@ -7,8 +7,8 @@
 
 use super::handler::{DaemonDbusExecutor, HandleOutcome};
 use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
+use crate::domain::machine::MachineName;
 use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
-use crate::nspawn::models::MachineName;
 use serde_json::Value;
 
 pub(super) async fn handle<B: DaemonDbusExecutor>(

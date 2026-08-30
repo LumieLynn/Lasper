@@ -1,8 +1,8 @@
 //! Typed image import operations shared by direct and elevated modes.
 
 use crate::adapters::rootfs::RootfsTarget;
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::PathBuf;

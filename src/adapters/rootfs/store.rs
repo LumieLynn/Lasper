@@ -9,11 +9,12 @@ use crate::adapters::rootfs::nvidia::{
 use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
 use crate::adapters::rootfs::{users, wayland};
 use crate::domain::machine::GuestHostname;
+use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretString;
 use crate::domain::wayland::ContainerUserIdentity;
 use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{validate_chpasswd_secret, CreateUser, MachineName};
+use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;

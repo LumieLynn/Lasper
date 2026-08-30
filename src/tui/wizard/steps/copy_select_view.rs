@@ -1,4 +1,4 @@
-use crate::nspawn::ImageEntry;
+use crate::domain::runtime::ImageEntry;
 use crate::tui::core::{Component, EventResult};
 use crate::tui::widgets::lists::selectable_list::SelectableList;
 use crate::tui::wizard::draft::WizardDraft;

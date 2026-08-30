@@ -15,10 +15,10 @@ use crate::adapters::runtime::inspection::MachineInspectionStore;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::operations::ExecutionRoute;
 use crate::application::runtime::{RuntimeCatalog, RuntimePort};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{
-    MachineEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::nspawn::models::MachineProperties;
 use std::sync::Arc;
 
 pub(crate) fn compose_runtime_catalog(

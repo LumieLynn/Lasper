@@ -17,8 +17,10 @@ use crate::application::machine_lifecycle::{
 };
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::{OperationRegistry, RuntimeCatalog};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
 use crate::nspawn::errors::NspawnError;
-use crate::nspawn::models::{ImageName, MachineEntry, MachineName, MachineProperties};
+use crate::nspawn::models::MachineProperties;
 use std::sync::Arc;
 
 pub(crate) struct MachineLifecycleAdapters {

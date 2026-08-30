@@ -266,7 +266,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             WorkspaceFocus::Images if app.ui.image_list.shows_internal() => {
                 let mut spans = vec![kspan("[j/k]"), hspan(" nav ")];
                 if app.selected_image().is_some_and(|image| {
-                    !crate::nspawn::models::ImageEntry::is_protected_name(&image.name)
+                    !crate::domain::runtime::ImageEntry::is_protected_name(&image.name)
                 }) {
                     spans.extend([kspan("[D]"), hspan(" delete internal ")]);
                 }

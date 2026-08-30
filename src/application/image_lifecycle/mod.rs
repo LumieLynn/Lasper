@@ -3,7 +3,8 @@
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
-use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -255,8 +256,9 @@ impl ImageLifecycleService {
         if ImageEntry::is_protected_name(&image.name) {
             return Err(ImageRemovalRejection::Protected);
         }
-        let name =
-            ImageName::new(image.name.clone()).map_err(|_| ImageRemovalRejection::InvalidTarget)?;
+        let name = image
+            .validated_name()
+            .map_err(|_| ImageRemovalRejection::InvalidTarget)?;
         let reservation = self
             .registry
             .reserve_image_removal(
@@ -291,7 +293,7 @@ impl std::fmt::Display for ImageRemovalRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ImageEntry, MachineState};
+    use crate::domain::runtime::{ImageEntry, MachineState};
 
     fn image(name: &str) -> ImageEntry {
         ImageEntry {

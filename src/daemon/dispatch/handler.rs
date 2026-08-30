@@ -6,7 +6,9 @@ use crate::adapters::system_operation::{execute_dbus_system_operation, SystemOpe
 use crate::application::machine_lifecycle::{
     MachineControlOutcome, MachineRejection, MachineRuntimeAction, NspawnUnitAction,
 };
-use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
+use crate::nspawn::models::MachineProperties;
 
 pub(crate) enum HandleOutcome {
     Spawned,

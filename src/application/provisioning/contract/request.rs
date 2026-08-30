@@ -56,7 +56,7 @@ impl DeploymentRequest {
         crate::nspawn::models::NspawnConfigSpec::try_from(&self.config)
             .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
         if let DeploymentSource::Copy { source_name } = &self.source {
-            crate::nspawn::models::ImageName::new(source_name).map_err(|error| {
+            crate::domain::runtime::ImageName::new(source_name).map_err(|error| {
                 super::job::DeploymentError::rejected(format!("Invalid clone source: {error}"))
             })?;
         }

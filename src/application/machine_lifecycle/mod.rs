@@ -4,10 +4,9 @@ use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
-use crate::nspawn::models::{
-    AllowedSignal, ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties,
-    MachineState,
-};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState};
+use crate::nspawn::models::{AllowedSignal, MachineProperties};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -351,10 +350,15 @@ impl MachineLifecycleService {
         entry: &MachineEntry,
         action: MachineRuntimeAction,
     ) -> Result<MachineOperation, MachineRejection> {
+        if !entry.is_nspawn() {
+            return Err(MachineRejection::Unsupported);
+        }
         if !entry.state.accepts_runtime_actions() {
             return Err(MachineRejection::NotRunning);
         }
-        let machine = MachineName::new(&entry.name).map_err(|_| MachineRejection::InvalidTarget)?;
+        let machine = entry
+            .validated_name()
+            .map_err(|_| MachineRejection::InvalidTarget)?;
         let transition = action.transition();
         let resource_key = ResourceKey::for_machine(&machine);
         self.begin_operation(
@@ -1018,9 +1022,10 @@ mod tests {
         let mut foreign = entry("foreign", MachineState::Running);
         foreign.class = "vm".into();
         foreign.service = "custom-manager".into();
-        assert!(service
-            .begin_runtime(&foreign, MachineRuntimeAction::Poweroff)
-            .is_ok());
+        assert!(matches!(
+            service.begin_runtime(&foreign, MachineRuntimeAction::Poweroff),
+            Err(MachineRejection::Unsupported)
+        ));
         assert!(matches!(
             service.begin_launch(&image("image with spaces"), None),
             Err(MachineRejection::InvalidTarget)

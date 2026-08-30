@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use super::super::core::utils::empty_block;
-use crate::nspawn::models::ImageEntry;
+use crate::domain::runtime::ImageEntry;
 use crate::tui::app::AppData;
 
 fn selected_image(data: &AppData) -> Option<&ImageEntry> {

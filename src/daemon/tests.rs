@@ -10,11 +10,13 @@ use crate::application::machine_lifecycle::{
     MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
     NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
 use crate::ipc::protocol::*;
 use crate::ipc::transport::*;
-use crate::nspawn::models::{ImageEntry, ImageName, MachineEntry, MachineName, MachineProperties};
+use crate::nspawn::models::MachineProperties;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -312,7 +314,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
         id: 1,
         method: "image_remove".into(),
         params: serde_json::to_value(ImageRemoveRequest {
-            image: crate::nspawn::models::ImageName::new("slow-image").unwrap(),
+            image: crate::domain::runtime::ImageName::new("slow-image").unwrap(),
             transport: ImageRemoveTransport::Dbus,
         })
         .unwrap(),
@@ -387,7 +389,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let release = slow.release.clone();
     let dbus = Some(slow);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
-    let image = crate::nspawn::models::ImageName::new("slow-image").unwrap();
+    let image = crate::domain::runtime::ImageName::new("slow-image").unwrap();
     let remove = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
@@ -404,7 +406,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
         method: "nspawn_launch".into(),
         params: serde_json::to_value(NspawnLaunchRequest {
             image: ImageName::new(image.as_str()).unwrap(),
-            machine: crate::nspawn::models::MachineName::new(image.as_str()).unwrap(),
+            machine: crate::domain::machine::MachineName::new(image.as_str()).unwrap(),
             transport: MachineControlTransport::Dbus,
         })
         .unwrap(),

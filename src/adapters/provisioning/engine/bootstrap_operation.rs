@@ -132,7 +132,7 @@ mod tests {
 
     fn missing_machine_target() -> RootfsTarget {
         RootfsTarget::Machine {
-            machine: crate::nspawn::models::MachineName::new("lasper-bootstrap-missing-target")
+            machine: crate::domain::machine::MachineName::new("lasper-bootstrap-missing-target")
                 .unwrap(),
         }
     }

@@ -2,8 +2,8 @@
 
 use crate::adapters::process::{log_output, CommandRunner};
 use crate::adapters::storage::get_filesystem_type;
+use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
 use std::path::{Path, PathBuf};
 
 pub async fn create_subvolume(
