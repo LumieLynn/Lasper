@@ -4,9 +4,9 @@ use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
-use crate::domain::machine::MachineName;
+use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState};
-use crate::nspawn::models::{AllowedSignal, MachineProperties};
+use crate::nspawn::models::MachineProperties;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

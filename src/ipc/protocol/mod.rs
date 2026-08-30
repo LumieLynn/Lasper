@@ -291,7 +291,9 @@ mod tests {
         let terminal = FdOperation::Terminal(SpawnTerminalParams {
             session_id: crate::ipc::protocol::session::WireSessionId::new(1).unwrap(),
             name: MachineName::new("machine").unwrap(),
-            size: crate::nspawn::models::TerminalSize::new(80, 24).unwrap(),
+            size: crate::domain::session::SessionSize::new(80, 24)
+                .unwrap()
+                .into(),
         });
         assert_eq!(terminal.wire_name(), "spawn_terminal");
         assert_eq!(terminal.family(), RpcFamily::Session);

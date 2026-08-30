@@ -1,6 +1,27 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
+/// A deliberately small set of signals exposed by machine lifecycle actions.
+///
+/// The domain owns the semantic choice; adapters map it to the host signal
+/// number when invoking a backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AllowedSignal {
+    #[serde(rename = "SIGTERM")]
+    Terminate,
+    #[serde(rename = "SIGKILL")]
+    Kill,
+}
+
+impl AllowedSignal {
+    pub fn as_name(self) -> &'static str {
+        match self {
+            Self::Terminate => "SIGTERM",
+            Self::Kill => "SIGKILL",
+        }
+    }
+}
+
 /// A validated systemd machine identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
@@ -175,6 +196,17 @@ fn is_valid_nspawn_hostname(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allowed_signal_has_stable_semantic_names() {
+        assert_eq!(AllowedSignal::Terminate.as_name(), "SIGTERM");
+        assert_eq!(AllowedSignal::Kill.as_name(), "SIGKILL");
+        assert_eq!(
+            serde_json::to_string(&AllowedSignal::Kill).unwrap(),
+            r#""SIGKILL""#
+        );
+        assert!(serde_json::from_str::<AllowedSignal>(r#""SIGUSR1""#).is_err());
+    }
 
     #[test]
     fn machine_name_rejects_traversal_and_invalid_characters() {

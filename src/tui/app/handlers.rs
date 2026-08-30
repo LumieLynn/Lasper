@@ -1,4 +1,5 @@
 use super::{App, ModalLayer, WorkspaceFocus};
+use crate::domain::machine::AllowedSignal;
 use crate::tui::core::{AppMessage, Component, ContainerMessage, EventResult, ListMessage};
 use crate::tui::views::detail_panel::DetailTarget;
 use crate::tui::wizard::StepAction as WizardAction;
@@ -381,7 +382,7 @@ impl App {
                         Some(ResourceAction::KillMachine { machine }) => self.action_runtime_named(
                             &machine,
                             crate::application::MachineRuntimeAction::Kill {
-                                signal: crate::nspawn::models::AllowedSignal::Kill,
+                                signal: AllowedSignal::Kill,
                             },
                         ),
                         None => {}

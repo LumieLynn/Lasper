@@ -1,4 +1,5 @@
 use crate::daemon::server::DaemonServerState;
+use crate::domain::session::SessionSize;
 use crate::ipc::protocol::session::{
     SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionLifecycle,
     WireTerminalAttachmentKind,
@@ -88,6 +89,7 @@ pub(crate) fn spawn_terminal(
         name,
         size,
     } = params;
+    let size: SessionSize = size.into_session_size();
     let pair = match native_pty_system().openpty(PtySize {
         rows: size.rows(),
         cols: size.cols(),

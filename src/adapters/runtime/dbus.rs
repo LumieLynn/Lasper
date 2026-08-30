@@ -3,7 +3,7 @@
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
-use crate::domain::machine::MachineName;
+use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{InspectionCompleteness, InspectionSource, MachineProperties};
@@ -257,18 +257,14 @@ impl DbusBackend {
             .await
     }
 
-    pub(crate) async fn kill(
-        &self,
-        name: &str,
-        signal: crate::nspawn::models::AllowedSignal,
-    ) -> Result<()> {
+    pub(crate) async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
         let name = parse_machine_name(name)?;
         let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
         let result = proxy
-            .kill_machine(name.as_str(), "all", signal.as_raw())
+            .kill_machine(name.as_str(), "all", allowed_signal_number(signal))
             .await;
         self.observe_result(generation, &result).await;
         result.map_err(NspawnError::Dbus)?;
@@ -292,6 +288,13 @@ impl DbusBackend {
 
     pub(crate) async fn reload_daemon(&self) -> Result<()> {
         self.call_systemd1::<_, ()>("Reload", &()).await
+    }
+}
+
+fn allowed_signal_number(signal: AllowedSignal) -> i32 {
+    match signal {
+        AllowedSignal::Terminate => libc::SIGTERM,
+        AllowedSignal::Kill => libc::SIGKILL,
     }
 }
 

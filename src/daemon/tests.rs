@@ -10,8 +10,9 @@ use crate::application::machine_lifecycle::{
     MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
     NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
-use crate::domain::machine::MachineName;
+use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
+use crate::domain::session::SessionSize;
 use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
 use crate::ipc::protocol::*;
@@ -159,7 +160,7 @@ fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
         params: serde_json::to_value(MachineRuntimeControlRequest {
             machine: MachineName::new("test-machine").unwrap(),
             action: MachineRuntimeAction::Kill {
-                signal: crate::nspawn::models::AllowedSignal::Kill,
+                signal: AllowedSignal::Kill,
             },
             transport: MachineControlTransport::Dbus,
         })
@@ -559,7 +560,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
         operation: FdOperation::Terminal(SpawnTerminalParams {
             session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
-            size: crate::nspawn::models::TerminalSize::new(120, 40).unwrap(),
+            size: SessionSize::new(120, 40).unwrap().into(),
         }),
     };
 
@@ -575,10 +576,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
         FdOperation::Terminal(params) => {
             assert_eq!(params.session_id.get(), 7);
             assert_eq!(params.name.as_str(), "test-machine");
-            assert_eq!(
-                params.size,
-                crate::nspawn::models::TerminalSize::new(120, 40).unwrap()
-            );
+            assert_eq!(params.size, SessionSize::new(120, 40).unwrap().into());
         }
         _ => panic!("expected spawn_terminal"),
     }
