@@ -9,8 +9,8 @@ use crate::application::inspection::{
 };
 use crate::application::sessions::{JournalSessionHandle, SessionService};
 use crate::application::{RuntimeCatalog, RuntimeQuery};
+use crate::domain::inspection::MachineProperties;
 use crate::domain::runtime::MachineEntry;
-use crate::nspawn::models::MachineProperties;
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::sync::Arc;
 

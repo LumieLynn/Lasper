@@ -1,7 +1,7 @@
 //! Semantic read models used by resource detail consumers.
 
+use crate::domain::inspection::MachineProperties;
 use crate::domain::runtime::MachineEntry;
-use crate::nspawn::models::MachineProperties;
 use std::path::PathBuf;
 use std::sync::Arc;
 

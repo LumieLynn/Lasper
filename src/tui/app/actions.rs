@@ -5,9 +5,9 @@ use super::detail_refresh::{
 use super::App;
 use crate::application::machine_lifecycle::MachineOperation;
 use crate::application::{MachineLifecycleAction, MachineRuntimeAction, NspawnUnitAction};
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineState};
-use crate::nspawn::models::MachineProperties;
 use crate::tui::views::detail_panel::{DetailPane, DetailTarget};
 use std::time::{Duration, Instant};
 
@@ -310,8 +310,8 @@ impl App {
 
     fn image_properties(&self, name: &str) -> MachineProperties {
         let mut properties = MachineProperties::from_inspection(
-            crate::nspawn::models::InspectionSource::RuntimeState,
-            crate::nspawn::models::InspectionCompleteness::RuntimeOnly,
+            InspectionSource::RuntimeState,
+            InspectionCompleteness::RuntimeOnly,
         );
         let image = self
             .data

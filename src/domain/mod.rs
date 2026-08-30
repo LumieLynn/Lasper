@@ -1,3 +1,4 @@
+pub mod inspection;
 pub mod machine;
 pub mod nvidia;
 pub mod runtime;

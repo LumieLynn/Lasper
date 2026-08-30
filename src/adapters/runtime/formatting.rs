@@ -1,4 +1,4 @@
-use crate::nspawn::models::MachineProperties;
+use crate::domain::inspection::{MachineProperties, GROUP_DEPENDENCIES, GROUP_SYSTEMD_UNIT};
 use std::ffi::CStr;
 use zbus::zvariant::Value;
 
@@ -22,10 +22,10 @@ pub fn is_dependency_key(key: &str) -> bool {
 pub fn insert_systemd_property(props: &mut MachineProperties, key: String, value: String) {
     if is_dependency_key(&key) {
         if !value.is_empty() && value != "[]" {
-            props.insert(crate::nspawn::models::GROUP_DEPENDENCIES, key, value);
+            props.insert(GROUP_DEPENDENCIES, key, value);
         }
     } else {
-        props.insert(crate::nspawn::models::GROUP_SYSTEMD_UNIT, key, value);
+        props.insert(GROUP_SYSTEMD_UNIT, key, value);
     }
 }
 

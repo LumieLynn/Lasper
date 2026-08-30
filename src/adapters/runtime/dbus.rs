@@ -3,10 +3,12 @@
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
+use crate::domain::inspection::{
+    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
+};
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{InspectionCompleteness, InspectionSource, MachineProperties};
 use std::collections::HashMap;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -380,7 +382,7 @@ impl RuntimeSource for DbusBackend {
         let machine_result = get_machine1_properties(&conn, &name).await;
         self.observe_result(generation, &machine_result).await;
         if let Ok(m1_props) = machine_result {
-            let group = props.get_group_mut(crate::nspawn::models::GROUP_MACHINE);
+            let group = props.get_group_mut(GROUP_MACHINE);
             for (k, v) in m1_props {
                 group.insert(k, v);
             }

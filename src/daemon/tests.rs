@@ -10,6 +10,7 @@ use crate::application::machine_lifecycle::{
     MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
     NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
+use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use crate::domain::session::SessionSize;
@@ -17,7 +18,6 @@ use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
 use crate::ipc::protocol::*;
 use crate::ipc::transport::*;
-use crate::nspawn::models::MachineProperties;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;

@@ -5,12 +5,12 @@
 //! only by explicit CLI mode so opening the details pane cannot invoke a D-Bus
 //! client indirectly through `machinectl show` or `systemctl show`.
 
+use crate::domain::inspection::{
+    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
+};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{MachineEntry, MachineState};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
-};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;

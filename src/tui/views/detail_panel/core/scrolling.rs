@@ -6,6 +6,7 @@ use ratatui::{
 
 use super::super::DetailPane;
 use super::super::DetailPanel;
+use super::properties::summary_properties;
 use crate::tui::app::AppData;
 
 /// Presentation cache for the log pane: pre-computed wrapped-line offsets
@@ -54,7 +55,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
             .properties
             .as_ref()
             .map(|p| {
-                p.get_summary()
+                summary_properties(p)
                     .iter()
                     .map(|(_, v)| {
                         v.lines()

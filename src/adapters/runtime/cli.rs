@@ -1,9 +1,9 @@
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{InspectionCompleteness, InspectionSource, MachineProperties};
 use serde::Deserialize;
 use std::time::Duration;
 
@@ -219,7 +219,7 @@ pub(crate) async fn get_properties_with_runner(
                         &zbus::zvariant::Value::Str(val.into()),
                     );
                     props.insert(
-                        crate::nspawn::models::GROUP_MACHINE,
+                        crate::domain::inspection::GROUP_MACHINE,
                         key.to_string(),
                         formatted,
                     );

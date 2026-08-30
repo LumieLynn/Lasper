@@ -1,10 +1,10 @@
 //! Application-owned runtime discovery and observation.
 
 use super::operations::{ExecutionRoute, RouteFallback};
+use crate::domain::inspection::{MachineProperties, GROUP_MACHINE, GROUP_SYSTEMD_UNIT};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineProperties;
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -365,21 +365,17 @@ fn fallback_reason(error: &NspawnError) -> String {
 fn enrich_properties(properties: &mut MachineProperties, entry: &MachineEntry) {
     if !entry.all_addresses.is_empty() {
         properties.insert(
-            crate::nspawn::models::GROUP_MACHINE,
+            GROUP_MACHINE,
             "IPAddresses".into(),
             entry.all_addresses.join(", "),
         );
     }
     if let Some(unit_file_state) = properties
-        .get_group(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+        .get_group(GROUP_SYSTEMD_UNIT)
         .and_then(|group| group.get("UnitFileState"))
         .cloned()
     {
-        properties.insert(
-            crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-            "Enabled".into(),
-            unit_file_state,
-        );
+        properties.insert(GROUP_SYSTEMD_UNIT, "Enabled".into(), unit_file_state);
     }
 }
 
@@ -536,11 +532,7 @@ mod tests {
         let mut fallback = port(ExecutionRoute::LocalCli);
         fallback.expect_inspect().returning(|_, _| {
             let mut properties = MachineProperties::default();
-            properties.insert(
-                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                "UnitFileState".into(),
-                "enabled".into(),
-            );
+            properties.insert(GROUP_SYSTEMD_UNIT, "UnitFileState".into(), "enabled".into());
             Ok(properties)
         });
         let catalog = RuntimeCatalog::new(None, Arc::new(fallback), vec![], None);
@@ -552,7 +544,7 @@ mod tests {
         assert_eq!(
             query
                 .value
-                .get_group(crate::nspawn::models::GROUP_MACHINE)
+                .get_group(GROUP_MACHINE)
                 .and_then(|group| group.get("IPAddresses"))
                 .map(String::as_str),
             Some("10.0.0.2, fd00::2")
@@ -560,7 +552,7 @@ mod tests {
         assert_eq!(
             query
                 .value
-                .get_group(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+                .get_group(GROUP_SYSTEMD_UNIT)
                 .and_then(|group| group.get("Enabled"))
                 .map(String::as_str),
             Some("enabled")

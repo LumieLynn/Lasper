@@ -17,9 +17,12 @@ use crate::application::{
     ResourceInspectionService, RuntimeCatalog, RuntimeUpdate,
 };
 use crate::composition::ApplicationServices;
+use crate::domain::inspection::MachineProperties;
+#[cfg(test)]
+use crate::domain::inspection::GROUP_SYSTEMD_UNIT;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, RuntimeSnapshot};
-use crate::nspawn::models::{CpuRepresentation, MachineMetrics};
 use crate::tui::core::Component;
+use crate::tui::effects::metrics::{CpuRepresentation, MachineMetrics};
 use crate::tui::events::{AppEvent, EventHandler, InputEvent};
 use crate::tui::views::detail_panel::DetailPanel;
 use crate::tui::views::detail_panel::DetailTarget;
@@ -197,7 +200,7 @@ pub struct AppData {
     pub image_selected: usize,
     pub internal_image_selected: usize,
     pub selected: usize,
-    pub properties: Result<crate::nspawn::models::MachineProperties, String>,
+    pub properties: Result<MachineProperties, String>,
     pub log_manager: crate::tui::views::detail_panel::log_manager::LogManager,
     pub config_content: Option<String>,
     pub config_path: Option<std::path::PathBuf>,
@@ -268,7 +271,7 @@ impl App {
                 image_selected: 0,
                 internal_image_selected: 0,
                 selected: 0,
-                properties: Ok(crate::nspawn::models::MachineProperties::default()),
+                properties: Ok(MachineProperties::default()),
                 log_manager: crate::tui::views::detail_panel::log_manager::LogManager::new(
                     log_buffer_lines,
                 ),
@@ -417,7 +420,7 @@ impl App {
                 .ensure_pane_for_target(&self.data.detail_target);
             // Background detail reads must never leave the previous target's
             // properties visible while the new request is in flight.
-            self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
+            self.data.properties = Ok(MachineProperties::default());
             self.data.properties_dirty = true;
             self.data.details_dirty = true;
             self.data.config_dirty = true;
@@ -999,12 +1002,8 @@ mod tests {
             let mut observation = MockMachineObservation::new();
             if successful {
                 observation.expect_inspect().once().returning(|_, _| {
-                    let mut properties = crate::nspawn::models::MachineProperties::default();
-                    properties.insert(
-                        crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                        "ActiveState".into(),
-                        "active".into(),
-                    );
+                    let mut properties = MachineProperties::default();
+                    properties.insert(GROUP_SYSTEMD_UNIT, "ActiveState".into(), "active".into());
                     Ok(properties)
                 });
             }
@@ -1888,7 +1887,7 @@ mod tests {
                 DetailTarget::Machine("second".into())
             );
 
-            let mut stale_properties = crate::nspawn::models::MachineProperties::default();
+            let mut stale_properties = MachineProperties::default();
             stale_properties.insert("Machine", "Name".into(), "first".into());
             app.apply_detail_refresh(DetailRefreshCompletion {
                 ticket: stale_ticket,

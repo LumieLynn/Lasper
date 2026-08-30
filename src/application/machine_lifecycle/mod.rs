@@ -4,9 +4,9 @@ use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
+use crate::domain::inspection::{MachineProperties, GROUP_SYSTEMD_UNIT};
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState};
-use crate::nspawn::models::MachineProperties;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -710,7 +710,7 @@ fn systemd_property<'a>(properties: &'a MachineProperties, key: &str) -> Option<
     properties
         .groups
         .iter()
-        .find(|group| group.name == crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+        .find(|group| group.name == GROUP_SYSTEMD_UNIT)
         .and_then(|group| group.properties.get(key))
         .map(String::as_str)
 }
@@ -767,11 +767,7 @@ mod tests {
 
     fn active_properties() -> MachineProperties {
         let mut properties = MachineProperties::default();
-        properties.insert(
-            crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-            "ActiveState".into(),
-            "active".into(),
-        );
+        properties.insert(GROUP_SYSTEMD_UNIT, "ActiveState".into(), "active".into());
         properties
     }
 
@@ -907,7 +903,7 @@ mod tests {
         observation.expect_inspect().once().returning(|_, _| {
             let mut properties = MachineProperties::default();
             properties.insert(
-                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
+                GROUP_SYSTEMD_UNIT,
                 "ActiveState".into(),
                 "activating".into(),
             );
@@ -1055,11 +1051,7 @@ mod tests {
             ("Result", "exit-code"),
             ("ExecMainStatus", "1"),
         ] {
-            failed.insert(
-                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                key.into(),
-                value.into(),
-            );
+            failed.insert(GROUP_SYSTEMD_UNIT, key.into(), value.into());
         }
         assert!(matches!(
             observe_start(&failed),

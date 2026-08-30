@@ -2,9 +2,9 @@
 
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::operations::ExecutionRoute;
+use crate::domain::inspection::MachineProperties;
 use crate::domain::runtime::MachineEntry;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineProperties;
 use std::path::PathBuf;
 use std::sync::Arc;
 
