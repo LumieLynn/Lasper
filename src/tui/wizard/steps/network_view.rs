@@ -1,4 +1,4 @@
-use crate::nspawn::models::{NetworkMode, PortForward};
+use crate::domain::provisioning::{NetworkMode, PortForward};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::inputs::text_box::TextBox;
 use crate::tui::widgets::lists::editable_list::EditableList;
@@ -134,13 +134,13 @@ impl NetworkStepView {
             bridge_list,
             custom_bridge: TextBox::new(" Custom Bridge Name ", initial_bridge.clone())
                 .with_validator(|value| {
-                    crate::nspawn::models::validate_nspawn_interface_name(value)
+                    crate::domain::provisioning::validate_network_interface_name(value)
                         .map_err(|error| error.to_string())
                 }),
             interface_list,
             custom_interface: TextBox::new(" Custom Interface Name ", initial_interface.clone())
                 .with_validator(|value| {
-                    crate::nspawn::models::validate_nspawn_interface_name(value)
+                    crate::domain::provisioning::validate_network_interface_name(value)
                         .map_err(|error| error.to_string())
                 }),
             port_list: EditableList::new(

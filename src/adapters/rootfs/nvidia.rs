@@ -1,7 +1,7 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::domain::secret::SecretBytes;
-use crate::nspawn::errors::{NspawnError, Result};
 use std::collections::HashSet;
 use std::path::{Component, Path};
 

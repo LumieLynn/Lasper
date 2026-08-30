@@ -108,10 +108,10 @@ pub(crate) struct ProbeDeploymentRecoveryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentSecrets, DeploymentSource, DeploymentStorage,
     };
-    use crate::nspawn::models::ContainerConfig;
 
     #[test]
     fn submission_debug_redacts_wire_secrets_and_json_keeps_them_in_the_capsule() {
@@ -119,7 +119,7 @@ mod tests {
             request_id: DeploymentRequestId::from_u128(1),
             deployment_id: DeploymentId::from_u128(2),
             request: DeploymentRequest {
-                config: ContainerConfig {
+                config: MachineProvisioningConfig {
                     name: "test".into(),
                     ..Default::default()
                 },

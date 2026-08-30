@@ -4,6 +4,7 @@ use ratatui::{
     Frame,
 };
 
+use super::super::core::properties::summary_properties;
 use super::super::core::style::property_style;
 use super::super::core::utils::empty_block;
 use crate::render_column_layout;
@@ -39,7 +40,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         }
     };
 
-    let pairs = props.get_summary();
+    let pairs = summary_properties(props);
 
     let key_width = if area.width > 6 {
         (area.width as f32 * 0.35) as usize

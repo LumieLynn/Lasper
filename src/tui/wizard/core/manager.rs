@@ -1,7 +1,8 @@
 use crate::application::provisioning::{
     DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
 };
-use crate::nspawn::{ContainerEntry, ImageEntry};
+use crate::domain::provisioning::NetworkMode;
+use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::core::{AppMessage, Component, EventResult, WizardMessage};
 use crate::tui::wizard::core::draft::{SourceKind, WizardDraft};
 use crate::tui::wizard::steps::{self, StepComponent};
@@ -67,7 +68,7 @@ pub struct Wizard {
 impl Wizard {
     pub fn new(
         id: crate::tui::wizard::WizardInstanceId,
-        entries: Vec<ContainerEntry>,
+        entries: Vec<MachineEntry>,
         images: Vec<ImageEntry>,
         permission_level: crate::composition::PermissionLevel,
         config: std::sync::Arc<crate::config::AppConfig>,
@@ -518,12 +519,10 @@ impl Wizard {
                 if self.step == WizardStep::Network {
                     let mode = self.draft.network.network_mode();
                     let (name, is_bridge) = match mode {
-                        Some(crate::nspawn::models::NetworkMode::Bridge(n)) => (Some(n), true),
-                        Some(crate::nspawn::models::NetworkMode::MacVlan(n))
-                        | Some(crate::nspawn::models::NetworkMode::IpVlan(n))
-                        | Some(crate::nspawn::models::NetworkMode::Interface(n)) => {
-                            (Some(n), false)
-                        }
+                        Some(NetworkMode::Bridge(n)) => (Some(n), true),
+                        Some(NetworkMode::MacVlan(n))
+                        | Some(NetworkMode::IpVlan(n))
+                        | Some(NetworkMode::Interface(n)) => (Some(n), false),
                         _ => (None, false),
                     };
 

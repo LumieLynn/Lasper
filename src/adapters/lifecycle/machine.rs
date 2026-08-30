@@ -1,23 +1,28 @@
 //! Runtime composition for the machine lifecycle vertical slice.
 
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::lifecycle::error::map_machine_control_error;
+use crate::adapters::error::NspawnError;
+use crate::adapters::lifecycle::error::map_system_operation_machine_error;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::system_operation::{
     execute_dbus_system_operation, execute_system_operation_with_runner, SystemOperation,
-    SystemOperationStore,
+    SystemOperationError, SystemOperationStore,
 };
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControl, MachineControlOutcome, MachineControlRequest,
-    MachineControlTransport, MachineLifecycleService, MachineObservation, MachineStartDiagnostics,
-    MachineStartPreparation, RoutedMachineControlOutcome, StartFailureEvidence,
+    MachineControl, MachineControlOutcome, MachineControlTransport, MachineLifecycleService,
+    MachineObservation, MachinePreparationError, MachineRuntimeAction,
+    MachineRuntimeControlRequest, MachineStartDiagnostics, MachineStartPreparation,
+    NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest, RoutedMachineControlOutcome,
+    StartFailureEvidence,
 };
 use crate::application::operations::{ExecutionRoute, RouteFallback};
+use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::nspawn::errors::NspawnError;
-use crate::nspawn::models::{ContainerEntry, MachineName, MachineProperties};
+use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
 use std::sync::Arc;
 
 pub(crate) struct MachineLifecycleAdapters {
@@ -30,7 +35,7 @@ pub(crate) struct MachineLifecycleAdapters {
 }
 
 pub(crate) enum MachineLifecycleRoute {
-    DirectDbus,
+    DirectDbus(DbusBackend),
     LocalCli,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
@@ -54,8 +59,8 @@ pub(crate) fn compose_machine_lifecycle(
     } = adapters;
     let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
         route: match route {
-            MachineLifecycleRoute::DirectDbus => MachineControlRoute::DirectDbus {
-                dbus: DbusBackend::new(),
+            MachineLifecycleRoute::DirectDbus(dbus) => MachineControlRoute::DirectDbus {
+                dbus,
                 fallback_runner: local_cmd.clone(),
             },
             MachineLifecycleRoute::LocalCli => MachineControlRoute::LocalCli {
@@ -106,12 +111,53 @@ struct RoutedMachineControl {
     route: MachineControlRoute,
 }
 
+#[derive(Clone, Debug)]
+enum MachineControlIntent {
+    Launch { image: ImageName },
+    Runtime(MachineRuntimeAction),
+    Unit(NspawnUnitAction),
+}
+
 #[async_trait::async_trait]
 impl MachineControl for RoutedMachineControl {
+    async fn launch(
+        &self,
+        image: &ImageName,
+        machine: &MachineName,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(
+            machine,
+            MachineControlIntent::Launch {
+                image: image.clone(),
+            },
+        )
+        .await
+    }
+
+    async fn execute_runtime(
+        &self,
+        machine: &MachineName,
+        action: MachineRuntimeAction,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(machine, MachineControlIntent::Runtime(action))
+            .await
+    }
+
+    async fn execute_unit(
+        &self,
+        machine: &MachineName,
+        action: NspawnUnitAction,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(machine, MachineControlIntent::Unit(action))
+            .await
+    }
+}
+
+impl RoutedMachineControl {
     async fn execute(
         &self,
         machine: &MachineName,
-        action: MachineAction,
+        intent: MachineControlIntent,
     ) -> RoutedMachineControlOutcome {
         match &self.route {
             MachineControlRoute::DirectDbus {
@@ -119,7 +165,7 @@ impl MachineControl for RoutedMachineControl {
                 fallback_runner,
             } => {
                 let dbus_outcome = if RuntimeSource::is_available(dbus).await {
-                    execute_dbus_machine_control(dbus, machine.clone(), action).await
+                    execute_dbus_machine_control(dbus, machine.clone(), intent.clone()).await
                 } else {
                     MachineControlOutcome::NotAttempted {
                         reason: "D-Bus backend is unavailable".into(),
@@ -129,7 +175,7 @@ impl MachineControl for RoutedMachineControl {
                     MachineControlOutcome::NotAttempted { reason } => {
                         let outcome = execute_cli_machine_control_with_runner(
                             machine.clone(),
-                            action,
+                            intent,
                             fallback_runner.as_ref(),
                         )
                         .await;
@@ -153,7 +199,7 @@ impl MachineControl for RoutedMachineControl {
             MachineControlRoute::LocalCli { runner } => RoutedMachineControlOutcome {
                 outcome: execute_cli_machine_control_with_runner(
                     machine.clone(),
-                    action,
+                    intent,
                     runner.as_ref(),
                 )
                 .await,
@@ -161,12 +207,14 @@ impl MachineControl for RoutedMachineControl {
                 fallback: None,
             },
             MachineControlRoute::Daemon { daemon, transport } => {
-                let request = MachineControlRequest {
-                    machine: machine.clone(),
-                    action,
-                    transport: *transport,
-                };
-                let outcome = match daemon.machine_control(request).await {
+                let outcome = match execute_daemon_machine_control(
+                    daemon,
+                    machine.clone(),
+                    intent.clone(),
+                    *transport,
+                )
+                .await
+                {
                     Ok(outcome) => outcome,
                     Err(error) => MachineControlOutcome::OutcomeUnknown {
                         reason: format!("daemon response was lost: {error}"),
@@ -174,12 +222,13 @@ impl MachineControl for RoutedMachineControl {
                 };
                 if *transport == MachineControlTransport::Dbus {
                     if let MachineControlOutcome::NotAttempted { reason } = outcome {
-                        let fallback_request = MachineControlRequest {
-                            machine: machine.clone(),
-                            action,
-                            transport: MachineControlTransport::Cli,
-                        };
-                        let fallback_outcome = match daemon.machine_control(fallback_request).await
+                        let fallback_outcome = match execute_daemon_machine_control(
+                            daemon,
+                            machine.clone(),
+                            intent,
+                            MachineControlTransport::Cli,
+                        )
+                        .await
                         {
                             Ok(outcome) => outcome,
                             Err(error) => MachineControlOutcome::OutcomeUnknown {
@@ -210,52 +259,128 @@ impl MachineControl for RoutedMachineControl {
     }
 }
 
-pub(crate) async fn execute_dbus_machine_control(
-    dbus: &DbusBackend,
+async fn execute_daemon_machine_control(
+    daemon: &ElevatedDaemon,
     machine: MachineName,
-    action: MachineAction,
-) -> MachineControlOutcome {
-    match execute_dbus_system_operation(dbus, system_operation(machine, action)).await {
-        Ok(()) => MachineControlOutcome::Succeeded,
-        Err(error) => map_machine_control_error(error),
+    intent: MachineControlIntent,
+    transport: MachineControlTransport,
+) -> std::io::Result<MachineControlOutcome> {
+    match intent {
+        MachineControlIntent::Launch { image } => {
+            daemon
+                .nspawn_launch(NspawnLaunchRequest {
+                    image,
+                    machine,
+                    transport,
+                })
+                .await
+        }
+        MachineControlIntent::Runtime(action) => {
+            daemon
+                .machine_runtime_control(MachineRuntimeControlRequest {
+                    machine,
+                    action,
+                    transport,
+                })
+                .await
+        }
+        MachineControlIntent::Unit(action) => {
+            daemon
+                .nspawn_unit_control(NspawnUnitControlRequest {
+                    machine,
+                    action,
+                    transport,
+                })
+                .await
+        }
     }
 }
 
-pub(crate) async fn execute_cli_machine_control(
+async fn execute_dbus_machine_control(
+    dbus: &DbusBackend,
     machine: MachineName,
-    action: MachineAction,
+    intent: MachineControlIntent,
+) -> MachineControlOutcome {
+    match execute_dbus_system_operation(dbus, system_operation(machine, intent)).await {
+        Ok(()) => MachineControlOutcome::Succeeded,
+        Err(error) => map_system_operation_machine_error(error),
+    }
+}
+
+async fn execute_cli_machine_control(
+    machine: MachineName,
+    intent: MachineControlIntent,
 ) -> MachineControlOutcome {
     execute_cli_machine_control_with_runner(
         machine,
-        action,
+        intent,
         &crate::adapters::process::DefaultCommandRunner,
     )
     .await
 }
 
+pub(crate) async fn execute_cli_nspawn_launch(
+    image: ImageName,
+    machine: MachineName,
+) -> MachineControlOutcome {
+    if image.as_str() != machine.as_str() {
+        return MachineControlOutcome::Rejected {
+            rejection: crate::application::machine_lifecycle::MachineRejection::InvalidTarget,
+            reason: "nspawn launch currently requires matching image and machine names".into(),
+        };
+    }
+    execute_cli_machine_control(machine, MachineControlIntent::Launch { image }).await
+}
+
+pub(crate) async fn execute_cli_machine_runtime(
+    machine: MachineName,
+    action: MachineRuntimeAction,
+) -> MachineControlOutcome {
+    execute_cli_machine_control(machine, MachineControlIntent::Runtime(action)).await
+}
+
+pub(crate) async fn execute_cli_nspawn_unit(
+    machine: MachineName,
+    action: NspawnUnitAction,
+) -> MachineControlOutcome {
+    execute_cli_machine_control(machine, MachineControlIntent::Unit(action)).await
+}
+
 async fn execute_cli_machine_control_with_runner(
     machine: MachineName,
-    action: MachineAction,
+    intent: MachineControlIntent,
     runner: &dyn CommandRunner,
 ) -> MachineControlOutcome {
-    match execute_system_operation_with_runner(system_operation(machine, action), runner).await {
+    match execute_system_operation_with_runner(system_operation(machine, intent), runner).await {
         Ok(()) => MachineControlOutcome::Succeeded,
-        Err(NspawnError::Io(_, error)) => MachineControlOutcome::NotAttempted {
-            reason: format!("failed to launch machine control command: {error}"),
-        },
-        Err(error) => map_machine_control_error(error),
+        Err(SystemOperationError::Io { source: error, .. }) => {
+            MachineControlOutcome::NotAttempted {
+                reason: format!("failed to launch machine control command: {error}"),
+            }
+        }
+        Err(error) => map_system_operation_machine_error(error),
     }
 }
 
-fn system_operation(machine: MachineName, action: MachineAction) -> SystemOperation {
-    match action {
-        MachineAction::Start => SystemOperation::Start { machine },
-        MachineAction::Terminate => SystemOperation::Terminate { machine },
-        MachineAction::Poweroff => SystemOperation::Poweroff { machine },
-        MachineAction::Reboot => SystemOperation::Reboot { machine },
-        MachineAction::Enable => SystemOperation::Enable { machine },
-        MachineAction::Disable => SystemOperation::Disable { machine },
-        MachineAction::Kill { signal } => SystemOperation::Kill { machine, signal },
+fn system_operation(machine: MachineName, intent: MachineControlIntent) -> SystemOperation {
+    match intent {
+        MachineControlIntent::Launch { .. } => SystemOperation::Start { machine },
+        MachineControlIntent::Runtime(MachineRuntimeAction::Terminate) => {
+            SystemOperation::Terminate { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff) => {
+            SystemOperation::Poweroff { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Reboot) => {
+            SystemOperation::Reboot { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Kill { signal }) => {
+            SystemOperation::Kill { machine, signal }
+        }
+        MachineControlIntent::Unit(NspawnUnitAction::Enable) => SystemOperation::Enable { machine },
+        MachineControlIntent::Unit(NspawnUnitAction::Disable) => {
+            SystemOperation::Disable { machine }
+        }
     }
 }
 
@@ -270,7 +395,7 @@ struct StoreStartPreparation {
 
 #[async_trait::async_trait]
 impl MachineStartPreparation for StoreStartPreparation {
-    async fn prepare(&self, machine: &MachineName) -> Result<(), String> {
+    async fn prepare(&self, machine: &MachineName) -> Result<(), MachinePreparationError> {
         let result = crate::adapters::platform::nvidia::ensure_gpu_passthrough(
             machine.as_str(),
             &self.nspawn,
@@ -280,7 +405,7 @@ impl MachineStartPreparation for StoreStartPreparation {
         )
         .await;
         self.runtime.invalidate();
-        result.map_err(|error| error.to_string())?;
+        result.map_err(map_machine_preparation_error)?;
         if let Err(error) = self.system_operations.reload_daemon().await {
             log::warn!(
                 "systemd daemon reload after pre-start reconciliation failed for {}: {}",
@@ -289,6 +414,23 @@ impl MachineStartPreparation for StoreStartPreparation {
             );
         }
         Ok(())
+    }
+}
+
+fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError {
+    let permission_denied =
+        error.is_polkit_rejection() || matches!(&error, NspawnError::PermissionDenied);
+    let invalid_configuration = matches!(
+        &error,
+        NspawnError::Validation(_) | NspawnError::InvalidConfig(_)
+    );
+    let message = error.to_string();
+    if permission_denied {
+        MachinePreparationError::permission_denied(message)
+    } else if invalid_configuration {
+        MachinePreparationError::invalid_configuration(message)
+    } else {
+        MachinePreparationError::failed(message)
     }
 }
 
@@ -301,13 +443,12 @@ impl MachineObservation for CatalogMachineObservation {
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
-    ) -> Result<MachineProperties, String> {
+        entry: &MachineEntry,
+    ) -> RuntimeResult<MachineProperties> {
         self.runtime
             .inspect(machine.as_str(), entry)
             .await
             .map(|query| query.value)
-            .map_err(|error| error.to_string())
     }
 
     fn invalidate(&self) {
@@ -356,7 +497,7 @@ impl MachineStartDiagnostics for LocalStartDiagnostics {
         ]);
         let journal = self
             .runner
-            .run("journalctl", args)
+            .run_bounded("journalctl", args, std::time::Duration::from_secs(5))
             .await
             .ok()
             .filter(|output| output.status.success())
@@ -388,16 +529,19 @@ mod tests {
     async fn cli_control_uses_fixed_typed_command() {
         let mut runner = MockCommandRunner::new();
         runner
-            .expect_run()
-            .withf(|program, args| {
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
                 program == "machinectl"
                     && args.iter().map(String::as_str).eq(["--", "start", "test"])
+                    && *timeout == std::time::Duration::from_secs(60)
             })
-            .returning(|_, _| Ok(success()));
+            .returning(|_, _, _| Ok(success()));
 
         let outcome = execute_cli_machine_control_with_runner(
             MachineName::new("test").unwrap(),
-            MachineAction::Start,
+            MachineControlIntent::Launch {
+                image: ImageName::new("test").unwrap(),
+            },
             &runner,
         )
         .await;
@@ -408,7 +552,7 @@ mod tests {
     #[tokio::test]
     async fn cli_launch_failure_is_explicitly_not_attempted() {
         let mut runner = MockCommandRunner::new();
-        runner.expect_run().returning(|_, _| {
+        runner.expect_run_bounded().returning(|_, _, _| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "machinectl missing",
@@ -417,7 +561,9 @@ mod tests {
 
         let outcome = execute_cli_machine_control_with_runner(
             MachineName::new("test").unwrap(),
-            MachineAction::Start,
+            MachineControlIntent::Launch {
+                image: ImageName::new("test").unwrap(),
+            },
             &runner,
         )
         .await;
@@ -426,5 +572,44 @@ mod tests {
             outcome,
             MachineControlOutcome::NotAttempted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn cli_mutation_timeout_has_unknown_outcome() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run_bounded().returning(|_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline exceeded",
+            ))
+        });
+
+        let outcome = execute_cli_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff),
+            &runner,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            MachineControlOutcome::OutcomeUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn preparation_errors_keep_host_semantics_at_the_adapter_boundary() {
+        let permission = map_machine_preparation_error(NspawnError::PermissionDenied);
+        assert!(permission.is_permission_denied());
+        assert!(!permission.is_invalid_configuration());
+
+        let invalid = map_machine_preparation_error(NspawnError::InvalidConfig("bad unit".into()));
+        assert!(invalid.is_invalid_configuration());
+        assert!(!invalid.is_permission_denied());
+
+        let failed = map_machine_preparation_error(NspawnError::Runtime("probe failed".into()));
+        assert!(!failed.is_invalid_configuration());
+        assert!(!failed.is_permission_denied());
+        assert_eq!(failed.to_string(), "Runtime error: probe failed");
     }
 }

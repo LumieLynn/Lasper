@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 
+use super::super::core::properties::group_display_priority;
 use super::super::core::style::property_style;
 use super::super::core::utils::empty_block;
 use crate::render_column_layout;
@@ -48,7 +49,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
 
     // Sort groups for consistent display order
     let mut sorted_groups = props.groups.clone();
-    sorted_groups.sort_by_key(|g| g.display_priority());
+    sorted_groups.sort_by_key(group_display_priority);
 
     let t = crate::tui::theme::theme();
     for group in &sorted_groups {

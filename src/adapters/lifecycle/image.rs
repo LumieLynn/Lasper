@@ -1,20 +1,23 @@
 //! Runtime composition for the image lifecycle vertical slice.
 
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::lifecycle::error::map_system_operation_image_error;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::system_operation::SystemOperationStore;
+use crate::adapters::system_operation::{SystemOperationError, SystemOperationStore};
 use crate::application::image_lifecycle::{
     ArtifactCleanupReport, ArtifactOwnership, ImageControl, ImageControlOutcome,
     ImageLifecycleService, ImageRemoveRequest, ImageRemoveTransport, ImageRuntime,
     ManagedArtifactCleanup, UnitDisableReport,
 };
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+    MachineControlOutcome, MachineControlTransport, NspawnUnitAction, NspawnUnitControlRequest,
 };
+use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::nspawn::models::{ContainerEntry, ImageName, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
 use std::sync::Arc;
 
 pub(crate) struct ImageLifecycleAdapters {
@@ -26,7 +29,7 @@ pub(crate) struct ImageLifecycleAdapters {
 }
 
 pub(crate) enum ImageLifecycleRoute {
-    DirectDbus,
+    DirectDbus(DbusBackend),
     LocalCli,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
@@ -58,8 +61,8 @@ pub(crate) fn compose_image_lifecycle(
             runner: local_cmd.clone(),
             system_operations: system_operations.clone(),
         },
-        ImageLifecycleRoute::DirectDbus => ImageControlRoute::DirectDbus {
-            dbus: DbusBackend::new(),
+        ImageLifecycleRoute::DirectDbus(dbus) => ImageControlRoute::DirectDbus {
+            dbus,
             fallback_runner: local_cmd,
             fallback_operations: system_operations.clone(),
         },
@@ -81,12 +84,8 @@ struct CatalogImageRuntime(Arc<RuntimeCatalog>);
 
 #[async_trait::async_trait]
 impl ImageRuntime for CatalogImageRuntime {
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>, String> {
-        self.0
-            .machines()
-            .await
-            .map(|query| query.value)
-            .map_err(|error| error.to_string())
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
+        self.0.machines().await.map(|query| query.value)
     }
 }
 
@@ -153,22 +152,22 @@ impl ImageControl for RoutedImageControl {
                 fallback_runner,
                 ..
             } => match dbus.remove_image_outcome(image).await {
-                outcome if direct_remove_may_fallback(&outcome) => {
+                outcome if direct_remove_may_fallback(&outcome) => map_cli_image_remove(
                     crate::adapters::system_operation::execute_cli_image_remove_with_runner(
                         image.clone(),
                         fallback_runner.as_ref(),
                     )
-                    .await
-                }
+                    .await,
+                ),
                 outcome => outcome,
             },
-            ImageControlRoute::LocalCli { runner, .. } => {
+            ImageControlRoute::LocalCli { runner, .. } => map_cli_image_remove(
                 crate::adapters::system_operation::execute_cli_image_remove_with_runner(
                     image.clone(),
                     runner.as_ref(),
                 )
-                .await
-            }
+                .await,
+            ),
             ImageControlRoute::Daemon {
                 daemon, transport, ..
             } => {
@@ -204,21 +203,28 @@ impl ImageControl for RoutedImageControl {
     }
 }
 
+fn map_cli_image_remove(result: Result<(), SystemOperationError>) -> ImageControlOutcome {
+    match result {
+        Ok(()) => ImageControlOutcome::Removed,
+        Err(error) => map_system_operation_image_error(error),
+    }
+}
+
 async fn disable_unit_via_daemon(
     daemon: &ElevatedDaemon,
     machine: &MachineName,
-) -> crate::nspawn::errors::Result<()> {
+) -> crate::adapters::error::Result<()> {
     let outcome = daemon
-        .machine_control(MachineControlRequest {
+        .nspawn_unit_control(NspawnUnitControlRequest {
             machine: machine.clone(),
-            action: MachineAction::Disable,
+            action: NspawnUnitAction::Disable,
             transport: MachineControlTransport::Dbus,
         })
         .await
-        .map_err(|error| crate::nspawn::errors::NspawnError::Runtime(error.to_string()))?;
+        .map_err(|error| crate::adapters::error::NspawnError::Runtime(error.to_string()))?;
     match outcome {
         MachineControlOutcome::Succeeded => Ok(()),
-        other => Err(crate::nspawn::errors::NspawnError::Runtime(format!(
+        other => Err(crate::adapters::error::NspawnError::Runtime(format!(
             "disable unit was not completed: {other:?}"
         ))),
     }

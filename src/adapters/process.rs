@@ -1,6 +1,7 @@
 //! Command builder helpers.
 
 use std::future::Future;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
@@ -141,12 +142,70 @@ pub(crate) fn signal_process_group(pid: u32, signal: i32) -> std::io::Result<()>
     }
 }
 
+/// Return the most useful diagnostic emitted by a completed command.
+///
+/// Most systemd client errors are written to stderr, but a few status-style
+/// commands communicate failure state through stdout instead. Keep stderr as
+/// the authoritative stream when it is present, then retain the other stream
+/// and finally the exit status rather than returning an empty error message.
+pub(crate) fn command_diagnostic(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !stderr.is_empty() {
+        return stderr;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        return stdout;
+    }
+
+    format!("process exited with {}", output.status)
+}
+
+/// Open a pidfd that pins the kernel identity of `pid`.
+///
+/// The descriptor is useful for liveness checks and parent monitoring. It does
+/// not make a later `kill(-pid, ...)` process-group operation atomic; callers
+/// must keep that residual race explicit in their ownership policy.
+pub(crate) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "process PID is out of range",
+        )
+    })?;
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
+    let flags = unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(pidfd)
+}
+
 /// Trait abstracting over command execution.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait CommandRunner: Send + Sync {
     /// Run a command, capturing stdout/stderr after it exits.
     async fn run(&self, program: &str, args: Vec<String>) -> std::io::Result<Output>;
+
+    /// Run a short host query with an explicit completion deadline.
+    ///
+    /// Implementations must terminate the child process group when the
+    /// deadline expires and wait for the child before returning `TimedOut`.
+    async fn run_bounded(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Output>;
 
     /// Spawn a command for streaming.  Stderr merged into stdout.
     /// Use [`SpawnedProcess::wait`] for the exit status.
@@ -163,10 +222,19 @@ impl CommandRunner for DefaultCommandRunner {
         new_command(program).args(&args_refs).output().await
     }
 
+    async fn run_bounded(
+        &self,
+        program: &str,
+        args: Vec<String>,
+        timeout: std::time::Duration,
+    ) -> std::io::Result<Output> {
+        run_bounded_command(program, args, timeout).await
+    }
+
     async fn spawn(&self, program: &str, args: Vec<String>) -> std::io::Result<SpawnedProcess> {
         let mut argv = vec![program.to_string()];
         argv.extend(args);
-        let mut command = tokio::process::Command::new("sh");
+        let mut command = new_command("sh");
         command
             .arg("-c")
             .arg("exec \"$@\" 2>&1")
@@ -176,7 +244,6 @@ impl CommandRunner for DefaultCommandRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        install_parent_death_signal(command.as_std_mut());
         command.as_std_mut().process_group(0);
         let mut child = command.spawn()?;
         let pid = child.id().expect("spawned command has pid");
@@ -187,6 +254,49 @@ impl CommandRunner for DefaultCommandRunner {
             move |signal| Box::pin(async move { signal_process_group(pid, signal) }),
         ))
     }
+}
+
+const BOUNDED_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn run_bounded_command(
+    program: &str,
+    args: Vec<String>,
+    timeout: std::time::Duration,
+) -> std::io::Result<Output> {
+    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut command = new_command(program);
+    command
+        .args(&args_refs)
+        .kill_on_drop(true)
+        .as_std_mut()
+        .process_group(0);
+    let child = command.spawn()?;
+    let pid = child.id().ok_or_else(|| {
+        std::io::Error::other(format!("bounded command {program} has no process id"))
+    })?;
+    let mut wait = Box::pin(child.wait_with_output());
+
+    if let Ok(result) = tokio::time::timeout(timeout, &mut wait).await {
+        return result;
+    }
+
+    log::warn!(
+        "bounded command {program} exceeded its {}ms deadline; terminating process group {pid}",
+        timeout.as_millis()
+    );
+    let _ = signal_process_group(pid, libc::SIGTERM);
+    if tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait)
+        .await
+        .is_err()
+    {
+        let _ = signal_process_group(pid, libc::SIGKILL);
+        let _ = tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait).await;
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("command {program} exceeded its completion deadline"),
+    ))
 }
 
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set
@@ -302,6 +412,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_commands_use_the_stable_locale() {
+        use tokio::io::AsyncReadExt;
+
+        let mut spawned = DefaultCommandRunner
+            .spawn("sh", vec!["-c".into(), "printf '%s' \"$LC_ALL\"".into()])
+            .await
+            .unwrap();
+        let mut output = String::new();
+        spawned.stdout.read_to_string(&mut output).await.unwrap();
+        let status = spawned.wait().await.unwrap();
+
+        assert!(status.success());
+        assert_eq!(output, "C");
+    }
+
+    #[tokio::test]
     async fn cancellable_process_waits_for_its_process_group_to_exit() {
         let spawned = DefaultCommandRunner
             .spawn("sh", vec!["-c".into(), "echo ready; sleep 30".into()])
@@ -337,5 +463,58 @@ mod tests {
         let status = spawned.terminate_and_wait().await.unwrap();
 
         assert!(status.success());
+    }
+
+    #[tokio::test]
+    async fn bounded_commands_return_output_before_the_deadline() {
+        let output = DefaultCommandRunner
+            .run_bounded(
+                "sh",
+                vec!["-c".into(), "printf ready".into()],
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ready");
+    }
+
+    #[tokio::test]
+    async fn bounded_commands_terminate_their_process_group_on_timeout() {
+        let error = DefaultCommandRunner
+            .run_bounded(
+                "sh",
+                vec!["-c".into(), "sleep 30".into()],
+                std::time::Duration::from_millis(25),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn command_diagnostic_prefers_stderr_then_stdout_then_status() {
+        let stderr = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: b"stdout diagnostic".to_vec(),
+            stderr: b"stderr diagnostic\n".to_vec(),
+        };
+        assert_eq!(command_diagnostic(&stderr), "stderr diagnostic");
+
+        let stdout = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: b"stdout diagnostic\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        assert_eq!(command_diagnostic(&stdout), "stdout diagnostic");
+
+        let status = Output {
+            status: ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        assert!(command_diagnostic(&status).contains("exit status"));
     }
 }

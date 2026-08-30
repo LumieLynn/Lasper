@@ -2,15 +2,17 @@
 
 use async_trait::async_trait;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, stream_deploy_command, ApplyReport, BootstrapStore, DeployLogEvent, Deployer,
     DeploymentCancellation,
 };
 use crate::adapters::rootfs::RootfsTarget;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BootstrapSpec, ContainerConfig, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
+use crate::application::provisioning::MachineProvisioningConfig;
+use crate::domain::bootstrap::{
+    BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
+    Dnf5RepositorySource, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
 };
 
 pub struct BootstrapDeployer {
@@ -23,13 +25,15 @@ impl Deployer for BootstrapDeployer {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &ContainerConfig,
+        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
         _report: &mut ApplyReport,
     ) -> Result<()> {
-        self.spec.validate()?;
+        self.spec
+            .validate()
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
         if signature_verification_disabled(&self.spec) {
             send_deploy_log(
                 &logs,
@@ -54,24 +58,16 @@ impl Deployer for BootstrapDeployer {
         }
         match &self.spec {
             BootstrapSpec::Pacstrap(spec)
-                if matches!(spec.cache, crate::nspawn::models::PacstrapCacheMode::Host)
-                    || matches!(
-                        spec.policy.keyring,
-                        crate::nspawn::models::PacmanKeyringMode::CopyHost
-                    )
-                    || matches!(
-                        spec.policy.mirrorlist,
-                        crate::nspawn::models::PacmanMirrorlistMode::CopyHost
-                    ) =>
+                if matches!(spec.cache, PacstrapCacheMode::Host)
+                    || matches!(spec.policy.keyring, PacmanKeyringMode::CopyHost)
+                    || matches!(spec.policy.mirrorlist, PacmanMirrorlistMode::CopyHost) =>
             {
                 log::info!(
                             "[AUDIT] [Container: {}] [Step: Bootstrap] pacstrap uses provider-default host cache/keyring/mirrorlist behavior",
                             name
                         );
             }
-            BootstrapSpec::Dnf5(spec)
-                if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Host =>
-            {
+            BootstrapSpec::Dnf5(spec) if spec.repository == Dnf5RepositorySource::Host => {
                 send_deploy_log(
                     &logs,
                     "DNF5 is using the host repository configuration for this bootstrap.",

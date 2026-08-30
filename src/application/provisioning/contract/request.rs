@@ -1,9 +1,13 @@
+use crate::domain::bootstrap::BootstrapSpec;
+use crate::domain::machine::{GuestHostname, MachineName};
 use crate::domain::nvidia::NvidiaPassthroughProfile;
+use crate::domain::provisioning::OciNetworkMode;
+use crate::domain::source::ArtifactSpec;
+use crate::domain::storage::DiskImageConfig;
 use crate::domain::wayland::WaylandGrantIntent;
-use crate::nspawn::models::{
-    ArtifactSpec, BootstrapSpec, ContainerConfig, DiskImageConfig, OciNetworkMode,
-};
 use serde::{Deserialize, Serialize};
+
+use super::config::MachineProvisioningConfig;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeploymentSource {
@@ -43,7 +47,7 @@ pub enum DeploymentStorage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentRequest {
-    pub config: ContainerConfig,
+    pub config: MachineProvisioningConfig,
     pub source: DeploymentSource,
     pub storage: DeploymentStorage,
     pub nvidia_profile: Option<NvidiaPassthroughProfile>,
@@ -53,10 +57,12 @@ pub struct DeploymentRequest {
 
 impl DeploymentRequest {
     pub(crate) fn validate(&self) -> Result<(), super::job::DeploymentError> {
-        crate::nspawn::models::NspawnConfigSpec::try_from(&self.config)
+        let machine = MachineName::new(self.config.name.clone())
+            .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
+        GuestHostname::resolve(&self.config.guest_hostname, &machine)
             .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
         if let DeploymentSource::Copy { source_name } = &self.source {
-            crate::nspawn::models::ImageName::new(source_name).map_err(|error| {
+            crate::domain::runtime::ImageName::new(source_name).map_err(|error| {
                 super::job::DeploymentError::rejected(format!("Invalid clone source: {error}"))
             })?;
         }

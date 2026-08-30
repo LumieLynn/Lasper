@@ -16,18 +16,24 @@ pub(crate) async fn shutdown_daemon_resources(server_state: &DaemonServerState) 
         );
     }
 
-    let pids = server_state.pids();
-    for pid in &pids {
-        if let Err(error) = crate::adapters::process::signal_process_group(*pid, libc::SIGTERM) {
-            log::warn!("Daemon: failed to terminate child process group {pid}: {error}");
+    let processes = server_state.session_processes();
+    for process in &processes {
+        if let Err(error) = server_state.signal_session_process(process, libc::SIGTERM) {
+            log::warn!(
+                "Daemon: failed to terminate child process group {}: {error}",
+                process.pid()
+            );
         }
     }
 
     tokio::time::sleep(DAEMON_SHUTDOWN_GRACE).await;
 
-    for pid in server_state.pids() {
-        if let Err(error) = crate::adapters::process::signal_process_group(pid, libc::SIGKILL) {
-            log::warn!("Daemon: failed to kill child process group {pid}: {error}");
+    for process in server_state.session_processes() {
+        if let Err(error) = server_state.signal_session_process(&process, libc::SIGKILL) {
+            log::warn!(
+                "Daemon: failed to kill child process group {}: {error}",
+                process.pid()
+            );
         }
     }
 }

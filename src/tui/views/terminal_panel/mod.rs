@@ -1,4 +1,5 @@
 pub mod manager;
+use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 pub use manager::{TerminalInputStatus, TerminalKeyOutcome, TerminalManager, TextSelection};
 use ratatui::{
     layout::{Alignment, Rect},
@@ -7,6 +8,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
+use unicode_width::UnicodeWidthStr;
 
 pub struct TerminalPanel;
 
@@ -19,18 +21,26 @@ impl TerminalPanel {
         is_focused: bool,
         resize_mode: bool,
     ) {
-        let sessions = &mut manager.sessions;
-        let active_idx = manager.active_idx;
-
-        if sessions.is_empty() {
+        if manager.sessions.is_empty() {
+            manager.tab_hitboxes.clear();
+            manager.term_area = Rect::default();
             return;
         }
+        let active_idx = manager.active_idx;
+
+        let tab_widths = manager
+            .sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| (index, session.machine_name.width().saturating_add(2)))
+            .collect::<Vec<_>>();
+        manager.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
 
         // Collect tab labels and session metadata before any mutable borrow.
         let t = crate::tui::theme::theme();
         let mut tab_spans = Vec::new();
-        let session_count = sessions.len();
-        for (i, s) in sessions.iter().enumerate() {
+        let session_count = manager.sessions.len();
+        for (i, s) in manager.sessions.iter().enumerate() {
             let mut style = Style::default().fg(t.tab_inactive);
             if i == active_idx {
                 style = style
@@ -41,14 +51,14 @@ impl TerminalPanel {
                     })
                     .add_modifier(Modifier::BOLD);
             }
-            tab_spans.push(Span::styled(format!(" {} ", s.container_name), style));
+            tab_spans.push(Span::styled(format!(" {} ", s.machine_name), style));
             if i < session_count - 1 {
                 tab_spans.push(Span::raw("-"));
             }
         }
         let tabs_line = Line::from(tab_spans);
 
-        let session = &mut sessions[active_idx];
+        let session = &mut manager.sessions[active_idx];
         // Clone the Arc before locking so the guard does not hold an
         // immutable borrow of the whole session while resize state changes.
         let terminal = session.terminal.clone();

@@ -1,16 +1,20 @@
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
+use crate::adapters::rootfs::hostname::configure_hostname_at;
 use crate::adapters::rootfs::network::configure_network_at;
 use crate::adapters::rootfs::nvidia::{
     cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
 };
 use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
 use crate::adapters::rootfs::{users, wayland};
-use crate::domain::secret::{serde_secret, SecretString};
+use crate::domain::machine::GuestHostname;
+use crate::domain::machine::MachineName;
+use crate::domain::provisioning::CreateUser;
+use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{validate_chpasswd_secret, CreateUser, MachineName};
+use crate::ipc::protocol::rootfs as rootfs_wire;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::os::unix::fs::PermissionsExt;
@@ -140,6 +144,21 @@ impl RootfsStore {
             }))
             .await?;
         Ok(result.warnings)
+    }
+
+    pub(crate) async fn configure_hostname(
+        &self,
+        target: &RootfsTarget,
+        hostname: &GuestHostname,
+    ) -> Result<()> {
+        self.execute(RootfsOperation::ConfigureHostname(
+            ConfigureHostnameRequest {
+                target: target.clone(),
+                hostname: hostname.clone(),
+            },
+        ))
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn set_root_password(
@@ -302,13 +321,13 @@ impl RootfsExecutor for ElevatedRootfsExecutor {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "operation", content = "params", rename_all = "snake_case")]
+#[derive(Debug)]
 pub(crate) enum RootfsOperation {
     ProbeOsRelease(TargetRequest),
     ProbeNspawnCommandSupport(TargetRequest),
     MountManagedRaw(TargetRequest),
     UnmountManagedRaw(TargetRequest),
+    ConfigureHostname(ConfigureHostnameRequest),
     ConfigureNetwork(TargetRequest),
     SetRootPassword(SetRootPasswordRequest),
     CreateUser(CreateUserRequest),
@@ -318,35 +337,34 @@ pub(crate) enum RootfsOperation {
     CleanupNvidia(CleanupNvidiaRequest),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct TargetRequest {
     target: RootfsTarget,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
+pub(crate) struct ConfigureHostnameRequest {
+    target: RootfsTarget,
+    hostname: GuestHostname,
+}
+
+#[derive(Debug)]
 pub(crate) struct SetRootPasswordRequest {
     target: RootfsTarget,
-    #[serde(with = "serde_secret")]
     password: SecretString,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 pub(crate) struct CreateUserRequest {
     target: RootfsTarget,
     username: String,
-    #[serde(default)]
     uid: Option<u32>,
-    #[serde(with = "serde_secret::optional")]
     password: Option<SecretString>,
     sudoer: bool,
     shell: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConfigureWaylandRequest {
     target: RootfsTarget,
     identity: ContainerUserIdentity,
@@ -354,15 +372,13 @@ pub(crate) struct ConfigureWaylandRequest {
     default_display: crate::domain::wayland::WaylandDisplay,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ResolveUserIdentityRequest {
     target: RootfsTarget,
     username: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ConfigureNvidiaRequest {
     target: RootfsTarget,
     ld_cache_folders: Vec<String>,
@@ -370,21 +386,240 @@ pub(crate) struct ConfigureNvidiaRequest {
     write_environment: bool,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct CleanupNvidiaRequest {
     target: RootfsTarget,
     paths: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RootfsResult {
     present: Option<bool>,
-    #[serde(default)]
     warnings: Vec<String>,
-    #[serde(default)]
     identity: Option<ContainerUserIdentity>,
+}
+
+impl TryFrom<rootfs_wire::RootfsOperation> for RootfsOperation {
+    type Error = NspawnError;
+
+    fn try_from(operation: rootfs_wire::RootfsOperation) -> Result<Self> {
+        use rootfs_wire::RootfsOperation as Wire;
+
+        Ok(match operation {
+            Wire::ProbeOsRelease(request) => Self::ProbeOsRelease(TargetRequest {
+                target: target_from_wire(request.target)?,
+            }),
+            Wire::ProbeNspawnCommandSupport(request) => {
+                Self::ProbeNspawnCommandSupport(TargetRequest {
+                    target: target_from_wire(request.target)?,
+                })
+            }
+            Wire::MountManagedRaw(request) => Self::MountManagedRaw(TargetRequest {
+                target: target_from_wire(request.target)?,
+            }),
+            Wire::UnmountManagedRaw(request) => Self::UnmountManagedRaw(TargetRequest {
+                target: target_from_wire(request.target)?,
+            }),
+            Wire::ConfigureHostname(request) => Self::ConfigureHostname(ConfigureHostnameRequest {
+                target: target_from_wire(request.target)?,
+                hostname: GuestHostname::try_from(request.hostname)
+                    .map_err(|error| NspawnError::Validation(error.to_string()))?,
+            }),
+            Wire::ConfigureNetwork(request) => Self::ConfigureNetwork(TargetRequest {
+                target: target_from_wire(request.target)?,
+            }),
+            Wire::SetRootPassword(request) => Self::SetRootPassword(SetRootPasswordRequest {
+                target: target_from_wire(request.target)?,
+                password: request.password,
+            }),
+            Wire::CreateUser(request) => Self::CreateUser(CreateUserRequest {
+                target: target_from_wire(request.target)?,
+                username: request.username,
+                uid: request.uid,
+                password: request.password,
+                sudoer: request.sudoer,
+                shell: request.shell,
+            }),
+            Wire::ResolveUserIdentity(request) => {
+                Self::ResolveUserIdentity(ResolveUserIdentityRequest {
+                    target: target_from_wire(request.target)?,
+                    username: request.username,
+                })
+            }
+            Wire::ConfigureWayland(request) => Self::ConfigureWayland(ConfigureWaylandRequest {
+                target: target_from_wire(request.target)?,
+                identity: request.identity,
+                shell: request.shell,
+                default_display: request.default_display,
+            }),
+            Wire::ConfigureNvidia(request) => Self::ConfigureNvidia(ConfigureNvidiaRequest {
+                target: target_from_wire(request.target)?,
+                ld_cache_folders: request.ld_cache_folders,
+                environment: request.environment,
+                write_environment: request.write_environment,
+            }),
+            Wire::CleanupNvidia(request) => Self::CleanupNvidia(CleanupNvidiaRequest {
+                target: target_from_wire(request.target)?,
+                paths: request.paths,
+            }),
+        })
+    }
+}
+
+impl From<RootfsOperation> for rootfs_wire::RootfsOperation {
+    fn from(operation: RootfsOperation) -> Self {
+        use rootfs_wire::RootfsOperation as Wire;
+
+        match operation {
+            RootfsOperation::ProbeOsRelease(request) => Wire::ProbeOsRelease(request.into()),
+            RootfsOperation::ProbeNspawnCommandSupport(request) => {
+                Wire::ProbeNspawnCommandSupport(request.into())
+            }
+            RootfsOperation::MountManagedRaw(request) => Wire::MountManagedRaw(request.into()),
+            RootfsOperation::UnmountManagedRaw(request) => Wire::UnmountManagedRaw(request.into()),
+            RootfsOperation::ConfigureHostname(request) => Wire::ConfigureHostname(request.into()),
+            RootfsOperation::ConfigureNetwork(request) => Wire::ConfigureNetwork(request.into()),
+            RootfsOperation::SetRootPassword(request) => Wire::SetRootPassword(request.into()),
+            RootfsOperation::CreateUser(request) => Wire::CreateUser(request.into()),
+            RootfsOperation::ResolveUserIdentity(request) => {
+                Wire::ResolveUserIdentity(request.into())
+            }
+            RootfsOperation::ConfigureWayland(request) => Wire::ConfigureWayland(request.into()),
+            RootfsOperation::ConfigureNvidia(request) => Wire::ConfigureNvidia(request.into()),
+            RootfsOperation::CleanupNvidia(request) => Wire::CleanupNvidia(request.into()),
+        }
+    }
+}
+
+impl From<RootfsResult> for rootfs_wire::RootfsResult {
+    fn from(result: RootfsResult) -> Self {
+        Self {
+            present: result.present,
+            warnings: result.warnings,
+            identity: result.identity,
+        }
+    }
+}
+
+impl From<rootfs_wire::RootfsResult> for RootfsResult {
+    fn from(result: rootfs_wire::RootfsResult) -> Self {
+        Self {
+            present: result.present,
+            warnings: result.warnings,
+            identity: result.identity,
+        }
+    }
+}
+
+fn target_from_wire(target: rootfs_wire::RootfsTarget) -> Result<RootfsTarget> {
+    Ok(match target {
+        rootfs_wire::RootfsTarget::Machine { machine } => RootfsTarget::Machine {
+            machine: parse_machine_name(&machine)?,
+        },
+        rootfs_wire::RootfsTarget::ImageMount { machine } => RootfsTarget::ImageMount {
+            machine: parse_machine_name(&machine)?,
+        },
+        rootfs_wire::RootfsTarget::RawMount { machine, mount_id } => RootfsTarget::RawMount {
+            machine: parse_machine_name(&machine)?,
+            mount_id,
+        },
+    })
+}
+
+impl From<TargetRequest> for rootfs_wire::TargetRequest {
+    fn from(request: TargetRequest) -> Self {
+        Self {
+            target: request.target.into(),
+        }
+    }
+}
+
+impl From<RootfsTarget> for rootfs_wire::RootfsTarget {
+    fn from(target: RootfsTarget) -> Self {
+        match target {
+            RootfsTarget::Machine { machine } => Self::Machine {
+                machine: machine.into_string(),
+            },
+            RootfsTarget::ImageMount { machine } => Self::ImageMount {
+                machine: machine.into_string(),
+            },
+            RootfsTarget::RawMount { machine, mount_id } => Self::RawMount {
+                machine: machine.into_string(),
+                mount_id,
+            },
+        }
+    }
+}
+
+impl From<ConfigureHostnameRequest> for rootfs_wire::ConfigureHostnameRequest {
+    fn from(request: ConfigureHostnameRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            hostname: request.hostname.into_string(),
+        }
+    }
+}
+
+impl From<SetRootPasswordRequest> for rootfs_wire::SetRootPasswordRequest {
+    fn from(request: SetRootPasswordRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            password: request.password,
+        }
+    }
+}
+
+impl From<CreateUserRequest> for rootfs_wire::CreateUserRequest {
+    fn from(request: CreateUserRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            username: request.username,
+            uid: request.uid,
+            password: request.password,
+            sudoer: request.sudoer,
+            shell: request.shell,
+        }
+    }
+}
+
+impl From<ConfigureWaylandRequest> for rootfs_wire::ConfigureWaylandRequest {
+    fn from(request: ConfigureWaylandRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            identity: request.identity,
+            shell: request.shell,
+            default_display: request.default_display,
+        }
+    }
+}
+
+impl From<ResolveUserIdentityRequest> for rootfs_wire::ResolveUserIdentityRequest {
+    fn from(request: ResolveUserIdentityRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            username: request.username,
+        }
+    }
+}
+
+impl From<ConfigureNvidiaRequest> for rootfs_wire::ConfigureNvidiaRequest {
+    fn from(request: ConfigureNvidiaRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            ld_cache_folders: request.ld_cache_folders,
+            environment: request.environment,
+            write_environment: request.write_environment,
+        }
+    }
+}
+
+impl From<CleanupNvidiaRequest> for rootfs_wire::CleanupNvidiaRequest {
+    fn from(request: CleanupNvidiaRequest) -> Self {
+        Self {
+            target: request.target.into(),
+            paths: request.paths,
+        }
+    }
 }
 
 pub(crate) async fn execute_rootfs_operation(operation: RootfsOperation) -> Result<RootfsResult> {
@@ -443,6 +678,12 @@ async fn execute_rootfs_operation_with_runners(
             unmount_managed_raw_at(&machine, &mount_id, runner).await?;
             Ok(RootfsResult::default())
         }
+        RootfsOperation::ConfigureHostname(request) => {
+            let path = request.target.path()?;
+            validate_required_rootfs_directory(&path).await?;
+            configure_hostname_at(&path, &request.hostname, runner).await?;
+            Ok(RootfsResult::default())
+        }
         RootfsOperation::ConfigureNetwork(request) => {
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
@@ -453,7 +694,8 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::SetRootPassword(request) => {
-            validate_chpasswd_secret("root password", request.password.expose_secret())?;
+            validate_chpasswd_secret(request.password.expose_secret())
+                .map_err(|error| NspawnError::Validation(error.message("root password")))?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
             let warnings =
@@ -471,9 +713,11 @@ async fn execute_rootfs_operation_with_runners(
                 sudoer: request.sudoer,
                 shell: request.shell,
             };
-            user.validate()?;
+            user.validate()
+                .map_err(|error| NspawnError::Validation(error.to_string()))?;
             if let Some(password) = &request.password {
-                validate_chpasswd_secret("user password", password.expose_secret())?;
+                validate_chpasswd_secret(password.expose_secret())
+                    .map_err(|error| NspawnError::Validation(error.message("user password")))?;
             }
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
@@ -490,7 +734,8 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::ResolveUserIdentity(request) => {
-            crate::nspawn::models::validate_login_username(&request.username)?;
+            crate::domain::provisioning::validate_login_username(&request.username)
+                .map_err(|error| NspawnError::Validation(error.to_string()))?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
             let identity =
@@ -842,7 +1087,7 @@ mod tests {
             "operation":"probe_os_release",
             "params":{"target":{"kind":"machine","machine":"../escape"}}
         }"#;
-        assert!(serde_json::from_str::<RootfsOperation>(invalid_machine).is_err());
+        assert!(decode_wire_operation(invalid_machine).is_err());
 
         let invalid_mount = RootfsTarget::RawMount {
             machine: MachineName::new("test").unwrap(),
@@ -854,7 +1099,7 @@ mod tests {
             "operation":"probe_os_release",
             "params":{"target":{"kind":"machine","machine":"test","path":"/tmp"}}
         }"#;
-        assert!(serde_json::from_str::<RootfsOperation>(unknown_field).is_err());
+        assert!(decode_wire_operation(unknown_field).is_err());
     }
 
     #[test]
@@ -870,7 +1115,7 @@ mod tests {
                 "program":"sh"
             }
         }"#;
-        assert!(serde_json::from_str::<RootfsOperation>(arbitrary_program).is_err());
+        assert!(decode_wire_operation(arbitrary_program).is_err());
 
         let arbitrary_path = r#"{
             "operation":"configure_wayland",
@@ -881,7 +1126,7 @@ mod tests {
                 "path":"/etc/shadow"
             }
         }"#;
-        assert!(serde_json::from_str::<RootfsOperation>(arbitrary_path).is_err());
+        assert!(decode_wire_operation(arbitrary_path).is_err());
 
         let x11_display = r#"{
             "operation":"configure_wayland",
@@ -892,7 +1137,22 @@ mod tests {
                 "display":":0"
             }
         }"#;
-        assert!(serde_json::from_str::<RootfsOperation>(x11_display).is_err());
+        assert!(decode_wire_operation(x11_display).is_err());
+
+        let invalid_hostname = r#"{
+            "operation":"configure_hostname",
+            "params":{
+                "target":{"kind":"machine","machine":"test"},
+                "hostname":"guest_name"
+            }
+        }"#;
+        assert!(decode_wire_operation(invalid_hostname).is_err());
+    }
+
+    fn decode_wire_operation(value: &str) -> std::result::Result<RootfsOperation, String> {
+        let operation: rootfs_wire::RootfsOperation =
+            serde_json::from_str(value).map_err(|error| error.to_string())?;
+        RootfsOperation::try_from(operation).map_err(|error| error.to_string())
     }
 
     #[tokio::test]

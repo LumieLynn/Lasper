@@ -5,11 +5,11 @@ use crate::application::provisioning::{
     DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentRequestId,
     DeploymentSecrets, DeploymentSource, DeploymentStatus,
 };
-use crate::daemon::protocol::deployment::{
+use crate::ipc::protocol::deployment::{
     DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame, DeploymentSubmissionStatus,
     SubmitDeploymentParams, MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
 };
-use crate::daemon::server::transport::read_bounded_line;
+use crate::ipc::transport::read_bounded_line;
 use async_trait::async_trait;
 use std::os::fd::RawFd;
 use std::sync::Arc;

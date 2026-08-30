@@ -1,6 +1,7 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::storage::{parse_disk_image_size, DiskImageFilesystem, DiskImagePartition};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -231,7 +232,9 @@ impl ManagedImageSize {
     }
 
     fn parse(value: &str) -> Result<Self> {
-        Self::new(crate::nspawn::models::config::parse_disk_image_size(value)?)
+        let bytes = parse_disk_image_size(value)
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
+        Self::new(bytes)
     }
 }
 

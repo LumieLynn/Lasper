@@ -1,8 +1,8 @@
 use super::discovery::get_nvidia_state;
 use super::state::{calculate_death_list, calculate_removed_binds, NvidiaState};
 use crate::adapters::config::nspawn_file::NspawnConfig;
+use crate::adapters::error::Result;
 use crate::domain::nvidia::NvidiaPassthroughMode;
-use crate::nspawn::errors::Result;
 
 macro_rules! log_step {
     ($name:expr, $step:expr, $msg:expr) => {
@@ -128,7 +128,7 @@ pub async fn ensure_gpu_passthrough(
         Some(c) => c,
         None => return Ok(()),
     };
-    if !config.is_gpu_enabled() {
+    if !config.is_gpu_enabled()? {
         return Ok(());
     }
 

@@ -265,11 +265,11 @@ pub(crate) async fn run_deployment_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentEvent, DeploymentJobContext, DeploymentSecrets, DeploymentSource,
         DeploymentStorage,
     };
-    use crate::nspawn::models::ContainerConfig;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -355,7 +355,7 @@ mod tests {
     fn submission() -> DeploymentSubmission {
         DeploymentSubmission::new(
             DeploymentRequest {
-                config: ContainerConfig {
+                config: MachineProvisioningConfig {
                     name: "test".into(),
                     ..Default::default()
                 },
@@ -517,7 +517,7 @@ mod tests {
         );
         let handle = service.start(submission()).unwrap();
         let target = crate::domain::machine::MachineName::new("test").unwrap();
-        let source = crate::nspawn::models::ImageName::new("base").unwrap();
+        let source = crate::domain::runtime::ImageName::new("base").unwrap();
 
         assert!(registry
             .reserve([crate::application::ResourceClaim::exclusive(

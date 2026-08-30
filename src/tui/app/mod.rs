@@ -17,15 +17,17 @@ use crate::application::{
     ResourceInspectionService, RuntimeCatalog, RuntimeUpdate,
 };
 use crate::composition::ApplicationServices;
-use crate::nspawn::models::{
-    ContainerEntry, ContainerMetrics, CpuRepresentation, ImageEntry, ImageName, RuntimeSnapshot,
-};
+use crate::domain::inspection::MachineProperties;
+#[cfg(test)]
+use crate::domain::inspection::GROUP_SYSTEMD_UNIT;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, RuntimeSnapshot};
 use crate::tui::core::Component;
+use crate::tui::effects::metrics::{CpuRepresentation, MachineMetrics};
 use crate::tui::events::{AppEvent, EventHandler, InputEvent};
-use crate::tui::views::container_list::ContainerListComponent;
 use crate::tui::views::detail_panel::DetailPanel;
 use crate::tui::views::detail_panel::DetailTarget;
 use crate::tui::views::image_list::ImageListComponent;
+use crate::tui::views::machine_list::MachineListComponent;
 use crate::tui::wizard::Wizard;
 use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 use std::io::Stdout;
@@ -99,13 +101,13 @@ pub struct AppUi {
     pub focus: WorkspaceFocus,
     /// Last non-terminal focus, used when closing or hiding the terminal.
     pub prev_focus: WorkspaceFocus,
-    pub container_list: ContainerListComponent,
+    pub machine_list: MachineListComponent,
     pub image_list: ImageListComponent,
     pub detail_panel: DetailPanel,
 
     pub show_wizard: bool,
     pub show_help: bool,
-    pub power_menu: Option<crate::tui::widgets::power_menu::PowerMenu>,
+    pub resource_action_menu: Option<crate::tui::widgets::resource_action_menu::ResourceActionMenu>,
     pub pane_height: u16,
 
     pub wizard: Option<Wizard>,
@@ -121,7 +123,7 @@ pub struct AppUi {
     pending_deployment_preflight: Option<u64>,
 
     pub resize_mode: ResizeMode,
-    pub container_list_pct: u16,
+    pub machine_list_pct: u16,
     pub left_machines_pct: u16,
     pub detail_pct: u16,
 
@@ -139,12 +141,12 @@ impl AppUi {
         Self {
             focus: WorkspaceFocus::Machines,
             prev_focus: WorkspaceFocus::Machines,
-            container_list: ContainerListComponent::new(),
+            machine_list: MachineListComponent::new(),
             image_list: ImageListComponent::new(),
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
-            power_menu: None,
+            resource_action_menu: None,
             pane_height: 10,
             wizard: None,
             status_message: None,
@@ -157,7 +159,7 @@ impl AppUi {
             next_deployment_preflight: 1,
             pending_deployment_preflight: None,
             resize_mode: ResizeMode::Inactive,
-            container_list_pct: 30,
+            machine_list_pct: 30,
             left_machines_pct: 50,
             detail_pct: 45,
             panel_layout: PanelLayout::default(),
@@ -178,8 +180,8 @@ impl AppUi {
             Some(ModalLayer::Help)
         } else if self.show_wizard {
             Some(ModalLayer::Wizard)
-        } else if self.power_menu.is_some() {
-            Some(ModalLayer::PowerMenu)
+        } else if self.resource_action_menu.is_some() {
+            Some(ModalLayer::ResourceActionMenu)
         } else {
             None
         }
@@ -191,17 +193,18 @@ impl AppUi {
 pub struct AppData {
     /// Running systemd-machined instances plus optimistic `Starting` rows.
     /// Persistent images live in `images`.
-    pub entries: Vec<ContainerEntry>,
+    pub entries: Vec<MachineEntry>,
     /// Normally visible images. Hidden dot-prefixed images are kept separate.
     pub images: Vec<ImageEntry>,
     pub internal_images: Vec<ImageEntry>,
     pub image_selected: usize,
     pub internal_image_selected: usize,
     pub selected: usize,
-    pub properties: Result<crate::nspawn::models::MachineProperties, String>,
+    pub properties: Result<MachineProperties, String>,
     pub log_manager: crate::tui::views::detail_panel::log_manager::LogManager,
     pub config_content: Option<String>,
     pub config_path: Option<std::path::PathBuf>,
+    pub config_error: Option<String>,
     pub detail_target: DetailTarget,
     pub unit_name: Option<String>,
     pub unit_drop_ins: Vec<crate::application::inspection::SystemdDropInInspection>,
@@ -214,8 +217,7 @@ pub struct AppData {
     pub provisioning_preparation: std::sync::Arc<ProvisioningPreparationService>,
     pub resource_inspection: std::sync::Arc<ResourceInspectionService>,
     pub host_operations: HostOperationTracker,
-    pub action_cooldown: Option<Instant>,
-    pub metrics: HashMap<String, ContainerMetrics>,
+    pub metrics: HashMap<String, MachineMetrics>,
     pub cpu_cores: usize,
     pub cpu_representation: CpuRepresentation,
 
@@ -269,12 +271,13 @@ impl App {
                 image_selected: 0,
                 internal_image_selected: 0,
                 selected: 0,
-                properties: Ok(crate::nspawn::models::MachineProperties::default()),
+                properties: Ok(MachineProperties::default()),
                 log_manager: crate::tui::views::detail_panel::log_manager::LogManager::new(
                     log_buffer_lines,
                 ),
                 config_content: None,
                 config_path: None,
+                config_error: None,
                 detail_target: DetailTarget::Empty,
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
@@ -287,7 +290,6 @@ impl App {
                 provisioning_preparation,
                 resource_inspection,
                 host_operations,
-                action_cooldown: None,
                 metrics: HashMap::new(),
                 cpu_cores: std::thread::available_parallelism()
                     .map(|n| n.get())
@@ -401,7 +403,7 @@ impl App {
                 .terminal
                 .active_session()
                 .and_then(|session| {
-                    let name = session.container_name.as_str();
+                    let name = session.machine_name.as_str();
                     self.data
                         .entries
                         .iter()
@@ -418,13 +420,14 @@ impl App {
                 .ensure_pane_for_target(&self.data.detail_target);
             // Background detail reads must never leave the previous target's
             // properties visible while the new request is in flight.
-            self.data.properties = Ok(crate::nspawn::models::MachineProperties::default());
+            self.data.properties = Ok(MachineProperties::default());
             self.data.properties_dirty = true;
             self.data.details_dirty = true;
             self.data.config_dirty = true;
             self.data.unit_dirty = true;
             self.data.config_content = None;
             self.data.config_path = None;
+            self.data.config_error = None;
             self.data.unit_name = None;
             self.data.unit_drop_ins.clear();
         }
@@ -457,7 +460,7 @@ impl App {
     }
 
     /// Update entries and selection state from a background refresh.
-    fn sync_entries(&mut self, entries: Vec<ContainerEntry>) {
+    fn sync_entries(&mut self, entries: Vec<MachineEntry>) {
         let prev_name = self
             .data
             .entries
@@ -485,11 +488,7 @@ impl App {
     /// Apply the independent machine/image snapshot returned by the backend.
     fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
         let RuntimeSnapshot { machines, images } = snapshot;
-        let running: Vec<_> = machines
-            .into_iter()
-            .filter(|e| e.state.is_running())
-            .collect();
-        self.sync_entries(running);
+        self.sync_entries(machines);
 
         let previous_name = self
             .data
@@ -563,6 +562,7 @@ impl App {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
+            AppEvent::Resize => {}
             AppEvent::Tick => self.tick().await,
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
@@ -633,7 +633,7 @@ impl App {
                 self.set_status(msg, level);
                 self.refresh();
             }
-            AppEvent::MachineActionFinished(outcome) => {
+            AppEvent::MachineLifecycleFinished(outcome) => {
                 let (message, level) = machine_outcome_status(outcome);
                 self.refresh();
                 self.set_status(message, level);
@@ -796,7 +796,7 @@ impl App {
     }
 
     async fn handle_input_event(&mut self, input: InputEvent) {
-        if input.is_stale() {
+        if input.is_stale() && !matches!(&input.event, AppEvent::Resize) {
             log::debug!(
                 "[TUI] dropping stale foreground {} input (age={} ms)",
                 input.event.label(),
@@ -881,7 +881,7 @@ fn machine_outcome_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerEntry, ContainerState, ImageEntry};
+    use crate::domain::runtime::{ImageEntry, MachineEntry, MachineState};
     use std::time::Duration;
 
     #[test]
@@ -895,12 +895,13 @@ mod tests {
         assert!(!production.contains("crate::adapters"));
     }
 
-    fn make_entry(name: &str, state: ContainerState) -> ContainerEntry {
-        ContainerEntry {
+    fn make_entry(name: &str, state: MachineState) -> MachineEntry {
+        MachineEntry {
             name: name.to_string(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
             state,
-            address: None,
-            all_addresses: vec![],
+            addresses: Default::default(),
         }
     }
 
@@ -988,7 +989,7 @@ mod tests {
             let successful = matches!(control_outcome, MachineControlOutcome::Succeeded);
             let mut control = MockMachineControl::new();
             control
-                .expect_execute()
+                .expect_launch()
                 .once()
                 .returning(move |_, _| RoutedMachineControlOutcome {
                     outcome: control_outcome.clone(),
@@ -1000,12 +1001,8 @@ mod tests {
             let mut observation = MockMachineObservation::new();
             if successful {
                 observation.expect_inspect().once().returning(|_, _| {
-                    let mut properties = crate::nspawn::models::MachineProperties::default();
-                    properties.insert(
-                        crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                        "ActiveState".into(),
-                        "active".into(),
-                    );
+                    let mut properties = MachineProperties::default();
+                    properties.insert(GROUP_SYSTEMD_UNIT, "ActiveState".into(), "active".into());
                     Ok(properties)
                 });
             }
@@ -1035,7 +1032,10 @@ mod tests {
 
             assert_eq!(
                 app.data.entries,
-                vec![make_entry("test", ContainerState::Starting)]
+                vec![MachineEntry::optimistic_nspawn(
+                    "test",
+                    MachineState::Starting
+                )]
             );
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -1046,15 +1046,15 @@ mod tests {
             assert_eq!(app.data.host_operations.active_count(), 0);
             assert!(matches!(
                 event,
-                AppEvent::MachineActionFinished(outcome)
+                AppEvent::MachineLifecycleFinished(outcome)
                     if outcome.result == MachineLifecycleResult::Succeeded
             ));
 
             let resolved = app
                 .data
                 .machine_lifecycle
-                .project_machines(vec![make_entry("test", ContainerState::Running)]);
-            assert_eq!(resolved, vec![make_entry("test", ContainerState::Running)]);
+                .project_machines(vec![make_entry("test", MachineState::Running)]);
+            assert_eq!(resolved, vec![make_entry("test", MachineState::Running)]);
         }
 
         #[tokio::test]
@@ -1069,7 +1069,7 @@ mod tests {
                 .await
                 .expect("start task should finish")
                 .expect("start task should report a result");
-            let AppEvent::MachineActionFinished(outcome) = event else {
+            let AppEvent::MachineLifecycleFinished(outcome) = event else {
                 panic!("start failure should report a semantic outcome");
             };
             assert_eq!(
@@ -1088,14 +1088,13 @@ mod tests {
             let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
 
             app.action_start();
-            app.data.action_cooldown = None;
             app.action_start();
 
             let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .expect("first start task should finish")
                 .expect("first start task should report a result");
-            assert!(matches!(event, AppEvent::MachineActionFinished(..)));
+            assert!(matches!(event, AppEvent::MachineLifecycleFinished(..)));
             assert_eq!(
                 app.ui
                     .status_message
@@ -1106,13 +1105,46 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn image_inspector_action_menu_keeps_its_retained_target() {
+            let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
+            app.data.images.push(make_image("second"));
+            app.data.image_selected = 1;
+            app.data.detail_target = DetailTarget::Image {
+                name: "test".into(),
+                internal: false,
+            };
+            app.ui.focus = WorkspaceFocus::ImageInspector;
+
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .await;
+
+            app.handle_key(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+            .await;
+
+            let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("start task should finish")
+                .expect("start task should report a result");
+            let AppEvent::MachineLifecycleFinished(outcome) = event else {
+                panic!("start should report a machine lifecycle outcome");
+            };
+            assert_eq!(outcome.machine.as_str(), "test");
+        }
+
+        #[tokio::test]
         async fn mstack_start_warns_but_still_dispatches_to_systemd() {
             let (mut app, mut rx) = prepare_image_start(MachineControlOutcome::Succeeded);
             app.data.images[0].image_type = "mstack".into();
 
             app.action_start();
 
-            assert_eq!(app.data.entries[0].state, ContainerState::Starting);
+            assert_eq!(app.data.entries[0].state, MachineState::Starting);
             assert_eq!(
                 app.ui
                     .status_message
@@ -1127,7 +1159,7 @@ mod tests {
                     .await
                     .expect("mstack start should finish")
                     .expect("mstack start should report a result"),
-                AppEvent::MachineActionFinished(..)
+                AppEvent::MachineLifecycleFinished(..)
             ));
         }
     }
@@ -1550,9 +1582,9 @@ mod tests {
         fn next_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", ContainerState::Off),
-                make_entry("b", ContainerState::Off),
-                make_entry("c", ContainerState::Off),
+                make_entry("a", MachineState::Running),
+                make_entry("b", MachineState::Running),
+                make_entry("c", MachineState::Running),
             ];
             app.data.selected = 2;
 
@@ -1564,9 +1596,9 @@ mod tests {
         fn prev_wraps() {
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("a", ContainerState::Off),
-                make_entry("b", ContainerState::Off),
-                make_entry("c", ContainerState::Off),
+                make_entry("a", MachineState::Running),
+                make_entry("b", MachineState::Running),
+                make_entry("c", MachineState::Running),
             ];
             app.data.selected = 0;
 
@@ -1595,7 +1627,7 @@ mod tests {
         #[test]
         fn image_navigation_is_independent_from_machine_selection() {
             let mut app = make_app();
-            app.data.entries = vec![make_entry("machine", ContainerState::Running)];
+            app.data.entries = vec![make_entry("machine", MachineState::Running)];
             app.data.images = vec![make_image("a"), make_image("b")];
             app.ui.focus = WorkspaceFocus::Images;
 
@@ -1636,7 +1668,7 @@ mod tests {
 
         fn app_with_machine_and_image() -> App {
             let mut app = make_app();
-            app.data.entries = vec![make_entry("machine", ContainerState::Running)];
+            app.data.entries = vec![make_entry("machine", MachineState::Running)];
             app.data.images = vec![make_image("image")];
             app.set_focus(WorkspaceFocus::Machines);
             app
@@ -1647,8 +1679,12 @@ mod tests {
             use crate::tui::widgets::dialogs::confirmation::ConfirmationDialog;
 
             let mut ui = AppUi::new();
-            ui.power_menu = Some(crate::tui::widgets::power_menu::PowerMenu::new(0));
-            assert_eq!(ui.modal_layer(), Some(ModalLayer::PowerMenu));
+            ui.resource_action_menu = Some(
+                crate::tui::widgets::resource_action_menu::ResourceActionMenu::for_machine(
+                    &make_entry("machine", MachineState::Running),
+                ),
+            );
+            assert_eq!(ui.modal_layer(), Some(ModalLayer::ResourceActionMenu));
 
             ui.show_wizard = true;
             assert_eq!(ui.modal_layer(), Some(ModalLayer::Wizard));
@@ -1751,7 +1787,7 @@ mod tests {
         fn inspector_keeps_the_last_image_as_its_terminal_resource() {
             let mut app = make_app();
             app.data.images = vec![make_image("workstation")];
-            app.data.entries = vec![make_entry("workstation", ContainerState::Running)];
+            app.data.entries = vec![make_entry("workstation", MachineState::Running)];
 
             app.set_focus(WorkspaceFocus::Images);
             app.set_focus(WorkspaceFocus::ImageInspector);
@@ -1767,13 +1803,13 @@ mod tests {
         fn image_terminal_requires_an_exact_running_machine() {
             let mut app = make_app();
             app.data.images = vec![make_image("workstation")];
-            app.data.entries = vec![make_entry("workstation", ContainerState::Starting)];
+            app.data.entries = vec![make_entry("workstation", MachineState::Starting)];
             app.set_focus(WorkspaceFocus::Images);
 
             let image = app.focused_image_resource().unwrap();
             assert!(!app.image_has_running_machine(image));
 
-            app.data.entries[0].state = ContainerState::Running;
+            app.data.entries[0].state = MachineState::Running;
             let image = app.focused_image_resource().unwrap();
             assert!(app.image_has_running_machine(image));
         }
@@ -1788,8 +1824,9 @@ mod tests {
                 internal: false,
             };
             app.ui.focus = WorkspaceFocus::ImageInspector;
-            app.ui.detail_panel.active_pane =
-                crate::tui::views::detail_panel::DetailPane::ImageOverview;
+            app.ui
+                .detail_panel
+                .ensure_pane_for_target(&app.data.detail_target);
 
             app.refresh_detail_now().await;
 
@@ -1814,8 +1851,16 @@ mod tests {
             };
             app.data.unit_name = Some("systemd-nspawn@stale.service".into());
             app.ui.focus = WorkspaceFocus::ImageInspector;
-            app.ui.detail_panel.active_pane =
-                crate::tui::views::detail_panel::DetailPane::ImageUnit;
+            app.ui
+                .detail_panel
+                .ensure_pane_for_target(&app.data.detail_target);
+            app.ui.detail_panel.handle_key(
+                crossterm::event::KeyEvent::new(
+                    crossterm::event::KeyCode::Char('3'),
+                    crossterm::event::KeyModifiers::ALT,
+                ),
+                &app.data.detail_target,
+            );
 
             app.refresh_detail_now().await;
 
@@ -1830,8 +1875,8 @@ mod tests {
 
             let mut app = make_app();
             app.data.entries = vec![
-                make_entry("first", ContainerState::Running),
-                make_entry("second", ContainerState::Running),
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
             ];
             app.set_focus(WorkspaceFocus::Machines);
             app.request_detail_refresh();
@@ -1844,7 +1889,7 @@ mod tests {
                 DetailTarget::Machine("second".into())
             );
 
-            let mut stale_properties = crate::nspawn::models::MachineProperties::default();
+            let mut stale_properties = MachineProperties::default();
             stale_properties.insert("Machine", "Name".into(), "first".into());
             app.apply_detail_refresh(DetailRefreshCompletion {
                 ticket: stale_ticket,
@@ -1913,20 +1958,100 @@ mod tests {
         assert_eq!(app.data.internal_image_selected, 1);
     }
 
-    mod action_cooldown {
-        use super::*;
+    #[test]
+    fn machine_refresh_keeps_every_present_runtime_state() {
+        let mut app = make_app();
 
-        #[test]
-        fn allows_first() {
+        app.sync_snapshot(RuntimeSnapshot::new(
+            vec![
+                make_entry("running", MachineState::Running),
+                make_entry("starting", MachineState::Starting),
+                make_entry("exiting", MachineState::Exiting),
+            ],
+            vec![],
+        ));
+
+        assert_eq!(
+            app.data
+                .entries
+                .iter()
+                .map(|entry| (entry.name.as_str(), entry.state.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("exiting", MachineState::Exiting),
+                ("running", MachineState::Running),
+                ("starting", MachineState::Starting),
+            ]
+        );
+    }
+
+    mod machine_actions {
+        use super::*;
+        use crate::application::machine_lifecycle::{
+            MachineControlOutcome, MockMachineControl, MockMachineObservation,
+            MockMachineStartDiagnostics, MockMachineStartPreparation, RoutedMachineControlOutcome,
+        };
+        use crate::application::operations::route::ExecutionRoute;
+        use crate::application::OperationRegistry;
+
+        fn prepare_poweroff_app() -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+            let mut control = MockMachineControl::new();
+            control
+                .expect_execute_runtime()
+                .times(2)
+                .returning(|_, action| {
+                    assert_eq!(action, crate::application::MachineRuntimeAction::Poweroff);
+                    RoutedMachineControlOutcome {
+                        outcome: MachineControlOutcome::Succeeded,
+                        route: ExecutionRoute::DirectDbus,
+                        fallback: None,
+                    }
+                });
+            let preparation = MockMachineStartPreparation::new();
+            let mut observation = MockMachineObservation::new();
+            observation.expect_invalidate().times(2).return_const(());
+            let diagnostics = MockMachineStartDiagnostics::new();
+            let lifecycle = std::sync::Arc::new(MachineLifecycleService::new(
+                std::sync::Arc::new(control),
+                std::sync::Arc::new(preparation),
+                std::sync::Arc::new(observation),
+                std::sync::Arc::new(diagnostics),
+                OperationRegistry::new(),
+            ));
             let mut app = make_app();
-            assert!(app.check_action_cooldown());
+            app.data.machine_lifecycle = lifecycle;
+            app.data.entries = vec![
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
+            ];
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            app.ui.app_tx = Some(tx);
+            (app, rx)
         }
 
-        #[test]
-        fn blocks_within_2s() {
-            let mut app = make_app();
-            assert!(app.check_action_cooldown());
-            assert!(!app.check_action_cooldown());
+        #[tokio::test]
+        async fn different_machines_accept_back_to_back_poweroff_actions() {
+            let (mut app, mut rx) = prepare_poweroff_app();
+
+            app.data.selected = 0;
+            app.action_poweroff();
+            app.data.selected = 1;
+            app.action_poweroff();
+
+            let mut completed = Vec::new();
+            for _ in 0..2 {
+                let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                    .await
+                    .expect("both poweroff actions should finish")
+                    .expect("both poweroff actions should report a result");
+                let AppEvent::MachineLifecycleFinished(outcome) = event else {
+                    panic!("poweroff should report a machine lifecycle outcome");
+                };
+                completed.push(outcome.machine.as_str().to_string());
+            }
+            completed.sort();
+
+            assert_eq!(completed, ["first", "second"]);
         }
     }
 

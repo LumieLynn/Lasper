@@ -3,16 +3,21 @@ use crate::application::provisioning::{
     DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot, ProvisioningHostSnapshot,
     StorageBackendKind, UserSecret,
 };
-use crate::domain::secret::zeroize_string;
-use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
-use crate::nspawn::models::{
-    ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
+use crate::domain::bootstrap::{
+    BootstrapSpec, Dnf5RepositorySource, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::nspawn::models::{
+use crate::domain::provisioning::{
     BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry};
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
+use crate::domain::runtime::{ImageEntry, MachineEntry};
+use crate::domain::secret::zeroize_string;
+use crate::domain::source::{ArtifactSpec, BootstrapMethod};
+use crate::domain::storage::{
+    DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
+};
+use crate::domain::wayland::{
+    HostWaylandSocket, WaylandDisplay, WaylandGrantIntent, WaylandValidationError,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +56,7 @@ pub enum SourceConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicConfig {
     pub name: String,
-    pub hostname: String,
+    pub guest_hostname: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -62,7 +67,7 @@ pub struct UserConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorageConfig {
     pub storage_type: StorageBackendKind,
-    pub disk_config: Option<crate::nspawn::models::DiskImageConfig>,
+    pub disk_config: Option<DiskImageConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -188,8 +193,8 @@ impl SourceState {
                 spec.releasever = self.dnf_releasever.trim().into();
                 spec.packages = split_packages(&self.dnf_pkgs);
                 spec.inherit_default_packages = self.dnf_inherit_default_packages;
-                if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Unspecified {
-                    spec.repository = crate::nspawn::models::Dnf5RepositorySource::Host;
+                if spec.repository == Dnf5RepositorySource::Unspecified {
+                    spec.repository = Dnf5RepositorySource::Host;
                 }
                 SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec))
             }
@@ -320,14 +325,14 @@ fn method_default(
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasicState {
     pub name: String,
-    pub hostname: String,
+    pub guest_hostname: String,
 }
 
 impl BasicState {
     pub fn extract_config(&self) -> BasicConfig {
         BasicConfig {
             name: self.name.clone(),
-            hostname: self.hostname.clone(),
+            guest_hostname: self.guest_hostname.clone(),
         }
     }
 }
@@ -351,17 +356,17 @@ impl StorageState {
             storage_type: st,
             disk_config: if st == StorageBackendKind::DiskImage {
                 let source = if self.creation_method_idx == 1 {
-                    crate::nspawn::models::DiskImageSource::ImportExisting {
+                    DiskImageSource::ImportExisting {
                         path: self.import_path.clone(),
                     }
                 } else {
-                    crate::nspawn::models::DiskImageSource::CreateNew {
+                    DiskImageSource::CreateNew {
                         size: self.disk_size.clone(),
                         fs_type: self.disk_fs,
                     }
                 };
 
-                Some(crate::nspawn::models::DiskImageConfig {
+                Some(DiskImageConfig {
                     source,
                     use_partition_table: self.disk_partition,
                     root_partition: if self.creation_method_idx == 1 {
@@ -387,7 +392,7 @@ impl WaylandAccessDraft {
     pub fn new(
         sockets: Vec<HostWaylandSocket>,
         default_display: WaylandDisplay,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WaylandValidationError> {
         WaylandGrantIntent::new("draft-user", sockets.clone(), default_display.clone())?;
         Ok(Self {
             sockets,
@@ -610,14 +615,14 @@ pub struct WizardDraft {
     pub user: UserState,
     pub network: NetworkState,
     pub passthrough: PassthroughState,
-    pub entries: Vec<ContainerEntry>,
+    pub entries: Vec<MachineEntry>,
     pub images: Vec<ImageEntry>,
     pub host: ProvisioningHostSnapshot,
 }
 
 impl WizardDraft {
     pub fn new(
-        entries: Vec<ContainerEntry>,
+        entries: Vec<MachineEntry>,
         images: Vec<ImageEntry>,
         config: Arc<crate::config::AppConfig>,
         host: ProvisioningHostSnapshot,
@@ -683,7 +688,7 @@ impl WizardDraft {
             },
             basic: BasicState {
                 name: "".to_string(),
-                hostname: "".to_string(),
+                guest_hostname: "".to_string(),
             },
             storage: StorageState {
                 type_idx: 0,
@@ -769,17 +774,21 @@ impl WizardDraft {
         let basic = self.basic.extract_config();
         if !source.supports_rootfs_configuration() {
             let config = match &source {
-                DeploymentSource::Copy { .. } => crate::nspawn::models::ContainerConfig {
-                    name: basic.name,
-                    ..Default::default()
-                },
-                DeploymentSource::Oci { network, .. } => crate::nspawn::models::ContainerConfig {
-                    name: basic.name,
-                    network: Some(network.into_network_mode()),
-                    private_users: Some(PrivateUsersMode::No),
-                    boot: false,
-                    ..Default::default()
-                },
+                DeploymentSource::Copy { .. } => {
+                    crate::application::provisioning::MachineProvisioningConfig {
+                        name: basic.name,
+                        ..Default::default()
+                    }
+                }
+                DeploymentSource::Oci { network, .. } => {
+                    crate::application::provisioning::MachineProvisioningConfig {
+                        name: basic.name,
+                        network: Some(network.into_network_mode()),
+                        private_users: Some(PrivateUsersMode::No),
+                        boot: false,
+                        ..Default::default()
+                    }
+                }
                 DeploymentSource::Bootstrap(_)
                 | DeploymentSource::Pull { .. }
                 | DeploymentSource::Artifact(_) => unreachable!(
@@ -824,9 +833,9 @@ impl WizardDraft {
                     .map(|access| access.intent_for(&user.username))
             })
             .collect();
-        let config = crate::nspawn::models::ContainerConfig {
+        let config = crate::application::provisioning::MachineProvisioningConfig {
             name: basic.name,
-            hostname: basic.hostname,
+            guest_hostname: basic.guest_hostname,
             network: network.mode,
             port_forwards: network.port_forwards,
             bind_mounts: passthrough.bind_mounts,
@@ -951,6 +960,7 @@ impl WizardDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     fn test_wayland_access() -> WaylandAccessDraft {
         let source = HostWaylandSocket::from_verified_parts(
@@ -1171,7 +1181,7 @@ mod tests {
         assert!(!spec.inherit_default_packages);
         assert_eq!(
             spec.policy.release_signatures,
-            crate::nspawn::models::DebootstrapReleaseSignaturePolicy::Disabled
+            DebootstrapReleaseSignaturePolicy::Disabled
         );
     }
 
@@ -1198,10 +1208,7 @@ mod tests {
         let SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec)) = state.extract_config() else {
             panic!("expected dnf5 source");
         };
-        assert_eq!(
-            spec.repository,
-            crate::nspawn::models::Dnf5RepositorySource::Host
-        );
+        assert_eq!(spec.repository, Dnf5RepositorySource::Host);
         assert!(spec.validate().is_ok());
     }
 

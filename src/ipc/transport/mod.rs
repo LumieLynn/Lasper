@@ -113,19 +113,6 @@ pub(crate) fn configure_user_socket(path: &Path, user_uid: u32) -> std::io::Resu
     Ok(())
 }
 
-pub(crate) async fn connect_rpc_socket(path: &Path) -> std::io::Result<UnixStream> {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        match UnixStream::connect(path).await {
-            Ok(stream) => return Ok(stream),
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 /// Read one protocol frame without allowing a peer to grow an unbounded line
 /// in memory. Callers discard the connection after an oversized frame.
 pub(crate) async fn read_bounded_line<R>(

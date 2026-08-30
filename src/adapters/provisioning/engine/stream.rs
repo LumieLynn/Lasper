@@ -1,8 +1,8 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::SpawnedProcess;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentProgress as DeployProgress,
 };
-use crate::nspawn::errors::{NspawnError, Result};
 use tokio::sync::mpsc::Sender;
 
 pub(crate) async fn send_deploy_log(logs: &Sender<DeployLogEvent>, message: impl Into<String>) {
@@ -54,6 +54,12 @@ pub(crate) async fn send_deploy_progress(
         progress.permille % 10
     );
     let _ = logs.send(DeployLogEvent::Progress(progress)).await;
+}
+
+pub(crate) fn check_deployment_cancellation(cancellation: &DeploymentCancellation) -> Result<()> {
+    cancellation
+        .checkpoint()
+        .map_err(|_| NspawnError::DeploymentCancelled)
 }
 
 pub(crate) async fn stream_deploy_command(

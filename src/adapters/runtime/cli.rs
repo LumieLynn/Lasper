@@ -1,14 +1,20 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ContainerEntry, ImageEntry, InspectionCompleteness, InspectionSource, MachineName,
-    MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 use serde::Deserialize;
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HOST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UnitInspection {
+    Present,
+    NotFound(String),
+}
 
 #[derive(Deserialize)]
 struct MachinectlImageRow {
@@ -106,14 +112,14 @@ impl RuntimeSource for CliBackend {
         which::which("machinectl").is_ok()
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
         crate::adapters::runtime::state::list_machines_at(self.runtime_machines_dir.clone()).await
     }
 
     async fn list_images(&self) -> Result<Vec<ImageEntry>> {
         let out = self
             .cmd_runner
-            .run(
+            .run_bounded(
                 "machinectl",
                 vec![
                     "--no-ask-password".to_string(),
@@ -123,6 +129,7 @@ impl RuntimeSource for CliBackend {
                     "--".to_string(),
                     "list-images".to_string(),
                 ],
+                HOST_QUERY_TIMEOUT,
             )
             .await
             .map_err(|e| NspawnError::Io(std::path::PathBuf::from("machinectl"), e))?;
@@ -138,8 +145,12 @@ impl RuntimeSource for CliBackend {
         parse_list_images_json(&out.stdout)
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
-        get_properties_with_runner(name, self.cmd_runner.as_ref()).await
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
+        get_properties_with_runner(name, include_nspawn_unit, self.cmd_runner.as_ref()).await
     }
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
@@ -191,52 +202,83 @@ impl RuntimeSource for CliBackend {
 /// Fixed, non-interactive CLI inspection shared with the elevated daemon.
 pub(crate) async fn get_properties_with_runner(
     name: &str,
+    include_nspawn_unit: bool,
     cmd_runner: &dyn CommandRunner,
 ) -> Result<MachineProperties> {
     let name = parse_machine_name(name)?;
     let mut props =
         MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
 
+    let machine_args = vec![
+        "--no-ask-password".to_string(),
+        "--".to_string(),
+        "show".to_string(),
+        name.as_str().to_string(),
+    ];
+    let machine_command = format!("machinectl {}", machine_args.join(" "));
+    let mut failures = Vec::new();
+
     let machine_out = cmd_runner
-        .run(
-            "machinectl",
-            vec![
-                "--no-ask-password".to_string(),
-                "--".to_string(),
-                "show".to_string(),
-                name.as_str().to_string(),
-            ],
-        )
+        .run_bounded("machinectl", machine_args.clone(), HOST_QUERY_TIMEOUT)
         .await;
 
-    if let Ok(out) = machine_out {
-        if out.status.success() {
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                if let Some((k, v)) = line.split_once('=') {
-                    let key = k.trim();
-                    let val = v.trim();
-                    let formatted = crate::adapters::runtime::formatting::format_property(
-                        key,
-                        &zbus::zvariant::Value::Str(val.into()),
-                    );
-                    props.insert(
-                        crate::nspawn::models::GROUP_MACHINE,
-                        key.to_string(),
-                        formatted,
-                    );
+    match machine_out {
+        Ok(out) if out.status.success() => {
+            let inserted = insert_machine_properties(&mut props, &out.stdout);
+            if inserted == 0 {
+                failures.push("machinectl returned no machine properties".to_string());
+            }
+        }
+        Ok(out) => failures.push(format!(
+            "machinectl: {}",
+            crate::adapters::process::command_diagnostic(&out)
+        )),
+        Err(error) => failures.push(format!("machinectl: {error}")),
+    }
+
+    if include_nspawn_unit {
+        match append_systemd_unit_properties(&name, cmd_runner, &mut props).await {
+            Ok(UnitInspection::Present) => {}
+            Ok(UnitInspection::NotFound(diagnostic)) => {
+                if props.groups.is_empty() {
+                    failures.push(format!("systemctl: {diagnostic}"));
                 }
             }
+            Err(error) => failures.push(format!("systemctl: {error}")),
         }
     }
 
-    let _ = append_systemd_unit_properties(&name, cmd_runner, &mut props).await;
-
     if props.groups.is_empty() {
+        let (operation, command) = if include_nspawn_unit {
+            let unit = name.systemd_nspawn_unit();
+            (
+                format!("machinectl/systemctl show {}", name.as_str()),
+                format!("{machine_command}; systemctl show {unit}"),
+            )
+        } else {
+            (
+                format!("machinectl show {}", name.as_str()),
+                machine_command.clone(),
+            )
+        };
         return Err(NspawnError::CommandFailed(
-            format!("machinectl/systemctl show {}", name.as_str()),
-            "No properties found".to_string(),
-            "The target machine might not exist or systemd-nspawn is not managing it.".to_string(),
+            operation,
+            command,
+            if failures.is_empty() {
+                "The target machine might not exist or its provider did not expose properties."
+                    .into()
+            } else {
+                failures.join("; ")
+            },
         ));
+    }
+
+    if !failures.is_empty() {
+        log::warn!(
+            "partial CLI inspection for {}: {}",
+            name,
+            failures.join("; ")
+        );
     }
 
     Ok(props)
@@ -256,15 +298,45 @@ pub(crate) async fn get_image_unit_properties_with_runner(
     };
     let mut props =
         MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
-    append_systemd_unit_properties(&name, cmd_runner, &mut props).await?;
-    Ok(Some(props))
+    match append_systemd_unit_properties(&name, cmd_runner, &mut props).await? {
+        UnitInspection::Present => Ok(Some(props)),
+        UnitInspection::NotFound(diagnostic) => {
+            let unit = name.systemd_nspawn_unit();
+            Err(NspawnError::CommandFailed(
+                format!("systemctl show {unit}"),
+                format!("systemctl --no-ask-password -- show {unit}"),
+                diagnostic,
+            ))
+        }
+    }
+}
+
+fn insert_machine_properties(props: &mut MachineProperties, output: &[u8]) -> usize {
+    let mut inserted = 0usize;
+    for (key, val) in parse_property_lines(output) {
+        let formatted = crate::adapters::runtime::formatting::format_property(
+            &key,
+            &zbus::zvariant::Value::Str(val.as_str().into()),
+        );
+        props.insert(crate::domain::inspection::GROUP_MACHINE, key, formatted);
+        inserted = inserted.saturating_add(1);
+    }
+    inserted
+}
+
+fn parse_property_lines(output: &[u8]) -> Vec<(String, String)> {
+    String::from_utf8_lossy(output)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.trim().to_string(), value.trim().to_string()))
+        .collect()
 }
 
 async fn append_systemd_unit_properties(
     name: &MachineName,
     cmd_runner: &dyn CommandRunner,
     props: &mut MachineProperties,
-) -> Result<()> {
+) -> Result<UnitInspection> {
     let unit = name.systemd_nspawn_unit();
     let args = vec![
         "--no-ask-password".to_string(),
@@ -273,7 +345,7 @@ async fn append_systemd_unit_properties(
         unit.clone(),
     ];
     let system_out = cmd_runner
-        .run("systemctl", args.clone())
+        .run_bounded("systemctl", args.clone(), HOST_QUERY_TIMEOUT)
         .await
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("systemctl"), error))?;
 
@@ -285,25 +357,24 @@ async fn append_systemd_unit_properties(
         ));
     }
 
-    let mut inserted = 0usize;
-    for line in String::from_utf8_lossy(&system_out.stdout).lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            let key = k.trim();
-            let val = v.trim();
-            let formatted = crate::adapters::runtime::formatting::format_property(
-                key,
-                &zbus::zvariant::Value::Str(val.into()),
-            );
-            crate::adapters::runtime::formatting::insert_systemd_property(
-                props,
-                key.to_string(),
-                formatted,
-            );
-            inserted = inserted.saturating_add(1);
-        }
+    let properties = parse_property_lines(&system_out.stdout);
+    if properties
+        .iter()
+        .any(|(key, value)| key == "LoadState" && value == "not-found")
+    {
+        let load_error = properties
+            .iter()
+            .find(|(key, _)| key == "LoadError")
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty());
+        let diagnostic = match load_error {
+            Some(load_error) => format!("LoadState=not-found; LoadError={load_error}"),
+            None => format!("Unit {unit} was not found (LoadState=not-found)"),
+        };
+        return Ok(UnitInspection::NotFound(diagnostic));
     }
 
-    if inserted == 0 {
+    if properties.is_empty() {
         return Err(NspawnError::CommandFailed(
             format!("systemctl show {unit}"),
             format!("systemctl {}", args.join(" ")),
@@ -311,7 +382,15 @@ async fn append_systemd_unit_properties(
         ));
     }
 
-    Ok(())
+    for (key, val) in properties {
+        let formatted = crate::adapters::runtime::formatting::format_property(
+            &key,
+            &zbus::zvariant::Value::Str(val.as_str().into()),
+        );
+        crate::adapters::runtime::formatting::insert_systemd_property(props, key, formatted);
+    }
+
+    Ok(UnitInspection::Present)
 }
 
 fn parse_machine_name(name: &str) -> Result<MachineName> {
@@ -322,7 +401,7 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 mod tests {
     use super::*;
     use crate::adapters::process::MockCommandRunner;
-    use crate::nspawn::models::ContainerState;
+    use crate::domain::runtime::MachineState;
     use std::os::unix::process::ExitStatusExt;
     use std::process::Output;
 
@@ -336,11 +415,12 @@ mod tests {
 
     fn observer_snapshot() -> RuntimeSnapshot {
         RuntimeSnapshot::new(
-            vec![ContainerEntry {
+            vec![MachineEntry {
                 name: "active".into(),
-                state: ContainerState::Running,
-                address: None,
-                all_addresses: vec![],
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
+                state: MachineState::Running,
+                addresses: Default::default(),
             }],
             vec![ImageEntry {
                 name: "active".into(),
@@ -392,7 +472,11 @@ mod tests {
             r
         });
         let runtime = tempfile::tempdir().unwrap();
-        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        std::fs::write(
+            runtime.path().join("active"),
+            "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
@@ -400,23 +484,27 @@ mod tests {
 
         assert_eq!(machines.len(), 1);
         assert_eq!(machines[0].name, "active");
-        assert_eq!(machines[0].state, ContainerState::Running);
-        assert!(machines[0].all_addresses.is_empty());
+        assert_eq!(machines[0].state, MachineState::Running);
+        assert!(matches!(
+            machines[0].addresses,
+            crate::domain::runtime::MachineAddressObservation::Unsupported(_)
+        ));
     }
 
     #[tokio::test]
     async fn list_images_preserves_systemd_image_names() {
         let runner = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run()
-                .withf(|program, args| {
+            r.expect_run_bounded()
+                .withf(|program, args, timeout| {
                     program == "machinectl"
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
                         && args.get(1).is_some_and(|arg| arg == "--output=json")
                         && args.get(4).is_some_and(|arg| arg == "--")
                         && args.get(5).is_some_and(|arg| arg == "list-images")
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|_, _| {
+                .returning(|_, _, _| {
                     Ok(mock_output(
                         true,
                         r#"[
@@ -473,9 +561,9 @@ mod tests {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut runner = MockCommandRunner::new();
             runner
-                .expect_run()
+                .expect_run_bounded()
                 .times(1)
-                .withf(|program, args| {
+                .withf(|program, args, timeout| {
                     program == "machinectl"
                         && args
                             == &[
@@ -486,8 +574,9 @@ mod tests {
                                 "--".to_string(),
                                 "list-images".to_string(),
                             ]
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|_, _| {
+                .returning(|_, _, _| {
                     Ok(mock_output(
                         true,
                         r#"[{"name":"active","type":"directory","ro":false,"usage":20971520}]"#,
@@ -497,7 +586,11 @@ mod tests {
             runner
         });
         let runtime = tempfile::tempdir().unwrap();
-        std::fs::write(runtime.path().join("active"), "NAME=active\n").unwrap();
+        std::fs::write(
+            runtime.path().join("active"),
+            "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         let provider =
             CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
 
@@ -515,14 +608,15 @@ mod tests {
     async fn test_get_properties_parses_machinectl_and_systemctl_output() {
         let runner: std::sync::Arc<dyn CommandRunner> = std::sync::Arc::new({
             let mut r = MockCommandRunner::new();
-            r.expect_run()
-                .withf(|program, args| {
+            r.expect_run_bounded()
+                .withf(|program, args, timeout| {
                     matches!(program, "machinectl" | "systemctl")
                         && args.first().is_some_and(|arg| arg == "--no-ask-password")
                         && args.get(1).is_some_and(|arg| arg == "--")
                         && args.get(2).is_some_and(|arg| arg == "show")
+                        && *timeout == HOST_QUERY_TIMEOUT
                 })
-                .returning(|program, _args| {
+                .returning(|program, _args, _timeout| {
                     if program == "systemctl" {
                         Ok(mock_output(
                             true,
@@ -537,7 +631,7 @@ mod tests {
         });
         let provider = CliBackend::with_runner(runner);
 
-        let props = RuntimeSource::get_properties(&provider, "test-ctr")
+        let props = RuntimeSource::get_properties(&provider, "test-ctr", true)
             .await
             .unwrap();
 
@@ -553,23 +647,129 @@ mod tests {
             let mut r = MockCommandRunner::new();
             let out1 = mock_output(false, "", "");
             let out2 = mock_output(false, "", "");
-            r.expect_run().returning(move |_, _| Ok(out1.clone()));
-            r.expect_run().returning(move |_, _| Ok(out2.clone()));
+            r.expect_run_bounded()
+                .returning(move |_, _, _| Ok(out1.clone()));
+            r.expect_run_bounded()
+                .returning(move |_, _, _| Ok(out2.clone()));
             r
         });
         let provider = CliBackend::with_runner(runner);
 
-        let result = RuntimeSource::get_properties(&provider, "missing-ctr").await;
+        let result = RuntimeSource::get_properties(&provider, "missing-ctr", true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn machine_inspection_preserves_both_cli_failure_reasons() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    false,
+                    "",
+                    "Could not get path to machine: No machine 'missing-ctr' known\n",
+                ))
+            });
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@missing-ctr.service\nLoadState=not-found\nLoadError=org.freedesktop.systemd1.NoSuchUnit \"Unit missing\"\n",
+                    "",
+                ))
+            });
+
+        let error = get_properties_with_runner("missing-ctr", true, &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("No machine 'missing-ctr' known"));
+        assert!(error.contains("LoadState=not-found"));
+        assert!(error.contains("org.freedesktop.systemd1.NoSuchUnit"));
+        assert!(!error.contains("The target machine might not exist"));
+    }
+
+    #[tokio::test]
+    async fn machine_inspection_keeps_machine_properties_when_unit_is_not_found() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| Ok(mock_output(true, "State=running\nLeader=12345\n", "")));
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@test-ctr.service\nLoadState=not-found\n",
+                    "",
+                ))
+            });
+
+        let properties = get_properties_with_runner("test-ctr", true, &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            properties
+                .get_group(crate::domain::inspection::GROUP_MACHINE)
+                .and_then(|group| group.get("State"))
+                .map(String::as_str),
+            Some("running")
+        );
+        assert!(properties
+            .get_group(crate::domain::inspection::GROUP_SYSTEMD_UNIT)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_machine_inspection_never_queries_an_nspawn_unit() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "machinectl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Name=guest-vm\nClass=vm\nService=systemd-vmspawn\nState=running\n",
+                    "",
+                ))
+            });
+
+        let properties = get_properties_with_runner("guest-vm", false, &runner)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            properties
+                .get_group(crate::domain::inspection::GROUP_MACHINE)
+                .and_then(|group| group.get("Service"))
+                .map(String::as_str),
+            Some("systemd-vmspawn")
+        );
+        assert!(properties
+            .get_group(crate::domain::inspection::GROUP_SYSTEMD_UNIT)
+            .is_none());
     }
 
     #[tokio::test]
     async fn image_unit_inspection_runs_only_systemctl() {
         let mut runner = MockCommandRunner::new();
         runner
-            .expect_run()
+            .expect_run_bounded()
             .times(1)
-            .withf(|program, args| {
+            .withf(|program, args, timeout| {
                 program == "systemctl"
                     && args
                         == &[
@@ -578,8 +778,9 @@ mod tests {
                             "show".to_string(),
                             "systemd-nspawn@test-image.service".to_string(),
                         ]
+                    && *timeout == HOST_QUERY_TIMEOUT
             })
-            .returning(|_, _| {
+            .returning(|_, _, _| {
                 Ok(mock_output(
                     true,
                     "ActiveState=inactive\nLoadState=loaded\n",
@@ -598,6 +799,47 @@ mod tests {
             Some("inactive")
         );
         assert_eq!(systemd.get("LoadState").map(String::as_str), Some("loaded"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_rejects_systemctl_not_found_state() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, _, _| program == "systemctl")
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "Id=systemd-nspawn@test-image.service\nLoadState=not-found\nLoadError=org.freedesktop.systemd1.NoSuchUnit \"Unit missing\"\n",
+                    "",
+                ))
+            });
+
+        let error = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("LoadState=not-found"));
+        assert!(error.contains("org.freedesktop.systemd1.NoSuchUnit"));
+        assert!(error.contains("systemd-nspawn@test-image.service"));
+    }
+
+    #[tokio::test]
+    async fn image_unit_inspection_preserves_stdout_only_systemctl_failure() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .returning(|_, _, _| Ok(mock_output(false, "inactive\n", "")));
+
+        let error = get_image_unit_properties_with_runner("test-image", &runner)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("inactive"));
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ fn coalesces_as_pointer_motion(mouse: &MouseEvent) -> bool {
 pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
+    Resize,
     Tick,
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
@@ -50,8 +51,8 @@ pub enum AppEvent {
     /// Background action execution finished.
     ActionDone(String, crate::tui::StatusLevel),
     /// A machine lifecycle workflow reached a semantic outcome.
-    MachineActionFinished(crate::application::MachineLifecycleOutcome),
-    /// Real-time metrics: (container_name, timestamp, cpu_pct, ram_mb)
+    MachineLifecycleFinished(crate::application::MachineLifecycleOutcome),
+    /// Real-time metrics: (machine name, timestamp, CPU percent, RAM MiB)
     MetricsUpdate(String, f64, f64, f64),
     /// Request a UI redraw for the terminal.
     TerminalRedraw,
@@ -62,13 +63,14 @@ impl AppEvent {
         match self {
             Self::Key(_) => "key",
             Self::Mouse(_) => "mouse",
+            Self::Resize => "resize",
             Self::Tick => "tick",
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",
             Self::DeploymentClaimReleaseFinished { .. } => "deployment-claim-release",
             Self::ActionDone(_, _) => "action-done",
-            Self::MachineActionFinished(_) => "machine-action-finished",
+            Self::MachineLifecycleFinished(_) => "machine-lifecycle-finished",
             Self::MetricsUpdate(_, _, _, _) => "metrics-update",
             Self::TerminalRedraw => "terminal-redraw",
         }
@@ -246,6 +248,14 @@ where
                             }
                         }
                     }
+                    Some(Ok(CrosstermEvent::Resize(_, _))) => {
+                        if matches!(
+                            try_send_input(&input_tx, AppEvent::Resize),
+                            InputSendResult::Closed
+                        ) {
+                            return Ok(());
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
                         return Err(format!("terminal input read failed: {error}"));
@@ -343,6 +353,27 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "terminal input stream ended unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn resize_wakes_the_foreground_event_loop() {
+        let (source_tx, source_rx) = mpsc::unbounded_channel();
+        let reader = tokio_stream::wrappers::UnboundedReceiverStream::new(source_rx);
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        let input_task = tokio::spawn(async move {
+            run_input_loop(reader, event_tx, watch::channel(None).0, &mut shutdown_rx).await
+        });
+
+        source_tx.send(Ok(CrosstermEvent::Resize(120, 40))).unwrap();
+        let input = tokio::time::timeout(Duration::from_millis(150), event_rx.recv())
+            .await
+            .expect("resize event was not delivered")
+            .expect("input channel closed");
+        assert!(matches!(input.event, AppEvent::Resize));
+
+        let _ = shutdown_tx.send(());
+        assert!(input_task.await.unwrap().is_ok());
     }
 
     #[tokio::test]

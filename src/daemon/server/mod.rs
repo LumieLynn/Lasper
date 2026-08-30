@@ -4,19 +4,17 @@ mod fd;
 pub(crate) mod logging;
 mod process_state;
 mod state;
-pub(crate) mod transport;
 
 use self::logging::{initialize_daemon_logging, AuthLogLimiter};
-use self::transport::{
+use super::dispatch::run_rpc_request_pump;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::domain::secret::zeroize_string;
+use crate::ipc::protocol::*;
+use crate::ipc::transport::{
     authorize_fd_peer, authorize_fd_token, configure_user_socket, get_peer_credentials,
     read_bounded_line, FdAuthorizationError, PeerCredentials, MAX_RPC_FRAME_BYTES,
 };
-use super::dispatch::run_rpc_request_pump;
-use super::protocol::*;
-use crate::adapters::runtime::source::RuntimeSource;
-use crate::domain::secret::zeroize_string;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::os::unix::io::AsRawFd;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
@@ -26,12 +24,7 @@ const MAX_FD_CONNECTIONS: usize = 32;
 pub(super) async fn initialize_dbus_backend(
     enabled: bool,
 ) -> Option<crate::adapters::runtime::dbus::DbusBackend> {
-    if !enabled {
-        return None;
-    }
-
-    let dbus = crate::adapters::runtime::dbus::DbusBackend::new();
-    RuntimeSource::is_available(&dbus).await.then_some(dbus)
+    enabled.then(crate::adapters::runtime::dbus::DbusBackend::new)
 }
 
 pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
@@ -43,28 +36,6 @@ pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
             "lasper daemon must run as root",
         ))
     }
-}
-
-pub(super) fn open_pidfd(pid: u32) -> std::io::Result<OwnedFd> {
-    let pid = libc::pid_t::try_from(pid).map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "parent PID is out of range",
-        )
-    })?;
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let pidfd = unsafe { OwnedFd::from_raw_fd(fd as RawFd) };
-    let flags = unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    if unsafe { libc::fcntl(pidfd.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(pidfd)
 }
 
 fn monitor_parent(pidfd: OwnedFd, state: Arc<DaemonServerState>) -> std::io::Result<()> {
@@ -192,7 +163,7 @@ pub async fn daemon_main(
         std::process::exit(1);
     }
     let server_state = Arc::new(DaemonServerState::default());
-    let parent_pidfd = match open_pidfd(expected_parent_pid) {
+    let parent_pidfd = match crate::adapters::process::open_pidfd(expected_parent_pid) {
         Ok(pidfd) => pidfd,
         Err(error) => {
             log::error!("Daemon: failed to pin launching TUI process: {error}");
@@ -287,10 +258,21 @@ pub async fn daemon_main(
         let dbus_bg = dbus.clone();
         tokio::spawn(async move {
             let (ev_tx, mut ev_rx) =
-                tokio::sync::mpsc::channel::<crate::nspawn::models::StatusUpdate>(16);
-            tokio::spawn(async move {
-                if let Err(e) = dbus_bg.watch_events(ev_tx).await {
-                    log::error!("Daemon DBus watcher exited: {}", e);
+                tokio::sync::mpsc::channel::<crate::domain::runtime::StatusUpdate>(16);
+            let watcher = tokio::spawn(async move {
+                let mut retry_delay = std::time::Duration::from_secs(1);
+                loop {
+                    match dbus_bg.watch_events(ev_tx.clone()).await {
+                        Ok(()) if ev_tx.is_closed() => break,
+                        Ok(()) => {
+                            log::warn!("Daemon D-Bus watcher stopped; reconnecting");
+                        }
+                        Err(error) => {
+                            log::warn!("Daemon D-Bus watcher unavailable: {error}; reconnecting");
+                        }
+                    }
+                    tokio::time::sleep(retry_delay).await;
+                    retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
                 }
             });
             while ev_rx.recv().await.is_some() {
@@ -300,6 +282,7 @@ pub async fn daemon_main(
                     break;
                 }
             }
+            watcher.abort();
         });
     }
 
@@ -447,7 +430,7 @@ async fn handle_fd_connection(
     // Convert to std stream for blocking send_with_fd.
     // tokio streams are non-blocking — must switch back so sendmsg
     // doesn't return EAGAIN.
-    let mut std_stream = match stream.into_std() {
+    let std_stream = match stream.into_std() {
         Ok(s) => {
             let _ = s.set_nonblocking(false);
             s
@@ -458,7 +441,7 @@ async fn handle_fd_connection(
         }
     };
 
-    self::fd::handle(&mut std_stream, operation, server_state, trusted_state_root).await;
+    self::fd::handle(std_stream, operation, server_state, trusted_state_root).await;
 }
 
 pub(crate) use process_state::shutdown_daemon_resources;

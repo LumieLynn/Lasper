@@ -27,8 +27,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_status(f, app, rows[2]);
 
     // Overlays (highest priority last so they render on top)
-    if let Some(pm) = &mut app.ui.power_menu {
-        pm.render(f, area);
+    if let Some(menu) = &mut app.ui.resource_action_menu {
+        menu.render(f, area);
     }
     if app.ui.show_wizard {
         if let Some(w) = &mut app.ui.wizard {
@@ -113,7 +113,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
 
     app.ui.detail_panel.set_focus(detail_focused);
 
-    let list_pct = app.ui.container_list_pct;
+    let list_pct = app.ui.machine_list_pct;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
@@ -178,7 +178,7 @@ fn render_content(f: &mut Frame, app: &mut App, area: Rect) {
         );
     }
 
-    app.ui.container_list.render_with_data(
+    app.ui.machine_list.render_with_data(
         f,
         machines_area,
         &app.data.entries,
@@ -266,7 +266,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             WorkspaceFocus::Images if app.ui.image_list.shows_internal() => {
                 let mut spans = vec![kspan("[j/k]"), hspan(" nav ")];
                 if app.selected_image().is_some_and(|image| {
-                    !crate::nspawn::models::ImageEntry::is_protected_name(&image.name)
+                    !crate::domain::runtime::ImageEntry::is_protected_name(&image.name)
                 }) {
                     spans.extend([kspan("[D]"), hspan(" delete internal ")]);
                 }

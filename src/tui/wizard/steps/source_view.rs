@@ -1,5 +1,8 @@
 use crate::application::provisioning::HostCapability;
-use crate::nspawn::models::{OciNetworkMode, RootfsSourceSpec};
+use crate::domain::bootstrap::RootfsSourceSpec;
+use crate::domain::oci::OciReference;
+use crate::domain::provisioning::OciNetworkMode;
+use crate::domain::source::BootstrapMethod;
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::inputs::path_box::expand_user_path;
@@ -122,7 +125,7 @@ impl SourceStepView {
             )
             .with_validator(|v| {
                 let v = v.trim();
-                crate::nspawn::models::OciReference::new(v)
+                OciReference::new(v)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }),
@@ -261,11 +264,7 @@ impl SourceStepView {
             .unwrap_or(SourceKind::Copy)
     }
 
-    fn selected_profile(
-        &self,
-        method: crate::nspawn::models::BootstrapMethod,
-        name: &str,
-    ) -> Option<&RootfsSourceSpec> {
+    fn selected_profile(&self, method: BootstrapMethod, name: &str) -> Option<&RootfsSourceSpec> {
         self.profiles
             .iter()
             .find(|profile| profile.method == method && profile.name == name)
@@ -499,12 +498,12 @@ fn source_kind_label(kind: &SourceKind, kind_column_width: usize) -> String {
     )
 }
 
-fn bootstrap_method_label(method: crate::nspawn::models::BootstrapMethod) -> &'static str {
+fn bootstrap_method_label(method: BootstrapMethod) -> &'static str {
     match method {
-        crate::nspawn::models::BootstrapMethod::Debootstrap => "debootstrap",
-        crate::nspawn::models::BootstrapMethod::Pacstrap => "pacstrap",
-        crate::nspawn::models::BootstrapMethod::Dnf5 => "dnf5",
-        crate::nspawn::models::BootstrapMethod::Artifact => "artifact",
+        BootstrapMethod::Debootstrap => "debootstrap",
+        BootstrapMethod::Pacstrap => "pacstrap",
+        BootstrapMethod::Dnf5 => "dnf5",
+        BootstrapMethod::Artifact => "artifact",
     }
 }
 
@@ -544,7 +543,7 @@ fn is_tar_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::BootstrapMethod;
+    use crate::domain::source::BootstrapMethod;
 
     #[test]
     fn source_kind_descriptions_align_with_wide_profile_names() {

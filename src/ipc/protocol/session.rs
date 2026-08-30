@@ -1,7 +1,8 @@
 use crate::domain::machine::MachineName;
-use crate::domain::session::TerminalAttachmentKind;
-use crate::nspawn::models::TerminalSize;
+use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::num::NonZeroU16;
 use std::num::NonZeroU64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -35,8 +36,78 @@ pub(crate) struct SpawnJournalctlParams {
 pub(crate) struct SpawnTerminalParams {
     pub session_id: WireSessionId,
     pub name: MachineName,
-    pub size: TerminalSize,
+    pub size: WireTerminalSize,
 }
+
+/// Raw terminal dimensions used only at the privileged FD boundary.
+///
+/// The application and session adapters exchange the validated domain
+/// `SessionSize`; this type keeps the JSON representation local to IPC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawTerminalSize", into = "RawTerminalSize")]
+pub(crate) struct WireTerminalSize {
+    cols: NonZeroU16,
+    rows: NonZeroU16,
+}
+
+impl WireTerminalSize {
+    pub(crate) fn cols(self) -> u16 {
+        self.cols.get()
+    }
+
+    pub(crate) fn rows(self) -> u16 {
+        self.rows.get()
+    }
+
+    pub(crate) fn into_session_size(self) -> SessionSize {
+        // NonZeroU16 fields make this conversion infallible by construction.
+        SessionSize::from_nonzero(self.cols, self.rows)
+    }
+}
+
+impl From<SessionSize> for WireTerminalSize {
+    fn from(value: SessionSize) -> Self {
+        let (cols, rows) = value.into_nonzero();
+        Self { cols, rows }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTerminalSize {
+    cols: u16,
+    rows: u16,
+}
+
+impl TryFrom<RawTerminalSize> for WireTerminalSize {
+    type Error = WireTerminalSizeError;
+
+    fn try_from(value: RawTerminalSize) -> Result<Self, Self::Error> {
+        let cols = NonZeroU16::new(value.cols).ok_or(WireTerminalSizeError)?;
+        let rows = NonZeroU16::new(value.rows).ok_or(WireTerminalSizeError)?;
+        Ok(Self { cols, rows })
+    }
+}
+
+impl From<WireTerminalSize> for RawTerminalSize {
+    fn from(value: WireTerminalSize) -> Self {
+        Self {
+            cols: value.cols(),
+            rows: value.rows(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WireTerminalSizeError;
+
+impl fmt::Display for WireTerminalSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("terminal dimensions must be non-zero u16 values")
+    }
+}
+
+impl std::error::Error for WireTerminalSizeError {}
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -2,16 +2,18 @@
 
 use async_trait::async_trait;
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::oci_operation::{
     ensure_pull_oci_available, OciPullRequest,
 };
 use crate::adapters::provisioning::engine::{
-    send_deploy_log, stream_deploy_command, AppliedResource, ApplyReport, DeployLogEvent, Deployer,
-    DeploymentCancellation, OciPullStore,
+    check_deployment_cancellation, send_deploy_log, stream_deploy_command, AppliedResource,
+    ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation, OciPullStore,
 };
-use crate::application::provisioning::DeploymentResource;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerConfig, MachineName, OciNetworkMode, OciReference};
+use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
+use crate::domain::machine::MachineName;
+use crate::domain::oci::OciReference;
+use crate::domain::provisioning::OciNetworkMode;
 
 pub struct OciDeployer {
     pub reference: String,
@@ -41,16 +43,16 @@ impl Deployer for OciDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &ContainerConfig,
+        _cfg: &MachineProvisioningConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> Result<()> {
         ensure_pull_oci_available()?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
         self.nspawn.prepare_oci_promotion(name).await?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
         let request = OciPullRequest {
             reference: OciReference::new(self.reference.trim())
                 .map_err(|error| NspawnError::Validation(error.to_string()))?,
@@ -81,7 +83,7 @@ impl Deployer for OciDeployer {
             ));
         }
         report.record_created(AppliedResource::ExternalImage);
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         send_deploy_log(
             &logs,
@@ -110,7 +112,7 @@ impl Deployer for OciDeployer {
                 ))
             })?;
         report.record_apply(AppliedResource::NspawnConfig, apply)?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         send_deploy_log(
             &logs,

@@ -1,11 +1,13 @@
 //! Typed bootstrap execution shared by direct and elevated modes.
 
+use super::bootstrap_args::{
+    debootstrap_args_with_signature_style, dnf5_args, pacstrap_args,
+    DebootstrapSignatureOptionStyle,
+};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::rootfs::RootfsTarget;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BootstrapSpec, DebootstrapReleaseSignaturePolicy, DebootstrapSignatureOptionStyle,
-};
+use crate::domain::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -61,11 +63,14 @@ pub(crate) fn build_command(
 ) -> Result<(String, Vec<String>)> {
     let target = request.target.path()?;
     let args = match &request.spec {
-        BootstrapSpec::Debootstrap(spec) => {
-            spec.args_with_signature_style(&target, request.include_sudo, signature_style)?
-        }
-        BootstrapSpec::Pacstrap(spec) => spec.args(&target, request.include_sudo)?,
-        BootstrapSpec::Dnf5(spec) => spec.args(&target, request.include_sudo)?,
+        BootstrapSpec::Debootstrap(spec) => debootstrap_args_with_signature_style(
+            spec,
+            &target,
+            request.include_sudo,
+            signature_style,
+        )?,
+        BootstrapSpec::Pacstrap(spec) => pacstrap_args(spec, &target, request.include_sudo)?,
+        BootstrapSpec::Dnf5(spec) => dnf5_args(spec, &target, request.include_sudo)?,
     };
     let program = match request.spec {
         BootstrapSpec::Debootstrap(_) => "debootstrap",
@@ -132,7 +137,7 @@ mod tests {
 
     fn missing_machine_target() -> RootfsTarget {
         RootfsTarget::Machine {
-            machine: crate::nspawn::models::MachineName::new("lasper-bootstrap-missing-target")
+            machine: crate::domain::machine::MachineName::new("lasper-bootstrap-missing-target")
                 .unwrap(),
         }
     }

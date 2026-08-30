@@ -14,10 +14,10 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect) {
         Some(e) => e,
         None => return,
     };
-    let container_name = &entry.name;
-    let is_running = entry.state == crate::nspawn::models::ContainerState::Running;
+    let machine_name = &entry.name;
+    let is_running = entry.state == crate::domain::runtime::MachineState::Running;
 
-    let metrics = match data.metrics.get(container_name) {
+    let metrics = match data.metrics.get(machine_name) {
         Some(m) => m,
         None => {
             let waiting = Block::default()

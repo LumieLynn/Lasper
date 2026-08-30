@@ -1,5 +1,5 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{new_command, CommandLogged};
-use crate::nspawn::errors::{NspawnError, Result};
 use std::path::Path;
 
 pub(crate) async fn get_ldconfig_cache() -> Option<String> {

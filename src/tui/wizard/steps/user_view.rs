@@ -1,6 +1,4 @@
-use crate::domain::secret::replace_secret_string;
-use crate::nspawn::errors::NspawnError;
-use crate::nspawn::models::validate_chpasswd_secret;
+use crate::domain::secret::{replace_secret_string, validate_chpasswd_secret};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::inputs::password_box::PasswordBox;
 use crate::tui::widgets::lists::editable_list::EditableList;
@@ -34,10 +32,7 @@ pub struct UserStepView {
 }
 
 fn validate_root_password(password: &str) -> Result<(), String> {
-    validate_chpasswd_secret("Root password", password).map_err(|error| match error {
-        NspawnError::Validation(message) => message,
-        other => other.to_string(),
-    })
+    validate_chpasswd_secret(password).map_err(|error| error.message("Root password"))
 }
 
 impl UserStepView {

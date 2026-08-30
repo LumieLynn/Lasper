@@ -1,8 +1,9 @@
-use super::super::protocol::session::{
+use crate::daemon::server::DaemonServerState;
+use crate::domain::session::SessionSize;
+use crate::ipc::protocol::session::{
     SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionLifecycle,
     WireTerminalAttachmentKind,
 };
-use crate::daemon::server::DaemonServerState;
 use sendfd::SendWithFd;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -39,18 +40,21 @@ pub(crate) fn spawn_journal(
                     return;
                 }
             };
-            if let Err(error) = state.register(session_id, child_pid) {
-                stop_child(&mut child, child_pid);
-                let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
-                return;
-            }
+            let session_process = match state.register(session_id, child_pid) {
+                Ok(process) => process,
+                Err(error) => {
+                    stop_child(&mut child, child_pid);
+                    let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
             let stdout = child.stdout.take().expect("journalctl stdout is piped");
             if let Err(error) =
                 stream.send_with_fd(b"ok", &[stdout.as_raw_fd(), status_reader.as_raw_fd()])
             {
                 log::error!("Daemon: send_with_fd (journalctl) failed: {error}");
                 stop_child(&mut child, child_pid);
-                state.finish(session_id, child_pid);
+                state.finish(session_id, &session_process);
                 return;
             }
             drop(stdout);
@@ -65,7 +69,7 @@ pub(crate) fn spawn_journal(
                         message: format!("wait for journal session: {error}"),
                     },
                 };
-                state.finish(session_id, child_pid);
+                state.finish(session_id, &session_process);
                 write_lifecycle(status_writer, lifecycle);
             });
         }
@@ -88,6 +92,7 @@ pub(crate) fn spawn_terminal(
         name,
         size,
     } = params;
+    let size: SessionSize = size.into_session_size();
     let pair = match native_pty_system().openpty(PtySize {
         rows: size.rows(),
         cols: size.cols(),
@@ -111,7 +116,15 @@ pub(crate) fn spawn_terminal(
     };
     let attachment_kind = attachment.kind();
     let terminal_name = name.to_string();
-    match pair.slave.spawn_command(attachment.into_pty_command()) {
+    let command = match attachment.into_pty_command() {
+        Ok(command) => command,
+        Err(error) => {
+            log::warn!("Daemon: terminal attachment validation failed: {error}");
+            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            return;
+        }
+    };
+    match pair.slave.spawn_command(command) {
         Ok(mut child) => {
             drop(pair.slave);
             let Some(child_pid) = child.process_id() else {
@@ -129,12 +142,15 @@ pub(crate) fn spawn_terminal(
                     return;
                 }
             };
-            if let Err(error) = state.register(session_id, child_pid) {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
-                return;
-            }
+            let session_process = match state.register(session_id, child_pid) {
+                Ok(process) => process,
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                    return;
+                }
+            };
             let master_fd = pair.master.as_raw_fd().expect("PTY master has an fd");
             let response = serde_json::to_vec(&SpawnTerminalResponse {
                 attach_kind: WireTerminalAttachmentKind::from(attachment_kind),
@@ -146,7 +162,7 @@ pub(crate) fn spawn_terminal(
                 log::error!("Daemon: send_with_fd (terminal) failed: {error}");
                 let _ = child.kill();
                 let _ = child.wait();
-                state.finish(session_id, child_pid);
+                state.finish(session_id, &session_process);
                 return;
             }
             drop(pair.master);
@@ -186,7 +202,7 @@ pub(crate) fn spawn_terminal(
                         }
                     }
                 };
-                state.finish(session_id, child_pid);
+                state.finish(session_id, &session_process);
                 write_lifecycle(status_writer, lifecycle);
             });
         }
@@ -222,18 +238,35 @@ fn stop_child(child: &mut std::process::Child, pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::protocol::session::WireSessionId;
+    use crate::ipc::protocol::session::WireSessionId;
 
     #[test]
     fn registry_rejects_duplicate_ids_and_removes_only_the_matching_process() {
         let state = DaemonServerState::default();
         let id = WireSessionId::new(1).unwrap();
-        state.register(id, 10).unwrap();
-        assert!(state.register(id, 11).is_err());
-        state.finish(id, 11);
+        let mut first = crate::adapters::process::new_sync_command("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let first_process = state.register(id, first.id()).unwrap();
+        let mut second = crate::adapters::process::new_sync_command("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let second_id = WireSessionId::new(2).unwrap();
+        let second_process = state.register(second_id, second.id()).unwrap();
+        let duplicate_error = state.register(id, u32::MAX).unwrap_err();
+        assert_eq!(duplicate_error.kind(), std::io::ErrorKind::AlreadyExists);
+        state.finish(id, &second_process);
+        assert_eq!(state.len(), 2);
+        state.finish(id, &first_process);
         assert_eq!(state.len(), 1);
-        state.finish(id, 10);
+        state.finish(second_id, &second_process);
         assert_eq!(state.len(), 0);
+        let _ = first.kill();
+        let _ = first.wait();
+        let _ = second.kill();
+        let _ = second.wait();
     }
 
     #[tokio::test]
@@ -244,12 +277,12 @@ mod tests {
         command.args(["-c", "exec sleep 30"]).process_group(0);
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        state.register(id, pid).unwrap();
+        let process = state.register(id, pid).unwrap();
 
         state.close_and_escalate(id).unwrap();
         let status = child.wait().unwrap();
         assert!(!status.success());
-        state.finish(id, pid);
+        state.finish(id, &process);
         assert_eq!(state.len(), 0);
     }
 }

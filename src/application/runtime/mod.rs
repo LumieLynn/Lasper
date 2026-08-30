@@ -1,10 +1,13 @@
 //! Application-owned runtime discovery and observation.
 
+mod error;
+
+pub use error::{RuntimeError, RuntimeResult};
+
 use super::operations::{ExecutionRoute, RouteFallback};
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::domain::inspection::{MachineProperties, GROUP_MACHINE, GROUP_SYSTEMD_UNIT};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
 use async_trait::async_trait;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
@@ -33,14 +36,14 @@ pub(crate) trait RuntimePort: Send + Sync + 'static {
     fn snapshot_route(&self) -> ExecutionRoute;
     fn inspection_route(&self) -> ExecutionRoute;
     async fn is_available(&self) -> bool;
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>>;
-    async fn snapshot(&self) -> Result<RuntimeSnapshot>;
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
+    async fn snapshot(&self) -> RuntimeResult<RuntimeSnapshot>;
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
-    ) -> Result<MachineProperties>;
-    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
+        entry: &MachineEntry,
+    ) -> RuntimeResult<MachineProperties>;
+    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> RuntimeResult<()>;
 }
 
 pub struct RuntimeCatalog {
@@ -75,7 +78,7 @@ impl RuntimeCatalog {
         }
     }
 
-    pub async fn machines(&self) -> Result<RuntimeQuery<Vec<ContainerEntry>>> {
+    pub async fn machines(&self) -> RuntimeResult<RuntimeQuery<Vec<MachineEntry>>> {
         if let Some(primary) = &self.primary {
             if primary.is_available().await {
                 match primary.list_machines().await {
@@ -96,7 +99,7 @@ impl RuntimeCatalog {
             return self
                 .fallback_machines(
                     primary.snapshot_route(),
-                    NspawnError::Runtime("D-Bus not available".into()),
+                    RuntimeError::unavailable("D-Bus not available"),
                 )
                 .await;
         }
@@ -108,7 +111,7 @@ impl RuntimeCatalog {
         })
     }
 
-    pub async fn snapshot(&self) -> Result<RuntimeQuery<RuntimeSnapshot>> {
+    pub async fn snapshot(&self) -> RuntimeResult<RuntimeQuery<RuntimeSnapshot>> {
         if let Some(primary) = &self.primary {
             if primary.is_available().await {
                 match primary.snapshot().await {
@@ -129,7 +132,7 @@ impl RuntimeCatalog {
             return self
                 .fallback_snapshot(
                     primary.snapshot_route(),
-                    NspawnError::Runtime("D-Bus not available".into()),
+                    RuntimeError::unavailable("D-Bus not available"),
                 )
                 .await;
         }
@@ -144,10 +147,10 @@ impl RuntimeCatalog {
     pub async fn inspect(
         &self,
         name: &str,
-        entry: &ContainerEntry,
-    ) -> Result<RuntimeQuery<MachineProperties>> {
-        let machine =
-            MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
+        entry: &MachineEntry,
+    ) -> RuntimeResult<RuntimeQuery<MachineProperties>> {
+        let machine = MachineName::new(name)
+            .map_err(|error| RuntimeError::invalid_input(error.to_string()))?;
         let mut query = if let Some(primary) = &self.primary {
             if primary.is_available().await {
                 match primary.inspect(&machine, entry).await {
@@ -166,7 +169,7 @@ impl RuntimeCatalog {
                     &machine,
                     entry,
                     primary.inspection_route(),
-                    NspawnError::Runtime("D-Bus not available".into()),
+                    RuntimeError::unavailable("D-Bus not available"),
                 )
                 .await?
             }
@@ -293,8 +296,8 @@ impl RuntimeCatalog {
     async fn fallback_machines(
         &self,
         from: ExecutionRoute,
-        error: NspawnError,
-    ) -> Result<RuntimeQuery<Vec<ContainerEntry>>> {
+        error: RuntimeError,
+    ) -> RuntimeResult<RuntimeQuery<Vec<MachineEntry>>> {
         let to = self.fallback.snapshot_route();
         let reason = fallback_reason(&error);
         log::warn!(
@@ -313,8 +316,8 @@ impl RuntimeCatalog {
     async fn fallback_snapshot(
         &self,
         from: ExecutionRoute,
-        error: NspawnError,
-    ) -> Result<RuntimeQuery<RuntimeSnapshot>> {
+        error: RuntimeError,
+    ) -> RuntimeResult<RuntimeQuery<RuntimeSnapshot>> {
         let to = self.fallback.snapshot_route();
         let reason = fallback_reason(&error);
         log::warn!(
@@ -333,10 +336,10 @@ impl RuntimeCatalog {
     async fn fallback_inspection(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
+        entry: &MachineEntry,
         from: ExecutionRoute,
-        error: NspawnError,
-    ) -> Result<RuntimeQuery<MachineProperties>> {
+        error: RuntimeError,
+    ) -> RuntimeResult<RuntimeQuery<MachineProperties>> {
         let to = self.fallback.inspection_route();
         let reason = fallback_reason(&error);
         log::warn!(
@@ -354,32 +357,28 @@ impl RuntimeCatalog {
     }
 }
 
-fn fallback_reason(error: &NspawnError) -> String {
-    if error.is_polkit_rejection() {
+fn fallback_reason(error: &RuntimeError) -> String {
+    if error.is_permission_denied() {
         "polkit denied access; run with -e to elevate".into()
     } else {
         error.to_string()
     }
 }
 
-fn enrich_properties(properties: &mut MachineProperties, entry: &ContainerEntry) {
-    if !entry.all_addresses.is_empty() {
-        properties.insert(
-            crate::nspawn::models::GROUP_MACHINE,
-            "IPAddresses".into(),
-            entry.all_addresses.join(", "),
-        );
-    }
+fn enrich_properties(properties: &mut MachineProperties, entry: &MachineEntry) {
+    properties.insert(GROUP_MACHINE, "Class".into(), entry.class.to_string());
+    properties.insert(GROUP_MACHINE, "Service".into(), entry.service.to_string());
+    properties.insert(
+        GROUP_MACHINE,
+        "IPAddresses".into(),
+        entry.addresses.property_value(),
+    );
     if let Some(unit_file_state) = properties
-        .get_group(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+        .get_group(GROUP_SYSTEMD_UNIT)
         .and_then(|group| group.get("UnitFileState"))
         .cloned()
     {
-        properties.insert(
-            crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-            "Enabled".into(),
-            unit_file_state,
-        );
+        properties.insert(GROUP_SYSTEMD_UNIT, "Enabled".into(), unit_file_state);
     }
 }
 
@@ -447,14 +446,15 @@ fn spawn_heartbeat(catalog: Arc<RuntimeCatalog>, fallback_active: Arc<AtomicBool
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerState, ImageEntry};
+    use crate::domain::runtime::{ImageEntry, MachineState};
 
-    fn entry(name: &str) -> ContainerEntry {
-        ContainerEntry {
+    fn entry(name: &str) -> MachineEntry {
+        MachineEntry {
             name: name.into(),
-            state: ContainerState::Running,
-            address: None,
-            all_addresses: vec![],
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
+            state: MachineState::Running,
+            addresses: Default::default(),
         }
     }
 
@@ -502,7 +502,7 @@ mod tests {
         primary.expect_is_available().returning(|| true);
         primary
             .expect_snapshot()
-            .returning(|| Err(NspawnError::Runtime("primary failed".into())));
+            .returning(|| Err(RuntimeError::failed("primary failed")));
         let mut fallback = port(ExecutionRoute::LocalCli);
         fallback
             .expect_snapshot()
@@ -534,23 +534,22 @@ mod tests {
         let mut fallback = port(ExecutionRoute::LocalCli);
         fallback.expect_inspect().returning(|_, _| {
             let mut properties = MachineProperties::default();
-            properties.insert(
-                crate::nspawn::models::GROUP_SYSTEMD_UNIT,
-                "UnitFileState".into(),
-                "enabled".into(),
-            );
+            properties.insert(GROUP_SYSTEMD_UNIT, "UnitFileState".into(), "enabled".into());
             Ok(properties)
         });
         let catalog = RuntimeCatalog::new(None, Arc::new(fallback), vec![], None);
         let mut machine = entry("test");
-        machine.all_addresses = vec!["10.0.0.2".into(), "fd00::2".into()];
+        machine.addresses = crate::domain::runtime::MachineAddressObservation::available([
+            "10.0.0.2".into(),
+            "fd00::2".into(),
+        ]);
 
         let query = catalog.inspect("test", &machine).await.unwrap();
 
         assert_eq!(
             query
                 .value
-                .get_group(crate::nspawn::models::GROUP_MACHINE)
+                .get_group(GROUP_MACHINE)
                 .and_then(|group| group.get("IPAddresses"))
                 .map(String::as_str),
             Some("10.0.0.2, fd00::2")
@@ -558,7 +557,7 @@ mod tests {
         assert_eq!(
             query
                 .value
-                .get_group(crate::nspawn::models::GROUP_SYSTEMD_UNIT)
+                .get_group(GROUP_SYSTEMD_UNIT)
                 .and_then(|group| group.get("Enabled"))
                 .map(String::as_str),
             Some("enabled")

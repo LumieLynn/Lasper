@@ -56,7 +56,7 @@ impl Component for HelpOverlay {
             key_row("s", "Start selected image", key_style, desc_style),
             key_row("S", "Poweroff selected machine", key_style, desc_style),
             key_row("D", "Delete focused image", key_style, desc_style),
-            key_row("x / Enter", "Actions / Power menu", key_style, desc_style),
+            key_row("x / Enter", "Open resource actions", key_style, desc_style),
             key_row(
                 "n / a",
                 "New container / Import wizard",

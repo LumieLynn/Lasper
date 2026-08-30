@@ -1,19 +1,28 @@
 #![allow(clippy::type_complexity)]
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ContainerEntry, ContainerState, ImageEntry, ImageName, InspectionCompleteness,
-    InspectionSource, MachineName, MachineProperties, StatusUpdate,
+use crate::domain::inspection::{
+    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
+};
+use crate::domain::machine::{AllowedSignal, MachineName};
+use crate::domain::runtime::{
+    ImageEntry, ImageName, MachineAddressObservation, MachineEntry, MachineState, StatusUpdate,
 };
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
 
 type EnableUnitFilesBody<'a> = (Vec<&'a str>, bool, bool);
+
+const DBUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DBUS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const DBUS_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
     (vec![unit], false, false)
@@ -58,36 +67,173 @@ trait Machine {
 
 #[derive(Clone)]
 pub struct DbusBackend {
-    conn: std::sync::Arc<tokio::sync::OnceCell<Option<Connection>>>,
+    conn: std::sync::Arc<tokio::sync::Mutex<ConnectionCache<Connection>>>,
+}
+
+struct ConnectionCache<T> {
+    current: Option<(u64, T)>,
+    next_generation: u64,
+}
+
+impl<T: Clone> ConnectionCache<T> {
+    fn lease(&self) -> Option<(u64, T)> {
+        self.current
+            .as_ref()
+            .map(|(generation, value)| (*generation, value.clone()))
+    }
+
+    fn insert(&mut self, value: T) -> (u64, T) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
+        self.current = Some((generation, value.clone()));
+        (generation, value)
+    }
+
+    fn invalidate(&mut self, generation: u64) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            self.current = None;
+        }
+    }
+}
+
+impl<T> Default for ConnectionCache<T> {
+    fn default() -> Self {
+        Self {
+            current: None,
+            next_generation: 0,
+        }
+    }
 }
 
 impl DbusBackend {
     pub fn new() -> Self {
         Self {
-            conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
+            conn: std::sync::Arc::new(tokio::sync::Mutex::new(ConnectionCache::default())),
         }
     }
 
     pub async fn connection(&self) -> Option<Connection> {
-        let conn_opt = self
-            .conn
-            .get_or_init(|| async { Connection::system().await.ok() })
-            .await;
-        conn_opt.clone()
+        self.connection_lease()
+            .await
+            .map(|(_, connection)| connection)
     }
 
-    pub async fn manager_proxy(&self) -> Option<ManagerProxy<'static>> {
-        let conn = self.connection().await?;
-        ManagerProxy::new(&conn).await.ok()
+    async fn connection_lease(&self) -> Option<(u64, Connection)> {
+        if let Some(lease) = self.conn.lock().await.lease() {
+            return Some(lease);
+        }
+
+        // Do not hold the cache mutex while waiting for a late or unavailable
+        // system bus. A second cache check closes the parallel-connect race.
+        let connection =
+            match tokio::time::timeout(DBUS_CONNECT_TIMEOUT, Connection::system()).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    log::debug!("System D-Bus connection unavailable: {error}");
+                    return None;
+                }
+                Err(_) => {
+                    log::debug!(
+                        "System D-Bus connection timed out after {}s",
+                        DBUS_CONNECT_TIMEOUT.as_secs()
+                    );
+                    return None;
+                }
+            };
+        let mut cache = self.conn.lock().await;
+        Some(cache.lease().unwrap_or_else(|| cache.insert(connection)))
+    }
+
+    async fn invalidate_connection(&self, generation: u64) {
+        self.conn.lock().await.invalidate(generation);
+    }
+
+    async fn observe_result<T>(&self, generation: u64, result: &zbus::Result<T>) {
+        if result.as_ref().is_err_and(is_connection_error) {
+            self.invalidate_connection(generation).await;
+        }
+    }
+
+    async fn query_with_deadline<T, F>(
+        &self,
+        generation: u64,
+        label: &str,
+        future: F,
+    ) -> zbus::Result<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+    {
+        let result = match tokio::time::timeout(DBUS_QUERY_TIMEOUT, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "D-Bus query {label} exceeded its {}s deadline",
+                    DBUS_QUERY_TIMEOUT.as_secs()
+                );
+                self.invalidate_connection(generation).await;
+                Err(zbus::Error::Failure(format!(
+                    "D-Bus query {label} timed out after {}s",
+                    DBUS_QUERY_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        self.observe_result(generation, &result).await;
+        result
+    }
+
+    async fn mutation_with_deadline<T, F>(
+        &self,
+        generation: u64,
+        label: &str,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+    {
+        match tokio::time::timeout(DBUS_MUTATION_TIMEOUT, future).await {
+            Ok(result) => {
+                self.observe_result(generation, &result).await;
+                result.map_err(NspawnError::Dbus)
+            }
+            Err(_) => {
+                log::warn!(
+                    "D-Bus mutation {label} exceeded its {}s deadline; its outcome is unknown",
+                    DBUS_MUTATION_TIMEOUT.as_secs()
+                );
+                self.invalidate_connection(generation).await;
+                Err(NspawnError::SystemOperationOutcomeUnknown(format!(
+                    "D-Bus mutation {label} timed out after {}s; reconcile host state before retrying",
+                    DBUS_MUTATION_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn manager_proxy(&self) -> Option<(u64, ManagerProxy<'static>)> {
+        let (generation, connection) = self.connection_lease().await?;
+        let result = self
+            .query_with_deadline(generation, "manager proxy", ManagerProxy::new(&connection))
+            .await;
+        result.ok().map(|proxy| (generation, proxy))
     }
 
     pub(crate) async fn remove_image_outcome(&self, image: &ImageName) -> ImageControlOutcome {
-        let Some(proxy) = self.manager_proxy().await else {
+        let Some((generation, proxy)) = self.manager_proxy().await else {
             return ImageControlOutcome::NotAttempted {
                 reason: "systemd-machined D-Bus endpoint is unavailable".into(),
             };
         };
-        match proxy.remove_image(image.as_str()).await {
+        // RemoveImage is intentionally exempt from the short-mutation
+        // deadline: machined reports completion only after its potentially
+        // long-running removal helper exits. The image operation holds its
+        // resource claim while this future is pending.
+        let result = proxy.remove_image(image.as_str()).await;
+        self.observe_result(generation, &result).await;
+        match result {
             Ok(()) => ImageControlOutcome::Removed,
             Err(error) => map_image_control_error(NspawnError::Dbus(error)),
         }
@@ -101,28 +247,36 @@ impl DbusBackend {
         B: serde::Serialize + zvariant::DynamicType,
         R: serde::de::DeserializeOwned + zvariant::Type,
     {
-        let conn = self
-            .connection()
+        let (generation, conn) = self
+            .connection_lease()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let proxy = zbus::proxy::Proxy::new(
-            &conn,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .await
-        .map_err(NspawnError::Dbus)?;
-        let _: R = proxy
-            .call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body)
-            .await
-            .map_err(NspawnError::Dbus)?
-            .ok_or_else(|| {
-                NspawnError::Dbus(zbus::Error::Failure(format!(
-                    "no reply from systemd1.Manager.{}",
-                    method
-                )))
-            })?;
+        let proxy_result = self
+            .query_with_deadline(
+                generation,
+                "systemd1 manager proxy",
+                zbus::proxy::Proxy::new(
+                    &conn,
+                    "org.freedesktop.systemd1",
+                    "/org/freedesktop/systemd1",
+                    "org.freedesktop.systemd1.Manager",
+                ),
+            )
+            .await;
+        let proxy = proxy_result.map_err(NspawnError::Dbus)?;
+        let result = self
+            .mutation_with_deadline(
+                generation,
+                method,
+                proxy.call_with_flags(method, MethodFlags::AllowInteractiveAuth.into(), body),
+            )
+            .await?;
+        let _: R = result.ok_or_else(|| {
+            NspawnError::Dbus(zbus::Error::Failure(format!(
+                "no reply from systemd1.Manager.{}",
+                method
+            )))
+        })?;
         Ok(())
     }
 
@@ -135,40 +289,46 @@ impl DbusBackend {
 
     pub(crate) async fn terminate(&self, name: &str) -> Result<()> {
         let name = parse_machine_name(name)?;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .terminate_machine(name.as_str())
-            .await
-            .map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "TerminateMachine",
+            proxy.terminate_machine(name.as_str()),
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn poweroff(&self, name: &str) -> Result<()> {
         let name = parse_machine_name(name)?;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .kill_machine(name.as_str(), "leader", libc::SIGRTMIN() + 4)
-            .await
-            .map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine(poweroff)",
+            proxy.kill_machine(name.as_str(), "leader", libc::SIGRTMIN() + 4),
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn reboot(&self, name: &str) -> Result<()> {
         let name = parse_machine_name(name)?;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .kill_machine(name.as_str(), "leader", libc::SIGINT)
-            .await
-            .map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine(reboot)",
+            proxy.kill_machine(name.as_str(), "leader", libc::SIGINT),
+        )
+        .await?;
         Ok(())
     }
 
@@ -190,43 +350,47 @@ impl DbusBackend {
             .await
     }
 
-    pub(crate) async fn kill(
-        &self,
-        name: &str,
-        signal: crate::nspawn::models::AllowedSignal,
-    ) -> Result<()> {
+    pub(crate) async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
         let name = parse_machine_name(name)?;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .kill_machine(name.as_str(), "all", signal.as_raw())
-            .await
-            .map_err(NspawnError::Dbus)?;
+        self.mutation_with_deadline(
+            generation,
+            "KillMachine",
+            proxy.kill_machine(name.as_str(), "all", allowed_signal_number(signal)),
+        )
+        .await?;
         Ok(())
     }
 
     pub(crate) async fn remove(&self, name: &str) -> Result<()> {
         if ImageEntry::is_protected_name(name) {
-            return Err(NspawnError::Validation(
-                "the .host image cannot be removed".into(),
-            ));
+            return Err(NspawnError::ProtectedImage(name.into()));
         }
         let name = parse_image_name(name)?;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        proxy
-            .remove_image(name.as_str())
-            .await
-            .map_err(NspawnError::Dbus)?;
+        // See remove_image_outcome: this is an explicitly long operation and
+        // must not turn normal slow removal into a fabricated timeout failure.
+        let result = proxy.remove_image(name.as_str()).await;
+        self.observe_result(generation, &result).await;
+        result.map_err(NspawnError::Dbus)?;
         Ok(())
     }
 
     pub(crate) async fn reload_daemon(&self) -> Result<()> {
         self.call_systemd1::<_, ()>("Reload", &()).await
+    }
+}
+
+fn allowed_signal_number(signal: AllowedSignal) -> i32 {
+    match signal {
+        AllowedSignal::Terminate => libc::SIGTERM,
+        AllowedSignal::Kill => libc::SIGKILL,
     }
 }
 
@@ -236,29 +400,57 @@ impl RuntimeSource for DbusBackend {
         self.connection().await.is_some()
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
-        let proxy = self
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
-        let machines = proxy.list_machines().await.map_err(NspawnError::Dbus)?;
+        let result = self
+            .query_with_deadline(generation, "ListMachines", proxy.list_machines())
+            .await;
+        let machines = result.map_err(NspawnError::Dbus)?;
         let mut entries = Vec::new();
-        for (name, _class, _service, _path) in machines {
+        for (name, class, service, _path) in machines {
             if name == ".host" {
                 continue;
             }
-            let addrs = proxy.get_machine_addresses(&name).await.unwrap_or_default();
-            let all_addresses: Vec<String> = addrs
-                .into_iter()
-                .map(|(family, data)| {
-                    crate::adapters::runtime::formatting::format_ip_address(family, &data)
-                })
-                .collect();
-            entries.push(ContainerEntry {
+            let class = crate::domain::runtime::MachineClass::from(class);
+            let service = crate::domain::runtime::MachineProvider::from(service);
+            let addresses = if class.is_container() {
+                let address_result = self
+                    .query_with_deadline(
+                        generation,
+                        "GetMachineAddresses",
+                        proxy.get_machine_addresses(&name),
+                    )
+                    .await;
+                match address_result {
+                    Ok(addrs) => MachineAddressObservation::available(addrs.into_iter().map(
+                        |(family, data)| {
+                            crate::adapters::runtime::formatting::format_ip_address(family, &data)
+                        },
+                    )),
+                    Err(error) => {
+                        let observation = classify_address_error(error);
+                        log::warn!(
+                            "D-Bus GetMachineAddresses did not provide data for machine '{}': {}",
+                            name,
+                            observation.diagnostic_value()
+                        );
+                        observation
+                    }
+                }
+            } else {
+                MachineAddressObservation::Unsupported(format!(
+                    "address observation is not available for machine class {class}"
+                ))
+            };
+            entries.push(MachineEntry {
                 name,
-                state: ContainerState::Running,
-                address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
-                all_addresses,
+                class,
+                service,
+                state: MachineState::Running,
+                addresses,
             });
         }
         entries.sort();
@@ -266,11 +458,14 @@ impl RuntimeSource for DbusBackend {
     }
 
     async fn list_images(&self) -> Result<Vec<ImageEntry>> {
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
-        let images = proxy.list_images().await.map_err(NspawnError::Dbus)?;
+        let result = self
+            .query_with_deadline(generation, "ListImages", proxy.list_images())
+            .await;
+        let images = result.map_err(NspawnError::Dbus)?;
         let mut images = images
             .into_iter()
             .map(
@@ -288,10 +483,14 @@ impl RuntimeSource for DbusBackend {
         Ok(images)
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
         let name = parse_machine_name(name)?;
-        let conn = self
-            .connection()
+        let (generation, conn) = self
+            .connection_lease()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
 
@@ -301,17 +500,35 @@ impl RuntimeSource for DbusBackend {
         );
 
         // 1) Try machine1 properties (only works for running/registered machines)
-        if let Ok(m1_props) = get_machine1_properties(&conn, &name).await {
-            let group = props.get_group_mut(crate::nspawn::models::GROUP_MACHINE);
+        let machine_result = self
+            .query_with_deadline(
+                generation,
+                "machine properties",
+                get_machine1_properties(&conn, &name),
+            )
+            .await;
+        if let Ok(m1_props) = machine_result {
+            let group = props.get_group_mut(GROUP_MACHINE);
             for (k, v) in m1_props {
                 group.insert(k, v);
             }
         }
 
-        // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
-        if let Ok(sd_props) = get_systemd1_properties(&conn, &name).await {
-            for (k, v) in sd_props {
-                crate::adapters::runtime::formatting::insert_systemd_property(&mut props, k, v);
+        // Only an exact nspawn identity may be associated with the generated
+        // systemd-nspawn@ unit. Foreign machined registrations can share the
+        // same name without referring to that unit.
+        if include_nspawn_unit {
+            let systemd_result = self
+                .query_with_deadline(
+                    generation,
+                    "systemd unit properties",
+                    get_systemd1_properties(&conn, &name),
+                )
+                .await;
+            if let Ok(sd_props) = systemd_result {
+                for (k, v) in sd_props {
+                    crate::adapters::runtime::formatting::insert_systemd_property(&mut props, k, v);
+                }
             }
         }
 
@@ -326,24 +543,33 @@ impl RuntimeSource for DbusBackend {
 
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         use futures_util::StreamExt;
-        let proxy = self
+        let (generation, proxy) = self
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
 
-        let mut new_stream = proxy
-            .receive_machine_new()
-            .await
-            .map_err(NspawnError::Dbus)?;
-        let mut rm_stream = proxy
-            .receive_machine_removed()
-            .await
-            .map_err(NspawnError::Dbus)?;
+        let new_result = self
+            .query_with_deadline(
+                generation,
+                "machine-new subscription",
+                proxy.receive_machine_new(),
+            )
+            .await;
+        let mut new_stream = new_result.map_err(NspawnError::Dbus)?;
+        let removed_result = self
+            .query_with_deadline(
+                generation,
+                "machine-removed subscription",
+                proxy.receive_machine_removed(),
+            )
+            .await;
+        let mut rm_stream = removed_result.map_err(NspawnError::Dbus)?;
 
         loop {
             tokio::select! {
                 event = new_stream.next() => {
                     if event.is_none() {
+                        self.invalidate_connection(generation).await;
                         return Err(NspawnError::Dbus(zbus::Error::Failure(
                             "machine-new signal stream closed".into(),
                         )));
@@ -354,6 +580,7 @@ impl RuntimeSource for DbusBackend {
                 }
                 event = rm_stream.next() => {
                     if event.is_none() {
+                        self.invalidate_connection(generation).await;
                         return Err(NspawnError::Dbus(zbus::Error::Failure(
                             "machine-removed signal stream closed".into(),
                         )));
@@ -364,6 +591,41 @@ impl RuntimeSource for DbusBackend {
                 }
             }
         }
+    }
+}
+
+const NO_PRIVATE_NETWORKING_ERROR: &str = "org.freedesktop.machine1.NoPrivateNetworking";
+const NOT_SUPPORTED_ERROR: &str = "org.freedesktop.DBus.Error.NotSupported";
+
+fn classify_address_error(error: zbus::Error) -> MachineAddressObservation {
+    match error {
+        zbus::Error::MethodError(name, detail, _)
+            if name.as_str() == NO_PRIVATE_NETWORKING_ERROR =>
+        {
+            MachineAddressObservation::NotPrivate(
+                detail.unwrap_or_else(|| "machine does not use private networking".into()),
+            )
+        }
+        zbus::Error::MethodError(name, detail, _) if name.as_str() == NOT_SUPPORTED_ERROR => {
+            MachineAddressObservation::Unsupported(detail.unwrap_or_else(|| {
+                "address observation is supported only for container machines".into()
+            }))
+        }
+        zbus::Error::Unsupported => MachineAddressObservation::Unsupported(
+            "the D-Bus client does not support address observation".into(),
+        ),
+        error => MachineAddressObservation::Unavailable(error.to_string()),
+    }
+}
+
+fn is_connection_error(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::InputOutput(_) | zbus::Error::Handshake(_) => true,
+        zbus::Error::FDO(error) => match error.as_ref() {
+            zbus::fdo::Error::ZBus(error) => is_connection_error(error),
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -444,6 +706,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_connection_failure_does_not_clear_a_new_generation() {
+        let mut cache = ConnectionCache::default();
+        let (stale_generation, _) = cache.insert("stale");
+        let (current_generation, _) = cache.insert("current");
+
+        cache.invalidate(stale_generation);
+
+        assert_eq!(cache.lease(), Some((current_generation, "current")));
+        cache.invalidate(current_generation);
+        assert_eq!(cache.lease(), None);
+    }
+
+    #[test]
+    fn backend_clones_share_one_connection_cache() {
+        let backend = DbusBackend::new();
+        let clone = backend.clone();
+
+        assert!(std::sync::Arc::ptr_eq(&backend.conn, &clone.conn));
+    }
+
+    #[test]
+    fn only_transport_failures_invalidate_connections() {
+        let io_error = zbus::Error::InputOutput(std::sync::Arc::new(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "closed",
+        )));
+
+        assert!(is_connection_error(&io_error));
+        assert!(!is_connection_error(&zbus::Error::Failure(
+            "service unavailable".into()
+        )));
+    }
+
+    #[test]
     fn enable_unit_files_uses_systemd_manager_signature() {
         let body = enable_unit_files_body("systemd-nspawn@test.service");
         let message = zbus::Message::method("/org/freedesktop/systemd1", "EnableUnitFiles")
@@ -469,5 +765,46 @@ mod tests {
         );
         assert!(parse_image_name(".#temporary").is_err());
         assert!(parse_image_name("../escape").is_err());
+    }
+
+    fn method_error(name: &str, detail: &str) -> zbus::Error {
+        let error_name = zbus::names::ErrorName::try_from(name)
+            .expect("test error name")
+            .to_owned()
+            .into();
+        let message = zbus::Message::method("/test", "Failure")
+            .expect("test method message")
+            .build(&())
+            .expect("test message body");
+        zbus::Error::MethodError(error_name, Some(detail.into()), message)
+    }
+
+    #[test]
+    fn address_observation_classifies_provider_limits_without_text_matching() {
+        let no_private = classify_address_error(method_error(
+            NO_PRIVATE_NETWORKING_ERROR,
+            "machine does not use private networking",
+        ));
+        assert!(matches!(
+            no_private,
+            MachineAddressObservation::NotPrivate(reason)
+                if reason == "machine does not use private networking"
+        ));
+
+        let virtual_machine = classify_address_error(method_error(
+            NOT_SUPPORTED_ERROR,
+            "address data is only supported on container machines",
+        ));
+        assert!(matches!(
+            virtual_machine,
+            MachineAddressObservation::Unsupported(reason)
+                if reason == "address data is only supported on container machines"
+        ));
+
+        let failure = classify_address_error(zbus::Error::Failure("temporary failure".into()));
+        assert_eq!(
+            failure,
+            MachineAddressObservation::Unavailable("temporary failure".into())
+        );
     }
 }

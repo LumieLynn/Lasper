@@ -1,11 +1,36 @@
-//! nspawn-specific metrics collection logic.
+//! Presentation metrics collection for currently running machine units.
 
-use crate::nspawn::models::CpuRepresentation;
 use crate::tui::events::AppEvent;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::Sender;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CpuRepresentation {
+    /// Aggregate usage across all cores (e.g., 230% for 2.3 cores).
+    Aggregate,
+    /// Normalize usage to total host capacity.
+    Normalized,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MachineMetrics {
+    /// Time-series for CPU usage: (timestamp offset in seconds, percentage).
+    pub cpu_history: Vec<(f64, f64)>,
+    /// Time-series for RAM usage: (timestamp offset in seconds, megabytes).
+    pub ram_history: Vec<(f64, f64)>,
+}
+
+impl Default for MachineMetrics {
+    fn default() -> Self {
+        Self {
+            cpu_history: Vec::with_capacity(61),
+            ram_history: Vec::with_capacity(61),
+        }
+    }
+}
 
 /// Scans the systemd-nspawn cgroup machine slice to discover active containers.
 async fn discover_containers() -> Vec<(String, PathBuf)> {
@@ -19,11 +44,11 @@ async fn discover_containers() -> Vec<(String, PathBuf)> {
     while let Ok(Some(entry)) = entries.next_entry().await {
         let name_str = entry.file_name().to_string_lossy().to_string();
         if name_str.starts_with("systemd-nspawn@") && name_str.ends_with(".service") {
-            if let Some(container_name) = name_str
+            if let Some(machine_name) = name_str
                 .strip_prefix("systemd-nspawn@")
                 .and_then(|s| s.strip_suffix(".service"))
             {
-                containers.push((container_name.to_string(), entry.path()));
+                containers.push((machine_name.to_string(), entry.path()));
             }
         }
     }

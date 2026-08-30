@@ -1,10 +1,10 @@
 //! Durable deployment crash manifests under the composed trusted state root.
 
+use crate::adapters::error::NspawnError;
 use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
 use crate::application::provisioning::{
     DeploymentCrashManifest, DeploymentId, DeploymentStateError, DeploymentStatePort,
 };
-use crate::nspawn::errors::NspawnError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -380,15 +380,15 @@ fn map_state_error(error: NspawnError) -> DeploymentStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentManifestState, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStage, DeploymentStorage, ResourceLedger,
     };
-    use crate::nspawn::models::ContainerConfig;
 
     fn plan() -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 ..Default::default()
             },

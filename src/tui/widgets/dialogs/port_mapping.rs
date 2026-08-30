@@ -1,4 +1,4 @@
-use crate::nspawn::models::PortForward;
+use crate::domain::provisioning::PortForward;
 use crate::tui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::tui::widgets::inputs::button::Button;

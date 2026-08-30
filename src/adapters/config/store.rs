@@ -1,14 +1,16 @@
+use super::nspawn_spec::NspawnConfigSpec;
 use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
+use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
+use crate::domain::machine::MachineName;
+use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
+use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ApplyStatus, ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
-};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -68,10 +70,10 @@ impl NspawnConfigStore {
 
     pub async fn write_generated(
         &self,
-        config: &ContainerConfig,
+        config: &MachineProvisioningConfig,
         wayland: &[WaylandGrant],
         nvidia_state: Option<&NvidiaState>,
-    ) -> Result<ApplyStatus> {
+    ) -> Result<ResourceApplyStatus> {
         let spec = NspawnConfigSpec::try_from(config)?;
         let result = self
             .execute(NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
@@ -87,7 +89,7 @@ impl NspawnConfigStore {
 
     pub(crate) async fn validate_wayland(
         &self,
-        config: &ContainerConfig,
+        config: &MachineProvisioningConfig,
         grant: &WaylandGrant,
     ) -> Result<()> {
         let spec = NspawnConfigSpec::try_from(config)?;
@@ -101,7 +103,11 @@ impl NspawnConfigStore {
         Ok(())
     }
 
-    pub async fn promote_oci(&self, name: &str, network: OciNetworkMode) -> Result<ApplyStatus> {
+    pub async fn promote_oci(
+        &self,
+        name: &str,
+        network: OciNetworkMode,
+    ) -> Result<ResourceApplyStatus> {
         let result = self
             .execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
                 machine: parse_machine_name(name)?,
@@ -279,7 +285,7 @@ pub(crate) struct UpdateNspawnGpu {
 pub(crate) struct NspawnConfigResult {
     content: Option<NspawnConfigInspection>,
     #[serde(default)]
-    apply: Option<ApplyStatus>,
+    apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     sidecars_cleaned: Option<bool>,
 }
@@ -529,12 +535,12 @@ async fn apply_new_content_at(
     path: &Path,
     content: String,
     mode: Option<u32>,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     let apply = move |existing: Option<String>| {
         Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
         })
     };
     match mode {
@@ -550,7 +556,7 @@ async fn promote_oci_config(
     machines_dir: &Path,
     admin_dir: &Path,
     runtime_dir: &Path,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     promote_oci_config_inner(machine, network, machines_dir, admin_dir, runtime_dir, true).await
 }
 
@@ -560,7 +566,7 @@ async fn promote_new_oci_config(
     machines_dir: &Path,
     admin_dir: &Path,
     runtime_dir: &Path,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     promote_oci_config_inner(
         machine,
         network,
@@ -579,7 +585,7 @@ async fn promote_oci_config_inner(
     admin_dir: &Path,
     runtime_dir: &Path,
     replace_owned: bool,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     validate_oci_promotion_target(machine, admin_dir, runtime_dir).await?;
     let filename = format!("{}.nspawn", machine.as_str());
     let source = machines_dir.join(&filename);
@@ -590,14 +596,14 @@ async fn promote_oci_config_inner(
     validate_content_size(&content)?;
     AsyncLockedWriter::apply_locked_with_mode(&destination, 0o640, move |existing| {
         Ok(match existing {
-            None => (Some(content), ApplyStatus::Created),
-            Some(existing) if existing == content => (None, ApplyStatus::Unchanged),
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
             Some(existing)
                 if replace_owned && existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) =>
             {
-                (Some(content), ApplyStatus::ReplacedOwned)
+                (Some(content), ResourceApplyStatus::ReplacedOwned)
             }
-            Some(_) => (None, ApplyStatus::ConflictUnknownOwner),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
         })
     })
     .await
@@ -830,7 +836,7 @@ async fn write_generated_at(
     wayland: &[WaylandGrant],
     nvidia_state: Option<&NvidiaState>,
     invoking_uid: u32,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     spec.validate()?;
     validate_custom_bind_sources(spec).await?;
     let mut wayland_binds = Vec::new();
@@ -972,21 +978,18 @@ async fn validate_wayland_source(
     let metadata = tokio::fs::metadata(runtime)
         .await
         .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
-    if !metadata.is_dir() || metadata.uid() != invoking_uid {
+    if !metadata.is_dir() || (metadata.uid() != 0 && metadata.uid() != invoking_uid) {
         return Err(NspawnError::Validation(format!(
-            "XDG runtime directory is not owned by uid {invoking_uid}"
+            "Wayland socket directory is not owned by uid {invoking_uid} or root"
         )));
     }
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(NspawnError::Validation(
-            "XDG runtime directory is writable by group or others".into(),
+            "Wayland socket directory is writable by group or others".into(),
         ));
     }
 
-    let display =
-        crate::domain::wayland::WaylandDisplay::new(source.display().as_str().to_string())
-            .map_err(NspawnError::Validation)?;
-    let requested_socket = runtime.join(display.as_str());
+    let requested_socket = runtime.join(source.display().as_str());
     if requested_socket.parent() != Some(runtime) {
         return Err(NspawnError::Validation(
             "Wayland socket entry escaped its runtime directory".into(),
@@ -1057,16 +1060,9 @@ async fn validate_wayland_socket_target(path: &Path) -> Result<ObservedWaylandSo
 
 fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGrant) -> Result<()> {
     let expected_policy = match spec.private_users {
-        Some(crate::nspawn::models::PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
-        None
-        | Some(
-            crate::nspawn::models::PrivateUsersMode::Yes
-            | crate::nspawn::models::PrivateUsersMode::Pick,
-        ) => WaylandBindPolicy::Idmap,
-        Some(
-            crate::nspawn::models::PrivateUsersMode::Managed
-            | crate::nspawn::models::PrivateUsersMode::Identity,
-        ) => {
+        Some(PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
+        None | Some(PrivateUsersMode::Yes | PrivateUsersMode::Pick) => WaylandBindPolicy::Idmap,
+        Some(PrivateUsersMode::Managed | PrivateUsersMode::Identity) => {
             return Err(NspawnError::Validation(
                 "Wayland grant uses an unsupported PrivateUsers mode".into(),
             ));
@@ -1095,8 +1091,9 @@ fn invoking_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::provisioning::CreateUser;
+    use crate::domain::provisioning::{BindMount, IdmapSuffix};
     use crate::domain::wayland::WaylandSocketAccess;
-    use crate::nspawn::models::IdmapSuffix;
 
     struct StubNspawnConfigExecutor;
 
@@ -1165,9 +1162,9 @@ mod tests {
 
     #[test]
     fn write_operation_contains_no_account_execution_data() {
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
-            users: vec![crate::nspawn::models::CreateUser {
+            users: vec![CreateUser {
                 username: "alice".into(),
                 ..Default::default()
             }],
@@ -1312,7 +1309,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
-        assert_eq!(first_apply, ApplyStatus::Created);
+        assert_eq!(first_apply, ResourceApplyStatus::Created);
         let first = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(first.contains("PrivateUsers=no"));
         assert!(first.contains("ResolvConf=bind-host"));
@@ -1345,7 +1342,7 @@ Unknown=preserve-me\n";
         )
         .await
         .unwrap();
-        assert_eq!(second_apply, ApplyStatus::ReplacedOwned);
+        assert_eq!(second_apply, ResourceApplyStatus::ReplacedOwned);
         let second = tokio::fs::read_to_string(&destination).await.unwrap();
         assert!(second.contains("PrivateUsers=no"));
         assert!(second.contains("ResolvConf=off"));
@@ -1506,9 +1503,9 @@ Unknown=preserve-me\n";
     async fn generated_write_is_typed_atomic_and_uses_persistent_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.nspawn");
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
-            hostname: "test-host".into(),
+            guest_hostname: "test-host".into(),
             ..Default::default()
         };
         let spec = NspawnConfigSpec::try_from(&config).unwrap();
@@ -1516,7 +1513,7 @@ Unknown=preserve-me\n";
         let created = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(created, ApplyStatus::Created);
+        assert_eq!(created, ResourceApplyStatus::Created);
 
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Boot=yes"));
@@ -1526,18 +1523,18 @@ Unknown=preserve-me\n";
         let unchanged = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(unchanged, ApplyStatus::Unchanged);
+        assert_eq!(unchanged, ResourceApplyStatus::Unchanged);
 
-        let different = NspawnConfigSpec::try_from(&ContainerConfig {
+        let different = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            hostname: "different".into(),
+            guest_hostname: "different".into(),
             ..Default::default()
         })
         .unwrap();
         let conflict = write_generated_at(&path, &different, &[], None, uzers::get_current_uid())
             .await
             .unwrap();
-        assert_eq!(conflict, ApplyStatus::ConflictUnknownOwner);
+        assert_eq!(conflict, ResourceApplyStatus::ConflictUnknownOwner);
         assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
     }
 
@@ -1581,9 +1578,9 @@ Unknown=preserve-me\n";
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("test.nspawn");
         let missing = directory.path().join("missing");
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            bind_mounts: vec![BindMount {
                 source: missing.to_string_lossy().into_owned(),
                 target: "/srv/data".into(),
                 readonly: false,
@@ -1614,10 +1611,10 @@ Unknown=preserve-me\n";
         let output = directory.path().join("test.nspawn");
         tokio::fs::write(&source, "data").await.unwrap();
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Yes),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            private_users: Some(PrivateUsersMode::Yes),
+            bind_mounts: vec![BindMount {
                 source: symlink.to_string_lossy().into_owned(),
                 target: "/srv/data".into(),
                 readonly: true,
@@ -1763,9 +1760,9 @@ Unknown=preserve-me\n";
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = runtime.path().join("wayland-0");
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1812,9 +1809,9 @@ Unknown=preserve-me\n";
         )
         .unwrap();
         let grant = resolved_wayland_grant(source, WaylandBindPolicy::Idmap);
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1831,9 +1828,9 @@ Unknown=preserve-me\n";
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = runtime.path().join("wayland-0");
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::No),
+            private_users: Some(PrivateUsersMode::No),
             ..Default::default()
         })
         .unwrap();
@@ -1883,9 +1880,9 @@ Unknown=preserve-me\n";
         let _listener = std::os::unix::net::UnixListener::bind(&target_socket).unwrap();
         let symlink_path = runtime.path().join("wayland-0");
         std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1916,9 +1913,9 @@ Unknown=preserve-me\n";
         let runtime = tempfile::tempdir().unwrap();
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(runtime.path().join("wayland-0"), b"not a socket").unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();
@@ -1949,9 +1946,9 @@ Unknown=preserve-me\n";
         drop(listener);
         std::fs::remove_file(&socket_path).unwrap();
         let _replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
-            private_users: Some(crate::nspawn::models::PrivateUsersMode::Pick),
+            private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         })
         .unwrap();

@@ -1,8 +1,10 @@
 //! Deployment trait and orchestrator.
 
+mod bootstrap_args;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 mod capabilities;
+mod image_acquisition;
 pub(crate) mod image_operation;
 pub(crate) mod oci_operation;
 mod orchestrator;
@@ -24,10 +26,11 @@ use capabilities::{
 pub(crate) use capabilities::{
     AppliedResource, ApplyReport, Deployer, DirectProvisioningCapabilities,
 };
+pub(crate) use image_acquisition::{ImageAcquisitionStore, ImageSource};
 pub use image_operation::ImageImportStore;
 pub use oci_operation::OciPullStore;
 pub(crate) use orchestrator::{is_cancelled_outcome, run_deployment};
 pub(crate) use stream::{
-    process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
-    stream_deploy_command,
+    check_deployment_cancellation, process_state_unknown, send_deploy_log, send_deploy_progress,
+    send_deploy_stream_log, stream_deploy_command,
 };

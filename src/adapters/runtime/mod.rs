@@ -8,17 +8,17 @@ pub(crate) mod inspection;
 pub(crate) mod source;
 pub(crate) mod state;
 
+use crate::adapters::error::NspawnError;
 use crate::adapters::runtime::cli::CliBackend;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::elevated::DaemonBackend;
 use crate::adapters::runtime::inspection::MachineInspectionStore;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::operations::ExecutionRoute;
-use crate::application::runtime::{RuntimeCatalog, RuntimePort};
-use crate::nspawn::errors::Result;
-use crate::nspawn::models::{
-    ContainerEntry, MachineName, MachineProperties, RuntimeSnapshot, StatusUpdate,
-};
+use crate::application::runtime::{RuntimeCatalog, RuntimeError, RuntimePort, RuntimeResult};
+use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
 use std::sync::Arc;
 
 pub(crate) fn compose_runtime_catalog(
@@ -44,8 +44,8 @@ pub(crate) fn compose_runtime_catalog(
 
     let primary = match primary_route {
         PrimaryRuntimeRoute::Disabled => None,
-        PrimaryRuntimeRoute::DirectDbus => Some((
-            Arc::new(DbusBackend::new()) as Arc<dyn RuntimeSource>,
+        PrimaryRuntimeRoute::DirectDbus(dbus) => Some((
+            Arc::new(dbus) as Arc<dyn RuntimeSource>,
             ExecutionRoute::DirectDbus,
         )),
         PrimaryRuntimeRoute::ElevatedDbus(daemon) => Some((
@@ -75,7 +75,7 @@ pub(crate) fn compose_runtime_catalog(
 
 pub(crate) enum PrimaryRuntimeRoute {
     Disabled,
-    DirectDbus,
+    DirectDbus(DbusBackend),
     ElevatedDbus(Arc<crate::adapters::elevated::ElevatedDaemon>),
 }
 
@@ -105,26 +105,78 @@ impl RuntimePort for SourceRuntimePort {
         self.source.is_available().await
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
-        self.source.list_machines().await
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
+        self.source.list_machines().await.map_err(map_runtime_error)
     }
 
-    async fn snapshot(&self) -> Result<RuntimeSnapshot> {
-        self.source.snapshot().await
+    async fn snapshot(&self) -> RuntimeResult<RuntimeSnapshot> {
+        self.source.snapshot().await.map_err(map_runtime_error)
     }
 
     async fn inspect(
         &self,
         machine: &MachineName,
-        entry: &ContainerEntry,
-    ) -> Result<MachineProperties> {
+        entry: &MachineEntry,
+    ) -> RuntimeResult<MachineProperties> {
         match &self.inspector {
-            RuntimeInspector::Source => self.source.get_properties(machine.as_str()).await,
-            RuntimeInspector::Store(store) => store.inspect(machine.as_str(), entry).await,
+            RuntimeInspector::Source => self
+                .source
+                .get_properties(machine.as_str(), entry.access().is_nspawn())
+                .await
+                .map_err(map_runtime_error),
+            RuntimeInspector::Store(store) => store
+                .inspect(machine.as_str(), entry)
+                .await
+                .map_err(map_runtime_error),
         }
     }
 
-    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
-        self.source.watch_events(tx).await
+    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> RuntimeResult<()> {
+        self.source
+            .watch_events(tx)
+            .await
+            .map_err(map_runtime_error)
+    }
+}
+
+pub(crate) fn map_runtime_error(error: NspawnError) -> RuntimeError {
+    let message = error.to_string();
+    if error.is_polkit_rejection() {
+        RuntimeError::permission_denied(message)
+    } else {
+        RuntimeError::failed(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::runtime::{MachineClass, MachineProvider, MachineState};
+
+    #[tokio::test]
+    async fn foreign_runtime_identity_disables_nspawn_unit_inspection() {
+        let mut source = crate::adapters::runtime::source::MockRuntimeSource::new();
+        source
+            .expect_get_properties()
+            .withf(|name, include_nspawn_unit| name == "guest-vm" && !include_nspawn_unit)
+            .once()
+            .returning(|_, _| Ok(MachineProperties::default()));
+        let port = SourceRuntimePort {
+            source: Arc::new(source),
+            inspector: RuntimeInspector::Source,
+            snapshot_route: ExecutionRoute::DirectDbus,
+            inspection_route: ExecutionRoute::DirectDbus,
+        };
+        let entry = MachineEntry {
+            name: "guest-vm".into(),
+            class: MachineClass::Vm,
+            service: MachineProvider::Vmspawn,
+            state: MachineState::Running,
+            addresses: Default::default(),
+        };
+
+        port.inspect(&MachineName::new("guest-vm").unwrap(), &entry)
+            .await
+            .unwrap();
     }
 }

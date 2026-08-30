@@ -1,25 +1,65 @@
 use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// A Wayland display basename such as `wayland-0`.
+/// Structured failures for Wayland display, discovery evidence, and grant invariants.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum WaylandValidationError {
+    #[error("invalid Wayland display name: {0:?}")]
+    InvalidDisplayName(String),
+    #[error("Wayland evidence {field} must be absolute: {path:?}")]
+    EvidencePathNotAbsolute { field: &'static str, path: PathBuf },
+    #[error("Wayland socket owner uid {owner_uid} does not match host session uid {session_uid}")]
+    SocketOwnerMismatch { session_uid: u32, owner_uid: u32 },
+    #[error("Wayland target username cannot be empty")]
+    EmptyTargetUsername,
+    #[error("Wayland access requires at least one socket")]
+    NoSocketSelection,
+    #[error(
+        "Wayland sockets assigned to one user must have the same owner uid (expected {expected_uid}, found {actual_uid})"
+    )]
+    MixedSocketOwners { expected_uid: u32, actual_uid: u32 },
+    #[error("Wayland access contains duplicate display {0}")]
+    DuplicateDisplay(WaylandDisplay),
+    #[error("Wayland access contains duplicate socket path {0:?}")]
+    DuplicateSocketPath(PathBuf),
+    #[error("Default Wayland display {0} is not one of the selected sockets")]
+    DefaultDisplayNotSelected(WaylandDisplay),
+    #[error("Resolved Wayland grant has no sockets")]
+    ResolvedGrantWithoutSockets,
+    #[error("Wayland grant does not match DAC permissions for display {0}")]
+    SocketAccessMismatch(WaylandDisplay),
+    #[error("Resolved Wayland grant contains duplicate display {0}")]
+    DuplicateResolvedDisplay(WaylandDisplay),
+    #[error("Resolved Wayland default display {0} is not granted")]
+    DefaultDisplayNotGranted(WaylandDisplay),
+}
+
+/// A safe Wayland display basename such as `wayland-0` or `compositor.sock`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct WaylandDisplay(String);
 
 impl WaylandDisplay {
-    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+    pub fn new(value: impl Into<String>) -> Result<Self, WaylandValidationError> {
         let value = value.into();
-        if !value.starts_with("wayland-")
+        if value.is_empty()
             || value.chars().any(char::is_control)
             || Path::new(&value).file_name().and_then(|name| name.to_str()) != Some(value.as_str())
         {
-            return Err(format!("invalid Wayland display name: {value:?}"));
+            return Err(WaylandValidationError::InvalidDisplayName(value));
         }
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Display for WaylandDisplay {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -105,12 +145,24 @@ impl HostWaylandSocket {
         owner_gid: u32,
         mode: u32,
         revision: SocketRevision,
-    ) -> Result<Self, String> {
-        if !runtime_dir.is_absolute() || !canonical_path.is_absolute() {
-            return Err("Wayland evidence paths must be absolute".into());
+    ) -> Result<Self, WaylandValidationError> {
+        if !runtime_dir.is_absolute() {
+            return Err(WaylandValidationError::EvidencePathNotAbsolute {
+                field: "runtime directory",
+                path: runtime_dir,
+            });
+        }
+        if !canonical_path.is_absolute() {
+            return Err(WaylandValidationError::EvidencePathNotAbsolute {
+                field: "canonical socket path",
+                path: canonical_path,
+            });
         }
         if owner_uid != session_uid {
-            return Err("Wayland socket must be owned by its host session user".into());
+            return Err(WaylandValidationError::SocketOwnerMismatch {
+                session_uid,
+                owner_uid,
+            });
         }
         Ok(Self {
             display,
@@ -204,13 +256,13 @@ impl WaylandGrantIntent {
         target_username: impl Into<String>,
         sources: Vec<HostWaylandSocket>,
         default_display: WaylandDisplay,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WaylandValidationError> {
         let target_username = target_username.into();
         if target_username.is_empty() {
-            return Err("Wayland target username cannot be empty".into());
+            return Err(WaylandValidationError::EmptyTargetUsername);
         }
         if sources.is_empty() {
-            return Err("Wayland access requires at least one socket".into());
+            return Err(WaylandValidationError::NoSocketSelection);
         }
 
         let owner_uid = sources[0].owner_uid();
@@ -218,19 +270,26 @@ impl WaylandGrantIntent {
         let mut paths = std::collections::HashSet::new();
         for source in &sources {
             if source.owner_uid() != owner_uid {
-                return Err(
-                    "Wayland sockets assigned to one user must have the same owner UID".into(),
-                );
+                return Err(WaylandValidationError::MixedSocketOwners {
+                    expected_uid: owner_uid,
+                    actual_uid: source.owner_uid(),
+                });
             }
             if !displays.insert(source.display().clone()) {
-                return Err("Wayland access contains a duplicate display".into());
+                return Err(WaylandValidationError::DuplicateDisplay(
+                    source.display().clone(),
+                ));
             }
             if !paths.insert(source.canonical_path().to_path_buf()) {
-                return Err("Wayland access contains a duplicate socket path".into());
+                return Err(WaylandValidationError::DuplicateSocketPath(
+                    source.canonical_path().to_path_buf(),
+                ));
             }
         }
         if !displays.contains(&default_display) {
-            return Err("Default Wayland display must be one of the selected sockets".into());
+            return Err(WaylandValidationError::DefaultDisplayNotSelected(
+                default_display,
+            ));
         }
 
         Ok(Self {
@@ -348,23 +407,29 @@ impl WaylandGrant {
         sockets: Vec<WaylandSocketGrant>,
         default_display: WaylandDisplay,
         bind_policy: WaylandBindPolicy,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WaylandValidationError> {
         if sockets.is_empty() {
-            return Err("Resolved Wayland grant has no sockets".into());
+            return Err(WaylandValidationError::ResolvedGrantWithoutSockets);
         }
         let mut displays = std::collections::HashSet::new();
         let mut has_default = false;
         for socket in &sockets {
             if socket.source.write_access_for(&target) != Some(socket.socket_access) {
-                return Err("Wayland grant does not match socket DAC permissions".into());
+                return Err(WaylandValidationError::SocketAccessMismatch(
+                    socket.source.display().clone(),
+                ));
             }
             if !displays.insert(socket.source.display().clone()) {
-                return Err("Resolved Wayland grant contains a duplicate display".into());
+                return Err(WaylandValidationError::DuplicateResolvedDisplay(
+                    socket.source.display().clone(),
+                ));
             }
             has_default |= socket.source.display() == &default_display;
         }
         if !has_default {
-            return Err("Resolved Wayland default display is not granted".into());
+            return Err(WaylandValidationError::DefaultDisplayNotGranted(
+                default_display,
+            ));
         }
         Ok(Self {
             target,
@@ -429,9 +494,17 @@ mod tests {
                 .as_str(),
             "wayland-1"
         );
-        for invalid in [r#""../wayland-1""#, r#""wayland-1/other""#, r#""x11-0""#] {
+        for invalid in [r#""../wayland-1""#, r#""wayland-1/other""#, r#""""#] {
             assert!(serde_json::from_str::<WaylandDisplay>(invalid).is_err());
         }
+        assert_eq!(
+            WaylandDisplay::new("compositor.sock").unwrap().as_str(),
+            "compositor.sock"
+        );
+        assert_eq!(
+            WaylandDisplay::new("../wayland-0").unwrap_err(),
+            WaylandValidationError::InvalidDisplayName("../wayland-0".into())
+        );
     }
 
     #[test]
@@ -442,28 +515,40 @@ mod tests {
             ctime_seconds: 3,
             ctime_nanoseconds: 4,
         };
-        assert!(HostWaylandSocket::from_verified_parts(
-            WaylandDisplay::new("wayland-0").unwrap(),
-            "/run/user/1000".into(),
-            "/run/user/1000/wayland-0".into(),
-            1000,
-            1001,
-            1000,
-            0o700,
-            revision,
-        )
-        .is_err());
-        assert!(HostWaylandSocket::from_verified_parts(
-            WaylandDisplay::new("wayland-0").unwrap(),
-            "/run/user/1000".into(),
-            "wayland-0".into(),
-            1000,
-            1000,
-            1000,
-            0o700,
-            revision,
-        )
-        .is_err());
+        assert_eq!(
+            HostWaylandSocket::from_verified_parts(
+                WaylandDisplay::new("wayland-0").unwrap(),
+                "/run/user/1000".into(),
+                "/run/user/1000/wayland-0".into(),
+                1000,
+                1001,
+                1000,
+                0o700,
+                revision,
+            )
+            .unwrap_err(),
+            WaylandValidationError::SocketOwnerMismatch {
+                session_uid: 1000,
+                owner_uid: 1001,
+            }
+        );
+        assert_eq!(
+            HostWaylandSocket::from_verified_parts(
+                WaylandDisplay::new("wayland-0").unwrap(),
+                "/run/user/1000".into(),
+                "wayland-0".into(),
+                1000,
+                1000,
+                1000,
+                0o700,
+                revision,
+            )
+            .unwrap_err(),
+            WaylandValidationError::EvidencePathNotAbsolute {
+                field: "canonical socket path",
+                path: "wayland-0".into(),
+            }
+        );
     }
 
     #[test]
@@ -613,32 +698,44 @@ mod tests {
         assert_eq!(intent.sources().len(), 2);
         assert_eq!(intent.default_display().as_str(), "wayland-1");
 
-        assert!(WaylandGrantIntent::new(
-            "alice",
-            vec![first.clone(), first],
-            WaylandDisplay::new("wayland-0").unwrap(),
-        )
-        .is_err());
-        assert!(WaylandGrantIntent::new(
-            "alice",
-            vec![second],
-            WaylandDisplay::new("wayland-9").unwrap(),
-        )
-        .is_err());
+        assert!(matches!(
+            WaylandGrantIntent::new(
+                "alice",
+                vec![first.clone(), first],
+                WaylandDisplay::new("wayland-0").unwrap(),
+            ),
+            Err(WaylandValidationError::DuplicateDisplay(display))
+                if display.as_str() == "wayland-0"
+        ));
+        assert!(matches!(
+            WaylandGrantIntent::new(
+                "alice",
+                vec![second],
+                WaylandDisplay::new("wayland-9").unwrap(),
+            ),
+            Err(WaylandValidationError::DefaultDisplayNotSelected(display))
+                if display.as_str() == "wayland-9"
+        ));
         assert!(WaylandGrantIntent::new(
             "alice",
             vec![socket("wayland-2", "/run/user/1001/wayland-2", 1001, 3,)],
             WaylandDisplay::new("wayland-2").unwrap(),
         )
         .is_ok());
-        assert!(WaylandGrantIntent::new(
-            "alice",
-            vec![
-                socket("wayland-0", "/run/user/1000/wayland-0", 1000, 1,),
-                socket("wayland-2", "/run/user/1001/wayland-2", 1001, 3,),
-            ],
-            WaylandDisplay::new("wayland-0").unwrap(),
-        )
-        .is_err());
+        assert_eq!(
+            WaylandGrantIntent::new(
+                "alice",
+                vec![
+                    socket("wayland-0", "/run/user/1000/wayland-0", 1000, 1,),
+                    socket("wayland-2", "/run/user/1001/wayland-2", 1001, 3,),
+                ],
+                WaylandDisplay::new("wayland-0").unwrap(),
+            )
+            .unwrap_err(),
+            WaylandValidationError::MixedSocketOwners {
+                expected_uid: 1000,
+                actual_uid: 1001,
+            }
+        );
     }
 }

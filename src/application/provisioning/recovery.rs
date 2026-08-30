@@ -110,15 +110,16 @@ impl DeploymentRecoveryProbe for MemoryDeploymentRecoveryProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource, DeploymentStage,
         DeploymentStorage, ResourceLedger,
     };
-    use crate::nspawn::models::{ContainerConfig, MachineName};
+    use crate::domain::machine::MachineName;
 
     fn manifest() -> DeploymentCrashManifest {
         let plan = DeploymentPlan::build(DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "target".into(),
                 ..Default::default()
             },

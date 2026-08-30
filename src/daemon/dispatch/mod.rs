@@ -4,15 +4,17 @@ mod command;
 pub(crate) mod handler;
 pub(crate) mod query;
 
-use self::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
-use super::server::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
+use self::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use super::server::DaemonServerState;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
-use crate::application::machine_lifecycle::MachineControlRequest;
+use crate::application::machine_lifecycle::{
+    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
+};
 use crate::domain::secret::zeroize_string;
+use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
+use crate::ipc::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
 use std::sync::Arc;
 
 const MAX_RPC_IN_FLIGHT: usize = 64;
@@ -27,7 +29,7 @@ pub(super) async fn run_rpc_request_pump<R, B>(
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
-    B: DaemonDbusExecutor + Clone + 'static,
+    B: DaemonRuntimeQueries + DaemonSystemExecutor + Clone + 'static,
 {
     async fn send(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) -> bool {
         let line = serde_json::to_string(&json).expect("JSON-RPC values are serializable");
@@ -193,14 +195,32 @@ pub(super) fn daemon_resource_claim(
                 .map_err(|error| format!("invalid image_remove request: {error}"))?;
             crate::application::ResourceKey::for_image(&request.image)
         }
-        RpcMethod::MachineControl => {
-            let request: MachineControlRequest = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid machine_control request: {error}"))?;
+        RpcMethod::NspawnLaunch => {
+            let request: NspawnLaunchRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid nspawn_launch request: {error}"))?;
+            if !request.validates_same_name_route() {
+                return Err(
+                    "invalid nspawn_launch request: image and machine names must match".into(),
+                );
+            }
+            crate::application::ResourceKey::for_image(&request.image)
+        }
+        RpcMethod::MachineRuntimeControl => {
+            let request: MachineRuntimeControlRequest =
+                serde_json::from_value(request.params.clone())
+                    .map_err(|error| format!("invalid machine_runtime_control request: {error}"))?;
+            crate::application::ResourceKey::for_machine(&request.machine)
+        }
+        RpcMethod::NspawnUnitControl => {
+            let request: NspawnUnitControlRequest = serde_json::from_value(request.params.clone())
+                .map_err(|error| format!("invalid nspawn_unit_control request: {error}"))?;
             crate::application::ResourceKey::for_machine(&request.machine)
         }
         RpcMethod::SystemOperation => {
-            let operation: SystemOperation = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
+            let wire_operation: crate::ipc::protocol::system::SystemOperation =
+                serde_json::from_value(request.params.clone())
+                    .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
+            let operation = SystemOperation::from(wire_operation);
             match operation {
                 SystemOperation::Start { machine } => {
                     crate::application::ResourceKey::for_machine(&machine)
@@ -216,7 +236,7 @@ pub(super) fn daemon_resource_claim(
     Ok(Some(crate::application::ResourceClaim::exclusive(key)))
 }
 
-pub(super) async fn handle_request<B: DaemonDbusExecutor>(
+pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
     request: RpcRequest,
     dbus: &Option<B>,
     out_tx: &tokio::sync::mpsc::Sender<String>,

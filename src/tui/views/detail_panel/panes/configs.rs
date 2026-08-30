@@ -50,6 +50,11 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
                 ))
             }
         }));
+    } else if let Some(error) = &data.config_error {
+        lines.push(Line::from(Span::styled(
+            format!("Configuration unavailable: {error}"),
+            Style::default().fg(t.error),
+        )));
     } else {
         let name = data.detail_target.name().unwrap_or("?");
         lines.push(Line::from(format!(

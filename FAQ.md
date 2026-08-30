@@ -30,15 +30,15 @@ Select a stopped image and press `D`. The confirmation is bound to that image ev
 
 Lasper removes only its known unit drop-in filenames and removes their directories only when they are empty, so unrelated administrator drop-ins remain. If you run `sudo machinectl remove <name>` manually, systemd still removes the same-name `.nspawn` settings, while Lasper's NVIDIA state and unit drop-ins may remain and require manual cleanup.
 
-## Why can't an OCI-created container start?
+## How does Lasper handle OCI-created containers?
 
-Most OCI images do not contain a bootable systemd userspace. systemd runs their configured entrypoint directly with `Boot=no`; `machinectl login` and `machinectl shell` normally remain unavailable because these operations require services inside the container. When Lasper runs as root or with `lasper -e`, its integrated terminal detects the missing system bus and attaches a fixed `/bin/bash` or `/bin/sh` through the machined leader's namespaces instead.
+Lasper treats OCI support as an experimental application-image path rather than a system-container bootstrap path. It delegates the pull to systemd 260 or newer `importctl pull-oci`, which stores the result as a systemd-managed `.mstack` image. Lasper promotes the generated `.nspawn` configuration to `/etc/systemd/nspawn/`, preserves its entrypoint and execution settings, and adds the network mode selected in the wizard.
 
-Lasper preserves `Boot=` and does not reject `Boot=yes`. If you deliberately install systemd and a system bus in the image, you may switch the trusted `.nspawn` configuration to `Boot=yes`; the image then behaves as a system container rather than a direct-entrypoint application.
+The generated configuration normally uses `Boot=no`, so systemd-nspawn runs the OCI entrypoint directly. The payload is not expected to provide systemd, D-Bus, or login services. Lasper also accepts `Boot=yes`; that mode is useful only after the payload has been prepared with a bootable init system and the services required by a system container.
 
-Mstack images require either `PrivateUsers=managed` or `PrivateUsers=no`. New Lasper imports use `no` because `importctl --system` creates root-owned layers, whereas `managed` expects directory layers imported in systemd's foreign UID/GID range; simply changing the setting to `managed` can expose the payload as `nobody` and make the writable overlay unusable. Use OCI payloads from trusted sources because `no` removes user-namespace isolation. Run Lasper as root or with `lasper -e` so it can preserve the OCI-generated entrypoint configuration in `/etc/systemd/nspawn/`. Existing foreign-owned mstack images may use `managed`, but they require `systemd-nsresourced`, `systemd-mountfsd`, host user-namespace/BPF-LSM support, and a private network mode. Lasper does not silently migrate older imports.
+Lasper's system-scoped OCI import uses `PrivateUsers=no` because the imported layers are root-owned. This removes user-namespace isolation, so OCI payloads should come from trusted sources. Changing the configuration to `PrivateUsers=managed` does not convert those layers into systemd's foreign UID/GID layout and can make their files appear as `nobody` or leave the writable layer unusable. A separately prepared foreign-owned mstack may use `managed`, but it also requires the corresponding systemd resource services, host support, and private networking.
 
-The nsenter terminal does not change those storage semantics. If the image was imported with incompatible ownership, the shell will still see `nobody` ownership or an unusable writable layer; fix the import/configuration pairing rather than treating the terminal path as a remount mechanism.
+The integrated terminal uses `machinectl login` when the container provides a system bus. For a running nspawn container without one, root mode and `lasper -e` can attach a fixed `/bin/bash` or `/bin/sh` through `nsenter`. This fallback only enters the existing namespaces; it does not add an init system, configure networking, or repair incompatible layer ownership.
 
 ## Why does veth or bridge networking not work?
 

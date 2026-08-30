@@ -41,12 +41,20 @@ impl SessionSize {
         })
     }
 
+    pub(crate) fn from_nonzero(cols: NonZeroU16, rows: NonZeroU16) -> Self {
+        Self { cols, rows }
+    }
+
     pub fn cols(self) -> u16 {
         self.cols.get()
     }
 
     pub fn rows(self) -> u16 {
         self.rows.get()
+    }
+
+    pub(crate) fn into_nonzero(self) -> (NonZeroU16, NonZeroU16) {
+        (self.cols, self.rows)
     }
 }
 

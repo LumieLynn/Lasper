@@ -1,18 +1,24 @@
 use super::dispatch::handler::*;
 use super::dispatch::*;
-use super::protocol::session::{self as session, SpawnTerminalParams};
-use super::protocol::*;
 use super::server::logging::*;
-use super::server::transport::*;
 use super::server::*;
+use crate::adapters::process::open_pidfd;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::rootfs::store::RootfsOperation;
-use crate::adapters::system_operation::SystemOperation;
+use crate::adapters::system_operation::{SystemOperation, SystemOperationError};
 use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTransport};
 use crate::application::machine_lifecycle::{
-    MachineAction, MachineControlRequest, MachineControlTransport,
+    MachineControlTransport, MachineRuntimeAction, MachineRuntimeControlRequest,
+    NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineName, MachineProperties};
+use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::{AllowedSignal, MachineName};
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
+use crate::domain::session::SessionSize;
+use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
+use crate::ipc::protocol::*;
+use crate::ipc::transport::*;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,46 +33,50 @@ struct SlowRemoveDbus {
 }
 
 #[async_trait::async_trait]
-impl DaemonDbusExecutor for SlowRemoveDbus {
-    async fn list_machines(&self) -> crate::nspawn::errors::Result<Vec<ContainerEntry>> {
-        Err(crate::nspawn::errors::NspawnError::Runtime(
-            "slow test backend does not list machines".into(),
+impl DaemonRuntimeQueries for SlowRemoveDbus {
+    async fn list_machines(&self) -> crate::application::runtime::RuntimeResult<Vec<MachineEntry>> {
+        Err(crate::application::runtime::RuntimeError::failed(
+            "slow test backend does not list machines",
         ))
     }
 
-    async fn list_images(&self) -> crate::nspawn::errors::Result<Vec<ImageEntry>> {
-        Err(crate::nspawn::errors::NspawnError::Runtime(
-            "slow test backend does not list images".into(),
+    async fn list_images(&self) -> crate::application::runtime::RuntimeResult<Vec<ImageEntry>> {
+        Err(crate::application::runtime::RuntimeError::failed(
+            "slow test backend does not list images",
         ))
     }
 
+    async fn get_properties(
+        &self,
+        _name: &str,
+        _include_nspawn_unit: bool,
+    ) -> crate::application::runtime::RuntimeResult<MachineProperties> {
+        Err(crate::application::runtime::RuntimeError::failed(
+            "slow test backend does not inspect machines",
+        ))
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+}
+
+#[async_trait::async_trait]
+impl DaemonSystemExecutor for SlowRemoveDbus {
     async fn system_operation(
         &self,
         operation: SystemOperation,
-    ) -> crate::nspawn::errors::Result<()> {
+    ) -> crate::adapters::system_operation::SystemOperationResult<()> {
         match operation {
             SystemOperation::RemoveImage { .. } => {
                 self.started.notify_one();
                 self.release.notified().await;
                 Ok(())
             }
-            _ => Err(crate::nspawn::errors::NspawnError::Runtime(
+            _ => Err(SystemOperationError::Backend(
                 "slow test backend only handles image removal".into(),
             )),
         }
-    }
-
-    async fn get_properties(
-        &self,
-        _name: &str,
-    ) -> crate::nspawn::errors::Result<MachineProperties> {
-        Err(crate::nspawn::errors::NspawnError::Runtime(
-            "slow test backend does not inspect machines".into(),
-        ))
-    }
-
-    async fn is_available(&self) -> bool {
-        true
     }
 }
 
@@ -107,7 +117,7 @@ fn rpc_bootstrap_carries_transport_mode_and_session_secret() {
 
 #[test]
 fn rootfs_rpc_uses_the_typed_outbound_envelope() {
-    let operation: RootfsOperation = serde_json::from_value(serde_json::json!({
+    let wire_operation: rootfs_wire::RootfsOperation = serde_json::from_value(serde_json::json!({
         "operation": "set_root_password",
         "params": {
             "target": {"kind": "machine", "machine": "test"},
@@ -115,9 +125,15 @@ fn rootfs_rpc_uses_the_typed_outbound_envelope() {
         }
     }))
     .unwrap();
-    let bytes = OutboundRpcRequest::Rootfs { id: 41, operation }
-        .into_wire_bytes()
-        .unwrap();
+    let operation = RootfsOperation::try_from(wire_operation).unwrap();
+    let bytes = OutboundRpcRequest::General(RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 41,
+        method: "rootfs".into(),
+        params: serde_json::to_value(rootfs_wire::RootfsOperation::from(operation)).unwrap(),
+    })
+    .into_wire_bytes()
+    .unwrap();
     let request: RpcRequest = serde_json::from_slice(bytes.as_slice()).unwrap();
 
     assert_eq!(request.id, 41);
@@ -141,15 +157,15 @@ fn rpc_request_rejects_unknown_fields() {
 }
 
 #[test]
-fn machine_control_rpc_is_typed_and_claims_the_machine_resource() {
+fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
     let request = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
-        method: "machine_control".into(),
-        params: serde_json::to_value(MachineControlRequest {
+        method: "machine_runtime_control".into(),
+        params: serde_json::to_value(MachineRuntimeControlRequest {
             machine: MachineName::new("test-machine").unwrap(),
-            action: MachineAction::Kill {
-                signal: crate::nspawn::models::AllowedSignal::Kill,
+            action: MachineRuntimeAction::Kill {
+                signal: AllowedSignal::Kill,
             },
             transport: MachineControlTransport::Dbus,
         })
@@ -164,7 +180,52 @@ fn machine_control_rpc_is_typed_and_claims_the_machine_resource() {
     );
     let mut invalid = request.params;
     invalid["program"] = serde_json::json!("sh");
-    assert!(serde_json::from_value::<MachineControlRequest>(invalid).is_err());
+    assert!(serde_json::from_value::<MachineRuntimeControlRequest>(invalid).is_err());
+}
+
+#[test]
+fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
+    let image = ImageName::new("test-image").unwrap();
+    let machine = MachineName::new("test-image").unwrap();
+    let expected = Some(crate::application::ResourceClaim::exclusive(
+        crate::application::ResourceKey::Nspawn("test-image".into()),
+    ));
+    let launch = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "nspawn_launch".into(),
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image: image.clone(),
+            machine: machine.clone(),
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+    };
+    let unit = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 2,
+        method: "nspawn_unit_control".into(),
+        params: serde_json::to_value(NspawnUnitControlRequest {
+            machine,
+            action: NspawnUnitAction::Enable,
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+    };
+
+    assert_eq!(daemon_resource_claim(&launch).unwrap(), expected);
+    assert_eq!(daemon_resource_claim(&unit).unwrap(), expected);
+
+    let mismatched = RpcRequest {
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image,
+            machine: MachineName::new("another-machine").unwrap(),
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+        ..launch
+    };
+    assert!(daemon_resource_claim(&mismatched).is_err());
 }
 
 #[tokio::test]
@@ -240,6 +301,11 @@ async fn cli_mode_skips_daemon_dbus_initialization() {
 }
 
 #[tokio::test]
+async fn daemon_keeps_dbus_capability_when_the_bus_is_late() {
+    assert!(initialize_dbus_backend(true).await.is_some());
+}
+
+#[tokio::test]
 async fn slow_remove_image_does_not_block_independent_requests() {
     let slow = SlowRemoveDbus {
         started: Arc::new(tokio::sync::Notify::new()),
@@ -254,7 +320,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
         id: 1,
         method: "image_remove".into(),
         params: serde_json::to_value(ImageRemoveRequest {
-            image: crate::nspawn::models::ImageName::new("slow-image").unwrap(),
+            image: crate::domain::runtime::ImageName::new("slow-image").unwrap(),
             transport: ImageRemoveTransport::Dbus,
         })
         .unwrap(),
@@ -329,7 +395,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let release = slow.release.clone();
     let dbus = Some(slow);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(4);
-    let image = crate::nspawn::models::ImageName::new("slow-image").unwrap();
+    let image = crate::domain::runtime::ImageName::new("slow-image").unwrap();
     let remove = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
@@ -343,10 +409,10 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let start = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 2,
-        method: "machine_control".into(),
-        params: serde_json::to_value(MachineControlRequest {
-            machine: crate::nspawn::models::MachineName::new(image.as_str()).unwrap(),
-            action: MachineAction::Start,
+        method: "nspawn_launch".into(),
+        params: serde_json::to_value(NspawnLaunchRequest {
+            image: ImageName::new(image.as_str()).unwrap(),
+            machine: crate::domain::machine::MachineName::new(image.as_str()).unwrap(),
             transport: MachineControlTransport::Dbus,
         })
         .unwrap(),
@@ -404,19 +470,27 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
 }
 
 #[test]
-fn cli_inspection_rpc_accepts_only_a_typed_machine_name() {
-    let valid: CliInspectMachineRequest =
-        serde_json::from_value(serde_json::json!({"machine": "test-machine"})).unwrap();
+fn machine_inspection_rpc_accepts_only_a_typed_target() {
+    let valid: InspectMachineRequest = serde_json::from_value(serde_json::json!({
+        "machine": "test-machine",
+        "include_nspawn_unit": true
+    }))
+    .unwrap();
     assert_eq!(valid.machine.as_str(), "test-machine");
+    assert!(valid.include_nspawn_unit);
 
-    assert!(serde_json::from_value::<CliInspectMachineRequest>(
-        serde_json::json!({"machine": "../escape"})
+    assert!(serde_json::from_value::<InspectMachineRequest>(
+        serde_json::json!({"machine": "../escape", "include_nspawn_unit": true})
     )
     .is_err());
-    assert!(serde_json::from_value::<CliInspectMachineRequest>(
-        serde_json::json!({"machine": "test-machine", "unexpected": true})
-    )
-    .is_err());
+    assert!(
+        serde_json::from_value::<InspectMachineRequest>(serde_json::json!({
+            "machine": "test-machine",
+            "include_nspawn_unit": false,
+            "unexpected": true
+        }))
+        .is_err()
+    );
 }
 
 #[test]
@@ -499,7 +573,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
         operation: FdOperation::Terminal(SpawnTerminalParams {
             session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
-            size: crate::nspawn::models::TerminalSize::new(120, 40).unwrap(),
+            size: SessionSize::new(120, 40).unwrap().into(),
         }),
     };
 
@@ -515,10 +589,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
         FdOperation::Terminal(params) => {
             assert_eq!(params.session_id.get(), 7);
             assert_eq!(params.name.as_str(), "test-machine");
-            assert_eq!(
-                params.size,
-                crate::nspawn::models::TerminalSize::new(120, 40).unwrap()
-            );
+            assert_eq!(params.size, SessionSize::new(120, 40).unwrap().into());
         }
         _ => panic!("expected spawn_terminal"),
     }
@@ -548,25 +619,21 @@ fn fd_request_rejects_invalid_machine_name_and_terminal_size() {
 }
 
 #[test]
-fn rpc_machine_name_validation_runs_on_daemon_request() {
-    let valid = RpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 1,
-        method: "dbus_get_properties".into(),
-        params: serde_json::json!({"name": "valid-machine"}),
-    };
-    assert_eq!(
-        super::dispatch::query::request_machine_name(&valid.params)
-            .unwrap()
-            .as_str(),
-        "valid-machine"
-    );
+fn dbus_inspection_request_revalidates_machine_name() {
+    let valid: InspectMachineRequest = serde_json::from_value(serde_json::json!({
+        "machine": "valid-machine",
+        "include_nspawn_unit": false
+    }))
+    .unwrap();
+    assert_eq!(valid.machine.as_str(), "valid-machine");
 
-    let invalid = RpcRequest {
-        params: serde_json::json!({"name": "../escape"}),
-        ..valid
-    };
-    assert!(super::dispatch::query::request_machine_name(&invalid.params).is_err());
+    assert!(
+        serde_json::from_value::<InspectMachineRequest>(serde_json::json!({
+            "machine": "../escape",
+            "include_nspawn_unit": false
+        }))
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -619,21 +686,21 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
 #[tokio::test]
 async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     use crate::adapters::provisioning::state::FilesystemDeploymentState;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStatePort, DeploymentStorage,
     };
-    use crate::daemon::protocol::deployment::{
+    use crate::ipc::protocol::deployment::{
         ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     };
-    use crate::nspawn::models::ContainerConfig;
 
     let directory = tempfile::tempdir().unwrap();
     let root =
         crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().join("lasper"));
     let state = FilesystemDeploymentState::new(root.clone());
     let plan = DeploymentPlan::build(DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "recovery-target".into(),
             ..Default::default()
         },

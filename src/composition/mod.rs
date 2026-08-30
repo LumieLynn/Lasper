@@ -37,6 +37,7 @@ pub(crate) fn compose_application_services(
     let daemon = mode.daemon().cloned();
     let local_cmd: Arc<dyn crate::adapters::process::CommandRunner> =
         Arc::new(crate::adapters::process::DefaultCommandRunner);
+    let direct_dbus = crate::adapters::runtime::dbus::DbusBackend::new();
     let host_operations = HostOperationTracker::default();
     let (
         system_operations,
@@ -98,7 +99,7 @@ pub(crate) fn compose_application_services(
     } else {
         match level {
             PermissionLevel::User | PermissionLevel::Root => {
-                crate::adapters::runtime::PrimaryRuntimeRoute::DirectDbus
+                crate::adapters::runtime::PrimaryRuntimeRoute::DirectDbus(direct_dbus.clone())
             }
             PermissionLevel::Elevated => {
                 crate::adapters::runtime::PrimaryRuntimeRoute::ElevatedDbus(
@@ -119,7 +120,7 @@ pub(crate) fn compose_application_services(
     let control_route = select_control_route(level, cli_mode);
     let image_route = match control_route {
         ExecutionRoute::DirectDbus => {
-            crate::adapters::lifecycle::image::ImageLifecycleRoute::DirectDbus
+            crate::adapters::lifecycle::image::ImageLifecycleRoute::DirectDbus(direct_dbus.clone())
         }
         ExecutionRoute::LocalCli => {
             crate::adapters::lifecycle::image::ImageLifecycleRoute::LocalCli
@@ -157,7 +158,7 @@ pub(crate) fn compose_application_services(
     ));
     let machine_route = match control_route {
         ExecutionRoute::DirectDbus => {
-            crate::adapters::lifecycle::machine::MachineLifecycleRoute::DirectDbus
+            crate::adapters::lifecycle::machine::MachineLifecycleRoute::DirectDbus(direct_dbus)
         }
         ExecutionRoute::LocalCli => {
             crate::adapters::lifecycle::machine::MachineLifecycleRoute::LocalCli

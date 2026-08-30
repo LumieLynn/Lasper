@@ -6,6 +6,7 @@ use ratatui::{
 
 use super::super::DetailPane;
 use super::super::DetailPanel;
+use super::properties::summary_properties;
 use crate::tui::app::AppData;
 
 /// Presentation cache for the log pane: pre-computed wrapped-line offsets
@@ -54,7 +55,7 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
             .properties
             .as_ref()
             .map(|p| {
-                p.get_summary()
+                summary_properties(p)
                     .iter()
                     .map(|(_, v)| {
                         v.lines()
@@ -132,14 +133,29 @@ pub fn sync_data_lengths(panel: &mut DetailPanel, data: &mut AppData, width: usi
                     .sum()
             })
             .unwrap_or(0);
-        panel.config_len =
-            content_len.saturating_add(if data.config_path.is_some() { 2 } else { 1 });
+        let error_len = data
+            .config_error
+            .as_deref()
+            .map(|error| {
+                crate::tui::soft_wrap_text(&format!("Configuration unavailable: {error}"), width)
+                    .len()
+            })
+            .unwrap_or(0);
+        panel.config_len = content_len
+            .max(error_len)
+            .saturating_add(if data.config_path.is_some() { 2 } else { 1 });
         data.config_dirty = false;
     }
 
     if data.unit_dirty || width_changed {
         let unit_header_len = usize::from(data.unit_name.is_some()).saturating_mul(2);
-        let unit_properties_len = panel.details_len;
+        let unit_properties_len = match &data.properties {
+            Ok(_) => panel.details_len,
+            Err(error) => {
+                crate::tui::soft_wrap_text(&format!("Unit properties unavailable: {error}"), width)
+                    .len()
+            }
+        };
         let unit_drop_ins_len = data
             .unit_drop_ins
             .iter()

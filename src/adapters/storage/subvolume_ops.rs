@@ -1,9 +1,9 @@
 //! Low-level operations for Lasper-managed Btrfs subvolumes.
 
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
 use crate::adapters::storage::get_filesystem_type;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::domain::machine::MachineName;
 use std::path::{Path, PathBuf};
 
 pub async fn create_subvolume(

@@ -20,9 +20,8 @@ pub struct DeploymentPlan {
 impl DeploymentPlan {
     pub(crate) fn build(request: DeploymentRequest) -> Result<Self, DeploymentError> {
         request.validate()?;
-        let target = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?
-            .machine;
+        let target = MachineName::new(request.config.name.clone())
+            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
         let normalized = serde_json::to_vec(&request).map_err(|error| {
             DeploymentError::failed(format!("Could not normalize deployment plan: {error}"))
         })?;
@@ -57,7 +56,7 @@ impl DeploymentPlan {
             &self.target,
         ))];
         if let super::DeploymentSource::Copy { source_name } = &self.request.source {
-            let source = crate::nspawn::models::ImageName::new(source_name.clone())
+            let source = crate::domain::runtime::ImageName::new(source_name.clone())
                 .expect("validated deployment plan has a valid clone source");
             claims.push(ResourceClaim::shared(ResourceKey::for_image(&source)));
         }
@@ -98,6 +97,7 @@ pub(crate) enum DeploymentResource {
     NvidiaState(MachineName),
     NspawnConfig(MachineName),
     SystemdOverride(MachineName),
+    RootfsHostname(MachineName),
     RootfsAccounts(MachineName),
     RootfsNvidia(MachineName),
     RootfsNetwork(MachineName),
@@ -113,6 +113,7 @@ impl DeploymentResource {
             Self::NvidiaState(_) => "NVIDIA state",
             Self::NspawnConfig(_) => ".nspawn configuration",
             Self::SystemdOverride(_) => "systemd service override",
+            Self::RootfsHostname(_) => "rootfs hostname state",
             Self::RootfsAccounts(_) => "rootfs account state",
             Self::RootfsNvidia(_) => "rootfs NVIDIA state",
             Self::RootfsNetwork(_) => "rootfs network state",
@@ -128,6 +129,7 @@ impl DeploymentResource {
             | Self::NvidiaState(target)
             | Self::NspawnConfig(target)
             | Self::SystemdOverride(target)
+            | Self::RootfsHostname(target)
             | Self::RootfsAccounts(target)
             | Self::RootfsNvidia(target)
             | Self::RootfsNetwork(target) => target,
@@ -526,13 +528,13 @@ impl DeploymentStateSession {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MachineProvisioningConfig;
     use super::*;
     use crate::application::provisioning::{DeploymentSource, DeploymentStorage};
-    use crate::nspawn::models::ContainerConfig;
 
     fn request() -> DeploymentRequest {
         DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 ..Default::default()
             },
@@ -553,7 +555,7 @@ mod tests {
         assert_eq!(first.fingerprint(), second.fingerprint());
 
         let mut changed = request();
-        changed.config.hostname = "different".into();
+        changed.config.guest_hostname = "different".into();
         let changed = DeploymentPlan::build(changed).unwrap();
         assert_ne!(first.fingerprint(), changed.fingerprint());
     }

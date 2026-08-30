@@ -1,9 +1,9 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
-use crate::domain::secret::SecretBytes;
+use crate::domain::provisioning::{validate_login_username, CreateUser};
+use crate::domain::secret::{validate_chpasswd_secret, SecretBytes};
 use crate::domain::wayland::ContainerUserIdentity;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{validate_chpasswd_secret, CreateUser};
 use std::path::Path;
 
 pub(crate) async fn create_user_in_container(
@@ -12,9 +12,11 @@ pub(crate) async fn create_user_in_container(
     password: Option<&str>,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<Vec<String>> {
-    user.validate()?;
+    user.validate()
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
     if let Some(password) = password {
-        validate_chpasswd_secret("user password", password)?;
+        validate_chpasswd_secret(password)
+            .map_err(|error| NspawnError::Validation(error.message("user password")))?;
     }
     let shell = user.login_shell();
 
@@ -61,7 +63,8 @@ pub(crate) async fn resolve_user_identity(
     username: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<ContainerUserIdentity> {
-    crate::nspawn::models::validate_login_username(username)?;
+    validate_login_username(username)
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
     let uid = query_numeric_identity(rootfs, username, "-u", "uid", runner).await?;
     let gid = query_numeric_identity(rootfs, username, "-g", "gid", runner).await?;
     Ok(ContainerUserIdentity {
@@ -129,8 +132,13 @@ async fn run_chpasswd(
     password: &str,
     runner: &dyn RootfsProcessRunner,
 ) -> Result<std::process::Output> {
-    validate_chpasswd_secret("password", password)?;
-    let input = format!("{username}:{password}\n").into_bytes();
+    validate_chpasswd_secret(password)
+        .map_err(|error| NspawnError::Validation(error.message("password")))?;
+    let mut input = Vec::with_capacity(username.len() + password.len() + 2);
+    input.extend_from_slice(username.as_bytes());
+    input.push(b':');
+    input.extend_from_slice(password.as_bytes());
+    input.push(b'\n');
     let output = runner
         .run(
             rootfs,

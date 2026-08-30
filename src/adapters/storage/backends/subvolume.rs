@@ -1,9 +1,9 @@
 //! Btrfs subvolume storage backend.
 
 use super::super::{StorageBackend, StorageType};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::ManagedStorageStore;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::MachineName;
+use crate::domain::machine::MachineName;
 use std::path::PathBuf;
 
 pub struct SubvolumeBackend {

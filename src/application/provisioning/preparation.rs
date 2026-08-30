@@ -1,7 +1,7 @@
 use super::{DeploymentError, DeploymentRequest};
 use crate::domain::nvidia::NvidiaFileCategory;
+use crate::domain::storage::{DiskImageFilesystem, DiskImagePartition};
 use crate::domain::wayland::HostWaylandSocket;
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;

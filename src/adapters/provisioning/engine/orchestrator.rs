@@ -1,16 +1,17 @@
 use super::rollback::{inspect_deployment_sidecars, rollback_apply_report};
 use super::{
-    capture_uncommitted_effects, finish_manifest, persist_applying, persist_cleanup_pending,
-    persist_committed, send_deploy_log, AppliedResource, ApplyReport, Deployer,
-    DirectProvisioningCapabilities,
+    capture_uncommitted_effects, check_deployment_cancellation, finish_manifest, persist_applying,
+    persist_cleanup_pending, persist_committed, send_deploy_log, AppliedResource, ApplyReport,
+    Deployer, DirectProvisioningCapabilities,
 };
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::StorageBackend;
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
-    DeploymentStage, ResourceDisposition,
+    DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
 };
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
+use crate::domain::provisioning::PrivateUsersMode;
 
 /// Runs one deployment using application-owned job state and event transport.
 #[allow(clippy::too_many_arguments)]
@@ -18,7 +19,7 @@ pub(crate) async fn run_deployment(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
-    cfg: ContainerConfig,
+    cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,
@@ -67,7 +68,7 @@ async fn run_deploy_internal(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
-    cfg: ContainerConfig,
+    cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,
@@ -76,7 +77,9 @@ async fn run_deploy_internal(
 ) -> Result<()> {
     let logs = job.event_sender();
     let cancellation = job.cancellation();
-    let target = crate::nspawn::models::NspawnConfigSpec::try_from(&cfg)?.machine;
+    let nspawn_spec = crate::adapters::config::NspawnConfigSpec::try_from(&cfg)?;
+    let target = nspawn_spec.machine;
+    let guest_hostname = nspawn_spec.guest_hostname;
     let system_operations = host.system_operations.clone();
 
     macro_rules! push_log {
@@ -94,12 +97,12 @@ async fn run_deploy_internal(
     let mut external_provider_started = false;
 
     let result = async {
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(&cancellation)?;
         for warning in inspect_deployment_sidecars(&name, &host).await? {
             log::warn!("[AUDIT] [Container: {}] [Step: Preflight] {}", name, warning);
             push_log!(format!("WARNING: {warning}"));
         }
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(&cancellation)?;
 
         if !is_ext {
             log::info!(
@@ -122,7 +125,7 @@ async fn run_deploy_internal(
             storage.create(&name).await?;
             report.record_created(AppliedResource::LocalStorage);
             persist_committed(&job, DeploymentStage::StoragePreparation, &report).await?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
         }
 
         let rootfs = if !is_ext {
@@ -174,12 +177,12 @@ async fn run_deploy_internal(
             )
             .await?;
         persist_committed(&job, DeploymentStage::SourceDeployment, &report).await?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(&cancellation)?;
 
         // 4. Post-deployment configuration
         if !deployer.requires_post_config() {
             log::info!("[AUDIT] [Container: {}] [Step: Config] Skipping post-config for pre-configured clones.", name);
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
             return Ok(());
         }
 
@@ -209,7 +212,7 @@ async fn run_deploy_internal(
                 Err(error) => return Err(error),
             }
             persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
         }
 
         let has_os_layout = host
@@ -221,6 +224,27 @@ async fn run_deploy_internal(
                 .rootfs
                 .supports_nspawn_commands(&actual_rootfs_target)
                 .await?;
+
+        if has_os_layout {
+            push_log!(format!(
+                "Setting guest hostname to {}...",
+                guest_hostname.as_str()
+            ));
+            let rootfs_hostname = DeploymentResource::RootfsHostname(target.clone());
+            persist_applying(
+                &job,
+                DeploymentStage::RootfsMutation,
+                vec![rootfs_hostname.clone()],
+                &report,
+            )
+            .await?;
+            host.rootfs
+                .configure_hostname(&actual_rootfs_target, &guest_hostname)
+                .await?;
+            report.record_typed(rootfs_hostname, ResourceDisposition::Committed);
+            persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
+            check_deployment_cancellation(&cancellation)?;
+        }
 
         let has_account_changes = secrets.has_account_changes();
         if supports_offline_commands {
@@ -243,7 +267,7 @@ async fn run_deploy_internal(
                     log::warn!("{}", warning);
                     push_log!(warning);
                 }
-                cancellation.checkpoint()?;
+                check_deployment_cancellation(&cancellation)?;
             }
 
             let mut users = cfg.users.iter().collect::<Vec<_>>();
@@ -261,11 +285,11 @@ async fn run_deploy_internal(
                     log::warn!("{}", warning);
                     push_log!(warning);
                 }
-                cancellation.checkpoint()?;
+                check_deployment_cancellation(&cancellation)?;
             }
         } else if !has_os_layout {
             log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
-            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping passwords and user creation.".to_string());
+            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping guest hostname, passwords, and user creation.".to_string());
         } else if has_account_changes {
             log::warn!("[AUDIT] [Container: {}] rootfs has no /usr tree required by systemd-nspawn offline commands. Skipping account modifications.", name);
             push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());
@@ -316,7 +340,7 @@ async fn run_deploy_internal(
                     grant.default_display(),
                 )
                 .await?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
             resolved_wayland.push(grant);
         }
         if supports_offline_commands && has_account_changes {
@@ -341,7 +365,7 @@ async fn run_deploy_internal(
             .map_err(|error| {
                 NspawnError::Runtime(format!("NVIDIA CDI discovery failed: {error}"))
             })?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
 
             // Persist the validated snapshot and its profile for lifecycle diffing.
             persist_applying(
@@ -355,19 +379,19 @@ async fn run_deploy_internal(
             report.record_apply(AppliedResource::NvidiaState, state_apply)?;
             persist_committed(&job, DeploymentStage::HostConfiguration, &report).await?;
             match state_apply {
-                ApplyStatus::ReplacedOwned => {
+                ResourceApplyStatus::ReplacedOwned => {
                     let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
                     log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::ConflictUnknownOwner => {
+                ResourceApplyStatus::ConflictUnknownOwner => {
                     let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
                     log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
             }
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
 
             // Write ld.so.conf.d and env vars into rootfs (one-time setup)
             if supports_offline_commands {
@@ -397,10 +421,10 @@ async fn run_deploy_internal(
                 push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
             }
             initial_nvidia_state = Some(state);
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
         }
 
-        if cfg.private_users == Some(crate::nspawn::models::PrivateUsersMode::No) {
+        if cfg.private_users == Some(PrivateUsersMode::No) {
             log::warn!("[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled.", name);
             push_log!("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
         }
@@ -428,7 +452,7 @@ async fn run_deploy_internal(
             .await?;
         report.record_apply(AppliedResource::NspawnConfig, nspawn_apply)?;
         persist_committed(&job, DeploymentStage::RuntimeCommit, &report).await?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(&cancellation)?;
 
         if !cfg.device_binds.is_empty() || cfg.gpu_passthrough_all {
             log::info!(
@@ -454,21 +478,21 @@ async fn run_deploy_internal(
             report.record_apply(AppliedResource::SystemdOverride, override_apply)?;
             persist_committed(&job, DeploymentStage::RuntimeCommit, &report).await?;
             match override_apply {
-                ApplyStatus::ReplacedOwned => {
+                ResourceApplyStatus::ReplacedOwned => {
                     let warning = "Replaced an existing Lasper-owned systemd service drop-in for this deployment.";
                     log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::ConflictUnknownOwner => {
+                ResourceApplyStatus::ConflictUnknownOwner => {
                     let warning = "Preserved the existing systemd service drop-in because Lasper could not prove ownership; requested device allowances were not written there.";
                     log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
                     push_log!(format!("WARNING: {warning}"));
                 }
-                ApplyStatus::Created | ApplyStatus::Unchanged => {}
+                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
             }
 
             system_operations.reload_daemon().await?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(&cancellation)?;
         }
 
         if supports_offline_commands {
@@ -500,11 +524,11 @@ async fn run_deploy_internal(
                         report.record_typed(rootfs_network, ResourceDisposition::Committed);
                     }
                     persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
-                    cancellation.checkpoint()?;
+                    check_deployment_cancellation(&cancellation)?;
                 }
             }
         }
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(&cancellation)?;
         Ok::<(), NspawnError>(())
     }
     .await;

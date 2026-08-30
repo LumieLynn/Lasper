@@ -1,7 +1,8 @@
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
 use crate::adapters::storage::{ImageMountSource, ManagedImageKind};
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition, MachineName};
+use crate::domain::machine::MachineName;
+use crate::domain::storage::{DiskImageFilesystem, DiskImagePartition, MAX_DISK_IMAGE_SIZE_BYTES};
 use serde::Deserialize;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -9,7 +10,15 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+const MAX_IMAGE_BYTES: u64 = MAX_DISK_IMAGE_SIZE_BYTES;
+
+fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => "mkfs.ext4",
+        DiskImageFilesystem::Xfs => "mkfs.xfs",
+        DiskImageFilesystem::Btrfs => "mkfs.btrfs",
+    }
+}
 
 #[derive(Debug)]
 struct ImagePartitionTable {
@@ -81,7 +90,7 @@ pub(crate) async fn create_raw_image(
     runner: &dyn CommandRunner,
 ) -> Result<PathBuf> {
     validate_size_bytes(size_bytes)?;
-    require_tool(filesystem.mkfs_tool())?;
+    require_tool(filesystem_tool(filesystem))?;
     if partition_table {
         require_tool("sfdisk")?;
         require_tool("losetup")?;
@@ -364,10 +373,10 @@ async fn finish_successful_unmount(
 }
 
 pub(crate) fn validate_size_bytes(size_bytes: u64) -> Result<()> {
-    if size_bytes == 0 || size_bytes > crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES {
+    if size_bytes == 0 || size_bytes > MAX_DISK_IMAGE_SIZE_BYTES {
         return Err(NspawnError::Validation(format!(
             "Disk image size must be between 1 byte and {} bytes",
-            crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES
+            MAX_DISK_IMAGE_SIZE_BYTES
         )));
     }
     Ok(())
@@ -566,7 +575,7 @@ async fn run_mkfs(
     filesystem: DiskImageFilesystem,
     runner: &dyn CommandRunner,
 ) -> Result<()> {
-    let program = filesystem.mkfs_tool();
+    let program = filesystem_tool(filesystem);
     let force = match filesystem {
         DiskImageFilesystem::Ext4 => "-F",
         DiskImageFilesystem::Xfs | DiskImageFilesystem::Btrfs => "-f",
@@ -945,7 +954,7 @@ fn partition_number_from_node(device: &str, node: &str) -> Result<DiskImageParti
             "Invalid partition number returned by sfdisk: {node}"
         ))
     })?;
-    DiskImagePartition::new(number)
+    DiskImagePartition::new(number).map_err(|error| NspawnError::Validation(error.to_string()))
 }
 
 fn command_io_error(program: &str, error: std::io::Error) -> NspawnError {

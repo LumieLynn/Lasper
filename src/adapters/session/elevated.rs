@@ -26,12 +26,7 @@ impl SessionPort for ElevatedSessionAdapter {
     ) -> Result<TerminalSessionHandle, SessionError> {
         let spawned = self
             .daemon
-            .spawn_terminal(
-                request.id.get(),
-                request.machine.as_str(),
-                request.size.cols(),
-                request.size.rows(),
-            )
+            .spawn_terminal(request.id.get(), request.machine.as_str(), request.size)
             .await
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
         let lifecycle = spawned.lifecycle;

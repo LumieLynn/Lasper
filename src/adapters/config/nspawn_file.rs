@@ -1,7 +1,7 @@
+use super::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::wayland::WaylandBind;
 use crate::domain::wayland::WaylandBindPolicy;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub struct NspawnConfig {
 /// must not trust inputs blindly in case of restricted-sudo environments.
 #[cfg(test)]
 fn validate_machine_name(name: &str) -> Result<()> {
-    crate::nspawn::models::MachineName::new(name)
+    crate::domain::machine::MachineName::new(name)
         .map(|_| ())
         .map_err(|error| NspawnError::Validation(error.to_string()))
 }
@@ -124,22 +124,23 @@ impl NspawnConfig {
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
-    pub fn is_gpu_enabled(&self) -> bool {
-        let conf = match Ini::load_from_str(&self.content) {
-            Ok(c) => c,
-            Err(_) => return false,
-        };
+    pub fn is_gpu_enabled(&self) -> Result<bool> {
+        let conf = Ini::load_from_str(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!(
+                "failed to parse {} while checking NVIDIA passthrough: {error}",
+                self.path.display()
+            ))
+        })?;
         // Read legacy marker locations as well as the current [Files] location.
         let enabled_msg = "X-Lasper-Nvidia-Enabled";
         let in_files = conf.get_from(Some("Files"), enabled_msg);
         let in_general = conf.get_from(Some("General"), enabled_msg);
         let in_global = conf.get_from(None::<&str>, enabled_msg);
 
-        in_files
+        Ok(in_files
             .or(in_general)
             .or(in_global)
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+            .is_some_and(|value| value.eq_ignore_ascii_case("true")))
     }
 
     /// Scans the raw content for markers and removes the block.
@@ -344,14 +345,14 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
         if spec.privileged {
             exec.set("Capability", "all");
         }
-        if !spec.hostname.is_empty() && spec.hostname != spec.machine.as_str() {
-            exec.set("Hostname", &spec.hostname);
+        if spec.guest_hostname.as_str() != spec.machine.as_str() {
+            exec.set("Hostname", spec.guest_hostname.as_str());
         }
     }
 
     //[Network]
     if let Some(mode) = &spec.network {
-        use crate::nspawn::models::NetworkMode;
+        use crate::domain::provisioning::NetworkMode;
         match mode {
             NetworkMode::Host => {
                 conf.with_section(Some("Network"))
@@ -526,13 +527,14 @@ fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::ContainerConfig;
+    use crate::application::provisioning::MachineProvisioningConfig;
+    use crate::domain::provisioning::{BindMount, IdmapSuffix};
 
-    fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
+    fn nspawn_config_content(cfg: &MachineProvisioningConfig) -> Result<String> {
         let spec = NspawnConfigSpec::try_from(cfg)?;
         nspawn_config_content_from_spec_with_wayland_binds(&spec, &[])
     }
-    use crate::nspawn::models::{NetworkMode, PortForward, PrivateUsersMode};
+    use crate::domain::provisioning::{NetworkMode, PortForward, PrivateUsersMode};
 
     // Validation
 
@@ -585,7 +587,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nX-Lasper-Nvidia-Enabled=true".to_string(),
         };
-        assert!(config.is_gpu_enabled());
+        assert!(config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -594,7 +596,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nX-Lasper-Nvidia-Enabled=false".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -603,7 +605,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "[General]\nSomeOther=value".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -612,7 +614,7 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        assert!(!config.is_gpu_enabled().unwrap());
     }
 
     #[test]
@@ -621,7 +623,9 @@ mod tests {
             path: PathBuf::from("test.nspawn"),
             content: "not valid ini [[[[".to_string(),
         };
-        assert!(!config.is_gpu_enabled());
+        let error = config.is_gpu_enabled().unwrap_err().to_string();
+        assert!(error.contains("failed to parse test.nspawn"));
+        assert!(error.contains("NVIDIA passthrough"));
     }
 
     // Purge nvidia block
@@ -680,7 +684,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_minimal() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             boot: true,
             ..Default::default()
@@ -692,7 +696,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_boot_disabled() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             boot: false,
             ..Default::default()
@@ -703,7 +707,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_host_network() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Host),
             ..Default::default()
@@ -716,7 +720,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_network_veth_with_ports() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Veth),
             port_forwards: vec![
@@ -742,7 +746,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_bridge_mode() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Bridge("br0".into())),
             ..Default::default()
@@ -753,7 +757,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_privileged() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             privileged: true,
             ..Default::default()
@@ -764,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_no() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::No),
             ..Default::default()
@@ -775,7 +779,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_yes() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
@@ -786,7 +790,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_pick() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -797,9 +801,9 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_managed() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
-            network: Some(crate::nspawn::models::NetworkMode::None),
+            network: Some(NetworkMode::None),
             private_users: Some(PrivateUsersMode::Managed),
             ..Default::default()
         };
@@ -809,7 +813,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_identity() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Identity),
             ..Default::default()
@@ -820,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_nvidia_marker() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             nvidia_gpu: true,
             ..Default::default()
@@ -833,7 +837,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_rejects_invalid_name() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "../escape".to_string(),
             ..Default::default()
         };
@@ -908,9 +912,9 @@ mod tests {
 
     #[test]
     fn ordinary_binds_escape_colons_and_backslashes() {
-        use crate::nspawn::models::{BindMount, IdmapSuffix};
+        use crate::domain::provisioning::{BindMount, IdmapSuffix};
 
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             device_binds: vec![r"/dev/dri/by-path/pci-0000:01:00.0-card".into()],
             readonly_binds: vec![r"/srv/driver\archive:current".into()],
@@ -940,7 +944,7 @@ mod tests {
 
     #[test]
     fn all_drm_passthrough_is_explicit_and_deduplicated() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             graphics_acceleration: true,
             gpu_passthrough_all: true,
@@ -955,9 +959,9 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_binds_only_the_verified_socket() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
-            network: Some(crate::nspawn::models::NetworkMode::Veth),
+            network: Some(NetworkMode::Veth),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
         };
@@ -976,7 +980,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_emits_each_selected_display_under_one_user_namespace() {
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1007,14 +1011,14 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_rejects_a_conflicting_custom_bind_target() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
-            bind_mounts: vec![crate::nspawn::models::BindMount {
+            bind_mounts: vec![BindMount {
                 source: "/srv/custom-socket".into(),
                 target: "/run/lasper/wayland/1000/custom".into(),
                 readonly: false,
-                suffix: crate::nspawn::models::IdmapSuffix::Noidmap,
+                suffix: IdmapSuffix::Noidmap,
             }],
             ..Default::default()
         };

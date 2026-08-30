@@ -5,11 +5,12 @@
 //! only by explicit CLI mode so opening the details pane cannot invoke a D-Bus
 //! client indirectly through `machinectl show` or `systemctl show`.
 
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    ContainerEntry, InspectionCompleteness, InspectionSource, MachineName, MachineProperties,
-    GROUP_MACHINE,
+use crate::adapters::error::{NspawnError, Result};
+use crate::domain::inspection::{
+    InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{MachineAddressObservation, MachineEntry, MachineState};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::OpenOptionsExt;
@@ -48,7 +49,7 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
 /// containers. This mirrors `sd_get_machine_names()` at the public API level:
 /// names come from the runtime directory, while `unit:` helper symlinks and
 /// invalid machine names are ignored.
-pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<ContainerEntry>> {
+pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<MachineEntry>> {
     let display_path = path.clone();
     tokio::task::spawn_blocking(move || enumerate_machines(&path))
         .await
@@ -58,7 +59,7 @@ pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<ContainerEntry
         .map_err(|error| NspawnError::Io(display_path, error))
 }
 
-fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
+fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
     let mut machines = Vec::new();
     let directory = match std::fs::read_dir(path) {
         Ok(directory) => directory,
@@ -85,11 +86,28 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
         if MachineName::new(&name).is_err() {
             continue;
         }
-        machines.push(ContainerEntry {
+        let fields = match read_runtime_state(&entry.path(), &name) {
+            Ok(fields) => fields,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                log::warn!(
+                    "Ignoring unreadable machined registration {}: {}",
+                    name,
+                    error
+                );
+                continue;
+            }
+        };
+        let class = fields.get("CLASS").cloned().unwrap_or_default();
+        let service = fields.get("SERVICE").cloned().unwrap_or_default();
+        machines.push(MachineEntry {
             name,
-            state: crate::nspawn::models::ContainerState::Running,
-            address: None,
-            all_addresses: Vec::new(),
+            class: class.into(),
+            service: service.into(),
+            state: MachineState::Running,
+            addresses: MachineAddressObservation::Unsupported(
+                "runtime-state observation does not query addresses".into(),
+            ),
         });
     }
     machines.sort();
@@ -97,7 +115,7 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<ContainerEntry>> {
 }
 
 /// Inspect one machine without contacting either systemd D-Bus service.
-pub async fn inspect(name: &str, entry: &ContainerEntry) -> Result<MachineProperties> {
+pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
     let name =
         MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
     inspect_at(
@@ -111,7 +129,7 @@ pub async fn inspect(name: &str, entry: &ContainerEntry) -> Result<MachineProper
 async fn inspect_at(
     path: PathBuf,
     name: MachineName,
-    entry: &ContainerEntry,
+    entry: &MachineEntry,
 ) -> Result<MachineProperties> {
     let mut properties = entry_properties(entry);
     let display_path = path.display().to_string();
@@ -148,7 +166,7 @@ async fn inspect_at(
     Ok(properties)
 }
 
-fn entry_properties(entry: &ContainerEntry) -> MachineProperties {
+fn entry_properties(entry: &MachineEntry) -> MachineProperties {
     let mut properties = MachineProperties::from_inspection(
         InspectionSource::RuntimeState,
         InspectionCompleteness::RuntimeOnly,
@@ -159,13 +177,13 @@ fn entry_properties(entry: &ContainerEntry) -> MachineProperties {
         "State".into(),
         entry.state.label().to_string(),
     );
-    if !entry.all_addresses.is_empty() {
-        properties.insert(
-            GROUP_MACHINE,
-            "IPAddresses".into(),
-            entry.all_addresses.join(", "),
-        );
-    }
+    properties.insert(GROUP_MACHINE, "Class".into(), entry.class.to_string());
+    properties.insert(GROUP_MACHINE, "Service".into(), entry.service.to_string());
+    properties.insert(
+        GROUP_MACHINE,
+        "IPAddresses".into(),
+        entry.addresses.property_value(),
+    );
     properties
 }
 
@@ -331,15 +349,16 @@ fn insert_runtime_fields(properties: &mut MachineProperties, mut fields: HashMap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::ContainerState;
+    use crate::domain::runtime::MachineState;
     use std::os::unix::fs::symlink;
 
-    fn entry(name: &str) -> ContainerEntry {
-        ContainerEntry {
+    fn entry(name: &str) -> MachineEntry {
+        MachineEntry {
             name: name.into(),
-            state: ContainerState::Running,
-            address: Some("10.0.0.2".into()),
-            all_addresses: vec!["10.0.0.2".into()],
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
+            state: MachineState::Running,
+            addresses: MachineAddressObservation::available(["10.0.0.2".into()]),
         }
     }
 
@@ -405,8 +424,21 @@ mod tests {
     #[tokio::test]
     async fn runtime_enumeration_uses_regular_valid_registration_files_only() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("z-machine"), "NAME=z-machine\n").unwrap();
-        std::fs::write(dir.path().join("a-machine"), "NAME=a-machine\n").unwrap();
+        std::fs::write(
+            dir.path().join("z-machine"),
+            "NAME=z-machine\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("a-machine"),
+            "NAME=a-machine\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("foreign-vm"),
+            "NAME=foreign-vm\nCLASS=vm\nSERVICE=libvirt\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("invalid:name"), "ignored\n").unwrap();
         symlink("a-machine", dir.path().join("unit:machine-a.scope")).unwrap();
         std::fs::create_dir(dir.path().join("directory-entry")).unwrap();
@@ -418,11 +450,17 @@ mod tests {
                 .iter()
                 .map(|machine| machine.name.as_str())
                 .collect::<Vec<_>>(),
-            ["a-machine", "z-machine"]
+            ["a-machine", "foreign-vm", "z-machine"]
         );
         assert!(machines
             .iter()
-            .all(|machine| machine.all_addresses.is_empty()));
+            .all(|machine| matches!(machine.addresses, MachineAddressObservation::Unsupported(_))));
+        let foreign = machines
+            .iter()
+            .find(|machine| machine.name == "foreign-vm")
+            .unwrap();
+        assert_eq!(foreign.class.as_str(), "vm");
+        assert_eq!(foreign.service.as_str(), "libvirt");
     }
 
     #[tokio::test]

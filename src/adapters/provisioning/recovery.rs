@@ -10,7 +10,7 @@ use crate::application::provisioning::{
     DeploymentRecoveryObservation, DeploymentRecoveryProbe, DeploymentResource,
 };
 use crate::application::RuntimeCatalog;
-use crate::nspawn::models::ImageEntry;
+use crate::domain::runtime::ImageEntry;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -124,6 +124,7 @@ pub(crate) async fn probe_manifest_locally(
             },
             DeploymentResource::StorageMount(_)
             | DeploymentResource::RawConfigurationMount(_)
+            | DeploymentResource::RootfsHostname(_)
             | DeploymentResource::RootfsAccounts(_)
             | DeploymentResource::RootfsNvidia(_)
             | DeploymentResource::RootfsNetwork(_) => DeploymentRecoveryEvidence::NotProbeable,

@@ -3,7 +3,9 @@
 use super::operations::{
     OperationRegistry, ResourceClaim, ResourceConflict, ResourceKey, ResourceReservation,
 };
-use crate::nspawn::models::{ContainerEntry, ImageEntry, ImageName, MachineName};
+use crate::application::runtime::RuntimeResult;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -115,7 +117,7 @@ pub enum ImageRemovalOutcome {
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait ImageRuntime: Send + Sync + 'static {
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>, String>;
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -170,11 +172,16 @@ impl ImageRemovalOperation {
 
         let machines = match self.runtime.list_machines().await {
             Ok(machines) => machines,
-            Err(reason) => return ImageRemovalOutcome::Failed { reason, report },
+            Err(reason) => {
+                return ImageRemovalOutcome::Failed {
+                    reason: reason.to_string(),
+                    report,
+                }
+            }
         };
         if machines
             .iter()
-            .any(|entry| entry.name == self.name.as_str() && entry.state.is_running())
+            .any(|entry| entry.name == self.name.as_str())
         {
             return ImageRemovalOutcome::Rejected {
                 rejection: ImageRemovalRejection::AlreadyRunning,
@@ -255,8 +262,9 @@ impl ImageLifecycleService {
         if ImageEntry::is_protected_name(&image.name) {
             return Err(ImageRemovalRejection::Protected);
         }
-        let name =
-            ImageName::new(image.name.clone()).map_err(|_| ImageRemovalRejection::InvalidTarget)?;
+        let name = image
+            .validated_name()
+            .map_err(|_| ImageRemovalRejection::InvalidTarget)?;
         let reservation = self
             .registry
             .reserve_image_removal(
@@ -291,7 +299,7 @@ impl std::fmt::Display for ImageRemovalRejection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::{ContainerState, ImageEntry};
+    use crate::domain::runtime::{ImageEntry, MachineState};
 
     fn image(name: &str) -> ImageEntry {
         ImageEntry {
@@ -320,11 +328,12 @@ mod tests {
     async fn running_machine_is_rejected_before_host_mutations() {
         let mut runtime = MockImageRuntime::new();
         runtime.expect_list_machines().returning(|| {
-            Ok(vec![ContainerEntry {
+            Ok(vec![MachineEntry {
                 name: "ubuntu".into(),
-                state: ContainerState::Running,
-                address: None,
-                all_addresses: vec![],
+                class: MachineEntry::NSPAWN_CLASS.into(),
+                service: MachineEntry::NSPAWN_SERVICE.into(),
+                state: MachineState::Running,
+                addresses: Default::default(),
             }])
         });
         let mut control = MockImageControl::new();

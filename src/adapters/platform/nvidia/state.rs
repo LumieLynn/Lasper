@@ -1,9 +1,10 @@
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
 use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
 use crate::application::image_lifecycle::ArtifactOwnership;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, MachineName};
+use crate::application::provisioning::ResourceApplyStatus;
+use crate::domain::machine::MachineName;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -233,7 +234,11 @@ impl NvidiaStateStore {
         Ok(())
     }
 
-    pub async fn write_initial(&self, name: &str, state: &NvidiaState) -> Result<ApplyStatus> {
+    pub async fn write_initial(
+        &self,
+        name: &str,
+        state: &NvidiaState,
+    ) -> Result<ResourceApplyStatus> {
         let result = self
             .execute(NvidiaStateOperation::WriteInitial(Box::new(
                 WriteNvidiaState {
@@ -354,7 +359,7 @@ pub(crate) struct RemoveNvidiaState {
 pub(crate) struct NvidiaStateResult {
     state: Option<NvidiaState>,
     #[serde(default)]
-    apply: Option<ApplyStatus>,
+    apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     ownership: Option<ArtifactOwnership>,
 }
@@ -470,7 +475,7 @@ fn write_initial_state(
     directory: &TrustedDirectory,
     name: &str,
     state: &NvidiaState,
-) -> Result<ApplyStatus> {
+) -> Result<ResourceApplyStatus> {
     validate_state(state)?;
     let mut state = state.clone();
     state.ownership_marker = Some(NVIDIA_STATE_MARKER.to_string());
@@ -487,14 +492,14 @@ fn write_initial_state(
         match existing {
             None => {
                 directory.write_atomic(name, &content, 0o600)?;
-                Ok(ApplyStatus::Created)
+                Ok(ResourceApplyStatus::Created)
             }
-            Some(existing) if existing.bytes == content => Ok(ApplyStatus::Unchanged),
+            Some(existing) if existing.bytes == content => Ok(ResourceApplyStatus::Unchanged),
             Some(_existing) if ownership == ArtifactOwnership::ProvenOwned => {
                 directory.write_atomic(name, &content, 0o600)?;
-                Ok(ApplyStatus::ReplacedOwned)
+                Ok(ResourceApplyStatus::ReplacedOwned)
             }
-            Some(_) => Ok(ApplyStatus::ConflictUnknownOwner),
+            Some(_) => Ok(ResourceApplyStatus::ConflictUnknownOwner),
         }
     })
 }
@@ -1100,11 +1105,11 @@ mod tests {
 
         assert_eq!(
             write_initial_state(&directory, "test.json", &state).unwrap(),
-            ApplyStatus::Created
+            ResourceApplyStatus::Created
         );
         assert_eq!(
             write_initial_state(&directory, "test.json", &state).unwrap(),
-            ApplyStatus::Unchanged
+            ResourceApplyStatus::Unchanged
         );
         let different = NvidiaState {
             driver_version: "2".into(),
@@ -1112,7 +1117,7 @@ mod tests {
         };
         assert_eq!(
             write_initial_state(&directory, "test.json", &different).unwrap(),
-            ApplyStatus::ReplacedOwned
+            ResourceApplyStatus::ReplacedOwned
         );
         assert_eq!(
             read_state(&directory, "test.json")
@@ -1127,7 +1132,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&unmarked).unwrap()).unwrap();
         assert_eq!(
             write_initial_state(&directory, "test.json", &state).unwrap(),
-            ApplyStatus::ConflictUnknownOwner
+            ResourceApplyStatus::ConflictUnknownOwner
         );
         assert_eq!(
             read_state(&directory, "test.json")

@@ -1,3 +1,4 @@
+pub(crate) mod hostname;
 pub mod network;
 pub(crate) mod nvidia;
 pub(crate) mod process;

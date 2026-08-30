@@ -1,4 +1,4 @@
-pub mod power_menu;
+pub mod resource_action_menu;
 
 pub mod dialogs;
 pub mod display;

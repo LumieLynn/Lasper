@@ -6,9 +6,10 @@
 //! read-only here; machine and image mutations use typed lifecycle requests.
 
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ContainerEntry, ImageEntry, MachineProperties, StatusUpdate};
+use crate::domain::inspection::MachineProperties;
+use crate::domain::runtime::{ImageEntry, MachineEntry, StatusUpdate};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -39,7 +40,7 @@ impl RuntimeSource for DaemonBackend {
             .unwrap_or(false)
     }
 
-    async fn list_machines(&self) -> Result<Vec<ContainerEntry>> {
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>> {
         let json = self
             .call("dbus_list_machines", serde_json::json!({}))
             .await?;
@@ -61,9 +62,20 @@ impl RuntimeSource for DaemonBackend {
         })
     }
 
-    async fn get_properties(&self, name: &str) -> Result<MachineProperties> {
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties> {
         let json = self
-            .call("dbus_get_properties", serde_json::json!({"name": name}))
+            .call(
+                "dbus_get_properties",
+                serde_json::to_value(crate::ipc::protocol::InspectMachineRequest {
+                    machine: crate::domain::machine::MachineName::new(name)
+                        .map_err(|error| NspawnError::Validation(error.to_string()))?,
+                    include_nspawn_unit,
+                })?,
+            )
             .await?;
         serde_json::from_value(json).map_err(|e| {
             NspawnError::Dbus(zbus::Error::Failure(format!(

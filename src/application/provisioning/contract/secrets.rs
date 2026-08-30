@@ -1,8 +1,8 @@
-use crate::domain::secret::SecretString;
-use crate::nspawn::models::ContainerConfig;
+use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use super::config::MachineProvisioningConfig;
 use super::job::DeploymentError;
 use super::request::DeploymentRequest;
 
@@ -21,11 +21,8 @@ impl UserSecret {
 
     fn validate(&self) -> Result<(), DeploymentError> {
         if let Some(password) = &self.password {
-            crate::nspawn::models::validate_chpasswd_secret(
-                "user password",
-                password.expose_secret(),
-            )
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+            validate_chpasswd_secret(password.expose_secret())
+                .map_err(|error| DeploymentError::rejected(error.message("user password")))?;
         }
         Ok(())
     }
@@ -57,13 +54,10 @@ impl DeploymentSecrets {
         }
     }
 
-    pub fn validate_for(&self, config: &ContainerConfig) -> Result<(), DeploymentError> {
+    pub fn validate_for(&self, config: &MachineProvisioningConfig) -> Result<(), DeploymentError> {
         if let Some(password) = &self.root_password {
-            crate::nspawn::models::validate_chpasswd_secret(
-                "root password",
-                password.expose_secret(),
-            )
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+            validate_chpasswd_secret(password.expose_secret())
+                .map_err(|error| DeploymentError::rejected(error.message("root password")))?;
         }
 
         if self.users.len() != config.users.len()

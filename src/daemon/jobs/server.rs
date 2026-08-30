@@ -1,10 +1,5 @@
 //! Daemon-owned provisioning job registry and dedicated event stream.
 
-use super::super::protocol::deployment::{
-    DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
-    DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,
-    MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
-};
 use super::super::server::DaemonServerState;
 use crate::adapters::provisioning::direct::DirectProvisioningExecutor;
 use crate::adapters::trusted_state::TrustedStateRoot;
@@ -15,6 +10,11 @@ use crate::application::provisioning::{
     PlanFingerprint,
 };
 use crate::application::{OperationRegistry, ResourceClaim};
+use crate::ipc::protocol::deployment::{
+    DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
+    DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,
+    MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
+};
 use sendfd::{RecvWithFd, SendWithFd};
 use std::collections::HashMap;
 use std::io::Write;
@@ -45,6 +45,13 @@ struct DeploymentRecord {
     cancellation_requested: bool,
     reservation: Option<ResourceReservation>,
     acknowledged: bool,
+    /// Number of forwarders that still own a stream for this deployment.
+    ///
+    /// A terminal record must remain addressable until its final snapshot has
+    /// been delivered.  The lease is held by the forwarder rather than being
+    /// inferred from the deployment status, because the client can
+    /// acknowledge a terminal record before the stream task has flushed it.
+    stream_leases: usize,
     sequence: u64,
 }
 
@@ -168,6 +175,7 @@ impl DeploymentRegistry {
                 cancellation_requested: false,
                 reservation: Some(reservation),
                 acknowledged: false,
+                stream_leases: 0,
                 sequence,
             },
         );
@@ -336,6 +344,33 @@ impl DeploymentRegistry {
         Ok(())
     }
 
+    pub(crate) fn register_stream(
+        self: &Arc<Self>,
+        deployment_id: DeploymentId,
+    ) -> std::io::Result<DeploymentStreamLease> {
+        let mut inner = self.inner.lock();
+        let record = inner.jobs.get_mut(&deployment_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("deployment {deployment_id} is not registered"),
+            )
+        })?;
+        record.stream_leases = record.stream_leases.saturating_add(1);
+        Ok(DeploymentStreamLease {
+            registry: Arc::clone(self),
+            deployment_id,
+        })
+    }
+
+    fn release_stream(&self, deployment_id: DeploymentId) {
+        let mut inner = self.inner.lock();
+        if let Some(record) = inner.jobs.get_mut(&deployment_id) {
+            record.stream_leases = record.stream_leases.saturating_sub(1);
+        }
+        drop(inner);
+        self.changed.notify_waiters();
+    }
+
     pub(crate) fn release_unresolved(
         &self,
         deployment_id: DeploymentId,
@@ -479,6 +514,7 @@ fn evict_one(inner: &mut DeploymentRegistryInner) -> bool {
                 DeploymentSubmissionStatus::Accepted { deployment_id } => {
                     inner.jobs.get(&deployment_id).is_some_and(|job| {
                         job.acknowledged
+                            && job.stream_leases == 0
                             && matches!(
                                 job.claim,
                                 DeploymentClaimState::Released
@@ -505,8 +541,24 @@ fn evict_one(inner: &mut DeploymentRegistryInner) -> bool {
     true
 }
 
+/// Ownership token held by a deployment stream forwarder.
+///
+/// Dropping the token means the forwarder has either delivered its terminal
+/// frame or lost the client connection.  Only then may the corresponding
+/// terminal record be evicted.
+pub(crate) struct DeploymentStreamLease {
+    registry: Arc<DeploymentRegistry>,
+    deployment_id: DeploymentId,
+}
+
+impl Drop for DeploymentStreamLease {
+    fn drop(&mut self) {
+        self.registry.release_stream(self.deployment_id);
+    }
+}
+
 pub(crate) async fn submit(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &std::os::unix::net::UnixStream,
     params: SubmitDeploymentParams,
     server_state: Arc<DaemonServerState>,
     state_root: TrustedStateRoot,
@@ -517,10 +569,14 @@ pub(crate) async fn submit(
         request,
         secrets,
     } = params;
+    if let Err(error) = crate::adapters::provisioning::validate_nspawn_config(&request.config) {
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
+        return;
+    }
     let plan = match DeploymentPlan::build(request.clone()) {
         Ok(plan) => plan,
         Err(error) => {
-            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
     };
@@ -529,7 +585,7 @@ pub(crate) async fn submit(
         deployment_id,
         plan.fingerprint().clone(),
     ) {
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
     let expects_artifact = matches!(
@@ -543,7 +599,7 @@ pub(crate) async fn submit(
                 server_state
                     .deployments
                     .reject_submission(request_id, error.to_string());
-                let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+                let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
                 return;
             }
         }
@@ -556,7 +612,7 @@ pub(crate) async fn submit(
         server_state
             .deployments
             .reject_submission(request_id, error.to_string());
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
     let (_, secrets) = submission.into_parts();
@@ -567,7 +623,7 @@ pub(crate) async fn submit(
             server_state
                 .deployments
                 .reject_submission(request_id, error.to_string());
-            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
     };
@@ -582,9 +638,18 @@ pub(crate) async fn submit(
         server_state
             .deployments
             .reject_submission(request_id, error.to_string());
-        let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
+
+    let stream_lease = match server_state.deployments.register_stream(deployment_id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let _ = server_state.deployments.cancel(deployment_id);
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
+            return;
+        }
+    };
 
     let executor: Arc<dyn DeploymentExecutor> = Arc::new(DirectProvisioningExecutor::for_daemon(
         state_root,
@@ -600,13 +665,33 @@ pub(crate) async fn submit(
         handle,
         writer,
         Arc::clone(&server_state),
+        stream_lease,
     ));
-    if let Err(error) = stream.send_with_fd(b"ok", &[reader.as_raw_fd()]) {
+    if let Err(error) = send_fd_payload(stream, b"ok".to_vec(), Some(reader)).await {
         log::error!(
             "Daemon: deployment {deployment_id} was accepted but its stream fd could not be delivered: {error}"
         );
     }
-    drop(reader);
+}
+
+async fn send_fd_payload(
+    stream: &std::os::unix::net::UnixStream,
+    payload: Vec<u8>,
+    fd: Option<OwnedFd>,
+) -> std::io::Result<()> {
+    let stream = stream.try_clone()?;
+    tokio::task::spawn_blocking(move || {
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        let result = match fd.as_ref() {
+            Some(fd) => stream.send_with_fd(&payload, &[fd.as_raw_fd()]),
+            None => stream.send_with_fd(&payload, &[]),
+        };
+        let reset = stream.set_write_timeout(None);
+        result?;
+        reset
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("deployment fd worker failed: {error}")))?
 }
 
 async fn receive_artifact_source(
@@ -659,6 +744,7 @@ async fn forward_job_stream(
     handle: crate::application::provisioning::DeploymentJobHandle,
     writer: std::fs::File,
     server_state: Arc<DaemonServerState>,
+    _stream_lease: DeploymentStreamLease,
 ) {
     use tokio::io::AsyncWriteExt;
 
@@ -674,10 +760,15 @@ async fn forward_job_stream(
                         write_frame(&mut writer, DeploymentStreamFrame::Event(event)).await;
                 }
             }
-            let snapshot = server_state
+            let Some(snapshot) = server_state
                 .deployments
                 .update_status(deployment_id, current)
-                .expect("registered deployment remains until terminal acknowledgment");
+            else {
+                log::warn!(
+                    "Deployment {deployment_id} disappeared before its terminal stream frame"
+                );
+                return;
+            };
             if stream_open {
                 let _ = write_frame(&mut writer, DeploymentStreamFrame::Snapshot(snapshot)).await;
             }
@@ -701,10 +792,13 @@ async fn forward_job_stream(
                     let failed = DeploymentStatus::ReconciliationRequired(
                         "daemon deployment status channel closed before a terminal result".into(),
                     );
-                    let snapshot = server_state
-                        .deployments
-                        .update_status(deployment_id, failed)
-                        .expect("registered deployment remains while its stream is active");
+                    let Some(snapshot) = server_state.deployments.update_status(deployment_id, failed)
+                    else {
+                        log::warn!(
+                            "Deployment {deployment_id} disappeared while reporting a closed status channel"
+                        );
+                        return;
+                    };
                     if stream_open {
                         let _ = write_frame(
                             &mut writer,
@@ -714,10 +808,15 @@ async fn forward_job_stream(
                     return;
                 }
                 let current = status.borrow().clone();
-                let snapshot = server_state
+                let Some(snapshot) = server_state
                     .deployments
                     .update_status(deployment_id, current.clone())
-                    .expect("registered deployment remains while its stream is active");
+                else {
+                    log::warn!(
+                        "Deployment {deployment_id} disappeared while forwarding status"
+                    );
+                    return;
+                };
                 if !current.is_finished() && stream_open {
                     stream_open = write_frame(
                         &mut writer,
@@ -773,16 +872,16 @@ fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentEvent, DeploymentRequest, DeploymentSource, DeploymentStorage,
     };
     use crate::domain::machine::MachineName;
-    use crate::nspawn::models::ContainerConfig;
     use tokio::io::AsyncBufReadExt;
 
     fn plan(target: &str) -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: target.into(),
                 ..Default::default()
             },
@@ -1103,6 +1202,44 @@ mod tests {
             .resolve_submission(DeploymentRequestId::from_u128(1))
             .is_err());
         assert!(registry.snapshot(DeploymentId::from_u128(101)).is_err());
+    }
+
+    #[test]
+    fn active_stream_lease_protects_terminal_record_from_eviction() {
+        let registry = Arc::new(DeploymentRegistry::default());
+        let operations = OperationRegistry::new();
+        for value in 1..=MAX_DEPLOYMENT_RECORDS as u128 {
+            let request_id = DeploymentRequestId::from_u128(value);
+            let deployment_id = DeploymentId::from_u128(value + 10_000);
+            let target = MachineName::new(format!("leased-evict-{value}"))
+                .expect("test target is a valid machine name");
+            register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
+            registry.update_status(deployment_id, DeploymentStatus::Succeeded);
+            registry.acknowledge_submission(request_id).unwrap();
+            registry.acknowledge(deployment_id).unwrap();
+        }
+
+        let first = DeploymentId::from_u128(10_001);
+        let lease = registry.register_stream(first).unwrap();
+        let fingerprint = plan("leased-replacement").fingerprint().clone();
+        registry
+            .reserve_submission(
+                DeploymentRequestId::from_u128(20_000),
+                DeploymentId::from_u128(20_001),
+                fingerprint.clone(),
+            )
+            .unwrap();
+        assert!(registry.snapshot(first).is_ok());
+
+        drop(lease);
+        registry
+            .reserve_submission(
+                DeploymentRequestId::from_u128(20_002),
+                DeploymentId::from_u128(20_003),
+                fingerprint,
+            )
+            .unwrap();
+        assert!(registry.snapshot(first).is_err());
     }
 
     #[tokio::test]

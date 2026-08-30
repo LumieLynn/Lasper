@@ -1,4 +1,5 @@
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
+use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::platform::nvidia::NvidiaStateStore;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::rootfs::RootfsStore;
@@ -6,10 +7,9 @@ use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentJobContext,
-    DeploymentResource, DeploymentStage, ResourceDisposition, ResourceLedger,
+    DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceApplyStatus,
+    ResourceDisposition, ResourceLedger,
 };
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 
 /// Direct host capabilities used by the provisioning implementation.
 ///
@@ -113,15 +113,15 @@ impl ApplyReport {
     pub(crate) fn record_apply(
         &mut self,
         resource: AppliedResource,
-        status: ApplyStatus,
+        status: ResourceApplyStatus,
     ) -> Result<()> {
         match status {
-            ApplyStatus::Created => {
+            ResourceApplyStatus::Created => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::Created);
                 Ok(())
             }
-            ApplyStatus::Unchanged => {
+            ResourceApplyStatus::Unchanged => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
@@ -130,7 +130,7 @@ impl ApplyReport {
                 }
                 Ok(())
             }
-            ApplyStatus::ReplacedOwned => {
+            ResourceApplyStatus::ReplacedOwned => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::Adopted);
                 if resource == AppliedResource::NspawnConfig {
@@ -146,7 +146,7 @@ impl ApplyReport {
                 // restoring stale state for a target that was not deployed.
                 Ok(())
             }
-            ApplyStatus::ConflictUnknownOwner => {
+            ResourceApplyStatus::ConflictUnknownOwner => {
                 self.ledger
                     .record(self.typed(resource), ResourceDisposition::PreExisting);
                 if resource == AppliedResource::NspawnConfig {
@@ -233,6 +233,7 @@ impl ApplyReport {
         for resource in [
             DeploymentResource::StorageMount(self.target.clone()),
             DeploymentResource::RawConfigurationMount(self.target.clone()),
+            DeploymentResource::RootfsHostname(self.target.clone()),
             DeploymentResource::RootfsAccounts(self.target.clone()),
             DeploymentResource::RootfsNvidia(self.target.clone()),
             DeploymentResource::RootfsNetwork(self.target.clone()),
@@ -335,7 +336,7 @@ pub(crate) trait Deployer: Send + Sync {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &ContainerConfig,
+        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

@@ -1,8 +1,8 @@
 use super::DeploymentError;
+use crate::domain::provisioning::PrivateUsersMode;
 use crate::domain::wayland::{
     ContainerUserIdentity, WaylandBindPolicy, WaylandGrant, WaylandGrantIntent,
 };
-use crate::nspawn::models::PrivateUsersMode;
 
 pub(crate) fn validate_wayland_intent(
     intent: &WaylandGrantIntent,
@@ -55,7 +55,7 @@ pub(crate) fn resolve_wayland_grant(
         intent.default_display().clone(),
         resolve_wayland_bind_policy(private_users)?,
     )
-    .map_err(DeploymentError::rejected)
+    .map_err(|error| DeploymentError::rejected(error.to_string()))
 }
 
 pub(crate) fn resolve_wayland_bind_policy(

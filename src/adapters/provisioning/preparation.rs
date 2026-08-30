@@ -4,12 +4,20 @@ use crate::application::provisioning::{
     InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort, StorageBackendKind,
     UnclassifiedNvidiaFile,
 };
-use crate::nspawn::models::DiskImageFilesystem;
+use crate::domain::storage::DiskImageFilesystem;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(crate) struct NspawnProvisioningPreparation;
+
+fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => "mkfs.ext4",
+        DiskImageFilesystem::Xfs => "mkfs.xfs",
+        DiskImageFilesystem::Btrfs => "mkfs.btrfs",
+    }
+}
 
 #[async_trait]
 impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
@@ -50,8 +58,9 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             .iter()
             .copied()
             .map(|filesystem| {
-                let available = tool_available(filesystem.mkfs_tool());
-                tools.insert(filesystem.mkfs_tool().to_string(), available);
+                let tool = filesystem_tool(filesystem);
+                let available = tool_available(tool);
+                tools.insert(tool.to_string(), available);
                 (filesystem, available)
             })
             .collect();
@@ -227,11 +236,14 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 crate::paths::machine_raw_image(&request.config.name),
             ),
         };
+        let guest_hostname = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
+            .map(|spec| spec.guest_hostname.into_string())
+            .unwrap_or_else(|_| request.config.guest_hostname.clone());
         let mut content = format!(
-            " [DEPLOYMENT PREVIEW - {}]\n\n Storage: {storage_label} ({})\n Hostname: {}\n",
+            " [DEPLOYMENT PREVIEW - {}]\n\n Storage: {storage_label} ({})\n Guest hostname: {}\n",
             request.config.name,
             storage_path.display(),
-            request.config.hostname,
+            guest_hostname,
         );
         if let DeploymentSource::Bootstrap(spec) = &request.source {
             if spec.inherits_default_packages() {
@@ -255,7 +267,7 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
         }
         let rendered = (|| -> Result<String, String> {
             request.validate().map_err(|error| error.to_string())?;
-            let spec = crate::nspawn::models::NspawnConfigSpec::try_from(&request.config)
+            let spec = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
                 .map_err(|error| error.to_string())?;
             let wayland_binds = if request.wayland.is_empty() {
                 Vec::new()
@@ -306,10 +318,12 @@ fn tool_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
+    use crate::domain::provisioning::CreateUser;
+    use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
     use crate::domain::wayland::{
         HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
     };
-    use crate::nspawn::models::{ContainerConfig, CreateUser, NetworkMode, PrivateUsersMode};
 
     fn request(private_users: PrivateUsersMode) -> DeploymentRequest {
         let source = HostWaylandSocket::from_verified_parts(
@@ -329,7 +343,7 @@ mod tests {
         )
         .unwrap();
         DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 private_users: Some(private_users),
                 network: Some(NetworkMode::Veth),

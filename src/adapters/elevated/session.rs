@@ -1,12 +1,11 @@
 use super::ElevatedDaemon;
-use crate::daemon::protocol::session::{
-    CloseSessionParams, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
-    WireSessionId, WireSessionLifecycle,
-};
-use crate::daemon::protocol::FdOperation;
 use crate::domain::machine::MachineName;
-use crate::domain::session::{SessionLifecycle, TerminalAttachmentKind};
-use crate::nspawn::models::TerminalSize;
+use crate::domain::session::{SessionLifecycle, SessionSize, TerminalAttachmentKind};
+use crate::ipc::protocol::session::{
+    CloseSessionParams, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
+    WireSessionId, WireSessionLifecycle, WireTerminalSize,
+};
+use crate::ipc::protocol::FdOperation;
 use sendfd::RecvWithFd;
 use std::os::fd::RawFd;
 
@@ -51,15 +50,13 @@ impl ElevatedDaemon {
         &self,
         session_id: u64,
         name: &str,
-        cols: u16,
-        rows: u16,
+        size: SessionSize,
     ) -> std::io::Result<SpawnedTerminalPty> {
         let request = SpawnTerminalParams {
             session_id: WireSessionId::new(session_id)?,
             name: MachineName::try_from(name)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
-            size: TerminalSize::new(cols, rows)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+            size: WireTerminalSize::from(size),
         };
         let socket = self.open_fd_channel(FdOperation::Terminal(request)).await?;
         let (message, fds) =

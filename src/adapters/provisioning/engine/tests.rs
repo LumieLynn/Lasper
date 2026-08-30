@@ -1,12 +1,13 @@
 use super::stream::is_high_signal_deploy_stream;
 use super::*;
+use crate::adapters::error::NspawnError;
+use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
     DeploymentSource, DeploymentStage, DeploymentStatePort, DeploymentStateSession,
-    DeploymentStorage, MemoryDeploymentStatePort, ResourceDisposition, ResourceLedger,
+    DeploymentStorage, MachineProvisioningConfig, MemoryDeploymentStatePort, ResourceDisposition,
+    ResourceLedger,
 };
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
 use std::sync::Arc;
 
 fn apply_report() -> ApplyReport {
@@ -46,13 +47,16 @@ fn deploy_stream_distinguishes_normal_output_from_warnings() {
 fn apply_report_records_only_resources_created_by_this_attempt() {
     let mut report = apply_report();
     report
-        .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+        .record_apply(AppliedResource::NspawnConfig, ResourceApplyStatus::Created)
         .unwrap();
     report
-        .record_apply(AppliedResource::NspawnConfig, ApplyStatus::Created)
+        .record_apply(AppliedResource::NspawnConfig, ResourceApplyStatus::Created)
         .unwrap();
     report
-        .record_apply(AppliedResource::SystemdOverride, ApplyStatus::Unchanged)
+        .record_apply(
+            AppliedResource::SystemdOverride,
+            ResourceApplyStatus::Unchanged,
+        )
         .unwrap();
 
     assert!(report.owns(AppliedResource::NspawnConfig));
@@ -65,7 +69,7 @@ fn unknown_nspawn_owner_blocks_external_image_compensation() {
     let error = report
         .record_apply(
             AppliedResource::NspawnConfig,
-            ApplyStatus::ConflictUnknownOwner,
+            ResourceApplyStatus::ConflictUnknownOwner,
         )
         .unwrap_err();
 
@@ -80,11 +84,14 @@ fn sidecar_conflicts_are_preserved_and_owned_replacements_are_adopted() {
     report
         .record_apply(
             AppliedResource::NvidiaState,
-            ApplyStatus::ConflictUnknownOwner,
+            ResourceApplyStatus::ConflictUnknownOwner,
         )
         .unwrap();
     report
-        .record_apply(AppliedResource::SystemdOverride, ApplyStatus::ReplacedOwned)
+        .record_apply(
+            AppliedResource::SystemdOverride,
+            ResourceApplyStatus::ReplacedOwned,
+        )
         .unwrap();
 
     assert!(report.owns(AppliedResource::SystemdOverride));
@@ -110,6 +117,9 @@ fn removing_owned_storage_resolves_unknown_rootfs_effects() {
     report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsAccounts(
         report.target.clone(),
     ));
+    report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsHostname(
+        report.target.clone(),
+    ));
     report.record_outcome_unknown_if_unclassified(DeploymentResource::RootfsNetwork(
         report.target.clone(),
     ));
@@ -126,7 +136,7 @@ fn removing_owned_storage_resolves_unknown_rootfs_effects() {
 #[tokio::test]
 async fn interrupted_applying_effect_is_persisted_as_unknown_not_owned() {
     let plan = DeploymentPlan::build(DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             ..Default::default()
         },
@@ -203,7 +213,7 @@ async fn deployment_cancellation_notifies_waiters_and_fails_checkpoints() {
 
     cancellation.request();
     task.await.unwrap();
-    let result: Result<()> = cancellation.checkpoint().map_err(Into::into);
+    let result = check_deployment_cancellation(&cancellation);
     assert!(matches!(result, Err(NspawnError::DeploymentCancelled)));
 }
 

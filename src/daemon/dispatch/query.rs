@@ -5,13 +5,12 @@
 //! like the other protocol families; this module only owns their dispatch and
 //! wire-result shaping.
 
-use super::super::protocol::{error_code, RpcFamily, RpcMethod};
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonRuntimeQueries, HandleOutcome};
 use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
-use crate::nspawn::models::MachineName;
+use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
 
-pub(super) async fn handle<B: DaemonDbusExecutor>(
+pub(super) async fn handle<B: DaemonRuntimeQueries>(
     method: RpcMethod,
     id: u64,
     params: Value,
@@ -53,7 +52,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::CliInspectMachine => {
-            let inspection: super::super::protocol::CliInspectMachineRequest =
+            let inspection: crate::ipc::protocol::InspectMachineRequest =
                 match serde_json::from_value(params) {
                     Ok(request) => request,
                     Err(error) => {
@@ -66,6 +65,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
             tokio::spawn(async move {
                 let response = match crate::adapters::runtime::cli::get_properties_with_runner(
                     inspection.machine.as_str(),
+                    inspection.include_nspawn_unit,
                     &crate::adapters::process::DefaultCommandRunner,
                 )
                 .await
@@ -124,11 +124,19 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
                 Some(dbus) => dbus,
                 None => return HandleOutcome::Sync(Err("DBus not available".into())),
             };
-            let name = match request_machine_name(&params) {
-                Ok(name) => name,
-                Err(error) => return HandleOutcome::Sync(Err(error)),
-            };
-            match dbus.get_properties(name.as_str()).await {
+            let inspection: crate::ipc::protocol::InspectMachineRequest =
+                match serde_json::from_value(params) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid dbus_get_properties request: {error}"
+                        )));
+                    }
+                };
+            match dbus
+                .get_properties(inspection.machine.as_str(), inspection.include_nspawn_unit)
+                .await
+            {
                 Ok(properties) => match serde_json::to_value(properties) {
                     Ok(value) => HandleOutcome::Sync(Ok(value)),
                     Err(error) => HandleOutcome::Sync(Err(error.to_string())),
@@ -144,13 +152,6 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
 
         _ => unreachable!("non-query method routed to query dispatcher"),
     }
-}
-
-pub(crate) fn request_machine_name(params: &Value) -> Result<MachineName, String> {
-    let name = params["name"]
-        .as_str()
-        .ok_or_else(|| "missing name".to_string())?;
-    MachineName::try_from(name).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

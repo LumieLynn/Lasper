@@ -4,7 +4,7 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::provisioning::{
     DeploymentClaimControl, DeploymentError, DeploymentId, DeploymentStatus,
 };
-use crate::daemon::protocol::deployment::DeploymentClaimState;
+use crate::ipc::protocol::deployment::DeploymentClaimState;
 use async_trait::async_trait;
 use std::sync::Arc;
 

@@ -2,7 +2,7 @@
 
 Read this before using Lasper on a machine that contains data you care about.
 
-Lasper is alpha software. It manages host-level systemd resources and may run operations as root through the elevated daemon. The current goal is to stabilize a useful `systemd-nspawn` workflow, not to provide a production container platform yet.
+Lasper remains early-stage software. It manages host-level systemd resources and may run operations as root through the elevated daemon. The current goal is a useful `systemd-nspawn` workflow, not a production container platform.
 
 ## General Safety
 
@@ -17,6 +17,8 @@ Lasper is alpha software. It manages host-level systemd resources and may run op
 `lasper -e` keeps the TUI unprivileged and starts a dedicated root daemon for that Lasper process. The control and FD-passing sockets live in a private directory, use `0600` permissions, and require exact PID/UID peer checks; the TUI also verifies that the control peer is root, and a per-session token protects each FD request. Privileged RPC traffic does not use the child process's stdin or stdout pipes.
 
 This isolates the daemon interfaces from independent local processes, and the daemon monitors the launching TUI so it can terminate tracked child operations when that session disappears. It does not protect against code already executing inside the Lasper TUI process. The daemon's normal interface is typed rather than a generic command/file RPC, but those typed operations still carry the host authority needed to manage containers. See [SECURITY.md](SECURITY.md).
+
+The elevated daemon requires Linux `pidfd_open` support to pin and monitor the launching TUI process. If the kernel returns `ENOSYS`, `lasper -e` fails closed instead of weakening session monitoring. Running `sudo lasper` remains a compatibility option on such hosts, but it places the complete TUI inside the root trust boundary.
 
 ## OCI Images
 
@@ -46,9 +48,11 @@ Disabling `PrivateUsers` may make display access easier, but it weakens containe
 
 ## Storage and Image Paths
 
-Lasper's normal managed image location is `/var/lib/machines/<name>` or `/var/lib/machines/<name>.raw`. Disk-image handling is being tightened around raw images and content validation. Treat unusual image formats and direct image imports as experimental until the storage model is fully typed and validated in the daemon.
+Lasper's normal managed image location is `/var/lib/machines/<name>` or `/var/lib/machines/<name>.raw`. Directory, Btrfs subvolume, and managed raw disk-image targets have distinct lifecycle behavior. Treat unusual image formats and externally managed image paths as experimental.
 
 Tar rootfs imports are extracted by the host's `tar` implementation with `TAR_OPTIONS` ignored. GNU tar 1.35 or newer is recommended: releases before 1.34 lack protection against archive-created symbolic-link traversal, while 1.34 lacks the hard-link confinement added in 1.35. Lasper warns when it detects an older or unrecognized implementation but continues for distribution compatibility. Do not import untrusted Tar archives on those hosts.
+
+Remote Tar/Raw sources use Lasper's custom acquisition path, not `importctl pull-tar`. Lasper invokes `curl` from the host `PATH` with startup configuration disabled, restricts transfers and redirects to HTTP/HTTPS, bounds redirect count and artifact size, and passes only the host `PATH`, stable locale, and explicit proxy variables. Caller-selected curl configuration and certificate override paths are not inherited by the root daemon. Acquired Tar bytes are materialized into the Directory, Subvolume, or DiskImage backend selected in the wizard; systemd-importd's verification, read-only image, and storage semantics therefore do not apply to this path.
 
 ## Native Tools Remain Useful
 

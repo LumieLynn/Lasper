@@ -8,10 +8,23 @@ pub(crate) mod state;
 
 use crate::application::provisioning::{
     DeploymentClaimControl, DeploymentError, DeploymentRecoveryProbe, DeploymentStatePort,
-    ProvisioningService, RemoteTarSafety, SourcePreflight,
+    MachineProvisioningConfig, ProvisioningService, RemoteTarSafety, SourcePreflight,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// Validate the provider-specific projection before any privileged side effect.
+///
+/// The application contract deliberately does not depend on nspawn syntax. The
+/// nspawn adapter therefore owns these checks and is called again at each
+/// execution boundary (daemon admission and direct execution).
+pub(crate) fn validate_nspawn_config(
+    config: &MachineProvisioningConfig,
+) -> Result<(), DeploymentError> {
+    crate::adapters::config::NspawnConfigSpec::try_from(config)
+        .map(|_| ())
+        .map_err(|error| DeploymentError::rejected(error.to_string()))
+}
 
 pub(crate) enum ProvisioningRoute {
     Direct {

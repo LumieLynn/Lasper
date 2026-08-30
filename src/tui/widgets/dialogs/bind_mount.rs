@@ -1,10 +1,45 @@
-use crate::nspawn::models::{BindMount, IdmapSuffix};
+use crate::domain::provisioning::{BindMount, IdmapSuffix};
 use crate::tui::core::{AppMessage, Component, FocusTracker, WizardMessage};
 
 use crate::tui::widgets::inputs::button::Button;
 use crate::tui::widgets::inputs::path_box::PathBox;
 use crate::tui::widgets::selectors::checkbox::Checkbox;
 use crate::tui::widgets::selectors::radio_group::RadioGroup;
+
+const IDMAP_SUFFIX_OPTIONS: &[(&str, IdmapSuffix)] = &[
+    ("None", IdmapSuffix::None),
+    ("noidmap", IdmapSuffix::Noidmap),
+    ("idmap", IdmapSuffix::Idmap),
+    ("rootidmap", IdmapSuffix::Rootidmap),
+    ("owneridmap", IdmapSuffix::Owneridmap),
+];
+
+fn idmap_suffix_options() -> Vec<String> {
+    IDMAP_SUFFIX_OPTIONS
+        .iter()
+        .map(|(label, _)| (*label).to_string())
+        .collect()
+}
+
+fn idmap_suffix_index(suffix: &IdmapSuffix) -> Option<usize> {
+    IDMAP_SUFFIX_OPTIONS
+        .iter()
+        .position(|(_, option)| option == suffix)
+}
+
+fn idmap_suffix_from_index(index: usize) -> Option<IdmapSuffix> {
+    IDMAP_SUFFIX_OPTIONS
+        .get(index)
+        .map(|(_, suffix)| suffix.clone())
+}
+
+pub(crate) fn idmap_suffix_label(suffix: &IdmapSuffix) -> &'static str {
+    IDMAP_SUFFIX_OPTIONS
+        .iter()
+        .find(|(_, option)| option == suffix)
+        .map(|(label, _)| *label)
+        .unwrap_or("unknown")
+}
 
 macro_rules! active_comps {
     ($self:ident) => {{
@@ -59,17 +94,7 @@ impl BindMountBox {
                     Ok(())
                 }),
             readonly: Checkbox::new("Read Only", false),
-            suffix: RadioGroup::new(
-                "ID Mapping",
-                vec![
-                    "None".to_string(),
-                    "noidmap".to_string(),
-                    "idmap".to_string(),
-                    "rootidmap".to_string(),
-                    "owneridmap".to_string(),
-                ],
-                0,
-            ),
+            suffix: RadioGroup::new("ID Mapping", idmap_suffix_options(), 0),
             btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
             btn_cancel: Button::new("Cancel", || AppMessage::Wizard(WizardMessage::DialogCancel)),
 
@@ -106,14 +131,8 @@ impl BindMountBox {
         self.readonly = Checkbox::new("Read Only", bm.readonly);
         self.suffix = RadioGroup::new(
             "ID Mapping",
-            vec![
-                "None".to_string(),
-                "noidmap".to_string(),
-                "idmap".to_string(),
-                "rootidmap".to_string(),
-                "owneridmap".to_string(),
-            ],
-            bm.suffix.to_index(),
+            idmap_suffix_options(),
+            idmap_suffix_index(&bm.suffix).unwrap_or(0),
         );
         self.update_focus();
         self
@@ -135,11 +154,12 @@ impl BindMountBox {
         if target.is_empty() {
             target = source.clone();
         }
+        let suffix = idmap_suffix_from_index(self.suffix.selected_idx())?;
         Some((self.on_submit)(BindMount {
             source,
             target,
             readonly: self.readonly.checked(),
-            suffix: IdmapSuffix::from_index(self.suffix.selected_idx()),
+            suffix,
         }))
     }
 }
@@ -150,3 +170,28 @@ form_dialog!(
     (45, 55),
     [source_path, target_path, readonly, suffix]
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idmap_selector_round_trips_configuration_values() {
+        for suffix in [
+            IdmapSuffix::None,
+            IdmapSuffix::Noidmap,
+            IdmapSuffix::Idmap,
+            IdmapSuffix::Rootidmap,
+            IdmapSuffix::Owneridmap,
+        ] {
+            let index = idmap_suffix_index(&suffix).expect("all config values are selectable");
+            assert_eq!(idmap_suffix_from_index(index), Some(suffix));
+        }
+    }
+
+    #[test]
+    fn idmap_selector_rejects_out_of_range_values() {
+        assert_eq!(idmap_suffix_from_index(usize::MAX), None);
+        assert_eq!(idmap_suffix_label(&IdmapSuffix::Idmap), "idmap");
+    }
+}

@@ -1,7 +1,7 @@
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BindMount, ContainerConfig, MachineName, NetworkMode, PortForward, PrivateUsersMode,
-};
+use crate::adapters::error::{NspawnError, Result};
+use crate::application::provisioning::MachineProvisioningConfig;
+use crate::domain::machine::{GuestHostname, MachineName};
+use crate::domain::provisioning::{BindMount, NetworkMode, PortForward, PrivateUsersMode};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -10,7 +10,7 @@ const MAX_CONFIG_ITEMS: usize = 4096;
 /// Explicit opt-in path for exposing every host DRM device to a container.
 pub const ALL_DRM_DEVICES_PATH: &str = "/dev/dri";
 
-/// The subset of `ContainerConfig` that is allowed to affect a `.nspawn` file.
+/// The subset of `MachineProvisioningConfig` that is allowed to affect a `.nspawn` file.
 ///
 /// Passwords, users, image sources, and other provisioning-only data are
 /// deliberately excluded from this type and therefore from the daemon wire
@@ -19,7 +19,7 @@ pub const ALL_DRM_DEVICES_PATH: &str = "/dev/dri";
 #[serde(deny_unknown_fields)]
 pub struct NspawnConfigSpec {
     pub machine: MachineName,
-    pub hostname: String,
+    pub guest_hostname: GuestHostname,
     pub network: Option<NetworkMode>,
     pub resolv_conf: Option<ResolvConfMode>,
     pub port_forwards: Vec<NspawnPortForward>,
@@ -37,8 +37,6 @@ pub struct NspawnConfigSpec {
 
 impl NspawnConfigSpec {
     pub fn validate(&self) -> Result<()> {
-        validate_nspawn_hostname(&self.hostname)?;
-
         let expected_resolv_conf = ResolvConfMode::for_network(self.network.as_ref());
         if self.resolv_conf != expected_resolv_conf {
             return Err(NspawnError::Validation(format!(
@@ -86,7 +84,8 @@ impl NspawnConfigSpec {
                 | NetworkMode::MacVlan(name)
                 | NetworkMode::IpVlan(name)
                 | NetworkMode::Interface(name) => {
-                    validate_nspawn_interface_name(name)?;
+                    crate::domain::provisioning::validate_network_interface_name(name)
+                        .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 }
                 NetworkMode::Host | NetworkMode::None | NetworkMode::Veth => {}
             }
@@ -107,15 +106,18 @@ impl NspawnConfigSpec {
     }
 }
 
-impl TryFrom<&ContainerConfig> for NspawnConfigSpec {
+impl TryFrom<&MachineProvisioningConfig> for NspawnConfigSpec {
     type Error = NspawnError;
 
-    fn try_from(config: &ContainerConfig) -> Result<Self> {
+    fn try_from(config: &MachineProvisioningConfig) -> Result<Self> {
         let resolv_conf = ResolvConfMode::for_network(config.network.as_ref());
+        let machine = MachineName::new(config.name.clone())
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
+        let guest_hostname = GuestHostname::resolve(&config.guest_hostname, &machine)
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
         let spec = Self {
-            machine: MachineName::new(config.name.clone())
-                .map_err(|error| NspawnError::Validation(error.to_string()))?,
-            hostname: config.hostname.clone(),
+            machine,
+            guest_hostname,
             network: config.network.clone(),
             resolv_conf,
             port_forwards: config
@@ -220,46 +222,6 @@ impl TransportProtocol {
     }
 }
 
-pub(crate) fn validate_nspawn_hostname(value: &str) -> Result<()> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    let valid = value.len() <= 64
-        && !value.starts_with('.')
-        && !value.ends_with('.')
-        && value.split('.').all(|label| {
-            !label.is_empty()
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        });
-    if !valid {
-        return Err(NspawnError::Validation(format!(
-            "Invalid hostname: {value:?}"
-        )));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_nspawn_interface_name(value: &str) -> Result<()> {
-    let bytes = value.as_bytes();
-    let valid = !bytes.is_empty()
-        && bytes.len() <= 15
-        && !matches!(value, "." | ".." | "all" | "default")
-        && !bytes.iter().all(u8::is_ascii_digit)
-        && bytes
-            .iter()
-            .all(|byte| (33..=126).contains(byte) && !matches!(*byte, b':' | b'/' | b'%'));
-    if !valid {
-        return Err(NspawnError::Validation(format!(
-            "Invalid network interface name: {value:?}"
-        )));
-    }
-    Ok(())
-}
-
 fn validate_text(label: &str, value: &str, allow_empty: bool) -> Result<()> {
     if (!allow_empty && value.is_empty())
         || value.len() > 255
@@ -285,11 +247,11 @@ fn validate_absolute_path(label: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::CreateUser;
+    use crate::domain::provisioning::CreateUser;
 
     #[test]
     fn config_spec_excludes_account_execution_data() {
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -307,7 +269,7 @@ mod tests {
 
     #[test]
     fn config_spec_rejects_unknown_protocol_and_relative_bind() {
-        let bad_protocol = ContainerConfig {
+        let bad_protocol = MachineProvisioningConfig {
             name: "test".into(),
             network: Some(NetworkMode::Veth),
             port_forwards: vec![PortForward {
@@ -319,7 +281,7 @@ mod tests {
         };
         assert!(NspawnConfigSpec::try_from(&bad_protocol).is_err());
 
-        let bad_bind = ContainerConfig {
+        let bad_bind = MachineProvisioningConfig {
             name: "test".into(),
             bind_mounts: vec![BindMount {
                 source: "relative".into(),
@@ -334,7 +296,7 @@ mod tests {
 
     #[test]
     fn config_spec_derives_and_validates_resolver_policy() {
-        let host = ContainerConfig {
+        let host = MachineProvisioningConfig {
             name: "host-network".into(),
             network: Some(NetworkMode::Host),
             ..Default::default()
@@ -342,7 +304,7 @@ mod tests {
         let host_spec = NspawnConfigSpec::try_from(&host).unwrap();
         assert_eq!(host_spec.resolv_conf, Some(ResolvConfMode::BindHost));
 
-        let private = ContainerConfig {
+        let private = MachineProvisioningConfig {
             name: "private-network".into(),
             network: Some(NetworkMode::Veth),
             ..Default::default()
@@ -357,7 +319,7 @@ mod tests {
     #[test]
     fn managed_private_users_requires_systemd_private_networking() {
         for network in [None, Some(NetworkMode::Host)] {
-            let config = ContainerConfig {
+            let config = MachineProvisioningConfig {
                 name: "managed-host".into(),
                 network,
                 private_users: Some(PrivateUsersMode::Managed),
@@ -378,7 +340,7 @@ mod tests {
             NetworkMode::IpVlan("eth0".into()),
             NetworkMode::Interface("eth1".into()),
         ] {
-            let config = ContainerConfig {
+            let config = MachineProvisioningConfig {
                 name: "managed-private".into(),
                 network: Some(network),
                 private_users: Some(PrivateUsersMode::Managed),
@@ -391,7 +353,7 @@ mod tests {
     #[test]
     fn port_forwards_reject_zero_in_typed_and_deserialized_specs() {
         for (host, container) in [(0, 80), (8080, 0)] {
-            let config = ContainerConfig {
+            let config = MachineProvisioningConfig {
                 name: "port-test".into(),
                 network: Some(NetworkMode::Veth),
                 port_forwards: vec![PortForward {
@@ -404,7 +366,7 @@ mod tests {
             assert!(NspawnConfigSpec::try_from(&config).is_err());
         }
 
-        let mut spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let mut spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "wire-port-test".into(),
             network: Some(NetworkMode::Veth),
             ..Default::default()
@@ -430,7 +392,7 @@ mod tests {
         ];
 
         for network in unsupported_modes {
-            let config = ContainerConfig {
+            let config = MachineProvisioningConfig {
                 name: "unsupported-port-mode".into(),
                 network,
                 port_forwards: vec![PortForward {
@@ -452,9 +414,12 @@ mod tests {
     #[test]
     fn hostname_validation_matches_nspawn_hostname_rules() {
         for hostname in ["", "host", "Host-01", "host.example"] {
-            assert!(validate_nspawn_hostname(hostname).is_ok(), "{hostname:?}");
+            assert!(
+                GuestHostname::validate_optional(hostname).is_ok(),
+                "{hostname:?}"
+            );
         }
-        assert!(validate_nspawn_hostname(&"a".repeat(64)).is_ok());
+        assert!(GuestHostname::validate_optional(&"a".repeat(64)).is_ok());
 
         for hostname in [
             "host name",
@@ -465,29 +430,48 @@ mod tests {
             "-host",
             "host-",
         ] {
-            assert!(validate_nspawn_hostname(hostname).is_err(), "{hostname:?}");
+            assert!(
+                GuestHostname::validate_optional(hostname).is_err(),
+                "{hostname:?}"
+            );
         }
-        assert!(validate_nspawn_hostname(&"a".repeat(65)).is_err());
+        assert!(GuestHostname::validate_optional(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn nspawn_spec_resolves_the_default_guest_hostname() {
+        let config = MachineProvisioningConfig {
+            name: "machine-name".into(),
+            ..Default::default()
+        };
+
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        assert_eq!(spec.guest_hostname.as_str(), "machine-name");
     }
 
     #[test]
     fn interface_validation_matches_systemd_ifname_rules() {
         for interface in ["eth0", "br-test", "veth.0", "name@peer"] {
             assert!(
-                validate_nspawn_interface_name(interface).is_ok(),
+                crate::domain::provisioning::validate_network_interface_name(interface).is_ok(),
                 "{interface:?}"
             );
         }
-        assert!(validate_nspawn_interface_name(&"a".repeat(15)).is_ok());
+        assert!(
+            crate::domain::provisioning::validate_network_interface_name(&"a".repeat(15)).is_ok()
+        );
 
         for interface in [
             "", ".", "..", "all", "default", "123", "eth 0", "eth/0", "eth:0", "eth%0", "接口0",
         ] {
             assert!(
-                validate_nspawn_interface_name(interface).is_err(),
+                crate::domain::provisioning::validate_network_interface_name(interface).is_err(),
                 "{interface:?}"
             );
         }
-        assert!(validate_nspawn_interface_name(&"a".repeat(16)).is_err());
+        assert!(
+            crate::domain::provisioning::validate_network_interface_name(&"a".repeat(16)).is_err()
+        );
     }
 }

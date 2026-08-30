@@ -6,18 +6,18 @@
 
 pub(crate) mod server;
 
-use super::dispatch::handler::{DaemonDbusExecutor, HandleOutcome};
-use super::protocol::deployment::{
-    DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
-    ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
-    ReleaseUnresolvedDeploymentRequest,
-};
-use super::protocol::{RpcFamily, RpcMethod};
+use super::dispatch::handler::{DaemonRuntimeQueries, HandleOutcome};
 use super::server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::DeploymentStatePort;
-use crate::nspawn::models::ImageEntry;
+use crate::domain::runtime::ImageEntry;
+use crate::ipc::protocol::deployment::{
+    DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
+    ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
+    ReleaseUnresolvedDeploymentRequest,
+};
+use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ pub(crate) struct JobContext<'a, B> {
     pub(super) trusted_state_root: TrustedStateRoot,
 }
 
-pub(crate) async fn handle<B: DaemonDbusExecutor>(
+pub(crate) async fn handle<B: DaemonRuntimeQueries>(
     method: RpcMethod,
     context: JobContext<'_, B>,
 ) -> HandleOutcome {
@@ -269,7 +269,7 @@ pub(crate) async fn handle<B: DaemonDbusExecutor>(
     }
 }
 
-async fn recovery_images<B: DaemonDbusExecutor>(
+async fn recovery_images<B: DaemonRuntimeQueries>(
     dbus: &Option<B>,
 ) -> Result<Vec<ImageEntry>, String> {
     if let Some(dbus) = dbus {

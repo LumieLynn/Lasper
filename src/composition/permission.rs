@@ -9,8 +9,13 @@
 //! loop responsive for DBus queries.
 
 use crate::config::AppSettings;
-use crate::nspawn::errors::Result;
 use std::future::Future;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PermissionError {
+    #[error("permission operation must not be empty")]
+    EmptyOperation,
+}
 
 // ── Level ──
 
@@ -43,9 +48,9 @@ pub struct AuditScope {
 }
 
 impl AuditScope {
-    pub async fn run<F, T>(self, f: F) -> Result<T>
+    pub async fn run<F, T>(self, f: F) -> T
     where
-        F: Future<Output = Result<T>> + Send,
+        F: Future<Output = T> + Send,
     {
         log::info!("[AUDIT] begin: {}", self.operation);
         let result = f.await;
@@ -59,7 +64,7 @@ impl AuditScope {
 #[async_trait::async_trait]
 pub trait PermissionManager: Send + Sync + 'static {
     fn level(&self) -> PermissionLevel;
-    async fn request_elevation(&self, operation: String) -> Result<AuditScope>;
+    async fn request_elevation(&self, operation: String) -> Result<AuditScope, PermissionError>;
 }
 
 // ── Default implementation ──
@@ -98,7 +103,10 @@ impl PermissionManager for DefaultPermissionManager {
         self.level
     }
 
-    async fn request_elevation(&self, operation: String) -> Result<AuditScope> {
+    async fn request_elevation(&self, operation: String) -> Result<AuditScope, PermissionError> {
+        if operation.trim().is_empty() {
+            return Err(PermissionError::EmptyOperation);
+        }
         Ok(AuditScope {
             operation,
             _private: (),
@@ -144,5 +152,14 @@ mod tests {
     fn test_with_elevation_noop_when_false() {
         let pm = DefaultPermissionManager::new().with_elevation(false);
         assert_eq!(pm.level(), PermissionLevel::User);
+    }
+
+    #[tokio::test]
+    async fn empty_audit_operation_is_rejected() {
+        let pm = DefaultPermissionManager::new();
+        assert!(matches!(
+            pm.request_elevation("  ".into()).await,
+            Err(PermissionError::EmptyOperation)
+        ));
     }
 }

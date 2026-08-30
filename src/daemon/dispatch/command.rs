@@ -4,11 +4,11 @@
 //! perform external I/O in a spawned task, but they do not expose accepted
 //! job state; long-running stateful work belongs to `jobs::server`.
 
-use super::super::protocol::{error_code, RpcFamily, RpcMethod};
 use super::super::server::DaemonServerState;
-use super::handler::{DaemonDbusExecutor, HandleOutcome};
+use super::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
 use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
+use crate::adapters::lifecycle::error::map_system_operation_image_error;
 use crate::adapters::platform::nvidia::state::{
     execute_nvidia_state_operation, NvidiaStateOperation,
 };
@@ -24,8 +24,14 @@ use crate::application::image_lifecycle::{
     ImageControlOutcome, ImageRemoveRequest, ImageRemoveTransport,
 };
 use crate::application::machine_lifecycle::{
-    MachineControlOutcome, MachineControlRequest, MachineControlTransport,
+    validate_nspawn_runtime_entry, MachineControlOutcome, MachineControlTransport,
+    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
 };
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::MachineEntry;
+use crate::ipc::protocol::rootfs as rootfs_wire;
+use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
+use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -39,7 +45,7 @@ pub(super) struct CommandContext<'a, B> {
     pub(super) trusted_state_root: TrustedStateRoot,
 }
 
-pub(super) async fn handle<B: DaemonDbusExecutor>(
+pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
     method: RpcMethod,
     context: CommandContext<'_, B>,
 ) -> HandleOutcome {
@@ -84,18 +90,21 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::SystemdUnit => {
-            let operation: SystemdUnitOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid systemd_unit request: {error}"
-                    )));
-                }
-            };
+            let wire_operation: systemd_unit_wire::SystemdUnitOperation =
+                match serde_json::from_value(params) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid systemd_unit request: {error}"
+                        )));
+                    }
+                };
+            let operation = SystemdUnitOperation::from(wire_operation);
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
                 let response = match execute_systemd_unit_operation(operation).await {
                     Ok(result) => {
+                        let result = systemd_unit_wire::SystemdUnitResult::from(result);
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }
                     Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
@@ -163,7 +172,14 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::Rootfs => {
-            let operation: RootfsOperation = match serde_json::from_value(params) {
+            let wire_operation: rootfs_wire::RootfsOperation = match serde_json::from_value(params)
+            {
+                Ok(operation) => operation,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
+                }
+            };
+            let operation = match RootfsOperation::try_from(wire_operation) {
                 Ok(operation) => operation,
                 Err(error) => {
                     return HandleOutcome::Sync(Err(format!("invalid rootfs request: {error}")));
@@ -173,6 +189,7 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
             tokio::spawn(async move {
                 let response = match execute_rootfs_operation(operation).await {
                     Ok(result) => {
+                        let result = rootfs_wire::RootfsResult::from(result);
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
                     }
                     Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
@@ -188,38 +205,112 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
         }
 
         RpcMethod::SystemOperation => {
-            let operation: SystemOperation = match serde_json::from_value(params) {
-                Ok(operation) => operation,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid system_operation request: {error}"
-                    )));
-                }
-            };
+            let wire_operation: crate::ipc::protocol::system::SystemOperation =
+                match serde_json::from_value(params) {
+                    Ok(operation) => operation,
+                    Err(error) => {
+                        return HandleOutcome::Sync(Err(format!(
+                            "invalid system_operation request: {error}"
+                        )));
+                    }
+                };
+            let operation = SystemOperation::from(wire_operation);
             match execute_system_operation(operation).await {
                 Ok(()) => HandleOutcome::Sync(Ok(Value::Null)),
                 Err(error) => HandleOutcome::Sync(Err(error.to_string())),
             }
         }
 
-        RpcMethod::MachineControl => {
-            let request: MachineControlRequest = match serde_json::from_value(params) {
+        RpcMethod::NspawnLaunch => {
+            let request: NspawnLaunchRequest = match serde_json::from_value(params) {
                 Ok(request) => request,
                 Err(error) => {
                     return HandleOutcome::Sync(Err(format!(
-                        "invalid machine_control request: {error}"
+                        "invalid nspawn_launch request: {error}"
                     )));
                 }
             };
+            if !request.validates_same_name_route() {
+                return HandleOutcome::Sync(Err(
+                    "invalid nspawn_launch request: image and machine names must match".into(),
+                ));
+            }
             let outcome = match request.transport {
                 MachineControlTransport::Dbus => match dbus.as_ref() {
-                    Some(dbus) => dbus.machine_control(request.machine, request.action).await,
+                    Some(dbus) => dbus.nspawn_launch(request.image, request.machine).await,
                     None => MachineControlOutcome::NotAttempted {
                         reason: "D-Bus backend is unavailable".into(),
                     },
                 },
                 MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_machine_control(
+                    crate::adapters::lifecycle::machine::execute_cli_nspawn_launch(
+                        request.image,
+                        request.machine,
+                    )
+                    .await
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
+        }
+
+        RpcMethod::MachineRuntimeControl => {
+            let request: MachineRuntimeControlRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid machine_runtime_control request: {error}"
+                    )));
+                }
+            };
+            if let Err(outcome) =
+                validate_runtime_target(&request.machine, request.transport, dbus).await
+            {
+                return HandleOutcome::Sync(
+                    serde_json::to_value(outcome).map_err(|error| error.to_string()),
+                );
+            }
+            let outcome = match request.transport {
+                MachineControlTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => {
+                        dbus.machine_runtime_control(request.machine, request.action)
+                            .await
+                    }
+                    None => MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    },
+                },
+                MachineControlTransport::Cli => {
+                    crate::adapters::lifecycle::machine::execute_cli_machine_runtime(
+                        request.machine,
+                        request.action,
+                    )
+                    .await
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
+        }
+
+        RpcMethod::NspawnUnitControl => {
+            let request: NspawnUnitControlRequest = match serde_json::from_value(params) {
+                Ok(request) => request,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid nspawn_unit_control request: {error}"
+                    )));
+                }
+            };
+            let outcome = match request.transport {
+                MachineControlTransport::Dbus => match dbus.as_ref() {
+                    Some(dbus) => {
+                        dbus.nspawn_unit_control(request.machine, request.action)
+                            .await
+                    }
+                    None => MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    },
+                },
+                MachineControlTransport::Cli => {
+                    crate::adapters::lifecycle::machine::execute_cli_nspawn_unit(
                         request.machine,
                         request.action,
                     )
@@ -247,15 +338,16 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
                         .await
                     {
                         Ok(()) => ImageControlOutcome::Removed,
-                        Err(error) => {
-                            crate::adapters::lifecycle::error::map_image_control_error(error)
-                        }
+                        Err(error) => map_system_operation_image_error(error),
                     },
                     None => ImageControlOutcome::NotAttempted {
                         reason: "DBus backend is unavailable".into(),
                     },
                 },
-                ImageRemoveTransport::Cli => execute_cli_image_remove(request.image).await,
+                ImageRemoveTransport::Cli => match execute_cli_image_remove(request.image).await {
+                    Ok(()) => ImageControlOutcome::Removed,
+                    Err(error) => map_system_operation_image_error(error),
+                },
             };
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
@@ -269,9 +361,73 @@ pub(super) async fn handle<B: DaemonDbusExecutor>(
     }
 }
 
+/// Re-read the machined registration at the privileged boundary before a
+/// runtime mutation. A client-provided machine name is not proof that the
+/// target is an nspawn container; VM and foreign-provider registrations must
+/// remain visible but read-only even if a caller bypasses the TUI.
+async fn validate_runtime_target<B: DaemonRuntimeQueries>(
+    machine: &MachineName,
+    transport: MachineControlTransport,
+    dbus: &Option<B>,
+) -> Result<(), MachineControlOutcome> {
+    let entries = match transport {
+        MachineControlTransport::Dbus => {
+            let Some(dbus) = dbus.as_ref() else {
+                return Err(MachineControlOutcome::NotAttempted {
+                    reason: "D-Bus backend is unavailable".into(),
+                });
+            };
+            dbus.list_machines()
+                .await
+                .map_err(|error| MachineControlOutcome::NotAttempted {
+                    reason: format!("could not verify machine registration: {error}"),
+                })?
+        }
+        MachineControlTransport::Cli => {
+            crate::adapters::runtime::state::list_machines_at(crate::paths::runtime_machines_dir())
+                .await
+                .map_err(|error| MachineControlOutcome::NotAttempted {
+                    reason: format!("could not verify machine registration: {error}"),
+                })?
+        }
+    };
+
+    validate_runtime_entries(&entries, machine)
+}
+
+fn validate_runtime_entries(
+    entries: &[MachineEntry],
+    machine: &MachineName,
+) -> Result<(), MachineControlOutcome> {
+    let Some(entry) = entries.iter().find(|entry| entry.name == machine.as_str()) else {
+        return Err(MachineControlOutcome::Rejected {
+            rejection: crate::application::machine_lifecycle::MachineRejection::NotFound,
+            reason: format!("machine '{}' is not registered with machined", machine),
+        });
+    };
+
+    validate_nspawn_runtime_entry(entry).map_err(|rejection| MachineControlOutcome::Rejected {
+        reason: format!(
+            "machine '{}' cannot be controlled by nspawn route: {rejection}",
+            machine
+        ),
+        rejection,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn machine(name: &str, class: &str, service: &str) -> MachineEntry {
+        MachineEntry {
+            name: name.into(),
+            class: class.into(),
+            service: service.into(),
+            state: crate::domain::runtime::MachineState::Running,
+            addresses: Default::default(),
+        }
+    }
 
     #[test]
     fn command_inventory_excludes_query_job_and_session_methods() {
@@ -292,5 +448,40 @@ mod tests {
                 ));
             }
         }
+    }
+
+    #[test]
+    fn runtime_validation_rejects_foreign_registrations_without_host_calls() {
+        let target = MachineName::new("guest").unwrap();
+        let vm = machine("guest", "vm", "systemd-vmspawn");
+        let result = validate_runtime_entries(&[vm], &target);
+        assert!(matches!(
+            result,
+            Err(MachineControlOutcome::Rejected {
+                rejection: crate::application::machine_lifecycle::MachineRejection::Unsupported,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn runtime_validation_accepts_only_the_exact_nspawn_registration() {
+        let target = MachineName::new("guest").unwrap();
+        let nspawn = machine("guest", "container", "systemd-nspawn");
+        assert!(validate_runtime_entries(&[nspawn], &target).is_ok());
+    }
+
+    #[test]
+    fn runtime_validation_distinguishes_an_unregistered_machine() {
+        let target = MachineName::new("missing").unwrap();
+        let result =
+            validate_runtime_entries(&[machine("other", "container", "systemd-nspawn")], &target);
+        assert!(matches!(
+            result,
+            Err(MachineControlOutcome::Rejected {
+                rejection: crate::application::machine_lifecycle::MachineRejection::NotFound,
+                ..
+            })
+        ));
     }
 }
