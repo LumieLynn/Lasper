@@ -43,6 +43,18 @@ impl MachineClass {
     }
 }
 
+impl From<&str> for MachineClass {
+    fn from(value: &str) -> Self {
+        Self::parse(value)
+    }
+}
+
+impl From<String> for MachineClass {
+    fn from(value: String) -> Self {
+        Self::parse(value)
+    }
+}
+
 impl Serialize for MachineClass {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -95,6 +107,18 @@ impl MachineProvider {
 
     pub fn is_nspawn(&self) -> bool {
         matches!(self, Self::Nspawn)
+    }
+}
+
+impl From<&str> for MachineProvider {
+    fn from(value: &str) -> Self {
+        Self::parse(value)
+    }
+}
+
+impl From<String> for MachineProvider {
+    fn from(value: String) -> Self {
+        Self::parse(value)
     }
 }
 
@@ -158,16 +182,12 @@ pub struct MachineRuntimeIdentity {
 }
 
 impl MachineRuntimeIdentity {
-    pub fn new(
-        name: impl Into<String>,
-        class: impl Into<String>,
-        service: impl Into<String>,
-    ) -> Result<Self, RuntimeIdentityError> {
-        Ok(Self {
-            name: MachineName::new(name).map_err(RuntimeIdentityError::InvalidMachineName)?,
-            class: MachineClass::parse(class),
-            provider: MachineProvider::parse(service),
-        })
+    pub fn from_parts(name: MachineName, class: MachineClass, provider: MachineProvider) -> Self {
+        Self {
+            name,
+            class,
+            provider,
+        }
     }
 
     pub fn name(&self) -> &MachineName {
@@ -291,15 +311,15 @@ impl<'de> Deserialize<'de> for MachineState {
 
 /// A machine registered with systemd-machined.
 ///
-/// The raw `class` and `service` strings remain in the snapshot shape during
-/// this migration so old daemon/client peers cannot silently reinterpret the
-/// JSON contract. Call [`MachineEntry::identity`] at an application boundary
-/// to obtain the validated semantic view.
+/// The `class` and `service` values retain their lossless string representation
+/// on the JSON wire while the domain keeps their known values typed. Call
+/// [`MachineEntry::identity`] at an application boundary to obtain the
+/// validated semantic view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineEntry {
     pub name: String,
-    pub class: String,
-    pub service: String,
+    pub class: MachineClass,
+    pub service: MachineProvider,
     pub state: MachineState,
     pub address: Option<String>,
     pub all_addresses: Vec<String>,
@@ -321,7 +341,13 @@ impl MachineEntry {
     }
 
     pub fn identity(&self) -> Result<MachineRuntimeIdentity, RuntimeIdentityError> {
-        MachineRuntimeIdentity::new(self.name.clone(), self.class.clone(), self.service.clone())
+        let name = MachineName::new(self.name.clone())
+            .map_err(RuntimeIdentityError::InvalidMachineName)?;
+        Ok(MachineRuntimeIdentity::from_parts(
+            name,
+            self.class.clone(),
+            self.service.clone(),
+        ))
     }
 
     pub fn validated_name(&self) -> Result<MachineName, RuntimeIdentityError> {
@@ -531,6 +557,14 @@ impl PartialOrd for MachineEntry {
 mod tests {
     use super::*;
 
+    fn identity(name: &str, class: &str, provider: &str) -> MachineRuntimeIdentity {
+        MachineRuntimeIdentity::from_parts(
+            MachineName::new(name).unwrap(),
+            MachineClass::parse(class),
+            MachineProvider::parse(provider),
+        )
+    }
+
     #[test]
     fn known_and_unknown_runtime_providers_are_lossless() {
         assert_eq!(MachineClass::parse("container"), MachineClass::Container);
@@ -550,13 +584,13 @@ mod tests {
 
     #[test]
     fn nspawn_identity_requires_both_container_class_and_nspawn_provider() {
-        let nspawn = MachineRuntimeIdentity::new("web", "container", "systemd-nspawn").unwrap();
+        let nspawn = identity("web", "container", "systemd-nspawn");
         assert!(nspawn.is_nspawn());
 
-        let vm = MachineRuntimeIdentity::new("web", "vm", "systemd-nspawn").unwrap();
+        let vm = identity("web", "vm", "systemd-nspawn");
         assert!(!vm.is_nspawn());
 
-        let foreign = MachineRuntimeIdentity::new("web", "container", "libvirt").unwrap();
+        let foreign = identity("web", "container", "libvirt");
         assert!(!foreign.is_nspawn());
     }
 
@@ -587,19 +621,19 @@ mod tests {
 
     #[test]
     fn non_nspawn_runtime_identities_are_read_only_with_lossless_reasons() {
-        let vm = MachineRuntimeIdentity::new("guest", "vm", "systemd-vmspawn").unwrap();
+        let vm = identity("guest", "vm", "systemd-vmspawn");
         assert_eq!(
             vm.access(),
             MachineAccess::ReadOnly(ReadOnlyReason::VirtualMachine)
         );
 
-        let foreign = MachineRuntimeIdentity::new("guest", "container", "libvirt").unwrap();
+        let foreign = identity("guest", "container", "libvirt");
         assert_eq!(
             foreign.access(),
             MachineAccess::ReadOnly(ReadOnlyReason::UnknownProvider("libvirt".into()))
         );
 
-        let host = MachineRuntimeIdentity::new("host", "host", "systemd-nspawn").unwrap();
+        let host = identity("host", "host", "systemd-nspawn");
         assert_eq!(host.access(), MachineAccess::ReadOnly(ReadOnlyReason::Host));
     }
 
@@ -617,5 +651,22 @@ mod tests {
             entry.access(),
             MachineAccess::ReadOnly(ReadOnlyReason::InvalidIdentity)
         );
+    }
+
+    #[test]
+    fn machine_entry_keeps_class_and_provider_wire_strings_while_typed() {
+        let entry = MachineEntry {
+            name: "guest".into(),
+            class: MachineClass::Unknown("container-like".into()),
+            service: MachineProvider::Unknown("custom-runner".into()),
+            state: MachineState::Running,
+            address: None,
+            all_addresses: Vec::new(),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["class"], "container-like");
+        assert_eq!(json["service"], "custom-runner");
+        let decoded: MachineEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, entry);
     }
 }

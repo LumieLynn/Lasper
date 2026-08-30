@@ -4,10 +4,11 @@ use crate::adapters::config::nspawn_file::{
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
+use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::{
-    ApplyStatus, ContainerConfig, ImageName, MachineName, NspawnConfigSpec, OciNetworkMode,
+    ApplyStatus, ContainerConfig, MachineName, NspawnConfigSpec, OciNetworkMode,
 };
 use serde::{Deserialize, Serialize};
 use std::io::Read;

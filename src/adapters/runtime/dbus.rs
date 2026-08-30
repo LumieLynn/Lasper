@@ -325,8 +325,8 @@ impl RuntimeSource for DbusBackend {
                 .collect();
             entries.push(MachineEntry {
                 name,
-                class,
-                service,
+                class: class.into(),
+                service: service.into(),
                 state: MachineState::Running,
                 address: all_addresses.first().cloned().filter(|s| !s.is_empty()),
                 all_addresses,

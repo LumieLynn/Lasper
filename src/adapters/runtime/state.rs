@@ -102,8 +102,8 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
         let service = fields.get("SERVICE").cloned().unwrap_or_default();
         machines.push(MachineEntry {
             name,
-            class,
-            service,
+            class: class.into(),
+            service: service.into(),
             state: MachineState::Running,
             address: None,
             all_addresses: Vec::new(),
@@ -459,8 +459,8 @@ mod tests {
             .iter()
             .find(|machine| machine.name == "foreign-vm")
             .unwrap();
-        assert_eq!(foreign.class, "vm");
-        assert_eq!(foreign.service, "libvirt");
+        assert_eq!(foreign.class.as_str(), "vm");
+        assert_eq!(foreign.service.as_str(), "libvirt");
     }
 
     #[tokio::test]

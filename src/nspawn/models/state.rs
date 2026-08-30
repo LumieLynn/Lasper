@@ -1,14 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// Compatibility re-exports remain only while the remaining configuration and
-// provisioning models are classified. Runtime ownership lives in domain.
-#[allow(unused_imports)]
-pub use crate::domain::runtime::{
-    ImageEntry, ImageName, ImageNameError, ImageVisibility, MachineClass, MachineEntry,
-    MachineProvider, MachineRuntimeIdentity, MachineState, RuntimeIdentityError, RuntimeSnapshot,
-    StatusUpdate,
-};
-
 /// A group of related properties for a machine/container.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PropertyGroup {
@@ -164,6 +155,9 @@ impl Default for MachineMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::runtime::{
+        ImageEntry, ImageName, ImageVisibility, MachineEntry, MachineState, RuntimeSnapshot,
+    };
 
     #[test]
     fn machine_state_labels() {
@@ -308,8 +302,8 @@ mod tests {
     #[test]
     fn optimistic_launch_preserves_its_registration_source() {
         let machine = make_entry("test", MachineState::Running);
-        assert_eq!(machine.class, "container");
-        assert_eq!(machine.service, "systemd-nspawn");
+        assert_eq!(machine.class.as_str(), "container");
+        assert_eq!(machine.service.as_str(), "systemd-nspawn");
     }
 
     #[test]
