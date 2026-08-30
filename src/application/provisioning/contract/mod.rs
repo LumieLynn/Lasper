@@ -9,8 +9,7 @@ pub use config::MachineProvisioningConfig;
 pub use identity::DeploymentId;
 pub(crate) use identity::DeploymentRequestId;
 pub(crate) use job::{
-    deployment_job_channel, DeploymentCancellation, DeploymentCancellationRequested,
-    DeploymentClaimControl, DeploymentJobContext,
+    deployment_job_channel, DeploymentCancellation, DeploymentClaimControl, DeploymentJobContext,
 };
 pub use job::{
     DeploymentClaimStatus, DeploymentError, DeploymentEvent, DeploymentExecutor,

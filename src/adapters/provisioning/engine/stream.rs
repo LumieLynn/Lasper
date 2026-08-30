@@ -56,6 +56,12 @@ pub(crate) async fn send_deploy_progress(
     let _ = logs.send(DeployLogEvent::Progress(progress)).await;
 }
 
+pub(crate) fn check_deployment_cancellation(cancellation: &DeploymentCancellation) -> Result<()> {
+    cancellation
+        .checkpoint()
+        .map_err(|_| NspawnError::DeploymentCancelled)
+}
+
 pub(crate) async fn stream_deploy_command(
     mut spawned: SpawnedProcess,
     logs: &Sender<DeployLogEvent>,

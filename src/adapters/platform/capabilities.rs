@@ -9,10 +9,6 @@ use std::path::{Path, PathBuf};
 /// layouts such as WSLg. The UID-derived systemd path is the fallback for
 /// sessions that do not export the variable or whose XDG directory has no
 /// usable Wayland socket.
-fn runtime_dir_candidates(session_uid: u32) -> Vec<PathBuf> {
-    runtime_dir_candidates_from(session_uid, std::env::var_os("XDG_RUNTIME_DIR"))
-}
-
 fn runtime_dir_candidates_from(
     session_uid: u32,
     xdg_runtime: Option<std::ffi::OsString>,
@@ -31,9 +27,35 @@ fn runtime_dir_candidates_from(
 /// Discovers session sockets and captures evidence that can be revalidated by
 /// the privileged configuration writer immediately before applying a bind.
 pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
-    let session_uid = invoking_uid();
+    discover_wayland_sockets_from(
+        invoking_uid(),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("WAYLAND_DISPLAY"),
+    )
+    .await
+}
+
+async fn discover_wayland_sockets_from(
+    session_uid: u32,
+    xdg_runtime: Option<std::ffi::OsString>,
+    configured_display: Option<std::ffi::OsString>,
+) -> Vec<HostWaylandSocket> {
     let mut last_error = None;
-    for candidate in runtime_dir_candidates(session_uid) {
+    let configured_path = configured_display.map(PathBuf::from);
+
+    if let Some(path) = configured_path.as_deref().filter(|path| path.is_absolute()) {
+        match discover_absolute_wayland_socket(path, session_uid).await {
+            Ok(socket) => return vec![socket],
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let preferred_display = configured_path
+        .as_deref()
+        .filter(|path| !path.is_absolute())
+        .and_then(Path::to_str)
+        .and_then(|display| WaylandDisplay::new(display.to_string()).ok());
+    for candidate in runtime_dir_candidates_from(session_uid, xdg_runtime) {
         let runtime = match validate_runtime_directory(&candidate, session_uid).await {
             Ok(runtime) => runtime,
             Err(error) => {
@@ -41,8 +63,9 @@ pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
                 continue;
             }
         };
-        let sockets = discover_wayland_sockets_in(&runtime, session_uid).await;
+        let mut sockets = discover_wayland_sockets_in(&runtime, session_uid).await;
         if !sockets.is_empty() {
+            prioritize_display(&mut sockets, preferred_display.as_ref());
             return sockets;
         }
     }
@@ -51,6 +74,51 @@ pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
         log::warn!("Wayland socket discovery unavailable: {error}");
     }
     Vec::new()
+}
+
+async fn discover_absolute_wayland_socket(
+    path: &Path,
+    session_uid: u32,
+) -> Result<HostWaylandSocket> {
+    let display = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            NspawnError::Validation(format!(
+                "WAYLAND_DISPLAY has no usable socket name: {}",
+                path.display()
+            ))
+        })
+        .and_then(|name| {
+            WaylandDisplay::new(name.to_string())
+                .map_err(|error| NspawnError::Validation(error.to_string()))
+        })?;
+    let parent = path.parent().ok_or_else(|| {
+        NspawnError::Validation(format!(
+            "WAYLAND_DISPLAY has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let runtime = validate_wayland_directory(parent, session_uid, true).await?;
+    inspect_wayland_socket(
+        &runtime,
+        &runtime.join(display.as_str()),
+        display,
+        session_uid,
+    )
+    .await
+}
+
+fn prioritize_display(sockets: &mut Vec<HostWaylandSocket>, preferred: Option<&WaylandDisplay>) {
+    let Some(index) = preferred.and_then(|preferred| {
+        sockets
+            .iter()
+            .position(|socket| socket.display() == preferred)
+    }) else {
+        return;
+    };
+    let preferred = sockets.remove(index);
+    sockets.insert(0, preferred);
 }
 
 async fn discover_wayland_sockets_in(runtime: &Path, session_uid: u32) -> Vec<HostWaylandSocket> {
@@ -74,32 +142,9 @@ async fn discover_wayland_sockets_in(runtime: &Path, session_uid: u32) -> Vec<Ho
             let Ok(display) = WaylandDisplay::new(name.to_string()) else {
                 continue;
             };
-            let requested = entry.path();
-            let Ok(canonical) = tokio::fs::canonicalize(&requested).await else {
-                continue;
-            };
-            let Ok(meta) = tokio::fs::metadata(&canonical).await else {
-                continue;
-            };
-            if !meta.file_type().is_socket() || meta.uid() != session_uid {
-                continue;
-            }
-            let revision = SocketRevision {
-                device: meta.dev(),
-                inode: meta.ino(),
-                ctime_seconds: meta.ctime(),
-                ctime_nanoseconds: meta.ctime_nsec(),
-            };
-            if let Ok(socket) = HostWaylandSocket::from_verified_parts(
-                display,
-                runtime.to_path_buf(),
-                canonical,
-                session_uid,
-                meta.uid(),
-                meta.gid(),
-                meta.permissions().mode(),
-                revision,
-            ) {
+            if let Ok(socket) =
+                inspect_wayland_socket(runtime, &entry.path(), display, session_uid).await
+            {
                 sockets.push(socket);
             }
         }
@@ -109,10 +154,65 @@ async fn discover_wayland_sockets_in(runtime: &Path, session_uid: u32) -> Vec<Ho
     sockets
 }
 
+async fn inspect_wayland_socket(
+    runtime: &Path,
+    requested: &Path,
+    display: WaylandDisplay,
+    session_uid: u32,
+) -> Result<HostWaylandSocket> {
+    let canonical = tokio::fs::canonicalize(requested)
+        .await
+        .map_err(|error| NspawnError::Io(requested.to_path_buf(), error))?;
+    let metadata = tokio::fs::metadata(&canonical)
+        .await
+        .map_err(|error| NspawnError::Io(canonical.clone(), error))?;
+    if !metadata.file_type().is_socket() {
+        return Err(NspawnError::Validation(format!(
+            "Wayland display is not a Unix socket: {}",
+            requested.display()
+        )));
+    }
+    if metadata.uid() != session_uid {
+        return Err(NspawnError::Validation(format!(
+            "Wayland socket is not owned by uid {session_uid}: {}",
+            requested.display()
+        )));
+    }
+    HostWaylandSocket::from_verified_parts(
+        display,
+        runtime.to_path_buf(),
+        canonical,
+        session_uid,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions().mode(),
+        SocketRevision {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds: metadata.ctime_nsec(),
+        },
+    )
+    .map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
 async fn validate_runtime_directory(path: &Path, session_uid: u32) -> Result<PathBuf> {
+    validate_wayland_directory(path, session_uid, false).await
+}
+
+async fn validate_wayland_directory(
+    path: &Path,
+    session_uid: u32,
+    allow_root_owner: bool,
+) -> Result<PathBuf> {
+    let label = if allow_root_owner {
+        "WAYLAND_DISPLAY parent directory"
+    } else {
+        "XDG runtime directory"
+    };
     if !path.is_absolute() {
         return Err(NspawnError::Validation(format!(
-            "XDG runtime directory is not absolute: {}",
+            "{label} is not absolute: {}",
             path.display()
         )));
     }
@@ -122,15 +222,17 @@ async fn validate_runtime_directory(path: &Path, session_uid: u32) -> Result<Pat
     let metadata = tokio::fs::metadata(&canonical)
         .await
         .map_err(|error| NspawnError::Io(canonical.clone(), error))?;
-    if !metadata.is_dir() || metadata.uid() != session_uid {
+    let trusted_owner = metadata.uid() == session_uid || (allow_root_owner && metadata.uid() == 0);
+    if !metadata.is_dir() || !trusted_owner {
         return Err(NspawnError::Validation(format!(
-            "XDG runtime directory is not owned by uid {session_uid}"
+            "{label} is not owned by uid {session_uid}{}",
+            if allow_root_owner { " or root" } else { "" }
         )));
     }
     if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(NspawnError::Validation(
-            "XDG runtime directory is writable by group or others".into(),
-        ));
+        return Err(NspawnError::Validation(format!(
+            "{label} is writable by group or others"
+        )));
     }
     Ok(canonical)
 }
@@ -183,5 +285,49 @@ mod tests {
             sockets[0].canonical_path(),
             std::fs::canonicalize(target).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn absolute_wayland_display_is_used_as_the_socket_path() {
+        let runtime = tempfile::tempdir().unwrap();
+        tokio::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let socket_path = runtime.path().join("compositor.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+
+        let sockets = discover_wayland_sockets_from(
+            uzers::get_current_uid(),
+            None,
+            Some(socket_path.as_os_str().to_os_string()),
+        )
+        .await;
+
+        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets[0].display().as_str(), "compositor.sock");
+        assert_eq!(
+            sockets[0].canonical_path(),
+            std::fs::canonicalize(socket_path).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn relative_wayland_display_is_preferred_within_xdg_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        tokio::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
+            .await
+            .unwrap();
+        let _first = UnixListener::bind(runtime.path().join("wayland-0")).unwrap();
+        let _preferred = UnixListener::bind(runtime.path().join("wayland-1")).unwrap();
+
+        let sockets = discover_wayland_sockets_from(
+            uzers::get_current_uid(),
+            Some(runtime.path().as_os_str().to_os_string()),
+            Some("wayland-1".into()),
+        )
+        .await;
+
+        assert_eq!(sockets.len(), 2);
+        assert_eq!(sockets[0].display().as_str(), "wayland-1");
     }
 }

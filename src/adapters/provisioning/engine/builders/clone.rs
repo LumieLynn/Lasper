@@ -4,7 +4,8 @@ use async_trait::async_trait;
 
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::provisioning::engine::{
-    send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
+    check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
+    Deployer, DeploymentCancellation,
 };
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
@@ -83,7 +84,7 @@ impl Deployer for CloneDeployer {
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> Result<()> {
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
         let source_config = self.nspawn.inspect(&self.source_name).await?;
         let source_has_override = if MachineName::new(&self.source_name).is_ok() {
             let source_unit = self.systemd_unit.read(&self.source_name).await?;
@@ -96,7 +97,7 @@ impl Deployer for CloneDeployer {
         } else {
             false
         };
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         send_deploy_log(
             &logs,
@@ -108,7 +109,7 @@ impl Deployer for CloneDeployer {
             .clone_image(&self.source_name, name)
             .await?;
         report.record_created(AppliedResource::ExternalImage);
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         let config_result = verify_systemd_cloned_config(
             &self.nspawn,
@@ -118,7 +119,7 @@ impl Deployer for CloneDeployer {
             report,
         )
         .await?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         let override_apply = if source_has_override {
             let apply = self
@@ -126,7 +127,7 @@ impl Deployer for CloneDeployer {
                 .clone_override(&self.source_name, name)
                 .await?;
             report.record_apply(AppliedResource::SystemdOverride, apply)?;
-            cancellation.checkpoint()?;
+            check_deployment_cancellation(cancellation)?;
             Some(apply)
         } else {
             None
@@ -138,7 +139,7 @@ impl Deployer for CloneDeployer {
             .map_err(|error| {
                 NspawnError::Runtime(format!("Failed to reload systemd after clone: {error}"))
             })?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
 
         let result = CloneApplyResult {
             config: config_result,

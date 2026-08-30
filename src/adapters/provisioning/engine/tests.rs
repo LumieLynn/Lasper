@@ -1,6 +1,6 @@
 use super::stream::is_high_signal_deploy_stream;
 use super::*;
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
@@ -213,7 +213,7 @@ async fn deployment_cancellation_notifies_waiters_and_fails_checkpoints() {
 
     cancellation.request();
     task.await.unwrap();
-    let result: Result<()> = cancellation.checkpoint().map_err(Into::into);
+    let result = check_deployment_cancellation(&cancellation);
     assert!(matches!(result, Err(NspawnError::DeploymentCancelled)));
 }
 

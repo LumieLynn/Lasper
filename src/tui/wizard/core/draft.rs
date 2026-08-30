@@ -15,7 +15,9 @@ use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::domain::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
-use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
+use crate::domain::wayland::{
+    HostWaylandSocket, WaylandDisplay, WaylandGrantIntent, WaylandValidationError,
+};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,7 +392,7 @@ impl WaylandAccessDraft {
     pub fn new(
         sockets: Vec<HostWaylandSocket>,
         default_display: WaylandDisplay,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, WaylandValidationError> {
         WaylandGrantIntent::new("draft-user", sockets.clone(), default_display.clone())?;
         Ok(Self {
             sockets,

@@ -286,6 +286,20 @@ fn adapters_do_not_depend_on_daemon_server_implementation() {
 }
 
 #[test]
+fn transitional_adapter_error_does_not_depend_on_application_types() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/adapters/error.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+    let sources = vec![(path, production_source(&source))];
+
+    assert_absent(
+        "transitional adapter error",
+        &sources,
+        &["crate::application::"],
+    );
+}
+
+#[test]
 fn ipc_transport_does_not_depend_on_runtime_layers() {
     let sources = rust_sources("src/ipc/transport");
 

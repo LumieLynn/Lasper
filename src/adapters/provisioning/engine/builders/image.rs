@@ -11,8 +11,9 @@ use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::provisioning::engine::image_operation::TarSourceOrigin;
 use crate::adapters::provisioning::engine::{
-    process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
-    AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
+    check_deployment_cancellation, process_state_unknown, send_deploy_log, send_deploy_progress,
+    send_deploy_stream_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer,
+    DeploymentCancellation,
 };
 use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::MachineName;
@@ -75,10 +76,10 @@ impl Deployer for ImageDeployer {
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> Result<()> {
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
         let source = acquire_image_source(&self.source, &logs, cancellation).await?;
         let source = normalize_compression(source, &logs, cancellation).await?;
-        cancellation.checkpoint()?;
+        check_deployment_cancellation(cancellation)?;
         match self.format {
             ImageFormat::Raw => {
                 send_deploy_log(&logs, "Importing typed RAW machine image...").await;
@@ -86,7 +87,7 @@ impl Deployer for ImageDeployer {
                     .map_err(|error| NspawnError::Validation(error.to_string()))?;
                 self.image_import.import_raw(machine, source).await?;
                 report.record_created(AppliedResource::ExternalImage);
-                cancellation.checkpoint()?;
+                check_deployment_cancellation(cancellation)?;
             }
             ImageFormat::Tar => {
                 send_deploy_log(&logs, "Extracting typed rootfs archive...").await;
@@ -104,7 +105,7 @@ impl Deployer for ImageDeployer {
                 for warning in report.warnings {
                     send_deploy_log(&logs, format!("WARNING: {warning}")).await;
                 }
-                cancellation.checkpoint()?;
+                check_deployment_cancellation(cancellation)?;
             }
         }
         Ok(())

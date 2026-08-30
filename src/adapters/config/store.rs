@@ -978,21 +978,18 @@ async fn validate_wayland_source(
     let metadata = tokio::fs::metadata(runtime)
         .await
         .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
-    if !metadata.is_dir() || metadata.uid() != invoking_uid {
+    if !metadata.is_dir() || (metadata.uid() != 0 && metadata.uid() != invoking_uid) {
         return Err(NspawnError::Validation(format!(
-            "XDG runtime directory is not owned by uid {invoking_uid}"
+            "Wayland socket directory is not owned by uid {invoking_uid} or root"
         )));
     }
     if metadata.permissions().mode() & 0o022 != 0 {
         return Err(NspawnError::Validation(
-            "XDG runtime directory is writable by group or others".into(),
+            "Wayland socket directory is writable by group or others".into(),
         ));
     }
 
-    let display =
-        crate::domain::wayland::WaylandDisplay::new(source.display().as_str().to_string())
-            .map_err(NspawnError::Validation)?;
-    let requested_socket = runtime.join(display.as_str());
+    let requested_socket = runtime.join(source.display().as_str());
     if requested_socket.parent() != Some(runtime) {
         return Err(NspawnError::Validation(
             "Wayland socket entry escaped its runtime directory".into(),

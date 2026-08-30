@@ -128,12 +128,6 @@ fn is_permission_dbus_error(error: &zbus::Error) -> bool {
 
 pub type Result<T> = std::result::Result<T, NspawnError>;
 
-impl From<crate::application::provisioning::DeploymentCancellationRequested> for NspawnError {
-    fn from(_: crate::application::provisioning::DeploymentCancellationRequested) -> Self {
-        Self::DeploymentCancelled
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
