@@ -6,4 +6,5 @@ pub mod provisioning;
 pub mod runtime;
 pub mod secret;
 pub mod session;
+pub mod storage;
 pub mod wayland;

@@ -7,8 +7,8 @@ pub(crate) mod image_ops;
 pub mod store;
 pub(crate) mod subvolume_ops;
 
+use crate::domain::storage::{DiskImageConfig, DiskImageSource};
 use crate::nspawn::errors::Result;
-use crate::nspawn::models::{DiskImageConfig, DiskImageSource};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

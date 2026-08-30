@@ -1,7 +1,7 @@
 use crate::application::provisioning::{
     ImagePartitionProbe, ProvisioningPreparationService, StorageBackendKind,
 };
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
+use crate::domain::storage::{parse_disk_image_size, DiskImageFilesystem, DiskImagePartition};
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::inputs::path_box::{expand_user_path, PathBox};
 use crate::tui::widgets::inputs::text_box::TextBox;
@@ -49,6 +49,30 @@ impl_wizard_nav!(StorageStepView, active_comps);
 struct RootPartitionChoice {
     partition: Option<DiskImagePartition>,
     label: String,
+}
+
+fn filesystem_label(filesystem: DiskImageFilesystem) -> &'static str {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => "Ext4",
+        DiskImageFilesystem::Xfs => "XFS",
+        DiskImageFilesystem::Btrfs => "Btrfs",
+    }
+}
+
+fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => "mkfs.ext4",
+        DiskImageFilesystem::Xfs => "mkfs.xfs",
+        DiskImageFilesystem::Btrfs => "mkfs.btrfs",
+    }
+}
+
+fn filesystem_index(filesystem: DiskImageFilesystem) -> usize {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => 0,
+        DiskImageFilesystem::Xfs => 1,
+        DiskImageFilesystem::Btrfs => 2,
+    }
 }
 
 impl RootPartitionChoice {
@@ -112,13 +136,17 @@ impl StorageStepView {
         let fs_options = info.filesystems.clone();
         let mut disk_fs = SelectableList::new(" Filesystem ", fs_options, |(fs, supported)| {
             if *supported {
-                fs.label().to_string()
+                filesystem_label(*fs).to_string()
             } else {
-                format!("{} (missing {})", fs.label(), fs.mkfs_tool())
+                format!(
+                    "{} (missing {})",
+                    filesystem_label(*fs),
+                    filesystem_tool(*fs)
+                )
             }
         })
         .with_item_enablement(|(_, supported)| *supported);
-        let mut fs_idx = initial_data.disk_fs.to_index();
+        let mut fs_idx = filesystem_index(initial_data.disk_fs);
         if let Some((_, supported)) = disk_fs.items().get(fs_idx) {
             if !*supported {
                 fs_idx = disk_fs
@@ -155,7 +183,7 @@ impl StorageStepView {
                 initial_data.disk_size.clone(),
             )
             .with_validator(|v| {
-                crate::nspawn::models::config::parse_disk_image_size(v)
+                parse_disk_image_size(v)
                     .map(|_| ())
                     .map_err(|error| error.to_string())
             }),
@@ -399,7 +427,7 @@ impl Component for StorageStepView {
                     return Err("Filesystem required".into());
                 };
                 if !*supported {
-                    return Err(format!("Missing dependency: {}", fs.mkfs_tool()));
+                    return Err(format!("Missing dependency: {}", filesystem_tool(*fs)));
                 }
                 if self.partition_table.checked() {
                     for tool in ["sfdisk", "losetup", "udevadm"] {

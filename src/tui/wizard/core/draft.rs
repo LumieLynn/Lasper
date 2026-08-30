@@ -8,11 +8,13 @@ use crate::domain::provisioning::{
 };
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::domain::secret::zeroize_string;
+use crate::domain::storage::{
+    DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
+};
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
 use crate::nspawn::models::{
     ArtifactSpec, BootstrapMethod, BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::nspawn::models::{DiskImageFilesystem, DiskImagePartition};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,7 +64,7 @@ pub struct UserConfig {
 #[derive(Debug, Clone, PartialEq)]
 pub struct StorageConfig {
     pub storage_type: StorageBackendKind,
-    pub disk_config: Option<crate::nspawn::models::DiskImageConfig>,
+    pub disk_config: Option<DiskImageConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,17 +353,17 @@ impl StorageState {
             storage_type: st,
             disk_config: if st == StorageBackendKind::DiskImage {
                 let source = if self.creation_method_idx == 1 {
-                    crate::nspawn::models::DiskImageSource::ImportExisting {
+                    DiskImageSource::ImportExisting {
                         path: self.import_path.clone(),
                     }
                 } else {
-                    crate::nspawn::models::DiskImageSource::CreateNew {
+                    DiskImageSource::CreateNew {
                         size: self.disk_size.clone(),
                         fs_type: self.disk_fs,
                     }
                 };
 
-                Some(crate::nspawn::models::DiskImageConfig {
+                Some(DiskImageConfig {
                     source,
                     use_partition_table: self.disk_partition,
                     root_partition: if self.creation_method_idx == 1 {

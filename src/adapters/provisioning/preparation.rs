@@ -4,12 +4,20 @@ use crate::application::provisioning::{
     InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort, StorageBackendKind,
     UnclassifiedNvidiaFile,
 };
-use crate::nspawn::models::DiskImageFilesystem;
+use crate::domain::storage::DiskImageFilesystem;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
 
 pub(crate) struct NspawnProvisioningPreparation;
+
+fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
+    match filesystem {
+        DiskImageFilesystem::Ext4 => "mkfs.ext4",
+        DiskImageFilesystem::Xfs => "mkfs.xfs",
+        DiskImageFilesystem::Btrfs => "mkfs.btrfs",
+    }
+}
 
 #[async_trait]
 impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
@@ -50,8 +58,9 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             .iter()
             .copied()
             .map(|filesystem| {
-                let available = tool_available(filesystem.mkfs_tool());
-                tools.insert(filesystem.mkfs_tool().to_string(), available);
+                let tool = filesystem_tool(filesystem);
+                let available = tool_available(tool);
+                tools.insert(tool.to_string(), available);
                 (filesystem, available)
             })
             .collect();

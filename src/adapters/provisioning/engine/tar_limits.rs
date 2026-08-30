@@ -4,7 +4,7 @@ use crate::nspawn::errors::{NspawnError, Result};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
-pub(super) const MAX_EXPANDED_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+pub(super) const MAX_EXPANDED_BYTES: u64 = crate::domain::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const MAX_ENTRIES: u64 = 1_000_000;
 const MAX_METADATA_BYTES: u64 = 1024 * 1024;
 

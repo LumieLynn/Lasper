@@ -17,7 +17,7 @@ use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
 use crate::nspawn::models::ContainerConfig;
 
-const MAX_IMAGE_BYTES: u64 = crate::nspawn::models::config::MAX_DISK_IMAGE_SIZE_BYTES;
+const MAX_IMAGE_BYTES: u64 = crate::domain::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
 
 #[derive(Clone, Debug)]
