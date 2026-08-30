@@ -10,11 +10,16 @@ use crate::domain::inspection::{
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry, MachineState, StatusUpdate};
 use std::collections::HashMap;
+use std::future::Future;
+use std::time::Duration;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
 
 type EnableUnitFilesBody<'a> = (Vec<&'a str>, bool, bool);
+
+const DBUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DBUS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
     (vec![unit], false, false)
@@ -115,18 +120,29 @@ impl DbusBackend {
     }
 
     async fn connection_lease(&self) -> Option<(u64, Connection)> {
-        let mut cache = self.conn.lock().await;
-        if let Some(lease) = cache.lease() {
+        if let Some(lease) = self.conn.lock().await.lease() {
             return Some(lease);
         }
 
-        match Connection::system().await {
-            Ok(connection) => Some(cache.insert(connection)),
-            Err(error) => {
-                log::debug!("System D-Bus connection unavailable: {error}");
-                None
-            }
-        }
+        // Do not hold the cache mutex while waiting for a late or unavailable
+        // system bus. A second cache check closes the parallel-connect race.
+        let connection =
+            match tokio::time::timeout(DBUS_CONNECT_TIMEOUT, Connection::system()).await {
+                Ok(Ok(connection)) => connection,
+                Ok(Err(error)) => {
+                    log::debug!("System D-Bus connection unavailable: {error}");
+                    return None;
+                }
+                Err(_) => {
+                    log::debug!(
+                        "System D-Bus connection timed out after {}s",
+                        DBUS_CONNECT_TIMEOUT.as_secs()
+                    );
+                    return None;
+                }
+            };
+        let mut cache = self.conn.lock().await;
+        Some(cache.lease().unwrap_or_else(|| cache.insert(connection)))
     }
 
     async fn invalidate_connection(&self, generation: u64) {
@@ -139,10 +155,38 @@ impl DbusBackend {
         }
     }
 
+    async fn query_with_deadline<T, F>(
+        &self,
+        generation: u64,
+        label: &str,
+        future: F,
+    ) -> zbus::Result<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+    {
+        let result = match tokio::time::timeout(DBUS_QUERY_TIMEOUT, future).await {
+            Ok(result) => result,
+            Err(_) => {
+                log::warn!(
+                    "D-Bus query {label} exceeded its {}s deadline",
+                    DBUS_QUERY_TIMEOUT.as_secs()
+                );
+                self.invalidate_connection(generation).await;
+                Err(zbus::Error::Failure(format!(
+                    "D-Bus query {label} timed out after {}s",
+                    DBUS_QUERY_TIMEOUT.as_secs()
+                )))
+            }
+        };
+        self.observe_result(generation, &result).await;
+        result
+    }
+
     async fn manager_proxy(&self) -> Option<(u64, ManagerProxy<'static>)> {
         let (generation, connection) = self.connection_lease().await?;
-        let result = ManagerProxy::new(&connection).await;
-        self.observe_result(generation, &result).await;
+        let result = self
+            .query_with_deadline(generation, "manager proxy", ManagerProxy::new(&connection))
+            .await;
         result.ok().map(|proxy| (generation, proxy))
     }
 
@@ -311,16 +355,22 @@ impl RuntimeSource for DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
-        let result = proxy.list_machines().await;
-        self.observe_result(generation, &result).await;
+        let result = self
+            .query_with_deadline(generation, "ListMachines", proxy.list_machines())
+            .await;
         let machines = result.map_err(NspawnError::Dbus)?;
         let mut entries = Vec::new();
         for (name, class, service, _path) in machines {
             if name == ".host" {
                 continue;
             }
-            let address_result = proxy.get_machine_addresses(&name).await;
-            self.observe_result(generation, &address_result).await;
+            let address_result = self
+                .query_with_deadline(
+                    generation,
+                    "GetMachineAddresses",
+                    proxy.get_machine_addresses(&name),
+                )
+                .await;
             let addrs = address_result.unwrap_or_default();
             let all_addresses: Vec<String> = addrs
                 .into_iter()
@@ -346,8 +396,9 @@ impl RuntimeSource for DbusBackend {
             .manager_proxy()
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
-        let result = proxy.list_images().await;
-        self.observe_result(generation, &result).await;
+        let result = self
+            .query_with_deadline(generation, "ListImages", proxy.list_images())
+            .await;
         let images = result.map_err(NspawnError::Dbus)?;
         let mut images = images
             .into_iter()
@@ -379,8 +430,13 @@ impl RuntimeSource for DbusBackend {
         );
 
         // 1) Try machine1 properties (only works for running/registered machines)
-        let machine_result = get_machine1_properties(&conn, &name).await;
-        self.observe_result(generation, &machine_result).await;
+        let machine_result = self
+            .query_with_deadline(
+                generation,
+                "machine properties",
+                get_machine1_properties(&conn, &name),
+            )
+            .await;
         if let Ok(m1_props) = machine_result {
             let group = props.get_group_mut(GROUP_MACHINE);
             for (k, v) in m1_props {
@@ -389,8 +445,13 @@ impl RuntimeSource for DbusBackend {
         }
 
         // 2) Supplement with systemd1 unit properties (works even when machine isn't registered)
-        let systemd_result = get_systemd1_properties(&conn, &name).await;
-        self.observe_result(generation, &systemd_result).await;
+        let systemd_result = self
+            .query_with_deadline(
+                generation,
+                "systemd unit properties",
+                get_systemd1_properties(&conn, &name),
+            )
+            .await;
         if let Ok(sd_props) = systemd_result {
             for (k, v) in sd_props {
                 crate::adapters::runtime::formatting::insert_systemd_property(&mut props, k, v);
@@ -413,11 +474,21 @@ impl RuntimeSource for DbusBackend {
             .await
             .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No DBus Connection".into())))?;
 
-        let new_result = proxy.receive_machine_new().await;
-        self.observe_result(generation, &new_result).await;
+        let new_result = self
+            .query_with_deadline(
+                generation,
+                "machine-new subscription",
+                proxy.receive_machine_new(),
+            )
+            .await;
         let mut new_stream = new_result.map_err(NspawnError::Dbus)?;
-        let removed_result = proxy.receive_machine_removed().await;
-        self.observe_result(generation, &removed_result).await;
+        let removed_result = self
+            .query_with_deadline(
+                generation,
+                "machine-removed subscription",
+                proxy.receive_machine_removed(),
+            )
+            .await;
         let mut rm_stream = removed_result.map_err(NspawnError::Dbus)?;
 
         loop {
