@@ -4,6 +4,7 @@ mod bootstrap_args;
 pub(crate) mod bootstrap_operation;
 pub mod builders;
 mod capabilities;
+mod image_acquisition;
 pub(crate) mod image_operation;
 pub(crate) mod oci_operation;
 mod orchestrator;
@@ -25,6 +26,7 @@ use capabilities::{
 pub(crate) use capabilities::{
     AppliedResource, ApplyReport, Deployer, DirectProvisioningCapabilities,
 };
+pub(crate) use image_acquisition::{ImageAcquisitionStore, ImageSource};
 pub use image_operation::ImageImportStore;
 pub use oci_operation::OciPullStore;
 pub(crate) use orchestrator::{is_cancelled_outcome, run_deployment};

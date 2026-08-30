@@ -2,7 +2,8 @@
 
 use super::engine::builders::{bootstrap, clone, image, oci};
 use super::engine::{
-    BootstrapStore, Deployer, DirectProvisioningCapabilities, ImageImportStore, OciPullStore,
+    BootstrapStore, Deployer, DirectProvisioningCapabilities, ImageAcquisitionStore,
+    ImageImportStore, ImageSource, OciPullStore,
 };
 use super::state::FilesystemDeploymentState;
 use crate::adapters::error::NspawnError;
@@ -25,6 +26,7 @@ pub(crate) struct DirectProvisioningExecutor {
     host_operations: HostOperationTracker,
     managed_storage: crate::adapters::storage::ManagedStorageStore,
     bootstrap: BootstrapStore,
+    image_acquisition: ImageAcquisitionStore,
     image_import: ImageImportStore,
     oci_pull: OciPullStore,
     deployment_state: Arc<dyn DeploymentStatePort>,
@@ -83,6 +85,7 @@ impl DirectProvisioningExecutor {
             host_operations,
             managed_storage: crate::adapters::storage::ManagedStorageStore::new(),
             bootstrap: BootstrapStore::new(command_runner),
+            image_acquisition: ImageAcquisitionStore::new(),
             image_import: ImageImportStore::new(),
             oci_pull: OciPullStore::new(),
             deployment_state,
@@ -135,23 +138,25 @@ impl DirectProvisioningExecutor {
             }),
             DeploymentSource::Artifact(artifact) => {
                 let source = match &self.artifact_source {
-                    Some(source) => image::ImageSource::Opened(Arc::clone(source)),
-                    None => image::ImageSource::Local(artifact.path.clone()),
+                    Some(source) => ImageSource::Opened(Arc::clone(source)),
+                    None => ImageSource::Local(artifact.path.clone()),
                 };
                 Box::new(image::ImageDeployer {
                     source,
                     format: image::ImageFormat::from_artifact(&artifact),
+                    acquisition: self.image_acquisition.clone(),
                     image_import: self.image_import.clone(),
                     allow_unsafe_remote_tar: false,
                 })
             }
             DeploymentSource::Pull { url, is_raw } => Box::new(image::ImageDeployer {
-                source: image::ImageSource::Remote(url),
+                source: ImageSource::Remote(url),
                 format: if is_raw {
                     image::ImageFormat::Raw
                 } else {
                     image::ImageFormat::Tar
                 },
+                acquisition: self.image_acquisition.clone(),
                 image_import: self.image_import.clone(),
                 allow_unsafe_remote_tar,
             }),
@@ -236,5 +241,60 @@ fn map_deployment_error(error: NspawnError) -> DeploymentError {
         DeploymentError::cancelled(error.to_string())
     } else {
         DeploymentError::failed(error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::storage::StorageType;
+    use crate::application::provisioning::MemoryDeploymentStatePort;
+    use crate::domain::storage::DiskImageConfig;
+
+    fn executor(state_root: &std::path::Path) -> DirectProvisioningExecutor {
+        DirectProvisioningExecutor::new(
+            Arc::new(DefaultCommandRunner),
+            HostOperationTracker::default(),
+            TrustedStateRoot::for_test(state_root.to_path_buf()),
+            Arc::new(MemoryDeploymentStatePort::default()),
+        )
+    }
+
+    #[test]
+    fn remote_tar_preserves_the_selected_storage_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let executor = executor(&temporary.path().join("state"));
+        let machine = "tar-backend-matrix";
+        let cases = [
+            (DeploymentStorage::Directory, StorageType::Directory),
+            (DeploymentStorage::Subvolume, StorageType::Subvolume),
+            (
+                DeploymentStorage::DiskImage(DiskImageConfig::default()),
+                StorageType::DiskImage,
+            ),
+        ];
+
+        for (storage, expected_type) in cases {
+            let backends = executor
+                .backends(
+                    DeploymentSource::Pull {
+                        url: "https://example.test/rootfs.tar.xz".into(),
+                        is_raw: false,
+                    },
+                    storage,
+                    true,
+                )
+                .unwrap();
+
+            assert_eq!(backends.storage.get_type(), expected_type);
+            assert!(!backends.deployer.is_external_storage_managed());
+            let expected_path = match expected_type {
+                StorageType::Directory | StorageType::Subvolume => {
+                    crate::paths::machine_root(machine)
+                }
+                StorageType::DiskImage => crate::paths::machine_raw_image(machine),
+            };
+            assert_eq!(backends.storage.get_path(machine), expected_path);
+        }
     }
 }
