@@ -677,6 +677,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
 #[tokio::test]
 async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     use crate::adapters::provisioning::state::FilesystemDeploymentState;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStatePort, DeploymentStorage,
@@ -684,14 +685,13 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     use crate::ipc::protocol::deployment::{
         ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     };
-    use crate::nspawn::models::ContainerConfig;
 
     let directory = tempfile::tempdir().unwrap();
     let root =
         crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().join("lasper"));
     let state = FilesystemDeploymentState::new(root.clone());
     let plan = DeploymentPlan::build(DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "recovery-target".into(),
             ..Default::default()
         },

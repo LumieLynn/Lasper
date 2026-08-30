@@ -4,12 +4,13 @@ use crate::adapters::config::nspawn_file::{
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
+use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig, NspawnConfigSpec};
+use crate::nspawn::models::{ApplyStatus, NspawnConfigSpec};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
@@ -69,7 +70,7 @@ impl NspawnConfigStore {
 
     pub async fn write_generated(
         &self,
-        config: &ContainerConfig,
+        config: &MachineProvisioningConfig,
         wayland: &[WaylandGrant],
         nvidia_state: Option<&NvidiaState>,
     ) -> Result<ApplyStatus> {
@@ -88,7 +89,7 @@ impl NspawnConfigStore {
 
     pub(crate) async fn validate_wayland(
         &self,
-        config: &ContainerConfig,
+        config: &MachineProvisioningConfig,
         grant: &WaylandGrant,
     ) -> Result<()> {
         let spec = NspawnConfigSpec::try_from(config)?;
@@ -1160,7 +1161,7 @@ mod tests {
 
     #[test]
     fn write_operation_contains_no_account_execution_data() {
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -1501,7 +1502,7 @@ Unknown=preserve-me\n";
     async fn generated_write_is_typed_atomic_and_uses_persistent_lock() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("test.nspawn");
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             guest_hostname: "test-host".into(),
             ..Default::default()
@@ -1523,7 +1524,7 @@ Unknown=preserve-me\n";
             .unwrap();
         assert_eq!(unchanged, ApplyStatus::Unchanged);
 
-        let different = NspawnConfigSpec::try_from(&ContainerConfig {
+        let different = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             guest_hostname: "different".into(),
             ..Default::default()
@@ -1576,7 +1577,7 @@ Unknown=preserve-me\n";
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("test.nspawn");
         let missing = directory.path().join("missing");
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             bind_mounts: vec![BindMount {
                 source: missing.to_string_lossy().into_owned(),
@@ -1609,7 +1610,7 @@ Unknown=preserve-me\n";
         let output = directory.path().join("test.nspawn");
         tokio::fs::write(&source, "data").await.unwrap();
         std::os::unix::fs::symlink(&source, &symlink).unwrap();
-        let config = ContainerConfig {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Yes),
             bind_mounts: vec![BindMount {
@@ -1758,7 +1759,7 @@ Unknown=preserve-me\n";
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = runtime.path().join("wayland-0");
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1807,7 +1808,7 @@ Unknown=preserve-me\n";
         )
         .unwrap();
         let grant = resolved_wayland_grant(source, WaylandBindPolicy::Idmap);
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1826,7 +1827,7 @@ Unknown=preserve-me\n";
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let socket_path = runtime.path().join("wayland-0");
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::No),
             ..Default::default()
@@ -1878,7 +1879,7 @@ Unknown=preserve-me\n";
         let _listener = std::os::unix::net::UnixListener::bind(&target_socket).unwrap();
         let symlink_path = runtime.path().join("wayland-0");
         std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1911,7 +1912,7 @@ Unknown=preserve-me\n";
         let runtime = tempfile::tempdir().unwrap();
         std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(runtime.path().join("wayland-0"), b"not a socket").unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1944,7 +1945,7 @@ Unknown=preserve-me\n";
         drop(listener);
         std::fs::remove_file(&socket_path).unwrap();
         let _replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()

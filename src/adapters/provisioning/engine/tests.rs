@@ -3,10 +3,11 @@ use super::*;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
     DeploymentSource, DeploymentStage, DeploymentStatePort, DeploymentStateSession,
-    DeploymentStorage, MemoryDeploymentStatePort, ResourceDisposition, ResourceLedger,
+    DeploymentStorage, MachineProvisioningConfig, MemoryDeploymentStatePort, ResourceDisposition,
+    ResourceLedger,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
+use crate::nspawn::models::ApplyStatus;
 use std::sync::Arc;
 
 fn apply_report() -> ApplyReport {
@@ -129,7 +130,7 @@ fn removing_owned_storage_resolves_unknown_rootfs_effects() {
 #[tokio::test]
 async fn interrupted_applying_effect_is_persisted_as_unknown_not_owned() {
     let plan = DeploymentPlan::build(DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             ..Default::default()
         },

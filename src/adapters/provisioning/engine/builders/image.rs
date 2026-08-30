@@ -13,10 +13,10 @@ use crate::adapters::provisioning::engine::{
     process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
     AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
+use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::MachineName;
 use crate::domain::source::{ArtifactFormat, ArtifactSpec};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ContainerConfig;
 
 const MAX_IMAGE_BYTES: u64 = crate::domain::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
@@ -69,7 +69,7 @@ impl Deployer for ImageDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &ContainerConfig,
+        _cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

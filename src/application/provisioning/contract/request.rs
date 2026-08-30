@@ -4,8 +4,9 @@ use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::source::ArtifactSpec;
 use crate::domain::storage::DiskImageConfig;
 use crate::domain::wayland::WaylandGrantIntent;
-use crate::nspawn::models::ContainerConfig;
 use serde::{Deserialize, Serialize};
+
+use super::config::MachineProvisioningConfig;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeploymentSource {
@@ -45,7 +46,7 @@ pub enum DeploymentStorage {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeploymentRequest {
-    pub config: ContainerConfig,
+    pub config: MachineProvisioningConfig,
     pub source: DeploymentSource,
     pub storage: DeploymentStorage,
     pub nvidia_profile: Option<NvidiaPassthroughProfile>,

@@ -1,11 +1,11 @@
 use super::job::DEPLOYMENT_EVENT_CAPACITY;
+use super::MachineProvisioningConfig;
 use super::*;
 use crate::domain::provisioning::CreateUser;
 use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::wayland::{
     HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
 };
-use crate::nspawn::models::ContainerConfig;
 use tokio::sync::mpsc;
 
 fn wayland_intent(target_username: &str) -> WaylandGrantIntent {
@@ -36,7 +36,7 @@ fn wayland_intent(target_username: &str) -> WaylandGrantIntent {
 #[test]
 fn wayland_target_must_belong_to_the_deployment_user_set() {
     let request = DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -63,7 +63,7 @@ fn wayland_target_must_belong_to_the_deployment_user_set() {
 #[test]
 fn wayland_target_must_request_the_host_session_uid() {
     let request = DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -102,7 +102,7 @@ fn wayland_grant_rejects_sources_that_skip_rootfs_configuration() {
         },
     ] {
         let request = DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 users: vec![CreateUser {
                     username: "alice".into(),
@@ -129,7 +129,7 @@ fn wayland_grant_rejects_sources_that_skip_rootfs_configuration() {
 #[test]
 fn request_debug_and_serializable_config_contain_no_passwords() {
     let request = DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -158,7 +158,7 @@ fn request_debug_and_serializable_config_contain_no_passwords() {
 #[test]
 fn submission_debug_redacts_all_secrets() {
     let request = DeploymentRequest {
-        config: ContainerConfig {
+        config: MachineProvisioningConfig {
             name: "test".into(),
             users: vec![CreateUser {
                 username: "alice".into(),
@@ -192,7 +192,7 @@ fn submission_debug_redacts_all_secrets() {
 fn sources_without_rootfs_configuration_reject_account_secrets() {
     let submission = DeploymentSubmission::new(
         DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 ..Default::default()
             },

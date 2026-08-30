@@ -7,11 +7,11 @@ use super::{
 use crate::adapters::storage::StorageBackend;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
-    DeploymentStage, ResourceDisposition,
+    DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
 };
 use crate::domain::provisioning::PrivateUsersMode;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
+use crate::nspawn::models::ApplyStatus;
 
 /// Runs one deployment using application-owned job state and event transport.
 #[allow(clippy::too_many_arguments)]
@@ -19,7 +19,7 @@ pub(crate) async fn run_deployment(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
-    cfg: ContainerConfig,
+    cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,
@@ -68,7 +68,7 @@ async fn run_deploy_internal(
     deployer: Box<dyn Deployer>,
     storage: Box<dyn StorageBackend>,
     name: String,
-    cfg: ContainerConfig,
+    cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,

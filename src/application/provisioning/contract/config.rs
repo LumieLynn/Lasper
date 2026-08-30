@@ -1,11 +1,18 @@
+//! Provisioning intent for creating a machine-backed systemd-nspawn guest.
+//!
+//! This is a workflow contract, not a lossless `.nspawn` document. Host-side
+//! adapters project its runtime fields into `NspawnConfigSpec`, while source,
+//! account, and storage fields remain owned by the provisioning workflow.
+
 use crate::domain::provisioning::{
     BindMount, CreateUser, NetworkMode, PortForward, PrivateUsersMode,
 };
 use crate::domain::storage::DiskImageConfig;
 use serde::{Deserialize, Serialize};
-/// Complete configuration for a new container.
+
+/// Complete provisioning configuration for a new machine.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ContainerConfig {
+pub struct MachineProvisioningConfig {
     pub name: String,
     /// Optional static hostname for the guest. An empty value uses `name`.
     #[serde(default, alias = "hostname")]
@@ -21,7 +28,7 @@ pub struct ContainerConfig {
     pub privileged: bool,
     /// Explicit `PrivateUsers=` setting. `None` keeps systemd's default policy.
     pub private_users: Option<PrivateUsersMode>,
-    /// Whether to enable hardware graphics acceleration (Auto-detected DRI/WSL/Mali).
+    /// Whether to enable hardware graphics acceleration (auto-detected DRI/WSL/Mali).
     pub graphics_acceleration: bool,
     /// Whether to expose the complete host DRM device directory.
     #[serde(default)]
@@ -29,9 +36,9 @@ pub struct ContainerConfig {
     pub users: Vec<CreateUser>,
     /// Whether to enable NVIDIA GPU passthrough (JIT managed).
     pub nvidia_gpu: bool,
-    /// Disk image specific configuration (only used if storage type is DiskImage).
+    /// Disk image-specific configuration (only used if storage type is DiskImage).
     pub disk_config: Option<DiskImageConfig>,
-    /// Whether to start an init process (Boot=yes). True by default. false for basic OCI containers.
+    /// Whether to start an init process (`Boot=yes`). False is used for basic OCI guests.
     #[serde(default = "default_boot")]
     pub boot: bool,
 }
@@ -40,7 +47,7 @@ fn default_boot() -> bool {
     true
 }
 
-impl Default for ContainerConfig {
+impl Default for MachineProvisioningConfig {
     fn default() -> Self {
         Self {
             name: Default::default(),
@@ -67,11 +74,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_container_config_defaults() {
-        let cfg = ContainerConfig::default();
-        assert!(cfg.boot);
-        assert_eq!(cfg.network, None);
-        assert_eq!(cfg.private_users, None);
+    fn defaults_describe_a_bootable_machine() {
+        let config = MachineProvisioningConfig::default();
+        assert!(config.boot);
+        assert_eq!(config.network, None);
+        assert_eq!(config.private_users, None);
     }
 
     #[test]
@@ -92,22 +99,22 @@ mod tests {
             "disk_config": null
         });
 
-        let config: ContainerConfig = serde_json::from_value(value).unwrap();
+        let config: MachineProvisioningConfig = serde_json::from_value(value).unwrap();
 
         assert_eq!(config.guest_hostname, "guest.example");
     }
 
     #[test]
-    fn test_container_config_serde_roundtrip() {
-        let cfg = ContainerConfig {
+    fn serde_roundtrip_preserves_machine_provisioning_intent() {
+        let config = MachineProvisioningConfig {
             name: "test".into(),
             nvidia_gpu: true,
             private_users: Some(PrivateUsersMode::Managed),
             ..Default::default()
         };
 
-        let json = serde_json::to_string(&cfg).unwrap();
-        let cfg2: ContainerConfig = serde_json::from_str(&json).unwrap();
-        assert_eq!(cfg, cfg2);
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: MachineProvisioningConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, restored);
     }
 }

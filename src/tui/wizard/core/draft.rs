@@ -772,17 +772,21 @@ impl WizardDraft {
         let basic = self.basic.extract_config();
         if !source.supports_rootfs_configuration() {
             let config = match &source {
-                DeploymentSource::Copy { .. } => crate::nspawn::models::ContainerConfig {
-                    name: basic.name,
-                    ..Default::default()
-                },
-                DeploymentSource::Oci { network, .. } => crate::nspawn::models::ContainerConfig {
-                    name: basic.name,
-                    network: Some(network.into_network_mode()),
-                    private_users: Some(PrivateUsersMode::No),
-                    boot: false,
-                    ..Default::default()
-                },
+                DeploymentSource::Copy { .. } => {
+                    crate::application::provisioning::MachineProvisioningConfig {
+                        name: basic.name,
+                        ..Default::default()
+                    }
+                }
+                DeploymentSource::Oci { network, .. } => {
+                    crate::application::provisioning::MachineProvisioningConfig {
+                        name: basic.name,
+                        network: Some(network.into_network_mode()),
+                        private_users: Some(PrivateUsersMode::No),
+                        boot: false,
+                        ..Default::default()
+                    }
+                }
                 DeploymentSource::Bootstrap(_)
                 | DeploymentSource::Pull { .. }
                 | DeploymentSource::Artifact(_) => unreachable!(
@@ -827,7 +831,7 @@ impl WizardDraft {
                     .map(|access| access.intent_for(&user.username))
             })
             .collect();
-        let config = crate::nspawn::models::ContainerConfig {
+        let config = crate::application::provisioning::MachineProvisioningConfig {
             name: basic.name,
             guest_hostname: basic.guest_hostname,
             network: network.mode,

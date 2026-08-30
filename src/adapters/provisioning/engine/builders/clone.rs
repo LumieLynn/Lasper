@@ -5,10 +5,10 @@ use async_trait::async_trait;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation,
 };
-use crate::application::provisioning::DeploymentResource;
+use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
+use crate::nspawn::models::ApplyStatus;
 
 pub struct CloneDeployer {
     pub source_name: String,
@@ -77,7 +77,7 @@ impl Deployer for CloneDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &ContainerConfig,
+        _cfg: &MachineProvisioningConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

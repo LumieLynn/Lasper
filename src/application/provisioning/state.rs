@@ -529,13 +529,13 @@ impl DeploymentStateSession {
 
 #[cfg(test)]
 mod tests {
+    use super::super::MachineProvisioningConfig;
     use super::*;
     use crate::application::provisioning::{DeploymentSource, DeploymentStorage};
-    use crate::nspawn::models::ContainerConfig;
 
     fn request() -> DeploymentRequest {
         DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 ..Default::default()
             },

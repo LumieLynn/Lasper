@@ -9,12 +9,11 @@ use crate::adapters::provisioning::engine::{
     send_deploy_log, stream_deploy_command, AppliedResource, ApplyReport, DeployLogEvent, Deployer,
     DeploymentCancellation, OciPullStore,
 };
-use crate::application::provisioning::DeploymentResource;
+use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
 use crate::domain::oci::OciReference;
 use crate::domain::provisioning::OciNetworkMode;
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ContainerConfig;
 
 pub struct OciDeployer {
     pub reference: String,
@@ -44,7 +43,7 @@ impl Deployer for OciDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &ContainerConfig,
+        _cfg: &MachineProvisioningConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

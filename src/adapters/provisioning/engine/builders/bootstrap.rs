@@ -8,12 +8,12 @@ use crate::adapters::provisioning::engine::{
     DeploymentCancellation,
 };
 use crate::adapters::rootfs::RootfsTarget;
+use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::bootstrap::{
     BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
     Dnf5RepositorySource, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::ContainerConfig;
 
 pub struct BootstrapDeployer {
     pub spec: BootstrapSpec,
@@ -25,7 +25,7 @@ impl Deployer for BootstrapDeployer {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &ContainerConfig,
+        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

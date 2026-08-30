@@ -380,15 +380,15 @@ fn map_state_error(error: NspawnError) -> DeploymentStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentManifestState, DeploymentPlan, DeploymentRequest, DeploymentSource,
         DeploymentStage, DeploymentStorage, ResourceLedger,
     };
-    use crate::nspawn::models::ContainerConfig;
 
     fn plan() -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: "test".into(),
                 ..Default::default()
             },

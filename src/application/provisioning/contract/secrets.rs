@@ -1,8 +1,8 @@
 use crate::domain::secret::{validate_chpasswd_secret, SecretString};
-use crate::nspawn::models::ContainerConfig;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use super::config::MachineProvisioningConfig;
 use super::job::DeploymentError;
 use super::request::DeploymentRequest;
 
@@ -54,7 +54,7 @@ impl DeploymentSecrets {
         }
     }
 
-    pub fn validate_for(&self, config: &ContainerConfig) -> Result<(), DeploymentError> {
+    pub fn validate_for(&self, config: &MachineProvisioningConfig) -> Result<(), DeploymentError> {
         if let Some(password) = &self.root_password {
             validate_chpasswd_secret(password.expose_secret())
                 .map_err(|error| DeploymentError::rejected(error.message("root password")))?;

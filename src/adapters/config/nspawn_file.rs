@@ -526,10 +526,10 @@ fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::domain::provisioning::{BindMount, IdmapSuffix};
-    use crate::nspawn::models::ContainerConfig;
 
-    fn nspawn_config_content(cfg: &ContainerConfig) -> Result<String> {
+    fn nspawn_config_content(cfg: &MachineProvisioningConfig) -> Result<String> {
         let spec = NspawnConfigSpec::try_from(cfg)?;
         nspawn_config_content_from_spec_with_wayland_binds(&spec, &[])
     }
@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_minimal() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             boot: true,
             ..Default::default()
@@ -693,7 +693,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_boot_disabled() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             boot: false,
             ..Default::default()
@@ -704,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_host_network() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Host),
             ..Default::default()
@@ -717,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_network_veth_with_ports() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Veth),
             port_forwards: vec![
@@ -743,7 +743,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_bridge_mode() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Bridge("br0".into())),
             ..Default::default()
@@ -754,7 +754,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_privileged() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             privileged: true,
             ..Default::default()
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_no() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::No),
             ..Default::default()
@@ -776,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_yes() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
@@ -787,7 +787,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_pick() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -798,7 +798,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_managed() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::None),
             private_users: Some(PrivateUsersMode::Managed),
@@ -810,7 +810,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_identity() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Identity),
             ..Default::default()
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_nvidia_marker() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".to_string(),
             nvidia_gpu: true,
             ..Default::default()
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_rejects_invalid_name() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "../escape".to_string(),
             ..Default::default()
         };
@@ -911,7 +911,7 @@ mod tests {
     fn ordinary_binds_escape_colons_and_backslashes() {
         use crate::domain::provisioning::{BindMount, IdmapSuffix};
 
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             device_binds: vec![r"/dev/dri/by-path/pci-0000:01:00.0-card".into()],
             readonly_binds: vec![r"/srv/driver\archive:current".into()],
@@ -941,7 +941,7 @@ mod tests {
 
     #[test]
     fn all_drm_passthrough_is_explicit_and_deduplicated() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             graphics_acceleration: true,
             gpu_passthrough_all: true,
@@ -956,7 +956,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_binds_only_the_verified_socket() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             network: Some(NetworkMode::Veth),
             private_users: Some(PrivateUsersMode::Pick),
@@ -977,7 +977,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_emits_each_selected_display_under_one_user_namespace() {
-        let spec = NspawnConfigSpec::try_from(&ContainerConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1008,7 +1008,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_rejects_a_conflicting_custom_bind_target() {
-        let cfg = ContainerConfig {
+        let cfg = MachineProvisioningConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             bind_mounts: vec![BindMount {

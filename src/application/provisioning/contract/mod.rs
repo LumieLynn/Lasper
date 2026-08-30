@@ -1,8 +1,10 @@
+mod config;
 mod identity;
 mod job;
 mod request;
 mod secrets;
 
+pub use config::MachineProvisioningConfig;
 pub use identity::DeploymentId;
 pub(crate) use identity::DeploymentRequestId;
 pub(crate) use job::{

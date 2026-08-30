@@ -792,16 +792,16 @@ fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentEvent, DeploymentRequest, DeploymentSource, DeploymentStorage,
     };
     use crate::domain::machine::MachineName;
-    use crate::nspawn::models::ContainerConfig;
     use tokio::io::AsyncBufReadExt;
 
     fn plan(target: &str) -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
-            config: ContainerConfig {
+            config: MachineProvisioningConfig {
                 name: target.into(),
                 ..Default::default()
             },

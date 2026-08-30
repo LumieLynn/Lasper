@@ -9,7 +9,7 @@ pub use contract::{
     DeploymentClaimStatus, DeploymentError, DeploymentEvent, DeploymentExecutor, DeploymentId,
     DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentRequest,
     DeploymentSecrets, DeploymentSource, DeploymentStatus, DeploymentStorage, DeploymentSubmission,
-    RemoteTarSafety, SourcePreflight, UserSecret,
+    MachineProvisioningConfig, RemoteTarSafety, SourcePreflight, UserSecret,
 };
 pub use preparation::{
     HostCapability, HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo, ImagePartitionProbe,

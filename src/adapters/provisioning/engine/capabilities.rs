@@ -6,10 +6,11 @@ use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentJobContext,
-    DeploymentResource, DeploymentStage, ResourceDisposition, ResourceLedger,
+    DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
+    ResourceLedger,
 };
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{ApplyStatus, ContainerConfig};
+use crate::nspawn::models::ApplyStatus;
 
 /// Direct host capabilities used by the provisioning implementation.
 ///
@@ -336,7 +337,7 @@ pub(crate) trait Deployer: Send + Sync {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &ContainerConfig,
+        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
