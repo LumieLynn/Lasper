@@ -1,8 +1,8 @@
 use crate::application::provisioning::HostCapability;
+use crate::domain::bootstrap::RootfsSourceSpec;
 use crate::domain::oci::OciReference;
 use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::source::BootstrapMethod;
-use crate::nspawn::models::RootfsSourceSpec;
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::inputs::path_box::expand_user_path;

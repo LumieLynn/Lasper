@@ -3,6 +3,9 @@ use crate::application::provisioning::{
     DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot, ProvisioningHostSnapshot,
     StorageBackendKind, UserSecret,
 };
+use crate::domain::bootstrap::{
+    BootstrapSpec, Dnf5RepositorySource, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
+};
 use crate::domain::provisioning::{
     BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
 };
@@ -13,7 +16,6 @@ use crate::domain::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay, WaylandGrantIntent};
-use crate::nspawn::models::{BootstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,8 +191,8 @@ impl SourceState {
                 spec.releasever = self.dnf_releasever.trim().into();
                 spec.packages = split_packages(&self.dnf_pkgs);
                 spec.inherit_default_packages = self.dnf_inherit_default_packages;
-                if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Unspecified {
-                    spec.repository = crate::nspawn::models::Dnf5RepositorySource::Host;
+                if spec.repository == Dnf5RepositorySource::Unspecified {
+                    spec.repository = Dnf5RepositorySource::Host;
                 }
                 SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec))
             }
@@ -952,6 +954,7 @@ impl WizardDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     fn test_wayland_access() -> WaylandAccessDraft {
         let source = HostWaylandSocket::from_verified_parts(
@@ -1172,7 +1175,7 @@ mod tests {
         assert!(!spec.inherit_default_packages);
         assert_eq!(
             spec.policy.release_signatures,
-            crate::nspawn::models::DebootstrapReleaseSignaturePolicy::Disabled
+            DebootstrapReleaseSignaturePolicy::Disabled
         );
     }
 
@@ -1199,10 +1202,7 @@ mod tests {
         let SourceConfig::Bootstrap(BootstrapSpec::Dnf5(spec)) = state.extract_config() else {
             panic!("expected dnf5 source");
         };
-        assert_eq!(
-            spec.repository,
-            crate::nspawn::models::Dnf5RepositorySource::Host
-        );
+        assert_eq!(spec.repository, Dnf5RepositorySource::Host);
         assert!(spec.validate().is_ok());
     }
 

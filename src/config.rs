@@ -3,10 +3,10 @@
 //! Reads `~/.config/lasper/lasper.toml`, which holds `[theme]` color overrides,
 //! `[settings]` for general application options, and typed bootstrap profiles.
 
-use crate::domain::source::{ArtifactSpec, BootstrapMethod};
-use crate::nspawn::models::{
+use crate::domain::bootstrap::{
     DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
+use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::tui::theme::PartialTheme;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -238,7 +238,7 @@ pub fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nspawn::models::DebootstrapReleaseSignaturePolicy;
+    use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     #[test]
     fn bootstrap_profiles_deserialize_as_typed_provider_specs() {

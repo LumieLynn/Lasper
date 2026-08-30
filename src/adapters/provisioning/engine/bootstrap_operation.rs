@@ -2,10 +2,9 @@
 
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::rootfs::RootfsTarget;
+use crate::domain::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
 use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BootstrapSpec, DebootstrapReleaseSignaturePolicy, DebootstrapSignatureOptionStyle,
-};
+use crate::nspawn::models::DebootstrapSignatureOptionStyle;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

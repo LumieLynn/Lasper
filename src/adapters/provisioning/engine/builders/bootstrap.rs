@@ -8,10 +8,12 @@ use crate::adapters::provisioning::engine::{
     DeploymentCancellation,
 };
 use crate::adapters::rootfs::RootfsTarget;
-use crate::nspawn::errors::{NspawnError, Result};
-use crate::nspawn::models::{
-    BootstrapSpec, ContainerConfig, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
+use crate::domain::bootstrap::{
+    BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
+    Dnf5RepositorySource, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
 };
+use crate::nspawn::errors::{NspawnError, Result};
+use crate::nspawn::models::ContainerConfig;
 
 pub struct BootstrapDeployer {
     pub spec: BootstrapSpec,
@@ -54,24 +56,16 @@ impl Deployer for BootstrapDeployer {
         }
         match &self.spec {
             BootstrapSpec::Pacstrap(spec)
-                if matches!(spec.cache, crate::nspawn::models::PacstrapCacheMode::Host)
-                    || matches!(
-                        spec.policy.keyring,
-                        crate::nspawn::models::PacmanKeyringMode::CopyHost
-                    )
-                    || matches!(
-                        spec.policy.mirrorlist,
-                        crate::nspawn::models::PacmanMirrorlistMode::CopyHost
-                    ) =>
+                if matches!(spec.cache, PacstrapCacheMode::Host)
+                    || matches!(spec.policy.keyring, PacmanKeyringMode::CopyHost)
+                    || matches!(spec.policy.mirrorlist, PacmanMirrorlistMode::CopyHost) =>
             {
                 log::info!(
                             "[AUDIT] [Container: {}] [Step: Bootstrap] pacstrap uses provider-default host cache/keyring/mirrorlist behavior",
                             name
                         );
             }
-            BootstrapSpec::Dnf5(spec)
-                if spec.repository == crate::nspawn::models::Dnf5RepositorySource::Host =>
-            {
+            BootstrapSpec::Dnf5(spec) if spec.repository == Dnf5RepositorySource::Host => {
                 send_deploy_log(
                     &logs,
                     "DNF5 is using the host repository configuration for this bootstrap.",
