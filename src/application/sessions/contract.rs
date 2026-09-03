@@ -2,6 +2,7 @@ use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use crate::domain::wayland::HostWaylandSocket;
 use async_trait::async_trait;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +16,8 @@ pub(crate) const JOURNAL_OUTPUT_CAPACITY: usize = 1024;
 /// A guest account name accepted by machine1's selected-user shell contract.
 /// It is passed as one D-Bus/argv value after validation, never interpolated
 /// into a shell command.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
 pub struct ValidatedGuestUserName(String);
 
 impl ValidatedGuestUserName {
@@ -63,6 +65,16 @@ impl TryFrom<&str> for ValidatedGuestUserName {
     }
 }
 
+impl<'de> Deserialize<'de> for ValidatedGuestUserName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum GuestUserNameError {
     #[error("guest username cannot be empty")]
@@ -75,6 +87,133 @@ pub enum GuestUserNameError {
     LeadingDash,
     #[error("guest username contains whitespace, control, path-separator, or '@' characters")]
     InvalidCharacter,
+}
+
+const MAX_TERM_BYTES: usize = 256;
+const MAX_TERMINAL_ENVIRONMENT_VALUE_BYTES: usize = 4096;
+
+/// Terminal capability variables inherited by one interactive selected-user
+/// shell. The variable names are fixed; callers cannot add arbitrary entries.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct InteractiveShellEnvironment {
+    term: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    colorterm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_color: Option<String>,
+}
+
+impl InteractiveShellEnvironment {
+    pub fn capture() -> Self {
+        let term = std::env::var("TERM")
+            .ok()
+            .filter(|value| valid_term(value))
+            .unwrap_or_else(|| "dumb".to_string());
+        let colorterm = captured_terminal_value("COLORTERM");
+        let no_color = captured_terminal_value("NO_COLOR");
+        Self {
+            term,
+            colorterm,
+            no_color,
+        }
+    }
+
+    pub(crate) fn new(
+        term: String,
+        colorterm: Option<String>,
+        no_color: Option<String>,
+    ) -> Result<Self, InteractiveShellEnvironmentError> {
+        if !valid_term(&term) {
+            return Err(InteractiveShellEnvironmentError::InvalidTerm);
+        }
+        for (name, value) in [("COLORTERM", &colorterm), ("NO_COLOR", &no_color)] {
+            if value
+                .as_deref()
+                .is_some_and(|value| !valid_terminal_value(value))
+            {
+                return Err(InteractiveShellEnvironmentError::InvalidValue { name });
+            }
+        }
+        Ok(Self {
+            term,
+            colorterm,
+            no_color,
+        })
+    }
+
+    pub fn term(&self) -> &str {
+        &self.term
+    }
+
+    pub fn colorterm(&self) -> Option<&str> {
+        self.colorterm.as_deref()
+    }
+
+    pub fn no_color(&self) -> Option<&str> {
+        self.no_color.as_deref()
+    }
+}
+
+impl Default for InteractiveShellEnvironment {
+    fn default() -> Self {
+        Self {
+            term: "dumb".to_string(),
+            colorterm: None,
+            no_color: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InteractiveShellEnvironment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Environment {
+            term: String,
+            #[serde(default)]
+            colorterm: Option<String>,
+            #[serde(default)]
+            no_color: Option<String>,
+        }
+
+        let environment = Environment::deserialize(deserializer)?;
+        Self::new(
+            environment.term,
+            environment.colorterm,
+            environment.no_color,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum InteractiveShellEnvironmentError {
+    #[error("TERM is not a valid terminal type name")]
+    InvalidTerm,
+    #[error("{name} contains control characters or exceeds the value limit")]
+    InvalidValue { name: &'static str },
+}
+
+fn captured_terminal_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| valid_terminal_value(value))
+}
+
+fn valid_term(value: &str) -> bool {
+    !value.is_empty()
+        && value != "unknown"
+        && value.len() <= MAX_TERM_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'.'))
+}
+
+fn valid_terminal_value(value: &str) -> bool {
+    value.len() <= MAX_TERMINAL_ENVIRONMENT_VALUE_BYTES && !value.chars().any(char::is_control)
 }
 
 /// The only user-selected identity accepted by the shell workflow.
@@ -122,14 +261,21 @@ impl WaylandShellRequest {
 pub struct ShellOpenIntent {
     target: ShellTarget,
     wayland: WaylandShellRequest,
+    terminal_environment: InteractiveShellEnvironment,
     size: SessionSize,
 }
 
 impl ShellOpenIntent {
-    pub fn new(target: ShellTarget, wayland: WaylandShellRequest, size: SessionSize) -> Self {
+    pub fn new(
+        target: ShellTarget,
+        wayland: WaylandShellRequest,
+        terminal_environment: InteractiveShellEnvironment,
+        size: SessionSize,
+    ) -> Self {
         Self {
             target,
             wayland,
+            terminal_environment,
             size,
         }
     }
@@ -140,6 +286,10 @@ impl ShellOpenIntent {
 
     pub fn wayland(&self) -> &WaylandShellRequest {
         &self.wayland
+    }
+
+    pub fn terminal_environment(&self) -> &InteractiveShellEnvironment {
+        &self.terminal_environment
     }
 
     pub const fn size(&self) -> SessionSize {
@@ -184,20 +334,32 @@ impl WaylandSessionContext {
 }
 
 /// Closed, feature-owned environment allowlist for `OpenMachineShell`.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TypedSessionEnvironment {
+    terminal: InteractiveShellEnvironment,
     wayland: Option<WaylandSessionContext>,
 }
 
 impl TypedSessionEnvironment {
-    pub(crate) fn empty() -> Self {
-        Self::default()
+    pub(crate) fn terminal(terminal: InteractiveShellEnvironment) -> Self {
+        Self {
+            terminal,
+            wayland: None,
+        }
     }
 
-    pub(crate) fn wayland(context: WaylandSessionContext) -> Self {
+    pub(crate) fn wayland(
+        terminal: InteractiveShellEnvironment,
+        context: WaylandSessionContext,
+    ) -> Self {
         Self {
+            terminal,
             wayland: Some(context),
         }
+    }
+
+    pub(crate) fn terminal_environment(&self) -> &InteractiveShellEnvironment {
+        &self.terminal
     }
 
     pub(crate) fn wayland_context(&self) -> Option<&WaylandSessionContext> {
@@ -210,7 +372,7 @@ pub(crate) enum TerminalLaunch {
     DefaultAttachment,
     SelectedUserShell {
         user: ValidatedGuestUserName,
-        environment: TypedSessionEnvironment,
+        environment: Box<TypedSessionEnvironment>,
     },
 }
 
@@ -247,7 +409,10 @@ impl TerminalSessionRequest {
             id,
             machine,
             size,
-            launch: TerminalLaunch::SelectedUserShell { user, environment },
+            launch: TerminalLaunch::SelectedUserShell {
+                user,
+                environment: Box::new(environment),
+            },
         }
     }
 }
@@ -370,6 +535,13 @@ impl TerminalSessionInput {
         }
     }
 
+    pub(crate) async fn send_input(&self, bytes: Vec<u8>) -> SessionSendStatus {
+        match self.tx.send(TerminalCommand::Input(bytes)).await {
+            Ok(()) => SessionSendStatus::Queued,
+            Err(_) => SessionSendStatus::Closed,
+        }
+    }
+
     pub fn try_resize(&self, size: SessionSize) -> SessionSendStatus {
         send_terminal_command(&self.tx, TerminalCommand::Resize(size))
     }
@@ -419,6 +591,20 @@ impl TerminalSessionHandle {
 
     pub fn take_resize_failure(&self) -> bool {
         self.resize_failed.swap(false, Ordering::AcqRel)
+    }
+
+    pub(crate) async fn wait(&mut self) -> SessionLifecycle {
+        loop {
+            let state = self.lifecycle.borrow().clone();
+            if !state.is_running() {
+                return state;
+            }
+            if self.lifecycle.changed().await.is_err() {
+                return SessionLifecycle::Failed(
+                    "terminal lifecycle channel closed while the session was running".into(),
+                );
+            }
+        }
     }
 
     pub fn close(&mut self) {
@@ -564,6 +750,41 @@ mod tests {
         ] {
             assert!(ValidatedGuestUserName::new(value).is_err(), "{value:?}");
         }
+    }
+
+    #[test]
+    fn guest_user_name_deserialization_reapplies_validation() {
+        let user: ValidatedGuestUserName = serde_json::from_str(r#""alice""#).unwrap();
+        assert_eq!(user.as_str(), "alice");
+        assert!(serde_json::from_str::<ValidatedGuestUserName>(r#""../root""#).is_err());
+    }
+
+    #[test]
+    fn interactive_shell_environment_is_typed_and_wire_validated() {
+        let environment = InteractiveShellEnvironment::new(
+            "xterm-kitty".into(),
+            Some("truecolor".into()),
+            Some(String::new()),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&environment).unwrap();
+        let decoded: InteractiveShellEnvironment = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(decoded.term(), "xterm-kitty");
+        assert_eq!(decoded.colorterm(), Some("truecolor"));
+        assert_eq!(decoded.no_color(), Some(""));
+        assert!(InteractiveShellEnvironment::new("bad term".into(), None, None).is_err());
+        assert!(
+            InteractiveShellEnvironment::new("xterm".into(), Some("truecolor\n".into()), None,)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<InteractiveShellEnvironment>(serde_json::json!({
+                "term": "xterm",
+                "unexpected": "value"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub(super) async fn handle(
     operation: FdOperation,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
+    machine: crate::adapters::session::MachineSessionTransport,
+    invoking_uid: u32,
 ) {
     log::trace!(
         "Daemon FD operation {} ({})",
@@ -31,10 +33,8 @@ pub(super) async fn handle(
             .await;
         }
         FdOperation::Terminal(params) => {
-            run_session_worker(stream, move |stream| {
-                sessions::server::spawn_terminal(stream, params, server_state)
-            })
-            .await;
+            sessions::server::spawn_terminal(stream, params, server_state, machine, invoking_uid)
+                .await;
         }
         FdOperation::SubmitDeployment(params) => {
             jobs::server::submit(&stream, *params, server_state, trusted_state_root).await;

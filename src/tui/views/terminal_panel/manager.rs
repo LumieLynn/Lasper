@@ -1,8 +1,8 @@
 //! Terminal session management.
 
 use crate::application::sessions::{
-    SessionSendStatus, SessionService, ShellOpenIntent, ShellTarget, TerminalSessionHandle,
-    TerminalSessionInput, ValidatedGuestUserName, WaylandShellRequest,
+    InteractiveShellEnvironment, SessionSendStatus, SessionService, ShellOpenIntent, ShellTarget,
+    TerminalSessionHandle, TerminalSessionInput, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
@@ -257,6 +257,7 @@ impl TerminalManager {
                     .open_shell(ShellOpenIntent::new(
                         ShellTarget::new(machine, user),
                         wayland,
+                        InteractiveShellEnvironment::capture(),
                         size,
                     ))
                     .await
@@ -927,6 +928,8 @@ mod tests {
     async fn spawn_rejects_transitional_machine_states() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut manager = TerminalManager::new(service);
@@ -950,6 +953,8 @@ mod tests {
     async fn terminal_tab_click_selects_the_session_and_machine() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service);
         let (first, _first_endpoint) = test_session(1, "first");

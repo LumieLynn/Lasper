@@ -21,24 +21,14 @@ pub(crate) struct DirectSessionAdapter {
 }
 
 impl DirectSessionAdapter {
-    pub(crate) fn new(terminal_policy: DirectTerminalPolicy) -> Self {
-        Self {
-            terminal_policy,
-            wayland: super::wayland::WaylandSessionResolver::new(
-                None,
-                crate::adapters::config::NspawnConfigStore::direct(),
-            ),
-        }
-    }
-
-    pub(crate) fn with_machine1(
+    pub(crate) fn new(
         terminal_policy: DirectTerminalPolicy,
-        machine1: crate::adapters::runtime::dbus::DbusBackend,
+        machine: super::MachineSessionTransport,
         nspawn: crate::adapters::config::NspawnConfigStore,
     ) -> Self {
         Self {
             terminal_policy,
-            wayland: super::wayland::WaylandSessionResolver::new(Some(machine1), nspawn),
+            wayland: super::wayland::WaylandSessionResolver::new(machine, nspawn),
         }
     }
 }
@@ -48,9 +38,6 @@ impl SessionPort for DirectSessionAdapter {
     async fn discover_host_wayland_sockets(
         &self,
     ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
-        if !self.wayland.is_available() {
-            return Vec::new();
-        }
         crate::adapters::platform::capabilities::discover_wayland_sockets().await
     }
 
@@ -65,24 +52,10 @@ impl SessionPort for DirectSessionAdapter {
             launch,
         } = request;
         if let TerminalLaunch::SelectedUserShell { user, environment } = launch {
-            if let Some(handle) = self
+            return self
                 .wayland
-                .open_selected_user_shell(id, machine.clone(), user.clone(), environment, size)
-                .await?
-            {
-                return Ok(handle);
-            }
-            let command = crate::adapters::session::terminal_attach::shell(&machine, &user)
-                .into_pty_command()
-                .map_err(|error| {
-                    SessionError::new(format!("validate selected-user shell: {error}"))
-                })?;
-            return crate::adapters::session::pty::spawn_direct_terminal(
-                command,
-                id,
-                crate::domain::session::TerminalAttachmentKind::Login,
-                size,
-            );
+                .open_selected_user_shell(id, machine.clone(), user.clone(), *environment, size)
+                .await;
         }
         let attachment = match self.terminal_policy {
             DirectTerminalPolicy::LoginOnly => {

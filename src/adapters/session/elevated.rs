@@ -5,25 +5,19 @@ use crate::application::sessions::{
     WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::session::SessionLifecycle;
+use crate::ipc::protocol::session::WireTerminalLaunch;
 use async_trait::async_trait;
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 
 pub(crate) struct ElevatedSessionAdapter {
     daemon: Arc<ElevatedDaemon>,
-    wayland: super::wayland::WaylandSessionResolver,
 }
 
 impl ElevatedSessionAdapter {
-    pub(crate) fn new(
-        daemon: Arc<ElevatedDaemon>,
-        machine1: Option<crate::adapters::runtime::dbus::DbusBackend>,
-        nspawn: crate::adapters::config::NspawnConfigStore,
-    ) -> Self {
-        Self {
-            daemon,
-            wayland: super::wayland::WaylandSessionResolver::new(machine1, nspawn),
-        }
+    pub(crate) fn new(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self { daemon }
     }
 }
 
@@ -32,9 +26,6 @@ impl SessionPort for ElevatedSessionAdapter {
     async fn discover_host_wayland_sockets(
         &self,
     ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
-        if !self.wayland.is_available() {
-            return Vec::new();
-        }
         crate::adapters::platform::capabilities::discover_wayland_sockets().await
     }
 
@@ -48,32 +39,27 @@ impl SessionPort for ElevatedSessionAdapter {
             size,
             launch,
         } = request;
-        if let TerminalLaunch::SelectedUserShell { user, environment } = launch {
-            if let Some(handle) = self
-                .wayland
-                .open_selected_user_shell(id, machine.clone(), user.clone(), environment, size)
-                .await?
-            {
-                return Ok(handle);
+        let launch = match launch {
+            TerminalLaunch::DefaultAttachment => WireTerminalLaunch::DefaultAttachment,
+            TerminalLaunch::SelectedUserShell { user, environment } => {
+                WireTerminalLaunch::SelectedUserShell {
+                    user,
+                    terminal: Box::new(environment.terminal_environment().clone()),
+                    wayland: environment
+                        .wayland_context()
+                        .map(|context| context.host_socket().clone()),
+                }
             }
-            let command = crate::adapters::session::terminal_attach::shell(&machine, &user)
-                .into_pty_command()
-                .map_err(|error| {
-                    SessionError::new(format!("validate selected-user shell: {error}"))
-                })?;
-            return crate::adapters::session::pty::spawn_direct_terminal(
-                command,
-                id,
-                crate::domain::session::TerminalAttachmentKind::Login,
-                size,
-            );
-        }
+        };
         let spawned = self
             .daemon
-            .spawn_terminal(id.get(), machine.as_str(), size)
+            .spawn_terminal(id.get(), machine.as_str(), size, launch)
             .await
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
-        let lifecycle = spawned.lifecycle;
+        let Some(lifecycle) = spawned.lifecycle else {
+            let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(spawned.master_fd) };
+            return crate::adapters::session::pty::spawn_machine1_terminal(master, id, size);
+        };
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,
             id,
@@ -119,7 +105,7 @@ impl SessionPort for ElevatedSessionAdapter {
         &self,
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
-        self.wayland.prepare(request).await
+        self.daemon.prepare_wayland(request).await
     }
 
     async fn open_journal(

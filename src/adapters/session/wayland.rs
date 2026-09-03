@@ -3,7 +3,6 @@
 
 use super::wayland_probe::{WaylandProbeObservation, WaylandTargetAccess};
 use crate::adapters::config::NspawnConfigStore;
-use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::machine1::{
     Machine1Environment, Machine1OpenRequest, Machine1WaylandProbeRequest,
 };
@@ -16,34 +15,44 @@ use crate::domain::session::{SessionId, SessionSize};
 
 #[derive(Clone)]
 pub(crate) struct WaylandSessionResolver {
-    machine1: Option<DbusBackend>,
+    machine: super::MachineSessionTransport,
     nspawn: NspawnConfigStore,
+    authorized_uid: u32,
 }
 
 impl WaylandSessionResolver {
-    pub(crate) fn new(machine1: Option<DbusBackend>, nspawn: NspawnConfigStore) -> Self {
-        Self { machine1, nspawn }
+    pub(crate) fn new(machine: super::MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
+        Self::for_authorized_uid(
+            machine,
+            nspawn,
+            crate::adapters::platform::capabilities::invoking_uid(),
+        )
     }
 
-    pub(crate) fn is_available(&self) -> bool {
-        self.machine1.is_some()
+    pub(crate) fn for_authorized_uid(
+        machine: super::MachineSessionTransport,
+        nspawn: NspawnConfigStore,
+        authorized_uid: u32,
+    ) -> Self {
+        Self {
+            machine,
+            nspawn,
+            authorized_uid,
+        }
     }
 
     pub(crate) async fn prepare(
         &self,
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
-        let machine1 = self.machine1.as_ref().ok_or_else(|| {
-            SessionError::new("Wayland shell validation requires the machine1 D-Bus transport")
-        })?;
-        let source = revalidate_host_socket(&request.host_socket).await?;
+        let source = revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
 
         let identity_request = Machine1WaylandProbeRequest::identity(
             request.target.machine().clone(),
             request.target.user().clone(),
         );
         let identity = run_probe(
-            machine1,
+            &self.machine,
             identity_request,
             request.identity_probe_id,
             "identity",
@@ -82,7 +91,13 @@ impl WaylandSessionResolver {
             &guest_socket,
         )
         .map_err(|error| SessionError::new(format!("validate Wayland probe target: {error}")))?;
-        let access = run_probe(machine1, access_request, request.access_probe_id, "access").await?;
+        let access = run_probe(
+            &self.machine,
+            access_request,
+            request.access_probe_id,
+            "access",
+        )
+        .await?;
         if access.identity != identity.identity {
             return Err(SessionError::new(
                 "guest identity changed while validating the Wayland projection",
@@ -121,7 +136,7 @@ impl WaylandSessionResolver {
 
         // Close the host-side replacement race as far as this pathname-based
         // design allows before handing the context to the terminal opener.
-        revalidate_host_socket(&request.host_socket).await?;
+        revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
         Ok(WaylandSessionContext::verified(
             request.host_socket,
             guest_socket,
@@ -133,18 +148,18 @@ impl WaylandSessionResolver {
         &self,
         environment: &TypedSessionEnvironment,
     ) -> Result<Machine1Environment, SessionError> {
-        let Some(context) = environment.wayland_context() else {
-            return Ok(Machine1Environment::empty());
+        let display = match environment.wayland_context() {
+            Some(context) => {
+                revalidate_host_socket(context.host_socket(), self.authorized_uid).await?;
+                Some(context.guest_socket())
+            }
+            None => None,
         };
-        revalidate_host_socket(context.host_socket()).await?;
-        Machine1Environment::wayland(context.guest_socket()).map_err(|error| {
-            SessionError::new(format!("build Wayland session environment: {error}"))
-        })
+        Machine1Environment::shell(environment.terminal_environment().clone(), display).map_err(
+            |error| SessionError::new(format!("build selected-user shell environment: {error}")),
+        )
     }
 
-    /// Open a selected-user shell through machine1 when that transport is
-    /// available. `None` lets CLI-only callers use their existing fallback,
-    /// but a verified Wayland context is never downgraded to that fallback.
     pub(crate) async fn open_selected_user_shell(
         &self,
         id: SessionId,
@@ -152,73 +167,41 @@ impl WaylandSessionResolver {
         user: ValidatedGuestUserName,
         environment: TypedSessionEnvironment,
         size: SessionSize,
-    ) -> Result<Option<TerminalSessionHandle>, SessionError> {
-        let Some(machine1) = self.machine1.as_ref() else {
-            return if environment.wayland_context().is_some() {
-                Err(SessionError::new(
-                    "Wayland shells require the machine1 D-Bus transport",
-                ))
-            } else {
-                Ok(None)
-            };
-        };
+    ) -> Result<TerminalSessionHandle, SessionError> {
         let machine1_environment = self.environment(&environment).await?;
         let request = crate::adapters::runtime::machine1::Machine1ShellRequest::new(
             machine,
             user,
             machine1_environment,
         );
-        let pty = machine1
-            .open_machine_session(Machine1OpenRequest::shell(request))
+        self.machine
+            .open_local(Machine1OpenRequest::shell(request), id, size)
             .await
-            .map_err(map_machine1_error)?;
-        super::pty::spawn_machine1_terminal(pty.master, id, size).map(Some)
     }
 }
 
 async fn revalidate_host_socket(
     socket: &crate::domain::wayland::HostWaylandSocket,
+    authorized_uid: u32,
 ) -> Result<std::path::PathBuf, SessionError> {
-    crate::adapters::wayland::revalidate_host_socket(socket, uzers::get_current_uid())
+    crate::adapters::wayland::revalidate_host_socket(socket, authorized_uid)
         .await
         .map_err(|error| SessionError::new(format!("revalidate current Wayland socket: {error}")))
 }
 
 async fn run_probe(
-    machine1: &DbusBackend,
+    machine: &super::MachineSessionTransport,
     request: Machine1WaylandProbeRequest,
     id: SessionId,
     phase: &'static str,
 ) -> Result<WaylandProbeObservation, SessionError> {
-    let pty = machine1
-        .open_machine_session(Machine1OpenRequest::wayland_probe(request))
-        .await
-        .map_err(|error| map_machine1_error_with_context("open Wayland projection probe", error))?;
     let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
-    let mut handle: TerminalSessionHandle =
-        super::pty::spawn_machine1_terminal(pty.master, id, size)?;
+    let mut handle: TerminalSessionHandle = machine
+        .open_local(Machine1OpenRequest::wayland_probe(request), id, size)
+        .await?;
     super::wayland_probe::collect_wayland_probe(&mut handle)
         .await
         .map_err(|error| SessionError::new(format!("Wayland {phase} probe failed: {error}")))
-}
-
-fn map_machine1_error(error: crate::adapters::error::NspawnError) -> SessionError {
-    map_machine1_error_with_context("open selected-user shell", error)
-}
-
-fn map_machine1_error_with_context(
-    context: &str,
-    error: crate::adapters::error::NspawnError,
-) -> SessionError {
-    let message = format!("{context} through machine1: {error}");
-    if error.is_polkit_rejection() {
-        SessionError::with_hint(
-            message,
-            "Authorize the machine1 shell request through the desktop authentication agent.",
-        )
-    } else {
-        SessionError::new(message)
-    }
 }
 
 fn projection_not_configured() -> SessionError {

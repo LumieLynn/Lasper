@@ -45,9 +45,13 @@ impl SessionService {
         &self,
         intent: ShellOpenIntent,
     ) -> Result<TerminalSessionHandle, SessionError> {
+        let terminal_environment = intent.terminal_environment().clone();
         let environment = match intent.wayland() {
-            WaylandShellRequest::Disabled => TypedSessionEnvironment::empty(),
+            WaylandShellRequest::Disabled => {
+                TypedSessionEnvironment::terminal(terminal_environment)
+            }
             WaylandShellRequest::SelectedHostDisplay(socket) => TypedSessionEnvironment::wayland(
+                terminal_environment,
                 self.prepare_wayland(intent.target().clone(), socket.clone())
                     .await?,
             ),
@@ -125,6 +129,7 @@ mod tests {
     struct RecordingPort {
         ids: Mutex<Vec<SessionId>>,
         terminal_wayland_contexts: Mutex<Vec<bool>>,
+        terminal_terms: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -145,6 +150,11 @@ mod tests {
                 TerminalLaunch::SelectedUserShell { environment, .. }
                     if environment.wayland_context().is_some()
             ));
+            if let TerminalLaunch::SelectedUserShell { environment, .. } = &request.launch {
+                self.terminal_terms
+                    .lock()
+                    .push(environment.terminal_environment().term().to_string());
+            }
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
         }
 
@@ -215,6 +225,7 @@ mod tests {
                     crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
                 ),
                 WaylandShellRequest::SelectedHostDisplay(socket),
+                crate::application::sessions::InteractiveShellEnvironment::default(),
                 SessionSize::new(80, 24).unwrap(),
             ))
             .await
@@ -223,5 +234,6 @@ mod tests {
         let ids = port.ids.lock();
         assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2, 3]);
         assert_eq!(*port.terminal_wayland_contexts.lock(), [true]);
+        assert_eq!(*port.terminal_terms.lock(), ["dumb"]);
     }
 }

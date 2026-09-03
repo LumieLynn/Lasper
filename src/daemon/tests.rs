@@ -26,6 +26,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
+fn cli_sessions() -> crate::adapters::session::MachineSessionTransport {
+    crate::adapters::session::MachineSessionTransport::Cli
+}
+
 #[derive(Clone)]
 struct SlowRemoveDbus {
     started: Arc<tokio::sync::Notify>,
@@ -351,6 +355,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            cli_sessions(),
         )
         .await
     });
@@ -428,6 +433,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            cli_sessions(),
         )
         .await
     });
@@ -574,6 +580,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
             session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
             size: SessionSize::new(120, 40).unwrap().into(),
+            launch: session::WireTerminalLaunch::DefaultAttachment,
         }),
     };
 
@@ -583,6 +590,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
     assert_eq!(json["params"]["name"], "test-machine");
     assert_eq!(json["params"]["size"]["cols"], 120);
     assert_eq!(json["params"]["size"]["rows"], 40);
+    assert_eq!(json["params"]["launch"]["launch"], "default_attachment");
 
     let parsed: FdRequest = serde_json::from_value(json).unwrap();
     match parsed.operation {
@@ -655,6 +663,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             Arc::clone(&server_state),
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            cli_sessions(),
         )
         .await,
         HandleOutcome::Spawned
@@ -677,6 +686,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            cli_sessions(),
         )
         .await,
         HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
@@ -736,6 +746,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         Arc::clone(&server_state),
         root.clone(),
+        cli_sessions(),
     )
     .await
     {
@@ -764,6 +775,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         server_state,
         root,
+        cli_sessions(),
     )
     .await
     {

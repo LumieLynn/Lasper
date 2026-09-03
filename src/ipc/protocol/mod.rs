@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 16;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 18;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -89,6 +89,7 @@ rpc_methods! {
     Ping => ("ping", Query),
     Exit => ("exit", Command),
     CloseSession => ("close_session", Session),
+    PrepareWayland => ("prepare_wayland", Session),
     NspawnConfig => ("nspawn_config", Command),
     SystemdUnit => ("systemd_unit", Command),
     NvidiaState => ("nvidia_state", Command),
@@ -297,6 +298,7 @@ mod tests {
             size: crate::domain::session::SessionSize::new(80, 24)
                 .unwrap()
                 .into(),
+            launch: crate::ipc::protocol::session::WireTerminalLaunch::DefaultAttachment,
         });
         assert_eq!(terminal.wire_name(), "spawn_terminal");
         assert_eq!(terminal.family(), RpcFamily::Session);

@@ -4,7 +4,7 @@
 //! boundary exposes only a login prompt, a selected user's default shell, and
 //! Lasper's fixed Wayland projection probe.
 
-use crate::application::sessions::ValidatedGuestUserName;
+use crate::application::sessions::{InteractiveShellEnvironment, ValidatedGuestUserName};
 use crate::domain::machine::MachineName;
 use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
@@ -47,25 +47,39 @@ pub(crate) struct Machine1Pty {
 /// Closed environment allowlist for a selected-user shell.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Machine1Environment {
+    terminal: InteractiveShellEnvironment,
     wayland_display: Option<String>,
 }
 
 impl Machine1Environment {
-    pub(crate) fn empty() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn wayland(display: &Path) -> Result<Self, Machine1EnvironmentError> {
+    pub(crate) fn shell(
+        terminal: InteractiveShellEnvironment,
+        display: Option<&Path>,
+    ) -> Result<Self, Machine1EnvironmentError> {
         Ok(Self {
-            wayland_display: Some(validate_absolute_path("WAYLAND_DISPLAY", display)?),
+            terminal,
+            wayland_display: display
+                .map(|display| validate_absolute_path("WAYLAND_DISPLAY", display))
+                .transpose()?,
         })
     }
 
     pub(crate) fn assignments(&self) -> Vec<String> {
-        self.wayland_display
-            .iter()
-            .map(|display| format!("WAYLAND_DISPLAY={display}"))
-            .collect()
+        let mut assignments = vec![format!("TERM={}", self.terminal.term())];
+        if let Some(value) = self.terminal.colorterm() {
+            assignments.push(format!("COLORTERM={value}"));
+        }
+        if let Some(value) = self.terminal.no_color() {
+            assignments.push(format!("NO_COLOR={value}"));
+        }
+        if let Some(display) = &self.wayland_display {
+            assignments.push(format!("WAYLAND_DISPLAY={display}"));
+        }
+        assignments
+    }
+
+    pub(crate) fn terminal_environment(&self) -> &InteractiveShellEnvironment {
+        &self.terminal
     }
 }
 
@@ -225,6 +239,13 @@ impl Machine1OpenRequest {
     pub(crate) fn wayland_probe(request: Machine1WaylandProbeRequest) -> Self {
         Self::WaylandProbe(request)
     }
+
+    pub(crate) const fn context(&self) -> &'static str {
+        match self {
+            Self::Shell(_) => "open selected-user shell",
+            Self::WaylandProbe(_) => "open Wayland projection probe",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -241,19 +262,42 @@ mod tests {
 
     #[test]
     fn wayland_environment_is_typed_and_deterministic() {
-        let environment =
-            Machine1Environment::wayland(Path::new("/run/lasper/wayland/1000/wayland-0")).unwrap();
+        let terminal = InteractiveShellEnvironment::new(
+            "xterm-256color".into(),
+            Some("truecolor".into()),
+            Some(String::new()),
+        )
+        .unwrap();
+        let environment = Machine1Environment::shell(
+            terminal,
+            Some(Path::new("/run/lasper/wayland/1000/wayland-0")),
+        )
+        .unwrap();
         assert_eq!(
             environment.assignments(),
-            ["WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0"]
+            [
+                "TERM=xterm-256color",
+                "COLORTERM=truecolor",
+                "NO_COLOR=",
+                "WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0",
+            ]
         );
-        assert!(Machine1Environment::empty().assignments().is_empty());
+        assert_eq!(
+            Machine1Environment::shell(InteractiveShellEnvironment::default(), None)
+                .unwrap()
+                .assignments(),
+            ["TERM=dumb"]
+        );
     }
 
     #[test]
     fn environment_rejects_relative_or_control_paths() {
         for path in ["wayland-0", "/run/../tmp/socket", "/run/socket\n"] {
-            assert!(Machine1Environment::wayland(Path::new(path)).is_err());
+            assert!(Machine1Environment::shell(
+                InteractiveShellEnvironment::default(),
+                Some(Path::new(path)),
+            )
+            .is_err());
         }
     }
 

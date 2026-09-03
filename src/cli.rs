@@ -7,7 +7,8 @@
 use std::path::PathBuf;
 
 use crate::application::sessions::{
-    SessionError, SessionService, ShellTarget, ValidatedGuestUserName, WaylandSessionContext,
+    InteractiveShellEnvironment, SessionError, SessionService, ShellOpenIntent, ShellTarget,
+    ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
@@ -31,6 +32,18 @@ pub(crate) enum CliDispatch {
 pub(crate) struct ShellCommand {
     target: ShellTarget,
     wayland: ShellWaylandSelection,
+    want_elevation: bool,
+    want_cli_mode: bool,
+}
+
+impl ShellCommand {
+    pub(crate) const fn wants_elevation(&self) -> bool {
+        self.want_elevation
+    }
+
+    pub(crate) const fn wants_cli_mode(&self) -> bool {
+        self.want_cli_mode
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -43,7 +56,7 @@ enum ShellWaylandSelection {
 fn print_help() {
     println!(
         "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
-         USAGE:\n    lasper [FLAGS]\n    lasper shell [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE\n\n\
+         USAGE:\n    lasper [FLAGS]\n    lasper [--elevate] [--cli-mode] shell [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE\n\n\
          FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use an isolated sudo daemon for privileged operations\n    -c, --cli-mode   Use runtime-state and systemd command backends\n\n\
          SHELL OPTIONS:\n    --wayland[=DISPLAY]  Use Wayland (default); optionally select a discovered display\n    --no-wayland         Open the shell without Wayland validation or environment\n\n\
          CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use the isolated sudo daemon.\n    [settings] cli-mode = true         Disable Lasper's direct DBus backend.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
@@ -54,8 +67,8 @@ fn print_help() {
 /// Dispatch process-level commands before the TUI owns the terminal.
 pub(crate) fn dispatch() -> std::result::Result<CliDispatch, i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|argument| argument == "shell") {
-        return parse_shell_command(&args[1..])
+    if let Some(shell_args) = shell_command_arguments(&args) {
+        return parse_shell_command(&shell_args)
             .map(CliDispatch::Shell)
             .map_err(|error| {
                 eprintln!("lasper: {error}");
@@ -65,12 +78,28 @@ pub(crate) fn dispatch() -> std::result::Result<CliDispatch, i32> {
     parse_flags(&args).map(CliDispatch::Application)
 }
 
+fn shell_command_arguments(args: &[String]) -> Option<Vec<String>> {
+    let shell_index = args.iter().position(|argument| argument == "shell")?;
+    args[..shell_index]
+        .iter()
+        .all(|argument| matches!(argument.as_str(), "--elevate" | "-e" | "--cli-mode" | "-c"))
+        .then(|| {
+            args[..shell_index]
+                .iter()
+                .chain(&args[shell_index + 1..])
+                .cloned()
+                .collect()
+        })
+}
+
 pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) -> i32 {
-    let ShellCommand { target, wayland } = command;
-    let context = match prepare_wayland_context(sessions, &target, wayland).await {
-        Ok(context) => context,
+    let ShellCommand {
+        target, wayland, ..
+    } = command;
+    let wayland = match resolve_wayland_request(sessions, wayland).await {
+        Ok(wayland) => wayland,
         Err(error) => {
-            report_shell_error("Wayland shell validation failed", &error);
+            report_shell_error("Wayland socket selection failed", &error);
             eprintln!(
                 "lasper: hint: choose another display with --wayland=DISPLAY, or use \
                  --no-wayland for a terminal-only shell"
@@ -78,31 +107,56 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
             return 1;
         }
     };
-
-    match crate::adapters::session::terminal_attach::run_inherited_shell(target, context).await {
-        Ok(status) => status.code().unwrap_or(1),
+    let uses_wayland = !matches!(&wayland, WaylandShellRequest::Disabled);
+    let size = match crate::adapters::session::terminal_attach::inherited_terminal_size() {
+        Ok(size) => size,
         Err(error) => {
-            report_shell_error("failed to start machinectl shell", &error);
+            report_shell_error("cannot attach the interactive terminal", &error);
+            return 1;
+        }
+    };
+    let handle = match sessions
+        .open_shell(ShellOpenIntent::new(
+            target,
+            wayland,
+            InteractiveShellEnvironment::capture(),
+            size,
+        ))
+        .await
+    {
+        Ok(handle) => handle,
+        Err(error) => {
+            report_shell_error("failed to open selected-user shell", &error);
+            if uses_wayland {
+                eprintln!(
+                    "lasper: hint: choose another display with --wayland=DISPLAY, or use \
+                     --no-wayland for a terminal-only shell"
+                );
+            }
+            return 1;
+        }
+    };
+
+    match crate::adapters::session::terminal_attach::run_inherited_terminal(handle).await {
+        Ok(code) => code,
+        Err(error) => {
+            report_shell_error("interactive shell failed", &error);
             1
         }
     }
 }
 
-async fn prepare_wayland_context(
+async fn resolve_wayland_request(
     sessions: &SessionService,
-    target: &ShellTarget,
     selection: ShellWaylandSelection,
-) -> Result<Option<WaylandSessionContext>, SessionError> {
+) -> Result<WaylandShellRequest, SessionError> {
     if selection == ShellWaylandSelection::Disabled {
-        return Ok(None);
+        return Ok(WaylandShellRequest::Disabled);
     }
 
     let sockets = sessions.discover_host_wayland_sockets().await;
     let socket = select_wayland_socket(sockets, &selection).map_err(SessionError::new)?;
-    sessions
-        .test_wayland(target.clone(), socket)
-        .await
-        .map(Some)
+    Ok(WaylandShellRequest::SelectedHostDisplay(socket))
 }
 
 fn select_wayland_socket(
@@ -162,6 +216,8 @@ fn parse_shell_command(args: &[String]) -> Result<ShellCommand, String> {
     let mut target = None;
     let mut wayland = ShellWaylandSelection::Preferred;
     let mut selection_was_explicit = false;
+    let mut want_elevation = false;
+    let mut want_cli_mode = false;
 
     for argument in args {
         let requested_wayland = if argument == "--wayland" {
@@ -189,6 +245,18 @@ fn parse_shell_command(args: &[String]) -> Result<ShellCommand, String> {
             continue;
         }
 
+        match argument.as_str() {
+            "--elevate" | "-e" => {
+                want_elevation = true;
+                continue;
+            }
+            "--cli-mode" | "-c" => {
+                want_cli_mode = true;
+                continue;
+            }
+            _ => {}
+        }
+
         if argument.starts_with('-') {
             return Err(format!("unknown shell option: {argument}"));
         }
@@ -199,7 +267,12 @@ fn parse_shell_command(args: &[String]) -> Result<ShellCommand, String> {
     }
 
     let target = target.ok_or_else(|| "shell requires USER@MACHINE".to_string())?;
-    Ok(ShellCommand { target, wayland })
+    Ok(ShellCommand {
+        target,
+        wayland,
+        want_elevation,
+        want_cli_mode,
+    })
 }
 
 fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
@@ -285,7 +358,7 @@ mod tests {
     use super::*;
     use crate::application::sessions::{
         JournalSessionHandle, JournalSessionRequest, SessionPort, TerminalSessionHandle,
-        TerminalSessionRequest, WaylandPreparationRequest,
+        TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
     };
     use crate::domain::wayland::SocketRevision;
     use async_trait::async_trait;
@@ -371,6 +444,8 @@ mod tests {
         assert_eq!(command.target.user().as_str(), "alice");
         assert_eq!(command.target.machine().as_str(), "demo");
         assert_eq!(command.wayland, ShellWaylandSelection::Preferred);
+        assert!(!command.wants_elevation());
+        assert!(!command.wants_cli_mode());
     }
 
     #[test]
@@ -384,6 +459,41 @@ mod tests {
 
         let disabled = parse_shell_command(&arguments(&["alice@demo", "--no-wayland"])).unwrap();
         assert_eq!(disabled.wayland, ShellWaylandSelection::Disabled);
+    }
+
+    #[test]
+    fn shell_accepts_the_shared_authority_and_transport_flags() {
+        let command =
+            parse_shell_command(&arguments(&["--elevate", "alice@demo", "--cli-mode"])).unwrap();
+
+        assert!(command.wants_elevation());
+        assert!(command.wants_cli_mode());
+    }
+
+    #[test]
+    fn shell_route_flags_work_before_or_after_the_subcommand() {
+        let before = shell_command_arguments(&arguments(&[
+            "--elevate",
+            "--cli-mode",
+            "shell",
+            "alice@demo",
+        ]))
+        .unwrap();
+        let after = shell_command_arguments(&arguments(&[
+            "shell",
+            "--elevate",
+            "--cli-mode",
+            "alice@demo",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            parse_shell_command(&before).unwrap(),
+            parse_shell_command(&after).unwrap()
+        );
+        assert!(
+            shell_command_arguments(&arguments(&["--unknown", "shell", "alice@demo"])).is_none()
+        );
     }
 
     #[test]
@@ -419,13 +529,11 @@ mod tests {
     async fn disabled_wayland_skips_discovery_and_probe() {
         let port = Arc::new(CountingSessionPort::default());
         let sessions = SessionService::new(port.clone());
-        let target = parse_shell_target("alice@demo").unwrap();
-
-        let context = prepare_wayland_context(&sessions, &target, ShellWaylandSelection::Disabled)
+        let request = resolve_wayland_request(&sessions, ShellWaylandSelection::Disabled)
             .await
             .unwrap();
 
-        assert!(context.is_none());
+        assert!(matches!(request, WaylandShellRequest::Disabled));
         assert_eq!(port.discovery_calls.load(Ordering::Relaxed), 0);
     }
 }

@@ -19,8 +19,35 @@ async fn main() -> Result<()> {
     let options = match crate::cli::dispatch() {
         Ok(crate::cli::CliDispatch::Application(options)) => options,
         Ok(crate::cli::CliDispatch::Shell(command)) => {
-            let sessions = crate::composition::compose_process_shell_service();
+            let loaded_config = crate::config::load_config();
+            if let Some(diagnostic) = loaded_config.diagnostic {
+                eprintln!("lasper: {}", diagnostic.summary);
+            }
+            let cli_mode = command.wants_cli_mode() || loaded_config.config.settings.cli_mode;
+            let use_sudo = crate::composition::DefaultPermissionManager::wants_elevation(
+                command.wants_elevation(),
+                &loaded_config.config.settings,
+            );
+            let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
+                crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
+            );
+            let daemon = if pm.level() == crate::composition::PermissionLevel::Elevated {
+                match crate::adapters::elevated::ElevatedDaemon::spawn(!cli_mode).await {
+                    Ok(daemon) => Some(std::sync::Arc::new(daemon)),
+                    Err(error) => {
+                        eprintln!("lasper: failed to start elevated daemon: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                None
+            };
+            let mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
+            let sessions = crate::composition::compose_process_shell_service(&mode, cli_mode);
             let code = crate::cli::run_shell(command, &sessions).await;
+            if let Some(daemon) = daemon {
+                daemon.exit().await;
+            }
             std::process::exit(code);
         }
         Err(code) => std::process::exit(code),

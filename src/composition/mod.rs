@@ -29,17 +29,29 @@ pub(crate) struct ApplicationServices {
     pub host_operations: HostOperationTracker,
 }
 
-/// Compose the narrow direct graph used by the process-level `lasper shell`
-/// command. CLI-mode and elevated session routing are separate follow-up
-/// capabilities; machine1 remains responsible for shell authorization here.
-pub(crate) fn compose_process_shell_service() -> Arc<SessionService> {
-    crate::adapters::session::compose_session_service(
-        crate::adapters::session::SessionRoute::Direct {
-            policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
-            machine1: Some(crate::adapters::runtime::dbus::DbusBackend::new()),
-            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
+/// Compose the process-level shell through the same authority and transport
+/// matrix as the TUI session service.
+pub(crate) fn compose_process_shell_service(
+    mode: &CompositionMode,
+    cli_mode: bool,
+) -> Arc<SessionService> {
+    let route = match mode {
+        CompositionMode::Elevated(daemon) => crate::adapters::session::SessionRoute::Elevated {
+            daemon: Arc::clone(daemon),
         },
-    )
+        CompositionMode::User | CompositionMode::Root => {
+            let machine = select_machine_session_transport(
+                cli_mode,
+                crate::adapters::runtime::dbus::DbusBackend::new(),
+            );
+            crate::adapters::session::SessionRoute::Direct {
+                policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
+                machine,
+                nspawn: crate::adapters::config::NspawnConfigStore::direct(),
+            }
+        }
+    };
+    crate::adapters::session::compose_session_service(route)
 }
 
 pub(crate) fn compose_application_services(
@@ -94,12 +106,12 @@ pub(crate) fn compose_application_services(
     let session_route = match level {
         PermissionLevel::User => crate::adapters::session::SessionRoute::Direct {
             policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
-            machine1: (!cli_mode).then(|| direct_dbus.clone()),
+            machine: select_machine_session_transport(cli_mode, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },
         PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct {
             policy: crate::adapters::session::DirectTerminalPolicy::Automatic,
-            machine1: (!cli_mode).then(|| direct_dbus.clone()),
+            machine: select_machine_session_transport(cli_mode, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },
         PermissionLevel::Elevated => crate::adapters::session::SessionRoute::Elevated {
@@ -107,8 +119,6 @@ pub(crate) fn compose_application_services(
                 .as_ref()
                 .cloned()
                 .expect("validated elevated composition has a daemon"),
-            machine1: (!cli_mode).then(|| direct_dbus.clone()),
-            nspawn: nspawn.clone(),
         },
     };
     let session = crate::adapters::session::compose_session_service(session_route);
@@ -237,6 +247,17 @@ pub(crate) fn compose_application_services(
     }
 }
 
+fn select_machine_session_transport(
+    cli_mode: bool,
+    dbus: crate::adapters::runtime::dbus::DbusBackend,
+) -> crate::adapters::session::MachineSessionTransport {
+    if cli_mode {
+        crate::adapters::session::MachineSessionTransport::Cli
+    } else {
+        crate::adapters::session::MachineSessionTransport::Dbus(dbus)
+    }
+}
+
 fn select_control_route(level: PermissionLevel, cli_mode: bool) -> ExecutionRoute {
     match (level, cli_mode) {
         (PermissionLevel::User | PermissionLevel::Root, false) => ExecutionRoute::DirectDbus,
@@ -276,5 +297,19 @@ mod tests {
             select_control_route(PermissionLevel::Elevated, true),
             ExecutionRoute::ElevatedCli
         );
+    }
+
+    #[test]
+    fn session_transport_follows_cli_mode() {
+        assert!(select_machine_session_transport(
+            false,
+            crate::adapters::runtime::dbus::DbusBackend::new(),
+        )
+        .uses_dbus());
+        assert!(!select_machine_session_transport(
+            true,
+            crate::adapters::runtime::dbus::DbusBackend::new(),
+        )
+        .uses_dbus());
     }
 }

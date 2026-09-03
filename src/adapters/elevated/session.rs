@@ -1,9 +1,13 @@
 use super::ElevatedDaemon;
+use crate::application::sessions::{
+    ObservedGuestIdentity, SessionError, WaylandPreparationRequest, WaylandSessionContext,
+};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use crate::ipc::protocol::session::{
-    CloseSessionParams, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
-    WireSessionId, WireSessionLifecycle, WireTerminalSize,
+    CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, SpawnJournalctlParams,
+    SpawnTerminalParams, SpawnTerminalResponse, WireSessionId, WireSessionLifecycle,
+    WireTerminalLaunch, WireTerminalLifecycleSource, WireTerminalSize,
 };
 use crate::ipc::protocol::FdOperation;
 use sendfd::RecvWithFd;
@@ -12,7 +16,7 @@ use std::os::fd::RawFd;
 pub(crate) struct SpawnedTerminalPty {
     pub master_fd: RawFd,
     pub attach_kind: TerminalAttachmentKind,
-    pub lifecycle: tokio::sync::oneshot::Receiver<SessionLifecycle>,
+    pub lifecycle: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
 }
 
 pub(crate) struct SpawnedJournalStream {
@@ -51,26 +55,89 @@ impl ElevatedDaemon {
         session_id: u64,
         name: &str,
         size: SessionSize,
+        launch: WireTerminalLaunch,
     ) -> std::io::Result<SpawnedTerminalPty> {
         let request = SpawnTerminalParams {
             session_id: WireSessionId::new(session_id)?,
             name: MachineName::try_from(name)
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
             size: WireTerminalSize::from(size),
+            launch,
         };
         let socket = self.open_fd_channel(FdOperation::Terminal(request)).await?;
-        let (message, fds) =
-            tokio::task::spawn_blocking(move || receive_two_fds(&socket)).await??;
+        let (message, fds, fd_count) =
+            tokio::task::spawn_blocking(move || receive_terminal_fds(&socket)).await??;
+        if fd_count == 0 {
+            return Err(daemon_fd_error(message.as_bytes()));
+        }
         match serde_json::from_str::<SpawnTerminalResponse>(&message) {
-            Ok(response) => Ok(SpawnedTerminalPty {
-                master_fd: fds[0],
-                attach_kind: response.attach_kind.into(),
-                lifecycle: monitor_lifecycle(fds[1]),
-            }),
+            Ok(response) => {
+                let lifecycle = match response.lifecycle {
+                    WireTerminalLifecycleSource::DaemonStatus if fd_count == 2 => {
+                        Some(monitor_lifecycle(fds[1]))
+                    }
+                    WireTerminalLifecycleSource::PtyEof if fd_count == 1 => None,
+                    expected => {
+                        close_fds(&fds[..fd_count]);
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "daemon terminal response has {fd_count} fds for {expected:?} lifecycle"
+                            ),
+                        ));
+                    }
+                };
+                Ok(SpawnedTerminalPty {
+                    master_fd: fds[0],
+                    attach_kind: response.attach_kind.into(),
+                    lifecycle,
+                })
+            }
             Err(error) => {
-                close_fds(&fds);
+                close_fds(&fds[..fd_count]);
                 Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
             }
+        }
+    }
+
+    pub(crate) async fn prepare_wayland(
+        &self,
+        request: WaylandPreparationRequest,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        let host_socket = request.host_socket.clone();
+        let params = PrepareWaylandParams {
+            identity_probe_id: WireSessionId::new(request.identity_probe_id.get())
+                .map_err(|error| SessionError::new(error.to_string()))?,
+            access_probe_id: WireSessionId::new(request.access_probe_id.get())
+                .map_err(|error| SessionError::new(error.to_string()))?,
+            machine: request.target.machine().clone(),
+            user: request.target.user().clone(),
+            host_socket: request.host_socket,
+        };
+        let params = serde_json::to_value(params)
+            .map_err(|error| SessionError::new(format!("encode Wayland validation: {error}")))?;
+        let result = self
+            .rpc_call("prepare_wayland", params)
+            .await
+            .map_err(|error| {
+                SessionError::new(format!("validate Wayland through daemon: {error}"))
+            })?;
+        let response: PrepareWaylandResponse = serde_json::from_value(result)
+            .map_err(|error| SessionError::new(format!("decode Wayland validation: {error}")))?;
+        match response {
+            PrepareWaylandResponse::Ready {
+                guest_socket,
+                uid,
+                gid,
+            } => Ok(WaylandSessionContext::verified(
+                host_socket,
+                guest_socket,
+                ObservedGuestIdentity::new(uid, gid),
+            )),
+            PrepareWaylandResponse::Failed { message, hint } => match hint {
+                Some(hint) => Err(SessionError::with_hint(message, hint)),
+                None => Err(SessionError::new(message)),
+            },
         }
     }
 
@@ -108,6 +175,22 @@ fn receive_two_fds(
         }
     };
     Ok((message, fds))
+}
+
+fn receive_terminal_fds(
+    socket: &std::os::unix::net::UnixStream,
+) -> std::io::Result<(String, [RawFd; 2], usize)> {
+    let mut buffer = [0u8; 512];
+    let mut fds = [-1 as RawFd; 2];
+    let (read, fd_count) = socket.recv_with_fd(&mut buffer, &mut fds)?;
+    let message = match String::from_utf8(buffer[..read].to_vec()) {
+        Ok(message) => message,
+        Err(error) => {
+            close_fds(&fds[..fd_count]);
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
+        }
+    };
+    Ok((message, fds, fd_count))
 }
 
 fn monitor_lifecycle(status_fd: RawFd) -> tokio::sync::oneshot::Receiver<SessionLifecycle> {
@@ -160,6 +243,7 @@ fn daemon_fd_error(message: &[u8]) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sendfd::SendWithFd;
     use std::io::Write;
     use std::os::fd::{FromRawFd, RawFd};
 
@@ -200,5 +284,28 @@ mod tests {
         });
         assert!(read_lifecycle(reader).await.is_err());
         task.await.unwrap();
+    }
+
+    #[test]
+    fn terminal_fd_receiver_accepts_a_machine1_pty_without_status_pipe() {
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (master, _writer) = pipe();
+        let response = serde_json::to_vec(&SpawnTerminalResponse {
+            attach_kind: crate::ipc::protocol::session::WireTerminalAttachmentKind::Login,
+            lifecycle: WireTerminalLifecycleSource::PtyEof,
+        })
+        .unwrap();
+
+        server.send_with_fd(&response, &[master]).unwrap();
+        unsafe { libc::close(master) };
+        let (message, fds, count) = receive_terminal_fds(&client).unwrap();
+
+        let decoded: SpawnTerminalResponse = serde_json::from_str(&message).unwrap();
+        assert!(matches!(
+            decoded.lifecycle,
+            WireTerminalLifecycleSource::PtyEof
+        ));
+        assert_eq!(count, 1);
+        close_fds(&fds[..count]);
     }
 }

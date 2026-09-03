@@ -1,16 +1,17 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
+use crate::adapters::runtime::machine1::{Machine1OpenRequest, Machine1ShellRequest};
 use crate::adapters::runtime::state as runtime_state;
-use crate::application::sessions::{
-    SessionError, ShellTarget, ValidatedGuestUserName, WaylandSessionContext,
-};
+#[cfg(test)]
+use crate::application::sessions::ValidatedGuestUserName;
+use crate::application::sessions::{SessionError, SessionSendStatus, TerminalSessionHandle};
 use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
+use crate::domain::session::{SessionLifecycle, SessionSize};
 use portable_pty::CommandBuilder;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::ExitStatus;
 
 const NAMESPACE_NAMES: [&str; 6] = ["user", "mnt", "uts", "ipc", "net", "pid"];
 
@@ -27,6 +28,14 @@ struct NamespaceSnapshot {
     start_time: u64,
     namespaces: [FileIdentity; NAMESPACE_NAMES.len()],
     root: FileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachProcessEnvironment {
+    Inherited,
+    MachinectlShell(crate::application::sessions::InteractiveShellEnvironment),
+    SanitizedNamespace,
+    MachinectlProbe,
 }
 
 impl NamespaceSnapshot {
@@ -70,6 +79,7 @@ pub struct TerminalAttachCommand {
     program: String,
     args: Vec<String>,
     namespace_snapshot: Option<NamespaceSnapshot>,
+    process_environment: AttachProcessEnvironment,
 }
 
 impl TerminalAttachCommand {
@@ -89,28 +99,50 @@ impl TerminalAttachCommand {
 
     pub fn into_pty_command(self) -> io::Result<CommandBuilder> {
         let Self {
-            kind,
             program,
             args,
             namespace_snapshot,
+            process_environment,
+            ..
         } = self;
         if let Some(snapshot) = namespace_snapshot {
             snapshot.verify()?;
         }
         let mut command = CommandBuilder::new(program);
         command.args(args);
-        if kind == TerminalAttachKind::Namespace {
-            // Do not copy sudo/daemon environment variables into a root shell
-            // inside a potentially untrusted container.
-            command.env_clear();
-            command.env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            );
-            command.env("HOME", "/root");
-            command.env("USER", "root");
-            command.env("LOGNAME", "root");
-            command.env("TERM", "xterm-256color");
+        match process_environment {
+            AttachProcessEnvironment::Inherited => {}
+            AttachProcessEnvironment::MachinectlShell(environment) => {
+                command.env("TERM", environment.term());
+                match environment.colorterm() {
+                    Some(value) => command.env("COLORTERM", value),
+                    None => command.env_remove("COLORTERM"),
+                }
+                match environment.no_color() {
+                    Some(value) => command.env("NO_COLOR", value),
+                    None => command.env_remove("NO_COLOR"),
+                }
+            }
+            AttachProcessEnvironment::SanitizedNamespace => {
+                // Do not copy sudo/daemon environment variables into a root
+                // shell inside a potentially untrusted container.
+                command.env_clear();
+                command.env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
+                command.env("HOME", "/root");
+                command.env("USER", "root");
+                command.env("LOGNAME", "root");
+                command.env("TERM", "xterm-256color");
+            }
+            AttachProcessEnvironment::MachinectlProbe => {
+                // machinectl emits OSC 3008 context sequences whenever its
+                // own terminal is non-dumb, including after probe output.
+                command.env("TERM", "dumb");
+                command.env_remove("COLORTERM");
+                command.env_remove("NO_COLOR");
+            }
         }
         Ok(command)
     }
@@ -177,6 +209,7 @@ fn login_command(name: &MachineName) -> TerminalAttachCommand {
         program: "machinectl".to_string(),
         args: vec!["--".to_string(), "login".to_string(), name.to_string()],
         namespace_snapshot: None,
+        process_environment: AttachProcessEnvironment::Inherited,
     }
 }
 
@@ -186,6 +219,7 @@ pub(crate) fn login(name: &MachineName) -> TerminalAttachCommand {
 
 /// Build the fixed selected-user route. The username remains one argv
 /// element all the way to machinectl and is never parsed by a shell.
+#[cfg(test)]
 pub(crate) fn shell(name: &MachineName, user: &ValidatedGuestUserName) -> TerminalAttachCommand {
     TerminalAttachCommand {
         kind: TerminalAttachKind::Login,
@@ -196,65 +230,177 @@ pub(crate) fn shell(name: &MachineName, user: &ValidatedGuestUserName) -> Termin
             format!("{}@{}", user, name),
         ],
         namespace_snapshot: None,
+        process_environment: AttachProcessEnvironment::Inherited,
     }
 }
 
+fn selected_user_shell(request: Machine1ShellRequest) -> io::Result<TerminalAttachCommand> {
+    let process_environment = AttachProcessEnvironment::MachinectlShell(
+        request.environment().terminal_environment().clone(),
+    );
+    let assignments = request.environment().assignments();
+    let mut args = assignments
+        .into_iter()
+        .map(|assignment| format!("--setenv={assignment}"))
+        .collect::<Vec<_>>();
+    args.extend([
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ]);
+    Ok(TerminalAttachCommand {
+        kind: TerminalAttachKind::Login,
+        program: "machinectl".to_string(),
+        args,
+        namespace_snapshot: None,
+        process_environment,
+    })
+}
+
+/// Convert the closed machine1 request set to its machinectl equivalent.
+pub(crate) fn machine1(request: Machine1OpenRequest) -> io::Result<TerminalAttachCommand> {
+    match request {
+        Machine1OpenRequest::Shell(request) => selected_user_shell(request),
+        Machine1OpenRequest::WaylandProbe(request) => {
+            let mut args = vec![
+                "--quiet".to_string(),
+                "--".to_string(),
+                "shell".to_string(),
+                format!("{}@{}", request.user(), request.machine()),
+            ];
+            args.extend(request.args());
+            Ok(TerminalAttachCommand {
+                kind: TerminalAttachKind::Login,
+                program: "machinectl".to_string(),
+                args,
+                namespace_snapshot: None,
+                process_environment: AttachProcessEnvironment::MachinectlProbe,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
 fn wayland_shell(
     name: &MachineName,
     user: &ValidatedGuestUserName,
     guest_socket: &Path,
 ) -> io::Result<TerminalAttachCommand> {
-    let assignment = crate::adapters::runtime::machine1::Machine1Environment::wayland(guest_socket)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
-        .assignments()
-        .into_iter()
-        .next()
-        .expect("Wayland environment contains its single typed assignment");
-    Ok(TerminalAttachCommand {
-        kind: TerminalAttachKind::Login,
-        program: "machinectl".to_string(),
-        args: vec![
-            format!("--setenv={assignment}"),
-            "--".to_string(),
-            "shell".to_string(),
-            format!("{}@{}", user, name),
-        ],
-        namespace_snapshot: None,
-    })
+    selected_user_shell(
+        crate::adapters::runtime::machine1::Machine1ShellRequest::new(
+            name.clone(),
+            user.clone(),
+            crate::adapters::runtime::machine1::Machine1Environment::shell(
+                crate::application::sessions::InteractiveShellEnvironment::default(),
+                Some(guest_socket),
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?,
+        ),
+    )
 }
 
-/// Run the process-level selected-user shell with the caller's terminal
-/// inherited by machinectl. A verified Wayland context permits exactly one
-/// environment assignment and is revalidated immediately before spawning.
-pub(crate) async fn run_inherited_shell(
-    target: ShellTarget,
-    wayland: Option<WaylandSessionContext>,
-) -> Result<ExitStatus, SessionError> {
-    let command = match wayland {
-        Some(context) => {
-            crate::adapters::wayland::revalidate_host_socket(
-                context.host_socket(),
-                uzers::get_current_uid(),
-            )
-            .await
-            .map_err(|error| {
-                SessionError::new(format!("revalidate current Wayland socket: {error}"))
-            })?;
-            wayland_shell(target.machine(), target.user(), context.guest_socket()).map_err(
-                |error| SessionError::new(format!("build Wayland shell command: {error}")),
-            )?
-        }
-        None => shell(target.machine(), target.user()),
-    };
+pub(crate) fn inherited_terminal_size() -> Result<SessionSize, SessionError> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(SessionError::new(
+            "lasper shell requires an interactive terminal on stdin and stdout",
+        ));
+    }
+    let (cols, rows) = crossterm::terminal::size()
+        .map_err(|error| SessionError::new(format!("read terminal size: {error}")))?;
+    SessionSize::new(cols, rows)
+        .map_err(|error| SessionError::new(format!("validate terminal size: {error}")))
+}
 
-    tokio::task::spawn_blocking(move || {
-        std::process::Command::new(command.program)
-            .args(command.args)
-            .status()
-    })
-    .await
-    .map_err(|error| SessionError::new(format!("machinectl shell task failed: {error}")))?
-    .map_err(|error| SessionError::new(error.to_string()))
+/// Forward the caller's terminal byte-for-byte to an application session.
+pub(crate) async fn run_inherited_terminal(
+    mut handle: TerminalSessionHandle,
+) -> Result<i32, SessionError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct RawModeGuard;
+    impl RawModeGuard {
+        fn enter() -> Result<Self, SessionError> {
+            crossterm::terminal::enable_raw_mode()
+                .map_err(|error| SessionError::new(format!("enable terminal raw mode: {error}")))?;
+            Ok(Self)
+        }
+    }
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let _ = crossterm::terminal::disable_raw_mode();
+        }
+    }
+
+    let mut output = handle
+        .take_output()
+        .ok_or_else(|| SessionError::new("terminal session output is unavailable"))?;
+    let input = handle.input();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let mut input_buffer = [0u8; 4096];
+    let mut resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        .map_err(|error| SessionError::new(format!("watch terminal size: {error}")))?;
+    let raw_mode = RawModeGuard::enter()?;
+    let mut lifecycle = Box::pin(handle.wait());
+    let mut completed = None;
+    let state = loop {
+        if let Some(state) = completed.take() {
+            while let Some(chunk) = output.recv().await {
+                stdout.write_all(&chunk).await.map_err(|error| {
+                    SessionError::new(format!("write terminal output: {error}"))
+                })?;
+            }
+            stdout
+                .flush()
+                .await
+                .map_err(|error| SessionError::new(format!("flush terminal output: {error}")))?;
+            break state;
+        }
+        tokio::select! {
+            read = stdin.read(&mut input_buffer) => {
+                let read = read.map_err(|error| SessionError::new(format!("read terminal input: {error}")))?;
+                if read == 0 {
+                    break SessionLifecycle::Closed;
+                }
+                if input.send_input(input_buffer[..read].to_vec()).await == SessionSendStatus::Closed {
+                    break lifecycle.await;
+                }
+            }
+            chunk = output.recv() => {
+                match chunk {
+                    Some(chunk) => {
+                        stdout
+                            .write_all(&chunk)
+                            .await
+                            .map_err(|error| SessionError::new(format!("write terminal output: {error}")))?;
+                        stdout
+                            .flush()
+                            .await
+                            .map_err(|error| SessionError::new(format!("flush terminal output: {error}")))?;
+                    }
+                    None => break lifecycle.await,
+                }
+            }
+            _ = resize.recv() => {
+                if let Ok(size) = inherited_terminal_size() {
+                    let _ = input.try_resize(size);
+                }
+            }
+            state = &mut lifecycle => completed = Some(state),
+        }
+    };
+    drop(raw_mode);
+
+    match state {
+        SessionLifecycle::Exited { success, code } => {
+            Ok(code.unwrap_or(if success { 0 } else { 1 }))
+        }
+        SessionLifecycle::Closed => Ok(0),
+        SessionLifecycle::Failed(message) => Err(SessionError::new(message)),
+        SessionLifecycle::Running => Err(SessionError::new(
+            "terminal session returned without a terminal lifecycle state",
+        )),
+    }
 }
 
 fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAttachCommand> {
@@ -309,6 +455,7 @@ fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAtt
         program: "nsenter".to_string(),
         args,
         namespace_snapshot: Some(snapshot),
+        process_environment: AttachProcessEnvironment::SanitizedNamespace,
     })
 }
 
@@ -439,27 +586,49 @@ mod tests {
     }
 
     #[test]
-    fn wayland_shell_has_one_typed_environment_assignment() {
+    fn selected_user_shell_forwards_the_typed_terminal_and_wayland_environment() {
         let name = MachineName::new("test-machine").unwrap();
         let user = ValidatedGuestUserName::new("alice").unwrap();
 
-        let command = wayland_shell(
-            &name,
-            &user,
-            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        let terminal = crate::application::sessions::InteractiveShellEnvironment::new(
+            "xterm-kitty".into(),
+            Some("truecolor".into()),
+            Some(String::new()),
         )
+        .unwrap();
+        let environment = crate::adapters::runtime::machine1::Machine1Environment::shell(
+            terminal,
+            Some(Path::new("/run/lasper/wayland/1000/wayland-1")),
+        )
+        .unwrap();
+        let command = machine1(Machine1OpenRequest::shell(
+            crate::adapters::runtime::machine1::Machine1ShellRequest::new(name, user, environment),
+        ))
         .unwrap();
 
         assert_eq!(command.program(), "machinectl");
         assert_eq!(
             command.args(),
             [
+                "--setenv=TERM=xterm-kitty",
+                "--setenv=COLORTERM=truecolor",
+                "--setenv=NO_COLOR=",
                 "--setenv=WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-1",
                 "--",
                 "shell",
                 "alice@test-machine",
             ]
         );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-kitty"))
+        );
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(command.get_env("NO_COLOR"), Some(std::ffi::OsStr::new("")));
     }
 
     #[test]
@@ -470,6 +639,39 @@ mod tests {
         for path in ["wayland-0", "/run/../tmp/socket", "/run/socket\n"] {
             assert!(wayland_shell(&name, &user, Path::new(path)).is_err());
         }
+    }
+
+    #[test]
+    fn machinectl_probe_preserves_the_fixed_program_and_argument_boundaries() {
+        let request = crate::adapters::runtime::machine1::Machine1WaylandProbeRequest::target(
+            MachineName::new("test-machine").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        )
+        .unwrap();
+
+        let command = machine1(Machine1OpenRequest::wayland_probe(request)).unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            &command.args()[..6],
+            [
+                "--quiet",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/bin/sh",
+                "-c"
+            ]
+        );
+        assert_eq!(
+            command.args().last().map(String::as_str),
+            Some("/run/lasper/wayland/1000/wayland-1")
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
+        assert_eq!(command.get_env("COLORTERM"), None);
+        assert_eq!(command.get_env("NO_COLOR"), None);
     }
 
     #[test]

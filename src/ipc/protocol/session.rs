@@ -1,9 +1,12 @@
+use crate::application::sessions::{InteractiveShellEnvironment, ValidatedGuestUserName};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
+use crate::domain::wayland::HostWaylandSocket;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroU16;
 use std::num::NonZeroU64;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -37,6 +40,44 @@ pub(crate) struct SpawnTerminalParams {
     pub session_id: WireSessionId,
     pub name: MachineName,
     pub size: WireTerminalSize,
+    pub launch: WireTerminalLaunch,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "launch", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum WireTerminalLaunch {
+    DefaultAttachment,
+    SelectedUserShell {
+        user: ValidatedGuestUserName,
+        terminal: Box<InteractiveShellEnvironment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wayland: Option<HostWaylandSocket>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrepareWaylandParams {
+    pub identity_probe_id: WireSessionId,
+    pub access_probe_id: WireSessionId,
+    pub machine: MachineName,
+    pub user: ValidatedGuestUserName,
+    pub host_socket: HostWaylandSocket,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum PrepareWaylandResponse {
+    Ready {
+        guest_socket: PathBuf,
+        uid: u32,
+        gid: u32,
+    },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
 }
 
 /// Raw terminal dimensions used only at the privileged FD boundary.
@@ -113,6 +154,14 @@ impl std::error::Error for WireTerminalSizeError {}
 #[serde(deny_unknown_fields)]
 pub(crate) struct SpawnTerminalResponse {
     pub attach_kind: WireTerminalAttachmentKind,
+    pub lifecycle: WireTerminalLifecycleSource,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WireTerminalLifecycleSource {
+    DaemonStatus,
+    PtyEof,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -170,5 +219,57 @@ mod tests {
     fn wire_session_id_rejects_zero() {
         assert!(serde_json::from_str::<WireSessionId>("0").is_err());
         assert_eq!(serde_json::from_str::<WireSessionId>("1").unwrap().get(), 1);
+    }
+
+    #[test]
+    fn selected_user_launch_revalidates_the_wire_username() {
+        let valid: WireTerminalLaunch = serde_json::from_value(serde_json::json!({
+            "launch": "selected_user_shell",
+            "user": "alice",
+            "terminal": { "term": "xterm-256color" }
+        }))
+        .unwrap();
+        assert!(matches!(
+            valid,
+            WireTerminalLaunch::SelectedUserShell {
+                terminal,
+                wayland: None,
+                ..
+            } if terminal.term() == "xterm-256color"
+        ));
+
+        assert!(
+            serde_json::from_value::<WireTerminalLaunch>(serde_json::json!({
+                "launch": "selected_user_shell",
+                "user": "../root",
+                "terminal": { "term": "xterm-256color" }
+            }))
+            .is_err()
+        );
+
+        assert!(
+            serde_json::from_value::<WireTerminalLaunch>(serde_json::json!({
+                "launch": "selected_user_shell",
+                "user": "alice",
+                "terminal": { "term": "bad term" }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn wayland_failure_preserves_its_actionable_hint() {
+        let response = PrepareWaylandResponse::Failed {
+            message: "projection is missing".into(),
+            hint: Some("restart the machine".into()),
+        };
+        let encoded = serde_json::to_value(response).unwrap();
+        let decoded: PrepareWaylandResponse = serde_json::from_value(encoded).unwrap();
+
+        assert!(matches!(
+            decoded,
+            PrepareWaylandResponse::Failed { hint: Some(hint), .. }
+                if hint == "restart the machine"
+        ));
     }
 }

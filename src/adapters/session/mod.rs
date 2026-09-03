@@ -1,5 +1,6 @@
 mod direct;
 mod elevated;
+mod machine;
 mod pty;
 pub(crate) mod terminal_attach;
 mod wayland;
@@ -10,17 +11,17 @@ use std::sync::Arc;
 
 pub(crate) use direct::{DirectSessionAdapter, DirectTerminalPolicy};
 pub(crate) use elevated::ElevatedSessionAdapter;
+pub(crate) use machine::MachineSessionTransport;
+pub(crate) use wayland::WaylandSessionResolver;
 
 pub(crate) enum SessionRoute {
     Direct {
         policy: DirectTerminalPolicy,
-        machine1: Option<crate::adapters::runtime::dbus::DbusBackend>,
+        machine: MachineSessionTransport,
         nspawn: crate::adapters::config::NspawnConfigStore,
     },
     Elevated {
         daemon: Arc<crate::adapters::elevated::ElevatedDaemon>,
-        machine1: Option<crate::adapters::runtime::dbus::DbusBackend>,
-        nspawn: crate::adapters::config::NspawnConfigStore,
     },
 }
 
@@ -28,19 +29,10 @@ pub(crate) fn compose_session_service(route: SessionRoute) -> Arc<SessionService
     let port: Arc<dyn SessionPort> = match route {
         SessionRoute::Direct {
             policy,
-            machine1,
+            machine,
             nspawn,
-        } => match machine1 {
-            Some(machine1) => Arc::new(DirectSessionAdapter::with_machine1(
-                policy, machine1, nspawn,
-            )),
-            None => Arc::new(DirectSessionAdapter::new(policy)),
-        },
-        SessionRoute::Elevated {
-            daemon,
-            machine1,
-            nspawn,
-        } => Arc::new(ElevatedSessionAdapter::new(daemon, machine1, nspawn)),
+        } => Arc::new(DirectSessionAdapter::new(policy, machine, nspawn)),
+        SessionRoute::Elevated { daemon } => Arc::new(ElevatedSessionAdapter::new(daemon)),
     };
     Arc::new(SessionService::new(port))
 }

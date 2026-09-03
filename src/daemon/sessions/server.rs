@@ -1,8 +1,9 @@
 use crate::daemon::server::DaemonServerState;
 use crate::domain::session::SessionSize;
 use crate::ipc::protocol::session::{
-    SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionLifecycle,
-    WireTerminalAttachmentKind,
+    SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse, WireSessionId,
+    WireSessionLifecycle, WireTerminalAttachmentKind, WireTerminalLaunch,
+    WireTerminalLifecycleSource, WireTerminalSize,
 };
 use sendfd::SendWithFd;
 use std::io::Write;
@@ -80,18 +81,130 @@ pub(crate) fn spawn_journal(
     }
 }
 
-pub(crate) fn spawn_terminal(
-    stream: &mut std::os::unix::net::UnixStream,
+pub(crate) async fn spawn_terminal(
+    mut stream: std::os::unix::net::UnixStream,
     params: SpawnTerminalParams,
     state: Arc<DaemonServerState>,
+    machine: crate::adapters::session::MachineSessionTransport,
+    invoking_uid: u32,
 ) {
-    use portable_pty::{native_pty_system, PtySize};
-
+    if let Err(error) = stream.set_write_timeout(Some(std::time::Duration::from_secs(5))) {
+        log::error!("Daemon: failed to set terminal response timeout: {error}");
+        return;
+    }
     let SpawnTerminalParams {
         session_id,
         name,
         size,
+        launch,
     } = params;
+    let command = match launch {
+        WireTerminalLaunch::DefaultAttachment => {
+            match crate::adapters::session::terminal_attach::select(&name) {
+                Ok(command) => command,
+                Err(error) => {
+                    send_session_error(&stream, "terminal attach planning failed", &error);
+                    return;
+                }
+            }
+        }
+        WireTerminalLaunch::SelectedUserShell {
+            user,
+            terminal,
+            wayland,
+        } => {
+            let target = crate::application::sessions::ShellTarget::new(name.clone(), user.clone());
+            let resolver = crate::adapters::session::WaylandSessionResolver::for_authorized_uid(
+                machine.clone(),
+                crate::adapters::config::NspawnConfigStore::direct(),
+                invoking_uid,
+            );
+            let environment = match wayland {
+                Some(host_socket) => {
+                    let result = resolver
+                        .prepare(crate::application::sessions::WaylandPreparationRequest {
+                            identity_probe_id: next_probe_id(),
+                            access_probe_id: next_probe_id(),
+                            target,
+                            host_socket,
+                        })
+                        .await;
+                    match result {
+                        Ok(context) => {
+                            crate::application::sessions::TypedSessionEnvironment::wayland(
+                                (*terminal).clone(),
+                                context,
+                            )
+                        }
+                        Err(error) => {
+                            send_session_error(&stream, "Wayland shell validation failed", &error);
+                            return;
+                        }
+                    }
+                }
+                None => crate::application::sessions::TypedSessionEnvironment::terminal(*terminal),
+            };
+            let environment = match resolver.environment(&environment).await {
+                Ok(environment) => environment,
+                Err(error) => {
+                    send_session_error(&stream, "Wayland environment validation failed", &error);
+                    return;
+                }
+            };
+            let request = crate::adapters::runtime::machine1::Machine1OpenRequest::shell(
+                crate::adapters::runtime::machine1::Machine1ShellRequest::new(
+                    name.clone(),
+                    user,
+                    environment,
+                ),
+            );
+            if machine.uses_dbus() {
+                match machine.open_dbus(request).await {
+                    Ok(Some(pty)) => {
+                        send_machine1_terminal(&stream, pty.master);
+                    }
+                    Ok(None) => {
+                        send_session_error(
+                            &stream,
+                            "selected-user shell failed",
+                            &"D-Bus session transport disappeared",
+                        );
+                    }
+                    Err(error) => {
+                        send_session_error(&stream, "selected-user shell failed", &error);
+                    }
+                }
+                return;
+            }
+            match crate::adapters::session::terminal_attach::machine1(request) {
+                Ok(command) => command,
+                Err(error) => {
+                    send_session_error(&stream, "machinectl shell planning failed", &error);
+                    return;
+                }
+            }
+        }
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        spawn_process_terminal(&mut stream, session_id, name, size, command, state)
+    })
+    .await;
+    if let Err(error) = result {
+        log::error!("Daemon terminal worker panicked: {error}");
+    }
+}
+
+fn spawn_process_terminal(
+    stream: &mut std::os::unix::net::UnixStream,
+    session_id: WireSessionId,
+    name: crate::domain::machine::MachineName,
+    size: WireTerminalSize,
+    attachment: crate::adapters::session::terminal_attach::TerminalAttachCommand,
+    state: Arc<DaemonServerState>,
+) {
+    use portable_pty::{native_pty_system, PtySize};
+
     let size: SessionSize = size.into_session_size();
     let pair = match native_pty_system().openpty(PtySize {
         rows: size.rows(),
@@ -102,14 +215,6 @@ pub(crate) fn spawn_terminal(
         Ok(pair) => pair,
         Err(error) => {
             log::error!("Daemon: openpty failed: {error}");
-            let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
-            return;
-        }
-    };
-    let attachment = match crate::adapters::session::terminal_attach::select(&name) {
-        Ok(attachment) => attachment,
-        Err(error) => {
-            log::error!("Daemon: terminal attach planning failed: {error}");
             let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
             return;
         }
@@ -154,6 +259,7 @@ pub(crate) fn spawn_terminal(
             let master_fd = pair.master.as_raw_fd().expect("PTY master has an fd");
             let response = serde_json::to_vec(&SpawnTerminalResponse {
                 attach_kind: WireTerminalAttachmentKind::from(attachment_kind),
+                lifecycle: WireTerminalLifecycleSource::DaemonStatus,
             })
             .expect("terminal response is serializable");
             if let Err(error) =
@@ -209,6 +315,39 @@ pub(crate) fn spawn_terminal(
         Err(error) => {
             log::error!("Daemon: spawn terminal attachment failed: {error}");
             let _ = stream.send_with_fd(error.to_string().as_bytes(), &[]);
+        }
+    }
+}
+
+fn send_machine1_terminal(stream: &std::os::unix::net::UnixStream, master: OwnedFd) {
+    let response = serde_json::to_vec(&SpawnTerminalResponse {
+        attach_kind: WireTerminalAttachmentKind::Login,
+        lifecycle: WireTerminalLifecycleSource::PtyEof,
+    })
+    .expect("terminal response is serializable");
+    if let Err(error) = stream.send_with_fd(&response, &[master.as_raw_fd()]) {
+        log::error!("Daemon: send_with_fd (machine1 terminal) failed: {error}");
+    }
+}
+
+fn send_session_error(
+    stream: &std::os::unix::net::UnixStream,
+    context: &str,
+    error: &dyn std::fmt::Display,
+) {
+    let message = format!("{context}: {error}");
+    log::warn!("Daemon: {message}");
+    let _ = stream.send_with_fd(message.as_bytes(), &[]);
+}
+
+fn next_probe_id() -> crate::domain::session::SessionId {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+    loop {
+        let value = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
+        if let Ok(id) = crate::domain::session::SessionId::new(value) {
+            return id;
         }
     }
 }
