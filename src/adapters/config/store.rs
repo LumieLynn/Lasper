@@ -10,11 +10,11 @@ use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyS
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
-use crate::domain::wayland::{SocketRevision, WaylandBindPolicy, WaylandGrant};
+use crate::domain::wayland::{WaylandBindPolicy, WaylandGrant};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -947,115 +947,11 @@ async fn validate_wayland_grant(
     validate_resolved_wayland_policy(spec, grant)?;
     let mut sockets = Vec::with_capacity(grant.sockets().len());
     for socket in grant.sockets() {
-        sockets.push(validate_wayland_source(socket.source(), invoking_uid).await?);
+        sockets.push(
+            crate::adapters::wayland::revalidate_host_socket(socket.source(), invoking_uid).await?,
+        );
     }
     Ok(sockets)
-}
-
-async fn validate_wayland_source(
-    source: &crate::domain::wayland::HostWaylandSocket,
-    invoking_uid: u32,
-) -> Result<PathBuf> {
-    if source.session_uid() != invoking_uid || source.owner_uid() != invoking_uid {
-        return Err(NspawnError::Validation(format!(
-            "Wayland grant does not belong to invoking uid {invoking_uid}"
-        )));
-    }
-    let runtime = source.runtime_dir();
-    if !runtime.is_absolute() {
-        return Err(NspawnError::Validation(
-            "Wayland runtime directory must be absolute".into(),
-        ));
-    }
-    let canonical_runtime = tokio::fs::canonicalize(runtime)
-        .await
-        .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
-    if canonical_runtime != runtime {
-        return Err(NspawnError::Validation(
-            "Wayland runtime directory evidence is no longer canonical".into(),
-        ));
-    }
-    let metadata = tokio::fs::metadata(runtime)
-        .await
-        .map_err(|error| NspawnError::Io(runtime.to_path_buf(), error))?;
-    if !metadata.is_dir() || (metadata.uid() != 0 && metadata.uid() != invoking_uid) {
-        return Err(NspawnError::Validation(format!(
-            "Wayland socket directory is not owned by uid {invoking_uid} or root"
-        )));
-    }
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(NspawnError::Validation(
-            "Wayland socket directory is writable by group or others".into(),
-        ));
-    }
-
-    let requested_socket = runtime.join(source.display().as_str());
-    if requested_socket.parent() != Some(runtime) {
-        return Err(NspawnError::Validation(
-            "Wayland socket entry escaped its runtime directory".into(),
-        ));
-    }
-    let canonical_socket = tokio::fs::canonicalize(&requested_socket)
-        .await
-        .map_err(|error| NspawnError::Io(requested_socket.clone(), error))?;
-    // The requested entry is derived from the verified runtime directory and
-    // validated display basename. Its canonical target may be outside that
-    // directory (for example, a WSLg socket symlink).
-    if canonical_socket != source.canonical_path() {
-        return Err(NspawnError::Validation(
-            "Wayland socket was replaced after discovery".into(),
-        ));
-    }
-    let observed = validate_wayland_socket_target(&canonical_socket).await?;
-    if observed.owner_uid != source.owner_uid()
-        || observed.owner_gid != source.owner_gid()
-        || observed.mode != source.mode()
-        || observed.revision != source.revision()
-    {
-        return Err(NspawnError::Validation(
-            "Wayland socket metadata changed after discovery".into(),
-        ));
-    }
-    Ok(canonical_socket)
-}
-
-struct ObservedWaylandSocket {
-    owner_uid: u32,
-    owner_gid: u32,
-    mode: u32,
-    revision: SocketRevision,
-}
-
-async fn validate_wayland_socket_target(path: &Path) -> Result<ObservedWaylandSocket> {
-    let path_text = path
-        .to_str()
-        .ok_or_else(|| NspawnError::Validation("Wayland socket path is not valid UTF-8".into()))?;
-    if path_text.chars().any(char::is_control) || !path.is_absolute() {
-        return Err(NspawnError::Validation(format!(
-            "Invalid Wayland socket path: {path_text:?}"
-        )));
-    }
-
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
-    if !metadata.file_type().is_socket() {
-        return Err(NspawnError::Validation(format!(
-            "Wayland path is not a socket: {}",
-            path.display()
-        )));
-    }
-    Ok(ObservedWaylandSocket {
-        owner_uid: metadata.uid(),
-        owner_gid: metadata.gid(),
-        mode: metadata.permissions().mode() & 0o7777,
-        revision: SocketRevision {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            ctime_seconds: metadata.ctime(),
-            ctime_nanoseconds: metadata.ctime_nsec(),
-        },
-    })
 }
 
 fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGrant) -> Result<()> {
@@ -1093,7 +989,8 @@ mod tests {
     use super::*;
     use crate::domain::provisioning::CreateUser;
     use crate::domain::provisioning::{BindMount, IdmapSuffix};
-    use crate::domain::wayland::WaylandSocketAccess;
+    use crate::domain::wayland::{SocketRevision, WaylandSocketAccess};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     struct StubNspawnConfigExecutor;
 
@@ -1739,7 +1636,6 @@ Unknown=preserve-me\n";
         source: crate::domain::wayland::HostWaylandSocket,
         policy: WaylandBindPolicy,
     ) -> WaylandGrant {
-        let display = source.display().clone();
         let target = crate::domain::wayland::ContainerUserIdentity {
             username: "lumie".into(),
             uid: source.owner_uid(),
@@ -1748,7 +1644,6 @@ Unknown=preserve-me\n";
         WaylandGrant::resolved(
             target,
             vec![WaylandGrant::socket(source, WaylandSocketAccess::Owner)],
-            display,
             policy,
         )
         .unwrap()

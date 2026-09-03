@@ -327,19 +327,10 @@ async fn run_deploy_internal(
             .map_err(|error| NspawnError::Validation(error.to_string()))?;
             host.nspawn.validate_wayland(&cfg, &grant).await?;
             push_log!(format!(
-                "Setting up {} Wayland display(s) for {}...",
+                "Prepared {} startup Wayland projection(s) for {}...",
                 grant.sockets().len(),
                 user.username,
             ));
-            host
-                .rootfs
-                .configure_wayland(
-                    &actual_rootfs_target,
-                    grant.target(),
-                    &user.shell,
-                    grant.default_display(),
-                )
-                .await?;
             check_deployment_cancellation(&cancellation)?;
             resolved_wayland.push(grant);
         }

@@ -81,6 +81,41 @@ pub(crate) fn spawn_fd_terminal(
     Ok((handle, RemoteSessionControl { close, lifecycle }))
 }
 
+/// Attach a machined-owned PTY. There is no child process for Lasper to wait
+/// on, so PTY EOF is the terminal lifecycle boundary.
+pub(crate) fn spawn_machine1_terminal(
+    master: OwnedFd,
+    id: SessionId,
+    size: SessionSize,
+) -> Result<TerminalSessionHandle, SessionError> {
+    set_fd_size(master.as_raw_fd(), size).map_err(|error| {
+        SessionError::new(format!("set initial machine1 terminal size: {error}"))
+    })?;
+    let reader = std::fs::File::from(
+        master
+            .try_clone()
+            .map_err(|error| SessionError::new(format!("clone machine1 terminal fd: {error}")))?,
+    );
+    let writer = std::fs::File::from(master);
+    let (handle, endpoint) = terminal_session_channel(id, TerminalAttachmentKind::Login);
+    let TerminalSessionEndpoint {
+        commands,
+        output,
+        lifecycle,
+        resize_failed,
+        close,
+    } = endpoint;
+
+    spawn_machine1_reader(reader, output, lifecycle.clone());
+    spawn_fd_writer(writer, commands, resize_failed);
+    tokio::spawn(async move {
+        if close.await.is_ok() && lifecycle.borrow().is_running() {
+            let _ = lifecycle.send(SessionLifecycle::Closed);
+        }
+    });
+    Ok(handle)
+}
+
 fn pty_size(size: SessionSize) -> PtySize {
     PtySize {
         rows: size.rows(),
@@ -110,6 +145,51 @@ fn spawn_reader(
                     if lifecycle.borrow().is_running() {
                         let _ = lifecycle.send(SessionLifecycle::Failed(format!(
                             "terminal output failed: {error}"
+                        )));
+                    }
+                    return;
+                }
+            }
+        }
+    });
+}
+
+fn spawn_machine1_reader(
+    mut reader: std::fs::File,
+    output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    if lifecycle.borrow().is_running() {
+                        let _ = lifecycle.send(SessionLifecycle::Exited {
+                            success: true,
+                            code: None,
+                        });
+                    }
+                    return;
+                }
+                Ok(read) => {
+                    if output.blocking_send(buffer[..read].to_vec()).is_err() {
+                        return;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                    if lifecycle.borrow().is_running() {
+                        let _ = lifecycle.send(SessionLifecycle::Exited {
+                            success: true,
+                            code: None,
+                        });
+                    }
+                    return;
+                }
+                Err(error) => {
+                    if lifecycle.borrow().is_running() {
+                        let _ = lifecycle.send(SessionLifecycle::Failed(format!(
+                            "machine1 terminal output failed: {error}"
                         )));
                     }
                     return;
@@ -170,27 +250,33 @@ fn spawn_fd_writer(
                     }
                 }
                 TerminalCommand::Resize(size) => {
-                    let dimensions = libc::winsize {
-                        ws_row: size.rows(),
-                        ws_col: size.cols(),
-                        ws_xpixel: 0,
-                        ws_ypixel: 0,
-                    };
-                    let result =
-                        unsafe { libc::ioctl(writer.as_raw_fd(), libc::TIOCSWINSZ, &dimensions) };
-                    if result < 0 {
+                    if let Err(error) = set_fd_size(writer.as_raw_fd(), size) {
                         resize_failed.store(true, Ordering::Release);
                         log::warn!(
                             "failed to resize elevated terminal PTY to {}x{}: {}",
                             size.cols(),
                             size.rows(),
-                            std::io::Error::last_os_error()
+                            error
                         );
                     }
                 }
             }
         }
     });
+}
+
+fn set_fd_size(fd: std::os::fd::RawFd, size: SessionSize) -> std::io::Result<()> {
+    let dimensions = libc::winsize {
+        ws_row: size.rows(),
+        ws_col: size.cols(),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &dimensions) } < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn spawn_direct_owner(

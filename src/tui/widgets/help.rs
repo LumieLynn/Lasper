@@ -49,6 +49,8 @@ impl Component for HelpOverlay {
             key_row("↑/↓ / j/k", "Scroll in detail pane", key_style, desc_style),
             spacer_row(),
             category_row(" Terminal ", header_style),
+            key_row("Ctrl+t", "Open selected-user shell", key_style, desc_style),
+            key_row("t", "Open or hide login terminal", key_style, desc_style),
             key_row("Alt+1..9", "Switch terminal tab", key_style, desc_style),
             key_row("[ / ]", "Cycle terminal tabs", key_style, desc_style),
             spacer_row(),

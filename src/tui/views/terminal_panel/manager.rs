@@ -1,7 +1,8 @@
 //! Terminal session management.
 
 use crate::application::sessions::{
-    SessionSendStatus, SessionService, TerminalSessionHandle, TerminalSessionInput,
+    SessionSendStatus, SessionService, ShellOpenIntent, ShellTarget, TerminalSessionHandle,
+    TerminalSessionInput, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
@@ -28,6 +29,8 @@ pub struct TextSelection {
 
 pub struct TerminalSession {
     pub machine_name: String,
+    pub guest_user: Option<ValidatedGuestUserName>,
+    pub wayland_socket: Option<crate::domain::wayland::HostWaylandSocket>,
     pub attach_kind: TerminalAttachmentKind,
     pub terminal: Arc<parking_lot::Mutex<crate::tui::term::Parser>>,
     pub input: TerminalSessionInput,
@@ -173,6 +176,30 @@ impl TerminalManager {
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_with_user(entry, None, WaylandShellRequest::Disabled, rows, app_tx)
+            .await
+    }
+
+    pub async fn spawn_as_user(
+        &mut self,
+        entry: &MachineEntry,
+        user: ValidatedGuestUserName,
+        wayland: WaylandShellRequest,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_with_user(entry, Some(user), wayland, rows, app_tx)
+            .await
+    }
+
+    async fn spawn_with_user(
+        &mut self,
+        entry: &MachineEntry,
+        user: Option<ValidatedGuestUserName>,
+        wayland: WaylandShellRequest,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
         if !entry.access().is_nspawn() {
             return Err(format!(
                 "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
@@ -183,9 +210,14 @@ impl TerminalManager {
             return Err(format!("Machine {} is not running", entry.name));
         }
 
-        // Re-use existing session if one is already open for this container.
+        let requested_wayland_socket = wayland.host_socket().cloned();
+
+        // Re-use only a session with the same user and display evidence.
         if let Some(idx) = self.sessions.iter().position(|session| {
-            session.machine_name == entry.name && session.handle.lifecycle().is_running()
+            session.machine_name == entry.name
+                && session.guest_user == user
+                && session.wayland_socket == requested_wayland_socket
+                && session.handle.lifecycle().is_running()
         }) {
             self.active_idx = idx;
             self.show = true;
@@ -197,7 +229,7 @@ impl TerminalManager {
         if let Some(idx) = self
             .sessions
             .iter()
-            .position(|session| session.machine_name == entry.name)
+            .position(|session| session.machine_name == entry.name && session.guest_user == user)
         {
             let mut stale = self.sessions.remove(idx);
             self.tab_hitboxes.clear();
@@ -219,11 +251,19 @@ impl TerminalManager {
             .map_err(|error| format!("Invalid machine name: {error}"))?;
         let size = SessionSize::new(cols, rows)
             .map_err(|error| format!("Invalid terminal size: {error}"))?;
-        let mut handle = self
-            .session_service
-            .open_terminal(machine, size)
-            .await
-            .map_err(|error| format!("Failed to attach terminal: {error}"))?;
+        let mut handle = match user.clone() {
+            Some(user) => {
+                self.session_service
+                    .open_shell(ShellOpenIntent::new(
+                        ShellTarget::new(machine, user),
+                        wayland,
+                        size,
+                    ))
+                    .await
+            }
+            None => self.session_service.open_terminal(machine, size).await,
+        }
+        .map_err(|error| format!("Failed to attach terminal: {error}"))?;
         let attach_kind = handle.attachment();
         log::debug!(
             "opened terminal session {} for {}",
@@ -247,6 +287,8 @@ impl TerminalManager {
 
         let session = TerminalSession {
             machine_name: entry.name.clone(),
+            guest_user: user,
+            wayland_socket: requested_wayland_socket,
             attach_kind,
             terminal,
             input,
@@ -611,6 +653,13 @@ impl TerminalManager {
 }
 
 impl TerminalSession {
+    pub(crate) fn label(&self) -> String {
+        match &self.guest_user {
+            Some(user) => format!("{}@{}", user, self.machine_name),
+            None => self.machine_name.clone(),
+        }
+    }
+
     pub fn is_insert_mode(&self) -> bool {
         self.insert_mode && self.handle.lifecycle().is_running()
     }
@@ -800,6 +849,8 @@ mod tests {
         (
             TerminalSession {
                 machine_name: machine_name.into(),
+                guest_user: None,
+                wayland_socket: None,
                 attach_kind: TerminalAttachmentKind::Login,
                 terminal: Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
                     24, 80, 100,

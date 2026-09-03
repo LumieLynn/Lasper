@@ -2,6 +2,9 @@
 
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
+use crate::adapters::runtime::machine1::{
+    Machine1OpenRequest, Machine1Pty, Machine1ShellRequest, Machine1WaylandProbeRequest,
+};
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::application::image_lifecycle::ImageControlOutcome;
 use crate::domain::inspection::{
@@ -40,6 +43,15 @@ trait Manager {
     ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
+    fn open_machine_shell(
+        &self,
+        name: &str,
+        user: &str,
+        path: &str,
+        args: Vec<String>,
+        environment: Vec<String>,
+    ) -> zbus::Result<(zvariant::OwnedFd, String)>;
     #[zbus(allow_interactive_auth)]
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
     #[zbus(allow_interactive_auth)]
@@ -237,6 +249,65 @@ impl DbusBackend {
             Ok(()) => ImageControlOutcome::Removed,
             Err(error) => map_image_control_error(NspawnError::Dbus(error)),
         }
+    }
+
+    /// Open a selected-user shell or Lasper's fixed projection probe.
+    pub(crate) async fn open_machine_session(
+        &self,
+        request: Machine1OpenRequest,
+    ) -> Result<Machine1Pty> {
+        match request {
+            Machine1OpenRequest::Shell(request) => self.open_machine_shell(&request).await,
+            Machine1OpenRequest::WaylandProbe(request) => self.open_wayland_probe(&request).await,
+        }
+    }
+
+    pub(crate) async fn open_machine_shell(
+        &self,
+        request: &Machine1ShellRequest,
+    ) -> Result<Machine1Pty> {
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let (fd, _path) = self
+            .mutation_with_deadline(
+                generation,
+                "OpenMachineShell",
+                proxy.open_machine_shell(
+                    request.machine().as_str(),
+                    request.user().as_str(),
+                    "",
+                    Vec::new(),
+                    request.environment().assignments(),
+                ),
+            )
+            .await?;
+        Ok(Machine1Pty { master: fd.into() })
+    }
+
+    async fn open_wayland_probe(
+        &self,
+        request: &Machine1WaylandProbeRequest,
+    ) -> Result<Machine1Pty> {
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let (fd, _path) = self
+            .mutation_with_deadline(
+                generation,
+                "OpenMachineShell Wayland projection probe",
+                proxy.open_machine_shell(
+                    request.machine().as_str(),
+                    request.user().as_str(),
+                    request.path(),
+                    request.args(),
+                    Vec::new(),
+                ),
+            )
+            .await?;
+        Ok(Machine1Pty { master: fd.into() })
     }
 
     /// Call a method on `org.freedesktop.systemd1.Manager` with
@@ -751,6 +822,21 @@ mod tests {
         assert_eq!(body.0, ["systemd-nspawn@test.service"]);
         assert!(!body.1, "runtime must remain disabled");
         assert!(!body.2, "force must remain disabled");
+    }
+
+    #[test]
+    fn machine1_session_bodies_match_the_upstream_xml_signatures() {
+        let shell = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineShell")
+            .unwrap()
+            .build(&(
+                "demo",
+                "alice",
+                "",
+                Vec::<String>::new(),
+                vec!["WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0"],
+            ))
+            .unwrap();
+        assert_eq!(shell.body().signature().unwrap().as_str(), "sssasas");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
 use crate::adapters::runtime::state as runtime_state;
+use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
 use portable_pty::CommandBuilder;
@@ -180,6 +181,21 @@ pub(crate) fn login(name: &MachineName) -> TerminalAttachCommand {
     login_command(name)
 }
 
+/// Build the fixed selected-user route. The username remains one argv
+/// element all the way to machinectl and is never parsed by a shell.
+pub(crate) fn shell(name: &MachineName, user: &ValidatedGuestUserName) -> TerminalAttachCommand {
+    TerminalAttachCommand {
+        kind: TerminalAttachKind::Login,
+        program: "machinectl".to_string(),
+        args: vec![
+            "--".to_string(),
+            "shell".to_string(),
+            format!("{}@{}", user, name),
+        ],
+        namespace_snapshot: None,
+    }
+}
+
 fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAttachCommand> {
     for namespace in NAMESPACE_NAMES {
         let path = process.join("ns").join(namespace);
@@ -347,6 +363,18 @@ mod tests {
         assert_eq!(command.kind(), TerminalAttachKind::Login);
         assert_eq!(command.program(), "machinectl");
         assert_eq!(command.args(), ["--", "login", "test-machine"]);
+    }
+
+    #[test]
+    fn selected_user_shell_is_a_fixed_machinectl_argv() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("1000").unwrap();
+
+        let command = shell(&name, &user);
+
+        assert_eq!(command.kind(), TerminalAttachKind::Login);
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(command.args(), ["--", "shell", "1000@test-machine"]);
     }
 
     #[test]

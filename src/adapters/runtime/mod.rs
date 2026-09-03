@@ -5,6 +5,7 @@ pub(crate) mod dbus;
 pub(crate) mod elevated;
 pub(crate) mod formatting;
 pub(crate) mod inspection;
+pub(crate) mod machine1;
 pub(crate) mod source;
 pub(crate) mod state;
 

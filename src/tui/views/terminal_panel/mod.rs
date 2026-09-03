@@ -32,7 +32,7 @@ impl TerminalPanel {
             .sessions
             .iter()
             .enumerate()
-            .map(|(index, session)| (index, session.machine_name.width().saturating_add(2)))
+            .map(|(index, session)| (index, session.label().width().saturating_add(2)))
             .collect::<Vec<_>>();
         manager.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
 
@@ -51,7 +51,7 @@ impl TerminalPanel {
                     })
                     .add_modifier(Modifier::BOLD);
             }
-            tab_spans.push(Span::styled(format!(" {} ", s.machine_name), style));
+            tab_spans.push(Span::styled(format!(" {} ", s.label()), style));
             if i < session_count - 1 {
                 tab_spans.push(Span::raw("-"));
             }

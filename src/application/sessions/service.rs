@@ -1,6 +1,7 @@
 use super::{
-    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, TerminalSessionHandle,
-    TerminalSessionRequest,
+    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenIntent,
+    ShellTarget, TerminalSessionHandle, TerminalSessionRequest, TypedSessionEnvironment,
+    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -26,12 +27,49 @@ impl SessionService {
         size: SessionSize,
     ) -> Result<TerminalSessionHandle, SessionError> {
         self.port
-            .open_terminal(TerminalSessionRequest {
-                id: self.allocate_id(),
+            .open_terminal(TerminalSessionRequest::default_attachment(
+                self.allocate_id(),
                 machine,
                 size,
-            })
+            ))
             .await
+    }
+
+    pub async fn discover_host_wayland_sockets(
+        &self,
+    ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+        self.port.discover_host_wayland_sockets().await
+    }
+
+    pub async fn open_shell(
+        &self,
+        intent: ShellOpenIntent,
+    ) -> Result<TerminalSessionHandle, SessionError> {
+        let environment = match intent.wayland() {
+            WaylandShellRequest::Disabled => TypedSessionEnvironment::empty(),
+            WaylandShellRequest::SelectedHostDisplay(socket) => TypedSessionEnvironment::wayland(
+                self.prepare_wayland(intent.target().clone(), socket.clone())
+                    .await?,
+            ),
+        };
+        let target = intent.target();
+        self.port
+            .open_terminal(TerminalSessionRequest::selected_user_shell(
+                self.allocate_id(),
+                target.machine().clone(),
+                target.user().clone(),
+                environment,
+                intent.size(),
+            ))
+            .await
+    }
+
+    pub async fn test_wayland(
+        &self,
+        target: ShellTarget,
+        host_socket: crate::domain::wayland::HostWaylandSocket,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        self.prepare_wayland(target, host_socket).await
     }
 
     pub async fn open_journal(
@@ -54,6 +92,21 @@ impl SessionService {
             }
         }
     }
+
+    async fn prepare_wayland(
+        &self,
+        target: ShellTarget,
+        host_socket: crate::domain::wayland::HostWaylandSocket,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        self.port
+            .prepare_wayland(WaylandPreparationRequest {
+                identity_probe_id: self.allocate_id(),
+                access_probe_id: self.allocate_id(),
+                target,
+                host_socket,
+            })
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -61,24 +114,52 @@ mod tests {
     use super::*;
     use crate::application::sessions::{
         journal_session_channel, terminal_session_channel, JournalSessionRequest, SessionPort,
-        TerminalSessionRequest,
+        TerminalLaunch, TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
     };
     use crate::domain::session::TerminalAttachmentKind;
+    use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
     use parking_lot::Mutex;
+    use std::path::PathBuf;
 
     #[derive(Default)]
     struct RecordingPort {
         ids: Mutex<Vec<SessionId>>,
+        terminal_wayland_contexts: Mutex<Vec<bool>>,
     }
 
     #[async_trait::async_trait]
     impl SessionPort for RecordingPort {
+        async fn discover_host_wayland_sockets(
+            &self,
+        ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+            Vec::new()
+        }
+
         async fn open_terminal(
             &self,
             request: TerminalSessionRequest,
         ) -> Result<TerminalSessionHandle, SessionError> {
             self.ids.lock().push(request.id);
+            self.terminal_wayland_contexts.lock().push(matches!(
+                &request.launch,
+                TerminalLaunch::SelectedUserShell { environment, .. }
+                    if environment.wayland_context().is_some()
+            ));
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
+        }
+
+        async fn prepare_wayland(
+            &self,
+            request: WaylandPreparationRequest,
+        ) -> Result<WaylandSessionContext, SessionError> {
+            self.ids
+                .lock()
+                .extend([request.identity_probe_id, request.access_probe_id]);
+            Ok(WaylandSessionContext::verified(
+                request.host_socket,
+                PathBuf::from("/run/lasper/wayland/1000/wayland-0"),
+                crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
+            ))
         }
 
         async fn open_journal(
@@ -104,5 +185,43 @@ mod tests {
         let ids = port.ids.lock();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn wayland_shell_prepares_before_opening_with_verified_context() {
+        let port = Arc::new(RecordingPort::default());
+        let service = SessionService::new(port.clone());
+        let socket = HostWaylandSocket::from_verified_parts(
+            WaylandDisplay::new("wayland-0").unwrap(),
+            PathBuf::from("/run/user/1000"),
+            PathBuf::from("/run/user/1000/wayland-0"),
+            1000,
+            1000,
+            1000,
+            0o700,
+            SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+
+        let _terminal = service
+            .open_shell(ShellOpenIntent::new(
+                ShellTarget::new(
+                    MachineName::new("test").unwrap(),
+                    crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
+                ),
+                WaylandShellRequest::SelectedHostDisplay(socket),
+                SessionSize::new(80, 24).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let ids = port.ids.lock();
+        assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(*port.terminal_wayland_contexts.lock(), [true]);
     }
 }

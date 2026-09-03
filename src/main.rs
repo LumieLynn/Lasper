@@ -16,7 +16,7 @@ mod tui;
 async fn main() -> Result<()> {
     // 1. Parse CLI flags — all early exits happen here, before terminal
     //    takeover, so raw-mode / alternate-screen restoration is never needed.
-    let options = match crate::cli::parse_flags() {
+    let options = match crate::cli::dispatch() {
         Ok(options) => options,
         Err(code) => std::process::exit(code),
     };

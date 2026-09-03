@@ -70,6 +70,10 @@ fn parse_nspawn_bind_line(line: &str) -> Option<NspawnBindSemantics> {
         "BindReadOnly" => true,
         _ => return None,
     };
+    parse_nspawn_bind_value(value, readonly)
+}
+
+fn parse_nspawn_bind_value(value: &str, readonly: bool) -> Option<NspawnBindSemantics> {
     let fields = parse_nspawn_bind_fields(value.trim())?;
     if fields.is_empty() || fields.len() > 3 {
         return None;
@@ -121,6 +125,50 @@ fn validate_machine_name(name: &str) -> Result<()> {
 impl NspawnConfig {
     pub fn default_path(name: &str) -> PathBuf {
         PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
+    }
+
+    /// Check the startup configuration for the exact writable bind used by a
+    /// Lasper Wayland projection. This proves configuration intent only; the
+    /// running guest is probed separately because editing this file does not
+    /// alter an already-running container's mount namespace.
+    pub(crate) fn has_wayland_projection(&self, source: &Path, target: &Path) -> Result<bool> {
+        let source = source.to_str().ok_or_else(|| {
+            NspawnError::Validation("Wayland projection source is not valid UTF-8".into())
+        })?;
+        let target = target.to_str().ok_or_else(|| {
+            NspawnError::Validation("Wayland projection target is not valid UTF-8".into())
+        })?;
+        let conf = Ini::load_from_str(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!(
+                "failed to parse {} while checking Wayland projection: {error}",
+                self.path.display()
+            ))
+        })?;
+
+        let mut found = false;
+        for files in conf.section_all(Some("Files")) {
+            for (key, value) in files.iter() {
+                let readonly = match key {
+                    "Bind" => false,
+                    "BindReadOnly" => true,
+                    _ => continue,
+                };
+                let Some(bind) = parse_nspawn_bind_value(value, readonly) else {
+                    // systemd logs and ignores malformed Bind= assignments.
+                    continue;
+                };
+                if bind.destination != target {
+                    continue;
+                }
+                if bind.readonly || bind.source != source {
+                    // Multiple mounts at one destination are reordered by
+                    // systemd before application. Do not guess which wins.
+                    return Ok(false);
+                }
+                found = true;
+            }
+        }
+        Ok(found)
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
@@ -889,6 +937,56 @@ mod tests {
             ),
             Some(("/dev/dri/card0".into(), path.into()))
         );
+    }
+
+    #[test]
+    fn wayland_projection_uses_nspawn_bind_parser_semantics() {
+        let config = NspawnConfig {
+            path: PathBuf::from("demo.nspawn"),
+            content: concat!(
+                "[Files]\n",
+                "Bind=/run/user/1000/wayland-0:/run/lasper/wayland/1000/wayland-0:idmap\n",
+                "Bind=\n",
+                "Bind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\n",
+            )
+            .into(),
+        };
+
+        // Empty Bind= is invalid and ignored by systemd; it is not a reset.
+        assert!(config
+            .has_wayland_projection(
+                Path::new("/run/user/1000/wayland-0"),
+                Path::new("/run/lasper/wayland/1000/wayland-0"),
+            )
+            .unwrap());
+        assert!(config
+            .has_wayland_projection(
+                Path::new("/run/user/1000/wayland-1"),
+                Path::new("/run/lasper/wayland/1000/wayland-1"),
+            )
+            .unwrap());
+
+        let conflicting = NspawnConfig {
+            path: PathBuf::from("demo.nspawn"),
+            content: concat!(
+                "[Files]\n",
+                "Bind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\n",
+                "BindReadOnly=/other/socket:/run/lasper/wayland/1000/wayland-1\n",
+            )
+            .into(),
+        };
+        assert!(!conflicting
+            .has_wayland_projection(
+                Path::new("/run/user/1000/wayland-1"),
+                Path::new("/run/lasper/wayland/1000/wayland-1"),
+            )
+            .unwrap());
+        assert!(!config
+            .has_wayland_projection(
+                Path::new("/run/user/1000/wayland-1"),
+                Path::new("/run/lasper/wayland/1000/other"),
+            )
+            .unwrap());
     }
 
     #[test]

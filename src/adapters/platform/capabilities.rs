@@ -42,13 +42,18 @@ async fn discover_wayland_sockets_from(
 ) -> Vec<HostWaylandSocket> {
     let mut last_error = None;
     let configured_path = configured_display.map(PathBuf::from);
-
-    if let Some(path) = configured_path.as_deref().filter(|path| path.is_absolute()) {
-        match discover_absolute_wayland_socket(path, session_uid).await {
-            Ok(socket) => return vec![socket],
-            Err(error) => last_error = Some(error),
-        }
-    }
+    let preferred_socket =
+        if let Some(path) = configured_path.as_deref().filter(|path| path.is_absolute()) {
+            match discover_absolute_wayland_socket(path, session_uid).await {
+                Ok(socket) => Some(socket),
+                Err(error) => {
+                    last_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     let preferred_display = configured_path
         .as_deref()
@@ -65,9 +70,21 @@ async fn discover_wayland_sockets_from(
         };
         let mut sockets = discover_wayland_sockets_in(&runtime, session_uid).await;
         if !sockets.is_empty() {
-            prioritize_display(&mut sockets, preferred_display.as_ref());
+            if let Some(preferred) = preferred_socket.as_ref() {
+                sockets.retain(|socket| {
+                    socket.display() != preferred.display()
+                        && socket.canonical_path() != preferred.canonical_path()
+                });
+                sockets.insert(0, preferred.clone());
+            } else {
+                prioritize_display(&mut sockets, preferred_display.as_ref());
+            }
             return sockets;
         }
+    }
+
+    if let Some(preferred) = preferred_socket {
+        return vec![preferred];
     }
 
     if let Some(error) = last_error {
@@ -288,27 +305,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absolute_wayland_display_is_used_as_the_socket_path() {
+    async fn absolute_wayland_display_is_preferred_without_hiding_other_sockets() {
         let runtime = tempfile::tempdir().unwrap();
         tokio::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700))
             .await
             .unwrap();
         let socket_path = runtime.path().join("compositor.sock");
-        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let _preferred = UnixListener::bind(&socket_path).unwrap();
+        let _other = UnixListener::bind(runtime.path().join("wayland-0")).unwrap();
 
         let sockets = discover_wayland_sockets_from(
             uzers::get_current_uid(),
-            None,
+            Some(runtime.path().as_os_str().to_os_string()),
             Some(socket_path.as_os_str().to_os_string()),
         )
         .await;
 
-        assert_eq!(sockets.len(), 1);
+        assert_eq!(sockets.len(), 2);
         assert_eq!(sockets[0].display().as_str(), "compositor.sock");
         assert_eq!(
             sockets[0].canonical_path(),
             std::fs::canonicalize(socket_path).unwrap()
         );
+        assert_eq!(sockets[1].display().as_str(), "wayland-0");
     }
 
     #[tokio::test]

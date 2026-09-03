@@ -5,7 +5,7 @@
 //! path-resolution policy, and conversion to its execution model.
 
 use crate::domain::secret::{serde_secret, SecretString};
-use crate::domain::wayland::{ContainerUserIdentity, WaylandDisplay};
+use crate::domain::wayland::ContainerUserIdentity;
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
@@ -25,7 +25,6 @@ pub(crate) enum RootfsOperation {
     SetRootPassword(SetRootPasswordRequest),
     CreateUser(CreateUserRequest),
     ResolveUserIdentity(ResolveUserIdentityRequest),
-    ConfigureWayland(ConfigureWaylandRequest),
     ConfigureNvidia(ConfigureNvidiaRequest),
     CleanupNvidia(CleanupNvidiaRequest),
 }
@@ -70,15 +69,6 @@ pub(crate) struct CreateUserRequest {
     pub(crate) password: Option<SecretString>,
     pub(crate) sudoer: bool,
     pub(crate) shell: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ConfigureWaylandRequest {
-    pub(crate) target: RootfsTarget,
-    pub(crate) identity: ContainerUserIdentity,
-    pub(crate) shell: String,
-    pub(crate) default_display: WaylandDisplay,
 }
 
 #[derive(Serialize, Deserialize)]

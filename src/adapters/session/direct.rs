@@ -1,6 +1,7 @@
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, TerminalSessionHandle, TerminalSessionRequest,
+    SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
+    WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::session::SessionLifecycle;
 use async_trait::async_trait;
@@ -16,39 +17,95 @@ pub(crate) enum DirectTerminalPolicy {
 
 pub(crate) struct DirectSessionAdapter {
     terminal_policy: DirectTerminalPolicy,
+    wayland: super::wayland::WaylandSessionResolver,
 }
 
 impl DirectSessionAdapter {
     pub(crate) fn new(terminal_policy: DirectTerminalPolicy) -> Self {
-        Self { terminal_policy }
+        Self {
+            terminal_policy,
+            wayland: super::wayland::WaylandSessionResolver::new(
+                None,
+                crate::adapters::config::NspawnConfigStore::direct(),
+            ),
+        }
+    }
+
+    pub(crate) fn with_machine1(
+        terminal_policy: DirectTerminalPolicy,
+        machine1: crate::adapters::runtime::dbus::DbusBackend,
+        nspawn: crate::adapters::config::NspawnConfigStore,
+    ) -> Self {
+        Self {
+            terminal_policy,
+            wayland: super::wayland::WaylandSessionResolver::new(Some(machine1), nspawn),
+        }
     }
 }
 
 #[async_trait]
 impl SessionPort for DirectSessionAdapter {
+    async fn discover_host_wayland_sockets(
+        &self,
+    ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+        if !self.wayland.is_available() {
+            return Vec::new();
+        }
+        crate::adapters::platform::capabilities::discover_wayland_sockets().await
+    }
+
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
     ) -> Result<TerminalSessionHandle, SessionError> {
+        let TerminalSessionRequest {
+            id,
+            machine,
+            size,
+            launch,
+        } = request;
+        if let TerminalLaunch::SelectedUserShell { user, environment } = launch {
+            if let Some(handle) = self
+                .wayland
+                .open_selected_user_shell(id, machine.clone(), user.clone(), environment, size)
+                .await?
+            {
+                return Ok(handle);
+            }
+            let command = crate::adapters::session::terminal_attach::shell(&machine, &user)
+                .into_pty_command()
+                .map_err(|error| {
+                    SessionError::new(format!("validate selected-user shell: {error}"))
+                })?;
+            return crate::adapters::session::pty::spawn_direct_terminal(
+                command,
+                id,
+                crate::domain::session::TerminalAttachmentKind::Login,
+                size,
+            );
+        }
         let attachment = match self.terminal_policy {
             DirectTerminalPolicy::LoginOnly => {
-                crate::adapters::session::terminal_attach::login(&request.machine)
+                crate::adapters::session::terminal_attach::login(&machine)
             }
-            DirectTerminalPolicy::Automatic => crate::adapters::session::terminal_attach::select(
-                &request.machine,
-            )
-            .map_err(|error| SessionError::new(format!("plan terminal attachment: {error}")))?,
+            DirectTerminalPolicy::Automatic => {
+                crate::adapters::session::terminal_attach::select(&machine).map_err(|error| {
+                    SessionError::new(format!("plan terminal attachment: {error}"))
+                })?
+            }
         };
         let kind = attachment.kind();
         let command = attachment
             .into_pty_command()
             .map_err(|error| SessionError::new(format!("validate terminal attachment: {error}")))?;
-        crate::adapters::session::pty::spawn_direct_terminal(
-            command,
-            request.id,
-            kind,
-            request.size,
-        )
+        crate::adapters::session::pty::spawn_direct_terminal(command, id, kind, size)
+    }
+
+    async fn prepare_wayland(
+        &self,
+        request: WaylandPreparationRequest,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        self.wayland.prepare(request).await
     }
 
     async fn open_journal(

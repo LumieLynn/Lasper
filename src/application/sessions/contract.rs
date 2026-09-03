@@ -1,6 +1,9 @@
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
+use crate::domain::wayland::HostWaylandSocket;
 use async_trait::async_trait;
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -9,17 +12,278 @@ pub(crate) const TERMINAL_COMMAND_CAPACITY: usize = 1024;
 pub(crate) const TERMINAL_OUTPUT_CAPACITY: usize = 256;
 pub(crate) const JOURNAL_OUTPUT_CAPACITY: usize = 1024;
 
+/// A guest account name accepted by machine1's selected-user shell contract.
+/// It is passed as one D-Bus/argv value after validation, never interpolated
+/// into a shell command.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidatedGuestUserName(String);
+
+impl ValidatedGuestUserName {
+    pub fn new(value: impl Into<String>) -> Result<Self, GuestUserNameError> {
+        let value = value.into();
+        let bytes = value.as_bytes();
+        if bytes.is_empty() {
+            return Err(GuestUserNameError::Empty);
+        }
+        if bytes.len() > 32 {
+            return Err(GuestUserNameError::TooLong);
+        }
+        if !value.is_ascii() {
+            return Err(GuestUserNameError::NonAscii);
+        }
+        if bytes[0] == b'-' {
+            return Err(GuestUserNameError::LeadingDash);
+        }
+        if bytes.iter().any(|byte| {
+            byte.is_ascii_whitespace()
+                || byte.is_ascii_control()
+                || matches!(*byte, b'/' | b'\\' | b'@')
+        }) {
+            return Err(GuestUserNameError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ValidatedGuestUserName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for ValidatedGuestUserName {
+    type Error = GuestUserNameError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum GuestUserNameError {
+    #[error("guest username cannot be empty")]
+    Empty,
+    #[error("guest username exceeds the 32-byte limit")]
+    TooLong,
+    #[error("guest username must be ASCII")]
+    NonAscii,
+    #[error("guest username cannot start with '-'")]
+    LeadingDash,
+    #[error("guest username contains whitespace, control, path-separator, or '@' characters")]
+    InvalidCharacter,
+}
+
+/// The only user-selected identity accepted by the shell workflow.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellTarget {
+    machine: MachineName,
+    user: ValidatedGuestUserName,
+}
+
+impl ShellTarget {
+    pub fn new(machine: MachineName, user: ValidatedGuestUserName) -> Self {
+        Self { machine, user }
+    }
+
+    pub fn machine(&self) -> &MachineName {
+        &self.machine
+    }
+
+    pub fn user(&self) -> &ValidatedGuestUserName {
+        &self.user
+    }
+}
+
+/// Optional Wayland context requested for one selected-user shell.
+///
+/// The host socket is produced by the local discovery adapter. The UI never
+/// submits an arbitrary path, and the session adapter must revalidate this
+/// evidence against the static `.nspawn` projection before opening the PTY.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WaylandShellRequest {
+    Disabled,
+    SelectedHostDisplay(HostWaylandSocket),
+}
+
+impl WaylandShellRequest {
+    pub fn host_socket(&self) -> Option<&HostWaylandSocket> {
+        match self {
+            Self::Disabled => None,
+            Self::SelectedHostDisplay(socket) => Some(socket),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShellOpenIntent {
+    target: ShellTarget,
+    wayland: WaylandShellRequest,
+    size: SessionSize,
+}
+
+impl ShellOpenIntent {
+    pub fn new(target: ShellTarget, wayland: WaylandShellRequest, size: SessionSize) -> Self {
+        Self {
+            target,
+            wayland,
+            size,
+        }
+    }
+
+    pub fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
+    pub fn wayland(&self) -> &WaylandShellRequest {
+        &self.wayland
+    }
+
+    pub const fn size(&self) -> SessionSize {
+        self.size
+    }
+}
+
+/// Runtime evidence that one startup-configured projection is usable by the
+/// selected guest account. It is deliberately not serializable: callers must
+/// obtain a fresh value from `SessionPort::prepare_wayland`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaylandSessionContext {
+    host_socket: HostWaylandSocket,
+    guest_socket: PathBuf,
+    identity: ObservedGuestIdentity,
+}
+
+impl WaylandSessionContext {
+    pub(crate) fn verified(
+        host_socket: HostWaylandSocket,
+        guest_socket: PathBuf,
+        identity: ObservedGuestIdentity,
+    ) -> Self {
+        Self {
+            host_socket,
+            guest_socket,
+            identity,
+        }
+    }
+
+    pub fn host_socket(&self) -> &HostWaylandSocket {
+        &self.host_socket
+    }
+
+    pub fn guest_socket(&self) -> &Path {
+        &self.guest_socket
+    }
+
+    pub const fn identity(&self) -> ObservedGuestIdentity {
+        self.identity
+    }
+}
+
+/// Closed, feature-owned environment allowlist for `OpenMachineShell`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TypedSessionEnvironment {
+    wayland: Option<WaylandSessionContext>,
+}
+
+impl TypedSessionEnvironment {
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn wayland(context: WaylandSessionContext) -> Self {
+        Self {
+            wayland: Some(context),
+        }
+    }
+
+    pub(crate) fn wayland_context(&self) -> Option<&WaylandSessionContext> {
+        self.wayland.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalLaunch {
+    DefaultAttachment,
+    SelectedUserShell {
+        user: ValidatedGuestUserName,
+        environment: TypedSessionEnvironment,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalSessionRequest {
     pub id: SessionId,
     pub machine: MachineName,
     pub size: SessionSize,
+    pub(crate) launch: TerminalLaunch,
+}
+
+impl TerminalSessionRequest {
+    pub(crate) fn default_attachment(
+        id: SessionId,
+        machine: MachineName,
+        size: SessionSize,
+    ) -> Self {
+        Self {
+            id,
+            machine,
+            size,
+            launch: TerminalLaunch::DefaultAttachment,
+        }
+    }
+
+    pub(crate) fn selected_user_shell(
+        id: SessionId,
+        machine: MachineName,
+        user: ValidatedGuestUserName,
+        environment: TypedSessionEnvironment,
+        size: SessionSize,
+    ) -> Self {
+        Self {
+            id,
+            machine,
+            size,
+            launch: TerminalLaunch::SelectedUserShell { user, environment },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalSessionRequest {
     pub id: SessionId,
     pub machine: MachineName,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaylandPreparationRequest {
+    pub identity_probe_id: SessionId,
+    pub access_probe_id: SessionId,
+    pub target: ShellTarget,
+    pub host_socket: HostWaylandSocket,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedGuestIdentity {
+    uid: u32,
+    gid: u32,
+}
+
+impl ObservedGuestIdentity {
+    pub fn new(uid: u32, gid: u32) -> Self {
+        Self { uid, gid }
+    }
+
+    pub fn uid(self) -> u32 {
+        self.uid
+    }
+
+    pub fn gid(self) -> u32 {
+        self.gid
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,10 +321,17 @@ impl From<std::io::Error> for SessionError {
 
 #[async_trait]
 pub trait SessionPort: Send + Sync + 'static {
+    async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket>;
+
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
     ) -> Result<TerminalSessionHandle, SessionError>;
+
+    async fn prepare_wayland(
+        &self,
+        request: WaylandPreparationRequest,
+    ) -> Result<WaylandSessionContext, SessionError>;
 
     async fn open_journal(
         &self,
@@ -263,6 +534,37 @@ pub(crate) fn journal_session_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_user_name_accepts_numeric_and_common_system_accounts() {
+        assert_eq!(
+            ValidatedGuestUserName::new("1000").unwrap().as_str(),
+            "1000"
+        );
+        assert_eq!(
+            ValidatedGuestUserName::new("alice-1").unwrap().as_str(),
+            "alice-1"
+        );
+        assert_eq!(
+            ValidatedGuestUserName::new("nvidia$").unwrap().as_str(),
+            "nvidia$"
+        );
+    }
+
+    #[test]
+    fn guest_user_name_rejects_target_and_argument_delimiters() {
+        for value in [
+            "",
+            "-root",
+            "alice@host",
+            "alice/name",
+            "alice\\name",
+            "alice name",
+            "alice\n",
+        ] {
+            assert!(ValidatedGuestUserName::new(value).is_err(), "{value:?}");
+        }
+    }
 
     #[test]
     fn terminal_input_and_output_channels_are_bounded() {

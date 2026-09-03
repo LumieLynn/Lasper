@@ -17,6 +17,96 @@ enum PreparedDetailRefresh {
 }
 
 impl App {
+    pub(crate) async fn show_shell_dialog(&mut self) {
+        let entry = if let Some(image) = self.focused_image_resource() {
+            self.data
+                .entries
+                .iter()
+                .find(|entry| entry.name == image.name)
+                .cloned()
+        } else {
+            self.data.entries.get(self.data.selected).cloned()
+        };
+        let Some(entry) = entry else {
+            self.set_status(
+                "Select a running machine before opening a shell.".into(),
+                crate::tui::StatusLevel::Info,
+            );
+            return;
+        };
+        if entry.state != MachineState::Running {
+            self.set_status(
+                format!("{} is not running.", entry.name),
+                crate::tui::StatusLevel::Info,
+            );
+            return;
+        }
+        let Ok(machine) = MachineName::new(&entry.name) else {
+            self.set_status(
+                format!("{} is not a valid nspawn machine name.", entry.name),
+                crate::tui::StatusLevel::Error,
+            );
+            return;
+        };
+        let wayland_sockets = self
+            .data
+            .session_service
+            .discover_host_wayland_sockets()
+            .await;
+        self.ui.active_dialog = Some(Box::new(
+            crate::tui::widgets::dialogs::shell::ShellDialog::new(
+                machine,
+                String::new(),
+                wayland_sockets,
+            ),
+        ));
+    }
+
+    pub(crate) async fn spawn_terminal_as_user(
+        &mut self,
+        machine: MachineName,
+        user: crate::application::sessions::ValidatedGuestUserName,
+        wayland: crate::application::sessions::WaylandShellRequest,
+    ) -> bool {
+        let Some(entry) = self
+            .data
+            .entries
+            .iter()
+            .find(|entry| entry.name == machine.as_str())
+            .cloned()
+        else {
+            self.set_status(
+                format!("{} is no longer running.", machine),
+                crate::tui::StatusLevel::Warn,
+            );
+            return false;
+        };
+        let rows = self.ui.pane_height.max(10);
+        match self
+            .data
+            .terminal
+            .spawn_as_user(&entry, user.clone(), wayland, rows, &self.ui.app_tx)
+            .await
+        {
+            Ok(_) => {
+                if !self.ui.focus.is_terminal() {
+                    self.ui.prev_focus = self.ui.focus;
+                }
+                self.set_focus(crate::tui::app::WorkspaceFocus::Terminal);
+                self.request_detail_refresh();
+                self.set_status(
+                    format!("Opened {}@{}", user, machine),
+                    crate::tui::StatusLevel::Info,
+                );
+                true
+            }
+            Err(message) => {
+                self.set_status(message, crate::tui::StatusLevel::Error);
+                false
+            }
+        }
+    }
+
     /// Request a runtime refresh without waiting on host I/O.
     ///
     /// The runtime observer owns the snapshot query and publishes the result

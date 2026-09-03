@@ -79,18 +79,24 @@ pub(crate) fn compose_application_services(
         }
     };
     let session_route = match level {
-        PermissionLevel::User => crate::adapters::session::SessionRoute::Direct(
-            crate::adapters::session::DirectTerminalPolicy::LoginOnly,
-        ),
-        PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct(
-            crate::adapters::session::DirectTerminalPolicy::Automatic,
-        ),
-        PermissionLevel::Elevated => crate::adapters::session::SessionRoute::Elevated(
-            daemon
+        PermissionLevel::User => crate::adapters::session::SessionRoute::Direct {
+            policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
+            machine1: (!cli_mode).then(|| direct_dbus.clone()),
+            nspawn: nspawn.clone(),
+        },
+        PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct {
+            policy: crate::adapters::session::DirectTerminalPolicy::Automatic,
+            machine1: (!cli_mode).then(|| direct_dbus.clone()),
+            nspawn: nspawn.clone(),
+        },
+        PermissionLevel::Elevated => crate::adapters::session::SessionRoute::Elevated {
+            daemon: daemon
                 .as_ref()
                 .cloned()
                 .expect("validated elevated composition has a daemon"),
-        ),
+            machine1: (!cli_mode).then(|| direct_dbus.clone()),
+            nspawn: nspawn.clone(),
+        },
     };
     let session = crate::adapters::session::compose_session_service(session_route);
     let fallback_inspector = cli_mode.then(|| machine_inspection.clone());

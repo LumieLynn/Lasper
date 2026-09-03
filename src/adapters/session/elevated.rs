@@ -1,7 +1,8 @@
 use crate::adapters::elevated::{pipe_reader, ElevatedDaemon};
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, TerminalSessionHandle, TerminalSessionRequest,
+    SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
+    WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::session::SessionLifecycle;
 use async_trait::async_trait;
@@ -10,34 +11,77 @@ use tokio::io::AsyncBufReadExt;
 
 pub(crate) struct ElevatedSessionAdapter {
     daemon: Arc<ElevatedDaemon>,
+    wayland: super::wayland::WaylandSessionResolver,
 }
 
 impl ElevatedSessionAdapter {
-    pub(crate) fn new(daemon: Arc<ElevatedDaemon>) -> Self {
-        Self { daemon }
+    pub(crate) fn new(
+        daemon: Arc<ElevatedDaemon>,
+        machine1: Option<crate::adapters::runtime::dbus::DbusBackend>,
+        nspawn: crate::adapters::config::NspawnConfigStore,
+    ) -> Self {
+        Self {
+            daemon,
+            wayland: super::wayland::WaylandSessionResolver::new(machine1, nspawn),
+        }
     }
 }
 
 #[async_trait]
 impl SessionPort for ElevatedSessionAdapter {
+    async fn discover_host_wayland_sockets(
+        &self,
+    ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+        if !self.wayland.is_available() {
+            return Vec::new();
+        }
+        crate::adapters::platform::capabilities::discover_wayland_sockets().await
+    }
+
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
     ) -> Result<TerminalSessionHandle, SessionError> {
+        let TerminalSessionRequest {
+            id,
+            machine,
+            size,
+            launch,
+        } = request;
+        if let TerminalLaunch::SelectedUserShell { user, environment } = launch {
+            if let Some(handle) = self
+                .wayland
+                .open_selected_user_shell(id, machine.clone(), user.clone(), environment, size)
+                .await?
+            {
+                return Ok(handle);
+            }
+            let command = crate::adapters::session::terminal_attach::shell(&machine, &user)
+                .into_pty_command()
+                .map_err(|error| {
+                    SessionError::new(format!("validate selected-user shell: {error}"))
+                })?;
+            return crate::adapters::session::pty::spawn_direct_terminal(
+                command,
+                id,
+                crate::domain::session::TerminalAttachmentKind::Login,
+                size,
+            );
+        }
         let spawned = self
             .daemon
-            .spawn_terminal(request.id.get(), request.machine.as_str(), request.size)
+            .spawn_terminal(id.get(), machine.as_str(), size)
             .await
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
         let lifecycle = spawned.lifecycle;
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,
-            request.id,
+            id,
             spawned.attach_kind,
         ) {
             Ok(session) => session,
             Err(error) => {
-                if let Err(close_error) = self.daemon.close_session(request.id.get()).await {
+                if let Err(close_error) = self.daemon.close_session(id.get()).await {
                     log::warn!(
                         "failed to close elevated terminal after local setup error: {close_error}"
                     );
@@ -51,7 +95,7 @@ impl SessionPort for ElevatedSessionAdapter {
                 close = control.close => {
                     if close.is_ok() {
                         let _ = control.lifecycle.send(SessionLifecycle::Closed);
-                        if let Err(error) = daemon.close_session(request.id.get()).await {
+                        if let Err(error) = daemon.close_session(id.get()).await {
                             log::warn!("failed to close elevated terminal session: {error}");
                         }
                     }
@@ -69,6 +113,13 @@ impl SessionPort for ElevatedSessionAdapter {
             }
         });
         Ok(handle)
+    }
+
+    async fn prepare_wayland(
+        &self,
+        request: WaylandPreparationRequest,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        self.wayland.prepare(request).await
     }
 
     async fn open_journal(
