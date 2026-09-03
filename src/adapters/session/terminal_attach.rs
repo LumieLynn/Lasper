@@ -1,13 +1,16 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
 use crate::adapters::runtime::state as runtime_state;
-use crate::application::sessions::ValidatedGuestUserName;
+use crate::application::sessions::{
+    SessionError, ShellTarget, ValidatedGuestUserName, WaylandSessionContext,
+};
 use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
 use portable_pty::CommandBuilder;
 use std::io;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 const NAMESPACE_NAMES: [&str; 6] = ["user", "mnt", "uts", "ipc", "net", "pid"];
 
@@ -196,6 +199,64 @@ pub(crate) fn shell(name: &MachineName, user: &ValidatedGuestUserName) -> Termin
     }
 }
 
+fn wayland_shell(
+    name: &MachineName,
+    user: &ValidatedGuestUserName,
+    guest_socket: &Path,
+) -> io::Result<TerminalAttachCommand> {
+    let assignment = crate::adapters::runtime::machine1::Machine1Environment::wayland(guest_socket)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+        .assignments()
+        .into_iter()
+        .next()
+        .expect("Wayland environment contains its single typed assignment");
+    Ok(TerminalAttachCommand {
+        kind: TerminalAttachKind::Login,
+        program: "machinectl".to_string(),
+        args: vec![
+            format!("--setenv={assignment}"),
+            "--".to_string(),
+            "shell".to_string(),
+            format!("{}@{}", user, name),
+        ],
+        namespace_snapshot: None,
+    })
+}
+
+/// Run the process-level selected-user shell with the caller's terminal
+/// inherited by machinectl. A verified Wayland context permits exactly one
+/// environment assignment and is revalidated immediately before spawning.
+pub(crate) async fn run_inherited_shell(
+    target: ShellTarget,
+    wayland: Option<WaylandSessionContext>,
+) -> Result<ExitStatus, SessionError> {
+    let command = match wayland {
+        Some(context) => {
+            crate::adapters::wayland::revalidate_host_socket(
+                context.host_socket(),
+                uzers::get_current_uid(),
+            )
+            .await
+            .map_err(|error| {
+                SessionError::new(format!("revalidate current Wayland socket: {error}"))
+            })?;
+            wayland_shell(target.machine(), target.user(), context.guest_socket()).map_err(
+                |error| SessionError::new(format!("build Wayland shell command: {error}")),
+            )?
+        }
+        None => shell(target.machine(), target.user()),
+    };
+
+    tokio::task::spawn_blocking(move || {
+        std::process::Command::new(command.program)
+            .args(command.args)
+            .status()
+    })
+    .await
+    .map_err(|error| SessionError::new(format!("machinectl shell task failed: {error}")))?
+    .map_err(|error| SessionError::new(error.to_string()))
+}
+
 fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAttachCommand> {
     for namespace in NAMESPACE_NAMES {
         let path = process.join("ns").join(namespace);
@@ -375,6 +436,40 @@ mod tests {
         assert_eq!(command.kind(), TerminalAttachKind::Login);
         assert_eq!(command.program(), "machinectl");
         assert_eq!(command.args(), ["--", "shell", "1000@test-machine"]);
+    }
+
+    #[test]
+    fn wayland_shell_has_one_typed_environment_assignment() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+
+        let command = wayland_shell(
+            &name,
+            &user,
+            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        )
+        .unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            command.args(),
+            [
+                "--setenv=WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-1",
+                "--",
+                "shell",
+                "alice@test-machine",
+            ]
+        );
+    }
+
+    #[test]
+    fn wayland_shell_rejects_untyped_display_paths() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+
+        for path in ["wayland-0", "/run/../tmp/socket", "/run/socket\n"] {
+            assert!(wayland_shell(&name, &user, Path::new(path)).is_err());
+        }
     }
 
     #[test]

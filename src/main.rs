@@ -17,7 +17,12 @@ async fn main() -> Result<()> {
     // 1. Parse CLI flags — all early exits happen here, before terminal
     //    takeover, so raw-mode / alternate-screen restoration is never needed.
     let options = match crate::cli::dispatch() {
-        Ok(options) => options,
+        Ok(crate::cli::CliDispatch::Application(options)) => options,
+        Ok(crate::cli::CliDispatch::Shell(command)) => {
+            let sessions = crate::composition::compose_process_shell_service();
+            let code = crate::cli::run_shell(command, &sessions).await;
+            std::process::exit(code);
+        }
         Err(code) => std::process::exit(code),
     };
     let want_elevation = options.want_elevation;

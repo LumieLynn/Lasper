@@ -29,6 +29,19 @@ pub(crate) struct ApplicationServices {
     pub host_operations: HostOperationTracker,
 }
 
+/// Compose the narrow direct graph used by the process-level `lasper shell`
+/// command. CLI-mode and elevated session routing are separate follow-up
+/// capabilities; machine1 remains responsible for shell authorization here.
+pub(crate) fn compose_process_shell_service() -> Arc<SessionService> {
+    crate::adapters::session::compose_session_service(
+        crate::adapters::session::SessionRoute::Direct {
+            policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
+            machine1: Some(crate::adapters::runtime::dbus::DbusBackend::new()),
+            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
+        },
+    )
+}
+
 pub(crate) fn compose_application_services(
     mode: CompositionMode,
     cli_mode: bool,
