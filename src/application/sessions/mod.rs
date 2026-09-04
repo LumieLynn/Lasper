@@ -3,11 +3,11 @@ mod service;
 
 #[allow(unused_imports)]
 pub use contract::{
-    GuestUserNameError, InteractiveShellEnvironment, InteractiveShellEnvironmentError,
-    JournalSessionHandle, JournalSessionRequest, ObservedGuestIdentity, SessionError, SessionPort,
-    SessionSendStatus, ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
-    TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
-    WaylandSessionContext, WaylandShellRequest,
+    GuestCommand, GuestCommandError, GuestUserNameError, InteractiveShellEnvironment,
+    InteractiveShellEnvironmentError, JournalSessionHandle, JournalSessionRequest,
+    ObservedGuestIdentity, SessionError, SessionPort, SessionSendStatus, ShellOpenIntent,
+    ShellTarget, TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest,
+    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
 };
 pub use service::SessionService;
 

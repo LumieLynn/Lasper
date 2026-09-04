@@ -3,7 +3,7 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
-use crate::adapters::session::MachineSessionRequest;
+use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::application::image_lifecycle::ImageControlOutcome;
 use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::inspection::{
@@ -29,6 +29,13 @@ const DBUS_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
     (vec![unit], false, false)
+}
+
+fn machine_shell_process(request: &MachineShellRequest) -> (&str, Vec<String>) {
+    request
+        .command()
+        .map(|command| (command.program(), command.argv()))
+        .unwrap_or_else(|| ("", Vec::new()))
 }
 
 #[proxy(
@@ -286,11 +293,12 @@ impl DbusBackend {
     ) -> Result<OwnedFd> {
         match request {
             MachineSessionRequest::Shell(request) => {
+                let (path, args) = machine_shell_process(&request);
                 self.open_machine_shell(
                     request.machine(),
                     request.user(),
-                    "",
-                    Vec::new(),
+                    path,
+                    args,
                     request.environment().assignments(),
                 )
                 .await
@@ -835,6 +843,33 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(shell.body().signature().unwrap().as_str(), "sssasas");
+    }
+
+    #[test]
+    fn selected_user_command_maps_to_dbus_path_and_complete_argv() {
+        let request = MachineShellRequest::new(
+            MachineName::new("demo").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            crate::adapters::session::MachineShellEnvironment::default(),
+        )
+        .with_command(
+            crate::application::sessions::GuestCommand::new(
+                "/usr/bin/kitty",
+                vec!["--class".into(), "a b".into()],
+            )
+            .unwrap(),
+        );
+
+        let (path, args) = machine_shell_process(&request);
+        assert_eq!(path, "/usr/bin/kitty");
+        assert_eq!(args, ["/usr/bin/kitty", "--class", "a b"]);
+
+        let default_shell = MachineShellRequest::new(
+            MachineName::new("demo").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            crate::adapters::session::MachineShellEnvironment::default(),
+        );
+        assert_eq!(machine_shell_process(&default_shell), ("", Vec::new()));
     }
 
     #[test]

@@ -4,7 +4,7 @@
 //! probe protocol, and `machine` is the route-fixed boundary.  The latter
 //! produces either a native D-Bus PTY (`runtime::dbus`) or a `machinectl`
 //! command (`runtime::cli`).  `terminal_attach` is only the default
-//! login/namespace selector; `terminal_io` owns the foreground CLI bridge.
+//! login/namespace selector; `terminal_io` owns the process-level I/O bridges.
 
 mod direct;
 mod elevated;

@@ -6,7 +6,8 @@
 
 use super::wayland_probe::WaylandProbeRequest;
 use crate::application::sessions::{
-    InteractiveShellEnvironment, SessionError, TerminalSessionHandle, ValidatedGuestUserName,
+    GuestCommand, InteractiveShellEnvironment, SessionError, TerminalSessionHandle,
+    ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize, TerminalAttachmentKind};
@@ -88,14 +89,15 @@ pub(crate) enum MachineShellEnvironmentError {
     TooLong { maximum: usize },
 }
 
-/// A selected user's default login shell. The caller cannot provide an
-/// executable or arbitrary argv; an empty machine1 path asks systemd to use
-/// the account's shell inside the guest.
+/// A selected user's machine1 shell request. An absent command asks systemd
+/// to use the account's login shell; a present command carries one validated
+/// executable and its argv values.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MachineShellRequest {
     machine: MachineName,
     user: ValidatedGuestUserName,
     environment: MachineShellEnvironment,
+    command: Option<GuestCommand>,
 }
 
 impl MachineShellRequest {
@@ -108,7 +110,13 @@ impl MachineShellRequest {
             machine,
             user,
             environment,
+            command: None,
         }
+    }
+
+    pub(crate) fn with_command(mut self, command: GuestCommand) -> Self {
+        self.command = Some(command);
+        self
     }
 
     pub(crate) fn machine(&self) -> &MachineName {
@@ -121,6 +129,10 @@ impl MachineShellRequest {
 
     pub(crate) fn environment(&self) -> &MachineShellEnvironment {
         &self.environment
+    }
+
+    pub(crate) fn command(&self) -> Option<&GuestCommand> {
+        self.command.as_ref()
     }
 }
 
@@ -301,5 +313,14 @@ mod tests {
         let probe =
             MachineSessionRequest::wayland_probe(WaylandProbeRequest::identity(machine(), user()));
         assert_eq!(probe.context(), "open Wayland projection probe");
+    }
+
+    #[test]
+    fn shell_request_can_carry_a_validated_guest_command() {
+        let request =
+            MachineShellRequest::new(machine(), user(), MachineShellEnvironment::default())
+                .with_command(GuestCommand::new("/bin/echo", vec!["hello".into()]).unwrap());
+        assert_eq!(request.command().unwrap().program(), "/bin/echo");
+        assert_eq!(request.command().unwrap().args(), ["hello"]);
     }
 }

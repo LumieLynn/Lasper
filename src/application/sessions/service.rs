@@ -46,6 +46,7 @@ impl SessionService {
         intent: ShellOpenIntent,
     ) -> Result<TerminalSessionHandle, SessionError> {
         let terminal_environment = intent.terminal_environment().clone();
+        let command = intent.command().cloned();
         let environment = match intent.wayland() {
             WaylandShellRequest::Disabled => {
                 TypedSessionEnvironment::terminal(terminal_environment)
@@ -58,11 +59,12 @@ impl SessionService {
         };
         let target = intent.target();
         self.port
-            .open_terminal(TerminalSessionRequest::selected_user_shell(
+            .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
                 self.allocate_id(),
                 target.machine().clone(),
                 target.user().clone(),
                 environment,
+                command,
                 intent.size(),
             ))
             .await
@@ -130,6 +132,7 @@ mod tests {
         ids: Mutex<Vec<SessionId>>,
         terminal_wayland_contexts: Mutex<Vec<bool>>,
         terminal_terms: Mutex<Vec<String>>,
+        terminal_commands: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -154,6 +157,13 @@ mod tests {
                 self.terminal_terms
                     .lock()
                     .push(environment.terminal_environment().term().to_string());
+            }
+            if let TerminalLaunch::SelectedUserShell { command, .. } = &request.launch {
+                self.terminal_commands.lock().push(
+                    command
+                        .as_ref()
+                        .map(|command| command.program().to_string()),
+                );
             }
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
         }
@@ -235,5 +245,36 @@ mod tests {
         assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2, 3]);
         assert_eq!(*port.terminal_wayland_contexts.lock(), [true]);
         assert_eq!(*port.terminal_terms.lock(), ["dumb"]);
+    }
+
+    #[tokio::test]
+    async fn shell_command_is_carried_after_wayland_preparation() {
+        let port = Arc::new(RecordingPort::default());
+        let service = SessionService::new(port.clone());
+        let command = crate::application::sessions::GuestCommand::new(
+            "/usr/bin/kitty",
+            vec!["--single-instance".into()],
+        )
+        .unwrap();
+        let _terminal = service
+            .open_shell(
+                ShellOpenIntent::new(
+                    ShellTarget::new(
+                        MachineName::new("test").unwrap(),
+                        crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
+                    ),
+                    WaylandShellRequest::Disabled,
+                    crate::application::sessions::InteractiveShellEnvironment::default(),
+                    SessionSize::new(80, 24).unwrap(),
+                )
+                .with_command(command),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            *port.terminal_commands.lock(),
+            [Some("/usr/bin/kitty".into())]
+        );
     }
 }

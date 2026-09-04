@@ -41,15 +41,18 @@ impl SessionPort for ElevatedSessionAdapter {
         } = request;
         let launch = match launch {
             TerminalLaunch::DefaultAttachment => WireTerminalLaunch::DefaultAttachment,
-            TerminalLaunch::SelectedUserShell { user, environment } => {
-                WireTerminalLaunch::SelectedUserShell {
-                    user,
-                    terminal: Box::new(environment.terminal_environment().clone()),
-                    wayland: environment
-                        .wayland_context()
-                        .map(|context| context.host_socket().clone()),
-                }
-            }
+            TerminalLaunch::SelectedUserShell {
+                user,
+                environment,
+                command,
+            } => WireTerminalLaunch::SelectedUserShell {
+                user,
+                terminal: Box::new(environment.terminal_environment().clone()),
+                wayland: environment
+                    .wayland_context()
+                    .map(|context| context.host_socket().clone()),
+                command: command.map(Into::into),
+            },
         };
         let spawned = self
             .daemon

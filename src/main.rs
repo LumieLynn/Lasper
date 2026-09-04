@@ -24,10 +24,11 @@ async fn main() -> Result<()> {
                 eprintln!("lasper: {}", diagnostic.summary);
             }
             let cli_mode = command.wants_cli_mode() || loaded_config.config.settings.cli_mode;
-            let use_sudo = crate::composition::DefaultPermissionManager::wants_elevation(
-                command.wants_elevation(),
-                &loaded_config.config.settings,
-            );
+            let use_sudo = command.permits_elevation()
+                && crate::composition::DefaultPermissionManager::wants_elevation(
+                    command.wants_elevation(),
+                    &loaded_config.config.settings,
+                );
             let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
                 crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
             );

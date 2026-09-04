@@ -112,7 +112,22 @@ pub(crate) async fn spawn_terminal(
             user,
             terminal,
             wayland,
+            command,
         } => {
+            let command = match command
+                .map(crate::application::sessions::GuestCommand::try_from)
+                .transpose()
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    send_session_error(
+                        &stream,
+                        "selected-user shell command validation failed",
+                        &error,
+                    );
+                    return;
+                }
+            };
             let target = crate::application::sessions::ShellTarget::new(name.clone(), user.clone());
             let resolver = crate::adapters::session::WaylandSessionResolver::for_authorized_uid(
                 machine.clone(),
@@ -151,9 +166,13 @@ pub(crate) async fn spawn_terminal(
                     return;
                 }
             };
-            let request = crate::adapters::session::MachineSessionRequest::shell(
-                crate::adapters::session::MachineShellRequest::new(name.clone(), user, environment),
-            );
+            let request =
+                crate::adapters::session::MachineShellRequest::new(name.clone(), user, environment);
+            let request = match command {
+                Some(command) => request.with_command(command),
+                None => request,
+            };
+            let request = crate::adapters::session::MachineSessionRequest::shell(request);
             match machine.open(request).await {
                 Ok(crate::adapters::session::MachineSessionOpening::Dbus(master)) => {
                     send_machine_terminal(&stream, master);

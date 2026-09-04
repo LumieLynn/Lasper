@@ -8,8 +8,8 @@ use super::{
 };
 use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
-    SessionError, TerminalSessionHandle, TypedSessionEnvironment, ValidatedGuestUserName,
-    WaylandPreparationRequest, WaylandSessionContext,
+    GuestCommand, SessionError, TerminalSessionHandle, TypedSessionEnvironment,
+    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -167,10 +167,15 @@ impl WaylandSessionResolver {
         machine: MachineName,
         user: ValidatedGuestUserName,
         environment: TypedSessionEnvironment,
+        command: Option<GuestCommand>,
         size: SessionSize,
     ) -> Result<TerminalSessionHandle, SessionError> {
         let shell_environment = self.environment(&environment).await?;
         let request = MachineShellRequest::new(machine, user, shell_environment);
+        let request = match command {
+            Some(command) => request.with_command(command),
+            None => request,
+        };
         self.machine
             .open_local(MachineSessionRequest::shell(request), id, size)
             .await

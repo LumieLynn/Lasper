@@ -134,6 +134,9 @@ fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttac
         "shell".to_string(),
         format!("{}@{}", request.user(), request.machine()),
     ]);
+    if let Some(command) = request.command() {
+        args.extend(command.argv());
+    }
     Ok(TerminalAttachCommand::with_terminal_environment(
         args, terminal,
     ))
@@ -450,7 +453,9 @@ mod tests {
     use crate::adapters::session::{
         MachineShellEnvironment, MachineShellRequest, WaylandProbeRequest,
     };
-    use crate::application::sessions::{InteractiveShellEnvironment, ValidatedGuestUserName};
+    use crate::application::sessions::{
+        GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
+    };
     use crate::domain::runtime::MachineState;
     use std::os::unix::process::ExitStatusExt;
     use std::path::Path;
@@ -503,6 +508,37 @@ mod tests {
         assert_eq!(
             command.args(),
             ["--setenv=TERM=dumb", "--", "shell", "1000@test-machine"]
+        );
+    }
+
+    #[test]
+    fn selected_user_shell_appends_guest_command_argv_without_requoting() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+        let request = MachineSessionRequest::shell(
+            MachineShellRequest::new(name, user, MachineShellEnvironment::default()).with_command(
+                GuestCommand::new(
+                    "/usr/bin/kitty",
+                    vec!["--class".into(), "a b".into(), "".into()],
+                )
+                .unwrap(),
+            ),
+        );
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(
+            command.args(),
+            [
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/usr/bin/kitty",
+                "--class",
+                "a b",
+                "",
+            ]
         );
     }
 

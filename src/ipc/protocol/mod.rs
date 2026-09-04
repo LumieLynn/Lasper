@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 18;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 19;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -140,6 +140,7 @@ pub(crate) struct FdRequest {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FdOperation {
     #[serde(rename = "spawn_journalctl")]
     Journalctl(SpawnJournalctlParams),

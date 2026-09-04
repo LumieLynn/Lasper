@@ -39,11 +39,11 @@ log-buffer-lines = 5000
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `elevate` | boolean | `false` | Start the isolated elevated daemon, equivalent to `lasper -e`. The TUI remains owned by the invoking user. |
-| `cli-mode` | boolean | `false` | Skip DBus and use the CLI communication backend. Equivalent to forcing `-c`. |
+| `elevate` | boolean | `false` | Start the isolated elevated daemon, equivalent to `lasper -e`. The TUI remains owned by the invoking user. This setting does not apply to `lasper launch`, which relies on the caller's systemd/polkit authority. |
+| `cli-mode` | boolean | `false` | Skip DBus and use the CLI communication backend. Equivalent to forcing `-c`; this also selects the `machinectl` transport for `shell` and `launch`. |
 | `log-buffer-lines` | integer | `5000` | Maximum number of journal lines retained per container in the detail panel. `0` also means `5000`. |
 
-The command-line flags take precedence over the corresponding configuration values. In particular, `lasper -e` always requests elevation and `lasper -c` always enables CLI mode.
+The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -c` always enables CLI mode. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
 
 ## Bootstrap Selection
 

@@ -1,4 +1,6 @@
-use crate::application::sessions::{InteractiveShellEnvironment, ValidatedGuestUserName};
+use crate::application::sessions::{
+    GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
+};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::domain::wayland::HostWaylandSocket;
@@ -43,6 +45,58 @@ pub(crate) struct SpawnTerminalParams {
     pub launch: WireTerminalLaunch,
 }
 
+/// Validated argv payload for a selected-user command crossing the elevated
+/// daemon boundary. Deserialization reuses the application command rules so
+/// malformed or relative executables are rejected before the daemon opens a
+/// machine session.
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireGuestCommand {
+    pub program: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for WireGuestCommand {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawWireGuestCommand {
+            program: String,
+            #[serde(default)]
+            args: Vec<String>,
+        }
+
+        let raw = RawWireGuestCommand::deserialize(deserializer)?;
+        GuestCommand::new(raw.program.clone(), raw.args.clone())
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            program: raw.program,
+            args: raw.args,
+        })
+    }
+}
+
+impl From<GuestCommand> for WireGuestCommand {
+    fn from(value: GuestCommand) -> Self {
+        Self {
+            program: value.program().to_owned(),
+            args: value.args().to_owned(),
+        }
+    }
+}
+
+impl TryFrom<WireGuestCommand> for GuestCommand {
+    type Error = crate::application::sessions::GuestCommandError;
+
+    fn try_from(value: WireGuestCommand) -> Result<Self, Self::Error> {
+        GuestCommand::new(value.program, value.args)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "launch", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireTerminalLaunch {
@@ -52,6 +106,8 @@ pub(crate) enum WireTerminalLaunch {
         terminal: Box<InteractiveShellEnvironment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wayland: Option<HostWaylandSocket>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<WireGuestCommand>,
     },
 }
 
@@ -252,6 +308,47 @@ mod tests {
                 "launch": "selected_user_shell",
                 "user": "alice",
                 "terminal": { "term": "bad term" }
+            }))
+            .is_err()
+        );
+
+        let command: WireTerminalLaunch = serde_json::from_value(serde_json::json!({
+            "launch": "selected_user_shell",
+            "user": "alice",
+            "terminal": { "term": "xterm-256color" },
+            "command": { "program": "/usr/bin/kitty", "args": ["--single-instance"] }
+        }))
+        .unwrap();
+        assert!(matches!(
+            command,
+            WireTerminalLaunch::SelectedUserShell {
+                command: Some(command),
+                ..
+            } if command.program == "/usr/bin/kitty" && command.args == ["--single-instance"]
+        ));
+
+        let encoded = serde_json::to_value(WireTerminalLaunch::SelectedUserShell {
+            user: ValidatedGuestUserName::new("alice").unwrap(),
+            terminal: Box::new(InteractiveShellEnvironment::default()),
+            wayland: None,
+            command: Some(
+                GuestCommand::new("/usr/bin/kitty", vec!["--single-instance".into()])
+                    .unwrap()
+                    .into(),
+            ),
+        })
+        .unwrap();
+        assert_eq!(
+            encoded["command"]["program"],
+            serde_json::Value::String("/usr/bin/kitty".into())
+        );
+
+        assert!(
+            serde_json::from_value::<WireTerminalLaunch>(serde_json::json!({
+                "launch": "selected_user_shell",
+                "user": "alice",
+                "terminal": { "term": "xterm-256color" },
+                "command": { "program": "kitty", "args": [] }
             }))
             .is_err()
         );

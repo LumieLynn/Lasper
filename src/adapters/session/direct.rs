@@ -51,10 +51,22 @@ impl SessionPort for DirectSessionAdapter {
             size,
             launch,
         } = request;
-        if let TerminalLaunch::SelectedUserShell { user, environment } = launch {
+        if let TerminalLaunch::SelectedUserShell {
+            user,
+            environment,
+            command,
+        } = launch
+        {
             return self
                 .wayland
-                .open_selected_user_shell(id, machine.clone(), user.clone(), *environment, size)
+                .open_selected_user_shell(
+                    id,
+                    machine.clone(),
+                    user.clone(),
+                    *environment,
+                    command,
+                    size,
+                )
                 .await;
         }
         let attachment = match self.terminal_policy {
