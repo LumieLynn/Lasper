@@ -4,11 +4,13 @@
 //! requests through the application session service. It does not construct
 //! concrete host adapters.
 
+use std::fmt;
 use std::path::PathBuf;
 
 use crate::application::sessions::{
-    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellOpenIntent,
-    ShellTarget, ValidatedGuestUserName, WaylandShellRequest,
+    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellOpenError,
+    ShellOpenIntent, ShellTarget, TerminalSessionHandle, ValidatedGuestUserName,
+    WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
@@ -40,6 +42,7 @@ pub(crate) struct ShellCommand {
     target: ShellTarget,
     wayland: ShellWaylandSelection,
     command: Option<GuestCommand>,
+    allow_wayland_fallback: bool,
     want_elevation: bool,
     want_cli_mode: bool,
 }
@@ -64,6 +67,10 @@ impl ShellCommand {
     pub(crate) fn command(&self) -> Option<&GuestCommand> {
         self.command.as_ref()
     }
+
+    pub(crate) const fn allows_wayland_fallback(&self) -> bool {
+        self.allow_wayland_fallback
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,16 +80,201 @@ enum ShellWaylandSelection {
     Disabled,
 }
 
-fn print_help() {
-    println!(
-        "lasper {} — A TUI for managing systemd-nspawn containers.\n\n\
-         USAGE:\n    lasper [FLAGS]\n    lasper [--elevate] [--cli-mode] shell [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]\n    lasper [--cli-mode] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]\n\n\
-         FLAGS:\n    -v, --version    Print version\n    -h, --help       Print this message\n    -e, --elevate    Use an isolated sudo daemon for privileged operations\n    -c, --cli-mode   Use runtime-state and systemd command backends\n\n\
-         SESSION OPTIONS:\n    --wayland[=DISPLAY]  Use Wayland (default); optionally select a discovered display\n    --no-wayland         Open without Wayland validation or environment\n    COMMAND [ARGUMENT...] Execute an absolute guest executable with argv values\n\n\
-         `shell` owns an interactive terminal and may use elevation. `launch` is for\n    Terminal=false desktop entries, always uses the caller's authority, and waits for\n    the guest command while forwarding its output.\n\n\
-         CONFIGURATION:\n    Settings are read from ~/.config/lasper/lasper.toml\n    [settings] elevate = true          Use the isolated sudo daemon.\n    [settings] cli-mode = true         Disable Lasper's direct DBus backend.\n    [settings] log-buffer-lines = N    Max log lines per container (default 5000).",
+struct HelpPage<'a> {
+    heading: String,
+    usage: Vec<&'a str>,
+    sections: Vec<HelpSection<'a>>,
+}
+
+impl<'a> HelpPage<'a> {
+    fn new(heading: String) -> Self {
+        Self {
+            heading,
+            usage: Vec::new(),
+            sections: Vec::new(),
+        }
+    }
+
+    fn usage(mut self, syntax: &'a str) -> Self {
+        self.usage.push(syntax);
+        self
+    }
+
+    fn section(mut self, section: HelpSection<'a>) -> Self {
+        self.sections.push(section);
+        self
+    }
+}
+
+impl fmt::Display for HelpPage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "{}", self.heading)?;
+        writeln!(formatter)?;
+        writeln!(formatter, "USAGE:")?;
+        for syntax in &self.usage {
+            writeln!(formatter, "    {syntax}")?;
+        }
+        for section in &self.sections {
+            writeln!(formatter)?;
+            section.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+struct HelpSection<'a> {
+    heading: &'a str,
+    items: Vec<HelpItem<'a>>,
+}
+
+enum HelpItem<'a> {
+    Entry(&'a str, &'a str),
+    Paragraph(&'a str),
+}
+
+impl<'a> HelpSection<'a> {
+    fn new(heading: &'a str) -> Self {
+        Self {
+            heading,
+            items: Vec::new(),
+        }
+    }
+
+    fn entry(mut self, syntax: &'a str, description: &'a str) -> Self {
+        self.items.push(HelpItem::Entry(syntax, description));
+        self
+    }
+
+    fn paragraph(mut self, text: &'a str) -> Self {
+        self.items.push(HelpItem::Paragraph(text));
+        self
+    }
+}
+
+impl fmt::Display for HelpSection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "{}:", self.heading)?;
+        let syntax_width = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                HelpItem::Entry(syntax, _) => Some(syntax.len()),
+                HelpItem::Paragraph(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                HelpItem::Entry(syntax, description) => writeln!(
+                    formatter,
+                    "    {syntax:<syntax_width$}  {description}",
+                    syntax_width = syntax_width
+                )?,
+                HelpItem::Paragraph(paragraph) => {
+                    if index > 0 {
+                        writeln!(formatter)?;
+                    }
+                    write_wrapped(formatter, paragraph, 4, 80)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_wrapped(
+    formatter: &mut fmt::Formatter<'_>,
+    text: &str,
+    indentation: usize,
+    width: usize,
+) -> fmt::Result {
+    let prefix = " ".repeat(indentation);
+    let line_width = width.saturating_sub(indentation).max(1);
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let separator = usize::from(!line.is_empty());
+        if !line.is_empty() && line.len() + separator + word.len() > line_width {
+            writeln!(formatter, "{prefix}{line}")?;
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        writeln!(formatter, "{prefix}{line}")?;
+    }
+    Ok(())
+}
+
+fn help_text() -> String {
+    HelpPage::new(format!(
+        "lasper {} - A TUI for managing systemd-nspawn containers.",
         env!("CARGO_PKG_VERSION")
-    );
+    ))
+    .usage("lasper [FLAGS]")
+    .usage(
+        "lasper [--elevate] [--cli-mode] shell [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
+    )
+    .usage(
+        "lasper [--cli-mode] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]",
+    )
+    .section(
+        HelpSection::new("FLAGS")
+            .entry("-v, --version", "Print version")
+            .entry("-h, --help", "Print this message")
+            .entry(
+                "-e, --elevate",
+                "Use an isolated sudo daemon for privileged operations",
+            )
+            .entry(
+                "-c, --cli-mode",
+                "Use runtime-state and systemd command backends",
+            ),
+    )
+    .section(
+        HelpSection::new("SESSION OPTIONS")
+            .entry(
+                "--wayland[=DISPLAY]",
+                "Use Wayland (default); optionally select a discovered display",
+            )
+            .entry(
+                "--no-wayland",
+                "Open without Wayland validation or environment",
+            )
+            .entry(
+                "COMMAND [ARGUMENT...]",
+                "Execute an absolute guest executable with argv values",
+            )
+            .paragraph(
+                "`shell` owns an interactive terminal and may use elevation. Its automatic Wayland selection falls back to a terminal-only shell when validation fails. An exact --wayland=DISPLAY selection does not fall back.",
+            )
+            .paragraph(
+                "`launch` is for Terminal=false desktop entries, always uses the caller's authority, and waits for the guest command while forwarding its output.",
+            ),
+    )
+    .section(
+        HelpSection::new("CONFIGURATION")
+            .paragraph("Settings are read from ~/.config/lasper/lasper.toml")
+            .entry(
+                "[settings] elevate = true",
+                "Use the isolated sudo daemon.",
+            )
+            .entry(
+                "[settings] cli-mode = true",
+                "Disable Lasper's direct DBus backend.",
+            )
+            .entry(
+                "[settings] log-buffer-lines = N",
+                "Max log lines per container (default 5000).",
+            ),
+    )
+    .to_string()
+}
+
+fn print_help() {
+    print!("{}", help_text());
 }
 
 /// Dispatch process-level commands before the TUI owns the terminal.
@@ -126,11 +318,16 @@ fn shell_command_arguments(args: &[String]) -> Option<(ShellIoMode, Vec<String>)
 pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) -> i32 {
     let io_mode = command.io_mode();
     let requested_command = command.command().cloned();
+    let allow_wayland_fallback = command.allows_wayland_fallback();
     let ShellCommand {
         target, wayland, ..
     } = command;
-    let wayland = match resolve_wayland_request(sessions, wayland).await {
-        Ok(wayland) => wayland,
+    let (wayland, discovery_fallback) = match resolve_wayland_request(sessions, wayland).await {
+        Ok(wayland) => (wayland, false),
+        Err(error) if allow_wayland_fallback => {
+            report_wayland_fallback("Wayland socket selection failed", &error);
+            (WaylandShellRequest::Disabled, true)
+        }
         Err(error) => {
             report_shell_error("Wayland socket selection failed", &error);
             eprintln!(
@@ -162,11 +359,22 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
     if let Some(command) = requested_command {
         intent = intent.with_command(command);
     }
-    let handle = match sessions.open_shell(intent).await {
+    let (handle, probe_fallback) = match open_shell_with_wayland_fallback(
+        sessions,
+        intent,
+        allow_wayland_fallback && uses_wayland,
+    )
+    .await
+    {
         Ok(handle) => handle,
-        Err(error) => {
-            report_shell_error("failed to open selected-user shell", &error);
-            if uses_wayland {
+        Err(ShellAttemptError::Initial(error)) => {
+            let context = if discovery_fallback {
+                "Wayland fallback shell failed"
+            } else {
+                "failed to open selected-user shell"
+            };
+            report_shell_error(context, error.session_error());
+            if uses_wayland && !allow_wayland_fallback {
                 eprintln!(
                     "lasper: hint: choose another display with --wayland=DISPLAY, or use \
                      --no-wayland for a terminal-only session"
@@ -174,7 +382,15 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
             }
             return 1;
         }
+        Err(ShellAttemptError::Fallback(error)) => {
+            report_shell_error("Wayland fallback shell failed", error.session_error());
+            return 1;
+        }
     };
+
+    if discovery_fallback || probe_fallback {
+        eprintln!("lasper: warning: continuing without Wayland");
+    }
 
     let result = match io_mode {
         ShellIoMode::Interactive => {
@@ -194,6 +410,31 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
             report_shell_error(context, &error);
             1
         }
+    }
+}
+
+#[derive(Debug)]
+enum ShellAttemptError {
+    Initial(ShellOpenError),
+    Fallback(ShellOpenError),
+}
+
+async fn open_shell_with_wayland_fallback(
+    sessions: &SessionService,
+    intent: ShellOpenIntent,
+    allow_fallback: bool,
+) -> Result<(TerminalSessionHandle, bool), ShellAttemptError> {
+    match sessions.open_shell(intent.clone()).await {
+        Ok(handle) => Ok((handle, false)),
+        Err(ShellOpenError::WaylandPreparation(error)) if allow_fallback => {
+            report_wayland_fallback("Wayland validation failed", &error);
+            sessions
+                .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
+                .await
+                .map(|handle| (handle, true))
+                .map_err(ShellAttemptError::Fallback)
+        }
+        Err(error) => Err(ShellAttemptError::Initial(error)),
     }
 }
 
@@ -247,6 +488,14 @@ fn report_shell_error(context: &str, error: &SessionError) {
     if let Some(hint) = error.hint() {
         eprintln!("lasper: hint: {hint}");
     }
+}
+
+fn report_wayland_fallback(context: &str, error: &SessionError) {
+    eprintln!("lasper: warning: {context}: {error}");
+    if let Some(hint) = error.hint() {
+        eprintln!("lasper: warning: hint: {hint}");
+    }
+    eprintln!("lasper: warning: retrying without Wayland");
 }
 
 fn parse_shell_target(target: &str) -> Result<ShellTarget, String> {
@@ -372,11 +621,14 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
     if io_mode == ShellIoMode::Launcher && command.is_none() {
         return Err("launch requires a guest executable".into());
     }
+    let allow_wayland_fallback =
+        io_mode == ShellIoMode::Interactive && wayland == ShellWaylandSelection::Preferred;
     Ok(ShellCommand {
         io_mode,
         target,
         wayland,
         command,
+        allow_wayland_fallback,
         want_elevation,
         want_cli_mode,
     })
@@ -464,9 +716,11 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
 mod tests {
     use super::*;
     use crate::application::sessions::{
-        JournalSessionHandle, JournalSessionRequest, SessionPort, TerminalSessionHandle,
+        journal_session_channel, terminal_session_channel, JournalSessionHandle,
+        JournalSessionRequest, SessionPort, TerminalLaunch, TerminalSessionHandle,
         TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
     };
+    use crate::domain::session::TerminalAttachmentKind;
     use crate::domain::wayland::SocketRevision;
     use async_trait::async_trait;
     use std::path::PathBuf;
@@ -538,6 +792,78 @@ mod tests {
         }
     }
 
+    struct FallbackSessionPort {
+        prepare_calls: AtomicUsize,
+        open_calls: AtomicUsize,
+        open_wayland: parking_lot::Mutex<Vec<bool>>,
+        fail_fallback: bool,
+    }
+
+    impl FallbackSessionPort {
+        fn new(fail_fallback: bool) -> Self {
+            Self {
+                prepare_calls: AtomicUsize::new(0),
+                open_calls: AtomicUsize::new(0),
+                open_wayland: parking_lot::Mutex::new(Vec::new()),
+                fail_fallback,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SessionPort for FallbackSessionPort {
+        async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket> {
+            vec![socket("wayland-0", 1)]
+        }
+
+        async fn open_terminal(
+            &self,
+            request: TerminalSessionRequest,
+        ) -> Result<TerminalSessionHandle, SessionError> {
+            self.open_calls.fetch_add(1, Ordering::Relaxed);
+            let has_wayland = matches!(
+                &request.launch,
+                TerminalLaunch::SelectedUserShell { environment, .. }
+                    if environment.wayland_context().is_some()
+            );
+            self.open_wayland.lock().push(has_wayland);
+            if self.fail_fallback && !has_wayland {
+                return Err(SessionError::new("simulated terminal open failure"));
+            }
+            Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
+        }
+
+        async fn prepare_wayland(
+            &self,
+            _request: WaylandPreparationRequest,
+        ) -> Result<WaylandSessionContext, SessionError> {
+            self.prepare_calls.fetch_add(1, Ordering::Relaxed);
+            Err(SessionError::with_hint(
+                "simulated Wayland probe failure",
+                "simulated probe hint",
+            ))
+        }
+
+        async fn open_journal(
+            &self,
+            request: JournalSessionRequest,
+        ) -> Result<JournalSessionHandle, SessionError> {
+            Ok(journal_session_channel(request.id).0)
+        }
+    }
+
+    fn selected_wayland_intent() -> ShellOpenIntent {
+        ShellOpenIntent::new(
+            ShellTarget::new(
+                MachineName::new("demo").unwrap(),
+                ValidatedGuestUserName::new("alice").unwrap(),
+            ),
+            WaylandShellRequest::SelectedHostDisplay(socket("wayland-0", 1)),
+            InteractiveShellEnvironment::default(),
+            crate::domain::session::SessionSize::new(80, 24).unwrap(),
+        )
+    }
+
     #[test]
     fn shell_target_parses_one_validated_user_and_machine() {
         let target = parse_shell_target("1000@demo").unwrap();
@@ -561,6 +887,7 @@ mod tests {
         assert_eq!(command.target.user().as_str(), "alice");
         assert_eq!(command.target.machine().as_str(), "demo");
         assert_eq!(command.wayland, ShellWaylandSelection::Preferred);
+        assert!(command.allows_wayland_fallback());
         assert!(command.command().is_none());
         assert!(!command.wants_elevation());
         assert!(!command.wants_cli_mode());
@@ -577,6 +904,12 @@ mod tests {
 
         let disabled = parse_interactive(&arguments(&["alice@demo", "--no-wayland"])).unwrap();
         assert_eq!(disabled.wayland, ShellWaylandSelection::Disabled);
+        assert!(!disabled.allows_wayland_fallback());
+
+        let automatic = parse_interactive(&arguments(&["--wayland", "alice@demo"])).unwrap();
+        assert!(automatic.allows_wayland_fallback());
+
+        assert!(!selected.allows_wayland_fallback());
     }
 
     #[test]
@@ -666,6 +999,74 @@ mod tests {
         assert_eq!(command.command().unwrap().program(), "/usr/bin/kitty");
         assert_eq!(command.command().unwrap().args(), ["--single-instance"]);
         assert!(parse_launcher(&arguments(&["alice@demo"])).is_err());
+    }
+
+    #[tokio::test]
+    async fn interactive_wayland_probe_retries_once_without_wayland() {
+        let port = Arc::new(FallbackSessionPort::new(false));
+        let service = SessionService::new(port.clone());
+        let (mut handle, used_fallback) =
+            open_shell_with_wayland_fallback(&service, selected_wayland_intent(), true)
+                .await
+                .unwrap();
+
+        assert!(used_fallback);
+        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*port.open_wayland.lock(), [false]);
+        handle.close();
+    }
+
+    #[tokio::test]
+    async fn explicit_wayland_failure_does_not_retry() {
+        let port = Arc::new(FallbackSessionPort::new(false));
+        let service = SessionService::new(port.clone());
+        let error = match open_shell_with_wayland_fallback(
+            &service,
+            selected_wayland_intent(),
+            false,
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("explicit Wayland failure unexpectedly opened a shell"),
+        };
+
+        assert!(matches!(
+            error,
+            ShellAttemptError::Initial(ShellOpenError::WaylandPreparation(_))
+        ));
+        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(port.open_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn wayland_fallback_failure_is_reported_as_fallback_error() {
+        let port = Arc::new(FallbackSessionPort::new(true));
+        let service = SessionService::new(port.clone());
+        let error =
+            match open_shell_with_wayland_fallback(&service, selected_wayland_intent(), true).await
+            {
+                Err(error) => error,
+                Ok(_) => panic!("Wayland fallback unexpectedly succeeded"),
+            };
+
+        assert!(matches!(
+            error,
+            ShellAttemptError::Fallback(ShellOpenError::Terminal(_))
+        ));
+        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn help_is_composed_from_sections() {
+        let help = help_text();
+        assert!(help.contains("USAGE:\n"));
+        assert!(help.contains("FLAGS:\n"));
+        assert!(help.contains("SESSION OPTIONS:\n"));
+        assert!(help.contains("CONFIGURATION:\n"));
+        assert!(help.contains("Wayland selection falls back"));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use super::{
-    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenIntent,
-    ShellTarget, TerminalSessionHandle, TerminalSessionRequest, TypedSessionEnvironment,
-    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
+    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenError,
+    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionRequest,
+    TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -44,7 +44,7 @@ impl SessionService {
     pub async fn open_shell(
         &self,
         intent: ShellOpenIntent,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, ShellOpenError> {
         let terminal_environment = intent.terminal_environment().clone();
         let command = intent.command().cloned();
         let environment = match intent.wayland() {
@@ -54,7 +54,8 @@ impl SessionService {
             WaylandShellRequest::SelectedHostDisplay(socket) => TypedSessionEnvironment::wayland(
                 terminal_environment,
                 self.prepare_wayland(intent.target().clone(), socket.clone())
-                    .await?,
+                    .await
+                    .map_err(ShellOpenError::WaylandPreparation)?,
             ),
         };
         let target = intent.target();
@@ -68,6 +69,7 @@ impl SessionService {
                 intent.size(),
             ))
             .await
+            .map_err(ShellOpenError::Terminal)
     }
 
     pub async fn test_wayland(

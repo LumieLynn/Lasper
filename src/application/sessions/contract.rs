@@ -383,6 +383,11 @@ impl ShellOpenIntent {
         self
     }
 
+    pub(crate) fn with_wayland(mut self, wayland: WaylandShellRequest) -> Self {
+        self.wayland = wayland;
+        self
+    }
+
     pub fn target(&self) -> &ShellTarget {
         &self.target
     }
@@ -591,6 +596,25 @@ impl SessionError {
 impl From<std::io::Error> for SessionError {
     fn from(error: std::io::Error) -> Self {
         Self::new(error.to_string())
+    }
+}
+
+/// Preserve whether a selected-user shell failed while preparing Wayland or
+/// while opening the terminal itself. Callers may safely retry only the first
+/// phase without risking a duplicate shell attachment.
+#[derive(Debug, thiserror::Error)]
+pub enum ShellOpenError {
+    #[error("{0}")]
+    WaylandPreparation(#[source] SessionError),
+    #[error("{0}")]
+    Terminal(#[source] SessionError),
+}
+
+impl ShellOpenError {
+    pub fn session_error(&self) -> &SessionError {
+        match self {
+            Self::WaylandPreparation(error) | Self::Terminal(error) => error,
+        }
     }
 }
 

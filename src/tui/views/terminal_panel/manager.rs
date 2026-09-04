@@ -252,17 +252,21 @@ impl TerminalManager {
         let size = SessionSize::new(cols, rows)
             .map_err(|error| format!("Invalid terminal size: {error}"))?;
         let mut handle = match user.clone() {
-            Some(user) => {
-                self.session_service
-                    .open_shell(ShellOpenIntent::new(
-                        ShellTarget::new(machine, user),
-                        wayland,
-                        InteractiveShellEnvironment::capture(),
-                        size,
-                    ))
-                    .await
-            }
-            None => self.session_service.open_terminal(machine, size).await,
+            Some(user) => self
+                .session_service
+                .open_shell(ShellOpenIntent::new(
+                    ShellTarget::new(machine, user),
+                    wayland,
+                    InteractiveShellEnvironment::capture(),
+                    size,
+                ))
+                .await
+                .map_err(|error| error.to_string()),
+            None => self
+                .session_service
+                .open_terminal(machine, size)
+                .await
+                .map_err(|error| error.to_string()),
         }
         .map_err(|error| format!("Failed to attach terminal: {error}"))?;
         let attach_kind = handle.attachment();
