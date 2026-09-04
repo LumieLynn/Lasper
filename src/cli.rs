@@ -15,6 +15,8 @@ use crate::application::sessions::{
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 
+const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
+
 pub(crate) struct CliOptions {
     pub(crate) want_elevation: bool,
     pub(crate) want_cli_mode: bool,
@@ -45,6 +47,7 @@ pub(crate) struct ShellCommand {
     allow_wayland_fallback: bool,
     want_elevation: bool,
     want_cli_mode: bool,
+    quiet: bool,
 }
 
 impl ShellCommand {
@@ -70,6 +73,10 @@ impl ShellCommand {
 
     pub(crate) const fn allows_wayland_fallback(&self) -> bool {
         self.allow_wayland_fallback
+    }
+
+    pub(crate) const fn is_quiet(&self) -> bool {
+        self.quiet
     }
 }
 
@@ -215,7 +222,7 @@ fn help_text() -> String {
     ))
     .usage("lasper [FLAGS]")
     .usage(
-        "lasper [--elevate] [--cli-mode] shell [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
+        "lasper [--elevate] [--cli-mode] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
     )
     .usage(
         "lasper [--cli-mode] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]",
@@ -244,11 +251,15 @@ fn help_text() -> String {
                 "Open without Wayland validation or environment",
             )
             .entry(
+                "--quiet",
+                "Suppress Wayland fallback and detach notices",
+            )
+            .entry(
                 "COMMAND [ARGUMENT...]",
                 "Execute an absolute guest executable with argv values",
             )
             .paragraph(
-                "`shell` owns an interactive terminal and may use elevation. Its automatic Wayland selection falls back to a terminal-only shell when validation fails. An exact --wayland=DISPLAY selection does not fall back.",
+                "`shell` owns an interactive terminal and may use elevation. Press Ctrl+] three times within one second to detach. Its automatic Wayland selection falls back to a terminal-only shell when validation fails. An exact --wayland=DISPLAY selection does not fall back.",
             )
             .paragraph(
                 "`launch` is for Terminal=false desktop entries, always uses the caller's authority, and waits for the guest command while forwarding its output.",
@@ -319,15 +330,16 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
     let io_mode = command.io_mode();
     let requested_command = command.command().cloned();
     let allow_wayland_fallback = command.allows_wayland_fallback();
+    let quiet = command.is_quiet();
     let ShellCommand {
         target, wayland, ..
     } = command;
     let (wayland, discovery_fallback) = match resolve_wayland_request(sessions, wayland).await {
-        Ok(wayland) => (wayland, false),
-        Err(error) if allow_wayland_fallback => {
-            report_wayland_fallback("Wayland socket selection failed", &error);
-            (WaylandShellRequest::Disabled, true)
-        }
+        Ok(wayland) => (wayland, None),
+        Err(error) if allow_wayland_fallback => (
+            WaylandShellRequest::Disabled,
+            Some(WaylandFallbackCause::SocketSelection(error)),
+        ),
         Err(error) => {
             report_shell_error("Wayland socket selection failed", &error);
             eprintln!(
@@ -368,33 +380,35 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
     {
         Ok(handle) => handle,
         Err(ShellAttemptError::Initial(error)) => {
-            let context = if discovery_fallback {
-                "Wayland fallback shell failed"
+            if let Some(cause) = &discovery_fallback {
+                report_wayland_fallback_failure(cause, &error);
             } else {
-                "failed to open selected-user shell"
-            };
-            report_shell_error(context, error.session_error());
-            if uses_wayland && !allow_wayland_fallback {
-                eprintln!(
-                    "lasper: hint: choose another display with --wayland=DISPLAY, or use \
-                     --no-wayland for a terminal-only session"
-                );
+                report_shell_error("failed to open selected-user shell", error.session_error());
+                if uses_wayland && !allow_wayland_fallback {
+                    eprintln!(
+                        "lasper: hint: choose another display with --wayland=DISPLAY, or use \
+                         --no-wayland for a terminal-only session"
+                    );
+                }
             }
             return 1;
         }
-        Err(ShellAttemptError::Fallback(error)) => {
-            report_shell_error("Wayland fallback shell failed", error.session_error());
+        Err(ShellAttemptError::Fallback { cause, error }) => {
+            report_wayland_fallback_failure(&cause, &error);
             return 1;
         }
     };
 
-    if discovery_fallback || probe_fallback {
-        eprintln!("lasper: warning: continuing without Wayland");
+    if let Some(notice) = wayland_fallback_notice(
+        quiet,
+        discovery_fallback.is_some() || probe_fallback.is_some(),
+    ) {
+        eprintln!("{notice}");
     }
 
     let result = match io_mode {
         ShellIoMode::Interactive => {
-            crate::adapters::session::terminal_io::run_inherited_terminal(handle).await
+            crate::adapters::session::terminal_io::run_inherited_terminal(handle, !quiet).await
         }
         ShellIoMode::Launcher => {
             crate::adapters::session::terminal_io::run_launcher_terminal(handle).await
@@ -416,23 +430,49 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
 #[derive(Debug)]
 enum ShellAttemptError {
     Initial(ShellOpenError),
-    Fallback(ShellOpenError),
+    Fallback {
+        cause: WaylandFallbackCause,
+        error: ShellOpenError,
+    },
+}
+
+#[derive(Debug)]
+enum WaylandFallbackCause {
+    SocketSelection(SessionError),
+    Validation(SessionError),
+}
+
+impl WaylandFallbackCause {
+    fn context(&self) -> &'static str {
+        match self {
+            Self::SocketSelection(_) => "Wayland socket selection failed",
+            Self::Validation(_) => "Wayland validation failed",
+        }
+    }
+
+    fn error(&self) -> &SessionError {
+        match self {
+            Self::SocketSelection(error) | Self::Validation(error) => error,
+        }
+    }
 }
 
 async fn open_shell_with_wayland_fallback(
     sessions: &SessionService,
     intent: ShellOpenIntent,
     allow_fallback: bool,
-) -> Result<(TerminalSessionHandle, bool), ShellAttemptError> {
+) -> Result<(TerminalSessionHandle, Option<WaylandFallbackCause>), ShellAttemptError> {
     match sessions.open_shell(intent.clone()).await {
-        Ok(handle) => Ok((handle, false)),
+        Ok(handle) => Ok((handle, None)),
         Err(ShellOpenError::WaylandPreparation(error)) if allow_fallback => {
-            report_wayland_fallback("Wayland validation failed", &error);
-            sessions
+            let cause = WaylandFallbackCause::Validation(error);
+            match sessions
                 .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
                 .await
-                .map(|handle| (handle, true))
-                .map_err(ShellAttemptError::Fallback)
+            {
+                Ok(handle) => Ok((handle, Some(cause))),
+                Err(error) => Err(ShellAttemptError::Fallback { cause, error }),
+            }
         }
         Err(error) => Err(ShellAttemptError::Initial(error)),
     }
@@ -490,12 +530,16 @@ fn report_shell_error(context: &str, error: &SessionError) {
     }
 }
 
-fn report_wayland_fallback(context: &str, error: &SessionError) {
-    eprintln!("lasper: warning: {context}: {error}");
-    if let Some(hint) = error.hint() {
-        eprintln!("lasper: warning: hint: {hint}");
-    }
-    eprintln!("lasper: warning: retrying without Wayland");
+fn report_wayland_fallback_failure(cause: &WaylandFallbackCause, error: &ShellOpenError) {
+    report_shell_error(cause.context(), cause.error());
+    report_shell_error(
+        "failed to open selected-user shell without Wayland",
+        error.session_error(),
+    );
+}
+
+fn wayland_fallback_notice(quiet: bool, fallback_used: bool) -> Option<&'static str> {
+    (!quiet && fallback_used).then_some(WAYLAND_FALLBACK_NOTICE)
 }
 
 fn parse_shell_target(target: &str) -> Result<ShellTarget, String> {
@@ -525,6 +569,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
     let mut command_started = false;
     let mut want_elevation = false;
     let mut want_cli_mode = false;
+    let mut quiet = false;
 
     let mut index = 0;
     while index < args.len() {
@@ -574,6 +619,11 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
                 index += 1;
                 continue;
             }
+            "--quiet" => {
+                quiet = true;
+                index += 1;
+                continue;
+            }
             "--" if target.is_none() => {
                 return Err(format!(
                     "{command_name} command separator must follow USER@MACHINE"
@@ -618,6 +668,9 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
     if io_mode == ShellIoMode::Launcher && want_elevation {
         return Err("launch does not support --elevate; desktop authorization uses polkit".into());
     }
+    if io_mode == ShellIoMode::Launcher && quiet {
+        return Err("launch does not support --quiet; it emits no shell notices".into());
+    }
     if io_mode == ShellIoMode::Launcher && command.is_none() {
         return Err("launch requires a guest executable".into());
     }
@@ -631,6 +684,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         allow_wayland_fallback,
         want_elevation,
         want_cli_mode,
+        quiet,
     })
 }
 
@@ -891,6 +945,7 @@ mod tests {
         assert!(command.command().is_none());
         assert!(!command.wants_elevation());
         assert!(!command.wants_cli_mode());
+        assert!(!command.is_quiet());
     }
 
     #[test]
@@ -970,6 +1025,19 @@ mod tests {
     }
 
     #[test]
+    fn quiet_is_a_right_side_shell_option() {
+        assert!(shell_command_arguments(&arguments(&["--quiet", "shell", "alice@demo"])).is_none());
+
+        for args in [
+            arguments(&["shell", "--quiet", "alice@demo"]),
+            arguments(&["shell", "alice@demo", "--quiet"]),
+        ] {
+            let (mode, command_args) = shell_command_arguments(&args).unwrap();
+            assert!(parse_shell_command(mode, &command_args).unwrap().is_quiet());
+        }
+    }
+
+    #[test]
     fn shell_rejects_conflicting_options_and_invalid_commands() {
         for args in [
             arguments(&["--wayland", "--no-wayland", "alice@demo"]),
@@ -1010,7 +1078,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert!(used_fallback);
+        assert!(matches!(
+            used_fallback,
+            Some(WaylandFallbackCause::Validation(_))
+        ));
         assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
         assert_eq!(*port.open_wayland.lock(), [false]);
@@ -1053,10 +1124,23 @@ mod tests {
 
         assert!(matches!(
             error,
-            ShellAttemptError::Fallback(ShellOpenError::Terminal(_))
+            ShellAttemptError::Fallback {
+                cause: WaylandFallbackCause::Validation(_),
+                error: ShellOpenError::Terminal(_),
+            }
         ));
         assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
         assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn quiet_suppresses_the_successful_wayland_fallback_notice() {
+        assert_eq!(
+            wayland_fallback_notice(false, true),
+            Some(WAYLAND_FALLBACK_NOTICE)
+        );
+        assert_eq!(wayland_fallback_notice(true, true), None);
+        assert_eq!(wayland_fallback_notice(false, false), None);
     }
 
     #[test]
@@ -1066,7 +1150,11 @@ mod tests {
         assert!(help.contains("FLAGS:\n"));
         assert!(help.contains("SESSION OPTIONS:\n"));
         assert!(help.contains("CONFIGURATION:\n"));
-        assert!(help.contains("Wayland selection falls back"));
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("Press Ctrl+] three times within one second to detach."));
+        assert!(normalized.contains("Wayland selection falls back"));
+        assert!(normalized.contains("--quiet Suppress Wayland fallback and detach notices"));
+        assert_eq!(WAYLAND_FALLBACK_NOTICE, "🪐 Continuing without Wayland...");
     }
 
     #[test]
@@ -1079,6 +1167,18 @@ mod tests {
             let (mode, command_args) = shell_command_arguments(&args).unwrap();
             let error = parse_shell_command(mode, &command_args).unwrap_err();
             assert!(error.contains("does not support --elevate"), "{error}");
+        }
+    }
+
+    #[test]
+    fn launch_rejects_the_shell_only_quiet_option() {
+        for args in [
+            arguments(&["launch", "--quiet", "alice@demo", "/bin/true"]),
+            arguments(&["launch", "alice@demo", "--quiet", "/bin/true"]),
+        ] {
+            let (mode, command_args) = shell_command_arguments(&args).unwrap();
+            let error = parse_shell_command(mode, &command_args).unwrap_err();
+            assert!(error.contains("does not support --quiet"), "{error}");
         }
     }
 

@@ -123,12 +123,14 @@ pub(crate) fn machine_session_command(
 
 fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttachCommand> {
     let terminal = request.environment().terminal_environment().clone();
-    let mut args = request
-        .environment()
-        .assignments()
-        .into_iter()
-        .map(|assignment| format!("--setenv={assignment}"))
-        .collect::<Vec<_>>();
+    let mut args = vec!["--quiet".to_string()];
+    args.extend(
+        request
+            .environment()
+            .assignments()
+            .into_iter()
+            .map(|assignment| format!("--setenv={assignment}")),
+    );
     args.extend([
         "--".to_string(),
         "shell".to_string(),
@@ -507,7 +509,13 @@ mod tests {
         assert_eq!(command.program(), "machinectl");
         assert_eq!(
             command.args(),
-            ["--setenv=TERM=dumb", "--", "shell", "1000@test-machine"]
+            [
+                "--quiet",
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "1000@test-machine"
+            ]
         );
     }
 
@@ -530,6 +538,7 @@ mod tests {
         assert_eq!(
             command.args(),
             [
+                "--quiet",
                 "--setenv=TERM=dumb",
                 "--",
                 "shell",
@@ -566,6 +575,7 @@ mod tests {
         assert_eq!(
             command.args(),
             [
+                "--quiet",
                 "--setenv=TERM=xterm-kitty",
                 "--setenv=COLORTERM=truecolor",
                 "--setenv=NO_COLOR=",

@@ -7,9 +7,86 @@
 use crate::application::sessions::{SessionError, SessionSendStatus, TerminalSessionHandle};
 use crate::domain::session::{SessionLifecycle, SessionSize};
 use std::io::IsTerminal;
+use std::time::Duration;
 
 const DEFAULT_LAUNCHER_COLUMNS: u16 = 80;
 const DEFAULT_LAUNCHER_ROWS: u16 = 24;
+const DETACH_BYTE: u8 = 0x1d;
+const DETACH_COUNT: u8 = 3;
+const DETACH_WINDOW: Duration = Duration::from_secs(1);
+const DETACH_NOTICE: &str = "🪐 Press Ctrl+] three times within 1s to detach...";
+
+#[derive(Debug, Default)]
+struct DetachSequence {
+    started_at: Option<tokio::time::Instant>,
+    pending: u8,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct FilteredInput {
+    forward: Vec<u8>,
+    detach: bool,
+}
+
+impl DetachSequence {
+    fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.started_at.map(|started| started + DETACH_WINDOW)
+    }
+
+    fn filter(&mut self, bytes: &[u8], now: tokio::time::Instant) -> FilteredInput {
+        let mut forward = Vec::with_capacity(bytes.len() + usize::from(self.pending));
+        if self.deadline().is_some_and(|deadline| now > deadline) {
+            self.flush_into(&mut forward);
+        }
+
+        for &byte in bytes {
+            if byte == DETACH_BYTE {
+                if self.pending == 0 {
+                    self.started_at = Some(now);
+                }
+                self.pending += 1;
+                if self.pending == DETACH_COUNT {
+                    self.reset();
+                    return FilteredInput {
+                        forward,
+                        detach: true,
+                    };
+                }
+            } else {
+                self.flush_into(&mut forward);
+                forward.push(byte);
+            }
+        }
+
+        FilteredInput {
+            forward,
+            detach: false,
+        }
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(usize::from(self.pending));
+        self.flush_into(&mut bytes);
+        bytes
+    }
+
+    fn flush_into(&mut self, bytes: &mut Vec<u8>) {
+        bytes.extend(std::iter::repeat_n(DETACH_BYTE, usize::from(self.pending)));
+        self.reset();
+    }
+
+    fn reset(&mut self) {
+        self.started_at = None;
+        self.pending = 0;
+    }
+}
+
+async fn wait_for_detach_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 pub(crate) fn inherited_terminal_size() -> Result<SessionSize, SessionError> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -53,6 +130,7 @@ fn parse_dimension(value: &str) -> Option<u16> {
 /// Forward the caller's terminal byte-for-byte to an application session.
 pub(crate) async fn run_inherited_terminal(
     mut handle: TerminalSessionHandle,
+    show_detach_notice: bool,
 ) -> Result<i32, SessionError> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -79,9 +157,13 @@ pub(crate) async fn run_inherited_terminal(
     let mut input_buffer = [0u8; 4096];
     let mut resize = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         .map_err(|error| SessionError::new(format!("watch terminal size: {error}")))?;
+    if let Some(notice) = detach_notice(show_detach_notice) {
+        eprintln!("{notice}");
+    }
     let raw_mode = RawModeGuard::enter()?;
     let mut lifecycle = Box::pin(handle.wait());
     let mut completed = None;
+    let mut detach_sequence = DetachSequence::default();
     let state = loop {
         if let Some(state) = completed.take() {
             while let Some(chunk) = output.recv().await {
@@ -95,14 +177,32 @@ pub(crate) async fn run_inherited_terminal(
                 .map_err(|error| SessionError::new(format!("flush terminal output: {error}")))?;
             break state;
         }
+        let detach_deadline = detach_sequence.deadline();
         tokio::select! {
             read = stdin.read(&mut input_buffer) => {
                 let read = read.map_err(|error| SessionError::new(format!("read terminal input: {error}")))?;
                 if read == 0 {
                     break SessionLifecycle::Closed;
                 }
-                if input.send_input(input_buffer[..read].to_vec()).await == SessionSendStatus::Closed {
+                let filtered = detach_sequence.filter(
+                    &input_buffer[..read],
+                    tokio::time::Instant::now(),
+                );
+                if !filtered.forward.is_empty()
+                    && input.send_input(filtered.forward).await == SessionSendStatus::Closed
+                {
                     break lifecycle.await;
+                }
+                if filtered.detach {
+                    stdout
+                        .write_all(b"\r\n")
+                        .await
+                        .map_err(|error| SessionError::new(format!("write detach newline: {error}")))?;
+                    stdout
+                        .flush()
+                        .await
+                        .map_err(|error| SessionError::new(format!("flush detach newline: {error}")))?;
+                    break SessionLifecycle::Closed;
                 }
             }
             chunk = output.recv() => {
@@ -118,6 +218,14 @@ pub(crate) async fn run_inherited_terminal(
                             .map_err(|error| SessionError::new(format!("flush terminal output: {error}")))?;
                     }
                     None => break lifecycle.await,
+                }
+            }
+            _ = wait_for_detach_deadline(detach_deadline) => {
+                let bytes = detach_sequence.flush();
+                if !bytes.is_empty()
+                    && input.send_input(bytes).await == SessionSendStatus::Closed
+                {
+                    break lifecycle.await;
                 }
             }
             _ = resize.recv() => {
@@ -204,6 +312,10 @@ fn terminal_exit_code(state: SessionLifecycle) -> Result<i32, SessionError> {
     }
 }
 
+fn detach_notice(show: bool) -> Option<&'static str> {
+    show.then_some(DETACH_NOTICE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +348,76 @@ mod tests {
         assert_eq!(parse_dimension("0"), None);
         assert_eq!(parse_dimension("65536"), None);
         assert_eq!(parse_dimension("24"), Some(24));
+    }
+
+    #[test]
+    fn detach_sequence_is_consumed_across_input_chunks() {
+        let started = tokio::time::Instant::now();
+        let mut sequence = DetachSequence::default();
+
+        assert_eq!(
+            sequence.filter(&[DETACH_BYTE], started),
+            FilteredInput {
+                forward: vec![],
+                detach: false,
+            }
+        );
+        assert_eq!(
+            sequence.filter(
+                &[DETACH_BYTE, DETACH_BYTE],
+                started + Duration::from_millis(500)
+            ),
+            FilteredInput {
+                forward: vec![],
+                detach: true,
+            }
+        );
+        assert_eq!(sequence.deadline(), None);
+    }
+
+    #[test]
+    fn interrupted_detach_sequence_is_forwarded_byte_for_byte() {
+        let started = tokio::time::Instant::now();
+        let mut sequence = DetachSequence::default();
+
+        assert!(sequence.filter(&[DETACH_BYTE], started).forward.is_empty());
+        assert_eq!(
+            sequence.filter(b"x", started + Duration::from_millis(100)),
+            FilteredInput {
+                forward: vec![DETACH_BYTE, b'x'],
+                detach: false,
+            }
+        );
+    }
+
+    #[test]
+    fn expired_detach_sequence_starts_a_new_window() {
+        let started = tokio::time::Instant::now();
+        let mut sequence = DetachSequence::default();
+
+        assert!(sequence
+            .filter(&[DETACH_BYTE, DETACH_BYTE], started)
+            .forward
+            .is_empty());
+        assert_eq!(
+            sequence.filter(
+                &[DETACH_BYTE],
+                started + DETACH_WINDOW + Duration::from_nanos(1)
+            ),
+            FilteredInput {
+                forward: vec![DETACH_BYTE, DETACH_BYTE],
+                detach: false,
+            }
+        );
+        assert_eq!(sequence.flush(), vec![DETACH_BYTE]);
+    }
+
+    #[test]
+    fn detach_notice_respects_visibility_and_matches_the_cli_status_style() {
+        assert_eq!(
+            detach_notice(true),
+            Some("🪐 Press Ctrl+] three times within 1s to detach...")
+        );
+        assert_eq!(detach_notice(false), None);
     }
 }
