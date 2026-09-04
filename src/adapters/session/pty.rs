@@ -81,20 +81,20 @@ pub(crate) fn spawn_fd_terminal(
     Ok((handle, RemoteSessionControl { close, lifecycle }))
 }
 
-/// Attach a machined-owned PTY. There is no child process for Lasper to wait
+/// Attach a systemd-owned machine PTY. There is no child process for Lasper to wait
 /// on, so PTY EOF is the terminal lifecycle boundary.
-pub(crate) fn spawn_machine1_terminal(
+pub(crate) fn spawn_machine_terminal(
     master: OwnedFd,
     id: SessionId,
     size: SessionSize,
 ) -> Result<TerminalSessionHandle, SessionError> {
     set_fd_size(master.as_raw_fd(), size).map_err(|error| {
-        SessionError::new(format!("set initial machine1 terminal size: {error}"))
+        SessionError::new(format!("set initial machine terminal size: {error}"))
     })?;
     let reader = std::fs::File::from(
         master
             .try_clone()
-            .map_err(|error| SessionError::new(format!("clone machine1 terminal fd: {error}")))?,
+            .map_err(|error| SessionError::new(format!("clone machine terminal fd: {error}")))?,
     );
     let writer = std::fs::File::from(master);
     let (handle, endpoint) = terminal_session_channel(id, TerminalAttachmentKind::Login);
@@ -106,7 +106,7 @@ pub(crate) fn spawn_machine1_terminal(
         close,
     } = endpoint;
 
-    spawn_machine1_reader(reader, output, lifecycle.clone());
+    spawn_machine_reader(reader, output, lifecycle.clone());
     spawn_fd_writer(writer, commands, resize_failed);
     tokio::spawn(async move {
         if close.await.is_ok() && lifecycle.borrow().is_running() {
@@ -154,7 +154,7 @@ fn spawn_reader(
     });
 }
 
-fn spawn_machine1_reader(
+fn spawn_machine_reader(
     mut reader: std::fs::File,
     output: tokio::sync::mpsc::Sender<Vec<u8>>,
     lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
@@ -189,7 +189,7 @@ fn spawn_machine1_reader(
                 Err(error) => {
                     if lifecycle.borrow().is_running() {
                         let _ = lifecycle.send(SessionLifecycle::Failed(format!(
-                            "machine1 terminal output failed: {error}"
+                            "machine terminal output failed: {error}"
                         )));
                     }
                     return;

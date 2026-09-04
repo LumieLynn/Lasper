@@ -108,7 +108,7 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
         }
     };
     let uses_wayland = !matches!(&wayland, WaylandShellRequest::Disabled);
-    let size = match crate::adapters::session::terminal_attach::inherited_terminal_size() {
+    let size = match crate::adapters::session::terminal_io::inherited_terminal_size() {
         Ok(size) => size,
         Err(error) => {
             report_shell_error("cannot attach the interactive terminal", &error);
@@ -137,7 +137,7 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
         }
     };
 
-    match crate::adapters::session::terminal_attach::run_inherited_terminal(handle).await {
+    match crate::adapters::session::terminal_io::run_inherited_terminal(handle).await {
         Ok(code) => code,
         Err(error) => {
             report_shell_error("interactive shell failed", &error);

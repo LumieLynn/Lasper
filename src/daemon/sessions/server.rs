@@ -151,35 +151,17 @@ pub(crate) async fn spawn_terminal(
                     return;
                 }
             };
-            let request = crate::adapters::runtime::machine1::Machine1OpenRequest::shell(
-                crate::adapters::runtime::machine1::Machine1ShellRequest::new(
-                    name.clone(),
-                    user,
-                    environment,
-                ),
+            let request = crate::adapters::session::MachineSessionRequest::shell(
+                crate::adapters::session::MachineShellRequest::new(name.clone(), user, environment),
             );
-            if machine.uses_dbus() {
-                match machine.open_dbus(request).await {
-                    Ok(Some(pty)) => {
-                        send_machine1_terminal(&stream, pty.master);
-                    }
-                    Ok(None) => {
-                        send_session_error(
-                            &stream,
-                            "selected-user shell failed",
-                            &"D-Bus session transport disappeared",
-                        );
-                    }
-                    Err(error) => {
-                        send_session_error(&stream, "selected-user shell failed", &error);
-                    }
+            match machine.open(request).await {
+                Ok(crate::adapters::session::MachineSessionOpening::Dbus(master)) => {
+                    send_machine_terminal(&stream, master);
+                    return;
                 }
-                return;
-            }
-            match crate::adapters::session::terminal_attach::machine1(request) {
-                Ok(command) => command,
+                Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
                 Err(error) => {
-                    send_session_error(&stream, "machinectl shell planning failed", &error);
+                    send_session_error(&stream, "selected-user shell failed", &error);
                     return;
                 }
             }
@@ -319,14 +301,14 @@ fn spawn_process_terminal(
     }
 }
 
-fn send_machine1_terminal(stream: &std::os::unix::net::UnixStream, master: OwnedFd) {
+fn send_machine_terminal(stream: &std::os::unix::net::UnixStream, master: OwnedFd) {
     let response = serde_json::to_vec(&SpawnTerminalResponse {
         attach_kind: WireTerminalAttachmentKind::Login,
         lifecycle: WireTerminalLifecycleSource::PtyEof,
     })
     .expect("terminal response is serializable");
     if let Err(error) = stream.send_with_fd(&response, &[master.as_raw_fd()]) {
-        log::error!("Daemon: send_with_fd (machine1 terminal) failed: {error}");
+        log::error!("Daemon: send_with_fd (machine terminal) failed: {error}");
     }
 }
 

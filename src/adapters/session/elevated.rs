@@ -58,7 +58,7 @@ impl SessionPort for ElevatedSessionAdapter {
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
         let Some(lifecycle) = spawned.lifecycle else {
             let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(spawned.master_fd) };
-            return crate::adapters::session::pty::spawn_machine1_terminal(master, id, size);
+            return crate::adapters::session::pty::spawn_machine_terminal(master, id, size);
         };
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,

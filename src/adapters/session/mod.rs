@@ -1,8 +1,17 @@
+//! Session adapter graph.
+//!
+//! `wayland` owns validation/orchestration, `wayland_probe` owns the fixed
+//! probe protocol, and `machine` is the route-fixed boundary.  The latter
+//! produces either a native D-Bus PTY (`runtime::dbus`) or a `machinectl`
+//! command (`runtime::cli`).  `terminal_attach` is only the default
+//! login/namespace selector; `terminal_io` owns the foreground CLI bridge.
+
 mod direct;
 mod elevated;
 mod machine;
 mod pty;
 pub(crate) mod terminal_attach;
+pub(crate) mod terminal_io;
 mod wayland;
 mod wayland_probe;
 
@@ -11,8 +20,12 @@ use std::sync::Arc;
 
 pub(crate) use direct::{DirectSessionAdapter, DirectTerminalPolicy};
 pub(crate) use elevated::ElevatedSessionAdapter;
-pub(crate) use machine::MachineSessionTransport;
+pub(crate) use machine::{
+    MachineSessionOpening, MachineSessionRequest, MachineSessionTransport, MachineShellEnvironment,
+    MachineShellRequest,
+};
 pub(crate) use wayland::WaylandSessionResolver;
+pub(crate) use wayland_probe::WaylandProbeRequest;
 
 pub(crate) enum SessionRoute {
     Direct {

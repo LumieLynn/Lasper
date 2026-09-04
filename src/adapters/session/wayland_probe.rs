@@ -1,10 +1,150 @@
-use crate::application::sessions::{ObservedGuestIdentity, SessionError, TerminalSessionHandle};
+//! The fixed Wayland identity/access probe.
+//!
+//! This module owns both halves of the probe contract: the closed request
+//! which a session transport has to execute and the bounded protocol parser
+//! which consumes its output.  Neither half knows whether the request is
+//! carried by machine1 D-Bus or by `machinectl`.
+
+use crate::application::sessions::{
+    ObservedGuestIdentity, SessionError, TerminalSessionHandle, ValidatedGuestUserName,
+};
+use crate::domain::machine::MachineName;
+use std::path::{Component, Path};
 use std::time::Duration;
 
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
 const MAX_PROBE_OUTPUT_BYTES: usize = 8 * 1024;
 const MAX_PROBE_LINE_BYTES: usize = 1024;
 const PROBE_MAGIC: &[u8] = b"LASPER_WAYLAND_PROBE_V1";
+const MAX_TARGET_PATH_BYTES: usize = 4096;
+
+const WAYLAND_PROBE_SCRIPT: &str = r#"euid=
+egid=
+while read -r key _real effective _rest; do
+    case "$key" in
+        Uid:) euid=$effective ;;
+        Gid:) egid=$effective ;;
+    esac
+done < /proc/self/status
+target=UNCHECKED
+if [ "$#" -gt 0 ]; then
+    if [ ! -e "$1" ]; then
+        target=MISSING
+    elif [ ! -S "$1" ]; then
+        target=NOT_SOCKET
+    elif [ ! -w "$1" ]; then
+        target=DENIED
+    else
+        target=ACCESSIBLE
+    fi
+fi
+printf '%s\n' \
+    'LASPER_WAYLAND_PROBE_V1' \
+    "EUID=$euid" \
+    "EGID=$egid" \
+    "TARGET=$target" \
+    'RESULT=READY'
+"#;
+
+/// The only two probe forms understood by the session transports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum WaylandProbeTarget {
+    IdentityOnly,
+    GuestSocket(String),
+}
+
+/// A transport-neutral request for Lasper's fixed Wayland probe.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WaylandProbeRequest {
+    machine: MachineName,
+    user: ValidatedGuestUserName,
+    target: WaylandProbeTarget,
+}
+
+impl WaylandProbeRequest {
+    pub(crate) fn identity(machine: MachineName, user: ValidatedGuestUserName) -> Self {
+        Self {
+            machine,
+            user,
+            target: WaylandProbeTarget::IdentityOnly,
+        }
+    }
+
+    pub(crate) fn target(
+        machine: MachineName,
+        user: ValidatedGuestUserName,
+        target: &Path,
+    ) -> Result<Self, WaylandProbeRequestError> {
+        Ok(Self {
+            machine,
+            user,
+            target: WaylandProbeTarget::GuestSocket(validate_absolute_path(target)?),
+        })
+    }
+
+    pub(crate) fn machine(&self) -> &MachineName {
+        &self.machine
+    }
+
+    pub(crate) fn user(&self) -> &ValidatedGuestUserName {
+        &self.user
+    }
+
+    /// The fixed executable passed to machine1's `OpenMachineShell` call.
+    pub(crate) fn path(&self) -> &'static str {
+        "/bin/sh"
+    }
+
+    /// The fixed argv, including the optional validated target as `$1`.
+    pub(crate) fn args(&self) -> Vec<String> {
+        let mut args = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            WAYLAND_PROBE_SCRIPT.into(),
+            "lasper-wayland-probe".into(),
+        ];
+        if let WaylandProbeTarget::GuestSocket(target) = &self.target {
+            args.push(target.clone());
+        }
+        args
+    }
+}
+
+fn validate_absolute_path(path: &Path) -> Result<String, WaylandProbeRequestError> {
+    if !path.is_absolute() {
+        return Err(WaylandProbeRequestError::NotAbsolute);
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(WaylandProbeRequestError::RelativeComponent);
+    }
+    let value = path.to_str().ok_or(WaylandProbeRequestError::NonUtf8)?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(WaylandProbeRequestError::InvalidValue);
+    }
+    if value.len() > MAX_TARGET_PATH_BYTES {
+        return Err(WaylandProbeRequestError::TooLong {
+            maximum: MAX_TARGET_PATH_BYTES,
+        });
+    }
+    Ok(value.to_owned())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum WaylandProbeRequestError {
+    #[error("Wayland probe target must be an absolute path")]
+    NotAbsolute,
+    #[error("Wayland probe target must not contain relative path components")]
+    RelativeComponent,
+    #[error("Wayland probe target is not valid UTF-8")]
+    NonUtf8,
+    #[error("Wayland probe target contains an empty or control-character value")]
+    InvalidValue,
+    #[error("Wayland probe target exceeds the {maximum}-byte path limit")]
+    TooLong { maximum: usize },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaylandTargetAccess {
@@ -188,6 +328,41 @@ fn parse_u32(value: &[u8], field: &str) -> Result<u32, SessionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn machine() -> MachineName {
+        MachineName::new("demo").unwrap()
+    }
+
+    fn user() -> ValidatedGuestUserName {
+        ValidatedGuestUserName::new("alice").unwrap()
+    }
+
+    #[test]
+    fn request_has_a_fixed_invocation_and_bounded_target_argument() {
+        let identity = WaylandProbeRequest::identity(machine(), user());
+        assert_eq!(identity.path(), "/bin/sh");
+        assert_eq!(identity.args().len(), 4);
+        assert_eq!(&identity.args()[..2], ["/bin/sh", "-c"]);
+        assert!(identity.args()[2].contains("/proc/self/status"));
+
+        let target = WaylandProbeRequest::target(
+            machine(),
+            user(),
+            Path::new("/run/lasper/wayland/1000/wayland-0"),
+        )
+        .unwrap();
+        assert_eq!(
+            target.args().last().map(String::as_str),
+            Some("/run/lasper/wayland/1000/wayland-0")
+        );
+    }
+
+    #[test]
+    fn target_rejects_relative_components_and_control_values() {
+        for path in ["wayland-0", "/run/../tmp/socket", "/run/socket\n"] {
+            assert!(WaylandProbeRequest::target(machine(), user(), Path::new(path)).is_err());
+        }
+    }
 
     #[test]
     fn parses_identity_and_target_after_bounded_pam_noise() {

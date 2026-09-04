@@ -1,11 +1,12 @@
 //! Runtime validation for a Wayland bind that was declared before container
 //! startup. This module never creates or removes mounts.
 
+use super::wayland_probe::WaylandProbeRequest;
 use super::wayland_probe::{WaylandProbeObservation, WaylandTargetAccess};
-use crate::adapters::config::NspawnConfigStore;
-use crate::adapters::runtime::machine1::{
-    Machine1Environment, Machine1OpenRequest, Machine1WaylandProbeRequest,
+use super::{
+    MachineSessionRequest, MachineSessionTransport, MachineShellEnvironment, MachineShellRequest,
 };
+use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
     SessionError, TerminalSessionHandle, TypedSessionEnvironment, ValidatedGuestUserName,
     WaylandPreparationRequest, WaylandSessionContext,
@@ -15,13 +16,13 @@ use crate::domain::session::{SessionId, SessionSize};
 
 #[derive(Clone)]
 pub(crate) struct WaylandSessionResolver {
-    machine: super::MachineSessionTransport,
+    machine: MachineSessionTransport,
     nspawn: NspawnConfigStore,
     authorized_uid: u32,
 }
 
 impl WaylandSessionResolver {
-    pub(crate) fn new(machine: super::MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
+    pub(crate) fn new(machine: MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
         Self::for_authorized_uid(
             machine,
             nspawn,
@@ -30,7 +31,7 @@ impl WaylandSessionResolver {
     }
 
     pub(crate) fn for_authorized_uid(
-        machine: super::MachineSessionTransport,
+        machine: MachineSessionTransport,
         nspawn: NspawnConfigStore,
         authorized_uid: u32,
     ) -> Self {
@@ -47,7 +48,7 @@ impl WaylandSessionResolver {
     ) -> Result<WaylandSessionContext, SessionError> {
         let source = revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
 
-        let identity_request = Machine1WaylandProbeRequest::identity(
+        let identity_request = WaylandProbeRequest::identity(
             request.target.machine().clone(),
             request.target.user().clone(),
         );
@@ -85,7 +86,7 @@ impl WaylandSessionResolver {
             return Err(projection_not_configured());
         }
 
-        let access_request = Machine1WaylandProbeRequest::target(
+        let access_request = WaylandProbeRequest::target(
             request.target.machine().clone(),
             request.target.user().clone(),
             &guest_socket,
@@ -147,7 +148,7 @@ impl WaylandSessionResolver {
     pub(crate) async fn environment(
         &self,
         environment: &TypedSessionEnvironment,
-    ) -> Result<Machine1Environment, SessionError> {
+    ) -> Result<MachineShellEnvironment, SessionError> {
         let display = match environment.wayland_context() {
             Some(context) => {
                 revalidate_host_socket(context.host_socket(), self.authorized_uid).await?;
@@ -155,7 +156,7 @@ impl WaylandSessionResolver {
             }
             None => None,
         };
-        Machine1Environment::shell(environment.terminal_environment().clone(), display).map_err(
+        MachineShellEnvironment::shell(environment.terminal_environment().clone(), display).map_err(
             |error| SessionError::new(format!("build selected-user shell environment: {error}")),
         )
     }
@@ -168,14 +169,10 @@ impl WaylandSessionResolver {
         environment: TypedSessionEnvironment,
         size: SessionSize,
     ) -> Result<TerminalSessionHandle, SessionError> {
-        let machine1_environment = self.environment(&environment).await?;
-        let request = crate::adapters::runtime::machine1::Machine1ShellRequest::new(
-            machine,
-            user,
-            machine1_environment,
-        );
+        let shell_environment = self.environment(&environment).await?;
+        let request = MachineShellRequest::new(machine, user, shell_environment);
         self.machine
-            .open_local(Machine1OpenRequest::shell(request), id, size)
+            .open_local(MachineSessionRequest::shell(request), id, size)
             .await
     }
 }
@@ -190,14 +187,14 @@ async fn revalidate_host_socket(
 }
 
 async fn run_probe(
-    machine: &super::MachineSessionTransport,
-    request: Machine1WaylandProbeRequest,
+    machine: &MachineSessionTransport,
+    request: WaylandProbeRequest,
     id: SessionId,
     phase: &'static str,
 ) -> Result<WaylandProbeObservation, SessionError> {
     let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
     let mut handle: TerminalSessionHandle = machine
-        .open_local(Machine1OpenRequest::wayland_probe(request), id, size)
+        .open_local(MachineSessionRequest::wayland_probe(request), id, size)
         .await?;
     super::wayland_probe::collect_wayland_probe(&mut handle)
         .await

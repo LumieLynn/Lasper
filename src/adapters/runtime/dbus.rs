@@ -2,11 +2,10 @@
 
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
-use crate::adapters::runtime::machine1::{
-    Machine1OpenRequest, Machine1Pty, Machine1ShellRequest, Machine1WaylandProbeRequest,
-};
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::session::MachineSessionRequest;
 use crate::application::image_lifecycle::ImageControlOutcome;
+use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
@@ -16,6 +15,7 @@ use crate::domain::runtime::{
 };
 use std::collections::HashMap;
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -251,21 +251,18 @@ impl DbusBackend {
         }
     }
 
-    /// Open a selected-user shell or Lasper's fixed projection probe.
-    pub(crate) async fn open_machine_session(
-        &self,
-        request: Machine1OpenRequest,
-    ) -> Result<Machine1Pty> {
-        match request {
-            Machine1OpenRequest::Shell(request) => self.open_machine_shell(&request).await,
-            Machine1OpenRequest::WaylandProbe(request) => self.open_wayland_probe(&request).await,
-        }
-    }
-
+    /// Call machine1's `OpenMachineShell` method for a session adapter.
+    ///
+    /// The session layer owns the closed shell/probe request set; this method
+    /// owns only the native D-Bus signature and timeout/error mapping.
     pub(crate) async fn open_machine_shell(
         &self,
-        request: &Machine1ShellRequest,
-    ) -> Result<Machine1Pty> {
+        machine: &MachineName,
+        user: &ValidatedGuestUserName,
+        path: &str,
+        args: Vec<String>,
+        environment: Vec<String>,
+    ) -> Result<OwnedFd> {
         let (generation, proxy) = self
             .manager_proxy()
             .await
@@ -274,40 +271,41 @@ impl DbusBackend {
             .mutation_with_deadline(
                 generation,
                 "OpenMachineShell",
-                proxy.open_machine_shell(
-                    request.machine().as_str(),
-                    request.user().as_str(),
+                proxy.open_machine_shell(machine.as_str(), user.as_str(), path, args, environment),
+            )
+            .await?;
+        Ok(fd.into())
+    }
+
+    /// Execute a closed machine-session request through machine1.  Request
+    /// construction stays in the session layer; the native D-Bus call and
+    /// its descriptor/error mapping stay here with the runtime adapter.
+    pub(crate) async fn open_machine_session(
+        &self,
+        request: MachineSessionRequest,
+    ) -> Result<OwnedFd> {
+        match request {
+            MachineSessionRequest::Shell(request) => {
+                self.open_machine_shell(
+                    request.machine(),
+                    request.user(),
                     "",
                     Vec::new(),
                     request.environment().assignments(),
-                ),
-            )
-            .await?;
-        Ok(Machine1Pty { master: fd.into() })
-    }
-
-    async fn open_wayland_probe(
-        &self,
-        request: &Machine1WaylandProbeRequest,
-    ) -> Result<Machine1Pty> {
-        let (generation, proxy) = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let (fd, _path) = self
-            .mutation_with_deadline(
-                generation,
-                "OpenMachineShell Wayland projection probe",
-                proxy.open_machine_shell(
-                    request.machine().as_str(),
-                    request.user().as_str(),
+                )
+                .await
+            }
+            MachineSessionRequest::WaylandProbe(request) => {
+                self.open_machine_shell(
+                    request.machine(),
+                    request.user(),
                     request.path(),
                     request.args(),
                     Vec::new(),
-                ),
-            )
-            .await?;
-        Ok(Machine1Pty { master: fd.into() })
+                )
+                .await
+            }
+        }
     }
 
     /// Call a method on `org.freedesktop.systemd1.Manager` with

@@ -287,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_fd_receiver_accepts_a_machine1_pty_without_status_pipe() {
+    fn terminal_fd_receiver_accepts_a_systemd_owned_pty_without_status_pipe() {
         let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let (master, _writer) = pipe();
         let response = serde_json::to_vec(&SpawnTerminalResponse {
