@@ -35,6 +35,41 @@ pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
     .await
 }
 
+/// Resolve only the display inherited by this process. The picker can still
+/// discover other displays independently.
+pub(crate) async fn current_wayland_socket() -> Result<Option<HostWaylandSocket>> {
+    current_wayland_socket_from(
+        invoking_uid(),
+        std::env::var_os("XDG_RUNTIME_DIR"),
+        std::env::var_os("WAYLAND_DISPLAY"),
+    )
+    .await
+}
+
+async fn current_wayland_socket_from(
+    uid: u32,
+    runtime: Option<std::ffi::OsString>,
+    display: Option<std::ffi::OsString>,
+) -> Result<Option<HostWaylandSocket>> {
+    let Some(display) = display.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(display);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        let name = path
+            .to_str()
+            .ok_or_else(|| NspawnError::Validation("WAYLAND_DISPLAY is not valid UTF-8".into()))?;
+        WaylandDisplay::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
+        let runtime = runtime.filter(|value| !value.is_empty()).ok_or_else(|| {
+            NspawnError::Validation("relative WAYLAND_DISPLAY requires XDG_RUNTIME_DIR".into())
+        })?;
+        PathBuf::from(runtime).join(path)
+    };
+    discover_absolute_wayland_socket(&path, uid).await.map(Some)
+}
+
 async fn discover_wayland_sockets_from(
     session_uid: u32,
     xdg_runtime: Option<std::ffi::OsString>,
@@ -270,6 +305,59 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
+
+    #[tokio::test]
+    async fn automatic_display_requires_environment_and_does_not_select_another_socket() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let _first = UnixListener::bind(runtime.path().join("wayland-0")).unwrap();
+        let _selected = UnixListener::bind(runtime.path().join("wayland-1")).unwrap();
+        let uid = uzers::get_current_uid();
+        let runtime_env = Some(runtime.path().as_os_str().to_os_string());
+        for display in [None, Some("".into())] {
+            assert!(
+                current_wayland_socket_from(uid, runtime_env.clone(), display)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let selected =
+            current_wayland_socket_from(uid, runtime_env.clone(), Some("wayland-1".into()))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(selected.canonical_path(), runtime.path().join("wayland-1"));
+        assert!(
+            current_wayland_socket_from(uid, runtime_env, Some("wayland-2".into()))
+                .await
+                .is_err()
+        );
+        assert!(
+            current_wayland_socket_from(uid, None, Some("wayland-1".into()))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_display_accepts_absolute_custom_socket_and_source_alias() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let source = runtime.path().join("compositor.sock");
+        let _listener = UnixListener::bind(&source).unwrap();
+        let alias = runtime.path().join("wayland-1");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let selected = current_wayland_socket_from(
+            uzers::get_current_uid(),
+            None,
+            Some(alias.into_os_string()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(selected.canonical_path(), source);
+    }
 
     #[test]
     fn xdg_runtime_precedes_uid_runtime_fallback() {

@@ -35,6 +35,13 @@ impl DirectSessionAdapter {
 
 #[async_trait]
 impl SessionPort for DirectSessionAdapter {
+    async fn automatic_wayland(
+        &self,
+        machine: &crate::domain::machine::MachineName,
+    ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+        self.wayland.automatic_wayland(machine).await
+    }
+
     async fn discover_host_wayland_sockets(
         &self,
     ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
@@ -61,9 +68,8 @@ impl SessionPort for DirectSessionAdapter {
                     .open_selected_user_shell(id, machine, user, *environment, command, size)
                     .await
             }
-            // User mode keeps the native machine1 login prompt on the chosen
-            // D-Bus/CLI route; root mode retains its existing namespace-aware
-            // attachment policy for the legacy direct path.
+            // Root may attach by namespace when the guest has no bus. Native
+            // login prompts otherwise use the selected D-Bus/CLI route.
             TerminalLaunch::LoginPrompt => match self.terminal_policy {
                 DirectTerminalPolicy::LoginOnly => {
                     self.wayland.open_login_prompt(id, machine, size).await
@@ -74,6 +80,9 @@ impl SessionPort for DirectSessionAdapter {
                             SessionError::new(format!("plan terminal attachment: {error}"))
                         })?;
                     let kind = attachment.kind();
+                    if kind != crate::domain::session::TerminalAttachmentKind::Namespace {
+                        return self.wayland.open_login_prompt(id, machine, size).await;
+                    }
                     let command = attachment.into_pty_command().map_err(|error| {
                         SessionError::new(format!("validate terminal attachment: {error}"))
                     })?;

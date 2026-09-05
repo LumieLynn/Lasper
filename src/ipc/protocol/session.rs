@@ -115,8 +115,7 @@ pub(crate) enum WireTerminalLaunch {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PrepareWaylandParams {
-    pub identity_probe_id: WireSessionId,
-    pub access_probe_id: WireSessionId,
+    pub probe_id: WireSessionId,
     pub machine: MachineName,
     pub user: ValidatedGuestUserName,
     pub host_socket: HostWaylandSocket,
@@ -219,6 +218,7 @@ pub(crate) struct SpawnTerminalResponse {
 pub(crate) enum WireTerminalLifecycleSource {
     DaemonStatus,
     PtyEof,
+    MachineRemoved,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

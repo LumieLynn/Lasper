@@ -548,8 +548,7 @@ pub struct JournalSessionRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaylandPreparationRequest {
-    pub identity_probe_id: SessionId,
-    pub access_probe_id: SessionId,
+    pub probe_id: SessionId,
     pub target: ShellTarget,
     pub host_socket: HostWaylandSocket,
 }
@@ -629,6 +628,11 @@ impl ShellOpenError {
 #[async_trait]
 pub trait SessionPort: Send + Sync + 'static {
     async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket>;
+
+    async fn automatic_wayland(
+        &self,
+        machine: &MachineName,
+    ) -> Result<Option<HostWaylandSocket>, SessionError>;
 
     async fn open_terminal(
         &self,

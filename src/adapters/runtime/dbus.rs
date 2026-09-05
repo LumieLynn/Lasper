@@ -307,8 +307,13 @@ impl DbusBackend {
     pub(crate) async fn open_machine_session(
         &self,
         request: MachineSessionRequest,
-    ) -> Result<OwnedFd> {
-        match request {
+    ) -> Result<crate::adapters::session::MachinePty> {
+        let machine_removed = if let MachineSessionRequest::LoginPrompt(request) = &request {
+            Some(self.watch_login_machine(request.machine()).await?)
+        } else {
+            None
+        };
+        let master = match request {
             MachineSessionRequest::Shell(request) => {
                 let (path, args) = machine_shell_process(&request);
                 self.open_machine_shell(
@@ -333,7 +338,54 @@ impl DbusBackend {
                 )
                 .await
             }
-        }
+        }?;
+        Ok(crate::adapters::session::MachinePty {
+            master,
+            machine_removed,
+        })
+    }
+
+    /// Subscribe before opening the PTY so an intervening machine removal
+    /// cannot leave a login forwarder waiting for a getty forever.
+    async fn watch_login_machine(
+        &self,
+        machine: &MachineName,
+    ) -> Result<tokio::sync::oneshot::Receiver<crate::domain::session::SessionLifecycle>> {
+        use crate::domain::session::SessionLifecycle;
+        use futures_util::StreamExt;
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let mut removed = self
+            .query_with_deadline(
+                generation,
+                "login machine removal subscription",
+                proxy.receive_machine_removed(),
+            )
+            .await?;
+        let machine = machine.clone();
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    event = removed.next() => match event {
+                        Some(event) => {
+                            if event.args().is_ok_and(|args| args.machine() == machine.as_str()) {
+                                let _ = tx.send(SessionLifecycle::Exited { success: true, code: None });
+                                return;
+                            }
+                        }
+                        None => {
+                            let _ = tx.send(SessionLifecycle::Failed("machine removal signal stream closed".into()));
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
 
     /// Call a method on `org.freedesktop.systemd1.Manager` with

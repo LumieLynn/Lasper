@@ -21,8 +21,8 @@ use std::sync::Arc;
 pub(crate) use direct::{DirectSessionAdapter, DirectTerminalPolicy};
 pub(crate) use elevated::ElevatedSessionAdapter;
 pub(crate) use machine::{
-    MachineSessionOpening, MachineSessionRequest, MachineSessionTransport, MachineShellEnvironment,
-    MachineShellRequest,
+    MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
+    MachineShellEnvironment, MachineShellRequest,
 };
 pub(crate) use wayland::WaylandSessionResolver;
 pub(crate) use wayland_probe::WaylandProbeRequest;

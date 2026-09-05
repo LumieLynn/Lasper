@@ -79,6 +79,7 @@ pub enum MouseProtocolEncoding {
 #[derive(Clone, Debug)]
 pub struct Screen {
     feed_buf: Vec<u8>,
+    suppress_initial_line_breaks: bool,
 
     grid: super::grid::Grid,
     alternate_grid: super::grid::Grid,
@@ -117,6 +118,7 @@ impl Screen {
         let grid = super::grid::Grid::new(size, scrollback_len);
         Self {
             feed_buf: Vec::new(),
+            suppress_initial_line_breaks: false,
 
             grid,
             alternate_grid: super::grid::Grid::new(size, 0),
@@ -147,6 +149,10 @@ impl Screen {
             height: rows,
             width: cols,
         });
+    }
+
+    pub(crate) fn suppress_initial_line_breaks(&mut self) {
+        self.suppress_initial_line_breaks = true;
     }
 
     /// Returns the current size of the terminal.
@@ -311,6 +317,7 @@ impl Screen {
 
 impl Screen {
     fn text(&mut self, c: char) {
+        self.suppress_initial_line_breaks = false;
         let pos = self.grid().pos();
         let size = self.grid().size();
         let attrs: super::attrs::Attrs = self.attrs;
@@ -640,7 +647,10 @@ impl Screen {
                 }
                 0x0A => {
                     // LF - Line Feed
-                    self.grid_mut().row_inc_scroll(1);
+                    if !self.suppress_initial_line_breaks || self.cursor_position() != (0, 0) {
+                        self.suppress_initial_line_breaks = false;
+                        self.grid_mut().row_inc_scroll(1);
+                    }
                 }
                 0x0B => {
                     // VT - Vertical Tabulation
@@ -1374,6 +1384,21 @@ mod tests {
 
     fn screen_with_size(width: u16, height: u16) -> Screen {
         Screen::new(Size { width, height }, 32)
+    }
+
+    #[test]
+    fn embedded_startup_skips_initial_line_breaks_but_default_screen_does_not() {
+        let mut screen = screen_with_size(80, 24);
+        screen.suppress_initial_line_breaks();
+        let mut events = Vec::new();
+        screen.process(b"\x1b[0m\r\n\r\nlogin: ", &mut events);
+        assert_eq!(screen.cell(0, 0).unwrap().contents(), "l");
+        screen.process(b"\r\n\r\nnext", &mut events);
+        assert_eq!(screen.cell(2, 0).unwrap().contents(), "n");
+
+        let mut regular = screen_with_size(80, 24);
+        regular.process(b"\r\nlogin: ", &mut events);
+        assert_eq!(regular.cell(1, 0).unwrap().contents(), "l");
     }
 
     #[test]

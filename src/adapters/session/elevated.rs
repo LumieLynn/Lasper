@@ -23,6 +23,17 @@ impl ElevatedSessionAdapter {
 
 #[async_trait]
 impl SessionPort for ElevatedSessionAdapter {
+    async fn automatic_wayland(
+        &self,
+        machine: &crate::domain::machine::MachineName,
+    ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+        super::wayland::automatic_wayland(
+            &crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(&self.daemon)),
+            machine,
+        )
+        .await
+    }
+
     async fn discover_host_wayland_sockets(
         &self,
     ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
@@ -61,7 +72,14 @@ impl SessionPort for ElevatedSessionAdapter {
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
         let Some(lifecycle) = spawned.lifecycle else {
             let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(spawned.master_fd) };
-            return crate::adapters::session::pty::spawn_machine_terminal(master, id, size);
+            return crate::adapters::session::pty::spawn_machine_terminal(
+                super::MachinePty {
+                    master,
+                    machine_removed: spawned.machine_removed,
+                },
+                id,
+                size,
+            );
         };
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,

@@ -64,14 +64,8 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
             );
             let result = resolver
                 .prepare(crate::application::sessions::WaylandPreparationRequest {
-                    identity_probe_id: crate::domain::session::SessionId::new(
-                        params.identity_probe_id.get(),
-                    )
-                    .expect("wire session id is non-zero"),
-                    access_probe_id: crate::domain::session::SessionId::new(
-                        params.access_probe_id.get(),
-                    )
-                    .expect("wire session id is non-zero"),
+                    probe_id: crate::domain::session::SessionId::new(params.probe_id.get())
+                        .expect("wire session id is non-zero"),
                     target: crate::application::sessions::ShellTarget::new(
                         params.machine,
                         params.user,

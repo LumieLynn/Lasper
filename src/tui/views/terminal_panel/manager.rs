@@ -253,6 +253,7 @@ impl TerminalManager {
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
             rows, 80, 10000,
         )));
+        terminal.lock().screen.suppress_initial_line_breaks();
         let service = Arc::clone(&self.session_service);
         tokio::spawn(run_builtin_shell_prompt(endpoint, service, machine, size));
         let output_task = spawn_output_parser(
@@ -358,11 +359,12 @@ impl TerminalManager {
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
             rows, cols, 10000,
         )));
+        terminal.lock().screen.suppress_initial_line_breaks();
         if wayland_fallback {
             let mut parser = terminal.lock();
             let mut events = Vec::new();
             parser.screen.process(
-                format!("\r\n{WAYLAND_FALLBACK_NOTICE}\r\n").as_bytes(),
+                format!("{WAYLAND_FALLBACK_NOTICE}\r\n").as_bytes(),
                 &mut events,
             );
         }
@@ -753,7 +755,7 @@ async fn run_builtin_shell_prompt(
         ..
     } = endpoint;
     let mut close = close;
-    let prompt = format!("\r\nlasper shell {} user: ", machine);
+    let prompt = format!("lasper shell {} user: ", machine);
     if send_prompt_output(&output, prompt.clone().into_bytes())
         .await
         .is_err()
@@ -882,13 +884,10 @@ async fn open_builtin_shell(
     user: ValidatedGuestUserName,
     size: SessionSize,
 ) -> Result<(TerminalSessionHandle, bool), String> {
-    let wayland = service
-        .discover_host_wayland_sockets()
-        .await
-        .into_iter()
-        .next()
-        .map(WaylandShellRequest::SelectedHostDisplay)
-        .unwrap_or(WaylandShellRequest::Disabled);
+    let (wayland, selection_failure) = match service.automatic_wayland(&machine).await {
+        Ok(wayland) => (wayland, None),
+        Err(error) => (WaylandShellRequest::Disabled, Some(error)),
+    };
     let intent = ShellOpenIntent::new(
         ShellTarget::new(machine, user),
         wayland.clone(),
@@ -896,7 +895,7 @@ async fn open_builtin_shell(
         size,
     );
     match service.open_shell(intent.clone()).await {
-        Ok(handle) => Ok((handle, false)),
+        Ok(handle) => Ok((handle, selection_failure.is_some())),
         Err(ShellOpenError::WaylandPreparation(error)) if wayland.host_socket().is_some() => {
             service
                 .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
@@ -908,7 +907,12 @@ async fn open_builtin_shell(
                 )
                 })
         }
-        Err(error) => Err(error.to_string()),
+        Err(error) => match selection_failure {
+            Some(selection) => Err(format!(
+                "Wayland selection failed: {selection}; terminal-only fallback failed: {error}"
+            )),
+            None => Err(error.to_string()),
+        },
     }
 }
 

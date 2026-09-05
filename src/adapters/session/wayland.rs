@@ -48,27 +48,6 @@ impl WaylandSessionResolver {
     ) -> Result<WaylandSessionContext, SessionError> {
         let source = revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
 
-        let identity_request = WaylandProbeRequest::identity(
-            request.target.machine().clone(),
-            request.target.user().clone(),
-        );
-        let identity = run_probe(
-            &self.machine,
-            identity_request,
-            request.identity_probe_id,
-            "identity",
-        )
-        .await?;
-        if identity.target != WaylandTargetAccess::Unchecked {
-            return Err(SessionError::new(
-                "Wayland identity probe returned unexpected target evidence",
-            ));
-        }
-
-        let guest_socket = crate::adapters::wayland::container_socket_path(
-            identity.identity.uid(),
-            request.host_socket.display(),
-        );
         let config = self
             .nspawn
             .inspect(request.target.machine().as_str())
@@ -77,72 +56,40 @@ impl WaylandSessionResolver {
                 SessionError::new(format!("inspect startup Wayland projection: {error}"))
             })?
             .ok_or_else(projection_not_configured)?;
-        if !config
-            .has_wayland_projection(&source, &guest_socket)
+        let targets = config.wayland_targets(&source).await.map_err(|error| {
+            SessionError::new(format!("inspect startup Wayland projection: {error}"))
+        })?;
+        let mut failure = projection_not_configured();
+        for guest_socket in targets {
+            let probe = WaylandProbeRequest::target(
+                request.target.machine().clone(),
+                request.target.user().clone(),
+                &guest_socket,
+            )
             .map_err(|error| {
-                SessionError::new(format!("inspect startup Wayland projection: {error}"))
-            })?
-        {
-            return Err(projection_not_configured());
+                SessionError::new(format!("validate Wayland probe target: {error}"))
+            })?;
+            let access = run_probe(&self.machine, probe, request.probe_id).await?;
+            match validate_target(&access, &request.host_socket, &guest_socket) {
+                Ok(()) => {
+                    revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
+                    return Ok(WaylandSessionContext::verified(
+                        request.host_socket,
+                        guest_socket,
+                        access.identity,
+                    ));
+                }
+                Err(error) => failure = error,
+            }
         }
+        Err(failure)
+    }
 
-        let access_request = WaylandProbeRequest::target(
-            request.target.machine().clone(),
-            request.target.user().clone(),
-            &guest_socket,
-        )
-        .map_err(|error| SessionError::new(format!("validate Wayland probe target: {error}")))?;
-        let access = run_probe(
-            &self.machine,
-            access_request,
-            request.access_probe_id,
-            "access",
-        )
-        .await?;
-        if access.identity != identity.identity {
-            return Err(SessionError::new(
-                "guest identity changed while validating the Wayland projection",
-            ));
-        }
-        match access.target {
-            WaylandTargetAccess::Accessible => {}
-            WaylandTargetAccess::Missing => {
-                return Err(SessionError::with_hint(
-                    format!(
-                        "startup Wayland projection is missing at {}",
-                        guest_socket.display()
-                    ),
-                    "The bind is applied only when the container starts; restart the machine after changing its .nspawn configuration.",
-                ));
-            }
-            WaylandTargetAccess::Denied => {
-                return Err(SessionError::new(format!(
-                    "guest user {} cannot access the projected Wayland socket {}",
-                    request.target.user(),
-                    guest_socket.display()
-                )));
-            }
-            WaylandTargetAccess::NotSocket => {
-                return Err(SessionError::new(format!(
-                    "projected Wayland target is not a socket: {}",
-                    guest_socket.display()
-                )));
-            }
-            WaylandTargetAccess::Unchecked => {
-                return Err(SessionError::new(
-                    "Wayland target probe did not check the projected socket",
-                ));
-            }
-        }
-
-        // Close the host-side replacement race as far as this pathname-based
-        // design allows before handing the context to the terminal opener.
-        revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
-        Ok(WaylandSessionContext::verified(
-            request.host_socket,
-            guest_socket,
-            identity.identity,
-        ))
+    pub(crate) async fn automatic_wayland(
+        &self,
+        machine: &MachineName,
+    ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+        automatic_wayland(&self.nspawn, machine).await
     }
 
     pub(crate) async fn environment(
@@ -193,6 +140,54 @@ impl WaylandSessionResolver {
     }
 }
 
+pub(super) async fn automatic_wayland(
+    nspawn: &NspawnConfigStore,
+    machine: &MachineName,
+) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+    let Some(socket) = crate::adapters::platform::capabilities::current_wayland_socket()
+        .await
+        .map_err(|error| SessionError::new(format!("resolve current Wayland display: {error}")))?
+    else {
+        return Ok(None);
+    };
+    let Some(config) = nspawn.inspect(machine.as_str()).await.map_err(|error| {
+        SessionError::new(format!("inspect startup Wayland projection: {error}"))
+    })?
+    else {
+        return Ok(None);
+    };
+    let targets = config
+        .wayland_targets(socket.canonical_path())
+        .await
+        .map_err(|error| {
+            SessionError::new(format!("inspect startup Wayland projection: {error}"))
+        })?;
+    Ok((!targets.is_empty()).then_some(socket))
+}
+
+fn validate_target(
+    access: &WaylandProbeObservation,
+    host: &crate::domain::wayland::HostWaylandSocket,
+    target: &std::path::Path,
+) -> Result<(), SessionError> {
+    let detail = match access.target {
+        WaylandTargetAccess::Accessible => {
+            let revision = host.revision();
+            if access.socket_identity == Some((revision.device, revision.inode)) {
+                return Ok(());
+            }
+            "is not the current host socket (the bind may be stale)"
+        }
+        WaylandTargetAccess::Missing => "is missing",
+        WaylandTargetAccess::Denied => "is not accessible to the guest user",
+        WaylandTargetAccess::NotSocket => "is not a socket",
+    };
+    Err(SessionError::with_hint(
+        format!("Wayland target {} {detail}", target.display()),
+        "Check the configured bind and guest permissions; restart the machine if the host socket or startup configuration changed.",
+    ))
+}
+
 async fn revalidate_host_socket(
     socket: &crate::domain::wayland::HostWaylandSocket,
     authorized_uid: u32,
@@ -206,7 +201,6 @@ async fn run_probe(
     machine: &MachineSessionTransport,
     request: WaylandProbeRequest,
     id: SessionId,
-    phase: &'static str,
 ) -> Result<WaylandProbeObservation, SessionError> {
     let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
     let mut handle: TerminalSessionHandle = machine
@@ -214,7 +208,7 @@ async fn run_probe(
         .await?;
     super::wayland_probe::collect_wayland_probe(&mut handle)
         .await
-        .map_err(|error| SessionError::new(format!("Wayland {phase} probe failed: {error}")))
+        .map_err(|error| SessionError::new(format!("Wayland access probe failed: {error}")))
 }
 
 fn projection_not_configured() -> SessionError {
@@ -222,4 +216,52 @@ fn projection_not_configured() -> SessionError {
         "the selected display is not declared as a Wayland bind in the machine's startup configuration",
         "Configure Wayland access while the machine is stopped, then start or restart it; Lasper does not create runtime binds for shell sessions.",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::sessions::ObservedGuestIdentity;
+    use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn custom_target_requires_matching_socket_identity_and_guest_access() {
+        let host = HostWaylandSocket::from_verified_parts(
+            WaylandDisplay::new("wayland-1").unwrap(),
+            PathBuf::from("/run/user/1000"),
+            PathBuf::from("/run/user/1000/wayland-1"),
+            1000,
+            1000,
+            1000,
+            0o755,
+            SocketRevision {
+                device: 69,
+                inode: 100,
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+            },
+        )
+        .unwrap();
+        let mut access = WaylandProbeObservation {
+            identity: ObservedGuestIdentity::new(1234, 1234),
+            target: WaylandTargetAccess::Accessible,
+            socket_identity: Some((69, 100)),
+        };
+        let path = Path::new("/custom/desktop.sock");
+        assert!(validate_target(&access, &host, path).is_ok());
+        for identity in [None, Some((69, 101)), Some((70, 100))] {
+            access.socket_identity = identity;
+            assert!(validate_target(&access, &host, path).is_err());
+        }
+        access.socket_identity = Some((69, 100));
+        for state in [
+            WaylandTargetAccess::Missing,
+            WaylandTargetAccess::Denied,
+            WaylandTargetAccess::NotSocket,
+        ] {
+            access.target = state;
+            assert!(validate_target(&access, &host, path).is_err());
+        }
+    }
 }

@@ -192,8 +192,14 @@ pub(crate) enum MachineSessionTransport {
 /// caller; a CLI session hands back a command that the caller must spawn in a
 /// PTY.  The daemon and direct adapters consume the same result shape.
 pub(crate) enum MachineSessionOpening {
-    Dbus(OwnedFd),
+    Dbus(MachinePty),
     Cli(Box<crate::adapters::session::terminal_attach::TerminalAttachCommand>),
+}
+
+pub(crate) struct MachinePty {
+    pub(crate) master: OwnedFd,
+    pub(crate) machine_removed:
+        Option<tokio::sync::oneshot::Receiver<crate::domain::session::SessionLifecycle>>,
 }
 
 impl MachineSessionTransport {
@@ -232,9 +238,7 @@ impl MachineSessionTransport {
     ) -> Result<TerminalSessionHandle, SessionError> {
         let opening = self.open(request).await?;
         match opening {
-            MachineSessionOpening::Dbus(master) => {
-                super::pty::spawn_machine_terminal(master, id, size)
-            }
+            MachineSessionOpening::Dbus(pty) => super::pty::spawn_machine_terminal(pty, id, size),
             MachineSessionOpening::Cli(command) => super::pty::spawn_direct_terminal(
                 (*command).into_pty_command().map_err(|error| {
                     SessionError::new(format!("validate machinectl session command: {error}"))
@@ -334,8 +338,10 @@ mod tests {
         let login = MachineSessionRequest::login_prompt(machine());
         assert_eq!(login.context(), "open machine login prompt");
 
-        let probe =
-            MachineSessionRequest::wayland_probe(WaylandProbeRequest::identity(machine(), user()));
+        let probe = MachineSessionRequest::wayland_probe(
+            WaylandProbeRequest::target(machine(), user(), Path::new("/custom/display.sock"))
+                .unwrap(),
+        );
         assert_eq!(probe.context(), "open Wayland projection probe");
     }
 

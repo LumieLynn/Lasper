@@ -11,12 +11,13 @@ use crate::ipc::protocol::session::{
 };
 use crate::ipc::protocol::FdOperation;
 use sendfd::RecvWithFd;
-use std::os::fd::RawFd;
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 
 pub(crate) struct SpawnedTerminalPty {
     pub master_fd: RawFd,
     pub attach_kind: TerminalAttachmentKind,
     pub lifecycle: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
+    pub machine_removed: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
 }
 
 pub(crate) struct SpawnedJournalStream {
@@ -72,11 +73,16 @@ impl ElevatedDaemon {
         }
         match serde_json::from_str::<SpawnTerminalResponse>(&message) {
             Ok(response) => {
+                let mut machine_removed = None;
                 let lifecycle = match response.lifecycle {
                     WireTerminalLifecycleSource::DaemonStatus if fd_count == 2 => {
                         Some(monitor_lifecycle(fds[1]))
                     }
                     WireTerminalLifecycleSource::PtyEof if fd_count == 1 => None,
+                    WireTerminalLifecycleSource::MachineRemoved if fd_count == 2 => {
+                        machine_removed = Some(monitor_lifecycle(fds[1]));
+                        None
+                    }
                     expected => {
                         close_fds(&fds[..fd_count]);
                         return Err(std::io::Error::new(
@@ -91,6 +97,7 @@ impl ElevatedDaemon {
                     master_fd: fds[0],
                     attach_kind: response.attach_kind.into(),
                     lifecycle,
+                    machine_removed,
                 })
             }
             Err(error) => {
@@ -106,9 +113,7 @@ impl ElevatedDaemon {
     ) -> Result<WaylandSessionContext, SessionError> {
         let host_socket = request.host_socket.clone();
         let params = PrepareWaylandParams {
-            identity_probe_id: WireSessionId::new(request.identity_probe_id.get())
-                .map_err(|error| SessionError::new(error.to_string()))?,
-            access_probe_id: WireSessionId::new(request.access_probe_id.get())
+            probe_id: WireSessionId::new(request.probe_id.get())
                 .map_err(|error| SessionError::new(error.to_string()))?,
             machine: request.target.machine().clone(),
             user: request.target.user().clone(),
@@ -194,21 +199,23 @@ fn receive_terminal_fds(
 }
 
 fn monitor_lifecycle(status_fd: RawFd) -> tokio::sync::oneshot::Receiver<SessionLifecycle> {
-    let (tx, rx) = tokio::sync::oneshot::channel();
+    let status_fd = unsafe { OwnedFd::from_raw_fd(status_fd) };
+    let (mut tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let lifecycle = read_lifecycle(status_fd)
-            .await
-            .unwrap_or_else(|error| SessionLifecycle::Failed(error.to_string()));
+        let lifecycle = tokio::select! {
+            _ = tx.closed() => return,
+            result = read_lifecycle(status_fd) => result.unwrap_or_else(|error| SessionLifecycle::Failed(error.to_string())),
+        };
         let _ = tx.send(lifecycle);
     });
     rx
 }
 
-async fn read_lifecycle(status_fd: RawFd) -> std::io::Result<SessionLifecycle> {
+async fn read_lifecycle(status_fd: OwnedFd) -> std::io::Result<SessionLifecycle> {
     use tokio::io::AsyncReadExt;
 
     const MAX_STATUS_BYTES: u64 = 4096;
-    let receiver = super::pipe_reader(status_fd)?;
+    let receiver = super::pipe_reader(status_fd.into_raw_fd())?;
     let mut bytes = Vec::new();
     receiver
         .take(MAX_STATUS_BYTES + 1)
@@ -267,7 +274,9 @@ mod tests {
         });
 
         assert_eq!(
-            read_lifecycle(reader).await.unwrap(),
+            read_lifecycle(unsafe { OwnedFd::from_raw_fd(reader) })
+                .await
+                .unwrap(),
             SessionLifecycle::Exited {
                 success: false,
                 code: Some(143)
@@ -282,7 +291,9 @@ mod tests {
         let task = tokio::task::spawn_blocking(move || {
             let _ = writer.write_all(&vec![b'x'; 5000]);
         });
-        assert!(read_lifecycle(reader).await.is_err());
+        assert!(read_lifecycle(unsafe { OwnedFd::from_raw_fd(reader) })
+            .await
+            .is_err());
         task.await.unwrap();
     }
 

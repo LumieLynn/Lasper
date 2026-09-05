@@ -41,6 +41,17 @@ impl SessionService {
         self.port.discover_host_wayland_sockets().await
     }
 
+    pub async fn automatic_wayland(
+        &self,
+        machine: &MachineName,
+    ) -> Result<WaylandShellRequest, SessionError> {
+        self.port.automatic_wayland(machine).await.map(|socket| {
+            socket
+                .map(WaylandShellRequest::SelectedHostDisplay)
+                .unwrap_or(WaylandShellRequest::Disabled)
+        })
+    }
+
     pub async fn open_shell(
         &self,
         intent: ShellOpenIntent,
@@ -108,8 +119,7 @@ impl SessionService {
     ) -> Result<WaylandSessionContext, SessionError> {
         self.port
             .prepare_wayland(WaylandPreparationRequest {
-                identity_probe_id: self.allocate_id(),
-                access_probe_id: self.allocate_id(),
+                probe_id: self.allocate_id(),
                 target,
                 host_socket,
             })
@@ -139,6 +149,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SessionPort for RecordingPort {
+        async fn automatic_wayland(
+            &self,
+            _machine: &MachineName,
+        ) -> Result<Option<HostWaylandSocket>, SessionError> {
+            Ok(None)
+        }
+
         async fn discover_host_wayland_sockets(
             &self,
         ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
@@ -174,9 +191,7 @@ mod tests {
             &self,
             request: WaylandPreparationRequest,
         ) -> Result<WaylandSessionContext, SessionError> {
-            self.ids
-                .lock()
-                .extend([request.identity_probe_id, request.access_probe_id]);
+            self.ids.lock().push(request.probe_id);
             Ok(WaylandSessionContext::verified(
                 request.host_socket,
                 PathBuf::from("/run/lasper/wayland/1000/wayland-0"),
@@ -244,7 +259,7 @@ mod tests {
             .unwrap();
 
         let ids = port.ids.lock();
-        assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2]);
         assert_eq!(*port.terminal_wayland_contexts.lock(), [true]);
         assert_eq!(*port.terminal_terms.lock(), ["dumb"]);
     }

@@ -109,18 +109,31 @@ pub(crate) async fn spawn_terminal(
             }
         }
         WireTerminalLaunch::LoginPrompt => {
-            match machine
-                .open(crate::adapters::session::MachineSessionRequest::login_prompt(name.clone()))
-                .await
-            {
-                Ok(crate::adapters::session::MachineSessionOpening::Dbus(master)) => {
-                    send_machine_terminal(&stream, master);
+            let attachment = match crate::adapters::session::terminal_attach::select(&name) {
+                Ok(command) => command,
+                Err(error) => {
+                    send_session_error(&stream, "terminal attach planning failed", &error);
                     return;
                 }
-                Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
-                Err(error) => {
-                    send_session_error(&stream, "machine login prompt failed", &error);
-                    return;
+            };
+            if attachment.kind() == crate::domain::session::TerminalAttachmentKind::Namespace {
+                attachment
+            } else {
+                match machine
+                    .open(
+                        crate::adapters::session::MachineSessionRequest::login_prompt(name.clone()),
+                    )
+                    .await
+                {
+                    Ok(crate::adapters::session::MachineSessionOpening::Dbus(master)) => {
+                        send_machine_terminal(&stream, master);
+                        return;
+                    }
+                    Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
+                    Err(error) => {
+                        send_session_error(&stream, "machine login prompt failed", &error);
+                        return;
+                    }
                 }
             }
         }
@@ -154,8 +167,7 @@ pub(crate) async fn spawn_terminal(
                 Some(host_socket) => {
                     let result = resolver
                         .prepare(crate::application::sessions::WaylandPreparationRequest {
-                            identity_probe_id: next_probe_id(),
-                            access_probe_id: next_probe_id(),
+                            probe_id: next_probe_id(),
                             target,
                             host_socket,
                         })
@@ -336,14 +348,76 @@ fn spawn_process_terminal(
     }
 }
 
-fn send_machine_terminal(stream: &std::os::unix::net::UnixStream, master: OwnedFd) {
+fn send_machine_terminal(
+    stream: &std::os::unix::net::UnixStream,
+    pty: crate::adapters::session::MachinePty,
+) {
+    let crate::adapters::session::MachinePty {
+        master,
+        machine_removed,
+    } = pty;
+    let status = if machine_removed.is_some() {
+        match status_pipe() {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                send_session_error(stream, "create machine status pipe", &error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
     let response = serde_json::to_vec(&SpawnTerminalResponse {
         attach_kind: WireTerminalAttachmentKind::Login,
-        lifecycle: WireTerminalLifecycleSource::PtyEof,
+        lifecycle: if status.is_some() {
+            WireTerminalLifecycleSource::MachineRemoved
+        } else {
+            WireTerminalLifecycleSource::PtyEof
+        },
     })
     .expect("terminal response is serializable");
-    if let Err(error) = stream.send_with_fd(&response, &[master.as_raw_fd()]) {
+    let mut fds = vec![master.as_raw_fd()];
+    if let Some((reader, _)) = &status {
+        fds.push(reader.as_raw_fd());
+    }
+    if let Err(error) = stream.send_with_fd(&response, &fds) {
         log::error!("Daemon: send_with_fd (machine terminal) failed: {error}");
+        return;
+    }
+    if let (Some(removed), Some((_reader, writer))) = (machine_removed, status) {
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                result = removed => result,
+                _ = status_reader_closed(&writer) => return,
+            };
+            let lifecycle = match result {
+                Ok(crate::domain::session::SessionLifecycle::Exited { success, code }) => {
+                    WireSessionLifecycle::Exited { success, code }
+                }
+                _ => WireSessionLifecycle::Failed {
+                    message: "machine removal monitor closed".into(),
+                },
+            };
+            write_lifecycle(writer, lifecycle);
+        });
+    }
+}
+
+async fn status_reader_closed(writer: &std::fs::File) {
+    // A login has no daemon-owned child to reap. Release its D-Bus signal
+    // subscription when the client closes the status pipe instead.
+    loop {
+        let mut fd = libc::pollfd {
+            fd: writer.as_raw_fd(),
+            events: 0,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut fd, 1, 0) } < 0
+            || fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+        {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 
@@ -440,5 +514,23 @@ mod tests {
         assert!(!status.success());
         state.finish(id, &process);
         assert_eq!(state.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn machine_status_monitor_stops_when_its_client_reader_closes() {
+        let (reader, writer) = status_pipe().unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            status_reader_closed(&writer),
+        )
+        .await
+        .is_err());
+        drop(reader);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            status_reader_closed(&writer),
+        )
+        .await
+        .unwrap();
     }
 }

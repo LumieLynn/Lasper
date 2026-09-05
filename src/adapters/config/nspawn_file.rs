@@ -127,25 +127,15 @@ impl NspawnConfig {
         PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
     }
 
-    /// Check the startup configuration for the exact writable bind used by a
-    /// Lasper Wayland projection. This proves configuration intent only; the
-    /// running guest is probed separately because editing this file does not
-    /// alter an already-running container's mount namespace.
-    pub(crate) fn has_wayland_projection(&self, source: &Path, target: &Path) -> Result<bool> {
-        let source = source.to_str().ok_or_else(|| {
-            NspawnError::Validation("Wayland projection source is not valid UTF-8".into())
+    /// Find declared targets for this exact host socket, including source
+    /// aliases. Guest paths are configuration data, not provisioning policy.
+    pub(crate) async fn wayland_targets(&self, source: &Path) -> Result<Vec<PathBuf>> {
+        // Preserve nspawn's own `\:` and `\\` path escapes until the bind
+        // codec below has split source, destination, and mount options.
+        let conf = Ini::load_from_str_noescape(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!("failed to parse {}: {error}", self.path.display()))
         })?;
-        let target = target.to_str().ok_or_else(|| {
-            NspawnError::Validation("Wayland projection target is not valid UTF-8".into())
-        })?;
-        let conf = Ini::load_from_str(&self.content).map_err(|error| {
-            NspawnError::InvalidConfig(format!(
-                "failed to parse {} while checking Wayland projection: {error}",
-                self.path.display()
-            ))
-        })?;
-
-        let mut found = false;
+        let mut targets = Vec::new();
         for files in conf.section_all(Some("Files")) {
             for (key, value) in files.iter() {
                 let readonly = match key {
@@ -154,21 +144,29 @@ impl NspawnConfig {
                     _ => continue,
                 };
                 let Some(bind) = parse_nspawn_bind_value(value, readonly) else {
-                    // systemd logs and ignores malformed Bind= assignments.
                     continue;
                 };
-                if bind.destination != target {
+                let bind_source = Path::new(&bind.source);
+                if !bind_source.is_absolute() {
                     continue;
                 }
-                if bind.readonly || bind.source != source {
-                    // Multiple mounts at one destination are reordered by
-                    // systemd before application. Do not guess which wins.
-                    return Ok(false);
+                if bind_source != source
+                    && tokio::fs::canonicalize(bind_source).await.ok().as_deref() != Some(source)
+                {
+                    continue;
                 }
-                found = true;
+                let target = PathBuf::from(bind.destination);
+                if !targets.contains(&target) {
+                    if targets.len() >= 16 {
+                        return Err(NspawnError::InvalidConfig(
+                            "too many targets for one Wayland socket".into(),
+                        ));
+                    }
+                    targets.push(target);
+                }
             }
         }
-        Ok(found)
+        Ok(targets)
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
@@ -939,54 +937,59 @@ mod tests {
         );
     }
 
-    #[test]
-    fn wayland_projection_uses_nspawn_bind_parser_semantics() {
+    #[tokio::test]
+    async fn wayland_targets_match_only_the_selected_source_and_allow_custom_paths() {
         let config = NspawnConfig {
             path: PathBuf::from("demo.nspawn"),
             content: concat!(
                 "[Files]\n",
-                "Bind=/run/user/1000/wayland-0:/run/lasper/wayland/1000/wayland-0:idmap\n",
+                "Bind=/run/user/1000/wayland-0:/custom/display.sock:idmap\n",
                 "Bind=\n",
                 "Bind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\n",
+                "Bind=/run/user/1000/wayland-0:/custom/display.sock:idmap\n",
+                "BindReadOnly=/run/user/1000/wayland-0:/other/display\\:0\n",
+                "[Exec]\nBind=/run/user/1000/wayland-0:/not-a-files-bind\n",
             )
             .into(),
         };
 
         // Empty Bind= is invalid and ignored by systemd; it is not a reset.
+        assert_eq!(
+            config
+                .wayland_targets(Path::new("/run/user/1000/wayland-0"))
+                .await
+                .unwrap(),
+            vec![
+                PathBuf::from("/custom/display.sock"),
+                PathBuf::from("/other/display:0")
+            ]
+        );
+        assert_eq!(
+            config
+                .wayland_targets(Path::new("/run/user/1000/wayland-1"))
+                .await
+                .unwrap(),
+            vec![PathBuf::from("/run/lasper/wayland/1000/wayland-1")]
+        );
         assert!(config
-            .has_wayland_projection(
-                Path::new("/run/user/1000/wayland-0"),
-                Path::new("/run/lasper/wayland/1000/wayland-0"),
-            )
-            .unwrap());
-        assert!(config
-            .has_wayland_projection(
-                Path::new("/run/user/1000/wayland-1"),
-                Path::new("/run/lasper/wayland/1000/wayland-1"),
-            )
-            .unwrap());
+            .wayland_targets(Path::new("/run/user/1000/wayland-2"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
 
-        let conflicting = NspawnConfig {
+    #[tokio::test]
+    async fn wayland_targets_resolve_source_aliases_and_implicit_destination() {
+        let runtime = tempfile::tempdir().unwrap();
+        let source = runtime.path().join("compositor.sock");
+        std::fs::write(&source, []).unwrap();
+        let alias = runtime.path().join("wayland-1");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let config = NspawnConfig {
             path: PathBuf::from("demo.nspawn"),
-            content: concat!(
-                "[Files]\n",
-                "Bind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\n",
-                "BindReadOnly=/other/socket:/run/lasper/wayland/1000/wayland-1\n",
-            )
-            .into(),
+            content: format!("[Files]\nBind={}\n", alias.display()),
         };
-        assert!(!conflicting
-            .has_wayland_projection(
-                Path::new("/run/user/1000/wayland-1"),
-                Path::new("/run/lasper/wayland/1000/wayland-1"),
-            )
-            .unwrap());
-        assert!(!config
-            .has_wayland_projection(
-                Path::new("/run/user/1000/wayland-1"),
-                Path::new("/run/lasper/wayland/1000/other"),
-            )
-            .unwrap());
+        assert_eq!(config.wayland_targets(&source).await.unwrap(), vec![alias]);
     }
 
     #[test]
