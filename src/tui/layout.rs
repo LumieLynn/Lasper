@@ -26,6 +26,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     render_content(f, app, rows[1]);
     render_status(f, app, rows[2]);
 
+    // The leader belongs to the content layer, above every panel but below
+    // the status bar and any full-screen modal.
+    if let Some(leader) = &mut app.ui.leader {
+        leader.render(f, rows[1]);
+    }
+
     // Overlays (highest priority last so they render on top)
     if let Some(menu) = &mut app.ui.resource_action_menu {
         menu.render(f, area);
@@ -225,7 +231,9 @@ fn split_left_column(area: Rect, machines_pct: u16) -> std::rc::Rc<[Rect]> {
 
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let t = theme::theme();
-    let line = if let Some((msg, level)) = &app.ui.status_message {
+    let line = if app.ui.leader_active() {
+        Line::from(vec![kspan("[Esc]"), hspan(" close leader")])
+    } else if let Some((msg, level)) = &app.ui.status_message {
         let color = t.status_color(level);
         Line::from(vec![
             Span::raw("  "),
@@ -255,11 +263,13 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 kspan("[x/⏎]"),
                 hspan(" actions "),
                 kspan("[t]"),
-                hspan(" terminal "),
+                hspan(" shell "),
                 kspan("[n/a]"),
                 hspan(" new "),
                 kspan("[Tab/⇧Tab]"),
                 hspan(" panels "),
+                kspan("[Space]"),
+                hspan(" leader "),
                 kspan("[?]"),
                 hspan(" help"),
             ]),
@@ -277,6 +287,8 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     hspan(" refresh "),
                     kspan("[Tab/⇧Tab]"),
                     hspan(" panels "),
+                    kspan("[Space]"),
+                    hspan(" leader "),
                     kspan("[?]"),
                     hspan(" help"),
                 ]);
@@ -299,13 +311,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     .focused_image_resource()
                     .is_some_and(|image| app.image_has_running_machine(image))
                 {
-                    spans.extend([kspan("[t]"), hspan(" terminal ")]);
+                    spans.extend([kspan("[t]"), hspan(" shell ")]);
                 }
                 spans.extend([
                     kspan("[[/]]"),
                     hspan(" image tabs "),
                     kspan("[Tab/⇧Tab]"),
-                    hspan(" panels"),
+                    hspan(" panels "),
+                    kspan("[Space]"),
+                    hspan(" leader"),
                 ]);
                 Line::from(spans)
             }
@@ -340,9 +354,16 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     true
                 };
                 if terminal_available {
-                    spans.extend([kspan("[t]"), hspan(" terminal ")]);
+                    spans.extend([kspan("[t]"), hspan(" shell ")]);
                 }
-                spans.extend([kspan("[?]"), hspan(" help "), kspan("[q]"), hspan(" quit")]);
+                spans.extend([
+                    kspan("[Space]"),
+                    hspan(" leader "),
+                    kspan("[?]"),
+                    hspan(" help "),
+                    kspan("[q]"),
+                    hspan(" quit"),
+                ]);
                 Line::from(spans)
             }
             WorkspaceFocus::Terminal => {
@@ -375,7 +396,7 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         kspan("[T]"),
                         hspan(t_label),
                         kspan("[t]"),
-                        hspan(" hide "),
+                        hspan(" shell "),
                         kspan("[x]"),
                         hspan(" close tab "),
                         kspan("[y]"),

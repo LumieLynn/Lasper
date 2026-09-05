@@ -199,6 +199,18 @@ pub struct InteractiveShellEnvironment {
 }
 
 impl InteractiveShellEnvironment {
+    /// Environment used by the embedded TUI terminal.  The TUI owns a
+    /// terminal emulator rather than the user's outer terminal, so inheriting
+    /// the host TERM would describe the wrong terminal capabilities.
+    pub fn embedded() -> Self {
+        let captured = Self::capture();
+        Self {
+            term: "xterm-256color".to_string(),
+            colorterm: captured.colorterm,
+            no_color: captured.no_color,
+        }
+    }
+
     pub fn capture() -> Self {
         let term = std::env::var("TERM")
             .ok()
@@ -481,7 +493,7 @@ impl TypedSessionEnvironment {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TerminalLaunch {
-    DefaultAttachment,
+    LoginPrompt,
     SelectedUserShell {
         user: ValidatedGuestUserName,
         environment: Box<TypedSessionEnvironment>,
@@ -498,16 +510,12 @@ pub struct TerminalSessionRequest {
 }
 
 impl TerminalSessionRequest {
-    pub(crate) fn default_attachment(
-        id: SessionId,
-        machine: MachineName,
-        size: SessionSize,
-    ) -> Self {
+    pub(crate) fn login_prompt(id: SessionId, machine: MachineName, size: SessionSize) -> Self {
         Self {
             id,
             machine,
             size,
-            launch: TerminalLaunch::DefaultAttachment,
+            launch: TerminalLaunch::LoginPrompt,
         }
     }
 
@@ -947,6 +955,12 @@ mod tests {
             }))
             .is_err()
         );
+    }
+
+    #[test]
+    fn embedded_terminal_environment_uses_tui_capabilities() {
+        let environment = InteractiveShellEnvironment::embedded();
+        assert_eq!(environment.term(), "xterm-256color");
     }
 
     #[test]

@@ -108,6 +108,22 @@ pub(crate) async fn spawn_terminal(
                 }
             }
         }
+        WireTerminalLaunch::LoginPrompt => {
+            match machine
+                .open(crate::adapters::session::MachineSessionRequest::login_prompt(name.clone()))
+                .await
+            {
+                Ok(crate::adapters::session::MachineSessionOpening::Dbus(master)) => {
+                    send_machine_terminal(&stream, master);
+                    return;
+                }
+                Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
+                Err(error) => {
+                    send_session_error(&stream, "machine login prompt failed", &error);
+                    return;
+                }
+            }
+        }
         WireTerminalLaunch::SelectedUserShell {
             user,
             terminal,

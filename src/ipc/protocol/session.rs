@@ -101,6 +101,7 @@ impl TryFrom<WireGuestCommand> for GuestCommand {
 #[serde(tag = "launch", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireTerminalLaunch {
     DefaultAttachment,
+    LoginPrompt,
     SelectedUserShell {
         user: ValidatedGuestUserName,
         terminal: Box<InteractiveShellEnvironment>,

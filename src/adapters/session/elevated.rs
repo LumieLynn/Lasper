@@ -40,7 +40,7 @@ impl SessionPort for ElevatedSessionAdapter {
             launch,
         } = request;
         let launch = match launch {
-            TerminalLaunch::DefaultAttachment => WireTerminalLaunch::DefaultAttachment,
+            TerminalLaunch::LoginPrompt => WireTerminalLaunch::LoginPrompt,
             TerminalLaunch::SelectedUserShell {
                 user,
                 environment,

@@ -27,7 +27,7 @@ impl SessionService {
         size: SessionSize,
     ) -> Result<TerminalSessionHandle, SessionError> {
         self.port
-            .open_terminal(TerminalSessionRequest::default_attachment(
+            .open_terminal(TerminalSessionRequest::login_prompt(
                 self.allocate_id(),
                 machine,
                 size,
@@ -92,7 +92,7 @@ impl SessionService {
             .await
     }
 
-    fn allocate_id(&self) -> SessionId {
+    pub(crate) fn allocate_id(&self) -> SessionId {
         loop {
             let value = self.next_id.fetch_add(1, Ordering::Relaxed);
             if let Ok(id) = SessionId::new(value) {

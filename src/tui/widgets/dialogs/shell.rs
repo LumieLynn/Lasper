@@ -55,7 +55,7 @@ impl ShellDialog {
             )
             .with_enabled(wayland_available),
             wayland_probe: WaylandProbeStatus::Untested,
-            wayland: Checkbox::new("Enable Wayland for this shell", false)
+            wayland: Checkbox::new("Enable Wayland for this shell", wayland_available)
                 .with_enabled(wayland_available),
             test_wayland: Button::new("Test Wayland", || {
                 AppMessage::Session(SessionMessage::DialogTestWayland)

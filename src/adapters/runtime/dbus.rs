@@ -60,6 +60,8 @@ trait Manager {
         environment: Vec<String>,
     ) -> zbus::Result<(zvariant::OwnedFd, String)>;
     #[zbus(allow_interactive_auth)]
+    fn open_machine_login(&self, name: &str) -> zbus::Result<(zvariant::OwnedFd, String)>;
+    #[zbus(allow_interactive_auth)]
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
     #[zbus(allow_interactive_auth)]
     fn kill_machine(&self, name: &str, who: &str, signal: i32) -> zbus::Result<()>;
@@ -284,6 +286,21 @@ impl DbusBackend {
         Ok(fd.into())
     }
 
+    pub(crate) async fn open_machine_login(&self, machine: &MachineName) -> Result<OwnedFd> {
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let (fd, _path) = self
+            .mutation_with_deadline(
+                generation,
+                "OpenMachineLogin",
+                proxy.open_machine_login(machine.as_str()),
+            )
+            .await?;
+        Ok(fd.into())
+    }
+
     /// Execute a closed machine-session request through machine1.  Request
     /// construction stays in the session layer; the native D-Bus call and
     /// its descriptor/error mapping stay here with the runtime adapter.
@@ -302,6 +319,9 @@ impl DbusBackend {
                     request.environment().assignments(),
                 )
                 .await
+            }
+            MachineSessionRequest::LoginPrompt(request) => {
+                self.open_machine_login(request.machine()).await
             }
             MachineSessionRequest::WaylandProbe(request) => {
                 self.open_machine_shell(
@@ -843,6 +863,12 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(shell.body().signature().unwrap().as_str(), "sssasas");
+
+        let login = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineLogin")
+            .unwrap()
+            .build(&("demo",))
+            .unwrap();
+        assert_eq!(login.body().signature().unwrap().as_str(), "s");
     }
 
     #[test]

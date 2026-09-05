@@ -180,6 +180,17 @@ impl WaylandSessionResolver {
             .open_local(MachineSessionRequest::shell(request), id, size)
             .await
     }
+
+    pub(crate) async fn open_login_prompt(
+        &self,
+        id: SessionId,
+        machine: MachineName,
+        size: SessionSize,
+    ) -> Result<TerminalSessionHandle, SessionError> {
+        self.machine
+            .open_local(MachineSessionRequest::login_prompt(machine), id, size)
+            .await
+    }
 }
 
 async fn revalidate_host_socket(

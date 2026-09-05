@@ -155,15 +155,24 @@ fn spawn_reader(
 }
 
 fn spawn_machine_reader(
-    mut reader: std::fs::File,
+    mut reader: impl Read + Send + 'static,
     output: tokio::sync::mpsc::Sender<Vec<u8>>,
     lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
 ) {
     tokio::task::spawn_blocking(move || {
         let mut buffer = [0u8; 4096];
+        let mut observed_output = false;
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
+                    // machinectl keeps the login PTY alive while the getty
+                    // is attaching.  Linux can report an initial EOF before
+                    // the slave side is opened; only treat it as an exit
+                    // after this session has produced output.
+                    if !observed_output && lifecycle.borrow().is_running() && !output.is_closed() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     if lifecycle.borrow().is_running() {
                         let _ = lifecycle.send(SessionLifecycle::Exited {
                             success: true,
@@ -173,11 +182,19 @@ fn spawn_machine_reader(
                     return;
                 }
                 Ok(read) => {
+                    observed_output = true;
                     if output.blocking_send(buffer[..read].to_vec()).is_err() {
                         return;
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => {
+                    if !observed_output && lifecycle.borrow().is_running() && !output.is_closed() {
+                        // OpenMachineLogin may return the master before the
+                        // getty has opened its slave.  This is the same
+                        // initial-vhangup condition that machinectl ignores.
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        continue;
+                    }
                     if lifecycle.borrow().is_running() {
                         let _ = lifecycle.send(SessionLifecycle::Exited {
                             success: true,
@@ -322,7 +339,26 @@ fn spawn_direct_owner(
 mod tests {
     use super::*;
     use portable_pty::CommandBuilder;
+    use std::collections::VecDeque;
+    use std::io;
     use std::time::Duration;
+
+    struct ScriptedReader {
+        steps: VecDeque<io::Result<Vec<u8>>>,
+    }
+
+    impl Read for ScriptedReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front().unwrap_or(Ok(Vec::new())) {
+                Ok(bytes) => {
+                    let len = bytes.len().min(buffer.len());
+                    buffer[..len].copy_from_slice(&bytes[..len]);
+                    Ok(len)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
 
     async fn wait_until_finished(handle: &TerminalSessionHandle) -> SessionLifecycle {
         for _ in 0..100 {
@@ -369,6 +405,40 @@ mod tests {
         assert!(matches!(
             wait_until_finished(&handle).await,
             SessionLifecycle::Closed
+        ));
+    }
+
+    #[tokio::test]
+    async fn machine_reader_ignores_initial_pty_hangup_until_getty_attaches() {
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (lifecycle, lifecycle_rx) = tokio::sync::watch::channel(SessionLifecycle::Running);
+        let reader = ScriptedReader {
+            steps: VecDeque::from([
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+                Ok(b"login: ".to_vec()),
+                Err(io::Error::from_raw_os_error(libc::EIO)),
+            ]),
+        };
+
+        spawn_machine_reader(reader, output_tx, lifecycle.clone());
+        let output = tokio::time::timeout(Duration::from_secs(1), output_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(output, b"login: ");
+
+        for _ in 0..100 {
+            if !lifecycle.borrow().is_running() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            *lifecycle_rx.borrow(),
+            SessionLifecycle::Exited {
+                success: true,
+                code: None
+            }
         ));
     }
 }

@@ -69,6 +69,18 @@ impl App {
             return;
         }
 
+        // Space opens the one-level leader from every resource context where
+        // a terminal action is meaningful: either list or either inspector.
+        if (self.ui.focus.is_machine_list()
+            || self.ui.focus.is_image_list()
+            || self.ui.focus.is_inspector())
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers.is_empty()
+        {
+            self.ui.open_leader();
+            return;
+        }
+
         // Layer 1.5 – resize mode (skip when terminal is in insert mode)
         if self.ui.resize_mode == super::ResizeMode::Active
             && !self.is_terminal_insert_mode()
@@ -92,6 +104,27 @@ impl App {
     }
 }
 
+impl App {
+    async fn handle_leader_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.ui.close_leader(),
+            (KeyCode::Char('t'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.spawn_shell_prompt().await;
+            }
+            (KeyCode::Char('l'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.spawn_terminal().await;
+            }
+            _ => {
+                // A leader keymap is intentionally one level deep. Unknown
+                // keys are consumed so they cannot trigger a workspace action.
+                self.ui.close_leader();
+            }
+        }
+    }
+}
+
 // Mouse dispatch
 
 impl App {
@@ -99,7 +132,6 @@ impl App {
         if self.handle_modal_mouse(mouse) {
             return;
         }
-
         // Hit-test: which panel is the mouse over?
         let layout = self.ui.panel_layout;
         let col = mouse.column;
@@ -215,6 +247,10 @@ impl App {
             Some(ModalLayer::QuitConfirmation) => self.handle_quit_confirm_key(key),
             Some(ModalLayer::Wizard | ModalLayer::Help | ModalLayer::ResourceActionMenu) => {
                 self.handle_overlay_key(key).await
+            }
+            Some(ModalLayer::Leader) => {
+                self.handle_leader_key(key).await;
+                true
             }
             None => false,
         }
@@ -499,7 +535,7 @@ impl App {
                 true
             }
             KeyCode::Char('t') => {
-                self.toggle_terminal().await;
+                self.spawn_shell_prompt().await;
                 true
             }
             KeyCode::Char('T') => {
@@ -774,18 +810,6 @@ impl App {
                         .await;
                 });
             }
-        }
-    }
-
-    async fn toggle_terminal(&mut self) {
-        if self.data.terminal.is_showing() {
-            self.data.terminal.show = false;
-            if self.ui.focus.is_terminal() {
-                self.restore_non_terminal_focus();
-            }
-            self.request_detail_refresh();
-        } else {
-            self.spawn_terminal().await;
         }
     }
 
@@ -1083,6 +1107,13 @@ impl App {
                 | ModalLayer::Help
                 | ModalLayer::ResourceActionMenu,
             ) => true,
+            Some(ModalLayer::Leader) => {
+                if let Some(leader) = &mut self.ui.leader {
+                    let _ = leader.handle_mouse(mouse);
+                }
+                self.ui.close_leader();
+                true
+            }
             None => false,
         }
     }

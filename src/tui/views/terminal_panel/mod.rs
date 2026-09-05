@@ -32,7 +32,7 @@ impl TerminalPanel {
             .sessions
             .iter()
             .enumerate()
-            .map(|(index, session)| (index, session.label().width().saturating_add(2)))
+            .map(|(index, _)| (index, manager.tab_label(index).width().saturating_add(2)))
             .collect::<Vec<_>>();
         manager.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
 
@@ -40,7 +40,7 @@ impl TerminalPanel {
         let t = crate::tui::theme::theme();
         let mut tab_spans = Vec::new();
         let session_count = manager.sessions.len();
-        for (i, s) in manager.sessions.iter().enumerate() {
+        for (i, _session) in manager.sessions.iter().enumerate() {
             let mut style = Style::default().fg(t.tab_inactive);
             if i == active_idx {
                 style = style
@@ -51,7 +51,7 @@ impl TerminalPanel {
                     })
                     .add_modifier(Modifier::BOLD);
             }
-            tab_spans.push(Span::styled(format!(" {} ", s.label()), style));
+            tab_spans.push(Span::styled(format!(" {} ", manager.tab_label(i)), style));
             if i < session_count - 1 {
                 tab_spans.push(Span::raw("-"));
             }

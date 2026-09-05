@@ -1,7 +1,8 @@
 //! Terminal session management.
 
 use crate::application::sessions::{
-    InteractiveShellEnvironment, SessionSendStatus, SessionService, ShellOpenIntent, ShellTarget,
+    terminal_session_channel, InteractiveShellEnvironment, SessionSendStatus, SessionService,
+    ShellOpenError, ShellOpenIntent, ShellTarget, TerminalCommand, TerminalSessionEndpoint,
     TerminalSessionHandle, TerminalSessionInput, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
@@ -30,8 +31,6 @@ pub struct TextSelection {
 pub struct TerminalSession {
     pub machine_name: String,
     pub guest_user: Option<ValidatedGuestUserName>,
-    pub wayland_socket: Option<crate::domain::wayland::HostWaylandSocket>,
-    pub attach_kind: TerminalAttachmentKind,
     pub terminal: Arc<parking_lot::Mutex<crate::tui::term::Parser>>,
     pub input: TerminalSessionInput,
     pub handle: TerminalSessionHandle,
@@ -52,6 +51,9 @@ pub struct TerminalSession {
 pub struct SpawnedTerminalSession {
     pub attach_kind: TerminalAttachmentKind,
 }
+
+const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
+const BUILTIN_USER_MAX_BYTES: usize = 32;
 
 #[derive(Clone, Debug)]
 struct RedrawGate {
@@ -158,6 +160,28 @@ impl TerminalManager {
         self.sessions.get(self.active_idx)
     }
 
+    pub(crate) fn tab_label(&self, index: usize) -> String {
+        let Some(session) = self.sessions.get(index) else {
+            return String::new();
+        };
+        let base = session.label();
+        let duplicate_count = self
+            .sessions
+            .iter()
+            .filter(|candidate| candidate.label() == base)
+            .count();
+        if duplicate_count < 2 {
+            return base;
+        }
+        let ordinal = self
+            .sessions
+            .iter()
+            .take(index + 1)
+            .filter(|candidate| candidate.label() == base)
+            .count();
+        format!("{base} #{ordinal}")
+    }
+
     pub fn clear_redraw_pending(&self) {
         self.redraw_gate.clear();
     }
@@ -192,6 +216,76 @@ impl TerminalManager {
             .await
     }
 
+    /// Start Lasper's embedded selected-user shell loop.  The first tab state
+    /// is a local username prompt; after a valid account is entered the same
+    /// session bridges to `OpenMachineShell`/`machinectl shell`.  This keeps
+    /// the prompt independent from the host login/getty path and allows every
+    /// invocation to create another tab.
+    pub async fn spawn_shell_prompt(
+        &mut self,
+        entry: &MachineEntry,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
+        if !entry.access().is_nspawn() {
+            return Err(format!(
+                "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
+                entry.name
+            ));
+        }
+        if entry.state != crate::domain::runtime::MachineState::Running {
+            return Err(format!("Machine {} is not running", entry.name));
+        }
+
+        let tx = app_tx
+            .as_ref()
+            .ok_or_else(|| "Internal error: app_tx not set".to_string())?;
+        let machine = MachineName::new(&entry.name)
+            .map_err(|error| format!("Invalid machine name: {error}"))?;
+        let size = SessionSize::new(80, rows)
+            .map_err(|error| format!("Invalid terminal size: {error}"))?;
+        let id = self.session_service.allocate_id();
+        let (mut handle, endpoint) = terminal_session_channel(id, TerminalAttachmentKind::Login);
+        let input = handle.input();
+        let output = handle
+            .take_output()
+            .ok_or_else(|| "Internal error: terminal output already attached".to_string())?;
+        let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
+            rows, 80, 10000,
+        )));
+        let service = Arc::clone(&self.session_service);
+        tokio::spawn(run_builtin_shell_prompt(endpoint, service, machine, size));
+        let output_task = spawn_output_parser(
+            output,
+            Arc::clone(&terminal),
+            input.clone(),
+            tx.clone(),
+            self.redraw_gate.clone(),
+        );
+        let session = TerminalSession {
+            machine_name: entry.name.clone(),
+            guest_user: None,
+            terminal,
+            input,
+            handle,
+            output_task,
+            scroll_offset: 0,
+            insert_mode: true,
+            selection: TextSelection::default(),
+            yanked: false,
+            queued_size: Some((80, rows)),
+            resize_channel_closed: false,
+            mouse_capture: false,
+        };
+        self.sessions.push(session);
+        self.tab_hitboxes.clear();
+        self.active_idx = self.sessions.len() - 1;
+        self.show = true;
+        Ok(SpawnedTerminalSession {
+            attach_kind: TerminalAttachmentKind::Login,
+        })
+    }
+
     async fn spawn_with_user(
         &mut self,
         entry: &MachineEntry,
@@ -210,38 +304,6 @@ impl TerminalManager {
             return Err(format!("Machine {} is not running", entry.name));
         }
 
-        let requested_wayland_socket = wayland.host_socket().cloned();
-
-        // Re-use only a session with the same user and display evidence.
-        if let Some(idx) = self.sessions.iter().position(|session| {
-            session.machine_name == entry.name
-                && session.guest_user == user
-                && session.wayland_socket == requested_wayland_socket
-                && session.handle.lifecycle().is_running()
-        }) {
-            self.active_idx = idx;
-            self.show = true;
-            return Ok(SpawnedTerminalSession {
-                attach_kind: self.sessions[idx].attach_kind,
-            });
-        }
-
-        if let Some(idx) = self
-            .sessions
-            .iter()
-            .position(|session| session.machine_name == entry.name && session.guest_user == user)
-        {
-            let mut stale = self.sessions.remove(idx);
-            self.tab_hitboxes.clear();
-            stale.handle.close();
-            stale.output_task.abort();
-            if self.active_idx > idx {
-                self.active_idx -= 1;
-            } else if self.active_idx >= self.sessions.len() && !self.sessions.is_empty() {
-                self.active_idx = self.sessions.len() - 1;
-            }
-        }
-
         let tx = app_tx
             .as_ref()
             .ok_or_else(|| "Internal error: app_tx not set".to_string())?;
@@ -251,21 +313,35 @@ impl TerminalManager {
             .map_err(|error| format!("Invalid machine name: {error}"))?;
         let size = SessionSize::new(cols, rows)
             .map_err(|error| format!("Invalid terminal size: {error}"))?;
-        let mut handle = match user.clone() {
-            Some(user) => self
-                .session_service
-                .open_shell(ShellOpenIntent::new(
+        let (mut handle, wayland_fallback) = match user.clone() {
+            Some(user) => {
+                let intent = ShellOpenIntent::new(
                     ShellTarget::new(machine, user),
-                    wayland,
-                    InteractiveShellEnvironment::capture(),
+                    wayland.clone(),
+                    InteractiveShellEnvironment::embedded(),
                     size,
-                ))
-                .await
-                .map_err(|error| error.to_string()),
+                );
+                match self.session_service.open_shell(intent.clone()).await {
+                    Ok(handle) => Ok((handle, false)),
+                    Err(ShellOpenError::WaylandPreparation(error))
+                        if wayland.host_socket().is_some() => self
+                        .session_service
+                        .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
+                        .await
+                        .map(|handle| (handle, true))
+                        .map_err(|fallback| {
+                            format!(
+                                "Wayland validation failed: {error}; terminal-only fallback failed: {fallback}"
+                            )
+                        }),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
             None => self
                 .session_service
                 .open_terminal(machine, size)
                 .await
+                .map(|handle| (handle, false))
                 .map_err(|error| error.to_string()),
         }
         .map_err(|error| format!("Failed to attach terminal: {error}"))?;
@@ -282,6 +358,14 @@ impl TerminalManager {
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
             rows, cols, 10000,
         )));
+        if wayland_fallback {
+            let mut parser = terminal.lock();
+            let mut events = Vec::new();
+            parser.screen.process(
+                format!("\r\n{WAYLAND_FALLBACK_NOTICE}\r\n").as_bytes(),
+                &mut events,
+            );
+        }
         let output_task = spawn_output_parser(
             output,
             Arc::clone(&terminal),
@@ -293,8 +377,6 @@ impl TerminalManager {
         let session = TerminalSession {
             machine_name: entry.name.clone(),
             guest_user: user,
-            wayland_socket: requested_wayland_socket,
-            attach_kind,
             terminal,
             input,
             handle,
@@ -657,6 +739,251 @@ impl TerminalManager {
     }
 }
 
+async fn run_builtin_shell_prompt(
+    endpoint: TerminalSessionEndpoint,
+    service: Arc<SessionService>,
+    machine: MachineName,
+    initial_size: SessionSize,
+) {
+    let TerminalSessionEndpoint {
+        mut commands,
+        output,
+        lifecycle,
+        close,
+        ..
+    } = endpoint;
+    let mut close = close;
+    let prompt = format!("\r\nlasper shell {} user: ", machine);
+    if send_prompt_output(&output, prompt.clone().into_bytes())
+        .await
+        .is_err()
+    {
+        let _ = lifecycle.send(crate::domain::session::SessionLifecycle::Closed);
+        return;
+    }
+
+    let mut line = Vec::new();
+    let mut size = initial_size;
+    let mut root_confirmation = None;
+    loop {
+        tokio::select! {
+            _ = &mut close => {
+                let _ = lifecycle.send(crate::domain::session::SessionLifecycle::Closed);
+                return;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    let _ = lifecycle.send(crate::domain::session::SessionLifecycle::Closed);
+                    return;
+                };
+                match command {
+                    TerminalCommand::Resize(next) => size = next,
+                    TerminalCommand::Reply(_) => {}
+                    TerminalCommand::Input(bytes) => {
+                        for byte in bytes {
+                            match byte {
+                                b'\r' | b'\n' => {
+                                    if line.is_empty() {
+                                        let _ = send_prompt_output(&output, b"\r\n".to_vec()).await;
+                                        let _ = send_prompt_output(&output, prompt.as_bytes().to_vec()).await;
+                                        continue;
+                                    }
+                                    let value = String::from_utf8_lossy(&line).into_owned();
+                                    line.clear();
+                                    let user = match ValidatedGuestUserName::new(value) {
+                                        Ok(user) => user,
+                                        Err(error) => {
+                                            root_confirmation = None;
+                                            let message = format!("\r\nlasper: invalid guest user: {error}\r\n{prompt}");
+                                            let _ = send_prompt_output(&output, message.into_bytes()).await;
+                                            continue;
+                                        }
+                                    };
+                                    if matches!(user.as_str(), "root" | "0")
+                                        && root_confirmation.as_ref() != Some(&user)
+                                    {
+                                        root_confirmation = Some(user);
+                                        let message = format!(
+                                            "\r\nRoot grants full control inside this guest. Enter the account again to confirm.\r\n{prompt}"
+                                        );
+                                        let _ = send_prompt_output(&output, message.into_bytes()).await;
+                                        continue;
+                                    }
+                                    root_confirmation = None;
+                                    let _ = send_prompt_output(&output, b"\r\n".to_vec()).await;
+                                    match open_builtin_shell(&service, machine.clone(), user, size).await {
+                                        Ok((mut remote, fallback)) => {
+                                            if fallback {
+                                                let _ = send_prompt_output(&output, format!("{WAYLAND_FALLBACK_NOTICE}\r\n").into_bytes()).await;
+                                            }
+                                            let state = bridge_builtin_shell(
+                                                &mut commands,
+                                                &mut close,
+                                                &output,
+                                                &mut remote,
+                                            ).await;
+                                            match state {
+                                                BuiltinBridgeResult::Closed => {
+                                                    let _ = lifecycle.send(crate::domain::session::SessionLifecycle::Closed);
+                                                    return;
+                                                }
+                                                BuiltinBridgeResult::Finished(state) => {
+                                                    let message = match state {
+                                                        crate::domain::session::SessionLifecycle::Exited { .. } => format!("\r\n{prompt}"),
+                                                        crate::domain::session::SessionLifecycle::Failed(error) => format!("\r\nlasper: {error}\r\n{prompt}"),
+                                                        crate::domain::session::SessionLifecycle::Closed => format!("\r\n{prompt}"),
+                                                        crate::domain::session::SessionLifecycle::Running => prompt.clone(),
+                                                    };
+                                                    let _ = send_prompt_output(&output, message.into_bytes()).await;
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            let message = format!("lasper: {error}\r\n{prompt}");
+                                            let _ = send_prompt_output(&output, message.into_bytes()).await;
+                                        }
+                                    }
+                                }
+                                0x04 if line.is_empty() => {
+                                    let _ = lifecycle.send(crate::domain::session::SessionLifecycle::Closed);
+                                    return;
+                                }
+                                0x03 => {
+                                    line.clear();
+                                    root_confirmation = None;
+                                    let _ = send_prompt_output(&output, format!("^C\r\n{prompt}").into_bytes()).await;
+                                }
+                                0x08 | 0x7f if !line.is_empty() => {
+                                    line.pop();
+                                    let _ = send_prompt_output(&output, b"\x08 \x08".to_vec()).await;
+                                }
+                                byte if byte.is_ascii_graphic()
+                                    && line.len() < BUILTIN_USER_MAX_BYTES =>
+                                {
+                                    line.push(byte);
+                                    let _ = send_prompt_output(&output, vec![byte]).await;
+                                }
+                                byte if byte.is_ascii_graphic() => {
+                                    let _ = send_prompt_output(&output, b"\x07".to_vec()).await;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn open_builtin_shell(
+    service: &SessionService,
+    machine: MachineName,
+    user: ValidatedGuestUserName,
+    size: SessionSize,
+) -> Result<(TerminalSessionHandle, bool), String> {
+    let wayland = service
+        .discover_host_wayland_sockets()
+        .await
+        .into_iter()
+        .next()
+        .map(WaylandShellRequest::SelectedHostDisplay)
+        .unwrap_or(WaylandShellRequest::Disabled);
+    let intent = ShellOpenIntent::new(
+        ShellTarget::new(machine, user),
+        wayland.clone(),
+        InteractiveShellEnvironment::embedded(),
+        size,
+    );
+    match service.open_shell(intent.clone()).await {
+        Ok(handle) => Ok((handle, false)),
+        Err(ShellOpenError::WaylandPreparation(error)) if wayland.host_socket().is_some() => {
+            service
+                .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
+                .await
+                .map(|handle| (handle, true))
+                .map_err(|fallback| {
+                    format!(
+                    "Wayland validation failed: {error}; terminal-only fallback failed: {fallback}"
+                )
+                })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+enum BuiltinBridgeResult {
+    Closed,
+    Finished(crate::domain::session::SessionLifecycle),
+}
+
+async fn bridge_builtin_shell(
+    commands: &mut tokio::sync::mpsc::Receiver<TerminalCommand>,
+    close: &mut tokio::sync::oneshot::Receiver<()>,
+    output: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    remote: &mut TerminalSessionHandle,
+) -> BuiltinBridgeResult {
+    let Some(mut remote_output) = remote.take_output() else {
+        return BuiltinBridgeResult::Finished(crate::domain::session::SessionLifecycle::Failed(
+            "selected-user shell output is unavailable".into(),
+        ));
+    };
+    let remote_input = remote.input();
+    let mut remote_wait = Box::pin(remote.wait());
+    let mut output_open = true;
+    let mut finished = None;
+    loop {
+        tokio::select! {
+            _ = &mut *close => return BuiltinBridgeResult::Closed,
+            state = &mut remote_wait, if finished.is_none() => {
+                finished = Some(state);
+                if !output_open {
+                    if let Some(state) = finished.take() {
+                        return BuiltinBridgeResult::Finished(state);
+                    }
+                }
+            }
+            command = commands.recv() => {
+                let Some(command) = command else { return BuiltinBridgeResult::Closed; };
+                if finished.is_none() {
+                    match command {
+                        TerminalCommand::Input(bytes) => { let _ = remote_input.send_input(bytes).await; }
+                        TerminalCommand::Reply(bytes) => { let _ = remote_input.send_reply(bytes).await; }
+                        TerminalCommand::Resize(size) => { let _ = remote_input.try_resize(size); }
+                    }
+                }
+            }
+            chunk = remote_output.recv(), if output_open => {
+                match chunk {
+                    Some(chunk) => {
+                        tokio::select! {
+                            result = output.send(chunk) => {
+                                if result.is_err() {
+                                    return BuiltinBridgeResult::Closed;
+                                }
+                            }
+                            _ = &mut *close => return BuiltinBridgeResult::Closed,
+                        }
+                    }
+                    None => {
+                        output_open = false;
+                        if let Some(state) = finished.take() {
+                            return BuiltinBridgeResult::Finished(state);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_prompt_output(
+    output: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    bytes: Vec<u8>,
+) -> Result<(), ()> {
+    output.send(bytes).await.map_err(|_| ())
+}
+
 impl TerminalSession {
     pub(crate) fn label(&self) -> String {
         match &self.guest_user {
@@ -820,19 +1147,28 @@ pub enum TerminalKeyOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalManager,
-        TerminalSession, TextSelection,
+        queue_input, queue_resize, run_builtin_shell_prompt, QueueResizeResult,
+        TerminalInputStatus, TerminalManager, TerminalSession, TextSelection,
     };
     use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
     use crate::application::sessions::{
-        terminal_session_channel, SessionService, TERMINAL_COMMAND_CAPACITY,
+        terminal_session_channel, SessionSendStatus, SessionService, TERMINAL_COMMAND_CAPACITY,
     };
+    use crate::domain::machine::MachineName;
     use crate::domain::runtime::{MachineEntry, MachineState};
-    use crate::domain::session::{SessionId, TerminalAttachmentKind};
+    use crate::domain::session::{SessionId, SessionSize, TerminalAttachmentKind};
     use crate::tui::views::title_tabs::TitleTabHitbox;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
     use std::sync::Arc;
+
+    fn prompt_service() -> Arc<SessionService> {
+        Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))))
+    }
 
     fn terminal_channels() -> (
         crate::application::sessions::TerminalSessionHandle,
@@ -855,8 +1191,6 @@ mod tests {
             TerminalSession {
                 machine_name: machine_name.into(),
                 guest_user: None,
-                wayland_socket: None,
-                attach_kind: TerminalAttachmentKind::Login,
                 terminal: Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
                     24, 80, 100,
                 ))),
@@ -951,6 +1285,79 @@ mod tests {
                 .expect_err("transitional state must not open a terminal");
             assert!(error.contains("not running"));
         }
+    }
+
+    #[tokio::test]
+    async fn builtin_shell_prompt_is_rendered_before_opening_a_guest_session() {
+        let (mut handle, endpoint) = terminal_channels();
+        let mut output = handle.take_output().unwrap();
+        let task = tokio::spawn(run_builtin_shell_prompt(
+            endpoint,
+            prompt_service(),
+            MachineName::new("demo").unwrap(),
+            SessionSize::new(80, 24).unwrap(),
+        ));
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&first).contains("lasper shell demo user:"));
+
+        handle.close();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn builtin_shell_prompt_rejects_invalid_guest_names_without_opening() {
+        let (mut handle, endpoint) = terminal_channels();
+        let input = handle.input();
+        let mut output = handle.take_output().unwrap();
+        let task = tokio::spawn(run_builtin_shell_prompt(
+            endpoint,
+            prompt_service(),
+            MachineName::new("demo").unwrap(),
+            SessionSize::new(80, 24).unwrap(),
+        ));
+
+        let _ = output.recv().await.unwrap();
+        assert_eq!(
+            input.try_input(b"../root\r".to_vec()),
+            SessionSendStatus::Queued
+        );
+        let mut response = String::new();
+        while !response.contains("invalid guest user") {
+            let chunk = tokio::time::timeout(std::time::Duration::from_secs(1), output.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            response.push_str(&String::from_utf8_lossy(&chunk));
+        }
+
+        handle.close();
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_tabs_receive_stable_ordinals() {
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))));
+        let mut manager = TerminalManager::new(service);
+        let (first, _first_endpoint) = test_session(1, "demo");
+        let (second, _second_endpoint) = test_session(2, "demo");
+        manager.sessions = vec![first, second];
+
+        assert_eq!(manager.tab_label(0), "demo #1");
+        assert_eq!(manager.tab_label(1), "demo #2");
     }
 
     #[tokio::test]

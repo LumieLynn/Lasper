@@ -117,6 +117,9 @@ pub(crate) fn machine_session_command(
 ) -> io::Result<TerminalAttachCommand> {
     match request {
         MachineSessionRequest::Shell(request) => selected_user_shell(request),
+        MachineSessionRequest::LoginPrompt(request) => Ok(
+            crate::adapters::session::terminal_attach::login(request.machine()),
+        ),
         MachineSessionRequest::WaylandProbe(request) => wayland_probe(request),
     }
 }
@@ -517,6 +520,17 @@ mod tests {
                 "1000@test-machine"
             ]
         );
+    }
+
+    #[test]
+    fn login_prompt_uses_machinectl_login_without_shell_arguments() {
+        let command = machine_session_command(MachineSessionRequest::login_prompt(
+            MachineName::new("test-machine").unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(command.args(), ["--", "login", "test-machine"]);
     }
 
     #[test]

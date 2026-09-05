@@ -100,6 +100,21 @@ pub(crate) struct MachineShellRequest {
     command: Option<GuestCommand>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MachineLoginRequest {
+    machine: MachineName,
+}
+
+impl MachineLoginRequest {
+    pub(crate) fn new(machine: MachineName) -> Self {
+        Self { machine }
+    }
+
+    pub(crate) fn machine(&self) -> &MachineName {
+        &self.machine
+    }
+}
+
 impl MachineShellRequest {
     pub(crate) fn new(
         machine: MachineName,
@@ -140,12 +155,17 @@ impl MachineShellRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MachineSessionRequest {
     Shell(MachineShellRequest),
+    LoginPrompt(MachineLoginRequest),
     WaylandProbe(WaylandProbeRequest),
 }
 
 impl MachineSessionRequest {
     pub(crate) fn shell(request: MachineShellRequest) -> Self {
         Self::Shell(request)
+    }
+
+    pub(crate) fn login_prompt(machine: MachineName) -> Self {
+        Self::LoginPrompt(MachineLoginRequest::new(machine))
     }
 
     pub(crate) fn wayland_probe(request: WaylandProbeRequest) -> Self {
@@ -155,6 +175,7 @@ impl MachineSessionRequest {
     pub(crate) const fn context(&self) -> &'static str {
         match self {
             Self::Shell(_) => "open selected-user shell",
+            Self::LoginPrompt(_) => "open machine login prompt",
             Self::WaylandProbe(_) => "open Wayland projection probe",
         }
     }
@@ -309,6 +330,9 @@ mod tests {
             MachineShellEnvironment::default(),
         ));
         assert_eq!(shell.context(), "open selected-user shell");
+
+        let login = MachineSessionRequest::login_prompt(machine());
+        assert_eq!(login.context(), "open machine login prompt");
 
         let probe =
             MachineSessionRequest::wayland_probe(WaylandProbeRequest::identity(machine(), user()));

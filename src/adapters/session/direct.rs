@@ -51,39 +51,36 @@ impl SessionPort for DirectSessionAdapter {
             size,
             launch,
         } = request;
-        if let TerminalLaunch::SelectedUserShell {
-            user,
-            environment,
-            command,
-        } = launch
-        {
-            return self
-                .wayland
-                .open_selected_user_shell(
-                    id,
-                    machine.clone(),
-                    user.clone(),
-                    *environment,
-                    command,
-                    size,
-                )
-                .await;
+        match launch {
+            TerminalLaunch::SelectedUserShell {
+                user,
+                environment,
+                command,
+            } => {
+                self.wayland
+                    .open_selected_user_shell(id, machine, user, *environment, command, size)
+                    .await
+            }
+            // User mode keeps the native machine1 login prompt on the chosen
+            // D-Bus/CLI route; root mode retains its existing namespace-aware
+            // attachment policy for the legacy direct path.
+            TerminalLaunch::LoginPrompt => match self.terminal_policy {
+                DirectTerminalPolicy::LoginOnly => {
+                    self.wayland.open_login_prompt(id, machine, size).await
+                }
+                DirectTerminalPolicy::Automatic => {
+                    let attachment = crate::adapters::session::terminal_attach::select(&machine)
+                        .map_err(|error| {
+                            SessionError::new(format!("plan terminal attachment: {error}"))
+                        })?;
+                    let kind = attachment.kind();
+                    let command = attachment.into_pty_command().map_err(|error| {
+                        SessionError::new(format!("validate terminal attachment: {error}"))
+                    })?;
+                    crate::adapters::session::pty::spawn_direct_terminal(command, id, kind, size)
+                }
+            },
         }
-        let attachment = match self.terminal_policy {
-            DirectTerminalPolicy::LoginOnly => {
-                crate::adapters::session::terminal_attach::login(&machine)
-            }
-            DirectTerminalPolicy::Automatic => {
-                crate::adapters::session::terminal_attach::select(&machine).map_err(|error| {
-                    SessionError::new(format!("plan terminal attachment: {error}"))
-                })?
-            }
-        };
-        let kind = attachment.kind();
-        let command = attachment
-            .into_pty_command()
-            .map_err(|error| SessionError::new(format!("validate terminal attachment: {error}")))?;
-        crate::adapters::session::pty::spawn_direct_terminal(command, id, kind, size)
     }
 
     async fn prepare_wayland(
