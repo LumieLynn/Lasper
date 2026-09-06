@@ -325,7 +325,6 @@ async fn run_deploy_internal(
                 cfg.private_users,
             )
             .map_err(|error| NspawnError::Validation(error.to_string()))?;
-            host.nspawn.validate_wayland(&cfg, &grant).await?;
             push_log!(format!(
                 "Prepared {} startup Wayland projection(s) for {}...",
                 grant.sockets().len(),

@@ -87,22 +87,6 @@ impl NspawnConfigStore {
             .ok_or_else(|| NspawnError::Runtime("nspawn write returned no apply status".into()))
     }
 
-    pub(crate) async fn validate_wayland(
-        &self,
-        config: &MachineProvisioningConfig,
-        grant: &WaylandGrant,
-    ) -> Result<()> {
-        let spec = NspawnConfigSpec::try_from(config)?;
-        self.execute(NspawnConfigOperation::ValidateWayland(Box::new(
-            ValidateWaylandGrant {
-                spec,
-                grant: grant.clone(),
-            },
-        )))
-        .await?;
-        Ok(())
-    }
-
     pub async fn promote_oci(
         &self,
         name: &str,
@@ -224,7 +208,6 @@ pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
     Write(Box<WriteNspawnConfig>),
-    ValidateWayland(Box<ValidateWaylandGrant>),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
     UpdateGpu(Box<UpdateNspawnGpu>),
@@ -250,13 +233,6 @@ pub(crate) struct WriteNspawnConfig {
     spec: NspawnConfigSpec,
     wayland: Vec<WaylandGrant>,
     nvidia_state: Option<NvidiaState>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ValidateWaylandGrant {
-    spec: NspawnConfigSpec,
-    grant: WaylandGrant,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -347,11 +323,6 @@ pub(crate) async fn execute_nspawn_config_operation(
                 apply: Some(apply),
                 ..Default::default()
             })
-        }
-        NspawnConfigOperation::ValidateWayland(request) => {
-            request.spec.validate()?;
-            validate_wayland_grant(&request.spec, &request.grant, invoking_uid).await?;
-            Ok(NspawnConfigResult::default())
         }
         NspawnConfigOperation::PromoteOci(request) => {
             let apply = promote_new_oci_config(
