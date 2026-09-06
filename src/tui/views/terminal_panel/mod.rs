@@ -1,4 +1,5 @@
 pub mod manager;
+mod shell_prompt;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 pub use manager::{TerminalInputStatus, TerminalKeyOutcome, TerminalManager, TextSelection};
 use ratatui::{
