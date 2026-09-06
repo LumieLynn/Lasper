@@ -1,6 +1,7 @@
 //! Select a closed, typed terminal attachment command for a running machine.
 
 use crate::adapters::runtime::state as runtime_state;
+use crate::application::sessions::InteractiveShellEnvironment;
 use crate::domain::machine::MachineName;
 pub use crate::domain::session::TerminalAttachmentKind as TerminalAttachKind;
 use portable_pty::CommandBuilder;
@@ -23,6 +24,14 @@ struct NamespaceSnapshot {
     start_time: u64,
     namespaces: [FileIdentity; NAMESPACE_NAMES.len()],
     root: FileIdentity,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AttachProcessEnvironment {
+    Inherited,
+    ExplicitTerminal(crate::application::sessions::InteractiveShellEnvironment),
+    SanitizedNamespace,
+    Dumb,
 }
 
 impl NamespaceSnapshot {
@@ -66,6 +75,7 @@ pub struct TerminalAttachCommand {
     program: String,
     args: Vec<String>,
     namespace_snapshot: Option<NamespaceSnapshot>,
+    process_environment: AttachProcessEnvironment,
 }
 
 impl TerminalAttachCommand {
@@ -74,41 +84,91 @@ impl TerminalAttachCommand {
     }
 
     #[cfg(test)]
-    fn program(&self) -> &str {
+    pub(crate) fn program(&self) -> &str {
         &self.program
     }
 
     #[cfg(test)]
-    fn args(&self) -> &[String] {
+    pub(crate) fn args(&self) -> &[String] {
         &self.args
     }
 
     pub fn into_pty_command(self) -> io::Result<CommandBuilder> {
         let Self {
-            kind,
             program,
             args,
             namespace_snapshot,
+            process_environment,
+            ..
         } = self;
         if let Some(snapshot) = namespace_snapshot {
             snapshot.verify()?;
         }
         let mut command = CommandBuilder::new(program);
         command.args(args);
-        if kind == TerminalAttachKind::Namespace {
-            // Do not copy sudo/daemon environment variables into a root shell
-            // inside a potentially untrusted container.
-            command.env_clear();
-            command.env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            );
-            command.env("HOME", "/root");
-            command.env("USER", "root");
-            command.env("LOGNAME", "root");
-            command.env("TERM", "xterm-256color");
+        match process_environment {
+            AttachProcessEnvironment::Inherited => {}
+            AttachProcessEnvironment::ExplicitTerminal(environment) => {
+                command.env("TERM", environment.term());
+                match environment.colorterm() {
+                    Some(value) => command.env("COLORTERM", value),
+                    None => command.env_remove("COLORTERM"),
+                }
+                match environment.no_color() {
+                    Some(value) => command.env("NO_COLOR", value),
+                    None => command.env_remove("NO_COLOR"),
+                }
+            }
+            AttachProcessEnvironment::SanitizedNamespace => {
+                // Do not copy sudo/daemon environment variables into a root
+                // shell inside a potentially untrusted container.
+                command.env_clear();
+                command.env(
+                    "PATH",
+                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                );
+                command.env("HOME", "/root");
+                command.env("USER", "root");
+                command.env("LOGNAME", "root");
+                command.env("TERM", "xterm-256color");
+            }
+            AttachProcessEnvironment::Dumb => {
+                // The systemd CLI emits OSC 3008 context sequences whenever
+                // its own terminal is non-dumb, including after probe output.
+                command.env("TERM", "dumb");
+                command.env_remove("COLORTERM");
+                command.env_remove("NO_COLOR");
+            }
         }
         Ok(command)
+    }
+
+    /// Construct a command with the selected terminal capability environment.
+    /// The runtime CLI adapter supplies the argv; this type only owns PTY
+    /// process-environment semantics.
+    pub(crate) fn with_terminal_environment(
+        args: Vec<String>,
+        environment: InteractiveShellEnvironment,
+    ) -> Self {
+        Self {
+            kind: TerminalAttachKind::Login,
+            program: "machinectl".to_string(),
+            args,
+            namespace_snapshot: None,
+            process_environment: AttachProcessEnvironment::ExplicitTerminal(environment),
+        }
+    }
+
+    /// Construct a command with a dumb terminal environment for a bounded
+    /// machine probe, so CLI context sequences cannot corrupt its protocol.
+    pub(crate) fn with_dumb_environment(args: Vec<String>) -> Self {
+        Self {
+            kind: TerminalAttachKind::Login,
+            program: "machinectl".to_string(),
+            args,
+            namespace_snapshot: None,
+            process_environment: AttachProcessEnvironment::Dumb,
+        }
     }
 }
 
@@ -173,6 +233,7 @@ fn login_command(name: &MachineName) -> TerminalAttachCommand {
         program: "machinectl".to_string(),
         args: vec!["--".to_string(), "login".to_string(), name.to_string()],
         namespace_snapshot: None,
+        process_environment: AttachProcessEnvironment::Inherited,
     }
 }
 
@@ -232,6 +293,7 @@ fn namespace_command(leader: u32, process: &Path) -> std::io::Result<TerminalAtt
         program: "nsenter".to_string(),
         args,
         namespace_snapshot: Some(snapshot),
+        process_environment: AttachProcessEnvironment::SanitizedNamespace,
     })
 }
 

@@ -14,7 +14,7 @@ Lasper provides a guided interface over native systemd resources. It organizes m
 - **Image provisioning**:
   - Pull OCI registry images through `importctl pull-oci` on systemd 260 or newer as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
   - Bootstrap native Debian, Ubuntu, or Arch systems with `debootstrap` or `pacstrap`.
-- **Hardware passthrough**: Allocate NVIDIA GPU devices (requires `nvidia-container-toolkit`), grant per-user Wayland access, and optionally bind X11 directories for GUI applications.
+- **Host Integration**: Allocate NVIDIA GPU devices (requires `nvidia-container-toolkit`) and grant per-user Wayland access.
 - **Storage backends**: Directory, Btrfs subvolume, and raw sparse image support.
 
 ## Status
@@ -94,6 +94,29 @@ Pass `--version` or `--help` for version info and usage.
 Press `a` or `n` to open the creation wizard.
 
 You can use Lasper's integrated terminal or native systemd tools after creation. For example: `sudo machinectl shell <user>@<machine>`. Containers with a working system bus use `machinectl login`. When Lasper runs as root or with `lasper -e`, a running container without that bus can instead receive a fixed `nsenter` shell through its machined leader PID.
+
+Lasper also provides process-level selected-user shell commands that follow `machinectl shell` and can run a specific guest executable with its arguments:
+
+```bash
+lasper shell user@machine
+lasper shell --quiet user@machine
+lasper shell user@machine -- /usr/bin/kitty --single-instance
+lasper launch user@machine -- /usr/bin/kitty --single-instance
+```
+
+The executable is an absolute guest path and the remaining values are passed as its argv. Wayland probing is enabled by default. When the automatically selected display cannot be discovered or validated, an interactive `lasper shell` retries once without Wayland and prints a concise status line if that fallback succeeds. Detailed diagnostics are shown only if the fallback also fails. An exact `--wayland=DISPLAY` selection remains strict, and `lasper launch` never silently drops its display access. Use `--no-wayland` to request a terminal-only session directly.
+
+`lasper shell` owns an interactive PTY and may use the configured elevated daemon. It prints a single detach hint for every transport; press `Ctrl+]` three times within one second to leave a session whose guest processes keep the PTY open. Pass `--quiet` to suppress this hint and the successful Wayland fallback notice; errors and guest output remain visible. `lasper launch` is intended for `Terminal=false` desktop entries. It always uses the invoking user's authority so machine1 can authenticate through the desktop polkit agent, while `--cli-mode` remains available as the systemd transport. It does not detach or discard output; Lasper forwards the guest PTY to its inherited stdout and waits for the guest command to finish.
+
+A desktop entry example:
+
+```ini
+[Desktop Entry]
+Type=Application
+Name=Kitty (archlinux)
+Exec=lasper launch Lumie@archlinux -- /usr/bin/kitty --single-instance
+Terminal=false
+```
 
 ### Keybindings
 

@@ -21,6 +21,13 @@ use tokio::net::{UnixListener, UnixStream};
 
 const MAX_FD_CONNECTIONS: usize = 32;
 
+#[derive(Clone)]
+struct FdHostContext {
+    trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot,
+    machine_sessions: crate::adapters::session::MachineSessionTransport,
+    invoking_uid: u32,
+}
+
 pub(super) async fn initialize_dbus_backend(
     enabled: bool,
 ) -> Option<crate::adapters::runtime::dbus::DbusBackend> {
@@ -251,6 +258,10 @@ pub async fn daemon_main(
     });
 
     let dbus = initialize_dbus_backend(dbus_enabled).await;
+    let machine_sessions = match dbus.as_ref() {
+        Some(dbus) => crate::adapters::session::MachineSessionTransport::Dbus(dbus.clone()),
+        None => crate::adapters::session::MachineSessionTransport::Cli,
+    };
     let trusted_state_root = crate::adapters::trusted_state::TrustedStateRoot::production();
 
     if let Some(ref dbus) = dbus {
@@ -288,7 +299,11 @@ pub async fn daemon_main(
 
     let fd_slots = Arc::new(tokio::sync::Semaphore::new(MAX_FD_CONNECTIONS));
     let fd_server_state = Arc::clone(&server_state);
-    let fd_state_root = trusted_state_root.clone();
+    let fd_host = FdHostContext {
+        trusted_state_root: trusted_state_root.clone(),
+        machine_sessions: machine_sessions.clone(),
+        invoking_uid: user_uid,
+    };
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -310,7 +325,7 @@ pub async fn daemon_main(
                         fd_auth_token.clone(),
                         auth_log.clone(),
                         Arc::clone(&fd_server_state),
-                        fd_state_root.clone(),
+                        fd_host.clone(),
                         permit,
                     ));
                 }
@@ -329,6 +344,7 @@ pub async fn daemon_main(
         user_uid,
         Arc::clone(&server_state),
         trusted_state_root,
+        machine_sessions,
     )
     .await
     {
@@ -350,7 +366,7 @@ async fn handle_fd_connection(
     expected_auth_token: Arc<str>,
     auth_log: AuthLogLimiter,
     server_state: Arc<DaemonServerState>,
-    trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot,
+    host: FdHostContext,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let actual_peer = match get_peer_credentials(&stream) {
@@ -441,7 +457,15 @@ async fn handle_fd_connection(
         }
     };
 
-    self::fd::handle(std_stream, operation, server_state, trusted_state_root).await;
+    self::fd::handle(
+        std_stream,
+        operation,
+        server_state,
+        host.trusted_state_root,
+        host.machine_sessions,
+        host.invoking_uid,
+    )
+    .await;
 }
 
 pub(crate) use process_state::shutdown_daemon_resources;

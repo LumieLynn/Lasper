@@ -3,7 +3,9 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::application::image_lifecycle::ImageControlOutcome;
+use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
@@ -13,6 +15,7 @@ use crate::domain::runtime::{
 };
 use std::collections::HashMap;
 use std::future::Future;
+use std::os::fd::OwnedFd;
 use std::time::Duration;
 use zbus::proxy::MethodFlags;
 use zbus::zvariant::{self, OwnedObjectPath};
@@ -28,6 +31,13 @@ fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
     (vec![unit], false, false)
 }
 
+fn machine_shell_process(request: &MachineShellRequest) -> (&str, Vec<String>) {
+    request
+        .command()
+        .map(|command| (command.program(), command.argv()))
+        .unwrap_or_else(|| ("", Vec::new()))
+}
+
 #[proxy(
     interface = "org.freedesktop.machine1.Manager",
     default_service = "org.freedesktop.machine1",
@@ -40,6 +50,17 @@ trait Manager {
     ) -> zbus::Result<Vec<(String, String, bool, u64, u64, u64, OwnedObjectPath)>>;
     fn get_machine(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
     fn get_image(&self, name: &str) -> zbus::Result<OwnedObjectPath>;
+    #[zbus(allow_interactive_auth)]
+    fn open_machine_shell(
+        &self,
+        name: &str,
+        user: &str,
+        path: &str,
+        args: Vec<String>,
+        environment: Vec<String>,
+    ) -> zbus::Result<(zvariant::OwnedFd, String)>;
+    #[zbus(allow_interactive_auth)]
+    fn open_machine_login(&self, name: &str) -> zbus::Result<(zvariant::OwnedFd, String)>;
     #[zbus(allow_interactive_auth)]
     fn terminate_machine(&self, name: &str) -> zbus::Result<()>;
     #[zbus(allow_interactive_auth)]
@@ -237,6 +258,134 @@ impl DbusBackend {
             Ok(()) => ImageControlOutcome::Removed,
             Err(error) => map_image_control_error(NspawnError::Dbus(error)),
         }
+    }
+
+    /// Call machine1's `OpenMachineShell` method for a session adapter.
+    ///
+    /// The session layer owns the closed shell/probe request set; this method
+    /// owns only the native D-Bus signature and timeout/error mapping.
+    pub(crate) async fn open_machine_shell(
+        &self,
+        machine: &MachineName,
+        user: &ValidatedGuestUserName,
+        path: &str,
+        args: Vec<String>,
+        environment: Vec<String>,
+    ) -> Result<OwnedFd> {
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let (fd, _path) = self
+            .mutation_with_deadline(
+                generation,
+                "OpenMachineShell",
+                proxy.open_machine_shell(machine.as_str(), user.as_str(), path, args, environment),
+            )
+            .await?;
+        Ok(fd.into())
+    }
+
+    pub(crate) async fn open_machine_login(&self, machine: &MachineName) -> Result<OwnedFd> {
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let (fd, _path) = self
+            .mutation_with_deadline(
+                generation,
+                "OpenMachineLogin",
+                proxy.open_machine_login(machine.as_str()),
+            )
+            .await?;
+        Ok(fd.into())
+    }
+
+    /// Execute a closed machine-session request through machine1.  Request
+    /// construction stays in the session layer; the native D-Bus call and
+    /// its descriptor/error mapping stay here with the runtime adapter.
+    pub(crate) async fn open_machine_session(
+        &self,
+        request: MachineSessionRequest,
+    ) -> Result<crate::adapters::session::MachinePty> {
+        let machine_removed = if let MachineSessionRequest::LoginPrompt(request) = &request {
+            Some(self.watch_login_machine(request.machine()).await?)
+        } else {
+            None
+        };
+        let master = match request {
+            MachineSessionRequest::Shell(request) => {
+                let (path, args) = machine_shell_process(&request);
+                self.open_machine_shell(
+                    request.machine(),
+                    request.user(),
+                    path,
+                    args,
+                    request.environment().assignments(),
+                )
+                .await
+            }
+            MachineSessionRequest::LoginPrompt(request) => {
+                self.open_machine_login(request.machine()).await
+            }
+            MachineSessionRequest::WaylandProbe(request) => {
+                self.open_machine_shell(
+                    request.machine(),
+                    request.user(),
+                    request.path(),
+                    request.args(),
+                    Vec::new(),
+                )
+                .await
+            }
+        }?;
+        Ok(crate::adapters::session::MachinePty {
+            master,
+            machine_removed,
+        })
+    }
+
+    /// Subscribe before opening the PTY so an intervening machine removal
+    /// cannot leave a login forwarder waiting for a getty forever.
+    async fn watch_login_machine(
+        &self,
+        machine: &MachineName,
+    ) -> Result<tokio::sync::oneshot::Receiver<crate::domain::session::SessionLifecycle>> {
+        use crate::domain::session::SessionLifecycle;
+        use futures_util::StreamExt;
+        let (generation, proxy) = self
+            .manager_proxy()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let mut removed = self
+            .query_with_deadline(
+                generation,
+                "login machine removal subscription",
+                proxy.receive_machine_removed(),
+            )
+            .await?;
+        let machine = machine.clone();
+        let (mut tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    event = removed.next() => match event {
+                        Some(event) => {
+                            if event.args().is_ok_and(|args| args.machine() == machine.as_str()) {
+                                let _ = tx.send(SessionLifecycle::Exited { success: true, code: None });
+                                return;
+                            }
+                        }
+                        None => {
+                            let _ = tx.send(SessionLifecycle::Failed("machine removal signal stream closed".into()));
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(rx)
     }
 
     /// Call a method on `org.freedesktop.systemd1.Manager` with
@@ -751,6 +900,54 @@ mod tests {
         assert_eq!(body.0, ["systemd-nspawn@test.service"]);
         assert!(!body.1, "runtime must remain disabled");
         assert!(!body.2, "force must remain disabled");
+    }
+
+    #[test]
+    fn machine1_session_bodies_match_the_upstream_xml_signatures() {
+        let shell = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineShell")
+            .unwrap()
+            .build(&(
+                "demo",
+                "alice",
+                "",
+                Vec::<String>::new(),
+                vec!["WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0"],
+            ))
+            .unwrap();
+        assert_eq!(shell.body().signature().unwrap().as_str(), "sssasas");
+
+        let login = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineLogin")
+            .unwrap()
+            .build(&("demo",))
+            .unwrap();
+        assert_eq!(login.body().signature().unwrap().as_str(), "s");
+    }
+
+    #[test]
+    fn selected_user_command_maps_to_dbus_path_and_complete_argv() {
+        let request = MachineShellRequest::new(
+            MachineName::new("demo").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            crate::adapters::session::MachineShellEnvironment::default(),
+        )
+        .with_command(
+            crate::application::sessions::GuestCommand::new(
+                "/usr/bin/kitty",
+                vec!["--class".into(), "a b".into()],
+            )
+            .unwrap(),
+        );
+
+        let (path, args) = machine_shell_process(&request);
+        assert_eq!(path, "/usr/bin/kitty");
+        assert_eq!(args, ["/usr/bin/kitty", "--class", "a b"]);
+
+        let default_shell = MachineShellRequest::new(
+            MachineName::new("demo").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            crate::adapters::session::MachineShellEnvironment::default(),
+        );
+        assert_eq!(machine_shell_process(&default_shell), ("", Vec::new()));
     }
 
     #[test]

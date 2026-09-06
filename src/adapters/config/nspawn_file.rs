@@ -70,6 +70,10 @@ fn parse_nspawn_bind_line(line: &str) -> Option<NspawnBindSemantics> {
         "BindReadOnly" => true,
         _ => return None,
     };
+    parse_nspawn_bind_value(value, readonly)
+}
+
+fn parse_nspawn_bind_value(value: &str, readonly: bool) -> Option<NspawnBindSemantics> {
     let fields = parse_nspawn_bind_fields(value.trim())?;
     if fields.is_empty() || fields.len() > 3 {
         return None;
@@ -121,6 +125,48 @@ fn validate_machine_name(name: &str) -> Result<()> {
 impl NspawnConfig {
     pub fn default_path(name: &str) -> PathBuf {
         PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
+    }
+
+    /// Find declared targets for this exact host socket, including source
+    /// aliases. Guest paths are configuration data, not provisioning policy.
+    pub(crate) async fn wayland_targets(&self, source: &Path) -> Result<Vec<PathBuf>> {
+        // Preserve nspawn's own `\:` and `\\` path escapes until the bind
+        // codec below has split source, destination, and mount options.
+        let conf = Ini::load_from_str_noescape(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!("failed to parse {}: {error}", self.path.display()))
+        })?;
+        let mut targets = Vec::new();
+        for files in conf.section_all(Some("Files")) {
+            for (key, value) in files.iter() {
+                let readonly = match key {
+                    "Bind" => false,
+                    "BindReadOnly" => true,
+                    _ => continue,
+                };
+                let Some(bind) = parse_nspawn_bind_value(value, readonly) else {
+                    continue;
+                };
+                let bind_source = Path::new(&bind.source);
+                if !bind_source.is_absolute() {
+                    continue;
+                }
+                if bind_source != source
+                    && tokio::fs::canonicalize(bind_source).await.ok().as_deref() != Some(source)
+                {
+                    continue;
+                }
+                let target = PathBuf::from(bind.destination);
+                if !targets.contains(&target) {
+                    if targets.len() >= 16 {
+                        return Err(NspawnError::InvalidConfig(
+                            "too many targets for one Wayland socket".into(),
+                        ));
+                    }
+                    targets.push(target);
+                }
+            }
+        }
+        Ok(targets)
     }
 
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
@@ -889,6 +935,61 @@ mod tests {
             ),
             Some(("/dev/dri/card0".into(), path.into()))
         );
+    }
+
+    #[tokio::test]
+    async fn wayland_targets_match_only_the_selected_source_and_allow_custom_paths() {
+        let config = NspawnConfig {
+            path: PathBuf::from("demo.nspawn"),
+            content: concat!(
+                "[Files]\n",
+                "Bind=/run/user/1000/wayland-0:/custom/display.sock:idmap\n",
+                "Bind=\n",
+                "Bind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\n",
+                "Bind=/run/user/1000/wayland-0:/custom/display.sock:idmap\n",
+                "BindReadOnly=/run/user/1000/wayland-0:/other/display\\:0\n",
+                "[Exec]\nBind=/run/user/1000/wayland-0:/not-a-files-bind\n",
+            )
+            .into(),
+        };
+
+        // Empty Bind= is invalid and ignored by systemd; it is not a reset.
+        assert_eq!(
+            config
+                .wayland_targets(Path::new("/run/user/1000/wayland-0"))
+                .await
+                .unwrap(),
+            vec![
+                PathBuf::from("/custom/display.sock"),
+                PathBuf::from("/other/display:0")
+            ]
+        );
+        assert_eq!(
+            config
+                .wayland_targets(Path::new("/run/user/1000/wayland-1"))
+                .await
+                .unwrap(),
+            vec![PathBuf::from("/run/lasper/wayland/1000/wayland-1")]
+        );
+        assert!(config
+            .wayland_targets(Path::new("/run/user/1000/wayland-2"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn wayland_targets_resolve_source_aliases_and_implicit_destination() {
+        let runtime = tempfile::tempdir().unwrap();
+        let source = runtime.path().join("compositor.sock");
+        std::fs::write(&source, []).unwrap();
+        let alias = runtime.path().join("wayland-1");
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        let config = NspawnConfig {
+            path: PathBuf::from("demo.nspawn"),
+            content: format!("[Files]\nBind={}\n", alias.display()),
+        };
+        assert_eq!(config.wayland_targets(&source).await.unwrap(), vec![alias]);
     }
 
     #[test]

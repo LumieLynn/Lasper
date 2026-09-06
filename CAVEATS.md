@@ -40,11 +40,13 @@ If networking fails, check the host firewall, the container's network services, 
 
 ## NVIDIA and Display Passthrough
 
-NVIDIA passthrough depends on `nvidia-container-toolkit` and the driver's CDI output. WSL and non-standard driver layouts often require host-mirror mode and explicit library-cache refresh inside the container.
+NVIDIA passthrough is derived from `nvidia-container-toolkit` CDI output and materialized as explicit device, executable, library, firmware, and metadata binds in the machine's `.nspawn` configuration. It therefore depends on the installed host driver and toolkit output remaining compatible with the container. Driver upgrades, WSL, and non-standard library layouts may require regenerating the passthrough configuration and refreshing the container's library cache.
 
-Wayland/X11 passthrough exposes host display sockets to the container. Lasper writes helper environment files such as `.wayland-env` and uses bind mounts to make sockets visible inside the container. UID mapping, `PrivateUsers`, and host compositor policy can still prevent GUI applications from working.
+Wayland access is configured per guest user and may include multiple discovered host sockets. During deployment Lasper writes explicit startup-time binds for the selected sockets under `/run/lasper/wayland/<uid>/`; runtime validation also honors an explicitly customized guest destination in the effective `.nspawn` configuration. Lasper does not add a bind to an already running container, so a new or changed grant takes effect only after the machine is started or restarted. Lasper does not currently configure X11 passthrough or write persistent display-environment helper files.
 
-Disabling `PrivateUsers` may make display access easier, but it weakens container isolation. Use it only when you understand the trade-off.
+For `lasper shell`, `lasper launch`, and the TUI's selected-user shell, Lasper uses the current `WAYLAND_DISPLAY` source when one is present, revalidates that host socket, finds every configured bind from that exact source, and probes candidate guest destinations until one has valid identity, access, and matching socket identity. It injects that absolute guest `WAYLAND_DISPLAY` only into the session. A failed probe does not repair a missing or stale bind. Host compositor policy, socket replacement, DAC permissions, and incompatible guest graphics libraries can still prevent a GUI client from connecting.
+
+Wayland grants use an idmapped bind with the default, `yes`, or `pick` user-namespace modes and a non-idmapped bind with `PrivateUsers=no`. They are rejected for `PrivateUsers=managed` and `PrivateUsers=identity`. Choosing `PrivateUsers=no` weakens container isolation and should be an explicit trade-off rather than a generic display workaround.
 
 ## Storage and Image Paths
 

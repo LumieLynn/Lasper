@@ -17,6 +17,96 @@ enum PreparedDetailRefresh {
 }
 
 impl App {
+    pub(crate) async fn show_shell_dialog(&mut self) {
+        let entry = if let Some(image) = self.focused_image_resource() {
+            self.data
+                .entries
+                .iter()
+                .find(|entry| entry.name == image.name)
+                .cloned()
+        } else {
+            self.data.entries.get(self.data.selected).cloned()
+        };
+        let Some(entry) = entry else {
+            self.set_status(
+                "Select a running machine before opening a shell.".into(),
+                crate::tui::StatusLevel::Info,
+            );
+            return;
+        };
+        if entry.state != MachineState::Running {
+            self.set_status(
+                format!("{} is not running.", entry.name),
+                crate::tui::StatusLevel::Info,
+            );
+            return;
+        }
+        let Ok(machine) = MachineName::new(&entry.name) else {
+            self.set_status(
+                format!("{} is not a valid nspawn machine name.", entry.name),
+                crate::tui::StatusLevel::Error,
+            );
+            return;
+        };
+        let wayland_sockets = self
+            .data
+            .session_service
+            .discover_host_wayland_sockets()
+            .await;
+        self.ui.active_dialog = Some(Box::new(
+            crate::tui::widgets::dialogs::shell::ShellDialog::new(
+                machine,
+                String::new(),
+                wayland_sockets,
+            ),
+        ));
+    }
+
+    pub(crate) async fn spawn_terminal_as_user(
+        &mut self,
+        machine: MachineName,
+        user: crate::application::sessions::ValidatedGuestUserName,
+        wayland: crate::application::sessions::WaylandShellRequest,
+    ) -> bool {
+        let Some(entry) = self
+            .data
+            .entries
+            .iter()
+            .find(|entry| entry.name == machine.as_str())
+            .cloned()
+        else {
+            self.set_status(
+                format!("{} is no longer running.", machine),
+                crate::tui::StatusLevel::Warn,
+            );
+            return false;
+        };
+        let rows = self.ui.pane_height.max(10);
+        match self
+            .data
+            .terminal
+            .spawn_as_user(&entry, user.clone(), wayland, rows, &self.ui.app_tx)
+            .await
+        {
+            Ok(_session) => {
+                if !self.ui.focus.is_terminal() {
+                    self.ui.prev_focus = self.ui.focus;
+                }
+                self.set_focus(crate::tui::app::WorkspaceFocus::Terminal);
+                self.request_detail_refresh();
+                self.set_status(
+                    format!("Opened {}@{}", user, machine),
+                    crate::tui::StatusLevel::Info,
+                );
+                true
+            }
+            Err(message) => {
+                self.set_status(message, crate::tui::StatusLevel::Error);
+                false
+            }
+        }
+    }
+
     /// Request a runtime refresh without waiting on host I/O.
     ///
     /// The runtime observer owns the snapshot query and publishes the result
@@ -848,18 +938,18 @@ impl App {
         }
     }
 
-    pub async fn spawn_terminal(&mut self) {
+    fn terminal_entry_for_focus(&mut self) -> Option<crate::domain::runtime::MachineEntry> {
         let entry = if self.focused_image_resource().is_some() {
             let Some(image) = self.focused_image_resource().cloned() else {
                 self.set_status("No image selected.".into(), crate::tui::StatusLevel::Warn);
-                return;
+                return None;
             };
             if image.is_hidden() {
                 self.set_status(
                     "Internal images do not provide terminal sessions.".into(),
                     crate::tui::StatusLevel::Info,
                 );
-                return;
+                return None;
             }
             let Some(machine_idx) = self
                 .data
@@ -871,7 +961,7 @@ impl App {
                     format!("{} is not running.", image.name),
                     crate::tui::StatusLevel::Info,
                 );
-                return;
+                return None;
             };
             let machine = self.data.entries[machine_idx].clone();
             if machine.state != MachineState::Running {
@@ -883,15 +973,45 @@ impl App {
                     ),
                     crate::tui::StatusLevel::Info,
                 );
-                return;
+                return None;
             }
             self.data.selected = machine_idx;
             machine
         } else {
-            let Some(entry) = self.data.entries.get(self.data.selected).cloned() else {
-                return;
-            };
-            entry
+            self.data.entries.get(self.data.selected).cloned()?
+        };
+        Some(entry)
+    }
+
+    pub async fn spawn_shell_prompt(&mut self) {
+        let Some(entry) = self.terminal_entry_for_focus() else {
+            return;
+        };
+        if !self.ui.focus.is_terminal() {
+            self.ui.prev_focus = self.ui.focus;
+        }
+        let rows = self.ui.pane_height.max(10);
+        match self
+            .data
+            .terminal
+            .spawn_shell_prompt(&entry, rows, &self.ui.app_tx)
+            .await
+        {
+            Ok(_) => {
+                self.set_focus(crate::tui::app::WorkspaceFocus::Terminal);
+                self.request_detail_refresh();
+                self.set_status(
+                    format!("Opened shell prompt for {}", entry.name),
+                    crate::tui::StatusLevel::Info,
+                );
+            }
+            Err(msg) => self.set_status(msg, crate::tui::StatusLevel::Error),
+        }
+    }
+
+    pub async fn spawn_terminal(&mut self) {
+        let Some(entry) = self.terminal_entry_for_focus() else {
+            return;
         };
         if !self.ui.focus.is_terminal() {
             self.ui.prev_focus = self.ui.focus;

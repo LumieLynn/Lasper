@@ -107,6 +107,9 @@ pub struct AppUi {
 
     pub show_wizard: bool,
     pub show_help: bool,
+    /// Transient which-key style action layer entered from a workspace panel.
+    /// The component owns its focus state and is removed when the layer closes.
+    pub leader: Option<crate::tui::widgets::leader::LeaderOverlay>,
     pub resource_action_menu: Option<crate::tui::widgets::resource_action_menu::ResourceActionMenu>,
     pub pane_height: u16,
 
@@ -146,6 +149,7 @@ impl AppUi {
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
+            leader: None,
             resource_action_menu: None,
             pane_height: 10,
             wizard: None,
@@ -182,8 +186,24 @@ impl AppUi {
             Some(ModalLayer::Wizard)
         } else if self.resource_action_menu.is_some() {
             Some(ModalLayer::ResourceActionMenu)
+        } else if self.leader.is_some() {
+            Some(ModalLayer::Leader)
         } else {
             None
+        }
+    }
+
+    pub fn leader_active(&self) -> bool {
+        self.leader.as_ref().is_some_and(Component::is_focused)
+    }
+
+    pub fn open_leader(&mut self) {
+        self.leader = Some(crate::tui::widgets::leader::LeaderOverlay::new());
+    }
+
+    pub fn close_leader(&mut self) {
+        if let Some(mut leader) = self.leader.take() {
+            leader.set_focus(false);
         }
     }
 }
@@ -319,6 +339,9 @@ impl App {
     /// Set focus while keeping the last non-terminal destination available
     /// for restoring focus when the terminal is closed or hidden.
     pub(crate) fn set_focus(&mut self, focus: WorkspaceFocus) {
+        if self.ui.leader_active() && self.ui.focus != focus {
+            self.ui.close_leader();
+        }
         if !focus.is_terminal() {
             self.ui.prev_focus = focus;
         }
@@ -1663,7 +1686,9 @@ mod tests {
 
     mod focus_and_modal_input {
         use super::*;
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
         use ratatui::layout::Rect;
 
         fn app_with_machine_and_image() -> App {
@@ -1672,6 +1697,61 @@ mod tests {
             app.data.images = vec![make_image("image")];
             app.set_focus(WorkspaceFocus::Machines);
             app
+        }
+
+        #[tokio::test]
+        async fn detail_focus_space_enters_a_one_level_leader_keymap() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::MachineInspector);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.leader_active());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                .await;
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.resource_action_menu.is_none());
+        }
+
+        #[tokio::test]
+        async fn leader_escape_only_closes_the_transient_keymap() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::MachineInspector);
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .await;
+
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.active_dialog.is_none());
+        }
+
+        #[tokio::test]
+        async fn list_focus_enters_the_same_leader_keymap() {
+            let mut app = app_with_machine_and_image();
+            for focus in [WorkspaceFocus::Machines, WorkspaceFocus::Images] {
+                app.set_focus(focus);
+                app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                    .await;
+                assert!(app.ui.leader_active());
+                assert_eq!(app.ui.modal_layer(), Some(ModalLayer::Leader));
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .await;
+                assert!(!app.ui.leader_active());
+            }
+        }
+
+        #[test]
+        fn changing_workspace_focus_destroys_the_leader_component() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::Machines);
+            app.ui.open_leader();
+            assert!(app.ui.leader_active());
+
+            app.set_focus(WorkspaceFocus::Images);
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.leader.is_none());
         }
 
         #[test]

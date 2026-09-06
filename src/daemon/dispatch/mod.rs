@@ -26,6 +26,7 @@ pub(super) async fn run_rpc_request_pump<R, B>(
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
+    machine_sessions: crate::adapters::session::MachineSessionTransport,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -147,6 +148,7 @@ where
         let out_tx = out_tx.clone();
         let server_state = Arc::clone(&server_state);
         let trusted_state_root = trusted_state_root.clone();
+        let machine_sessions = machine_sessions.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _reservation = reservation;
@@ -158,6 +160,7 @@ where
                 invoking_uid,
                 Arc::clone(&server_state),
                 trusted_state_root,
+                machine_sessions,
             )
             .await
             {
@@ -243,6 +246,7 @@ pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecuto
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
+    machine_sessions: crate::adapters::session::MachineSessionTransport,
 ) -> HandleOutcome {
     let RpcRequest {
         id, method, params, ..
@@ -287,6 +291,8 @@ pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecuto
             super::sessions::SessionContext {
                 params,
                 server_state,
+                machine: machine_sessions,
+                invoking_uid,
             },
         )
         .await;

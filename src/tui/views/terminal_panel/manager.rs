@@ -1,7 +1,9 @@
 //! Terminal session management.
 
 use crate::application::sessions::{
-    SessionSendStatus, SessionService, TerminalSessionHandle, TerminalSessionInput,
+    terminal_session_channel, InteractiveShellEnvironment, SessionSendStatus, SessionService,
+    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
+    ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
@@ -12,6 +14,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent,
 use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+use super::shell_prompt::run_builtin_shell_prompt;
 
 #[cfg(target_os = "linux")]
 use arboard::SetExtLinux;
@@ -28,7 +32,7 @@ pub struct TextSelection {
 
 pub struct TerminalSession {
     pub machine_name: String,
-    pub attach_kind: TerminalAttachmentKind,
+    pub guest_user: Option<ValidatedGuestUserName>,
     pub terminal: Arc<parking_lot::Mutex<crate::tui::term::Parser>>,
     pub input: TerminalSessionInput,
     pub handle: TerminalSessionHandle,
@@ -155,6 +159,28 @@ impl TerminalManager {
         self.sessions.get(self.active_idx)
     }
 
+    pub(crate) fn tab_label(&self, index: usize) -> String {
+        let Some(session) = self.sessions.get(index) else {
+            return String::new();
+        };
+        let base = session.label();
+        let duplicate_count = self
+            .sessions
+            .iter()
+            .filter(|candidate| candidate.label() == base)
+            .count();
+        if duplicate_count < 2 {
+            return base;
+        }
+        let ordinal = self
+            .sessions
+            .iter()
+            .take(index + 1)
+            .filter(|candidate| candidate.label() == base)
+            .count();
+        format!("{base} #{ordinal}")
+    }
+
     pub fn clear_redraw_pending(&self) {
         self.redraw_gate.clear();
     }
@@ -173,6 +199,33 @@ impl TerminalManager {
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_with_user(entry, None, WaylandShellRequest::Disabled, rows, app_tx)
+            .await
+    }
+
+    pub async fn spawn_as_user(
+        &mut self,
+        entry: &MachineEntry,
+        user: ValidatedGuestUserName,
+        wayland: WaylandShellRequest,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_with_user(entry, Some(user), wayland, rows, app_tx)
+            .await
+    }
+
+    /// Start Lasper's embedded selected-user shell loop.  The first tab state
+    /// is a local username prompt; after a valid account is entered the same
+    /// session bridges to `OpenMachineShell`/`machinectl shell`.  This keeps
+    /// the prompt independent from the host login/getty path and allows every
+    /// invocation to create another tab.
+    pub async fn spawn_shell_prompt(
+        &mut self,
+        entry: &MachineEntry,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
         if !entry.access().is_nspawn() {
             return Err(format!(
                 "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
@@ -183,31 +236,72 @@ impl TerminalManager {
             return Err(format!("Machine {} is not running", entry.name));
         }
 
-        // Re-use existing session if one is already open for this container.
-        if let Some(idx) = self.sessions.iter().position(|session| {
-            session.machine_name == entry.name && session.handle.lifecycle().is_running()
-        }) {
-            self.active_idx = idx;
-            self.show = true;
-            return Ok(SpawnedTerminalSession {
-                attach_kind: self.sessions[idx].attach_kind,
-            });
-        }
+        let tx = app_tx
+            .as_ref()
+            .ok_or_else(|| "Internal error: app_tx not set".to_string())?;
+        let machine = MachineName::new(&entry.name)
+            .map_err(|error| format!("Invalid machine name: {error}"))?;
+        let size = SessionSize::new(80, rows)
+            .map_err(|error| format!("Invalid terminal size: {error}"))?;
+        let id = self.session_service.allocate_id();
+        let (mut handle, endpoint) = terminal_session_channel(id, TerminalAttachmentKind::Login);
+        let input = handle.input();
+        let output = handle
+            .take_output()
+            .ok_or_else(|| "Internal error: terminal output already attached".to_string())?;
+        let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
+            rows, 80, 10000,
+        )));
+        terminal.lock().screen.suppress_initial_line_breaks();
+        let service = Arc::clone(&self.session_service);
+        tokio::spawn(run_builtin_shell_prompt(endpoint, service, machine, size));
+        let output_task = spawn_output_parser(
+            output,
+            Arc::clone(&terminal),
+            input.clone(),
+            tx.clone(),
+            self.redraw_gate.clone(),
+        );
+        let session = TerminalSession {
+            machine_name: entry.name.clone(),
+            guest_user: None,
+            terminal,
+            input,
+            handle,
+            output_task,
+            scroll_offset: 0,
+            insert_mode: true,
+            selection: TextSelection::default(),
+            yanked: false,
+            queued_size: Some((80, rows)),
+            resize_channel_closed: false,
+            mouse_capture: false,
+        };
+        self.sessions.push(session);
+        self.tab_hitboxes.clear();
+        self.active_idx = self.sessions.len() - 1;
+        self.show = true;
+        Ok(SpawnedTerminalSession {
+            attach_kind: TerminalAttachmentKind::Login,
+        })
+    }
 
-        if let Some(idx) = self
-            .sessions
-            .iter()
-            .position(|session| session.machine_name == entry.name)
-        {
-            let mut stale = self.sessions.remove(idx);
-            self.tab_hitboxes.clear();
-            stale.handle.close();
-            stale.output_task.abort();
-            if self.active_idx > idx {
-                self.active_idx -= 1;
-            } else if self.active_idx >= self.sessions.len() && !self.sessions.is_empty() {
-                self.active_idx = self.sessions.len() - 1;
-            }
+    async fn spawn_with_user(
+        &mut self,
+        entry: &MachineEntry,
+        user: Option<ValidatedGuestUserName>,
+        wayland: WaylandShellRequest,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+    ) -> Result<SpawnedTerminalSession, String> {
+        if !entry.access().is_nspawn() {
+            return Err(format!(
+                "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
+                entry.name
+            ));
+        }
+        if entry.state != crate::domain::runtime::MachineState::Running {
+            return Err(format!("Machine {} is not running", entry.name));
         }
 
         let tx = app_tx
@@ -219,11 +313,26 @@ impl TerminalManager {
             .map_err(|error| format!("Invalid machine name: {error}"))?;
         let size = SessionSize::new(cols, rows)
             .map_err(|error| format!("Invalid terminal size: {error}"))?;
-        let mut handle = self
-            .session_service
-            .open_terminal(machine, size)
-            .await
-            .map_err(|error| format!("Failed to attach terminal: {error}"))?;
+        let mut handle = match user.clone() {
+            Some(user) => {
+                let intent = ShellOpenIntent::new(
+                    ShellTarget::new(machine, user),
+                    wayland,
+                    InteractiveShellEnvironment::embedded(),
+                    size,
+                );
+                self.session_service
+                    .open_shell(intent)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+            None => self
+                .session_service
+                .open_terminal(machine, size)
+                .await
+                .map_err(|error| error.to_string()),
+        }
+        .map_err(|error| format!("Failed to attach terminal: {error}"))?;
         let attach_kind = handle.attachment();
         log::debug!(
             "opened terminal session {} for {}",
@@ -237,6 +346,7 @@ impl TerminalManager {
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
             rows, cols, 10000,
         )));
+        terminal.lock().screen.suppress_initial_line_breaks();
         let output_task = spawn_output_parser(
             output,
             Arc::clone(&terminal),
@@ -247,7 +357,7 @@ impl TerminalManager {
 
         let session = TerminalSession {
             machine_name: entry.name.clone(),
-            attach_kind,
+            guest_user: user,
             terminal,
             input,
             handle,
@@ -611,6 +721,13 @@ impl TerminalManager {
 }
 
 impl TerminalSession {
+    pub(crate) fn label(&self) -> String {
+        match &self.guest_user {
+            Some(user) => format!("{}@{}", user, self.machine_name),
+            None => self.machine_name.clone(),
+        }
+    }
+
     pub fn is_insert_mode(&self) -> bool {
         self.insert_mode && self.handle.lifecycle().is_running()
     }
@@ -771,14 +888,83 @@ mod tests {
     };
     use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
     use crate::application::sessions::{
-        terminal_session_channel, SessionService, TERMINAL_COMMAND_CAPACITY,
+        journal_session_channel, terminal_session_channel, JournalSessionHandle,
+        JournalSessionRequest, SessionError, SessionPort, SessionService, TerminalSessionHandle,
+        TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
+        TERMINAL_COMMAND_CAPACITY,
     };
+    use crate::domain::machine::MachineName;
     use crate::domain::runtime::{MachineEntry, MachineState};
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use crate::tui::views::title_tabs::TitleTabHitbox;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    struct RejectingWaylandPort {
+        prepare_calls: AtomicUsize,
+        open_calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionPort for RejectingWaylandPort {
+        async fn discover_host_wayland_sockets(
+            &self,
+        ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+            Vec::new()
+        }
+
+        async fn automatic_wayland(
+            &self,
+            _machine: &MachineName,
+        ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+            Ok(None)
+        }
+
+        async fn open_terminal(
+            &self,
+            request: TerminalSessionRequest,
+        ) -> Result<TerminalSessionHandle, SessionError> {
+            self.open_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
+        }
+
+        async fn prepare_wayland(
+            &self,
+            _request: WaylandPreparationRequest,
+        ) -> Result<WaylandSessionContext, SessionError> {
+            self.prepare_calls.fetch_add(1, Ordering::Relaxed);
+            Err(SessionError::new("configured Wayland target is stale"))
+        }
+
+        async fn open_journal(
+            &self,
+            request: JournalSessionRequest,
+        ) -> Result<JournalSessionHandle, SessionError> {
+            Ok(journal_session_channel(request.id).0)
+        }
+    }
+
+    fn host_socket() -> crate::domain::wayland::HostWaylandSocket {
+        crate::domain::wayland::HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap(),
+            PathBuf::from("/run/user/1000"),
+            PathBuf::from("/run/user/1000/wayland-0"),
+            1000,
+            1000,
+            1000,
+            0o700,
+            crate::domain::wayland::SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap()
+    }
 
     fn terminal_channels() -> (
         crate::application::sessions::TerminalSessionHandle,
@@ -800,7 +986,7 @@ mod tests {
         (
             TerminalSession {
                 machine_name: machine_name.into(),
-                attach_kind: TerminalAttachmentKind::Login,
+                guest_user: None,
                 terminal: Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
                     24, 80, 100,
                 ))),
@@ -876,6 +1062,8 @@ mod tests {
     async fn spawn_rejects_transitional_machine_states() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut manager = TerminalManager::new(service);
@@ -896,9 +1084,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explicitly_selected_wayland_does_not_fall_back_to_a_plain_shell() {
+        let port = Arc::new(RejectingWaylandPort {
+            prepare_calls: AtomicUsize::new(0),
+            open_calls: AtomicUsize::new(0),
+        });
+        let service = Arc::new(SessionService::new(port.clone()));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut manager = TerminalManager::new(service);
+        let entry = MachineEntry {
+            name: "demo".into(),
+            class: MachineEntry::NSPAWN_CLASS.into(),
+            service: MachineEntry::NSPAWN_SERVICE.into(),
+            state: MachineState::Running,
+            addresses: Default::default(),
+        };
+
+        let error = manager
+            .spawn_as_user(
+                &entry,
+                crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
+                crate::application::sessions::WaylandShellRequest::SelectedHostDisplay(
+                    host_socket(),
+                ),
+                24,
+                &Some(tx),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("configured Wayland target is stale"));
+        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(port.open_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn duplicate_terminal_tabs_receive_stable_ordinals() {
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))));
+        let mut manager = TerminalManager::new(service);
+        let (first, _first_endpoint) = test_session(1, "demo");
+        let (second, _second_endpoint) = test_session(2, "demo");
+        manager.sessions = vec![first, second];
+
+        assert_eq!(manager.tab_label(0), "demo #1");
+        assert_eq!(manager.tab_label(1), "demo #2");
+    }
+
+    #[tokio::test]
     async fn terminal_tab_click_selects_the_session_and_machine() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service);
         let (first, _first_endpoint) = test_session(1, "first");

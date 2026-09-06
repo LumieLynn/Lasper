@@ -1,10 +1,13 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::session::terminal_attach::TerminalAttachCommand;
+use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 use serde::Deserialize;
+use std::io;
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -104,6 +107,57 @@ impl CliBackend {
         self.runtime_machines_dir = path;
         self
     }
+}
+
+/// Encode one of the closed machine-session requests as a `machinectl`
+/// command.  This is a runtime transport operation: the session layer owns
+/// the request semantics, while this module owns the CLI wire shape.
+pub(crate) fn machine_session_command(
+    request: MachineSessionRequest,
+) -> io::Result<TerminalAttachCommand> {
+    match request {
+        MachineSessionRequest::Shell(request) => selected_user_shell(request),
+        MachineSessionRequest::LoginPrompt(request) => Ok(
+            crate::adapters::session::terminal_attach::login(request.machine()),
+        ),
+        MachineSessionRequest::WaylandProbe(request) => wayland_probe(request),
+    }
+}
+
+fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttachCommand> {
+    let terminal = request.environment().terminal_environment().clone();
+    let mut args = vec!["--quiet".to_string()];
+    args.extend(
+        request
+            .environment()
+            .assignments()
+            .into_iter()
+            .map(|assignment| format!("--setenv={assignment}")),
+    );
+    args.extend([
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ]);
+    if let Some(command) = request.command() {
+        args.extend(command.argv());
+    }
+    Ok(TerminalAttachCommand::with_terminal_environment(
+        args, terminal,
+    ))
+}
+
+fn wayland_probe(
+    request: crate::adapters::session::WaylandProbeRequest,
+) -> io::Result<TerminalAttachCommand> {
+    let mut args = vec![
+        "--quiet".to_string(),
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ];
+    args.extend(request.args());
+    Ok(TerminalAttachCommand::with_dumb_environment(args))
 }
 
 #[async_trait::async_trait]
@@ -401,8 +455,15 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 mod tests {
     use super::*;
     use crate::adapters::process::MockCommandRunner;
+    use crate::adapters::session::{
+        MachineShellEnvironment, MachineShellRequest, WaylandProbeRequest,
+    };
+    use crate::application::sessions::{
+        GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
+    };
     use crate::domain::runtime::MachineState;
     use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::process::Output;
 
     fn mock_output(status: bool, stdout: &str, stderr: &str) -> Output {
@@ -430,6 +491,158 @@ mod tests {
                 dbus_object_path: None,
             }],
         )
+    }
+
+    #[test]
+    fn selected_user_shell_is_a_fixed_machinectl_argv() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("1000").unwrap();
+        let request = MachineSessionRequest::shell(MachineShellRequest::new(
+            name,
+            user,
+            MachineShellEnvironment::default(),
+        ));
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(
+            command.kind(),
+            crate::domain::session::TerminalAttachmentKind::Login
+        );
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "1000@test-machine"
+            ]
+        );
+    }
+
+    #[test]
+    fn login_prompt_uses_machinectl_login_without_shell_arguments() {
+        let command = machine_session_command(MachineSessionRequest::login_prompt(
+            MachineName::new("test-machine").unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(command.args(), ["--", "login", "test-machine"]);
+    }
+
+    #[test]
+    fn selected_user_shell_appends_guest_command_argv_without_requoting() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+        let request = MachineSessionRequest::shell(
+            MachineShellRequest::new(name, user, MachineShellEnvironment::default()).with_command(
+                GuestCommand::new(
+                    "/usr/bin/kitty",
+                    vec!["--class".into(), "a b".into(), "".into()],
+                )
+                .unwrap(),
+            ),
+        );
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/usr/bin/kitty",
+                "--class",
+                "a b",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_user_shell_forwards_the_typed_terminal_and_wayland_environment() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+        let terminal = InteractiveShellEnvironment::new(
+            "xterm-kitty".into(),
+            Some("truecolor".into()),
+            Some(String::new()),
+        )
+        .unwrap();
+        let environment = MachineShellEnvironment::shell(
+            terminal,
+            Some(Path::new("/run/lasper/wayland/1000/wayland-1")),
+        )
+        .unwrap();
+        let request =
+            MachineSessionRequest::shell(MachineShellRequest::new(name, user, environment));
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=xterm-kitty",
+                "--setenv=COLORTERM=truecolor",
+                "--setenv=NO_COLOR=",
+                "--setenv=WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-1",
+                "--",
+                "shell",
+                "alice@test-machine",
+            ]
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-kitty"))
+        );
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(command.get_env("NO_COLOR"), Some(std::ffi::OsStr::new("")));
+    }
+
+    #[test]
+    fn machinectl_probe_preserves_the_fixed_program_and_argument_boundaries() {
+        let request = WaylandProbeRequest::target(
+            MachineName::new("test-machine").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        )
+        .unwrap();
+
+        let command =
+            machine_session_command(MachineSessionRequest::wayland_probe(request)).unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            &command.args()[..6],
+            [
+                "--quiet",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/bin/sh",
+                "-c"
+            ]
+        );
+        assert_eq!(
+            command.args().last().map(String::as_str),
+            Some("/run/lasper/wayland/1000/wayland-1")
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
+        assert_eq!(command.get_env("COLORTERM"), None);
+        assert_eq!(command.get_env("NO_COLOR"), None);
     }
 
     #[test]

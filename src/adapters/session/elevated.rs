@@ -1,10 +1,13 @@
 use crate::adapters::elevated::{pipe_reader, ElevatedDaemon};
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, TerminalSessionHandle, TerminalSessionRequest,
+    SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
+    WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::session::SessionLifecycle;
+use crate::ipc::protocol::session::WireTerminalLaunch;
 use async_trait::async_trait;
+use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 
@@ -20,24 +23,72 @@ impl ElevatedSessionAdapter {
 
 #[async_trait]
 impl SessionPort for ElevatedSessionAdapter {
+    async fn automatic_wayland(
+        &self,
+        machine: &crate::domain::machine::MachineName,
+    ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+        super::wayland::automatic_wayland(
+            &crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(&self.daemon)),
+            machine,
+        )
+        .await
+    }
+
+    async fn discover_host_wayland_sockets(
+        &self,
+    ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+        crate::adapters::platform::capabilities::discover_wayland_sockets().await
+    }
+
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
     ) -> Result<TerminalSessionHandle, SessionError> {
+        let TerminalSessionRequest {
+            id,
+            machine,
+            size,
+            launch,
+        } = request;
+        let launch = match launch {
+            TerminalLaunch::LoginPrompt => WireTerminalLaunch::LoginPrompt,
+            TerminalLaunch::SelectedUserShell {
+                user,
+                environment,
+                command,
+            } => WireTerminalLaunch::SelectedUserShell {
+                user,
+                terminal: Box::new(environment.terminal_environment().clone()),
+                wayland: environment
+                    .wayland_context()
+                    .map(|context| context.host_socket().clone()),
+                command: command.map(Into::into),
+            },
+        };
         let spawned = self
             .daemon
-            .spawn_terminal(request.id.get(), request.machine.as_str(), request.size)
+            .spawn_terminal(id.get(), machine.as_str(), size, launch)
             .await
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
-        let lifecycle = spawned.lifecycle;
+        let Some(lifecycle) = spawned.lifecycle else {
+            let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(spawned.master_fd) };
+            return crate::adapters::session::pty::spawn_machine_terminal(
+                super::MachinePty {
+                    master,
+                    machine_removed: spawned.machine_removed,
+                },
+                id,
+                size,
+            );
+        };
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,
-            request.id,
+            id,
             spawned.attach_kind,
         ) {
             Ok(session) => session,
             Err(error) => {
-                if let Err(close_error) = self.daemon.close_session(request.id.get()).await {
+                if let Err(close_error) = self.daemon.close_session(id.get()).await {
                     log::warn!(
                         "failed to close elevated terminal after local setup error: {close_error}"
                     );
@@ -51,7 +102,7 @@ impl SessionPort for ElevatedSessionAdapter {
                 close = control.close => {
                     if close.is_ok() {
                         let _ = control.lifecycle.send(SessionLifecycle::Closed);
-                        if let Err(error) = daemon.close_session(request.id.get()).await {
+                        if let Err(error) = daemon.close_session(id.get()).await {
                             log::warn!("failed to close elevated terminal session: {error}");
                         }
                     }
@@ -69,6 +120,13 @@ impl SessionPort for ElevatedSessionAdapter {
             }
         });
         Ok(handle)
+    }
+
+    async fn prepare_wayland(
+        &self,
+        request: WaylandPreparationRequest,
+    ) -> Result<WaylandSessionContext, SessionError> {
+        self.daemon.prepare_wayland(request).await
     }
 
     async fn open_journal(

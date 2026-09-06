@@ -15,9 +15,7 @@ use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::domain::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
-use crate::domain::wayland::{
-    HostWaylandSocket, WaylandDisplay, WaylandGrantIntent, WaylandValidationError,
-};
+use crate::domain::wayland::{HostWaylandSocket, WaylandGrantIntent, WaylandValidationError};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -385,23 +383,16 @@ impl StorageState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WaylandAccessDraft {
     pub sockets: Vec<HostWaylandSocket>,
-    pub default_display: WaylandDisplay,
 }
 
 impl WaylandAccessDraft {
-    pub fn new(
-        sockets: Vec<HostWaylandSocket>,
-        default_display: WaylandDisplay,
-    ) -> Result<Self, WaylandValidationError> {
-        WaylandGrantIntent::new("draft-user", sockets.clone(), default_display.clone())?;
-        Ok(Self {
-            sockets,
-            default_display,
-        })
+    pub fn new(sockets: Vec<HostWaylandSocket>) -> Result<Self, WaylandValidationError> {
+        WaylandGrantIntent::new("draft-user", sockets.clone())?;
+        Ok(Self { sockets })
     }
 
     pub fn intent_for(&self, username: &str) -> WaylandGrantIntent {
-        WaylandGrantIntent::new(username, self.sockets.clone(), self.default_display.clone())
+        WaylandGrantIntent::new(username, self.sockets.clone())
             .expect("Wayland draft invariants were checked when it was created")
     }
 
@@ -979,7 +970,7 @@ mod tests {
             },
         )
         .unwrap();
-        WaylandAccessDraft::new(vec![source.clone()], source.display().clone()).unwrap()
+        WaylandAccessDraft::new(vec![source]).unwrap()
     }
 
     fn test_source_state() -> SourceState {
