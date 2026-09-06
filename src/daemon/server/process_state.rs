@@ -36,7 +36,12 @@ pub(crate) async fn shutdown_daemon_resources(server_state: &DaemonServerState) 
         return;
     }
 
-    tokio::time::sleep(DAEMON_SHUTDOWN_GRACE).await;
+    if server_state
+        .wait_for_sessions_to_finish(DAEMON_SHUTDOWN_GRACE)
+        .await
+    {
+        return;
+    }
 
     for process in server_state.session_processes() {
         if let Err(error) = server_state.signal_session_process(&process, libc::SIGKILL) {
@@ -79,5 +84,29 @@ mod tests {
         assert_eq!(tokio::time::Instant::now() - started, DAEMON_SHUTDOWN_GRACE);
         let _ = child.wait();
         state.finish(id, &process);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_returns_as_soon_as_the_last_session_is_reaped() {
+        let state = DaemonServerState::default();
+        let id = WireSessionId::new(2).unwrap();
+        let mut command = crate::adapters::process::new_sync_command("sleep");
+        command.arg("30").process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process = state.register(id, child.id()).unwrap();
+        let started = tokio::time::Instant::now();
+        let mut shutdown = Box::pin(shutdown_daemon_resources(&state));
+
+        tokio::select! {
+            biased;
+            () = &mut shutdown => panic!("shutdown completed while a session was registered"),
+            () = tokio::task::yield_now() => {}
+        }
+        state.finish(id, &process);
+        shutdown.await;
+
+        assert_eq!(tokio::time::Instant::now(), started);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

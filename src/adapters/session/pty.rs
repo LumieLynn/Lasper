@@ -82,7 +82,7 @@ pub(crate) fn spawn_fd_terminal(
 }
 
 /// Login PTYs survive getty hangups until machine removal or explicit close.
-/// Shell PTYs finish after a sustained hangup, allowing startup/reset gaps.
+/// Shell PTYs finish as soon as the remote side hangs up, matching machinectl.
 pub(crate) fn spawn_machine_terminal(
     pty: super::MachinePty,
     id: SessionId,
@@ -125,25 +125,11 @@ pub(crate) fn spawn_machine_terminal(
             }
         };
         tokio::pin!(removed);
-        let started = tokio::time::Instant::now();
-        let mut hangup_since = None;
         let mut read_retry_at = None;
         let mut write_retry_at = None;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut buffer = [0u8; 4096];
         let state = loop {
-            let now = tokio::time::Instant::now();
-            if !login
-                && hangup_since.is_some_and(|since| {
-                    now.duration_since(since) >= std::time::Duration::from_millis(250)
-                })
-                && now.duration_since(started) >= std::time::Duration::from_secs(1)
-            {
-                break SessionLifecycle::Exited {
-                    success: true,
-                    code: None,
-                };
-            }
             tokio::select! {
                 _ = &mut close => break SessionLifecycle::Closed,
                 state = &mut removed => break state,
@@ -163,11 +149,13 @@ pub(crate) fn spawn_machine_terminal(
                 },
                 (result, read_closed) = read_machine_pty(&master, &mut buffer), if read_retry_at.is_none() => match result {
                     Ok(0) => {
-                        hangup_since.get_or_insert(tokio::time::Instant::now());
-                        read_retry_at = Some(machine_pty_retry_deadline());
+                        if login {
+                            read_retry_at = Some(machine_pty_retry_deadline());
+                        } else {
+                            break SessionLifecycle::Exited { success: true, code: None };
+                        }
                     }
                     Ok(count) => {
-                        hangup_since = None;
                         tokio::select! {
                             _ = &mut close => break SessionLifecycle::Closed,
                             state = &mut removed => break state,
@@ -177,13 +165,19 @@ pub(crate) fn spawn_machine_terminal(
                         }
                     }
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                        hangup_since.get_or_insert(tokio::time::Instant::now());
-                        read_retry_at = Some(machine_pty_retry_deadline());
+                        if login {
+                            read_retry_at = Some(machine_pty_retry_deadline());
+                        } else {
+                            break SessionLifecycle::Exited { success: true, code: None };
+                        }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        hangup_since = None;
                         if read_closed {
-                            read_retry_at = Some(machine_pty_retry_deadline());
+                            if login {
+                                read_retry_at = Some(machine_pty_retry_deadline());
+                            } else {
+                                break SessionLifecycle::Exited { success: true, code: None };
+                            }
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {},
@@ -613,26 +607,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn machine_shell_recovers_a_reset_hangup_after_initial_output() {
-        let (master, mut slave, path) = machine_pty();
+    async fn machine_shell_honors_hangup_after_initial_output() {
+        let (master, mut slave, _) = machine_pty();
         let mut handle = open_test_machine(master, None);
         let mut output = handle.take_output().unwrap();
-        slave.write_all(b"reset").unwrap();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(1), output.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            b"reset"
-        );
-        drop(slave);
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(handle.lifecycle().is_running());
-        let mut slave = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
-            .open(&path)
-            .unwrap();
         slave.write_all(b"shell ready").unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), output.recv())
@@ -642,10 +620,10 @@ mod tests {
             b"shell ready"
         );
         drop(slave);
-        assert!(matches!(
-            wait_until_finished(&handle).await,
-            SessionLifecycle::Exited { .. }
-        ));
+        let state = tokio::time::timeout(Duration::from_millis(500), wait_until_finished(&handle))
+            .await
+            .expect("D-Bus shell retained a closed PTY");
+        assert!(matches!(state, SessionLifecycle::Exited { .. }));
     }
 
     #[tokio::test]
@@ -653,10 +631,10 @@ mod tests {
         let (master, slave, _) = machine_pty();
         let handle = open_test_machine(master, None);
         drop(slave);
-        assert!(matches!(
-            wait_until_finished(&handle).await,
-            SessionLifecycle::Exited { .. }
-        ));
+        let state = tokio::time::timeout(Duration::from_millis(500), wait_until_finished(&handle))
+            .await
+            .expect("D-Bus shell retained an initially closed PTY");
+        assert!(matches!(state, SessionLifecycle::Exited { .. }));
     }
 
     #[tokio::test]
