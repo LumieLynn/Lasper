@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 pub enum ExecutionRoute {
     DirectDbus,
     ElevatedDbus,
-    LocalCli,
-    ElevatedCli,
+    LocalSystemdTools,
+    ElevatedSystemdTools,
 }
 
 impl ExecutionRoute {
@@ -18,8 +18,8 @@ impl ExecutionRoute {
         match self {
             Self::DirectDbus => "direct D-Bus",
             Self::ElevatedDbus => "elevated D-Bus",
-            Self::LocalCli => "local CLI",
-            Self::ElevatedCli => "elevated CLI",
+            Self::LocalSystemdTools => "local systemd tools",
+            Self::ElevatedSystemdTools => "elevated systemd tools",
         }
     }
 }

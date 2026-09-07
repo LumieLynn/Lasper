@@ -44,7 +44,7 @@ pub enum ImageControlOutcome {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ImageRemoveTransport {
     Dbus,
-    Cli,
+    SystemdTools,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -72,7 +72,7 @@ Lasper reads an optional TOML file from `~/.config/lasper/lasper.toml` once at s
 
 The configuration is typed and can control:
 
-- startup and communication behavior, including `elevate`, `cli-mode`, and the journal `log-buffer-lines` limit;
+- startup and communication behavior, including `elevate`, `systemd-tools`, and the journal `log-buffer-lines` limit;
 - bootstrap defaults, named profiles, provider-specific policies, package inheritance, and local artifact paths for `debootstrap`, `pacstrap`, `dnf5`, and artifact imports;
 - TUI colors and semantic status styling through the `[theme]` section.
 
@@ -106,7 +106,7 @@ lasper launch user@machine -- /usr/bin/kitty --single-instance
 
 The executable is an absolute guest path and the remaining values are passed as its argv. Wayland probing is enabled by default. When the automatically selected display cannot be discovered or validated, an interactive `lasper shell` retries once without Wayland and prints a concise status line if that fallback succeeds. Detailed diagnostics are shown only if the fallback also fails. An exact `--wayland=DISPLAY` selection remains strict, and `lasper launch` never silently drops its display access. Use `--no-wayland` to request a terminal-only session directly.
 
-`lasper shell` owns an interactive PTY and may use the configured elevated daemon. It prints a single detach hint for every transport; press `Ctrl+]` three times within one second to leave a session whose guest processes keep the PTY open. Pass `--quiet` to suppress this hint and the successful Wayland fallback notice; errors and guest output remain visible. `lasper launch` is intended for `Terminal=false` desktop entries. It always uses the invoking user's authority so machine1 can authenticate through the desktop polkit agent, while `--cli-mode` remains available as the systemd transport. It does not detach or discard output; Lasper forwards the guest PTY to its inherited stdout and waits for the guest command to finish.
+`lasper shell` owns an interactive PTY and may use the configured elevated daemon. It prints a single detach hint for every transport; press `Ctrl+]` three times within one second to leave a session whose guest processes keep the PTY open. Pass `--quiet` to suppress this hint and the successful Wayland fallback notice; errors and guest output remain visible. `lasper launch` is intended for `Terminal=false` desktop entries. It always uses the invoking user's authority so machine1 can authenticate through the desktop polkit agent, while `--systemd-tools` remains available as the systemd transport. It does not detach or discard output; Lasper forwards the guest PTY to its inherited stdout and waits for the guest command to finish.
 
 A desktop entry example:
 

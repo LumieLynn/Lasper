@@ -33,17 +33,19 @@ TOML duplicate keys or duplicate tables are invalid. Lasper does not apply a "la
 ```toml
 [settings]
 elevate = false
-cli-mode = false
+systemd-tools = false
 log-buffer-lines = 5000
 ```
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `elevate` | boolean | `false` | Start the isolated elevated daemon, equivalent to `lasper -e`. The TUI remains owned by the invoking user. This setting does not apply to `lasper launch`, which relies on the caller's systemd/polkit authority. |
-| `cli-mode` | boolean | `false` | Skip DBus and use the CLI communication backend. Equivalent to forcing `-c`; this also selects the `machinectl` transport for `shell` and `launch`. |
+| `systemd-tools` | boolean | `false` | Use systemd tools and runtime-state discovery instead of Lasper's own D-Bus client. Equivalent to forcing `-s`; this also selects the `machinectl` transport for `shell` and `launch`. |
 | `log-buffer-lines` | integer | `5000` | Maximum number of journal lines retained per container in the detail panel. `0` also means `5000`. |
 
-The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -c` always enables CLI mode. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
+The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -s` always enables the systemd tools path. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
+
+`-s/--systemd-tools` selects the same execution path previously named `-c/--cli-mode`; it does not select a command-line UI or change the authority of an operation. The old flags and `[settings] cli-mode` remain accepted as compatibility aliases. Use only one of `systemd-tools` and `cli-mode` in a configuration file; declaring both is a duplicate-setting error. The theme key `badge_systemd_tools` likewise accepts the old `badge_cli` name.
 
 ## Bootstrap Selection
 
@@ -350,7 +352,7 @@ resize_unfocused = "white"
 # Badges and status bar
 badge_root = "red"
 badge_readonly = "yellow"
-badge_cli = "cyan"
+badge_systemd_tools = "cyan"
 status_info = "cyan"
 status_success = "green"
 status_warning = "yellow"
@@ -418,7 +420,7 @@ The following combines the settings, a debootstrap default prefill, a named prof
 ```toml
 [settings]
 elevate = true
-cli-mode = false
+systemd-tools = false
 log-buffer-lines = 10000
 
 [theme]

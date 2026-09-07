@@ -265,7 +265,7 @@ mod tests {
     fn prompt_service() -> Arc<SessionService> {
         Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
-            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))))
     }

@@ -260,7 +260,7 @@ pub async fn daemon_main(
     let dbus = initialize_dbus_backend(dbus_enabled).await;
     let machine_sessions = match dbus.as_ref() {
         Some(dbus) => crate::adapters::session::MachineSessionTransport::Dbus(dbus.clone()),
-        None => crate::adapters::session::MachineSessionTransport::Cli,
+        None => crate::adapters::session::MachineSessionTransport::SystemdTools,
     };
     let trusted_state_root = crate::adapters::trusted_state::TrustedStateRoot::production();
 

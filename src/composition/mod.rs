@@ -33,7 +33,7 @@ pub(crate) struct ApplicationServices {
 /// matrix as the TUI session service.
 pub(crate) fn compose_process_shell_service(
     mode: &CompositionMode,
-    cli_mode: bool,
+    systemd_tools: bool,
 ) -> Arc<SessionService> {
     let route = match mode {
         CompositionMode::Elevated(daemon) => crate::adapters::session::SessionRoute::Elevated {
@@ -41,7 +41,7 @@ pub(crate) fn compose_process_shell_service(
         },
         CompositionMode::User | CompositionMode::Root => {
             let machine = select_machine_session_transport(
-                cli_mode,
+                systemd_tools,
                 crate::adapters::runtime::dbus::DbusBackend::new(),
             );
             crate::adapters::session::SessionRoute::Direct {
@@ -56,7 +56,7 @@ pub(crate) fn compose_process_shell_service(
 
 pub(crate) fn compose_application_services(
     mode: CompositionMode,
-    cli_mode: bool,
+    systemd_tools: bool,
 ) -> ApplicationServices {
     let level = mode.permission_level();
     let daemon = mode.daemon().cloned();
@@ -106,12 +106,12 @@ pub(crate) fn compose_application_services(
     let session_route = match level {
         PermissionLevel::User => crate::adapters::session::SessionRoute::Direct {
             policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
-            machine: select_machine_session_transport(cli_mode, direct_dbus.clone()),
+            machine: select_machine_session_transport(systemd_tools, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },
         PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct {
             policy: crate::adapters::session::DirectTerminalPolicy::Automatic,
-            machine: select_machine_session_transport(cli_mode, direct_dbus.clone()),
+            machine: select_machine_session_transport(systemd_tools, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },
         PermissionLevel::Elevated => crate::adapters::session::SessionRoute::Elevated {
@@ -122,8 +122,8 @@ pub(crate) fn compose_application_services(
         },
     };
     let session = crate::adapters::session::compose_session_service(session_route);
-    let fallback_inspector = cli_mode.then(|| machine_inspection.clone());
-    let primary_runtime = if cli_mode {
+    let fallback_inspector = systemd_tools.then(|| machine_inspection.clone());
+    let primary_runtime = if systemd_tools {
         crate::adapters::runtime::PrimaryRuntimeRoute::Disabled
     } else {
         match level {
@@ -146,13 +146,13 @@ pub(crate) fn compose_application_services(
         primary_runtime,
     );
     let operations = OperationRegistry::new();
-    let control_route = select_control_route(level, cli_mode);
+    let control_route = select_control_route(level, systemd_tools);
     let image_route = match control_route {
         ExecutionRoute::DirectDbus => {
             crate::adapters::lifecycle::image::ImageLifecycleRoute::DirectDbus(direct_dbus.clone())
         }
-        ExecutionRoute::LocalCli => {
-            crate::adapters::lifecycle::image::ImageLifecycleRoute::LocalCli
+        ExecutionRoute::LocalSystemdTools => {
+            crate::adapters::lifecycle::image::ImageLifecycleRoute::LocalSystemdTools
         }
         ExecutionRoute::ElevatedDbus => {
             crate::adapters::lifecycle::image::ImageLifecycleRoute::Elevated {
@@ -163,13 +163,13 @@ pub(crate) fn compose_application_services(
                 transport: crate::application::image_lifecycle::ImageRemoveTransport::Dbus,
             }
         }
-        ExecutionRoute::ElevatedCli => {
+        ExecutionRoute::ElevatedSystemdTools => {
             crate::adapters::lifecycle::image::ImageLifecycleRoute::Elevated {
                 daemon: daemon
                     .as_ref()
                     .cloned()
                     .expect("validated elevated composition has a daemon"),
-                transport: crate::application::image_lifecycle::ImageRemoveTransport::Cli,
+                transport: crate::application::image_lifecycle::ImageRemoveTransport::SystemdTools,
             }
         }
     };
@@ -189,8 +189,8 @@ pub(crate) fn compose_application_services(
         ExecutionRoute::DirectDbus => {
             crate::adapters::lifecycle::machine::MachineLifecycleRoute::DirectDbus(direct_dbus)
         }
-        ExecutionRoute::LocalCli => {
-            crate::adapters::lifecycle::machine::MachineLifecycleRoute::LocalCli
+        ExecutionRoute::LocalSystemdTools => {
+            crate::adapters::lifecycle::machine::MachineLifecycleRoute::LocalSystemdTools
         }
         ExecutionRoute::ElevatedDbus => {
             crate::adapters::lifecycle::machine::MachineLifecycleRoute::Elevated {
@@ -201,13 +201,14 @@ pub(crate) fn compose_application_services(
                 transport: crate::application::machine_lifecycle::MachineControlTransport::Dbus,
             }
         }
-        ExecutionRoute::ElevatedCli => {
+        ExecutionRoute::ElevatedSystemdTools => {
             crate::adapters::lifecycle::machine::MachineLifecycleRoute::Elevated {
                 daemon: daemon
                     .as_ref()
                     .cloned()
                     .expect("validated elevated composition has a daemon"),
-                transport: crate::application::machine_lifecycle::MachineControlTransport::Cli,
+                transport:
+                    crate::application::machine_lifecycle::MachineControlTransport::SystemdTools,
             }
         }
     };
@@ -248,22 +249,22 @@ pub(crate) fn compose_application_services(
 }
 
 fn select_machine_session_transport(
-    cli_mode: bool,
+    systemd_tools: bool,
     dbus: crate::adapters::runtime::dbus::DbusBackend,
 ) -> crate::adapters::session::MachineSessionTransport {
-    if cli_mode {
-        crate::adapters::session::MachineSessionTransport::Cli
+    if systemd_tools {
+        crate::adapters::session::MachineSessionTransport::SystemdTools
     } else {
         crate::adapters::session::MachineSessionTransport::Dbus(dbus)
     }
 }
 
-fn select_control_route(level: PermissionLevel, cli_mode: bool) -> ExecutionRoute {
-    match (level, cli_mode) {
+fn select_control_route(level: PermissionLevel, systemd_tools: bool) -> ExecutionRoute {
+    match (level, systemd_tools) {
         (PermissionLevel::User | PermissionLevel::Root, false) => ExecutionRoute::DirectDbus,
-        (PermissionLevel::User | PermissionLevel::Root, true) => ExecutionRoute::LocalCli,
+        (PermissionLevel::User | PermissionLevel::Root, true) => ExecutionRoute::LocalSystemdTools,
         (PermissionLevel::Elevated, false) => ExecutionRoute::ElevatedDbus,
-        (PermissionLevel::Elevated, true) => ExecutionRoute::ElevatedCli,
+        (PermissionLevel::Elevated, true) => ExecutionRoute::ElevatedSystemdTools,
     }
 }
 
@@ -272,7 +273,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_route_covers_authority_and_cli_modes() {
+    fn control_route_covers_authority_and_systemd_toolss() {
         assert_eq!(
             select_control_route(PermissionLevel::User, false),
             ExecutionRoute::DirectDbus
@@ -283,11 +284,11 @@ mod tests {
         );
         assert_eq!(
             select_control_route(PermissionLevel::User, true),
-            ExecutionRoute::LocalCli
+            ExecutionRoute::LocalSystemdTools
         );
         assert_eq!(
             select_control_route(PermissionLevel::Root, true),
-            ExecutionRoute::LocalCli
+            ExecutionRoute::LocalSystemdTools
         );
         assert_eq!(
             select_control_route(PermissionLevel::Elevated, false),
@@ -295,12 +296,12 @@ mod tests {
         );
         assert_eq!(
             select_control_route(PermissionLevel::Elevated, true),
-            ExecutionRoute::ElevatedCli
+            ExecutionRoute::ElevatedSystemdTools
         );
     }
 
     #[test]
-    fn session_transport_follows_cli_mode() {
+    fn session_transport_follows_systemd_tools() {
         assert!(select_machine_session_transport(
             false,
             crate::adapters::runtime::dbus::DbusBackend::new(),

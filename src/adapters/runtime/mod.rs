@@ -1,19 +1,19 @@
 //! RuntimeCatalog composition over the current host adapters.
 
-pub(crate) mod cli;
 pub(crate) mod dbus;
 pub(crate) mod elevated;
 pub(crate) mod formatting;
 pub(crate) mod inspection;
 pub(crate) mod source;
 pub(crate) mod state;
+pub(crate) mod systemd_tools;
 
 use crate::adapters::error::NspawnError;
-use crate::adapters::runtime::cli::CliBackend;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::elevated::DaemonBackend;
 use crate::adapters::runtime::inspection::MachineInspectionStore;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::runtime::systemd_tools::SystemdToolsBackend;
 use crate::application::operations::ExecutionRoute;
 use crate::application::runtime::{RuntimeCatalog, RuntimeError, RuntimePort, RuntimeResult};
 use crate::domain::inspection::MachineProperties;
@@ -27,19 +27,19 @@ pub(crate) fn compose_runtime_catalog(
     primary_route: PrimaryRuntimeRoute,
 ) -> Arc<RuntimeCatalog> {
     let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
-    let cli = CliBackend::new(local_cmd);
-    cli.set_nudge(nudge_rx);
-    let fallback_source: Arc<dyn RuntimeSource> = Arc::new(cli);
+    let systemd_tools = SystemdToolsBackend::new(local_cmd);
+    systemd_tools.set_nudge(nudge_rx);
+    let fallback_source: Arc<dyn RuntimeSource> = Arc::new(systemd_tools);
     let fallback: Arc<dyn RuntimePort> = Arc::new(SourceRuntimePort {
         source: fallback_source,
         inspection_route: fallback_inspector
             .as_ref()
             .map(MachineInspectionStore::route)
-            .unwrap_or(ExecutionRoute::LocalCli),
+            .unwrap_or(ExecutionRoute::LocalSystemdTools),
         inspector: fallback_inspector
             .map(RuntimeInspector::Store)
             .unwrap_or(RuntimeInspector::Source),
-        snapshot_route: ExecutionRoute::LocalCli,
+        snapshot_route: ExecutionRoute::LocalSystemdTools,
     });
 
     let primary = match primary_route {

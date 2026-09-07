@@ -133,7 +133,7 @@ impl TerminalAttachCommand {
                 command.env("TERM", "xterm-256color");
             }
             AttachProcessEnvironment::Dumb => {
-                // The systemd CLI emits OSC 3008 context sequences whenever
+                // The systemd tools emit OSC 3008 context sequences whenever
                 // its own terminal is non-dumb, including after probe output.
                 command.env("TERM", "dumb");
                 command.env_remove("COLORTERM");
@@ -144,7 +144,7 @@ impl TerminalAttachCommand {
     }
 
     /// Construct a command with the selected terminal capability environment.
-    /// The runtime CLI adapter supplies the argv; this type only owns PTY
+    /// The runtime systemd tools adapter supplies the argv; this type only owns PTY
     /// process-environment semantics.
     pub(crate) fn with_terminal_environment(
         args: Vec<String>,
@@ -160,7 +160,7 @@ impl TerminalAttachCommand {
     }
 
     /// Construct a command with a dumb terminal environment for a bounded
-    /// machine probe, so CLI context sequences cannot corrupt its protocol.
+    /// machine probe, so systemd tools context sequences cannot corrupt its protocol.
     pub(crate) fn with_dumb_environment(args: Vec<String>) -> Self {
         Self {
             kind: TerminalAttachKind::Login,

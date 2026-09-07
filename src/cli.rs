@@ -19,7 +19,7 @@ const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
 
 pub(crate) struct CliOptions {
     pub(crate) want_elevation: bool,
-    pub(crate) want_cli_mode: bool,
+    pub(crate) want_systemd_tools: bool,
     pub(crate) is_daemon: bool,
     pub(crate) fd_sock: Option<PathBuf>,
     pub(crate) rpc_sock: Option<PathBuf>,
@@ -46,7 +46,7 @@ pub(crate) struct ShellCommand {
     command: Option<GuestCommand>,
     allow_wayland_fallback: bool,
     want_elevation: bool,
-    want_cli_mode: bool,
+    want_systemd_tools: bool,
     quiet: bool,
 }
 
@@ -63,8 +63,8 @@ impl ShellCommand {
         self.want_elevation
     }
 
-    pub(crate) const fn wants_cli_mode(&self) -> bool {
-        self.want_cli_mode
+    pub(crate) const fn wants_systemd_tools(&self) -> bool {
+        self.want_systemd_tools
     }
 
     pub(crate) fn command(&self) -> Option<&GuestCommand> {
@@ -222,10 +222,10 @@ fn help_text() -> String {
     ))
     .usage("lasper [FLAGS]")
     .usage(
-        "lasper [--elevate] [--cli-mode] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
+        "lasper [--elevate] [--systemd-tools] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
     )
     .usage(
-        "lasper [--cli-mode] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]",
+        "lasper [--systemd-tools] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]",
     )
     .section(
         HelpSection::new("FLAGS")
@@ -236,7 +236,7 @@ fn help_text() -> String {
                 "Use an isolated sudo daemon for privileged operations",
             )
             .entry(
-                "-c, --cli-mode",
+                "-s, --systemd-tools",
                 "Use runtime-state and systemd command backends",
             ),
     )
@@ -273,8 +273,8 @@ fn help_text() -> String {
                 "Use the isolated sudo daemon.",
             )
             .entry(
-                "[settings] cli-mode = true",
-                "Disable Lasper's direct DBus backend.",
+                "[settings] systemd-tools = true",
+                "Use systemd tools instead of Lasper's D-Bus client.",
             )
             .entry(
                 "[settings] log-buffer-lines = N",
@@ -313,7 +313,12 @@ fn shell_command_arguments(args: &[String]) -> Option<(ShellIoMode, Vec<String>)
     })?;
     args[..shell_index]
         .iter()
-        .all(|argument| matches!(argument.as_str(), "--elevate" | "-e" | "--cli-mode" | "-c"))
+        .all(|argument| {
+            matches!(
+                argument.as_str(),
+                "--elevate" | "-e" | "--systemd-tools" | "-s" | "--cli-mode" | "-c"
+            )
+        })
         .then(|| {
             (
                 io_mode,
@@ -568,7 +573,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
     let mut command_args = Vec::new();
     let mut command_started = false;
     let mut want_elevation = false;
-    let mut want_cli_mode = false;
+    let mut want_systemd_tools = false;
     let mut quiet = false;
 
     let mut index = 0;
@@ -614,8 +619,8 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
                 index += 1;
                 continue;
             }
-            "--cli-mode" | "-c" => {
-                want_cli_mode = true;
+            "--systemd-tools" | "-s" | "--cli-mode" | "-c" => {
+                want_systemd_tools = true;
                 index += 1;
                 continue;
             }
@@ -683,7 +688,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         command,
         allow_wayland_fallback,
         want_elevation,
-        want_cli_mode,
+        want_systemd_tools,
         quiet,
     })
 }
@@ -691,7 +696,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
 fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
     let mut options = CliOptions {
         want_elevation: false,
-        want_cli_mode: false,
+        want_systemd_tools: false,
         is_daemon: false,
         fd_sock: None,
         rpc_sock: None,
@@ -710,7 +715,7 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
                 return Err(0);
             }
             "--elevate" | "-e" => options.want_elevation = true,
-            "--cli-mode" | "-c" => options.want_cli_mode = true,
+            "--systemd-tools" | "-s" | "--cli-mode" | "-c" => options.want_systemd_tools = true,
             "--daemon" => options.is_daemon = true,
             "--fd-sock" => {
                 i += 1;
@@ -935,6 +940,63 @@ mod tests {
     }
 
     #[test]
+    fn systemd_tools_flags_and_legacy_aliases_select_the_same_route() {
+        for flag in ["-s", "--systemd-tools", "-c", "--cli-mode"] {
+            let options = parse_flags(&arguments(&[flag])).unwrap();
+            assert!(options.want_systemd_tools, "{flag}");
+            assert!(!options.want_elevation, "{flag}");
+
+            for verb in ["shell", "launch"] {
+                for args in [
+                    arguments(&[flag, verb, "alice@demo", "/bin/echo"]),
+                    arguments(&[verb, flag, "alice@demo", "/bin/echo"]),
+                    arguments(&[verb, "alice@demo", flag, "/bin/echo"]),
+                ] {
+                    let (mode, args) = shell_command_arguments(&args).unwrap();
+                    let command = parse_shell_command(mode, &args).unwrap();
+                    assert!(command.wants_systemd_tools());
+                    assert!(!command.wants_elevation());
+                }
+            }
+        }
+        assert!(!parse_flags(&[]).unwrap().want_systemd_tools);
+    }
+
+    #[test]
+    fn transport_flags_after_the_executable_belong_to_the_guest() {
+        for verb in ["shell", "launch"] {
+            for separator in [false, true] {
+                let mut args = arguments(&[verb, "alice@demo"]);
+                if separator {
+                    args.push("--".into());
+                }
+                args.extend(arguments(&[
+                    "/bin/echo",
+                    "-s",
+                    "--systemd-tools",
+                    "-c",
+                    "--cli-mode",
+                ]));
+                let (mode, args) = shell_command_arguments(&args).unwrap();
+                let command = parse_shell_command(mode, &args).unwrap();
+                assert!(!command.wants_systemd_tools());
+                assert_eq!(
+                    command.command().unwrap().args(),
+                    ["-s", "--systemd-tools", "-c", "--cli-mode"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_uses_only_the_canonical_transport_name() {
+        let help = help_text();
+        assert!(help.contains("-s, --systemd-tools"));
+        assert!(help.contains("[settings] systemd-tools = true"));
+        assert!(!help.contains("--cli-mode"));
+    }
+
+    #[test]
     fn shell_target_parses_one_validated_user_and_machine() {
         let target = parse_shell_target("1000@demo").unwrap();
         assert_eq!(target.user().as_str(), "1000");
@@ -960,7 +1022,7 @@ mod tests {
         assert!(command.allows_wayland_fallback());
         assert!(command.command().is_none());
         assert!(!command.wants_elevation());
-        assert!(!command.wants_cli_mode());
+        assert!(!command.wants_systemd_tools());
         assert!(!command.is_quiet());
     }
 
@@ -989,7 +1051,7 @@ mod tests {
             parse_interactive(&arguments(&["--elevate", "alice@demo", "--cli-mode"])).unwrap();
 
         assert!(command.wants_elevation());
-        assert!(command.wants_cli_mode());
+        assert!(command.wants_systemd_tools());
     }
 
     #[test]
@@ -1079,7 +1141,7 @@ mod tests {
 
         assert_eq!(command.io_mode(), ShellIoMode::Launcher);
         assert!(!command.permits_elevation());
-        assert!(command.wants_cli_mode());
+        assert!(command.wants_systemd_tools());
         assert_eq!(command.command().unwrap().program(), "/usr/bin/kitty");
         assert_eq!(command.command().unwrap().args(), ["--single-instance"]);
         assert!(parse_launcher(&arguments(&["alice@demo"])).is_err());

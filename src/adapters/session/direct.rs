@@ -71,7 +71,7 @@ impl SessionPort for DirectSessionAdapter {
                     .await
             }
             // Root may attach by namespace when the guest has no bus. Native
-            // login prompts otherwise use the selected D-Bus/CLI route.
+            // login prompts otherwise use the selected D-Bus/systemd tools route.
             TerminalLaunch::LoginPrompt => match self.terminal_policy {
                 DirectTerminalPolicy::LoginOnly => {
                     self.machine

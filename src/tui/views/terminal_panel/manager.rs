@@ -1062,7 +1062,7 @@ mod tests {
     async fn spawn_rejects_transitional_machine_states() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
-            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -1122,7 +1122,7 @@ mod tests {
     async fn duplicate_terminal_tabs_receive_stable_ordinals() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
-            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service);
@@ -1138,7 +1138,7 @@ mod tests {
     async fn terminal_tab_click_selects_the_session_and_machine() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
-            crate::adapters::session::MachineSessionTransport::Cli,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service);

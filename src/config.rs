@@ -18,8 +18,8 @@ pub struct AppSettings {
     /// Always request root elevation on startup (equivalent to -e / --elevate).
     pub elevate: bool,
     /// Use runtime-state and systemd command backends instead of Lasper's DBus backend.
-    #[serde(rename = "cli-mode")]
-    pub cli_mode: bool,
+    #[serde(rename = "systemd-tools", alias = "cli-mode")]
+    pub systemd_tools: bool,
     /// Maximum log lines retained per container buffer.
     #[serde(rename = "log-buffer-lines")]
     pub log_buffer_lines: usize,
@@ -239,6 +239,39 @@ pub fn config_path() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
+
+    #[test]
+    fn systemd_tools_setting_accepts_the_legacy_name() {
+        for key in ["systemd-tools", "cli-mode"] {
+            for enabled in [false, true] {
+                let config: AppConfig =
+                    toml::from_str(&format!("[settings]\n{key} = {enabled}\n")).unwrap();
+                assert_eq!(config.settings.systemd_tools, enabled);
+            }
+        }
+        assert!(!AppSettings::default().systemd_tools);
+    }
+
+    #[test]
+    fn duplicate_transport_settings_are_reported_instead_of_choosing_a_route() {
+        let loaded = parse_config(
+            "[settings]\nsystemd-tools = false\ncli-mode = true\n",
+            Path::new("lasper.toml"),
+        );
+        assert!(loaded
+            .diagnostic
+            .unwrap()
+            .summary
+            .contains("duplicate field"));
+    }
+
+    #[test]
+    fn systemd_tools_badge_accepts_the_legacy_theme_key() {
+        for key in ["badge_systemd_tools", "badge_cli"] {
+            let config: AppConfig = toml::from_str(&format!("[theme]\n{key} = 'cyan'\n")).unwrap();
+            assert!(config.theme.unwrap().badge_systemd_tools.is_some());
+        }
+    }
 
     #[test]
     fn bootstrap_profiles_deserialize_as_typed_provider_specs() {

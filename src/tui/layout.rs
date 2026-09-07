@@ -69,7 +69,7 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
         crate::composition::PermissionLevel::Elevated => Span::styled(
             " [ SUDO ] ",
             Style::default()
-                .fg(t.badge_cli)
+                .fg(t.badge_systemd_tools)
                 .add_modifier(Modifier::BOLD),
         ),
         crate::composition::PermissionLevel::User => {
@@ -87,9 +87,9 @@ fn render_title(f: &mut Frame, app: &App, area: Rect) {
 
     if !app.data.dbus_active {
         spans.push(Span::styled(
-            " [ ⚡ CLI ] ",
+            " [ ⚡ Systemd Tools ] ",
             Style::default()
-                .fg(t.badge_cli)
+                .fg(t.badge_systemd_tools)
                 .add_modifier(Modifier::BOLD),
         ));
     }

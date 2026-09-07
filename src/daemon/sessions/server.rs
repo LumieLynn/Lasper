@@ -129,7 +129,9 @@ pub(crate) async fn spawn_terminal(
                         send_machine_terminal(&stream, master);
                         return;
                     }
-                    Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
+                    Ok(crate::adapters::session::MachineSessionOpening::SystemdTools(command)) => {
+                        *command
+                    }
                     Err(error) => {
                         send_session_error(&stream, "machine login prompt failed", &error);
                         return;
@@ -206,7 +208,9 @@ pub(crate) async fn spawn_terminal(
                     send_machine_terminal(&stream, master);
                     return;
                 }
-                Ok(crate::adapters::session::MachineSessionOpening::Cli(command)) => *command,
+                Ok(crate::adapters::session::MachineSessionOpening::SystemdTools(command)) => {
+                    *command
+                }
                 Err(error) => {
                     send_session_error(&stream, "selected-user shell failed", &error);
                     return;

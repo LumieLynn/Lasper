@@ -285,8 +285,8 @@ async fn recovery_images<B: DaemonRuntimeQueries>(
 
     let runner: Arc<dyn crate::adapters::process::CommandRunner> =
         Arc::new(crate::adapters::process::DefaultCommandRunner);
-    let cli = crate::adapters::runtime::cli::CliBackend::new(runner);
-    RuntimeSource::list_images(&cli)
+    let systemd_tools = crate::adapters::runtime::systemd_tools::SystemdToolsBackend::new(runner);
+    RuntimeSource::list_images(&systemd_tools)
         .await
         .map_err(|error| error.to_string())
 }

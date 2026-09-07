@@ -265,7 +265,7 @@ pub struct App {
 impl App {
     pub fn new(
         permissions: std::sync::Arc<dyn crate::composition::PermissionManager>,
-        cli_mode: bool,
+        systemd_tools: bool,
         log_buffer_lines: usize,
         services: ApplicationServices,
         config: std::sync::Arc<crate::config::AppConfig>,
@@ -301,7 +301,7 @@ impl App {
                 detail_target: DetailTarget::Empty,
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
-                dbus_active: !cli_mode,
+                dbus_active: !systemd_tools,
                 session_service: session_service.clone(),
                 runtime_catalog,
                 machine_lifecycle,
@@ -850,7 +850,7 @@ fn machine_outcome_status(
 
     let fallback = outcome
         .fallback
-        .map(|fallback| format!(" (CLI fallback: {})", fallback.reason))
+        .map(|fallback| format!(" (systemd tools fallback: {})", fallback.reason))
         .unwrap_or_default();
     let machine = outcome.machine.as_str();
     match outcome.result {
@@ -952,7 +952,7 @@ mod tests {
         let services = crate::composition::compose_application_services(mode, false);
         App::new(
             permissions,
-            false, // cli_mode
+            false, // systemd_tools
             0,
             services,
             std::sync::Arc::new(crate::config::AppConfig::default()),

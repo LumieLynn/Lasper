@@ -1,6 +1,6 @@
 //! Lossless read models for the common systemd-machined inspection plane.
 //!
-//! Adapters populate these snapshots from D-Bus, CLI output, or runtime state.
+//! Adapters populate these snapshots from D-Bus, systemd tools output, or runtime state.
 //! Unknown property groups and keys are retained so a provider-specific value
 //! is never silently discarded at the application boundary.
 
@@ -26,7 +26,7 @@ pub enum InspectionSource {
     #[default]
     Unknown,
     Dbus,
-    Cli,
+    SystemdTools,
     RuntimeState,
 }
 

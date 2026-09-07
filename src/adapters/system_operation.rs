@@ -254,11 +254,13 @@ impl SystemOperationStore {
     }
 }
 
-pub(crate) async fn execute_cli_image_remove(image: ImageName) -> SystemOperationResult<()> {
-    execute_cli_image_remove_with_runner(image, &DefaultCommandRunner).await
+pub(crate) async fn execute_systemd_tools_image_remove(
+    image: ImageName,
+) -> SystemOperationResult<()> {
+    execute_systemd_tools_image_remove_with_runner(image, &DefaultCommandRunner).await
 }
 
-pub(crate) async fn execute_cli_image_remove_with_runner(
+pub(crate) async fn execute_systemd_tools_image_remove_with_runner(
     image: ImageName,
     runner: &dyn CommandRunner,
 ) -> SystemOperationResult<()> {
@@ -630,19 +632,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_cli_removal_reports_success() {
+    async fn typed_systemd_tools_removal_reports_success() {
         let mut runner = MockCommandRunner::new();
         runner.expect_run().once().returning(|_, _| Ok(success()));
 
-        assert!(
-            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,)
-                .await
-                .is_ok()
-        );
+        assert!(execute_systemd_tools_image_remove_with_runner(
+            ImageName::new("ubuntu").unwrap(),
+            &runner,
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
-    async fn typed_cli_removal_reports_launch_failure_as_not_attempted() {
+    async fn typed_systemd_tools_removal_reports_launch_failure_as_not_attempted() {
         let mut runner = MockCommandRunner::new();
         runner.expect_run().once().returning(|_, _| {
             Err(std::io::Error::new(
@@ -652,13 +655,17 @@ mod tests {
         });
 
         assert!(matches!(
-            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
+            execute_systemd_tools_image_remove_with_runner(
+                ImageName::new("ubuntu").unwrap(),
+                &runner,
+            )
+            .await,
             Err(SystemOperationError::Io { .. })
         ));
     }
 
     #[tokio::test]
-    async fn typed_cli_removal_reports_nonzero_exit_as_failed() {
+    async fn typed_systemd_tools_removal_reports_nonzero_exit_as_failed() {
         let mut runner = MockCommandRunner::new();
         runner
             .expect_run()
@@ -666,13 +673,17 @@ mod tests {
             .returning(|_, _| Ok(failure("image is busy")));
 
         assert!(matches!(
-            execute_cli_image_remove_with_runner(ImageName::new("ubuntu").unwrap(), &runner,).await,
+            execute_systemd_tools_image_remove_with_runner(
+                ImageName::new("ubuntu").unwrap(),
+                &runner,
+            )
+            .await,
             Err(SystemOperationError::CommandFailed { .. })
         ));
     }
 
     #[tokio::test]
-    async fn short_cli_mutation_timeout_preserves_unknown_outcome() {
+    async fn short_systemd_tools_mutation_timeout_preserves_unknown_outcome() {
         let mut runner = MockCommandRunner::new();
         runner
             .expect_run_bounded()

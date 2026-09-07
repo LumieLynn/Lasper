@@ -26,8 +26,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
-fn cli_sessions() -> crate::adapters::session::MachineSessionTransport {
-    crate::adapters::session::MachineSessionTransport::Cli
+fn systemd_tools_sessions() -> crate::adapters::session::MachineSessionTransport {
+    crate::adapters::session::MachineSessionTransport::SystemdTools
 }
 
 #[derive(Clone)]
@@ -300,7 +300,7 @@ async fn bounded_protocol_reader_rejects_oversized_frames() {
 }
 
 #[tokio::test]
-async fn cli_mode_skips_daemon_dbus_initialization() {
+async fn systemd_tools_skips_daemon_dbus_initialization() {
     assert!(initialize_dbus_backend(false).await.is_none());
 }
 
@@ -355,7 +355,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
-            cli_sessions(),
+            systemd_tools_sessions(),
         )
         .await
     });
@@ -433,7 +433,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
-            cli_sessions(),
+            systemd_tools_sessions(),
         )
         .await
     });
@@ -663,7 +663,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             Arc::clone(&server_state),
             crate::adapters::trusted_state::TrustedStateRoot::production(),
-            cli_sessions(),
+            systemd_tools_sessions(),
         )
         .await,
         HandleOutcome::Spawned
@@ -686,7 +686,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
-            cli_sessions(),
+            systemd_tools_sessions(),
         )
         .await,
         HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
@@ -746,7 +746,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         Arc::clone(&server_state),
         root.clone(),
-        cli_sessions(),
+        systemd_tools_sessions(),
     )
     .await
     {
@@ -775,7 +775,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         server_state,
         root,
-        cli_sessions(),
+        systemd_tools_sessions(),
     )
     .await
     {

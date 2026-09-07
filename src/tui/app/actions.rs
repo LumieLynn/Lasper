@@ -111,7 +111,7 @@ impl App {
     ///
     /// The runtime observer owns the snapshot query and publishes the result
     /// back to the main loop. Keeping this call synchronous prevents a slow
-    /// D-Bus or CLI backend from blocking keyboard and mouse dispatch.
+    /// D-Bus or systemd tools backend from blocking keyboard and mouse dispatch.
     pub fn refresh(&mut self) {
         if self.ui.show_wizard || self.ui.show_help || self.ui.resource_action_menu.is_some() {
             return;

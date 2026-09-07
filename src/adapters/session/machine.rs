@@ -1,7 +1,7 @@
 //! Transport-neutral machine session requests and route selection.
 //!
 //! The application asks for one of the two closed session operations below.
-//! This module selects the already-composed D-Bus or CLI implementation; it
+//! This module selects the already-composed D-Bus or systemd tools implementation; it
 //! does not expose either wire shape to the rest of the session workflow.
 
 use super::wayland_probe::WaylandProbeRequest;
@@ -184,16 +184,16 @@ impl MachineSessionRequest {
 #[derive(Clone)]
 pub(crate) enum MachineSessionTransport {
     Dbus(crate::adapters::runtime::dbus::DbusBackend),
-    Cli,
+    SystemdTools,
 }
 
 /// Result of opening one closed machine session operation through the
 /// selected route.  A D-Bus session hands ownership of a machined PTY to the
-/// caller; a CLI session hands back a command that the caller must spawn in a
+/// caller; a systemd tools session hands back a command that the caller must spawn in a
 /// PTY.  The daemon and direct adapters consume the same result shape.
 pub(crate) enum MachineSessionOpening {
     Dbus(MachinePty),
-    Cli(Box<crate::adapters::session::terminal_attach::TerminalAttachCommand>),
+    SystemdTools(Box<crate::adapters::session::terminal_attach::TerminalAttachCommand>),
 }
 
 pub(crate) struct MachinePty {
@@ -218,12 +218,15 @@ impl MachineSessionTransport {
                     .map_err(|error| map_machine_session_error(context, error))?;
                 Ok(MachineSessionOpening::Dbus(master))
             }
-            Self::Cli => {
-                let command = crate::adapters::runtime::cli::machine_session_command(request)
-                    .map_err(|error| {
-                        SessionError::new(format!("build {context} machinectl command: {error}"))
-                    })?;
-                Ok(MachineSessionOpening::Cli(Box::new(command)))
+            Self::SystemdTools => {
+                let command =
+                    crate::adapters::runtime::systemd_tools::machine_session_command(request)
+                        .map_err(|error| {
+                            SessionError::new(format!(
+                                "build {context} machinectl command: {error}"
+                            ))
+                        })?;
+                Ok(MachineSessionOpening::SystemdTools(Box::new(command)))
             }
         }
     }
@@ -239,7 +242,7 @@ impl MachineSessionTransport {
         let opening = self.open(request).await?;
         match opening {
             MachineSessionOpening::Dbus(pty) => super::pty::spawn_machine_terminal(pty, id, size),
-            MachineSessionOpening::Cli(command) => super::pty::spawn_direct_terminal(
+            MachineSessionOpening::SystemdTools(command) => super::pty::spawn_direct_terminal(
                 (*command).into_pty_command().map_err(|error| {
                     SessionError::new(format!("validate machinectl session command: {error}"))
                 })?,

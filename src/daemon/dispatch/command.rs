@@ -17,7 +17,7 @@ use crate::adapters::provisioning::state::{
 };
 use crate::adapters::rootfs::store::{execute_rootfs_operation, RootfsOperation};
 use crate::adapters::system_operation::{
-    execute_cli_image_remove, execute_system_operation, SystemOperation,
+    execute_system_operation, execute_systemd_tools_image_remove, SystemOperation,
 };
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::{
@@ -242,8 +242,8 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                         reason: "D-Bus backend is unavailable".into(),
                     },
                 },
-                MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_nspawn_launch(
+                MachineControlTransport::SystemdTools => {
+                    crate::adapters::lifecycle::machine::execute_systemd_tools_nspawn_launch(
                         request.image,
                         request.machine,
                     )
@@ -279,8 +279,8 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                         reason: "D-Bus backend is unavailable".into(),
                     },
                 },
-                MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_machine_runtime(
+                MachineControlTransport::SystemdTools => {
+                    crate::adapters::lifecycle::machine::execute_systemd_tools_machine_runtime(
                         request.machine,
                         request.action,
                     )
@@ -309,8 +309,8 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                         reason: "D-Bus backend is unavailable".into(),
                     },
                 },
-                MachineControlTransport::Cli => {
-                    crate::adapters::lifecycle::machine::execute_cli_nspawn_unit(
+                MachineControlTransport::SystemdTools => {
+                    crate::adapters::lifecycle::machine::execute_systemd_tools_nspawn_unit(
                         request.machine,
                         request.action,
                     )
@@ -344,10 +344,12 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                         reason: "DBus backend is unavailable".into(),
                     },
                 },
-                ImageRemoveTransport::Cli => match execute_cli_image_remove(request.image).await {
-                    Ok(()) => ImageControlOutcome::Removed,
-                    Err(error) => map_system_operation_image_error(error),
-                },
+                ImageRemoveTransport::SystemdTools => {
+                    match execute_systemd_tools_image_remove(request.image).await {
+                        Ok(()) => ImageControlOutcome::Removed,
+                        Err(error) => map_system_operation_image_error(error),
+                    }
+                }
             };
             HandleOutcome::Sync(serde_json::to_value(outcome).map_err(|error| error.to_string()))
         }
@@ -383,7 +385,7 @@ async fn validate_runtime_target<B: DaemonRuntimeQueries>(
                     reason: format!("could not verify machine registration: {error}"),
                 })?
         }
-        MachineControlTransport::Cli => {
+        MachineControlTransport::SystemdTools => {
             crate::adapters::runtime::state::list_machines_at(crate::paths::runtime_machines_dir())
                 .await
                 .map_err(|error| MachineControlOutcome::NotAttempted {

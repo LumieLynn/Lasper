@@ -121,7 +121,7 @@ impl MachineLifecycleAction {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum MachineControlTransport {
     Dbus,
-    Cli,
+    SystemdTools,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -876,7 +876,7 @@ mod tests {
             .once()
             .returning(|_, _| RoutedMachineControlOutcome {
                 outcome: MachineControlOutcome::Succeeded,
-                route: ExecutionRoute::LocalCli,
+                route: ExecutionRoute::LocalSystemdTools,
                 fallback: None,
             });
         let mut preparation = MockMachineStartPreparation::new();

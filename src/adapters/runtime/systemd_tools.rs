@@ -78,13 +78,13 @@ fn snapshot_update(
 }
 
 #[derive(Clone)]
-pub struct CliBackend {
+pub struct SystemdToolsBackend {
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
     runtime_machines_dir: std::path::PathBuf,
     nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
-impl CliBackend {
+impl SystemdToolsBackend {
     pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
         Self {
             cmd_runner: runner,
@@ -111,7 +111,7 @@ impl CliBackend {
 
 /// Encode one of the closed machine-session requests as a `machinectl`
 /// command.  This is a runtime transport operation: the session layer owns
-/// the request semantics, while this module owns the CLI wire shape.
+/// the request semantics, while this module owns the systemd tools command shape.
 pub(crate) fn machine_session_command(
     request: MachineSessionRequest,
 ) -> io::Result<TerminalAttachCommand> {
@@ -161,7 +161,7 @@ fn wayland_probe(
 }
 
 #[async_trait::async_trait]
-impl RuntimeSource for CliBackend {
+impl RuntimeSource for SystemdToolsBackend {
     async fn is_available(&self) -> bool {
         which::which("machinectl").is_ok()
     }
@@ -210,7 +210,7 @@ impl RuntimeSource for CliBackend {
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         let mut nudge_rx = self.nudge_rx.lock().take().ok_or_else(|| {
             NspawnError::Dbus(zbus::Error::Failure(
-                "watch_events: no nudge channel set on CliBackend".into(),
+                "watch_events: no nudge channel set on SystemdToolsBackend".into(),
             ))
         })?;
 
@@ -253,15 +253,17 @@ impl RuntimeSource for CliBackend {
     }
 }
 
-/// Fixed, non-interactive CLI inspection shared with the elevated daemon.
+/// Fixed, non-interactive systemd tools inspection shared with the elevated daemon.
 pub(crate) async fn get_properties_with_runner(
     name: &str,
     include_nspawn_unit: bool,
     cmd_runner: &dyn CommandRunner,
 ) -> Result<MachineProperties> {
     let name = parse_machine_name(name)?;
-    let mut props =
-        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    let mut props = MachineProperties::from_inspection(
+        InspectionSource::SystemdTools,
+        InspectionCompleteness::Full,
+    );
 
     let machine_args = vec![
         "--no-ask-password".to_string(),
@@ -329,7 +331,7 @@ pub(crate) async fn get_properties_with_runner(
 
     if !failures.is_empty() {
         log::warn!(
-            "partial CLI inspection for {}: {}",
+            "partial systemd tools inspection for {}: {}",
             name,
             failures.join("; ")
         );
@@ -350,8 +352,10 @@ pub(crate) async fn get_image_unit_properties_with_runner(
     let Ok(name) = MachineName::new(name) else {
         return Ok(None);
     };
-    let mut props =
-        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    let mut props = MachineProperties::from_inspection(
+        InspectionSource::SystemdTools,
+        InspectionCompleteness::Full,
+    );
     match append_systemd_unit_properties(&name, cmd_runner, &mut props).await? {
         UnitInspection::Present => Ok(Some(props)),
         UnitInspection::NotFound(diagnostic) => {
@@ -690,8 +694,8 @@ mod tests {
             "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
         )
         .unwrap();
-        let provider =
-            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
+        let provider = SystemdToolsBackend::with_runner(runner)
+            .with_runtime_machines_dir(runtime.path().to_path_buf());
 
         let machines = RuntimeSource::list_machines(&provider).await.unwrap();
 
@@ -731,7 +735,7 @@ mod tests {
                 });
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let images = RuntimeSource::list_images(&provider).await.unwrap();
 
@@ -804,8 +808,8 @@ mod tests {
             "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
         )
         .unwrap();
-        let provider =
-            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
+        let provider = SystemdToolsBackend::with_runner(runner)
+            .with_runtime_machines_dir(runtime.path().to_path_buf());
 
         let snapshot = RuntimeSource::snapshot(&provider).await.unwrap();
 
@@ -842,13 +846,13 @@ mod tests {
                 });
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let props = RuntimeSource::get_properties(&provider, "test-ctr", true)
             .await
             .unwrap();
 
-        assert_eq!(props.source, InspectionSource::Cli);
+        assert_eq!(props.source, InspectionSource::SystemdTools);
         assert_eq!(props.completeness, InspectionCompleteness::Full);
         assert!(props.groups.iter().any(|g| g.name == "Machine"));
         assert!(props.groups.iter().any(|g| g.name == "Systemd"));
@@ -866,14 +870,14 @@ mod tests {
                 .returning(move |_, _, _| Ok(out2.clone()));
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let result = RuntimeSource::get_properties(&provider, "missing-ctr", true).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn machine_inspection_preserves_both_cli_failure_reasons() {
+    async fn machine_inspection_preserves_both_systemd_tools_failure_reasons() {
         let mut runner = MockCommandRunner::new();
         runner
             .expect_run_bounded()

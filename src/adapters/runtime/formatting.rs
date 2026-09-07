@@ -263,7 +263,7 @@ fn format_dependencies(v: &Value<'_>) -> String {
     result
 }
 
-/// Format an ExecCommand struct (from CLI serialization or D-Bus typed data).
+/// Format an ExecCommand struct (from systemd tools serialization or D-Bus typed data).
 /// Produces just the command line; metadata (pid, exit code, timestamps) live in
 /// separate ExecMain* properties.
 fn format_exec_command(v: &Value<'_>) -> String {

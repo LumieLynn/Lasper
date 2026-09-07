@@ -23,7 +23,8 @@ async fn main() -> Result<()> {
             if let Some(diagnostic) = loaded_config.diagnostic {
                 eprintln!("lasper: {}", diagnostic.summary);
             }
-            let cli_mode = command.wants_cli_mode() || loaded_config.config.settings.cli_mode;
+            let systemd_tools =
+                command.wants_systemd_tools() || loaded_config.config.settings.systemd_tools;
             let use_sudo = command.permits_elevation()
                 && crate::composition::DefaultPermissionManager::wants_elevation(
                     command.wants_elevation(),
@@ -33,7 +34,7 @@ async fn main() -> Result<()> {
                 crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
             );
             let daemon = if pm.level() == crate::composition::PermissionLevel::Elevated {
-                match crate::adapters::elevated::ElevatedDaemon::spawn(!cli_mode).await {
+                match crate::adapters::elevated::ElevatedDaemon::spawn(!systemd_tools).await {
                     Ok(daemon) => Some(std::sync::Arc::new(daemon)),
                     Err(error) => {
                         eprintln!("lasper: failed to start elevated daemon: {error}");
@@ -44,7 +45,7 @@ async fn main() -> Result<()> {
                 None
             };
             let mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
-            let sessions = crate::composition::compose_process_shell_service(&mode, cli_mode);
+            let sessions = crate::composition::compose_process_shell_service(&mode, systemd_tools);
             let code = crate::cli::run_shell(command, &sessions).await;
             if let Some(daemon) = daemon {
                 daemon.exit().await;
@@ -54,7 +55,7 @@ async fn main() -> Result<()> {
         Err(code) => std::process::exit(code),
     };
     let want_elevation = options.want_elevation;
-    let mut want_cli_mode = options.want_cli_mode;
+    let mut want_systemd_tools = options.want_systemd_tools;
 
     // 1b. Internal daemon mode — run as root child process, exit early.
     if options.is_daemon {
@@ -72,8 +73,8 @@ async fn main() -> Result<()> {
     let config_diagnostic = loaded_config.diagnostic;
     let app_config = std::sync::Arc::new(loaded_config.config);
     let app_settings = &app_config.settings;
-    if !want_cli_mode {
-        want_cli_mode = app_settings.cli_mode;
+    if !want_systemd_tools {
+        want_systemd_tools = app_settings.systemd_tools;
     }
 
     // 3. Permission manager — no full-process elevation.
@@ -88,7 +89,7 @@ async fn main() -> Result<()> {
     //     password prompt (if any) appears on the clean terminal.
     let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> =
         if pm.level() == crate::composition::PermissionLevel::Elevated {
-            match crate::adapters::elevated::ElevatedDaemon::spawn(!want_cli_mode).await {
+            match crate::adapters::elevated::ElevatedDaemon::spawn(!want_systemd_tools).await {
                 Ok(d) => Some(std::sync::Arc::new(d)),
                 Err(e) => {
                     eprintln!("Failed to start elevated daemon: {}", e);
@@ -116,7 +117,7 @@ async fn main() -> Result<()> {
     // the TUI launcher so a future CLI entry point can bypass it entirely.
     let log_buffer_lines = app_settings.log_buffer_lines;
     let services =
-        crate::composition::compose_application_services(composition_mode, want_cli_mode);
+        crate::composition::compose_application_services(composition_mode, want_systemd_tools);
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
         None
     } else {
@@ -169,7 +170,13 @@ async fn main() -> Result<()> {
             }
         }
     };
-    let mut app = tui::app::App::new(pm, want_cli_mode, log_buffer_lines, services, app_config);
+    let mut app = tui::app::App::new(
+        pm,
+        want_systemd_tools,
+        log_buffer_lines,
+        services,
+        app_config,
+    );
     if let Some(diagnostic) = config_diagnostic {
         log::warn!("{}", diagnostic.detail);
         app.set_status_for(

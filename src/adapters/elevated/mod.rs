@@ -555,7 +555,7 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(super) async fn cli_inspect_machine(
+    pub(super) async fn systemd_tools_inspect_machine(
         &self,
         name: &str,
         include_nspawn_unit: bool,
@@ -567,7 +567,9 @@ impl ElevatedDaemon {
         };
         let params = serde_json::to_value(request)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("cli_inspect_machine", params).await?;
+        let result = self
+            .rpc_call("systemd_tools_inspect_machine", params)
+            .await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }

@@ -2,7 +2,7 @@
 //!
 //! systemd exposes a small public `sd-login` API over this state directory, but
 //! it does not expose the complete machine property set. This reader is used
-//! only by explicit CLI mode so opening the details pane cannot invoke a D-Bus
+//! only by explicit systemd tools mode so opening the details pane cannot invoke a D-Bus
 //! client indirectly through `machinectl show` or `systemctl show`.
 
 use crate::adapters::error::{NspawnError, Result};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024;
 
 /// Read the leader PID from machined's registration for a validated machine.
-/// The same bounded, no-symlink parser used by CLI inspection protects this
+/// The same bounded, no-symlink parser used by systemd tools inspection protects this
 /// value before it is used as a namespace target.
 pub(crate) fn leader_pid(name: &MachineName) -> std::io::Result<u32> {
     leader_pid_at(
