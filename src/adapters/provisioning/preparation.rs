@@ -217,8 +217,9 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
         }
         if let DeploymentSource::Copy { source_name } = &request.source {
             return format!(
-                " [CLONE OPERATION]\n\n Source: {source_name}\n Destination: {}\n\n All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.",
-                request.config.name
+                " [CLONE OPERATION]\n\n Source: {source_name}\n Destination: {}\n\n Image data, effective .nspawn settings, and Lasper's service override\n are copied when present.\n\n WARNING: {}",
+                request.config.name,
+                crate::adapters::provisioning::engine::builders::clone::CLONE_IDENTITY_NOTICE,
             );
         }
 
@@ -384,5 +385,20 @@ mod tests {
         assert!(preview.contains("[ERROR:"));
         assert!(preview.contains("not supported with PrivateUsers=managed"));
         assert!(!preview.contains("/run/lasper/wayland/1001/wayland-0:idmap"));
+    }
+
+    #[test]
+    fn clone_preview_discloses_preserved_guest_identity() {
+        let mut request = request(PrivateUsersMode::Pick);
+        request.source = DeploymentSource::Copy {
+            source_name: "source-machine".into(),
+        };
+
+        let preview = NspawnProvisioningPreparation.preview(&request);
+
+        assert!(preview.contains("Exact clone"));
+        assert!(preview.contains("machine-id"));
+        assert!(preview.contains("SSH host keys"));
+        assert!(preview.contains("Reset guest identity manually"));
     }
 }
