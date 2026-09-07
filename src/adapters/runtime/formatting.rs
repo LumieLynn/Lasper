@@ -533,7 +533,11 @@ fn format_timestamp(v: &Value<'_>) -> String {
         return "n/a".to_string();
     }
 
-    let secs = (us / 1_000_000) as libc::time_t;
+    let epoch_seconds = us / 1_000_000;
+    let secs = match epoch_seconds.try_into() {
+        Ok(secs) => secs,
+        Err(_) => return format!("{}s (unix epoch)", epoch_seconds),
+    };
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&secs, &mut tm);

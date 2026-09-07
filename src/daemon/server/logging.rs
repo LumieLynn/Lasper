@@ -84,10 +84,14 @@ impl Write for SessionLogWriter {
 }
 
 fn utc_log_timestamp() -> String {
-    let seconds = std::time::SystemTime::now()
+    let epoch_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as libc::time_t)
+        .map(|duration| duration.as_secs())
         .unwrap_or_default();
+    let seconds = match epoch_seconds.try_into() {
+        Ok(seconds) => seconds,
+        Err(_) => return epoch_seconds.to_string(),
+    };
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::gmtime_r(&seconds, &mut tm).is_null() {
