@@ -22,6 +22,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 const MAX_DEPLOYMENT_RECORDS: usize = 64;
+const DEPLOYMENT_STREAM_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct DeploymentRegistry {
@@ -837,8 +838,6 @@ async fn forward_job_stream(
     server_state: Arc<DaemonServerState>,
     _stream_lease: DeploymentStreamLease,
 ) {
-    use tokio::io::AsyncWriteExt;
-
     let (mut events, mut status) = handle.into_streams();
     let mut writer = tokio::io::BufWriter::new(tokio::fs::File::from_std(writer));
     let mut stream_open = true;
@@ -863,7 +862,6 @@ async fn forward_job_stream(
             if stream_open {
                 let _ = write_frame(&mut writer, DeploymentStreamFrame::Snapshot(snapshot)).await;
             }
-            let _ = writer.flush().await;
             return;
         }
 
@@ -913,6 +911,14 @@ async fn write_frame(
     writer: &mut (impl tokio::io::AsyncWrite + Unpin),
     frame: DeploymentStreamFrame,
 ) -> bool {
+    write_frame_with_timeout(writer, frame, DEPLOYMENT_STREAM_WRITE_TIMEOUT).await
+}
+
+async fn write_frame_with_timeout(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    frame: DeploymentStreamFrame,
+    timeout: std::time::Duration,
+) -> bool {
     use tokio::io::AsyncWriteExt;
 
     let mut bytes = match serde_json::to_vec(&frame) {
@@ -931,13 +937,27 @@ async fn write_frame(
         .expect("bounded fallback deployment frame serializes");
     }
     bytes.push(b'\n');
-    if writer.write_all(&bytes).await.is_err() {
-        return false;
+    match tokio::time::timeout(timeout, async {
+        writer.write_all(&bytes).await?;
+        // The client consumes one frame at a time from the pipe. Flush here so
+        // progress remains visible while the deployment is still running.
+        writer.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            log::debug!("Daemon: deployment stream closed while writing a frame: {error}");
+            false
+        }
+        Err(_) => {
+            log::warn!(
+                "Daemon: deployment stream write exceeded {} ms; detaching the client stream",
+                timeout.as_millis()
+            );
+            false
+        }
     }
-    // The client consumes one frame at a time from the pipe. Flush here so
-    // progress output is visible while the deployment is still running,
-    // rather than being held by the BufWriter until the terminal snapshot.
-    writer.flush().await.is_ok()
 }
 
 fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
@@ -958,7 +978,29 @@ mod tests {
         DeploymentEvent, DeploymentRequest, DeploymentSource, DeploymentStorage,
     };
     use crate::domain::machine::MachineName;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use tokio::io::AsyncBufReadExt;
+
+    struct PendingWriter;
+
+    impl tokio::io::AsyncWrite for PendingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn plan(target: &str) -> DeploymentPlan {
         DeploymentPlan::build(DeploymentRequest {
@@ -1039,6 +1081,20 @@ mod tests {
             serde_json::from_str::<DeploymentStreamFrame>(line.trim_end()).unwrap(),
             DeploymentStreamFrame::Event(DeploymentEvent::Line(message)) if message == "early log"
         ));
+    }
+
+    #[tokio::test]
+    async fn deployment_stream_write_stops_waiting_for_a_stalled_client() {
+        let mut writer = PendingWriter;
+
+        assert!(
+            !write_frame_with_timeout(
+                &mut writer,
+                DeploymentStreamFrame::Event(DeploymentEvent::Line("blocked".into())),
+                std::time::Duration::from_millis(10),
+            )
+            .await
+        );
     }
 
     #[test]
