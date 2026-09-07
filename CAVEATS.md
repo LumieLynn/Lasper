@@ -56,6 +56,8 @@ Tar rootfs imports are extracted by the host's `tar` implementation with `TAR_OP
 
 Remote Tar/Raw sources use Lasper's custom acquisition path, not `importctl pull-tar`. Lasper invokes `curl` from the host `PATH` with startup configuration disabled, restricts transfers and redirects to HTTP/HTTPS, bounds redirect count and artifact size, and passes only the host `PATH`, stable locale, and explicit proxy variables. Caller-selected curl configuration and certificate override paths are not inherited by the root daemon. Acquired Tar bytes are materialized into the Directory, Subvolume, or DiskImage backend selected in the wizard; systemd-importd's verification, read-only image, and storage semantics therefore do not apply to this path.
 
+After acquisition, Lasper may run tools from the guest filesystem to configure its hostname, users, network services, or NVIDIA state. These `systemd-nspawn -D ... --settings=no` invocations carry Lasper's host authority. The option suppresses `.nspawn` settings for the helper invocation; it does not sandbox guest binaries. Use trusted rootfs inputs for any deployment that requests post-configuration. Raw images and native-bootstrap results differ from Tar archives during acquisition, but are not a separate trust boundary once guest tools are executed. Exact clones avoid this phase while preserving the source guest's identity and application state.
+
 ## Native Tools Remain Useful
 
 Lasper is meant to make systemd-nspawn easier to operate, not to hide systemd from you. When debugging, the native tools are still the best source of truth:

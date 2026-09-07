@@ -34,6 +34,12 @@ The remaining security work is about ownership and failure semantics: long opera
 
 Prefer `lasper -e` over running the complete interface with `sudo lasper`. Running the whole TUI as root also elevates terminal parsing, clipboard integration, configuration parsing, and all UI code.
 
+## Root Filesystem Post-Configuration Policy
+
+Lasper may configure a newly acquired root filesystem by invoking its own tools through `systemd-nspawn -D ROOTFS --settings=no`. This includes account creation, network service enablement, and NVIDIA library-cache or environment updates. These commands run with Lasper's host authority and may execute binaries, loaders, libraries, and maintainer-generated state supplied by the guest filesystem. `--settings=no` prevents image-adjacent `.nspawn` settings from changing this helper invocation; it does not make guest programs trusted or place the operation behind a separate security boundary.
+
+Treat every non-clone root filesystem that receives post-configuration as privileged input, whether it came from a Tar archive, a Raw image, or a native bootstrap provider. Native bootstrap limits acquisition to the selected distribution's package sources, but the resulting filesystem still enters the same post-configuration boundary. Exact clones skip this setup phase, but intentionally preserve the source guest's hostname, machine ID, SSH host keys, accounts, application data, and other identity-bearing state.
+
 ## OCI Image Policy
 
 OCI application imports use systemd's typed `importctl pull-oci` operation (systemd 260 or newer). Registry transport and authentication are provided by HTTPS, but publisher signatures are not verified by Lasper yet. systemd owns the resulting `.mstack` image under `/var/lib/machines`; Lasper does not treat it as a bootable root filesystem or rewrite it through a generic extraction path.
@@ -44,7 +50,7 @@ Users should select trusted registries and immutable image digests when image pr
 
 ## Tar Image Policy
 
-Tar rootfs extraction runs with the authority required to populate a managed container root. Lasper ignores `TAR_OPTIONS` and reports when the executing host does not provide verified GNU tar 1.35+ extraction protections, but older or unrecognized implementations remain allowed for distribution compatibility. Treat such imports as trusted-input operations; use GNU tar 1.35+, a Raw image, or a native bootstrap provider when the archive is not fully trusted.
+Tar rootfs extraction runs with the authority required to populate a managed container root. Lasper ignores `TAR_OPTIONS` and reports when the executing host does not provide verified GNU tar 1.35+ extraction protections, but older or unrecognized implementations remain allowed for distribution compatibility. Treat such imports as trusted-input operations. GNU tar 1.35+ hardens the extraction phase, but neither a hardened extraction path nor switching to a Raw or native-bootstrap source removes the separate post-configuration trust boundary described above.
 
 ## RustSec Exceptions
 
