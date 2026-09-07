@@ -9,7 +9,7 @@ use std::process::Stdio;
 use tokio::io::AsyncReadExt;
 
 use crate::adapters::error::{NspawnError, Result};
-use crate::adapters::process::log_output;
+use crate::adapters::process::{log_output, terminate_child_process_group};
 use crate::adapters::provisioning::engine::image_operation::TarSourceOrigin;
 use crate::adapters::provisioning::engine::{
     process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
@@ -104,10 +104,13 @@ async fn download_image(
         terminate_child_group(&mut child, pid, "curl").await?;
         return Err(NspawnError::DeploymentCancelled);
     }
-    let status = child
-        .wait()
-        .await
-        .map_err(|error| process_state_unknown("curl", error))?;
+    let status = tokio::select! {
+        status = child.wait() => status.map_err(|error| process_state_unknown("curl", error))?,
+        _ = cancellation.cancelled() => {
+            terminate_child_group(&mut child, pid, "curl").await?;
+            return Err(NspawnError::DeploymentCancelled);
+        }
+    };
     if !status.success() {
         if status.code() == Some(CURL_FILESIZE_EXCEEDED_EXIT_CODE)
             || file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES)
@@ -356,46 +359,9 @@ async fn terminate_child_group(
     label: &str,
 ) -> Result<()> {
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-    if let Err(error) = crate::adapters::process::signal_process_group(pid, libc::SIGTERM) {
-        log::warn!("Failed to request termination of {label}: {error}; waiting for natural exit");
-        tokio::time::timeout(STOP_TIMEOUT, child.wait())
-            .await
-            .map_err(|_| {
-                process_state_unknown(
-                    label,
-                    std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        format!(
-                            "termination request failed ({error}) and process exit was not confirmed"
-                        ),
-                    ),
-                )
-            })?
-            .map_err(|wait_error| process_state_unknown(label, wait_error))?;
-        return Ok(());
-    }
-    match tokio::time::timeout(STOP_TIMEOUT, child.wait()).await {
-        Ok(status) => {
-            status.map_err(|error| process_state_unknown(label, error))?;
-        }
-        Err(_) => {
-            crate::adapters::process::signal_process_group(pid, libc::SIGKILL)
-                .map_err(|error| process_state_unknown(label, error))?;
-            tokio::time::timeout(STOP_TIMEOUT, child.wait())
-                .await
-                .map_err(|_| {
-                    process_state_unknown(
-                        label,
-                        std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "process exit was not confirmed after SIGKILL",
-                        ),
-                    )
-                })?
-                .map_err(|error| process_state_unknown(label, error))?;
-        }
-    }
+    terminate_child_process_group(child, pid, label, STOP_TIMEOUT)
+        .await
+        .map_err(|error| process_state_unknown(label, error))?;
     Ok(())
 }
 

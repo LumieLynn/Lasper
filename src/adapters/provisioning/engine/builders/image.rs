@@ -76,6 +76,7 @@ impl Deployer for ImageDeployer {
                         source,
                         self.source.tar_origin(),
                         self.allow_unsafe_remote_tar,
+                        cancellation,
                     )
                     .await?;
                 for warning in report.warnings {

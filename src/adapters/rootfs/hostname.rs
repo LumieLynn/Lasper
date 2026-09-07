@@ -1,5 +1,6 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
+use crate::adapters::rootfs::process::ROOTFS_COMMAND_TIMEOUT;
 use crate::domain::machine::GuestHostname;
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,7 @@ pub(crate) async fn configure_hostname_at(
         "--force".into(),
     ];
     let output = runner
-        .run("systemd-firstboot", args)
+        .run_bounded("systemd-firstboot", args, ROOTFS_COMMAND_TIMEOUT)
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("systemd-firstboot"), error))?;
     log_output("systemd-firstboot hostname", &output);
@@ -47,18 +48,22 @@ mod tests {
     #[tokio::test]
     async fn hostname_is_written_with_the_systemd_offline_writer() {
         let mut runner = MockCommandRunner::new();
-        runner.expect_run().once().returning(|program, args| {
-            assert_eq!(program, "systemd-firstboot");
-            assert_eq!(
-                args,
-                [
-                    "--root=/var/lib/machines/test",
-                    "--hostname=guest.example",
-                    "--force",
-                ]
-            );
-            Ok(output(true, ""))
-        });
+        runner
+            .expect_run_bounded()
+            .once()
+            .returning(|program, args, timeout| {
+                assert_eq!(program, "systemd-firstboot");
+                assert_eq!(
+                    args,
+                    [
+                        "--root=/var/lib/machines/test",
+                        "--hostname=guest.example",
+                        "--force",
+                    ]
+                );
+                assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
+                Ok(output(true, ""))
+            });
 
         configure_hostname_at(
             Path::new("/var/lib/machines/test"),
@@ -73,9 +78,9 @@ mod tests {
     async fn firstboot_failure_is_not_reported_as_a_successful_mutation() {
         let mut runner = MockCommandRunner::new();
         runner
-            .expect_run()
+            .expect_run_bounded()
             .once()
-            .returning(|_, _| Ok(output(false, "read-only rootfs")));
+            .returning(|_, _, _| Ok(output(false, "read-only rootfs")));
 
         let error = configure_hostname_at(
             Path::new("/var/lib/machines/test"),

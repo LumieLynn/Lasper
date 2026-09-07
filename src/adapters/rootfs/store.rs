@@ -7,7 +7,9 @@ use crate::adapters::rootfs::network::configure_network_at;
 use crate::adapters::rootfs::nvidia::{
     cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
 };
-use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
+use crate::adapters::rootfs::process::{
+    DefaultRootfsProcessRunner, RootfsProcessRunner, ROOTFS_COMMAND_TIMEOUT,
+};
 use crate::adapters::rootfs::users;
 use crate::domain::machine::GuestHostname;
 use crate::domain::machine::MachineName;
@@ -832,13 +834,14 @@ async fn mount_managed_raw_at(
         .map_err(|error| NspawnError::Io(mount_point.clone(), error))?;
 
     let output = match runner
-        .run(
+        .run_bounded(
             "systemd-dissect",
             vec![
                 "--mount".into(),
                 image.to_string_lossy().to_string(),
                 mount_point.to_string_lossy().to_string(),
             ],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
     {
@@ -898,9 +901,10 @@ async fn unmount_managed_raw_at(
     validate_required_rootfs_directory(&mount_point).await?;
     let mount_point_string = mount_point.to_string_lossy().to_string();
     let output = runner
-        .run(
+        .run_bounded(
             "systemd-dissect",
             vec!["--umount".into(), mount_point_string.clone()],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("systemd-dissect"), error))?;
@@ -908,7 +912,7 @@ async fn unmount_managed_raw_at(
 
     if !output.status.success() {
         let fallback = runner
-            .run("umount", vec![mount_point_string])
+            .run_bounded("umount", vec![mount_point_string], ROOTFS_COMMAND_TIMEOUT)
             .await
             .map_err(|error| NspawnError::Io(PathBuf::from("umount"), error))?;
         log_output("umount", &fallback);
