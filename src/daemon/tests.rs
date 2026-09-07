@@ -177,10 +177,10 @@ fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
     };
 
     assert_eq!(
-        daemon_resource_claim(&request).unwrap(),
-        Some(crate::application::ResourceClaim::exclusive(
+        daemon_resource_claims(&request).unwrap(),
+        vec![crate::application::ResourceClaim::exclusive(
             crate::application::ResourceKey::Nspawn("test-machine".into())
-        ))
+        )]
     );
     let mut invalid = request.params;
     invalid["program"] = serde_json::json!("sh");
@@ -191,9 +191,9 @@ fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
 fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
     let image = ImageName::new("test-image").unwrap();
     let machine = MachineName::new("test-image").unwrap();
-    let expected = Some(crate::application::ResourceClaim::exclusive(
+    let launch_expected = vec![crate::application::ResourceClaim::exclusive(
         crate::application::ResourceKey::Nspawn("test-image".into()),
-    ));
+    )];
     let launch = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
@@ -217,8 +217,18 @@ fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
         .unwrap(),
     };
 
-    assert_eq!(daemon_resource_claim(&launch).unwrap(), expected);
-    assert_eq!(daemon_resource_claim(&unit).unwrap(), expected);
+    assert_eq!(daemon_resource_claims(&launch).unwrap(), launch_expected);
+    assert_eq!(
+        daemon_resource_claims(&unit).unwrap(),
+        vec![
+            crate::application::ResourceClaim::exclusive(crate::application::ResourceKey::Nspawn(
+                "test-image".into()
+            )),
+            crate::application::ResourceClaim::shared(
+                crate::application::ResourceKey::SystemdManager
+            ),
+        ]
+    );
 
     let mismatched = RpcRequest {
         params: serde_json::to_value(NspawnLaunchRequest {
@@ -229,7 +239,88 @@ fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
         .unwrap(),
         ..launch
     };
-    assert!(daemon_resource_claim(&mismatched).is_err());
+    assert!(daemon_resource_claims(&mismatched).is_err());
+}
+
+#[test]
+fn generic_system_mutations_claim_every_affected_resource() {
+    use crate::application::{ResourceClaim, ResourceKey};
+    use crate::ipc::protocol::system::SystemOperation as WireOperation;
+
+    let machine = MachineName::new("test-machine").unwrap();
+    let machine_claim = vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))];
+    let request_for = |operation| RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "system_operation".into(),
+        params: serde_json::to_value(operation).unwrap(),
+    };
+
+    for operation in [
+        WireOperation::Start {
+            machine: machine.clone(),
+        },
+        WireOperation::Terminate {
+            machine: machine.clone(),
+        },
+        WireOperation::Poweroff {
+            machine: machine.clone(),
+        },
+        WireOperation::Reboot {
+            machine: machine.clone(),
+        },
+        WireOperation::Kill {
+            machine: machine.clone(),
+            signal: AllowedSignal::Kill,
+        },
+    ] {
+        assert_eq!(
+            daemon_resource_claims(&request_for(operation)).unwrap(),
+            machine_claim
+        );
+    }
+
+    for operation in [
+        WireOperation::Enable {
+            machine: machine.clone(),
+        },
+        WireOperation::Disable {
+            machine: machine.clone(),
+        },
+    ] {
+        assert_eq!(
+            daemon_resource_claims(&request_for(operation)).unwrap(),
+            vec![
+                ResourceClaim::exclusive(ResourceKey::for_machine(&machine)),
+                ResourceClaim::shared(ResourceKey::SystemdManager),
+            ]
+        );
+    }
+
+    let source = ImageName::new("source-image").unwrap();
+    let destination = ImageName::new("destination-image").unwrap();
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::CloneImage {
+            source: source.clone(),
+            destination: destination.clone(),
+        }))
+        .unwrap(),
+        vec![
+            ResourceClaim::shared(ResourceKey::for_image(&source)),
+            ResourceClaim::exclusive(ResourceKey::for_image(&destination)),
+        ]
+    );
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::RemoveImage {
+            image: source.clone(),
+        }))
+        .unwrap(),
+        vec![ResourceClaim::exclusive(ResourceKey::for_image(&source))]
+    );
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::ReloadDaemon)).unwrap(),
+        vec![ResourceClaim::exclusive(ResourceKey::SystemdManager)]
+    );
 }
 
 #[tokio::test]
