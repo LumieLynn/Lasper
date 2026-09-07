@@ -929,6 +929,29 @@ fn fd_socket_is_user_owned_and_private() {
 }
 
 #[test]
+fn fd_socket_configuration_rejects_symlinks_without_touching_their_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let socket_path = directory.path().join("fd.sock");
+    std::fs::write(&target, "untouched").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    symlink(&target, &socket_path).unwrap();
+
+    assert!(configure_user_socket(&socket_path, uzers::get_current_uid()).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert_eq!(
+        std::fs::symlink_metadata(&target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+}
+
+#[test]
 fn fd_socket_directory_is_user_owned_and_private() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 

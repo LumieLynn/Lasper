@@ -1,6 +1,8 @@
 //! Unix socket creation, peer authorization, and bounded frame transport.
 
-use std::os::unix::io::AsRawFd;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 
@@ -95,20 +97,100 @@ pub(crate) fn runtime_dir_error_allows_fallback(error: &std::io::Error) -> bool 
 }
 
 pub(crate) fn configure_user_socket(path: &Path, user_uid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::os::unix::fs::MetadataExt;
 
-    let metadata = std::fs::symlink_metadata(path)?;
-    if metadata.uid() != user_uid {
-        std::os::unix::fs::chown(path, Some(user_uid), None)?;
+    let path_bytes = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon socket path contains a NUL byte",
+        )
+    })?;
+    let raw_fd = unsafe {
+        libc::open(
+            path_bytes.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let before = descriptor_metadata(&socket)?;
+    if before.mode() & libc::S_IFMT != libc::S_IFSOCK {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "daemon socket path is not a Unix socket",
+        ));
+    }
 
-    let secured = std::fs::symlink_metadata(path)?;
-    if secured.uid() != user_uid || secured.mode() & 0o777 != 0o600 {
+    if before.uid() != user_uid {
+        let result = unsafe {
+            libc::fchownat(
+                socket.as_raw_fd(),
+                c"".as_ptr(),
+                user_uid,
+                libc::gid_t::MAX,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    chmod_descriptor(&socket, 0o600)?;
+
+    let secured = descriptor_metadata(&socket)?;
+    let current = std::fs::symlink_metadata(path)?;
+    if secured.uid() != user_uid
+        || secured.mode() & 0o777 != 0o600
+        || secured.dev() != current.dev()
+        || secured.ino() != current.ino()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "daemon socket ownership or mode verification failed",
+            "daemon socket identity, ownership, or mode verification failed",
         ));
+    }
+    Ok(())
+}
+
+fn descriptor_metadata(fd: &OwnedFd) -> std::io::Result<std::fs::Metadata> {
+    std::fs::File::from(fd.try_clone()?).metadata()
+}
+
+fn chmod_descriptor(fd: &OwnedFd, mode: libc::mode_t) -> std::io::Result<()> {
+    let result = unsafe { libc::fchmodat(fd.as_raw_fd(), c"".as_ptr(), mode, libc::AT_EMPTY_PATH) };
+    if result == 0 {
+        return Ok(());
+    }
+
+    let mut error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EINVAL) {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_fchmodat2,
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                mode,
+                libc::AT_EMPTY_PATH,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        error = std::io::Error::last_os_error();
+    }
+    if !matches!(error.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EPERM)) {
+        return Err(error);
+    }
+
+    // Linux kernels predating fchmodat2 can still address the pinned O_PATH
+    // inode through procfs. The path contains only the already-open fd number.
+    let proc_path = CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd()))
+        .expect("fd path cannot contain NUL");
+    let result = unsafe { libc::chmod(proc_path.as_ptr(), mode) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
