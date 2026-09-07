@@ -23,13 +23,18 @@ pub struct ProvisioningService {
     operations: Arc<OperationRegistry>,
     unresolved_claims:
         Arc<parking_lot::Mutex<HashMap<super::DeploymentId, RetainedDeploymentClaim>>>,
-    recovered_claims: parking_lot::Mutex<Option<ResourceReservation>>,
+    recovered_claims: tokio::sync::Mutex<HashMap<super::DeploymentId, RecoveredDeploymentClaim>>,
 }
 
 struct RetainedDeploymentClaim {
     _reservation: ResourceReservation,
     status: tokio::sync::watch::Sender<DeploymentClaimStatus>,
     release_in_progress: bool,
+}
+
+struct RecoveredDeploymentClaim {
+    claim: crate::application::ResourceClaim,
+    _reservation: ResourceReservation,
 }
 
 impl ProvisioningService {
@@ -49,7 +54,7 @@ impl ProvisioningService {
             claim_control,
             operations,
             unresolved_claims: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            recovered_claims: parking_lot::Mutex::new(None),
+            recovered_claims: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,26 +179,64 @@ impl ProvisioningService {
     pub(crate) async fn unfinished_deployments(
         &self,
     ) -> Result<Vec<DeploymentRecoveryReport>, DeploymentError> {
+        // Serialize the snapshot read and claim reconciliation so an older
+        // concurrent scan cannot overwrite a newer manifest view.
+        let mut recovered_claims = self.recovered_claims.lock().await;
         let manifests = self
             .state
             .unfinished()
             .await
             .map_err(|error| DeploymentError::failed(error.to_string()))?;
-        if !manifests.is_empty() {
-            let mut recovered_claims = self.recovered_claims.lock();
-            if recovered_claims.is_none() {
-                let reservation = self
-                    .operations
-                    .reserve(manifests.iter().map(DeploymentCrashManifest::recovery_claim))
-                    .map_err(|conflict| {
-                        DeploymentError::reconciliation_required(format!(
-                            "unfinished deployment recovery conflicts with an active resource: {:?}",
-                            conflict.key
-                        ))
-                    })?;
-                *recovered_claims = Some(reservation);
+
+        let mut desired = HashMap::with_capacity(manifests.len());
+        for manifest in &manifests {
+            if desired
+                .insert(manifest.deployment_id, manifest.recovery_claim())
+                .is_some()
+            {
+                return Err(DeploymentError::reconciliation_required(format!(
+                    "unfinished deployment {} appears more than once",
+                    manifest.deployment_id
+                )));
             }
         }
+
+        for (deployment_id, retained) in recovered_claims.iter() {
+            if let Some(claim) = desired.get(deployment_id) {
+                if claim != &retained.claim {
+                    return Err(DeploymentError::reconciliation_required(format!(
+                        "unfinished deployment {deployment_id} changed its claimed resource"
+                    )));
+                }
+            }
+        }
+
+        recovered_claims.retain(|deployment_id, _| desired.contains_key(deployment_id));
+        let mut additions = Vec::new();
+        for (deployment_id, claim) in &desired {
+            if recovered_claims.contains_key(deployment_id) {
+                continue;
+            }
+            let reservation = self
+                .operations
+                .reserve([claim.clone()])
+                .map_err(|conflict| {
+                    DeploymentError::reconciliation_required(format!(
+                        "unfinished deployment recovery conflicts with an active resource: {:?}",
+                        conflict.key
+                    ))
+                })?;
+            additions.push((
+                *deployment_id,
+                RecoveredDeploymentClaim {
+                    claim: claim.clone(),
+                    _reservation: reservation,
+                },
+            ));
+        }
+        recovered_claims.extend(additions);
+        drop(recovered_claims);
+
         let mut reports = Vec::with_capacity(manifests.len());
         for manifest in manifests {
             match self.recovery.probe(&manifest).await {
@@ -673,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_recovery_reserves_manifest_targets_without_mutating_them() {
+    async fn startup_recovery_tracks_manifest_claims_without_mutating_them() {
         let registry = OperationRegistry::new();
         let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
         let (request, _) = submission().into_parts();
@@ -707,6 +750,17 @@ mod tests {
             .is_err());
         assert_eq!(state.unfinished().await.unwrap().len(), 1);
         assert_eq!(service.unfinished_deployments().await.unwrap().len(), 1);
+
+        state
+            .remove(manifest.deployment_id, manifest.revision)
+            .await
+            .unwrap();
+        assert!(service.unfinished_deployments().await.unwrap().is_empty());
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(plan.target()),
+            )])
+            .is_ok());
     }
 
     #[test]
