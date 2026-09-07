@@ -5,9 +5,9 @@ use crate::adapters::provisioning::direct::DirectProvisioningExecutor;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::operations::ResourceReservation;
 use crate::application::provisioning::{
-    deployment_job_channel, run_deployment_executor, DeploymentCancellation, DeploymentExecutor,
-    DeploymentId, DeploymentPlan, DeploymentRequestId, DeploymentStatus, DeploymentSubmission,
-    PlanFingerprint,
+    deployment_job_channel, run_deployment_executor, DeploymentCancellation, DeploymentClaimStatus,
+    DeploymentExecutor, DeploymentId, DeploymentPlan, DeploymentRequestId, DeploymentStatus,
+    DeploymentSubmission, PlanFingerprint,
 };
 use crate::application::{OperationRegistry, ResourceClaim};
 use crate::ipc::protocol::deployment::{
@@ -188,34 +188,78 @@ impl DeploymentRegistry {
         Ok(())
     }
 
-    fn update_status(
+    fn observe_status(
         &self,
         deployment_id: DeploymentId,
         status: DeploymentStatus,
-    ) -> Option<DeploymentJobSnapshot> {
+    ) -> std::io::Result<DeploymentJobSnapshot> {
+        if status.is_finished() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal deployment status must be finalized by its executor",
+            ));
+        }
         let mut inner = self.inner.lock();
         let sequence = next_sequence(&mut inner);
-        let record = inner.jobs.get_mut(&deployment_id)?;
-        let claim = if matches!(status, DeploymentStatus::ReconciliationRequired(_)) {
-            DeploymentClaimState::ReconciliationRequired
-        } else if status.is_finished() {
-            DeploymentClaimState::Released
-        } else {
-            DeploymentClaimState::Held
-        };
-        if status != record.status || claim != record.claim {
+        let record = inner.jobs.get_mut(&deployment_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("deployment {deployment_id} is not registered"),
+            )
+        })?;
+        if record.status.is_finished() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("deployment {deployment_id} is already terminal"),
+            ));
+        }
+        if status != record.status {
             record.revision = record.revision.saturating_add(1);
             record.status = status;
-            record.claim = claim;
             record.sequence = sequence;
-            if claim == DeploymentClaimState::Released {
-                record.reservation.take();
-            }
         }
         let snapshot = snapshot(deployment_id, record);
         drop(inner);
         self.changed.notify_waiters();
-        Some(snapshot)
+        Ok(snapshot)
+    }
+
+    fn finalize(
+        &self,
+        deployment_id: DeploymentId,
+        status: DeploymentStatus,
+        claim_status: DeploymentClaimStatus,
+    ) -> std::io::Result<DeploymentJobSnapshot> {
+        let claim = terminal_claim_state(&status, claim_status)?;
+        let mut inner = self.inner.lock();
+        let sequence = next_sequence(&mut inner);
+        let record = inner.jobs.get_mut(&deployment_id).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("deployment {deployment_id} is not registered"),
+            )
+        })?;
+        if record.status.is_finished() {
+            if record.status == status && record.claim == claim {
+                return Ok(snapshot(deployment_id, record));
+            }
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("deployment {deployment_id} already has a different terminal result"),
+            ));
+        }
+
+        record.revision = record.revision.saturating_add(1);
+        record.status = status;
+        record.claim = claim;
+        record.sequence = sequence;
+        if claim != DeploymentClaimState::ReconciliationRequired {
+            record.reservation.take();
+        }
+        let snapshot = snapshot(deployment_id, record);
+        drop(inner);
+        self.changed.notify_waiters();
+        Ok(snapshot)
     }
 
     pub(crate) fn snapshot(
@@ -486,6 +530,42 @@ impl DeploymentRegistry {
     }
 }
 
+fn terminal_claim_state(
+    status: &DeploymentStatus,
+    claim_status: DeploymentClaimStatus,
+) -> std::io::Result<DeploymentClaimState> {
+    let claim = match claim_status {
+        DeploymentClaimStatus::Released => DeploymentClaimState::Released,
+        DeploymentClaimStatus::ReconciliationRequired => {
+            DeploymentClaimState::ReconciliationRequired
+        }
+        DeploymentClaimStatus::Reconciled => DeploymentClaimState::Reconciled,
+        DeploymentClaimStatus::Held | DeploymentClaimStatus::ReleasedUnresolved => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "executor returned an invalid terminal claim state",
+            ))
+        }
+    };
+    let consistent = match status {
+        DeploymentStatus::ReconciliationRequired(_) => matches!(
+            claim,
+            DeploymentClaimState::ReconciliationRequired | DeploymentClaimState::Reconciled
+        ),
+        DeploymentStatus::Succeeded
+        | DeploymentStatus::Failed(_)
+        | DeploymentStatus::Cancelled(_) => claim == DeploymentClaimState::Released,
+        DeploymentStatus::Running | DeploymentStatus::RollingBack => false,
+    };
+    if !consistent {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "executor returned an inconsistent terminal status and claim state",
+        ));
+    }
+    Ok(claim)
+}
+
 fn next_sequence(inner: &mut DeploymentRegistryInner) -> u64 {
     inner.next_sequence = inner.next_sequence.saturating_add(1);
     inner.next_sequence
@@ -656,9 +736,20 @@ pub(crate) async fn submit(
         artifact_source,
     ));
     let terminal_status = context.status_sender();
+    let deployment_registry = Arc::clone(&server_state.deployments);
     tokio::spawn(async move {
         let terminal = run_deployment_executor(executor, plan, secrets, context).await;
-        terminal_status.send_replace(terminal.status);
+        let status = terminal.status;
+        match deployment_registry.finalize(deployment_id, status.clone(), terminal.claim_status) {
+            Ok(_) => {
+                terminal_status.send_replace(status);
+            }
+            Err(error) => {
+                log::error!(
+                    "Daemon: deployment {deployment_id} could not finalize its registry state: {error}"
+                );
+            }
+        }
     });
     tokio::spawn(forward_job_stream(
         deployment_id,
@@ -760,14 +851,14 @@ async fn forward_job_stream(
                         write_frame(&mut writer, DeploymentStreamFrame::Event(event)).await;
                 }
             }
-            let Some(snapshot) = server_state
-                .deployments
-                .update_status(deployment_id, current)
-            else {
-                log::warn!(
-                    "Deployment {deployment_id} disappeared before its terminal stream frame"
-                );
-                return;
+            let snapshot = match server_state.deployments.snapshot(deployment_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    log::warn!(
+                        "Deployment {deployment_id} disappeared before its terminal stream frame: {error}"
+                    );
+                    return;
+                }
             };
             if stream_open {
                 let _ = write_frame(&mut writer, DeploymentStreamFrame::Snapshot(snapshot)).await;
@@ -789,33 +880,23 @@ async fn forward_job_stream(
             }
             changed = status.changed() => {
                 if changed.is_err() {
-                    let failed = DeploymentStatus::ReconciliationRequired(
-                        "daemon deployment status channel closed before a terminal result".into(),
+                    log::error!(
+                        "Deployment {deployment_id} status channel closed before its executor finalized"
                     );
-                    let Some(snapshot) = server_state.deployments.update_status(deployment_id, failed)
-                    else {
-                        log::warn!(
-                            "Deployment {deployment_id} disappeared while reporting a closed status channel"
-                        );
-                        return;
-                    };
-                    if stream_open {
-                        let _ = write_frame(
-                            &mut writer,
-                            DeploymentStreamFrame::Snapshot(snapshot),
-                        ).await;
-                    }
                     return;
                 }
                 let current = status.borrow().clone();
-                let Some(snapshot) = server_state
+                let snapshot = match server_state
                     .deployments
-                    .update_status(deployment_id, current.clone())
-                else {
-                    log::warn!(
-                        "Deployment {deployment_id} disappeared while forwarding status"
-                    );
-                    return;
+                    .observe_status(deployment_id, current.clone())
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        log::warn!(
+                            "Deployment {deployment_id} status could not be observed: {error}"
+                        );
+                        return;
+                    }
                 };
                 if !current.is_finished() && stream_open {
                     stream_open = write_frame(
@@ -916,6 +997,21 @@ mod tests {
         )
     }
 
+    fn finalize_job(
+        registry: &DeploymentRegistry,
+        deployment_id: DeploymentId,
+        status: DeploymentStatus,
+    ) -> DeploymentJobSnapshot {
+        let claim_status = if matches!(status, DeploymentStatus::ReconciliationRequired(_)) {
+            DeploymentClaimStatus::ReconciliationRequired
+        } else {
+            DeploymentClaimStatus::Released
+        };
+        registry
+            .finalize(deployment_id, status, claim_status)
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn deployment_stream_frames_are_flushed_before_terminal_state() {
         let (reader, writer) = tokio::io::duplex(1024);
@@ -963,7 +1059,8 @@ mod tests {
         )
         .is_err());
 
-        registry.update_status(
+        finalize_job(
+            &registry,
             first,
             DeploymentStatus::ReconciliationRequired("inspect manifest".into()),
         );
@@ -982,7 +1079,7 @@ mod tests {
         let target = MachineName::new("test").unwrap();
         let request_id = DeploymentRequestId::from_u128(13);
         register_job(&registry, &operations, request_id, id, &target).unwrap();
-        registry.update_status(id, DeploymentStatus::Succeeded);
+        finalize_job(&registry, id, DeploymentStatus::Succeeded);
         registry.acknowledge_submission(request_id).unwrap();
         registry.acknowledge(id).unwrap();
         register_job(
@@ -1054,20 +1151,19 @@ mod tests {
         assert!(operations.is_held(&key));
 
         let rolling = registry
-            .update_status(deployment_id, DeploymentStatus::RollingBack)
+            .observe_status(deployment_id, DeploymentStatus::RollingBack)
             .unwrap();
         assert_eq!(rolling.revision, 2);
         let repeated = registry
-            .update_status(deployment_id, DeploymentStatus::RollingBack)
+            .observe_status(deployment_id, DeploymentStatus::RollingBack)
             .unwrap();
         assert_eq!(repeated.revision, 2);
 
-        let terminal = registry
-            .update_status(
-                deployment_id,
-                DeploymentStatus::Failed("known failure".into()),
-            )
-            .unwrap();
+        let terminal = finalize_job(
+            &registry,
+            deployment_id,
+            DeploymentStatus::Failed("known failure".into()),
+        );
         assert_eq!(terminal.revision, 3);
         assert_eq!(terminal.claim, DeploymentClaimState::Released);
         assert!(!operations.is_held(&key));
@@ -1099,12 +1195,11 @@ mod tests {
         let target = MachineName::new("reconcile-test").unwrap();
         let key = crate::application::ResourceKey::for_machine(&target);
         register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-        let unresolved = registry
-            .update_status(
-                deployment_id,
-                DeploymentStatus::ReconciliationRequired("inspect state".into()),
-            )
-            .unwrap();
+        let unresolved = finalize_job(
+            &registry,
+            deployment_id,
+            DeploymentStatus::ReconciliationRequired("inspect state".into()),
+        );
 
         let retained = registry.reconcile(deployment_id, true).unwrap();
         assert_eq!(retained.revision, unresolved.revision);
@@ -1124,6 +1219,28 @@ mod tests {
     }
 
     #[test]
+    fn executor_reconciled_terminal_releases_its_claim_immediately() {
+        let registry = DeploymentRegistry::default();
+        let operations = OperationRegistry::new();
+        let request_id = DeploymentRequestId::from_u128(39);
+        let deployment_id = DeploymentId::from_u128(40);
+        let target = MachineName::new("already-reconciled").unwrap();
+        let key = crate::application::ResourceKey::for_machine(&target);
+        register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
+
+        let snapshot = registry
+            .finalize(
+                deployment_id,
+                DeploymentStatus::ReconciliationRequired("historical outcome unknown".into()),
+                DeploymentClaimStatus::Reconciled,
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.claim, DeploymentClaimState::Reconciled);
+        assert!(!operations.is_held(&key));
+    }
+
+    #[test]
     fn unresolved_release_requires_confirmation_and_preserves_history() {
         let registry = DeploymentRegistry::default();
         let operations = OperationRegistry::new();
@@ -1132,7 +1249,8 @@ mod tests {
         let target = MachineName::new("unresolved-test").unwrap();
         let key = crate::application::ResourceKey::for_machine(&target);
         register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-        registry.update_status(
+        finalize_job(
+            &registry,
             deployment_id,
             DeploymentStatus::ReconciliationRequired("inspect host state".into()),
         );
@@ -1185,7 +1303,7 @@ mod tests {
             let deployment_id = DeploymentId::from_u128(value + 100);
             let target = MachineName::new(format!("evict-{value}")).unwrap();
             register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-            registry.update_status(deployment_id, DeploymentStatus::Succeeded);
+            finalize_job(&registry, deployment_id, DeploymentStatus::Succeeded);
             registry.acknowledge_submission(request_id).unwrap();
             registry.acknowledge(deployment_id).unwrap();
         }
@@ -1214,7 +1332,7 @@ mod tests {
             let target = MachineName::new(format!("leased-evict-{value}"))
                 .expect("test target is a valid machine name");
             register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-            registry.update_status(deployment_id, DeploymentStatus::Succeeded);
+            finalize_job(&registry, deployment_id, DeploymentStatus::Succeeded);
             registry.acknowledge_submission(request_id).unwrap();
             registry.acknowledge(deployment_id).unwrap();
         }
@@ -1268,10 +1386,13 @@ mod tests {
         let updater = Arc::clone(&registry);
         tokio::spawn(async move {
             cancellation.cancelled().await;
-            updater.update_status(
-                deployment_id,
-                DeploymentStatus::Cancelled("daemon shutdown".into()),
-            );
+            updater
+                .finalize(
+                    deployment_id,
+                    DeploymentStatus::Cancelled("daemon shutdown".into()),
+                    DeploymentClaimStatus::Released,
+                )
+                .unwrap();
         });
 
         assert!(

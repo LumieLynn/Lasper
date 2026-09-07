@@ -275,7 +275,7 @@ impl ElevatedProvisioningExecutor {
                 snapshot.deployment_id
             );
         }
-        status_into_result(snapshot.status)
+        status_into_result(snapshot.status, snapshot.claim)
     }
 }
 
@@ -383,11 +383,22 @@ pub(super) fn validate_snapshot(
     }
 }
 
-fn status_into_result(status: DeploymentStatus) -> Result<(), DeploymentError> {
+fn status_into_result(
+    status: DeploymentStatus,
+    claim: DeploymentClaimState,
+) -> Result<(), DeploymentError> {
     match status {
         DeploymentStatus::Succeeded => Ok(()),
         DeploymentStatus::Failed(message) => Err(DeploymentError::failed(message)),
         DeploymentStatus::Cancelled(message) => Err(DeploymentError::cancelled(message)),
+        DeploymentStatus::ReconciliationRequired(message)
+            if matches!(
+                claim,
+                DeploymentClaimState::Reconciled | DeploymentClaimState::ReleasedUnresolved
+            ) =>
+        {
+            Err(DeploymentError::reconciled_unknown(message))
+        }
         DeploymentStatus::ReconciliationRequired(message) => {
             Err(DeploymentError::reconciliation_required(message))
         }
@@ -405,27 +416,45 @@ mod tests {
 
     #[test]
     fn terminal_statuses_preserve_their_application_meaning() {
-        assert!(status_into_result(DeploymentStatus::Succeeded).is_ok());
-        assert!(status_into_result(DeploymentStatus::Failed("failed".into())).is_err());
         assert!(
-            status_into_result(DeploymentStatus::Cancelled("cancelled".into()))
-                .unwrap_err()
-                .is_cancelled()
+            status_into_result(DeploymentStatus::Succeeded, DeploymentClaimState::Released).is_ok()
         );
-        assert!(status_into_result(DeploymentStatus::ReconciliationRequired(
-            "inspect state".into()
-        ))
+        assert!(status_into_result(
+            DeploymentStatus::Failed("failed".into()),
+            DeploymentClaimState::Released
+        )
+        .is_err());
+        assert!(status_into_result(
+            DeploymentStatus::Cancelled("cancelled".into()),
+            DeploymentClaimState::Released
+        )
+        .unwrap_err()
+        .is_cancelled());
+        assert!(status_into_result(
+            DeploymentStatus::ReconciliationRequired("inspect state".into()),
+            DeploymentClaimState::ReconciliationRequired
+        )
         .unwrap_err()
         .requires_reconciliation());
+        assert!(!status_into_result(
+            DeploymentStatus::ReconciliationRequired("historical outcome unknown".into()),
+            DeploymentClaimState::Reconciled
+        )
+        .unwrap_err()
+        .retains_resource_claim());
     }
 
     #[test]
     fn non_terminal_status_cannot_complete_an_executor() {
-        assert!(status_into_result(DeploymentStatus::Running)
-            .unwrap_err()
-            .requires_reconciliation());
-        assert!(status_into_result(DeploymentStatus::RollingBack)
-            .unwrap_err()
-            .requires_reconciliation());
+        assert!(
+            status_into_result(DeploymentStatus::Running, DeploymentClaimState::Held)
+                .unwrap_err()
+                .requires_reconciliation()
+        );
+        assert!(
+            status_into_result(DeploymentStatus::RollingBack, DeploymentClaimState::Held)
+                .unwrap_err()
+                .requires_reconciliation()
+        );
     }
 }
