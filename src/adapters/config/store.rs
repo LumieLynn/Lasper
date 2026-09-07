@@ -855,7 +855,7 @@ async fn write_generated_at(
         content = NspawnConfig::apply_gpu_passthrough_to_content(content, state, &[])?;
     }
     validate_content_size(&content)?;
-    apply_new_content_at(path, content, None).await
+    apply_new_content_at(path, content, Some(0o644)).await
 }
 
 async fn validate_custom_bind_sources(spec: &NspawnConfigSpec) -> Result<()> {
@@ -1410,6 +1410,10 @@ Unknown=preserve-me\n";
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(content.contains("Boot=yes"));
         assert!(content.contains("Hostname=test-host"));
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o777,
+            0o644
+        );
         assert!(crate::adapters::filesystem::lock_path_for(&path).exists());
 
         let unchanged = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
