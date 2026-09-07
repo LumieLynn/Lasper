@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 
 pub(crate) const MAX_RPC_FRAME_BYTES: usize = 1024 * 1024;
+const SYS_FCHMODAT2: libc::c_long = linux_raw_sys::general::__NR_fchmodat2 as libc::c_long;
 
 pub(crate) fn create_fd_socket_dir(user_uid: u32) -> std::io::Result<tempfile::TempDir> {
     let mut candidates = Vec::new();
@@ -168,7 +169,7 @@ fn chmod_descriptor(fd: &OwnedFd, mode: libc::mode_t) -> std::io::Result<()> {
     if error.raw_os_error() == Some(libc::EINVAL) {
         let result = unsafe {
             libc::syscall(
-                libc::SYS_fchmodat2,
+                SYS_FCHMODAT2,
                 fd.as_raw_fd(),
                 c"".as_ptr(),
                 mode,
