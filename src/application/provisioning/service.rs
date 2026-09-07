@@ -1,13 +1,13 @@
 use super::contract::{
     deployment_job_channel, DeploymentClaimStatus, DeploymentError, DeploymentStatus,
 };
+#[cfg(test)]
+use super::DeploymentCrashManifest;
 use super::{
     DeploymentClaimControl, DeploymentExecutor, DeploymentJobHandle, DeploymentPlan,
     DeploymentPreflight, DeploymentRequest, DeploymentSubmission, RemoteTarSafety, SourcePreflight,
 };
-use super::{
-    DeploymentCrashManifest, DeploymentRecoveryProbe, DeploymentRecoveryReport, DeploymentStatePort,
-};
+use super::{DeploymentRecoveryProbe, DeploymentRecoveryReport, DeploymentStatePort};
 use crate::application::operations::ResourceReservation;
 use crate::application::OperationRegistry;
 use futures_util::FutureExt;
