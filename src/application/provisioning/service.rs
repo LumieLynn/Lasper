@@ -106,6 +106,10 @@ impl ProvisioningService {
                         release_in_progress: false,
                     },
                 );
+            } else {
+                // A terminal status is the public completion boundary. Release
+                // known-outcome claims before observers can act on it.
+                drop(reservation);
             }
             claim_status.send_replace(terminal.claim_status);
             terminal_status.send_replace(terminal.status);
@@ -532,21 +536,11 @@ mod tests {
 
         handle.request_cancel();
         wait_until_finished(&handle).await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if registry
-                    .reserve([crate::application::ResourceClaim::exclusive(
-                        crate::application::ResourceKey::for_machine(&target),
-                    )])
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(&target),
+            )])
+            .is_ok());
     }
 
     #[tokio::test]
@@ -670,21 +664,11 @@ mod tests {
         assert_eq!(handle.claim_status(), DeploymentClaimStatus::Reconciled);
 
         let target = crate::domain::machine::MachineName::new("test").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if registry
-                    .reserve([crate::application::ResourceClaim::exclusive(
-                        crate::application::ResourceKey::for_machine(&target),
-                    )])
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(&target),
+            )])
+            .is_ok());
         assert!(service.unresolved_claims.lock().is_empty());
     }
 
