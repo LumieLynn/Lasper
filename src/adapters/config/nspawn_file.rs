@@ -6,6 +6,31 @@ use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 
+const NVIDIA_BLOCK_BEGIN: &str = "X-Lasper-Nvidia-Begin=managed-by-lasper";
+const NVIDIA_BLOCK_END: &str = "X-Lasper-Nvidia-End=true";
+
+fn line_body(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+fn is_files_section(line: &str) -> bool {
+    line.trim().eq_ignore_ascii_case("[files]")
+}
+
+fn is_section_header(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('[') && line.ends_with(']')
+}
+
+pub(crate) fn is_nvidia_begin_marker(line: &str) -> bool {
+    line.trim() == NVIDIA_BLOCK_BEGIN
+}
+
+pub(crate) fn is_nvidia_end_marker(line: &str) -> bool {
+    line.trim() == NVIDIA_BLOCK_END
+}
+
 pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
     path.replace('\\', "\\\\").replace(':', "\\:")
 }
@@ -191,52 +216,56 @@ impl NspawnConfig {
 
     /// Scans the raw content for markers and removes the block.
     pub fn purge_nvidia_block(content: &str) -> Result<(String, Vec<String>)> {
-        let lines: Vec<&str> = content.lines().collect();
-        let mut start_idx = None;
-        let mut end_idx = None;
+        let mut in_files = false;
+        let mut start_offset = None;
+        let mut end_offset = None;
         let mut death_list = Vec::new();
+        let mut offset = 0usize;
 
-        for (i, line) in lines.iter().enumerate() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("X-Lasper-Nvidia-Begin=") {
-                if start_idx.is_some() {
+        for line in content.split_inclusive('\n') {
+            let body = line_body(line);
+            if is_section_header(body) {
+                if start_offset.is_some() && end_offset.is_none() {
+                    return Err(NspawnError::Runtime(
+                        "Incomplete NVIDIA markers cross a section boundary".into(),
+                    ));
+                }
+                in_files = is_files_section(body);
+                offset += line.len();
+                continue;
+            }
+
+            if in_files && is_nvidia_begin_marker(body) {
+                if start_offset.is_some() {
                     return Err(NspawnError::Runtime(
                         "Duplicate X-Lasper-Nvidia-Begin marker".into(),
                     ));
                 }
-                start_idx = Some(i);
-            } else if trimmed.starts_with("X-Lasper-Nvidia-End=") {
-                if end_idx.is_some() {
+                start_offset = Some(offset);
+            } else if in_files && is_nvidia_end_marker(body) {
+                if start_offset.is_none() || end_offset.is_some() {
                     return Err(NspawnError::Runtime(
-                        "Duplicate X-Lasper-Nvidia-End marker".into(),
+                        "X-Lasper-Nvidia-End marker has no matching begin marker".into(),
                     ));
                 }
-                end_idx = Some(i);
+                end_offset = Some(offset + line.len());
+            } else if start_offset.is_some() && end_offset.is_none() {
+                let trimmed = body.trim();
+                if let Some((key, value)) = trimmed.split_once('=') {
+                    if matches!(key.trim(), "Bind" | "BindReadOnly") {
+                        death_list.push(value.to_string());
+                    }
+                }
             }
+            offset += line.len();
         }
 
-        match (start_idx, end_idx) {
-            (Some(s), Some(e)) => {
-                if s > e {
-                    return Err(NspawnError::Runtime("Markers out of order".into()));
-                }
-                // Extract paths from common entries in this block
-                for line in &lines[s + 1..e] {
-                    let line = line.trim();
-                    if line.starts_with("Bind=") || line.starts_with("BindReadOnly=") {
-                        if let Some(val) = line.split_once('=').map(|x| x.1) {
-                            death_list.push(val.to_string());
-                        }
-                    }
-                }
-                // Reconstruct content excluding the block
-                let mut new_lines = Vec::new();
-                for (i, line) in lines.iter().enumerate() {
-                    if i < s || i > e {
-                        new_lines.push(*line);
-                    }
-                }
-                Ok((new_lines.join("\n"), death_list))
+        match (start_offset, end_offset) {
+            (Some(start), Some(end)) => {
+                let mut clean = String::with_capacity(content.len() - (end - start));
+                clean.push_str(&content[..start]);
+                clean.push_str(&content[end..]);
+                Ok((clean, death_list))
             }
             (None, None) => Ok((content.to_string(), Vec::new())),
             _ => Err(NspawnError::Runtime(
@@ -271,19 +300,30 @@ impl NspawnConfig {
             .map(|bind| bind.destination.clone())
             .collect::<HashSet<_>>();
         let mut conflicts = BTreeSet::new();
-        let mut result_lines = Vec::new();
+        let mut result = String::with_capacity(clean_content.len());
         let mut in_files = false;
+        let mut first_files_seen = false;
+        let mut first_files_open = false;
+        let mut insert_at = None;
 
-        for line in clean_content.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with('[') && trimmed.ends_with(']') {
-                in_files = trimmed.eq_ignore_ascii_case("[files]");
-                result_lines.push(line.to_string());
+        for line in clean_content.split_inclusive('\n') {
+            let body = line_body(line);
+            if is_section_header(body) {
+                if first_files_open {
+                    insert_at = Some(result.len());
+                    first_files_open = false;
+                }
+                in_files = is_files_section(body);
+                if in_files && !first_files_seen {
+                    first_files_seen = true;
+                    first_files_open = true;
+                }
+                result.push_str(line);
                 continue;
             }
 
             if in_files {
-                if let Some(bind) = parse_nspawn_bind_line(line) {
+                if let Some(bind) = parse_nspawn_bind_line(body) {
                     if new_binds.contains(&bind) || removed_binds.contains(&bind) {
                         continue;
                     }
@@ -292,7 +332,10 @@ impl NspawnConfig {
                     }
                 }
             }
-            result_lines.push(line.to_string());
+            result.push_str(line);
+        }
+        if first_files_open {
+            insert_at = Some(result.len());
         }
 
         if !conflicts.is_empty() {
@@ -304,8 +347,7 @@ impl NspawnConfig {
 
         // 3. Build the new managed block from unified PassthroughBind list
         if !new_state.binds.is_empty() {
-            let mut block = Vec::new();
-            block.push("X-Lasper-Nvidia-Begin=managed-by-lasper".to_string());
+            let mut block = vec![NVIDIA_BLOCK_BEGIN.to_string()];
             for bind in &new_state.binds {
                 let host_path = escape_nspawn_bind_path(&bind.host_path);
                 let container_path = escape_nspawn_bind_path(&bind.container_path);
@@ -321,37 +363,69 @@ impl NspawnConfig {
                     block.push(format!("Bind={host_path}:{container_path}"));
                 }
             }
-            block.push("X-Lasper-Nvidia-End=true".to_string());
+            block.push(NVIDIA_BLOCK_END.to_string());
 
-            // 4. Find [Files] section and insert block at its end
-            let files_idx = result_lines
-                .iter()
-                .position(|l| l.trim().eq_ignore_ascii_case("[files]"));
-
-            match files_idx {
-                Some(idx) => {
-                    let insert_at = result_lines
-                        .iter()
-                        .enumerate()
-                        .skip(idx + 1)
-                        .find(|(_, l)| l.trim().starts_with('[') && l.trim().ends_with(']'))
-                        .map(|(i, _)| i)
-                        .unwrap_or(result_lines.len());
-
-                    for (i, line) in block.into_iter().enumerate() {
-                        result_lines.insert(insert_at + i, line);
-                    }
+            let line_ending = if clean_content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let preserve_final_newline = clean_content.ends_with('\n');
+            result = match insert_at {
+                Some(offset) => {
+                    insert_block(result, offset, &block, line_ending, preserve_final_newline)
                 }
-                None => {
-                    result_lines.push(String::new());
-                    result_lines.push("[Files]".to_string());
-                    result_lines.extend(block);
-                }
-            }
+                None => append_files_block(result, &block, line_ending, preserve_final_newline),
+            };
         }
 
-        Ok(result_lines.join("\n"))
+        Ok(result)
     }
+}
+
+fn insert_block(
+    content: String,
+    offset: usize,
+    block: &[String],
+    line_ending: &str,
+    preserve_final_newline: bool,
+) -> String {
+    let (prefix, suffix) = content.split_at(offset);
+    let mut result =
+        String::with_capacity(content.len() + block.iter().map(String::len).sum::<usize>());
+    result.push_str(prefix);
+    if !prefix.is_empty() && !prefix.ends_with('\n') {
+        result.push_str(line_ending);
+    }
+    result.push_str(&block.join(line_ending));
+    if !suffix.is_empty() || preserve_final_newline {
+        result.push_str(line_ending);
+    }
+    result.push_str(suffix);
+    result
+}
+
+fn append_files_block(
+    mut content: String,
+    block: &[String],
+    line_ending: &str,
+    preserve_final_newline: bool,
+) -> String {
+    if !content.is_empty() {
+        if !content.ends_with('\n') {
+            content.push_str(line_ending);
+        }
+        if !content.ends_with(&format!("{line_ending}{line_ending}")) {
+            content.push_str(line_ending);
+        }
+    }
+    content.push_str("[Files]");
+    content.push_str(line_ending);
+    content.push_str(&block.join(line_ending));
+    if preserve_final_newline {
+        content.push_str(line_ending);
+    }
+    content
 }
 
 //.nspawn file generation
@@ -678,9 +752,9 @@ mod tests {
 
     #[test]
     fn test_purge_nvidia_block_present() {
-        let content = "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nBindReadOnly=/usr/lib/libcuda.so\nX-Lasper-Nvidia-End=true\nLine 2";
+        let content = "[Files]\nLine 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nBindReadOnly=/usr/lib/libcuda.so\nX-Lasper-Nvidia-End=true\nLine 2";
         let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
-        assert_eq!(new_content, "Line 1\nLine 2");
+        assert_eq!(new_content, "[Files]\nLine 1\nLine 2");
         assert_eq!(death_list, vec!["/dev/nvidia0", "/usr/lib/libcuda.so"]);
     }
 
@@ -694,35 +768,43 @@ mod tests {
 
     #[test]
     fn test_purge_nvidia_block_begin_only() {
-        let content = "X-Lasper-Nvidia-Begin=managed-by-lasper\nLine 1";
+        let content = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nLine 1";
         assert!(NspawnConfig::purge_nvidia_block(content).is_err());
     }
 
     #[test]
     fn test_purge_nvidia_block_end_only() {
-        let content = "Line 1\nX-Lasper-Nvidia-End=true\nLine 2";
+        let content = "[Files]\nLine 1\nX-Lasper-Nvidia-End=true\nLine 2";
         assert!(NspawnConfig::purge_nvidia_block(content).is_err());
     }
 
     #[test]
     fn test_purge_nvidia_block_duplicate_begin() {
-        let content = "X-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true";
+        let content = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true";
         assert!(NspawnConfig::purge_nvidia_block(content).is_err());
     }
 
     #[test]
     fn test_purge_nvidia_block_reversed_markers() {
-        let content =
-            "X-Lasper-Nvidia-End=true\nBind=/dev/nvidia0\nX-Lasper-Nvidia-Begin=managed-by-lasper";
+        let content = "[Files]\nX-Lasper-Nvidia-End=true\nBind=/dev/nvidia0\nX-Lasper-Nvidia-Begin=managed-by-lasper";
         assert!(NspawnConfig::purge_nvidia_block(content).is_err());
     }
 
     #[test]
     fn test_purge_nvidia_block_empty_block() {
-        let content =
-            "Line 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\nLine 2";
+        let content = "[Files]\nLine 1\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\nLine 2";
         let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
-        assert_eq!(new_content, "Line 1\nLine 2");
+        assert_eq!(new_content, "[Files]\nLine 1\nLine 2");
+        assert!(death_list.is_empty());
+    }
+
+    #[test]
+    fn purge_nvidia_block_ignores_marker_shaped_content_outside_files() {
+        let content = "[Exec]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\n";
+
+        let (new_content, death_list) = NspawnConfig::purge_nvidia_block(content).unwrap();
+
+        assert_eq!(new_content, content);
         assert!(death_list.is_empty());
     }
 
@@ -1177,6 +1259,53 @@ mod tests {
         let updated =
             NspawnConfig::apply_gpu_passthrough_to_content(content, &new_state, &[]).unwrap();
         assert!(updated.contains("# My custom comment"));
+    }
+
+    #[test]
+    fn gpu_update_preserves_crlf_and_final_newline() {
+        use crate::adapters::platform::nvidia::state::PassthroughBind;
+
+        let content =
+            "[Exec]\r\nBoot=yes\r\n\r\n[Files]\r\nBind=/srv/data\r\n[Network]\r\nPrivate=yes\r\n"
+                .to_string();
+        let state = crate::adapters::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(content, &state, &[]).unwrap();
+
+        assert!(updated.ends_with("\r\n"));
+        assert!(!updated.replace("\r\n", "").contains('\n'));
+        assert!(updated.contains("Bind=/srv/data\r\nX-Lasper-Nvidia-Begin="));
+        assert!(updated.contains("X-Lasper-Nvidia-End=true\r\n[Network]"));
+    }
+
+    #[test]
+    fn gpu_update_preserves_missing_final_newline() {
+        use crate::adapters::platform::nvidia::state::PassthroughBind;
+
+        let state = crate::adapters::platform::nvidia::NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+
+        let updated = NspawnConfig::apply_gpu_passthrough_to_content(
+            "[Files]\nBind=/srv/data".into(),
+            &state,
+            &[],
+        )
+        .unwrap();
+
+        assert!(updated.ends_with(NVIDIA_BLOCK_END));
     }
 
     #[test]
