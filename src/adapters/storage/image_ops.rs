@@ -738,11 +738,7 @@ async fn inspect_partition_table(
         )
         .await
         .map_err(|error| command_io_error("sfdisk", error))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    parse_sfdisk_partition_table(&output.stdout).map(Some)
+    classify_sfdisk_partition_table(image, &output)
 }
 
 pub(crate) fn probe_image_partitions(image: &Path) -> Result<Option<ImagePartitionProbe>> {
@@ -751,22 +747,50 @@ pub(crate) fn probe_image_partitions(image: &Path) -> Result<Option<ImagePartiti
         .arg(image)
         .output()
         .map_err(|error| command_io_error("sfdisk", error))?;
-    if !output.status.success() {
+    classify_sfdisk_partition_table(image, &output).map(|table| {
+        table.map(|table| ImagePartitionProbe {
+            label: table.label,
+            partitions: table
+                .partitions
+                .into_iter()
+                .map(|partition| ImagePartitionInfo {
+                    number: partition.number,
+                    type_id: partition.type_id,
+                })
+                .collect(),
+        })
+    })
+}
+
+fn classify_sfdisk_partition_table(
+    image: &Path,
+    output: &std::process::Output,
+) -> Result<Option<ImagePartitionTable>> {
+    if output.status.success() {
+        return parse_sfdisk_partition_table(&output.stdout).map(Some);
+    }
+    if sfdisk_reports_no_partition_table(output) {
         return Ok(None);
     }
 
-    let table = parse_sfdisk_partition_table(&output.stdout)?;
-    Ok(Some(ImagePartitionProbe {
-        label: table.label,
-        partitions: table
-            .partitions
-            .into_iter()
-            .map(|partition| ImagePartitionInfo {
-                number: partition.number,
-                type_id: partition.type_id,
-            })
-            .collect(),
-    }))
+    Err(NspawnError::cmd_failed(
+        "inspect image partition table",
+        format!("sfdisk --json {}", image.display()),
+        output,
+    ))
+}
+
+fn sfdisk_reports_no_partition_table(output: &std::process::Output) -> bool {
+    const DIAGNOSTIC: &str = ": does not contain a recognized partition table";
+
+    output.stdout.is_empty()
+        && std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+            stderr
+                .trim_end()
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("sfdisk: ") && line.ends_with(DIAGNOSTIC))
+        })
 }
 
 pub(crate) fn partition_type_label(type_id: &str) -> String {
@@ -1530,6 +1554,32 @@ mod tests {
             }
         }"#;
         assert!(parse_sfdisk_partition_table(injected).is_err());
+    }
+
+    #[test]
+    fn sfdisk_absent_partition_table_is_not_an_error() {
+        let output = failed_output(
+            "sfdisk: /var/lib/machines/test.raw: does not contain a recognized partition table\n",
+        );
+
+        assert!(
+            classify_sfdisk_partition_table(Path::new("/var/lib/machines/test.raw"), &output)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sfdisk_operational_failure_is_not_misclassified_as_an_empty_image() {
+        let output =
+            failed_output("sfdisk: cannot open /var/lib/machines/test.raw: Permission denied\n");
+
+        let error =
+            classify_sfdisk_partition_table(Path::new("/var/lib/machines/test.raw"), &output)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(error.to_string().contains("inspect image partition table"));
     }
 
     #[test]
