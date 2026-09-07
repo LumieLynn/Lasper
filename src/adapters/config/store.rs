@@ -17,6 +17,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 
 const MAX_NSPAWN_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_BINDS: usize = 16384;
@@ -424,9 +425,8 @@ async fn read_discovered_config(image: &ImageName) -> Result<Option<NspawnConfig
 
 async fn read_discovered_config_from(paths: &[PathBuf]) -> Result<Option<NspawnConfigInspection>> {
     for (index, path) in paths.iter().enumerate() {
-        match tokio::fs::read_to_string(path).await {
+        match read_bounded_utf8(path).await {
             Ok(content) => {
-                validate_content_size(&content)?;
                 return Ok(Some(NspawnConfigInspection {
                     path: path.clone(),
                     content,
@@ -463,11 +463,35 @@ async fn read_config_at(path: &Path) -> Result<Option<NspawnConfigInspection>> {
 }
 
 async fn read_optional(path: &Path) -> Result<Option<String>> {
-    match tokio::fs::read_to_string(path).await {
+    match read_bounded_utf8(path).await {
         Ok(content) => Ok(Some(content)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
     }
+}
+
+async fn read_bounded_utf8(path: &Path) -> std::io::Result<String> {
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if metadata.len() > MAX_NSPAWN_CONTENT_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(".nspawn content exceeds {} bytes", MAX_NSPAWN_CONTENT_BYTES),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_NSPAWN_CONTENT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_NSPAWN_CONTENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(".nspawn content exceeds {} bytes", MAX_NSPAWN_CONTENT_BYTES),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 async fn remove_optional_file(path: &Path) -> Result<()> {
@@ -1439,6 +1463,24 @@ Unknown=preserve-me\n";
             .unwrap();
         assert_eq!(discovered.path, admin);
         assert!(discovered.content.contains("PrivateUsers=managed"));
+    }
+
+    #[tokio::test]
+    async fn config_reads_reject_content_beyond_the_limit_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.nspawn");
+        tokio::fs::write(&path, vec![b'x'; MAX_NSPAWN_CONTENT_BYTES + 1])
+            .await
+            .unwrap();
+
+        let error = read_optional(&path).await.unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Io(ref error_path, ref source)
+                if error_path == &path
+                    && source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string().contains("exceeds")
+        ));
     }
 
     #[tokio::test]
