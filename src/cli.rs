@@ -279,6 +279,10 @@ fn help_text() -> String {
             .entry(
                 "[settings] log-buffer-lines = N",
                 "Max log lines per container (default 5000).",
+            )
+            .entry(
+                "[settings] scrollback-lines = N",
+                "Max history rows per embedded terminal (default 2000, 0 disables).",
             ),
     )
     .to_string()

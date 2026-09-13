@@ -38,7 +38,7 @@ The generated configuration normally uses `Boot=no`, so systemd-nspawn runs the 
 
 Lasper's system-scoped OCI import uses `PrivateUsers=no` because the imported layers are root-owned. This removes user-namespace isolation, so OCI payloads should come from trusted sources. Changing the configuration to `PrivateUsers=managed` does not convert those layers into systemd's foreign UID/GID layout and can make their files appear as `nobody` or leave the writable layer unusable. A separately prepared foreign-owned mstack may use `managed`, but it also requires the corresponding systemd resource services, host support, and private networking.
 
-The integrated terminal uses `machinectl login` when the container provides a system bus. For a running nspawn container without one, root mode and `lasper -e` can attach a fixed `/bin/bash` or `/bin/sh` through `nsenter`. This fallback only enters the existing namespaces; it does not add an init system, configure networking, or repair incompatible layer ownership.
+Use `Space` then `l` to open the native login attachment. It uses systemd's login interface when the container provides a system bus. For a running nspawn container without one, root mode and `lasper -e` can attach a fixed `/bin/bash` or `/bin/sh` through `nsenter`. This fallback only enters the existing namespaces; it does not add an init system, configure networking, or repair incompatible layer ownership. Lasper's selected-user shell prompt (`t`) requires the guest shell interface and does not substitute a root namespace shell for the selected account.
 
 ## Why does veth or bridge networking not work?
 

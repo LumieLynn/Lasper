@@ -35,6 +35,7 @@ TOML duplicate keys or duplicate tables are invalid. Lasper does not apply a "la
 elevate = false
 systemd-tools = false
 log-buffer-lines = 5000
+scrollback-lines = 2000
 ```
 
 | Key | Type | Default | Meaning |
@@ -42,6 +43,7 @@ log-buffer-lines = 5000
 | `elevate` | boolean | `false` | Start the isolated elevated daemon, equivalent to `lasper -e`. The TUI remains owned by the invoking user. This setting does not apply to `lasper launch`, which relies on the caller's systemd/polkit authority. |
 | `systemd-tools` | boolean | `false` | Use systemd tools and runtime-state discovery instead of Lasper's own D-Bus client. Equivalent to forcing `-s`; this also selects the `machinectl` transport for `shell` and `launch`. |
 | `log-buffer-lines` | integer | `5000` | Maximum number of journal lines retained per container in the detail panel. `0` also means `5000`. |
+| `scrollback-lines` | integer | `2000` | Maximum history rows retained by each running embedded terminal, in addition to its visible screen. `0` disables history. Finished sessions retain their last screen while their history is released, including hidden tabs. |
 
 The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -s` always enables the systemd tools path. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
 
