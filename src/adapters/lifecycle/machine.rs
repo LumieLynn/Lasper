@@ -20,7 +20,7 @@ use crate::application::machine_lifecycle::{
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::domain::inspection::MachineProperties;
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageName, MachineEntry};
 use std::sync::Arc;
@@ -81,6 +81,7 @@ pub(crate) fn compose_machine_lifecycle(
     });
     let observation: Arc<dyn MachineObservation> = Arc::new(CatalogMachineObservation {
         runtime: runtime.clone(),
+        systemd_tools: local_cmd.clone(),
     });
     let diagnostics: Arc<dyn MachineStartDiagnostics> =
         Arc::new(LocalStartDiagnostics { runner: local_cmd });
@@ -438,6 +439,7 @@ fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError 
 
 struct CatalogMachineObservation {
     runtime: Arc<RuntimeCatalog>,
+    systemd_tools: Arc<dyn CommandRunner>,
 }
 
 #[async_trait::async_trait]
@@ -447,10 +449,30 @@ impl MachineObservation for CatalogMachineObservation {
         machine: &MachineName,
         entry: &MachineEntry,
     ) -> RuntimeResult<MachineProperties> {
-        self.runtime
-            .inspect(machine.as_str(), entry)
+        let query = self.runtime.inspect(machine.as_str(), entry).await?;
+        if query.value.completeness == InspectionCompleteness::RuntimeOnly {
+            let mut properties = query.value;
+            match crate::adapters::runtime::systemd_tools::append_nspawn_unit_properties_with_runner(
+                machine,
+                self.systemd_tools.as_ref(),
+                &mut properties,
+            )
             .await
-            .map(|query| query.value)
+            {
+                Ok(true) => {
+                    properties.source = InspectionSource::SystemdTools;
+                    properties.completeness = InspectionCompleteness::Full;
+                }
+                Ok(false) => {}
+                Err(error) => log::debug!(
+                    "systemd-tools lifecycle inspection for {} is not ready: {}",
+                    machine,
+                    error
+                ),
+            }
+            return Ok(properties);
+        }
+        Ok(query.value)
     }
 
     fn invalidate(&self) {

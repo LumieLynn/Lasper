@@ -451,6 +451,21 @@ async fn append_systemd_unit_properties(
     Ok(UnitInspection::Present)
 }
 
+/// Enrich a runtime-state snapshot with the nspawn unit properties needed for
+/// lifecycle confirmation. The machine registration reader intentionally does
+/// not invoke systemctl; callers opt into this small second query when they
+/// need ActiveState/Result.
+pub(crate) async fn append_nspawn_unit_properties_with_runner(
+    name: &MachineName,
+    cmd_runner: &dyn CommandRunner,
+    props: &mut MachineProperties,
+) -> Result<bool> {
+    match append_systemd_unit_properties(name, cmd_runner, props).await? {
+        UnitInspection::Present => Ok(true),
+        UnitInspection::NotFound(_) => Ok(false),
+    }
+}
+
 fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
@@ -874,6 +889,47 @@ mod tests {
 
         let result = RuntimeSource::get_properties(&provider, "missing-ctr", true).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_state_enrichment_reads_the_nspawn_unit_properties() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, args, _| {
+                program == "systemctl"
+                    && *args
+                        == [
+                            "--no-ask-password",
+                            "--",
+                            "show",
+                            "systemd-nspawn@test-machine.service",
+                        ]
+                        .map(String::from)
+            })
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "ActiveState=active\nResult=success\n",
+                    "",
+                ))
+            });
+
+        let mut properties = MachineProperties::from_inspection(
+            InspectionSource::RuntimeState,
+            InspectionCompleteness::RuntimeOnly,
+        );
+        let name = MachineName::new("test-machine").unwrap();
+        let present = append_nspawn_unit_properties_with_runner(&name, &runner, &mut properties)
+            .await
+            .unwrap();
+
+        assert!(present);
+        assert_eq!(
+            properties.get_group("Systemd").unwrap()["ActiveState"],
+            "active"
+        );
     }
 
     #[tokio::test]
