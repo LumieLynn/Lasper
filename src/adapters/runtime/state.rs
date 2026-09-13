@@ -48,7 +48,9 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
 /// Enumerate runtime registrations without asking machined to inspect the
 /// containers. This mirrors `sd_get_machine_names()` at the public API level:
 /// names come from the runtime directory, while `unit:` helper symlinks and
-/// invalid machine names are ignored.
+/// malformed registration names are ignored. The observation grammar accepts
+/// systemd's trailing-dot hostname form; the stricter `MachineName` type is
+/// still enforced when an operation needs a mutable nspawn identity.
 pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<MachineEntry>> {
     let display_path = path.clone();
     tokio::task::spawn_blocking(move || enumerate_machines(&path))
@@ -83,7 +85,7 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if MachineName::new(&name).is_err() {
+        if validate_observed_machine_name(&name).is_err() {
             continue;
         }
         let fields = match read_runtime_state(&entry.path(), &name) {
@@ -116,10 +118,10 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
 
 /// Inspect one machine without contacting either systemd D-Bus service.
 pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
-    let name =
-        MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
+    validate_observed_machine_name(name)
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
     inspect_at(
-        crate::paths::runtime_machine_state(name.as_str()),
+        crate::paths::runtime_machine_state(name),
         name,
         entry,
     )
@@ -128,12 +130,12 @@ pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperti
 
 async fn inspect_at(
     path: PathBuf,
-    name: MachineName,
+    name: &str,
     entry: &MachineEntry,
 ) -> Result<MachineProperties> {
     let mut properties = entry_properties(entry);
     let display_path = path.display().to_string();
-    let expected_name = name.into_string();
+    let expected_name = name.to_string();
     let read = tokio::task::spawn_blocking(move || read_runtime_state(&path, &expected_name))
         .await
         .map_err(|error| {
@@ -164,6 +166,22 @@ async fn inspect_at(
     }
 
     Ok(properties)
+}
+
+fn validate_observed_machine_name(name: &str) -> std::io::Result<()> {
+    if MachineName::new(name).is_ok() {
+        return Ok(());
+    }
+
+    let without_trailing_dot = name.strip_suffix('.').unwrap_or_default();
+    if !without_trailing_dot.is_empty() && MachineName::new(without_trailing_dot).is_ok() {
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!("invalid systemd machine registration name {name:?}"),
+    ))
 }
 
 fn entry_properties(entry: &MachineEntry) -> MachineProperties {
@@ -390,7 +408,7 @@ mod tests {
 
         let properties = inspect_at(
             path,
-            MachineName::new("test-machine").unwrap(),
+            "test-machine",
             &entry("test-machine"),
         )
         .await
@@ -439,6 +457,11 @@ mod tests {
             "NAME=foreign-vm\nCLASS=vm\nSERVICE=libvirt\n",
         )
         .unwrap();
+        std::fs::write(
+            dir.path().join("trailing-dot."),
+            "NAME=trailing-dot.\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("invalid:name"), "ignored\n").unwrap();
         symlink("a-machine", dir.path().join("unit:machine-a.scope")).unwrap();
         std::fs::create_dir(dir.path().join("directory-entry")).unwrap();
@@ -450,7 +473,7 @@ mod tests {
                 .iter()
                 .map(|machine| machine.name.as_str())
                 .collect::<Vec<_>>(),
-            ["a-machine", "foreign-vm", "z-machine"]
+            ["a-machine", "foreign-vm", "trailing-dot.", "z-machine"]
         );
         assert!(machines
             .iter()
@@ -479,7 +502,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let properties = inspect_at(
             dir.path().join("missing"),
-            MachineName::new("missing").unwrap(),
+            "missing",
             &entry("missing"),
         )
         .await
@@ -501,7 +524,7 @@ mod tests {
 
         let properties = inspect_at(
             link,
-            MachineName::new("test-machine").unwrap(),
+            "test-machine",
             &entry("test-machine"),
         )
         .await
