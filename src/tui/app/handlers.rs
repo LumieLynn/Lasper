@@ -69,6 +69,18 @@ impl App {
             return;
         }
 
+        // Space opens the one-level leader from every resource context where
+        // a terminal action is meaningful: either list or either inspector.
+        if (self.ui.focus.is_machine_list()
+            || self.ui.focus.is_image_list()
+            || self.ui.focus.is_inspector())
+            && key.code == KeyCode::Char(' ')
+            && key.modifiers.is_empty()
+        {
+            self.ui.open_leader();
+            return;
+        }
+
         // Layer 1.5 – resize mode (skip when terminal is in insert mode)
         if self.ui.resize_mode == super::ResizeMode::Active
             && !self.is_terminal_insert_mode()
@@ -92,6 +104,27 @@ impl App {
     }
 }
 
+impl App {
+    async fn handle_leader_key(&mut self, key: KeyEvent) {
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.ui.close_leader(),
+            (KeyCode::Char('t'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.spawn_shell_prompt().await;
+            }
+            (KeyCode::Char('l'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.spawn_terminal().await;
+            }
+            _ => {
+                // A leader keymap is intentionally one level deep. Unknown
+                // keys are consumed so they cannot trigger a workspace action.
+                self.ui.close_leader();
+            }
+        }
+    }
+}
+
 // Mouse dispatch
 
 impl App {
@@ -99,7 +132,6 @@ impl App {
         if self.handle_modal_mouse(mouse) {
             return;
         }
-
         // Hit-test: which panel is the mouse over?
         let layout = self.ui.panel_layout;
         let col = mouse.column;
@@ -215,6 +247,10 @@ impl App {
             Some(ModalLayer::QuitConfirmation) => self.handle_quit_confirm_key(key),
             Some(ModalLayer::Wizard | ModalLayer::Help | ModalLayer::ResourceActionMenu) => {
                 self.handle_overlay_key(key).await
+            }
+            Some(ModalLayer::Leader) => {
+                self.handle_leader_key(key).await;
+                true
             }
             None => false,
         }
@@ -494,8 +530,12 @@ impl App {
                 };
                 true
             }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.show_shell_dialog().await;
+                true
+            }
             KeyCode::Char('t') => {
-                self.toggle_terminal().await;
+                self.spawn_shell_prompt().await;
                 true
             }
             KeyCode::Char('T') => {
@@ -773,18 +813,6 @@ impl App {
         }
     }
 
-    async fn toggle_terminal(&mut self) {
-        if self.data.terminal.is_showing() {
-            self.data.terminal.show = false;
-            if self.ui.focus.is_terminal() {
-                self.restore_non_terminal_focus();
-            }
-            self.request_detail_refresh();
-        } else {
-            self.spawn_terminal().await;
-        }
-    }
-
     pub(super) fn show_delete_dialog(&mut self) {
         if let Some(name) = self
             .focused_image_resource()
@@ -954,6 +982,89 @@ impl App {
         let mut dialog = self.ui.active_dialog.take().unwrap();
         let result = dialog.handle_key(key);
         match result {
+            EventResult::Message(AppMessage::Session(
+                crate::tui::core::SessionMessage::OpenShell {
+                    machine,
+                    user,
+                    wayland,
+                },
+            )) => {
+                if !self.spawn_terminal_as_user(machine, user, wayland).await {
+                    self.ui.active_dialog = Some(dialog);
+                }
+                true
+            }
+            EventResult::Message(AppMessage::Session(
+                crate::tui::core::SessionMessage::TestWayland {
+                    machine,
+                    user,
+                    host_socket,
+                    available_sockets,
+                },
+            )) => {
+                let result = self
+                    .data
+                    .session_service
+                    .test_wayland(
+                        crate::application::sessions::ShellTarget::new(
+                            machine.clone(),
+                            user.clone(),
+                        ),
+                        host_socket.clone(),
+                    )
+                    .await;
+                let (probe_result, message, level) = match result {
+                    Ok(context) => (
+                        Ok(context.clone()),
+                        format!(
+                            "Wayland projection for {}@{} is ready at {}.",
+                            user,
+                            machine,
+                            context.guest_socket().display()
+                        ),
+                        crate::tui::StatusLevel::Info,
+                    ),
+                    Err(error) => {
+                        let error = error
+                            .to_string()
+                            .chars()
+                            .take(160)
+                            .map(|character| {
+                                if character.is_control() {
+                                    ' '
+                                } else {
+                                    character
+                                }
+                            })
+                            .collect::<String>();
+                        (
+                            Err(error.clone()),
+                            format!("Wayland validation failed: {error}"),
+                            crate::tui::StatusLevel::Error,
+                        )
+                    }
+                };
+                self.set_status(message, level);
+                self.ui.active_dialog = Some(Box::new(
+                    crate::tui::widgets::dialogs::shell::ShellDialog::new(
+                        machine,
+                        user.to_string(),
+                        available_sockets,
+                    )
+                    .with_selected_wayland_socket(&host_socket)
+                    .with_probe_result(probe_result),
+                ));
+                true
+            }
+            EventResult::Message(AppMessage::Session(
+                crate::tui::core::SessionMessage::DialogCancel,
+            )) => true,
+            EventResult::Message(AppMessage::Session(
+                crate::tui::core::SessionMessage::DialogSubmit,
+            )) => {
+                self.ui.active_dialog = Some(dialog);
+                true
+            }
             EventResult::Message(msg) => {
                 if let Some(action) = self
                     .ui
@@ -996,6 +1107,13 @@ impl App {
                 | ModalLayer::Help
                 | ModalLayer::ResourceActionMenu,
             ) => true,
+            Some(ModalLayer::Leader) => {
+                if let Some(leader) = &mut self.ui.leader {
+                    let _ = leader.handle_mouse(mouse);
+                }
+                self.ui.close_leader();
+                true
+            }
             None => false,
         }
     }

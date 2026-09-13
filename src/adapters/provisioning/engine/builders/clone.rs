@@ -11,6 +11,8 @@ use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
 
+pub(crate) const CLONE_IDENTITY_NOTICE: &str = "Exact clone: guest hostname, machine-id, SSH host keys, user accounts, and application state are preserved. Reset guest identity manually before treating the clone as an independent machine.";
+
 pub struct CloneDeployer {
     pub source_name: String,
     pub system_operations: crate::adapters::system_operation::SystemOperationStore,
@@ -104,6 +106,7 @@ impl Deployer for CloneDeployer {
             format!("Cloning image {} to {}...", self.source_name, name),
         )
         .await;
+        send_deploy_log(&logs, format!("WARNING: {CLONE_IDENTITY_NOTICE}")).await;
 
         self.system_operations
             .clone_image(&self.source_name, name)

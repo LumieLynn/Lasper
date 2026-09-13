@@ -25,12 +25,7 @@ fn wayland_intent(target_username: &str) -> WaylandGrantIntent {
         },
     )
     .unwrap();
-    WaylandGrantIntent::new(
-        target_username,
-        vec![source.clone()],
-        source.display().clone(),
-    )
-    .unwrap()
+    WaylandGrantIntent::new(target_username, vec![source]).unwrap()
 }
 
 #[test]

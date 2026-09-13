@@ -20,7 +20,7 @@ use crate::application::machine_lifecycle::{
 use crate::application::operations::{ExecutionRoute, RouteFallback};
 use crate::application::runtime::RuntimeResult;
 use crate::application::{OperationRegistry, RuntimeCatalog};
-use crate::domain::inspection::MachineProperties;
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageName, MachineEntry};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ pub(crate) struct MachineLifecycleAdapters {
 
 pub(crate) enum MachineLifecycleRoute {
     DirectDbus(DbusBackend),
-    LocalCli,
+    LocalSystemdTools,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
         transport: MachineControlTransport,
@@ -63,7 +63,7 @@ pub(crate) fn compose_machine_lifecycle(
                 dbus,
                 fallback_runner: local_cmd.clone(),
             },
-            MachineLifecycleRoute::LocalCli => MachineControlRoute::LocalCli {
+            MachineLifecycleRoute::LocalSystemdTools => MachineControlRoute::LocalSystemdTools {
                 runner: local_cmd.clone(),
             },
             MachineLifecycleRoute::Elevated { daemon, transport } => {
@@ -81,6 +81,7 @@ pub(crate) fn compose_machine_lifecycle(
     });
     let observation: Arc<dyn MachineObservation> = Arc::new(CatalogMachineObservation {
         runtime: runtime.clone(),
+        systemd_tools: local_cmd.clone(),
     });
     let diagnostics: Arc<dyn MachineStartDiagnostics> =
         Arc::new(LocalStartDiagnostics { runner: local_cmd });
@@ -98,7 +99,7 @@ enum MachineControlRoute {
         dbus: DbusBackend,
         fallback_runner: Arc<dyn CommandRunner>,
     },
-    LocalCli {
+    LocalSystemdTools {
         runner: Arc<dyn CommandRunner>,
     },
     Daemon {
@@ -173,7 +174,7 @@ impl RoutedMachineControl {
                 };
                 match dbus_outcome {
                     MachineControlOutcome::NotAttempted { reason } => {
-                        let outcome = execute_cli_machine_control_with_runner(
+                        let outcome = execute_systemd_tools_machine_control_with_runner(
                             machine.clone(),
                             intent,
                             fallback_runner.as_ref(),
@@ -181,10 +182,10 @@ impl RoutedMachineControl {
                         .await;
                         RoutedMachineControlOutcome {
                             outcome,
-                            route: ExecutionRoute::LocalCli,
+                            route: ExecutionRoute::LocalSystemdTools,
                             fallback: Some(RouteFallback {
                                 from: ExecutionRoute::DirectDbus,
-                                to: ExecutionRoute::LocalCli,
+                                to: ExecutionRoute::LocalSystemdTools,
                                 reason,
                             }),
                         }
@@ -196,14 +197,14 @@ impl RoutedMachineControl {
                     },
                 }
             }
-            MachineControlRoute::LocalCli { runner } => RoutedMachineControlOutcome {
-                outcome: execute_cli_machine_control_with_runner(
+            MachineControlRoute::LocalSystemdTools { runner } => RoutedMachineControlOutcome {
+                outcome: execute_systemd_tools_machine_control_with_runner(
                     machine.clone(),
                     intent,
                     runner.as_ref(),
                 )
                 .await,
-                route: ExecutionRoute::LocalCli,
+                route: ExecutionRoute::LocalSystemdTools,
                 fallback: None,
             },
             MachineControlRoute::Daemon { daemon, transport } => {
@@ -226,7 +227,7 @@ impl RoutedMachineControl {
                             daemon,
                             machine.clone(),
                             intent,
-                            MachineControlTransport::Cli,
+                            MachineControlTransport::SystemdTools,
                         )
                         .await
                         {
@@ -237,10 +238,10 @@ impl RoutedMachineControl {
                         };
                         return RoutedMachineControlOutcome {
                             outcome: fallback_outcome,
-                            route: ExecutionRoute::ElevatedCli,
+                            route: ExecutionRoute::ElevatedSystemdTools,
                             fallback: Some(RouteFallback {
                                 from: ExecutionRoute::ElevatedDbus,
-                                to: ExecutionRoute::ElevatedCli,
+                                to: ExecutionRoute::ElevatedSystemdTools,
                                 reason,
                             }),
                         };
@@ -250,7 +251,9 @@ impl RoutedMachineControl {
                     outcome,
                     route: match transport {
                         MachineControlTransport::Dbus => ExecutionRoute::ElevatedDbus,
-                        MachineControlTransport::Cli => ExecutionRoute::ElevatedCli,
+                        MachineControlTransport::SystemdTools => {
+                            ExecutionRoute::ElevatedSystemdTools
+                        }
                     },
                     fallback: None,
                 }
@@ -307,11 +310,11 @@ async fn execute_dbus_machine_control(
     }
 }
 
-async fn execute_cli_machine_control(
+async fn execute_systemd_tools_machine_control(
     machine: MachineName,
     intent: MachineControlIntent,
 ) -> MachineControlOutcome {
-    execute_cli_machine_control_with_runner(
+    execute_systemd_tools_machine_control_with_runner(
         machine,
         intent,
         &crate::adapters::process::DefaultCommandRunner,
@@ -319,7 +322,7 @@ async fn execute_cli_machine_control(
     .await
 }
 
-pub(crate) async fn execute_cli_nspawn_launch(
+pub(crate) async fn execute_systemd_tools_nspawn_launch(
     image: ImageName,
     machine: MachineName,
 ) -> MachineControlOutcome {
@@ -329,24 +332,24 @@ pub(crate) async fn execute_cli_nspawn_launch(
             reason: "nspawn launch currently requires matching image and machine names".into(),
         };
     }
-    execute_cli_machine_control(machine, MachineControlIntent::Launch { image }).await
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Launch { image }).await
 }
 
-pub(crate) async fn execute_cli_machine_runtime(
+pub(crate) async fn execute_systemd_tools_machine_runtime(
     machine: MachineName,
     action: MachineRuntimeAction,
 ) -> MachineControlOutcome {
-    execute_cli_machine_control(machine, MachineControlIntent::Runtime(action)).await
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Runtime(action)).await
 }
 
-pub(crate) async fn execute_cli_nspawn_unit(
+pub(crate) async fn execute_systemd_tools_nspawn_unit(
     machine: MachineName,
     action: NspawnUnitAction,
 ) -> MachineControlOutcome {
-    execute_cli_machine_control(machine, MachineControlIntent::Unit(action)).await
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Unit(action)).await
 }
 
-async fn execute_cli_machine_control_with_runner(
+async fn execute_systemd_tools_machine_control_with_runner(
     machine: MachineName,
     intent: MachineControlIntent,
     runner: &dyn CommandRunner,
@@ -436,6 +439,7 @@ fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError 
 
 struct CatalogMachineObservation {
     runtime: Arc<RuntimeCatalog>,
+    systemd_tools: Arc<dyn CommandRunner>,
 }
 
 #[async_trait::async_trait]
@@ -445,10 +449,30 @@ impl MachineObservation for CatalogMachineObservation {
         machine: &MachineName,
         entry: &MachineEntry,
     ) -> RuntimeResult<MachineProperties> {
-        self.runtime
-            .inspect(machine.as_str(), entry)
+        let query = self.runtime.inspect(machine.as_str(), entry).await?;
+        if query.value.completeness == InspectionCompleteness::RuntimeOnly {
+            let mut properties = query.value;
+            match crate::adapters::runtime::systemd_tools::append_nspawn_unit_properties_with_runner(
+                machine,
+                self.systemd_tools.as_ref(),
+                &mut properties,
+            )
             .await
-            .map(|query| query.value)
+            {
+                Ok(true) => {
+                    properties.source = InspectionSource::SystemdTools;
+                    properties.completeness = InspectionCompleteness::Full;
+                }
+                Ok(false) => {}
+                Err(error) => log::debug!(
+                    "systemd-tools lifecycle inspection for {} is not ready: {}",
+                    machine,
+                    error
+                ),
+            }
+            return Ok(properties);
+        }
+        Ok(query.value)
     }
 
     fn invalidate(&self) {
@@ -526,7 +550,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_control_uses_fixed_typed_command() {
+    async fn systemd_tools_control_uses_fixed_typed_command() {
         let mut runner = MockCommandRunner::new();
         runner
             .expect_run_bounded()
@@ -537,7 +561,7 @@ mod tests {
             })
             .returning(|_, _, _| Ok(success()));
 
-        let outcome = execute_cli_machine_control_with_runner(
+        let outcome = execute_systemd_tools_machine_control_with_runner(
             MachineName::new("test").unwrap(),
             MachineControlIntent::Launch {
                 image: ImageName::new("test").unwrap(),
@@ -550,7 +574,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_launch_failure_is_explicitly_not_attempted() {
+    async fn systemd_tools_launch_failure_is_explicitly_not_attempted() {
         let mut runner = MockCommandRunner::new();
         runner.expect_run_bounded().returning(|_, _, _| {
             Err(std::io::Error::new(
@@ -559,7 +583,7 @@ mod tests {
             ))
         });
 
-        let outcome = execute_cli_machine_control_with_runner(
+        let outcome = execute_systemd_tools_machine_control_with_runner(
             MachineName::new("test").unwrap(),
             MachineControlIntent::Launch {
                 image: ImageName::new("test").unwrap(),
@@ -575,7 +599,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_mutation_timeout_has_unknown_outcome() {
+    async fn systemd_tools_mutation_timeout_has_unknown_outcome() {
         let mut runner = MockCommandRunner::new();
         runner.expect_run_bounded().returning(|_, _, _| {
             Err(std::io::Error::new(
@@ -584,7 +608,7 @@ mod tests {
             ))
         });
 
-        let outcome = execute_cli_machine_control_with_runner(
+        let outcome = execute_systemd_tools_machine_control_with_runner(
             MachineName::new("test").unwrap(),
             MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff),
             &runner,

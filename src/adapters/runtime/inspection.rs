@@ -1,4 +1,4 @@
-//! Route-fixed CLI machine inspection.
+//! Route-fixed systemd tools machine inspection.
 
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
@@ -57,7 +57,7 @@ struct DirectMachineInspectionExecutor;
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for DirectMachineInspectionExecutor {
     fn route(&self) -> ExecutionRoute {
-        ExecutionRoute::LocalCli
+        ExecutionRoute::LocalSystemdTools
     }
 
     async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
@@ -72,14 +72,16 @@ struct ElevatedMachineInspectionExecutor {
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
     fn route(&self) -> ExecutionRoute {
-        ExecutionRoute::ElevatedCli
+        ExecutionRoute::ElevatedSystemdTools
     }
 
     async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
         self.daemon
-            .cli_inspect_machine(name, entry.access().is_nspawn())
+            .systemd_tools_inspect_machine(name, entry.access().is_nspawn())
             .await
-            .map_err(|error| NspawnError::Io(PathBuf::from("elevated CLI inspection"), error))
+            .map_err(|error| {
+                NspawnError::Io(PathBuf::from("elevated systemd tools inspection"), error)
+            })
     }
 }
 
@@ -96,7 +98,7 @@ mod tests {
     #[async_trait::async_trait]
     impl MachineInspectionExecutor for RecordingInspector {
         fn route(&self) -> ExecutionRoute {
-            ExecutionRoute::LocalCli
+            ExecutionRoute::LocalSystemdTools
         }
 
         async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
@@ -126,6 +128,6 @@ mod tests {
         store.inspect("test-machine", &entry).await.unwrap();
 
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(store.route(), ExecutionRoute::LocalCli);
+        assert_eq!(store.route(), ExecutionRoute::LocalSystemdTools);
     }
 }

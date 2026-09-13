@@ -107,6 +107,9 @@ pub struct AppUi {
 
     pub show_wizard: bool,
     pub show_help: bool,
+    /// Transient which-key style action layer entered from a workspace panel.
+    /// The component owns its focus state and is removed when the layer closes.
+    pub leader: Option<crate::tui::widgets::leader::LeaderOverlay>,
     pub resource_action_menu: Option<crate::tui::widgets::resource_action_menu::ResourceActionMenu>,
     pub pane_height: u16,
 
@@ -146,6 +149,7 @@ impl AppUi {
             detail_panel: DetailPanel::new(),
             show_wizard: false,
             show_help: false,
+            leader: None,
             resource_action_menu: None,
             pane_height: 10,
             wizard: None,
@@ -182,8 +186,24 @@ impl AppUi {
             Some(ModalLayer::Wizard)
         } else if self.resource_action_menu.is_some() {
             Some(ModalLayer::ResourceActionMenu)
+        } else if self.leader.is_some() {
+            Some(ModalLayer::Leader)
         } else {
             None
+        }
+    }
+
+    pub fn leader_active(&self) -> bool {
+        self.leader.as_ref().is_some_and(Component::is_focused)
+    }
+
+    pub fn open_leader(&mut self) {
+        self.leader = Some(crate::tui::widgets::leader::LeaderOverlay::new());
+    }
+
+    pub fn close_leader(&mut self) {
+        if let Some(mut leader) = self.leader.take() {
+            leader.set_focus(false);
         }
     }
 }
@@ -245,7 +265,7 @@ pub struct App {
 impl App {
     pub fn new(
         permissions: std::sync::Arc<dyn crate::composition::PermissionManager>,
-        cli_mode: bool,
+        systemd_tools: bool,
         log_buffer_lines: usize,
         services: ApplicationServices,
         config: std::sync::Arc<crate::config::AppConfig>,
@@ -260,6 +280,7 @@ impl App {
             resource_inspection,
             host_operations,
         } = services;
+        let scrollback_lines = config.settings.scrollback_lines;
         Self {
             permissions,
             config,
@@ -281,7 +302,7 @@ impl App {
                 detail_target: DetailTarget::Empty,
                 unit_name: None,
                 unit_drop_ins: Vec::new(),
-                dbus_active: !cli_mode,
+                dbus_active: !systemd_tools,
                 session_service: session_service.clone(),
                 runtime_catalog,
                 machine_lifecycle,
@@ -300,7 +321,7 @@ impl App {
                 unit_dirty: true,
                 details_dirty: true,
                 detail_refresh: detail_refresh::DetailRefreshState::default(),
-                terminal: TerminalManager::new(session_service),
+                terminal: TerminalManager::new(session_service, scrollback_lines),
             },
             ui: AppUi::new(),
         }
@@ -319,6 +340,9 @@ impl App {
     /// Set focus while keeping the last non-terminal destination available
     /// for restoring focus when the terminal is closed or hidden.
     pub(crate) fn set_focus(&mut self, focus: WorkspaceFocus) {
+        if self.ui.leader_active() && self.ui.focus != focus {
+            self.ui.close_leader();
+        }
         if !focus.is_terminal() {
             self.ui.prev_focus = focus;
         }
@@ -712,6 +736,7 @@ impl App {
 
             // Drain per-buffer log channels before rendering
             self.data.log_manager.drain_all();
+            self.data.terminal.reclaim_exited_scrollback();
 
             // Detail reads are scheduled after input/observer batches have
             // coalesced, and never execute on the event-handler call stack.
@@ -827,7 +852,7 @@ fn machine_outcome_status(
 
     let fallback = outcome
         .fallback
-        .map(|fallback| format!(" (CLI fallback: {})", fallback.reason))
+        .map(|fallback| format!(" (systemd tools fallback: {})", fallback.reason))
         .unwrap_or_default();
     let machine = outcome.machine.as_str();
     match outcome.result {
@@ -929,7 +954,7 @@ mod tests {
         let services = crate::composition::compose_application_services(mode, false);
         App::new(
             permissions,
-            false, // cli_mode
+            false, // systemd_tools
             0,
             services,
             std::sync::Arc::new(crate::config::AppConfig::default()),
@@ -1663,7 +1688,9 @@ mod tests {
 
     mod focus_and_modal_input {
         use super::*;
-        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
         use ratatui::layout::Rect;
 
         fn app_with_machine_and_image() -> App {
@@ -1672,6 +1699,61 @@ mod tests {
             app.data.images = vec![make_image("image")];
             app.set_focus(WorkspaceFocus::Machines);
             app
+        }
+
+        #[tokio::test]
+        async fn detail_focus_space_enters_a_one_level_leader_keymap() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::MachineInspector);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.leader_active());
+
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                .await;
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.resource_action_menu.is_none());
+        }
+
+        #[tokio::test]
+        async fn leader_escape_only_closes_the_transient_keymap() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::MachineInspector);
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .await;
+
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.active_dialog.is_none());
+        }
+
+        #[tokio::test]
+        async fn list_focus_enters_the_same_leader_keymap() {
+            let mut app = app_with_machine_and_image();
+            for focus in [WorkspaceFocus::Machines, WorkspaceFocus::Images] {
+                app.set_focus(focus);
+                app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                    .await;
+                assert!(app.ui.leader_active());
+                assert_eq!(app.ui.modal_layer(), Some(ModalLayer::Leader));
+                app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .await;
+                assert!(!app.ui.leader_active());
+            }
+        }
+
+        #[test]
+        fn changing_workspace_focus_destroys_the_leader_component() {
+            let mut app = app_with_machine_and_image();
+            app.set_focus(WorkspaceFocus::Machines);
+            app.ui.open_leader();
+            assert!(app.ui.leader_active());
+
+            app.set_focus(WorkspaceFocus::Images);
+            assert!(!app.ui.leader_active());
+            assert!(app.ui.leader.is_none());
         }
 
         #[test]

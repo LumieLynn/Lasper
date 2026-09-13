@@ -26,6 +26,7 @@ pub(super) async fn run_rpc_request_pump<R, B>(
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
+    machine_sessions: crate::adapters::session::MachineSessionTransport,
 ) -> std::io::Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -89,8 +90,8 @@ where
             method.family().as_str()
         );
 
-        let reservation = match daemon_resource_claim(&request) {
-            Ok(Some(claim)) => match server_state.operations.reserve([claim]) {
+        let reservation = match daemon_resource_claims(&request) {
+            Ok(claims) if !claims.is_empty() => match server_state.operations.reserve(claims) {
                 Ok(reservation) => Some(reservation),
                 Err(conflict) => {
                     if !send(
@@ -109,7 +110,7 @@ where
                     continue;
                 }
             },
-            Ok(None) => None,
+            Ok(_) => None,
             Err(error) => {
                 if !send(
                     out_tx,
@@ -147,6 +148,7 @@ where
         let out_tx = out_tx.clone();
         let server_state = Arc::clone(&server_state);
         let trusted_state_root = trusted_state_root.clone();
+        let machine_sessions = machine_sessions.clone();
         tokio::spawn(async move {
             let _permit = permit;
             let _reservation = reservation;
@@ -158,6 +160,7 @@ where
                 invoking_uid,
                 Arc::clone(&server_state),
                 trusted_state_root,
+                machine_sessions,
             )
             .await
             {
@@ -185,15 +188,19 @@ where
     }
 }
 
-pub(super) fn daemon_resource_claim(
+pub(super) fn daemon_resource_claims(
     request: &RpcRequest,
-) -> Result<Option<crate::application::ResourceClaim>, String> {
+) -> Result<Vec<crate::application::ResourceClaim>, String> {
+    use crate::application::{ResourceClaim, ResourceKey};
+
     let method = request.method_kind().map_err(|error| error.message)?;
-    let key = match method {
+    let claims = match method {
         RpcMethod::ImageRemove => {
             let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
                 .map_err(|error| format!("invalid image_remove request: {error}"))?;
-            crate::application::ResourceKey::for_image(&request.image)
+            vec![ResourceClaim::exclusive(ResourceKey::for_image(
+                &request.image,
+            ))]
         }
         RpcMethod::NspawnLaunch => {
             let request: NspawnLaunchRequest = serde_json::from_value(request.params.clone())
@@ -203,37 +210,67 @@ pub(super) fn daemon_resource_claim(
                     "invalid nspawn_launch request: image and machine names must match".into(),
                 );
             }
-            crate::application::ResourceKey::for_image(&request.image)
+            vec![ResourceClaim::exclusive(ResourceKey::for_image(
+                &request.image,
+            ))]
         }
         RpcMethod::MachineRuntimeControl => {
             let request: MachineRuntimeControlRequest =
                 serde_json::from_value(request.params.clone())
                     .map_err(|error| format!("invalid machine_runtime_control request: {error}"))?;
-            crate::application::ResourceKey::for_machine(&request.machine)
+            vec![ResourceClaim::exclusive(ResourceKey::for_machine(
+                &request.machine,
+            ))]
         }
         RpcMethod::NspawnUnitControl => {
             let request: NspawnUnitControlRequest = serde_json::from_value(request.params.clone())
                 .map_err(|error| format!("invalid nspawn_unit_control request: {error}"))?;
-            crate::application::ResourceKey::for_machine(&request.machine)
+            vec![
+                ResourceClaim::exclusive(ResourceKey::for_machine(&request.machine)),
+                ResourceClaim::shared(ResourceKey::SystemdManager),
+            ]
         }
         RpcMethod::SystemOperation => {
             let wire_operation: crate::ipc::protocol::system::SystemOperation =
                 serde_json::from_value(request.params.clone())
                     .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
             let operation = SystemOperation::from(wire_operation);
-            match operation {
-                SystemOperation::Start { machine } => {
-                    crate::application::ResourceKey::for_machine(&machine)
-                }
-                SystemOperation::RemoveImage { image } => {
-                    crate::application::ResourceKey::for_image(&image)
-                }
-                _ => return Ok(None),
-            }
+            system_operation_claims(operation)
         }
-        _ => return Ok(None),
+        _ => Vec::new(),
     };
-    Ok(Some(crate::application::ResourceClaim::exclusive(key)))
+    Ok(claims)
+}
+
+fn system_operation_claims(operation: SystemOperation) -> Vec<crate::application::ResourceClaim> {
+    use crate::application::{ResourceClaim, ResourceKey};
+
+    match operation {
+        SystemOperation::Start { machine }
+        | SystemOperation::Terminate { machine }
+        | SystemOperation::Poweroff { machine }
+        | SystemOperation::Reboot { machine }
+        | SystemOperation::Kill { machine, .. } => {
+            vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))]
+        }
+        SystemOperation::Enable { machine } | SystemOperation::Disable { machine } => vec![
+            ResourceClaim::exclusive(ResourceKey::for_machine(&machine)),
+            ResourceClaim::shared(ResourceKey::SystemdManager),
+        ],
+        SystemOperation::RemoveImage { image } => {
+            vec![ResourceClaim::exclusive(ResourceKey::for_image(&image))]
+        }
+        SystemOperation::CloneImage {
+            source,
+            destination,
+        } => vec![
+            ResourceClaim::shared(ResourceKey::for_image(&source)),
+            ResourceClaim::exclusive(ResourceKey::for_image(&destination)),
+        ],
+        SystemOperation::ReloadDaemon => {
+            vec![ResourceClaim::exclusive(ResourceKey::SystemdManager)]
+        }
+    }
 }
 
 pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
@@ -243,6 +280,7 @@ pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecuto
     invoking_uid: u32,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
+    machine_sessions: crate::adapters::session::MachineSessionTransport,
 ) -> HandleOutcome {
     let RpcRequest {
         id, method, params, ..
@@ -287,6 +325,8 @@ pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecuto
             super::sessions::SessionContext {
                 params,
                 server_state,
+                machine: machine_sessions,
+                invoking_uid,
             },
         )
         .await;

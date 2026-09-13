@@ -25,17 +25,37 @@ macro_rules! log_step {
 fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
     use std::collections::HashSet;
 
+    let mut in_files = false;
     let mut inside = false;
+    let mut complete = false;
     let mut file_binds: HashSet<(String, String, bool)> = HashSet::new();
 
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("X-Lasper-Nvidia-Begin=") {
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if inside {
+                return false;
+            }
+            in_files = trimmed.eq_ignore_ascii_case("[files]");
+            continue;
+        }
+        if !in_files {
+            continue;
+        }
+        if crate::adapters::config::nspawn_file::is_nvidia_begin_marker(trimmed) {
+            if inside || complete {
+                return false;
+            }
             inside = true;
             continue;
         }
-        if trimmed.starts_with("X-Lasper-Nvidia-End=") {
-            break;
+        if crate::adapters::config::nspawn_file::is_nvidia_end_marker(trimmed) {
+            if !inside {
+                return false;
+            }
+            inside = false;
+            complete = true;
+            continue;
         }
         if !inside {
             continue;
@@ -61,7 +81,7 @@ fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
         .map(|b| (b.host_path.clone(), b.container_path.clone(), b.readonly))
         .collect();
 
-    file_binds == state_binds
+    complete && !inside && file_binds == state_binds
 }
 
 async fn inject_persistent_device_allow(
@@ -280,6 +300,14 @@ X-Lasper-Nvidia-End=true
 ";
 
         assert!(marker_binds_match_state(content, &state));
+    }
+
+    #[test]
+    fn marker_match_ignores_marker_shaped_content_outside_files() {
+        let state = NvidiaState::default();
+        let content = "[Exec]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nX-Lasper-Nvidia-End=true\n";
+
+        assert!(!marker_binds_match_state(content, &state));
     }
 
     #[test]

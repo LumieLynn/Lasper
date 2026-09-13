@@ -263,7 +263,7 @@ fn format_dependencies(v: &Value<'_>) -> String {
     result
 }
 
-/// Format an ExecCommand struct (from CLI serialization or D-Bus typed data).
+/// Format an ExecCommand struct (from systemd tools serialization or D-Bus typed data).
 /// Produces just the command line; metadata (pid, exit code, timestamps) live in
 /// separate ExecMain* properties.
 fn format_exec_command(v: &Value<'_>) -> String {
@@ -533,7 +533,11 @@ fn format_timestamp(v: &Value<'_>) -> String {
         return "n/a".to_string();
     }
 
-    let secs = (us / 1_000_000) as libc::time_t;
+    let epoch_seconds = us / 1_000_000;
+    let secs = match epoch_seconds.try_into() {
+        Ok(secs) => secs,
+        Err(_) => return format!("{}s (unix epoch)", epoch_seconds),
+    };
     unsafe {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&secs, &mut tm);

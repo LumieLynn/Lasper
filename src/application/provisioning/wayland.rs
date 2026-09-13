@@ -49,13 +49,8 @@ pub(crate) fn resolve_wayland_grant(
         sockets.push(WaylandGrant::socket(source.clone(), socket_access));
     }
 
-    WaylandGrant::resolved(
-        target,
-        sockets,
-        intent.default_display().clone(),
-        resolve_wayland_bind_policy(private_users)?,
-    )
-    .map_err(|error| DeploymentError::rejected(error.to_string()))
+    WaylandGrant::resolved(target, sockets, resolve_wayland_bind_policy(private_users)?)
+        .map_err(|error| DeploymentError::rejected(error.to_string()))
 }
 
 pub(crate) fn resolve_wayland_bind_policy(
@@ -103,7 +98,7 @@ mod tests {
     }
 
     fn intent(socket: HostWaylandSocket) -> WaylandGrantIntent {
-        WaylandGrantIntent::new("lumie", vec![socket.clone()], socket.display().clone()).unwrap()
+        WaylandGrantIntent::new("lumie", vec![socket]).unwrap()
     }
 
     #[test]

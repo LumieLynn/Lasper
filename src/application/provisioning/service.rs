@@ -1,13 +1,13 @@
 use super::contract::{
     deployment_job_channel, DeploymentClaimStatus, DeploymentError, DeploymentStatus,
 };
+#[cfg(test)]
+use super::DeploymentCrashManifest;
 use super::{
     DeploymentClaimControl, DeploymentExecutor, DeploymentJobHandle, DeploymentPlan,
     DeploymentPreflight, DeploymentRequest, DeploymentSubmission, RemoteTarSafety, SourcePreflight,
 };
-use super::{
-    DeploymentCrashManifest, DeploymentRecoveryProbe, DeploymentRecoveryReport, DeploymentStatePort,
-};
+use super::{DeploymentRecoveryProbe, DeploymentRecoveryReport, DeploymentStatePort};
 use crate::application::operations::ResourceReservation;
 use crate::application::OperationRegistry;
 use futures_util::FutureExt;
@@ -23,13 +23,19 @@ pub struct ProvisioningService {
     operations: Arc<OperationRegistry>,
     unresolved_claims:
         Arc<parking_lot::Mutex<HashMap<super::DeploymentId, RetainedDeploymentClaim>>>,
-    recovered_claims: parking_lot::Mutex<Option<ResourceReservation>>,
+    recovered_claims: tokio::sync::Mutex<HashMap<super::DeploymentId, RecoveredDeploymentClaim>>,
 }
 
 struct RetainedDeploymentClaim {
     _reservation: ResourceReservation,
     status: tokio::sync::watch::Sender<DeploymentClaimStatus>,
     release_in_progress: bool,
+    authority_released: bool,
+}
+
+struct RecoveredDeploymentClaim {
+    claim: crate::application::ResourceClaim,
+    _reservation: ResourceReservation,
 }
 
 impl ProvisioningService {
@@ -49,7 +55,7 @@ impl ProvisioningService {
             claim_control,
             operations,
             unresolved_claims: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            recovered_claims: parking_lot::Mutex::new(None),
+            recovered_claims: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,8 +110,13 @@ impl ProvisioningService {
                         _reservation: reservation,
                         status: claim_status.clone(),
                         release_in_progress: false,
+                        authority_released: false,
                     },
                 );
+            } else {
+                // A terminal status is the public completion boundary. Release
+                // known-outcome claims before observers can act on it.
+                drop(reservation);
             }
             claim_status.send_replace(terminal.claim_status);
             terminal_status.send_replace(terminal.status);
@@ -123,7 +134,7 @@ impl ProvisioningService {
                 "releasing an unresolved deployment requires explicit confirmation",
             ));
         }
-        {
+        let release_authority = {
             let mut claims = self.unresolved_claims.lock();
             let claim = claims.get_mut(&deployment_id).ok_or_else(|| {
                 DeploymentError::rejected(format!(
@@ -136,17 +147,56 @@ impl ProvisioningService {
                 )));
             }
             claim.release_in_progress = true;
+            !claim.authority_released
+        };
+
+        // Capture the durable revision before releasing the in-memory claim.
+        // The explicit confirmation covers both actions: the outcome remains
+        // unknown, and the crash manifest is discarded only after the active
+        // executor no longer holds the coordination claim.
+        let durable_revision = match self.state.unfinished().await {
+            Ok(manifests) => manifests
+                .into_iter()
+                .find(|manifest| manifest.deployment_id == deployment_id)
+                .map(|manifest| manifest.revision),
+            Err(error) => {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(DeploymentError::reconciliation_required(error.to_string()));
+            }
+        };
+
+        if release_authority {
+            if let Err(error) = self
+                .claim_control
+                .release_unresolved(deployment_id, true)
+                .await
+            {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(error);
+            }
+            // The daemon may acknowledge and remove its terminal record after
+            // release. A failed manifest removal must retry only that removal.
+            if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                claim.authority_released = true;
+            }
         }
 
-        if let Err(error) = self
-            .claim_control
-            .release_unresolved(deployment_id, true)
-            .await
-        {
-            if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
-                claim.release_in_progress = false;
+        if let Some(revision) = durable_revision {
+            if let Err(error) = self.state.remove(deployment_id, revision).await {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(DeploymentError::reconciliation_required(format!(
+                    "deployment {deployment_id} claim was released but its durable manifest could not be discarded: {error}"
+                )));
             }
-            return Err(error);
+            log::warn!(
+                "[AUDIT] Discarded durable unresolved deployment manifest {deployment_id} at revision {revision} after explicit confirmation"
+            );
         }
 
         let claim = self
@@ -170,26 +220,64 @@ impl ProvisioningService {
     pub(crate) async fn unfinished_deployments(
         &self,
     ) -> Result<Vec<DeploymentRecoveryReport>, DeploymentError> {
+        // Serialize the snapshot read and claim reconciliation so an older
+        // concurrent scan cannot overwrite a newer manifest view.
+        let mut recovered_claims = self.recovered_claims.lock().await;
         let manifests = self
             .state
             .unfinished()
             .await
             .map_err(|error| DeploymentError::failed(error.to_string()))?;
-        if !manifests.is_empty() {
-            let mut recovered_claims = self.recovered_claims.lock();
-            if recovered_claims.is_none() {
-                let reservation = self
-                    .operations
-                    .reserve(manifests.iter().map(DeploymentCrashManifest::recovery_claim))
-                    .map_err(|conflict| {
-                        DeploymentError::reconciliation_required(format!(
-                            "unfinished deployment recovery conflicts with an active resource: {:?}",
-                            conflict.key
-                        ))
-                    })?;
-                *recovered_claims = Some(reservation);
+
+        let mut desired = HashMap::with_capacity(manifests.len());
+        for manifest in &manifests {
+            if desired
+                .insert(manifest.deployment_id, manifest.recovery_claim())
+                .is_some()
+            {
+                return Err(DeploymentError::reconciliation_required(format!(
+                    "unfinished deployment {} appears more than once",
+                    manifest.deployment_id
+                )));
             }
         }
+
+        for (deployment_id, retained) in recovered_claims.iter() {
+            if let Some(claim) = desired.get(deployment_id) {
+                if claim != &retained.claim {
+                    return Err(DeploymentError::reconciliation_required(format!(
+                        "unfinished deployment {deployment_id} changed its claimed resource"
+                    )));
+                }
+            }
+        }
+
+        recovered_claims.retain(|deployment_id, _| desired.contains_key(deployment_id));
+        let mut additions = Vec::new();
+        for (deployment_id, claim) in &desired {
+            if recovered_claims.contains_key(deployment_id) {
+                continue;
+            }
+            let reservation = self
+                .operations
+                .reserve([claim.clone()])
+                .map_err(|conflict| {
+                    DeploymentError::reconciliation_required(format!(
+                        "unfinished deployment recovery conflicts with an active resource: {:?}",
+                        conflict.key
+                    ))
+                })?;
+            additions.push((
+                *deployment_id,
+                RecoveredDeploymentClaim {
+                    claim: claim.clone(),
+                    _reservation: reservation,
+                },
+            ));
+        }
+        recovered_claims.extend(additions);
+        drop(recovered_claims);
+
         let mut reports = Vec::with_capacity(manifests.len());
         for manifest in manifests {
             match self.recovery.probe(&manifest).await {
@@ -288,6 +376,29 @@ mod tests {
     struct PanicExecutor;
 
     struct FailingClaimControl;
+
+    struct RevisingClaimControl {
+        state: Arc<super::super::MemoryDeploymentStatePort>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DeploymentClaimControl for RevisingClaimControl {
+        async fn release_unresolved(
+            &self,
+            deployment_id: super::super::DeploymentId,
+            confirmed: bool,
+        ) -> Result<(), DeploymentError> {
+            assert!(confirmed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut manifest = self.state.unfinished().await.unwrap().pop().unwrap();
+            assert_eq!(manifest.deployment_id, deployment_id);
+            let revision = manifest.revision;
+            manifest.revision += 1;
+            self.state.update(revision, manifest).await.unwrap();
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl SourcePreflight for RecordingPreflight {
@@ -532,33 +643,24 @@ mod tests {
 
         handle.request_cancel();
         wait_until_finished(&handle).await;
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if registry
-                    .reserve([crate::application::ResourceClaim::exclusive(
-                        crate::application::ResourceKey::for_machine(&target),
-                    )])
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(&target),
+            )])
+            .is_ok());
     }
 
     #[tokio::test]
     async fn executor_panic_is_reconciliation_required_and_retains_its_claim() {
         let registry = OperationRegistry::new();
+        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
         let service = ProvisioningService::new(
             Arc::new(RecordingPreflight {
                 calls: AtomicUsize::new(0),
                 safety: RemoteTarSafety::Compatible,
             }),
             Arc::new(PanicExecutor),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            state.clone(),
             recovery(),
             claim_control(),
             Arc::clone(&registry),
@@ -581,6 +683,13 @@ mod tests {
             .is_err());
         assert_eq!(service.unresolved_claims.lock().len(), 1);
 
+        let (request, _) = submission().into_parts();
+        let plan = DeploymentPlan::build(request).unwrap();
+        state
+            .create(DeploymentCrashManifest::prepared(handle.id(), &plan))
+            .await
+            .unwrap();
+
         assert!(service
             .release_unresolved(handle.id(), false)
             .await
@@ -599,11 +708,61 @@ mod tests {
             DeploymentStatus::ReconciliationRequired(_)
         ));
         assert!(service.unresolved_claims.lock().is_empty());
+        assert!(state.unfinished().await.unwrap().is_empty());
         assert!(registry
             .reserve([crate::application::ResourceClaim::exclusive(
                 crate::application::ResourceKey::for_machine(&target),
             )])
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn manifest_discard_can_retry_without_releasing_an_acknowledged_daemon_job_again() {
+        let registry = OperationRegistry::new();
+        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
+        let control = Arc::new(RevisingClaimControl {
+            state: state.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let service = ProvisioningService::new(
+            Arc::new(RecordingPreflight {
+                calls: AtomicUsize::new(0),
+                safety: RemoteTarSafety::Compatible,
+            }),
+            Arc::new(PanicExecutor),
+            state.clone(),
+            recovery(),
+            control.clone(),
+            registry.clone(),
+        );
+        let handle = service.start(submission()).unwrap();
+        wait_until_finished(&handle).await;
+        let (request, _) = submission().into_parts();
+        let plan = DeploymentPlan::build(request).unwrap();
+        state
+            .create(DeploymentCrashManifest::prepared(handle.id(), &plan))
+            .await
+            .unwrap();
+
+        let error = service
+            .release_unresolved(handle.id(), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision changed"));
+        assert_eq!(
+            handle.claim_status(),
+            DeploymentClaimStatus::ReconciliationRequired
+        );
+        assert!(registry.reserve(plan.resource_claims()).is_err());
+
+        service.release_unresolved(handle.id(), true).await.unwrap();
+        assert_eq!(control.calls.load(Ordering::Relaxed), 1);
+        assert!(state.unfinished().await.unwrap().is_empty());
+        assert!(registry.reserve(plan.resource_claims()).is_ok());
+        assert_eq!(
+            handle.claim_status(),
+            DeploymentClaimStatus::ReleasedUnresolved
+        );
     }
 
     #[tokio::test]
@@ -670,26 +829,16 @@ mod tests {
         assert_eq!(handle.claim_status(), DeploymentClaimStatus::Reconciled);
 
         let target = crate::domain::machine::MachineName::new("test").unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if registry
-                    .reserve([crate::application::ResourceClaim::exclusive(
-                        crate::application::ResourceKey::for_machine(&target),
-                    )])
-                    .is_ok()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(&target),
+            )])
+            .is_ok());
         assert!(service.unresolved_claims.lock().is_empty());
     }
 
     #[tokio::test]
-    async fn startup_recovery_reserves_manifest_targets_without_mutating_them() {
+    async fn startup_recovery_tracks_manifest_claims_without_mutating_them() {
         let registry = OperationRegistry::new();
         let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
         let (request, _) = submission().into_parts();
@@ -723,6 +872,17 @@ mod tests {
             .is_err());
         assert_eq!(state.unfinished().await.unwrap().len(), 1);
         assert_eq!(service.unfinished_deployments().await.unwrap().len(), 1);
+
+        state
+            .remove(manifest.deployment_id, manifest.revision)
+            .await
+            .unwrap();
+        assert!(service.unfinished_deployments().await.unwrap().is_empty());
+        assert!(registry
+            .reserve([crate::application::ResourceClaim::exclusive(
+                crate::application::ResourceKey::for_machine(plan.target()),
+            )])
+            .is_ok());
     }
 
     #[test]

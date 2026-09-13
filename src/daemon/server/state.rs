@@ -57,6 +57,7 @@ impl SessionProcess {
 #[derive(Default)]
 pub(crate) struct DaemonServerState {
     sessions: parking_lot::Mutex<HashMap<WireSessionId, SessionProcess>>,
+    session_changes: tokio::sync::Notify,
     pub(crate) deployments: Arc<DeploymentRegistry>,
     pub(crate) operations: Arc<crate::application::OperationRegistry>,
 }
@@ -76,15 +77,23 @@ impl DaemonServerState {
     }
 
     pub(crate) fn finish(&self, id: WireSessionId, process: &SessionProcess) {
-        let mut sessions = self.sessions.lock();
-        if sessions
-            .get(&id)
-            .is_some_and(|current| current.same_process(process))
-        {
-            if let Some(process) = sessions.get(&id) {
-                process.mark_completed();
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            if sessions
+                .get(&id)
+                .is_some_and(|current| current.same_process(process))
+            {
+                if let Some(process) = sessions.get(&id) {
+                    process.mark_completed();
+                }
+                sessions.remove(&id);
+                true
+            } else {
+                false
             }
-            sessions.remove(&id);
+        };
+        if removed {
+            self.session_changes.notify_waiters();
         }
     }
 
@@ -150,6 +159,27 @@ impl DaemonServerState {
         self.sessions.lock().values().cloned().collect()
     }
 
+    /// Wait until every registered session has been reaped, bounded by the
+    /// caller's shutdown deadline. Register the notification waiter before
+    /// inspecting the map so a concurrent final reap cannot be missed.
+    pub(crate) async fn wait_for_sessions_to_finish(&self, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let changed = self.session_changes.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.sessions.lock().is_empty() {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, &mut changed)
+                .await
+                .is_err()
+            {
+                return self.sessions.lock().is_empty();
+            }
+        }
+    }
+
     pub(crate) fn signal_session_process(
         &self,
         process: &SessionProcess,
@@ -182,12 +212,20 @@ impl DaemonServerState {
     }
 
     fn remove_if_process(&self, id: WireSessionId, process: &SessionProcess) {
-        let mut sessions = self.sessions.lock();
-        if sessions
-            .get(&id)
-            .is_some_and(|current| current.same_process(process))
-        {
-            sessions.remove(&id);
+        let removed = {
+            let mut sessions = self.sessions.lock();
+            if sessions
+                .get(&id)
+                .is_some_and(|current| current.same_process(process))
+            {
+                sessions.remove(&id);
+                true
+            } else {
+                false
+            }
+        };
+        if removed {
+            self.session_changes.notify_waiters();
         }
     }
 

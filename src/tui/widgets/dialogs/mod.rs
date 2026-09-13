@@ -158,6 +158,7 @@ pub mod bind_mount;
 pub mod confirmation;
 pub mod nvidia_config;
 pub mod port_mapping;
+pub mod shell;
 pub mod unclassified_file;
 pub mod user_editor;
 pub mod wayland_access;

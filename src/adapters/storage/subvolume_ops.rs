@@ -6,6 +6,9 @@ use crate::adapters::storage::get_filesystem_type;
 use crate::domain::machine::MachineName;
 use std::path::{Path, PathBuf};
 
+const BTRFS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_BTRFS_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+
 pub async fn create_subvolume(
     machine: &MachineName,
     runner: &dyn CommandRunner,
@@ -45,10 +48,16 @@ pub async fn is_subvolume(path: &Path) -> bool {
         }
     }
 
-    let output = crate::adapters::process::new_command("btrfs")
-        .args(["subvolume", "show", &path.to_string_lossy()])
-        .output()
-        .await;
+    let mut command = crate::adapters::process::new_command("btrfs");
+    command.args(["subvolume", "show", &path.to_string_lossy()]);
+    let output = crate::adapters::process::run_bounded_child_command(
+        command,
+        None,
+        BTRFS_COMMAND_TIMEOUT,
+        "btrfs subvolume show",
+        MAX_BTRFS_COMMAND_OUTPUT_BYTES,
+    )
+    .await;
     output
         .map(|result| result.status.success())
         .unwrap_or(false)
@@ -86,13 +95,14 @@ async fn create_subvolume_at(
     reject_existing_target(&image_path(parent, machine, "img")).await?;
 
     let output = runner
-        .run(
+        .run_bounded(
             "btrfs",
             vec![
                 "subvolume".into(),
                 "create".into(),
                 target.to_string_lossy().to_string(),
             ],
+            BTRFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("btrfs"), error))?;
@@ -124,13 +134,14 @@ async fn remove_subvolume_at(
     }
 
     let show = runner
-        .run(
+        .run_bounded(
             "btrfs",
             vec![
                 "subvolume".into(),
                 "show".into(),
                 target.to_string_lossy().to_string(),
             ],
+            BTRFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("btrfs"), error))?;
@@ -143,13 +154,14 @@ async fn remove_subvolume_at(
     }
 
     let output = runner
-        .run(
+        .run_bounded(
             "btrfs",
             vec![
                 "subvolume".into(),
                 "delete".into(),
                 target.to_string_lossy().to_string(),
             ],
+            BTRFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("btrfs"), error))?;
@@ -228,10 +240,13 @@ mod tests {
             .unwrap();
 
         let mut runner = MockCommandRunner::new();
-        runner.expect_run().returning(|program, _| {
-            assert_eq!(program, "btrfs");
-            Ok(output(false, "", "Not a subvolume"))
-        });
+        runner
+            .expect_run_bounded()
+            .returning(|program, _, timeout| {
+                assert_eq!(program, "btrfs");
+                assert_eq!(timeout, BTRFS_COMMAND_TIMEOUT);
+                Ok(output(false, "", "Not a subvolume"))
+            });
 
         let result = remove_subvolume_at(directory.path(), &machine, &runner).await;
         assert!(
@@ -248,14 +263,18 @@ mod tests {
             .unwrap();
 
         let mut runner = MockCommandRunner::new();
-        runner.expect_run().times(2).returning(|program, args| {
-            assert_eq!(program, "btrfs");
-            if args.get(1).map(String::as_str) == Some("show") {
-                Ok(output(true, "Name: test", ""))
-            } else {
-                Err(std::io::Error::other("simulated delete failure"))
-            }
-        });
+        runner
+            .expect_run_bounded()
+            .times(2)
+            .returning(|program, args, timeout| {
+                assert_eq!(program, "btrfs");
+                assert_eq!(timeout, BTRFS_COMMAND_TIMEOUT);
+                if args.get(1).map(String::as_str) == Some("show") {
+                    Ok(output(true, "Name: test", ""))
+                } else {
+                    Err(std::io::Error::other("simulated delete failure"))
+                }
+            });
 
         let result = remove_subvolume_at(directory.path(), &machine, &runner).await;
         assert!(matches!(result, Err(NspawnError::Io(_, _))));

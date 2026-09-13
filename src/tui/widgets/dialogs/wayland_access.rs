@@ -2,7 +2,6 @@ use crate::domain::wayland::HostWaylandSocket;
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::inputs::button::Button;
 use crate::tui::widgets::lists::checklist::Checklist;
-use crate::tui::widgets::lists::selectable_list::SelectableList;
 use crate::tui::wizard::draft::WaylandAccessDraft;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -14,19 +13,14 @@ use ratatui::{
 
 macro_rules! active_comps {
     ($self:ident) => {{
-        let comps: Vec<&mut dyn Component> = vec![
-            &mut $self.sockets,
-            &mut $self.default_display,
-            &mut $self.btn_ok,
-            &mut $self.btn_cancel,
-        ];
+        let comps: Vec<&mut dyn Component> =
+            vec![&mut $self.sockets, &mut $self.btn_ok, &mut $self.btn_cancel];
         comps
     }};
 }
 
 pub struct WaylandAccessDialog {
     sockets: Checklist<HostWaylandSocket>,
-    default_display: SelectableList<HostWaylandSocket>,
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
@@ -45,20 +39,8 @@ impl WaylandAccessDialog {
             );
         }
 
-        let selected = checked_sockets(&sockets);
-        let default_index = initial
-            .and_then(|initial| {
-                selected
-                    .iter()
-                    .position(|socket| socket.display() == &initial.default_display)
-            })
-            .unwrap_or(0);
-        let mut default_display = SelectableList::new("Default Display", selected, socket_label);
-        default_display.select(default_index);
-
         let mut dialog = Self {
             sockets,
-            default_display,
             btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
             btn_cancel: Button::new("Cancel", || AppMessage::Wizard(WizardMessage::DialogCancel)),
             focus: FocusTracker::new(),
@@ -84,26 +66,9 @@ impl WaylandAccessDialog {
         self.update_focus();
     }
 
-    fn sync_default_displays(&mut self) {
-        let previous = self.default_display.selected_item().cloned();
-        let selected = checked_sockets(&self.sockets);
-        self.default_display.set_items(selected);
-        if let Some(previous) = previous {
-            if let Some(index) = self
-                .default_display
-                .items()
-                .iter()
-                .position(|socket| socket == &previous)
-            {
-                self.default_display.select(index);
-            }
-        }
-    }
-
     fn try_submit(&self) -> Option<WaylandAccessDraft> {
         let sockets = checked_sockets(&self.sockets);
-        let default_display = self.default_display.selected_item()?.display().clone();
-        WaylandAccessDraft::new(sockets, default_display).ok()
+        WaylandAccessDraft::new(sockets).ok()
     }
 }
 
@@ -140,24 +105,22 @@ impl Component for WaylandAccessDialog {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(50),
                 Constraint::Min(4),
                 Constraint::Length(1),
                 Constraint::Length(3),
             ])
             .split(inner);
         self.sockets.render(frame, chunks[0]);
-        self.default_display.render(frame, chunks[1]);
         frame.render_widget(
-            Paragraph::new(" [Space] select displays  [Tab] switch  [Up/Down] choose default ")
+            Paragraph::new(" [Space] select displays  [Tab] switch ")
                 .style(Style::default().fg(crate::tui::theme::theme().wizard_footer)),
-            chunks[2],
+            chunks[1],
         );
 
         let buttons = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(chunks[3]);
+            .split(chunks[2]);
         self.btn_ok.render(frame, buttons[0]);
         self.btn_cancel.render(frame, buttons[1]);
     }
@@ -185,13 +148,9 @@ impl Component for WaylandAccessDialog {
             _ => {}
         }
 
-        let sockets_focused = self.sockets.is_focused();
         let mut comps = active_comps!(self);
         let result = comps[self.focus.active_idx].handle_key(key);
         drop(comps);
-        if sockets_focused && key.code == KeyCode::Char(' ') {
-            self.sync_default_displays();
-        }
         match result {
             EventResult::Message(AppMessage::Wizard(WizardMessage::DialogSubmit)) => {
                 self.try_submit().map_or(EventResult::Consumed, |access| {
@@ -223,10 +182,7 @@ impl Component for WaylandAccessDialog {
     }
 
     fn is_focused(&self) -> bool {
-        self.sockets.is_focused()
-            || self.default_display.is_focused()
-            || self.btn_ok.is_focused()
-            || self.btn_cancel.is_focused()
+        self.sockets.is_focused() || self.btn_ok.is_focused() || self.btn_cancel.is_focused()
     }
 }
 
@@ -255,18 +211,14 @@ mod tests {
     }
 
     #[test]
-    fn multiple_selected_sockets_preserve_an_explicit_default() {
+    fn multiple_selected_sockets_are_preserved_without_a_guest_default() {
         let first = socket("wayland-0", 1);
         let second = socket("wayland-1", 2);
-        let initial = WaylandAccessDraft::new(
-            vec![first.clone(), second.clone()],
-            second.display().clone(),
-        )
-        .unwrap();
+        let initial = WaylandAccessDraft::new(vec![first.clone(), second.clone()]).unwrap();
         let dialog = WaylandAccessDialog::new(vec![first, second], Some(&initial));
 
         let result = dialog.try_submit().unwrap();
         assert_eq!(result.sockets.len(), 2);
-        assert_eq!(result.default_display.as_str(), "wayland-1");
+        assert_eq!(result.sockets[1].display().as_str(), "wayland-1");
     }
 }

@@ -1,14 +1,17 @@
 //! Typed image import operations shared by direct and elevated modes.
 
 use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::process::{read_bounded_stream, terminate_child_process_group};
 use crate::adapters::rootfs::RootfsTarget;
 use crate::domain::machine::MachineName;
 use serde::{Deserialize, Serialize};
-use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 
 const MAX_TAR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const IMAGE_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_IMAGE_VALIDATION_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +62,7 @@ impl ImageImportStore {
         source: std::fs::File,
         source_origin: TarSourceOrigin,
         allow_unsafe_remote: bool,
+        cancellation: &super::DeploymentCancellation,
     ) -> Result<ImageImportReport> {
         validate_source(&source)?;
         let request = ImportTarRequest {
@@ -66,7 +70,7 @@ impl ImageImportStore {
             source_origin,
             allow_unsafe_remote,
         };
-        import_tar_image(request, source).await
+        import_tar_image(request, source, cancellation).await
     }
 }
 
@@ -76,11 +80,16 @@ pub(crate) async fn import_raw_system_image(
 ) -> Result<()> {
     validate_source(&source)?;
     let path = crate::adapters::storage::image_ops::import_raw_image(&machine, source).await?;
-    let output = match crate::adapters::process::new_command("systemd-dissect")
-        .args(["--validate"])
-        .arg(&path)
-        .output()
-        .await
+    let mut command = crate::adapters::process::new_command("systemd-dissect");
+    command.args(["--validate"]).arg(&path);
+    let output = match crate::adapters::process::run_bounded_child_command(
+        command,
+        None,
+        IMAGE_VALIDATION_TIMEOUT,
+        "systemd-dissect --validate",
+        MAX_IMAGE_VALIDATION_OUTPUT_BYTES,
+    )
+    .await
     {
         Ok(output) => output,
         Err(error) => {
@@ -117,51 +126,61 @@ fn validate_source(source: &std::fs::File) -> Result<()> {
 pub(crate) async fn import_tar_image(
     request: ImportTarRequest,
     source: std::fs::File,
+    cancellation: &super::DeploymentCancellation,
 ) -> Result<ImageImportReport> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
     let target = request.target.path()?;
-    let operation_target = target.clone();
     let source_origin = request.source_origin;
     let allow_unsafe_remote = request.allow_unsafe_remote;
 
-    tokio::task::spawn_blocking(move || {
-        extract_tar_at(
-            &operation_target,
-            source,
-            source_origin,
-            allow_unsafe_remote,
-        )
-    })
-    .await
-    .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))?
+    let preparation = tokio::task::spawn_blocking(move || {
+        prepare_tar_import(source, source_origin, allow_unsafe_remote)
+    });
+    let (source, report) = tokio::select! {
+        result = preparation => result
+            .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))??,
+        _ = cancellation.cancelled() => return Err(NspawnError::DeploymentCancelled),
+    };
+    super::check_deployment_cancellation(cancellation)?;
+    extract_tar_at(&target, source, cancellation).await?;
+    Ok(report)
 }
 
-fn extract_tar_at(
-    target: &std::path::Path,
+fn prepare_tar_import(
     source: std::fs::File,
     source_origin: TarSourceOrigin,
     allow_unsafe_remote: bool,
-) -> Result<ImageImportReport> {
+) -> Result<(std::fs::File, ImageImportReport)> {
     super::tar_limits::validate(&source)?;
     let assessment = inspect_tar_runtime()?;
     let report = tar_runtime_policy(source_origin, &assessment, allow_unsafe_remote)?;
     for warning in &report.warnings {
         log::warn!("[AUDIT] [Tar import] {warning}");
     }
+    Ok((source, report))
+}
 
-    let mut command = tar_command();
-    crate::adapters::process::limit_file_size(&mut command, super::tar_limits::MAX_EXPANDED_BYTES);
+async fn extract_tar_at(
+    target: &std::path::Path,
+    source: std::fs::File,
+    cancellation: &super::DeploymentCancellation,
+) -> Result<()> {
+    let mut command = async_tar_command();
+    crate::adapters::process::limit_file_size(
+        command.as_std_mut(),
+        super::tar_limits::MAX_EXPANDED_BYTES,
+    );
     command
         .args(["--numeric-owner", "-pxf", "-", "-C"])
         .arg(target)
         .stdin(Stdio::from(source))
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let output = run_tar_extract(command)?;
+    let output = run_tar_extract(command, cancellation).await?;
     crate::adapters::process::log_output("typed tar import", &output);
     if output.status.success() {
-        Ok(report)
+        Ok(())
     } else {
         Err(NspawnError::cmd_failed(
             "extract rootfs archive",
@@ -171,56 +190,51 @@ fn extract_tar_at(
     }
 }
 
-fn run_tar_extract(mut command: std::process::Command) -> Result<std::process::Output> {
+async fn run_tar_extract(
+    mut command: tokio::process::Command,
+    cancellation: &super::DeploymentCancellation,
+) -> Result<std::process::Output> {
+    const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+    command.kill_on_drop(true).as_std_mut().process_group(0);
     let mut child = command
         .spawn()
         .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
-    let mut stderr = child.stderr.take().expect("tar stderr piped");
-    let stderr = match read_bounded_diagnostics(&mut stderr, MAX_TAR_DIAGNOSTIC_BYTES) {
-        Ok(stderr) => stderr,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(NspawnError::Io(PathBuf::from("tar"), error));
-        }
-    };
-    let status = child
-        .wait()
-        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
-    Ok(std::process::Output {
-        status,
-        stdout: Vec::new(),
-        stderr,
-    })
-}
-
-fn read_bounded_diagnostics(reader: &mut impl Read, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut kept = Vec::with_capacity(limit.min(4096));
-    let mut chunk = [0u8; 4096];
-    let mut truncated = false;
-    loop {
-        let count = reader.read(&mut chunk)?;
-        if count == 0 {
-            break;
-        }
-        let remaining = limit.saturating_sub(kept.len());
-        let take = count.min(remaining);
-        kept.extend_from_slice(&chunk[..take]);
-        truncated |= take < count;
+    let pid = child.id().expect("tar has pid");
+    let stderr = child.stderr.take().expect("tar stderr piped");
+    let mut completion = Box::pin(async {
+        let (status, stderr) = tokio::join!(
+            child.wait(),
+            read_bounded_stream(stderr, MAX_TAR_DIAGNOSTIC_BYTES),
+        );
+        Ok::<std::process::Output, std::io::Error>(std::process::Output {
+            status: status?,
+            stdout: Vec::new(),
+            stderr: stderr?,
+        })
+    });
+    tokio::select! {
+        biased;
+        result = &mut completion => return result.map_err(|error| NspawnError::Io(PathBuf::from("tar"), error)),
+        _ = cancellation.cancelled() => {},
     }
-    if truncated {
-        const MARKER: &[u8] = b"\n[tar diagnostics truncated]\n";
-        let marker_start = limit.saturating_sub(MARKER.len());
-        kept.truncate(marker_start);
-        kept.extend_from_slice(&MARKER[..MARKER.len().min(limit)]);
-    }
-    Ok(kept)
+    drop(completion);
+    terminate_child_process_group(&mut child, pid, "tar", STOP_TIMEOUT)
+        .await
+        .map_err(|error| super::process_state_unknown("tar", error))?;
+    Err(NspawnError::DeploymentCancelled)
 }
 
 fn tar_command() -> std::process::Command {
     let mut command = crate::adapters::process::new_sync_command("tar");
     // GNU tar reads additional extraction flags from this environment variable.
     // Ignore it so callers cannot silently enable unsafe link-following behavior.
+    command.env_remove("TAR_OPTIONS");
+    command
+}
+
+fn async_tar_command() -> tokio::process::Command {
+    let mut command = crate::adapters::process::new_command("tar");
     command.env_remove("TAR_OPTIONS");
     command
 }
@@ -425,18 +439,23 @@ mod tests {
             .any(|(name, value)| name == "TAR_OPTIONS" && value.is_none()));
     }
 
-    #[test]
-    fn tar_diagnostics_are_drained_with_a_bounded_capture() {
-        let mut diagnostics = std::io::Cursor::new(vec![b'x'; 4096]);
+    #[tokio::test]
+    async fn tar_diagnostics_are_drained_with_a_bounded_capture() {
+        let (mut writer, diagnostics) = tokio::io::duplex(8192);
+        let write = tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            writer.write_all(&vec![b'x'; 4096]).await.unwrap();
+        });
 
-        let captured = read_bounded_diagnostics(&mut diagnostics, 128).unwrap();
+        let captured = read_bounded_stream(diagnostics, 128).await.unwrap();
+        write.await.unwrap();
 
         assert_eq!(captured.len(), 128);
-        assert!(captured.ends_with(b"[tar diagnostics truncated]\n"));
+        assert!(captured.ends_with(b"[command output truncated]\n"));
     }
 
-    #[test]
-    fn typed_tar_import_reads_archive_from_fd() {
+    #[tokio::test]
+    async fn typed_tar_import_reads_archive_from_fd() {
         let source = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
         std::fs::create_dir(source.path().join("etc")).unwrap();
@@ -454,10 +473,39 @@ mod tests {
         assert!(output.status.success());
         archive.seek(SeekFrom::Start(0)).unwrap();
 
-        extract_tar_at(target.path(), archive, TarSourceOrigin::Local, false).unwrap();
+        let (archive, _) = prepare_tar_import(archive, TarSourceOrigin::Local, false).unwrap();
+        extract_tar_at(
+            target.path(),
+            archive,
+            &super::super::DeploymentCancellation::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             std::fs::read(target.path().join("etc/os-release")).unwrap(),
             b"NAME=Lasper test\n"
         );
+    }
+
+    #[tokio::test]
+    async fn tar_extraction_stops_when_deployment_is_cancelled() {
+        let mut command = crate::adapters::process::new_command("sh");
+        command.args(["-c", "sleep 30"]);
+        let cancellation = super::super::DeploymentCancellation::default();
+        let request = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            request.request();
+        });
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            run_tar_extract(command, &cancellation),
+        )
+        .await
+        .expect("cancelled tar child did not stop")
+        .unwrap_err();
+
+        assert!(matches!(error, NspawnError::DeploymentCancelled));
     }
 }

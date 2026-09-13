@@ -1,5 +1,6 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{log_output, CommandRunner};
+use crate::adapters::rootfs::process::ROOTFS_COMMAND_TIMEOUT;
 use std::path::{Path, PathBuf};
 use std::process::Output;
 
@@ -10,7 +11,7 @@ pub(crate) async fn configure_network_at(
 ) -> Result<Vec<String>> {
     let rootfs_s = rootfs.to_string_lossy().to_string();
     let systemctl_probe = cmd_runner
-        .run(
+        .run_bounded(
             "systemd-nspawn",
             vec![
                 "-D".into(),
@@ -21,6 +22,7 @@ pub(crate) async fn configure_network_at(
                 "-e".into(),
                 "/usr/bin/systemctl".into(),
             ],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("systemd-nspawn"), error))?;
@@ -61,7 +63,7 @@ async fn enable_systemd_unit(
     cmd_runner: &dyn CommandRunner,
 ) -> Result<Output> {
     let out = cmd_runner
-        .run(
+        .run_bounded(
             "systemd-nspawn",
             vec![
                 "-D".into(),
@@ -72,6 +74,7 @@ async fn enable_systemd_unit(
                 "enable".into(),
                 unit.into(),
             ],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
@@ -112,11 +115,14 @@ mod tests {
         let mut runner = MockCommandRunner::new();
         {
             let calls = calls.clone();
-            runner.expect_run().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args.clone());
-                Ok(mock_output(true, ""))
-            });
+            runner
+                .expect_run_bounded()
+                .returning(move |program, args, timeout| {
+                    assert_eq!(program, "systemd-nspawn");
+                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
+                    calls.lock().unwrap().push(args.clone());
+                    Ok(mock_output(true, ""))
+                });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
@@ -140,15 +146,18 @@ mod tests {
         let mut runner = MockCommandRunner::new();
         {
             let calls = calls.clone();
-            runner.expect_run().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args.clone());
-                if args.iter().any(|arg| arg == "test") {
-                    Ok(mock_output(true, ""))
-                } else {
-                    Ok(mock_output(false, "networkd failed"))
-                }
-            });
+            runner
+                .expect_run_bounded()
+                .returning(move |program, args, timeout| {
+                    assert_eq!(program, "systemd-nspawn");
+                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
+                    calls.lock().unwrap().push(args.clone());
+                    if args.iter().any(|arg| arg == "test") {
+                        Ok(mock_output(true, ""))
+                    } else {
+                        Ok(mock_output(false, "networkd failed"))
+                    }
+                });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
@@ -173,11 +182,14 @@ mod tests {
         let mut runner = MockCommandRunner::new();
         {
             let calls = calls.clone();
-            runner.expect_run().returning(move |program, args| {
-                assert_eq!(program, "systemd-nspawn");
-                calls.lock().unwrap().push(args);
-                Ok(mock_output(false, "missing"))
-            });
+            runner
+                .expect_run_bounded()
+                .returning(move |program, args, timeout| {
+                    assert_eq!(program, "systemd-nspawn");
+                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
+                    calls.lock().unwrap().push(args);
+                    Ok(mock_output(false, "missing"))
+                });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();

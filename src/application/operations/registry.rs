@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub enum ResourceKey {
     Nspawn(String),
     Image(String),
+    SystemdManager,
 }
 
 impl ResourceKey {

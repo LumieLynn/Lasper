@@ -4,7 +4,7 @@ use fs2::FileExt;
 use std::ffi::OsString;
 use std::fs::File;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::time::sleep;
@@ -70,8 +70,6 @@ impl AsyncLockedWriter {
     {
         let path_buf = path.to_path_buf();
         let lock_path = lock_path_for(path);
-        let tmp_path = path.with_extension("tmp");
-
         // Ensure parent exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -102,33 +100,8 @@ impl AsyncLockedWriter {
             return Ok(result);
         };
 
-        // Atomic update with durability
-        {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            if let Some(mode) = mode {
-                options.mode(mode);
-            }
-            let mut f = options
-                .open(&tmp_path)
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            if let Some(mode) = mode {
-                f.set_permissions(std::fs::Permissions::from_mode(mode))
-                    .await
-                    .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            }
-            f.write_all(new_content.as_bytes())
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            f.sync_data()
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-        }
-
-        fs::rename(&tmp_path, &path_buf)
-            .await
-            .map_err(|e| NspawnError::Io(path_buf.clone(), e))?;
+        let final_mode = mode.or(existing_mode(path)?).unwrap_or(0o600);
+        persist_atomic(path, new_content.as_bytes(), final_mode).await?;
 
         // Sync parent directory
         if let Some(parent) = path.parent() {
@@ -248,8 +221,6 @@ impl AsyncLockedWriter {
         content: &str,
         mode: Option<u32>,
     ) -> Result<()> {
-        let tmp_path = path.with_extension("write.tmp");
-
         // 1. Ensure parent exists
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -257,44 +228,61 @@ impl AsyncLockedWriter {
                 .map_err(|e| NspawnError::Io(parent.to_path_buf(), e))?;
         }
 
-        // 2. Write and sync
-        {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            if let Some(mode) = mode {
-                options.mode(mode);
-            }
-            let mut f = options
-                .open(&tmp_path)
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            if let Some(mode) = mode {
-                f.set_permissions(std::fs::Permissions::from_mode(mode))
-                    .await
-                    .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            }
-            f.write_all(content.as_bytes())
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-            f.sync_data()
-                .await
-                .map_err(|e| NspawnError::Io(tmp_path.clone(), e))?;
-        }
-
-        // 3. Atomic swap
-        fs::rename(&tmp_path, path)
-            .await
-            .map_err(|e| NspawnError::Io(path.to_path_buf(), e))?;
-
-        // 4. Sync parent directory
-        if let Some(parent) = path.parent() {
-            if let Ok(dir) = fs::File::open(parent).await {
-                let _ = dir.sync_all().await;
-            }
-        }
-
-        Ok(())
+        let final_mode = mode.or(existing_mode(path)?).unwrap_or(0o600);
+        persist_atomic(path, content.as_bytes(), final_mode).await
     }
+}
+
+fn existing_mode(path: &Path) -> Result<Option<u32>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(metadata.mode() & 0o7777)),
+        Ok(_) => Err(NspawnError::Validation(format!(
+            "Atomic write target {} is not a regular file",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn persist_atomic(path: &Path, content: &[u8], mode: u32) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let prefix = path
+        .file_name()
+        .map(|name| {
+            let mut prefix = OsString::from(".");
+            prefix.push(name);
+            prefix.push(".lasper-");
+            prefix
+        })
+        .unwrap_or_else(|| OsString::from(".lasper-"));
+    let named = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| NspawnError::Io(parent.to_path_buf(), error))?;
+    named
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(mode))
+        .map_err(|error| NspawnError::Io(named.path().to_path_buf(), error))?;
+    let (file, temp_path) = named.into_parts();
+    let temp_name: PathBuf = temp_path.to_path_buf();
+    let mut file = fs::File::from_std(file);
+    file.write_all(content)
+        .await
+        .map_err(|error| NspawnError::Io(temp_name.clone(), error))?;
+    file.sync_data()
+        .await
+        .map_err(|error| NspawnError::Io(temp_name.clone(), error))?;
+    drop(file);
+
+    temp_path
+        .persist(path)
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error.error))?;
+    if let Ok(directory) = fs::File::open(parent).await {
+        let _ = directory.sync_all().await;
+    }
+    Ok(())
 }
 
 async fn wait_for_lock_retry(
@@ -403,5 +391,38 @@ mod tests {
 
         assert!(!AsyncLockedWriter::locked_inode_is_current(&old, &lock).unwrap());
         old.unlock().unwrap();
+    }
+
+    #[tokio::test]
+    async fn atomic_write_does_not_follow_a_predictable_temporary_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.conf");
+        let victim = directory.path().join("victim");
+        let legacy_temp = target.with_extension("write.tmp");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, &legacy_temp).unwrap();
+
+        AsyncLockedWriter::write_atomic_with_mode(&target, "new", Some(0o640))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(legacy_temp.is_symlink());
+    }
+
+    #[tokio::test]
+    async fn atomic_rewrite_preserves_existing_mode_without_an_override() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("settings.conf");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        AsyncLockedWriter::write_atomic(&target, "new")
+            .await
+            .unwrap();
+
+        let mode = std::fs::symlink_metadata(&target).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o640);
     }
 }

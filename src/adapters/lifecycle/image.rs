@@ -30,7 +30,7 @@ pub(crate) struct ImageLifecycleAdapters {
 
 pub(crate) enum ImageLifecycleRoute {
     DirectDbus(DbusBackend),
-    LocalCli,
+    LocalSystemdTools,
     Elevated {
         daemon: Arc<ElevatedDaemon>,
         transport: ImageRemoveTransport,
@@ -57,7 +57,7 @@ pub(crate) fn compose_image_lifecycle(
             system_operations: system_operations.clone(),
             transport,
         },
-        ImageLifecycleRoute::LocalCli => ImageControlRoute::LocalCli {
+        ImageLifecycleRoute::LocalSystemdTools => ImageControlRoute::LocalSystemdTools {
             runner: local_cmd.clone(),
             system_operations: system_operations.clone(),
         },
@@ -95,7 +95,7 @@ enum ImageControlRoute {
         fallback_runner: Arc<dyn CommandRunner>,
         fallback_operations: SystemOperationStore,
     },
-    LocalCli {
+    LocalSystemdTools {
         runner: Arc<dyn CommandRunner>,
         system_operations: SystemOperationStore,
     },
@@ -126,7 +126,7 @@ impl ImageControl for RoutedImageControl {
                     fallback_operations.disable(machine.as_str()).await
                 }
             }
-            ImageControlRoute::LocalCli {
+            ImageControlRoute::LocalSystemdTools {
                 system_operations, ..
             } => system_operations.disable(machine.as_str()).await,
             ImageControlRoute::Daemon {
@@ -136,7 +136,9 @@ impl ImageControl for RoutedImageControl {
                 ..
             } => match transport {
                 ImageRemoveTransport::Dbus => disable_unit_via_daemon(daemon, machine).await,
-                ImageRemoveTransport::Cli => system_operations.disable(machine.as_str()).await,
+                ImageRemoveTransport::SystemdTools => {
+                    system_operations.disable(machine.as_str()).await
+                }
             },
         };
         match result {
@@ -152,8 +154,8 @@ impl ImageControl for RoutedImageControl {
                 fallback_runner,
                 ..
             } => match dbus.remove_image_outcome(image).await {
-                outcome if direct_remove_may_fallback(&outcome) => map_cli_image_remove(
-                    crate::adapters::system_operation::execute_cli_image_remove_with_runner(
+                outcome if direct_remove_may_fallback(&outcome) => map_systemd_tools_image_remove(
+                    crate::adapters::system_operation::execute_systemd_tools_image_remove_with_runner(
                         image.clone(),
                         fallback_runner.as_ref(),
                     )
@@ -161,8 +163,8 @@ impl ImageControl for RoutedImageControl {
                 ),
                 outcome => outcome,
             },
-            ImageControlRoute::LocalCli { runner, .. } => map_cli_image_remove(
-                crate::adapters::system_operation::execute_cli_image_remove_with_runner(
+            ImageControlRoute::LocalSystemdTools { runner, .. } => map_systemd_tools_image_remove(
+                crate::adapters::system_operation::execute_systemd_tools_image_remove_with_runner(
                     image.clone(),
                     runner.as_ref(),
                 )
@@ -203,7 +205,7 @@ impl ImageControl for RoutedImageControl {
     }
 }
 
-fn map_cli_image_remove(result: Result<(), SystemOperationError>) -> ImageControlOutcome {
+fn map_systemd_tools_image_remove(result: Result<(), SystemOperationError>) -> ImageControlOutcome {
     match result {
         Ok(()) => ImageControlOutcome::Removed,
         Err(error) => map_system_operation_image_error(error),

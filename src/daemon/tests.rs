@@ -26,6 +26,10 @@ use tokio::net::{UnixListener, UnixStream};
 
 const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
 
+fn systemd_tools_sessions() -> crate::adapters::session::MachineSessionTransport {
+    crate::adapters::session::MachineSessionTransport::SystemdTools
+}
+
 #[derive(Clone)]
 struct SlowRemoveDbus {
     started: Arc<tokio::sync::Notify>,
@@ -173,10 +177,10 @@ fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
     };
 
     assert_eq!(
-        daemon_resource_claim(&request).unwrap(),
-        Some(crate::application::ResourceClaim::exclusive(
+        daemon_resource_claims(&request).unwrap(),
+        vec![crate::application::ResourceClaim::exclusive(
             crate::application::ResourceKey::Nspawn("test-machine".into())
-        ))
+        )]
     );
     let mut invalid = request.params;
     invalid["program"] = serde_json::json!("sh");
@@ -187,9 +191,9 @@ fn machine_runtime_rpc_is_typed_and_claims_the_machine_resource() {
 fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
     let image = ImageName::new("test-image").unwrap();
     let machine = MachineName::new("test-image").unwrap();
-    let expected = Some(crate::application::ResourceClaim::exclusive(
+    let launch_expected = vec![crate::application::ResourceClaim::exclusive(
         crate::application::ResourceKey::Nspawn("test-image".into()),
-    ));
+    )];
     let launch = RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
@@ -213,8 +217,18 @@ fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
         .unwrap(),
     };
 
-    assert_eq!(daemon_resource_claim(&launch).unwrap(), expected);
-    assert_eq!(daemon_resource_claim(&unit).unwrap(), expected);
+    assert_eq!(daemon_resource_claims(&launch).unwrap(), launch_expected);
+    assert_eq!(
+        daemon_resource_claims(&unit).unwrap(),
+        vec![
+            crate::application::ResourceClaim::exclusive(crate::application::ResourceKey::Nspawn(
+                "test-image".into()
+            )),
+            crate::application::ResourceClaim::shared(
+                crate::application::ResourceKey::SystemdManager
+            ),
+        ]
+    );
 
     let mismatched = RpcRequest {
         params: serde_json::to_value(NspawnLaunchRequest {
@@ -225,7 +239,88 @@ fn nspawn_launch_and_unit_requests_share_the_image_resource_identity() {
         .unwrap(),
         ..launch
     };
-    assert!(daemon_resource_claim(&mismatched).is_err());
+    assert!(daemon_resource_claims(&mismatched).is_err());
+}
+
+#[test]
+fn generic_system_mutations_claim_every_affected_resource() {
+    use crate::application::{ResourceClaim, ResourceKey};
+    use crate::ipc::protocol::system::SystemOperation as WireOperation;
+
+    let machine = MachineName::new("test-machine").unwrap();
+    let machine_claim = vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))];
+    let request_for = |operation| RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "system_operation".into(),
+        params: serde_json::to_value(operation).unwrap(),
+    };
+
+    for operation in [
+        WireOperation::Start {
+            machine: machine.clone(),
+        },
+        WireOperation::Terminate {
+            machine: machine.clone(),
+        },
+        WireOperation::Poweroff {
+            machine: machine.clone(),
+        },
+        WireOperation::Reboot {
+            machine: machine.clone(),
+        },
+        WireOperation::Kill {
+            machine: machine.clone(),
+            signal: AllowedSignal::Kill,
+        },
+    ] {
+        assert_eq!(
+            daemon_resource_claims(&request_for(operation)).unwrap(),
+            machine_claim
+        );
+    }
+
+    for operation in [
+        WireOperation::Enable {
+            machine: machine.clone(),
+        },
+        WireOperation::Disable {
+            machine: machine.clone(),
+        },
+    ] {
+        assert_eq!(
+            daemon_resource_claims(&request_for(operation)).unwrap(),
+            vec![
+                ResourceClaim::exclusive(ResourceKey::for_machine(&machine)),
+                ResourceClaim::shared(ResourceKey::SystemdManager),
+            ]
+        );
+    }
+
+    let source = ImageName::new("source-image").unwrap();
+    let destination = ImageName::new("destination-image").unwrap();
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::CloneImage {
+            source: source.clone(),
+            destination: destination.clone(),
+        }))
+        .unwrap(),
+        vec![
+            ResourceClaim::shared(ResourceKey::for_image(&source)),
+            ResourceClaim::exclusive(ResourceKey::for_image(&destination)),
+        ]
+    );
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::RemoveImage {
+            image: source.clone(),
+        }))
+        .unwrap(),
+        vec![ResourceClaim::exclusive(ResourceKey::for_image(&source))]
+    );
+    assert_eq!(
+        daemon_resource_claims(&request_for(WireOperation::ReloadDaemon)).unwrap(),
+        vec![ResourceClaim::exclusive(ResourceKey::SystemdManager)]
+    );
 }
 
 #[tokio::test]
@@ -296,7 +391,7 @@ async fn bounded_protocol_reader_rejects_oversized_frames() {
 }
 
 #[tokio::test]
-async fn cli_mode_skips_daemon_dbus_initialization() {
+async fn systemd_tools_skips_daemon_dbus_initialization() {
     assert!(initialize_dbus_backend(false).await.is_none());
 }
 
@@ -351,6 +446,7 @@ async fn slow_remove_image_does_not_block_independent_requests() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            systemd_tools_sessions(),
         )
         .await
     });
@@ -428,6 +524,7 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            systemd_tools_sessions(),
         )
         .await
     });
@@ -574,6 +671,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
             session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
             size: SessionSize::new(120, 40).unwrap().into(),
+            launch: session::WireTerminalLaunch::DefaultAttachment,
         }),
     };
 
@@ -583,6 +681,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
     assert_eq!(json["params"]["name"], "test-machine");
     assert_eq!(json["params"]["size"]["cols"], 120);
     assert_eq!(json["params"]["size"]["rows"], 40);
+    assert_eq!(json["params"]["launch"]["launch"], "default_attachment");
 
     let parsed: FdRequest = serde_json::from_value(json).unwrap();
     match parsed.operation {
@@ -655,6 +754,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             Arc::clone(&server_state),
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            systemd_tools_sessions(),
         )
         .await,
         HandleOutcome::Spawned
@@ -677,6 +777,7 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
             uzers::get_current_uid(),
             server_state,
             crate::adapters::trusted_state::TrustedStateRoot::production(),
+            systemd_tools_sessions(),
         )
         .await,
         HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
@@ -736,6 +837,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         Arc::clone(&server_state),
         root.clone(),
+        systemd_tools_sessions(),
     )
     .await
     {
@@ -764,6 +866,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         uzers::get_current_uid(),
         server_state,
         root,
+        systemd_tools_sessions(),
     )
     .await
     {
@@ -914,6 +1017,29 @@ fn fd_socket_is_user_owned_and_private() {
     let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
     assert_eq!(metadata.uid(), uid);
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+}
+
+#[test]
+fn fd_socket_configuration_rejects_symlinks_without_touching_their_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    let socket_path = directory.path().join("fd.sock");
+    std::fs::write(&target, "untouched").unwrap();
+    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+    symlink(&target, &socket_path).unwrap();
+
+    assert!(configure_user_socket(&socket_path, uzers::get_current_uid()).is_err());
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert_eq!(
+        std::fs::symlink_metadata(&target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
 }
 
 #[test]

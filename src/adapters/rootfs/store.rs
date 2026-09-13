@@ -7,8 +7,10 @@ use crate::adapters::rootfs::network::configure_network_at;
 use crate::adapters::rootfs::nvidia::{
     cleanup_nvidia_files, configure_nvidia_rootfs, validate_cleanup_paths, validate_nvidia_config,
 };
-use crate::adapters::rootfs::process::{DefaultRootfsProcessRunner, RootfsProcessRunner};
-use crate::adapters::rootfs::{users, wayland};
+use crate::adapters::rootfs::process::{
+    DefaultRootfsProcessRunner, RootfsProcessRunner, ROOTFS_COMMAND_TIMEOUT,
+};
+use crate::adapters::rootfs::users;
 use crate::domain::machine::GuestHostname;
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::CreateUser;
@@ -194,23 +196,6 @@ impl RootfsStore {
         Ok(result.warnings)
     }
 
-    pub(crate) async fn configure_wayland(
-        &self,
-        target: &RootfsTarget,
-        identity: &ContainerUserIdentity,
-        shell: &str,
-        default_display: &crate::domain::wayland::WaylandDisplay,
-    ) -> Result<()> {
-        self.execute(RootfsOperation::ConfigureWayland(ConfigureWaylandRequest {
-            target: target.clone(),
-            identity: identity.clone(),
-            shell: shell.to_string(),
-            default_display: default_display.clone(),
-        }))
-        .await?;
-        Ok(())
-    }
-
     pub(crate) async fn resolve_user_identity(
         &self,
         target: &RootfsTarget,
@@ -332,7 +317,6 @@ pub(crate) enum RootfsOperation {
     SetRootPassword(SetRootPasswordRequest),
     CreateUser(CreateUserRequest),
     ResolveUserIdentity(ResolveUserIdentityRequest),
-    ConfigureWayland(ConfigureWaylandRequest),
     ConfigureNvidia(ConfigureNvidiaRequest),
     CleanupNvidia(CleanupNvidiaRequest),
 }
@@ -362,14 +346,6 @@ pub(crate) struct CreateUserRequest {
     password: Option<SecretString>,
     sudoer: bool,
     shell: String,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ConfigureWaylandRequest {
-    target: RootfsTarget,
-    identity: ContainerUserIdentity,
-    shell: String,
-    default_display: crate::domain::wayland::WaylandDisplay,
 }
 
 #[derive(Clone, Debug)]
@@ -446,12 +422,6 @@ impl TryFrom<rootfs_wire::RootfsOperation> for RootfsOperation {
                     username: request.username,
                 })
             }
-            Wire::ConfigureWayland(request) => Self::ConfigureWayland(ConfigureWaylandRequest {
-                target: target_from_wire(request.target)?,
-                identity: request.identity,
-                shell: request.shell,
-                default_display: request.default_display,
-            }),
             Wire::ConfigureNvidia(request) => Self::ConfigureNvidia(ConfigureNvidiaRequest {
                 target: target_from_wire(request.target)?,
                 ld_cache_folders: request.ld_cache_folders,
@@ -484,7 +454,6 @@ impl From<RootfsOperation> for rootfs_wire::RootfsOperation {
             RootfsOperation::ResolveUserIdentity(request) => {
                 Wire::ResolveUserIdentity(request.into())
             }
-            RootfsOperation::ConfigureWayland(request) => Wire::ConfigureWayland(request.into()),
             RootfsOperation::ConfigureNvidia(request) => Wire::ConfigureNvidia(request.into()),
             RootfsOperation::CleanupNvidia(request) => Wire::CleanupNvidia(request.into()),
         }
@@ -578,17 +547,6 @@ impl From<CreateUserRequest> for rootfs_wire::CreateUserRequest {
             password: request.password,
             sudoer: request.sudoer,
             shell: request.shell,
-        }
-    }
-}
-
-impl From<ConfigureWaylandRequest> for rootfs_wire::ConfigureWaylandRequest {
-    fn from(request: ConfigureWaylandRequest) -> Self {
-        Self {
-            target: request.target.into(),
-            identity: request.identity,
-            shell: request.shell,
-            default_display: request.default_display,
         }
     }
 }
@@ -745,36 +703,6 @@ async fn execute_rootfs_operation_with_runners(
                 ..Default::default()
             })
         }
-        RootfsOperation::ConfigureWayland(request) => {
-            wayland::validate_wayland_config(&request.identity.username, &request.shell)?;
-            let path = request.target.path()?;
-            validate_required_rootfs_directory(&path).await?;
-            let observed =
-                users::resolve_user_identity(&path, &request.identity.username, rootfs_runner)
-                    .await?;
-            if observed != request.identity {
-                return Err(NspawnError::Validation(format!(
-                    "Wayland target identity changed: expected {}:{} for {}, observed {}:{}",
-                    request.identity.uid,
-                    request.identity.gid,
-                    request.identity.username,
-                    observed.uid,
-                    observed.gid,
-                )));
-            }
-            wayland::setup_wayland_shell_env(
-                &path,
-                &request.identity.username,
-                &request.shell,
-                &crate::adapters::wayland::container_socket_path(
-                    request.identity.uid,
-                    &request.default_display,
-                ),
-                rootfs_runner,
-            )
-            .await?;
-            Ok(RootfsResult::default())
-        }
         RootfsOperation::ConfigureNvidia(request) => {
             validate_nvidia_config(
                 &request.ld_cache_folders,
@@ -906,13 +834,14 @@ async fn mount_managed_raw_at(
         .map_err(|error| NspawnError::Io(mount_point.clone(), error))?;
 
     let output = match runner
-        .run(
+        .run_bounded(
             "systemd-dissect",
             vec![
                 "--mount".into(),
                 image.to_string_lossy().to_string(),
                 mount_point.to_string_lossy().to_string(),
             ],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
     {
@@ -972,9 +901,10 @@ async fn unmount_managed_raw_at(
     validate_required_rootfs_directory(&mount_point).await?;
     let mount_point_string = mount_point.to_string_lossy().to_string();
     let output = runner
-        .run(
+        .run_bounded(
             "systemd-dissect",
             vec!["--umount".into(), mount_point_string.clone()],
+            ROOTFS_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("systemd-dissect"), error))?;
@@ -982,7 +912,7 @@ async fn unmount_managed_raw_at(
 
     if !output.status.success() {
         let fallback = runner
-            .run("umount", vec![mount_point_string])
+            .run_bounded("umount", vec![mount_point_string], ROOTFS_COMMAND_TIMEOUT)
             .await
             .map_err(|error| NspawnError::Io(PathBuf::from("umount"), error))?;
         log_output("umount", &fallback);
@@ -1116,28 +1046,6 @@ mod tests {
             }
         }"#;
         assert!(decode_wire_operation(arbitrary_program).is_err());
-
-        let arbitrary_path = r#"{
-            "operation":"configure_wayland",
-            "params":{
-                "target":{"kind":"machine","machine":"test"},
-                "username":"alice",
-                "shell":"/bin/bash",
-                "path":"/etc/shadow"
-            }
-        }"#;
-        assert!(decode_wire_operation(arbitrary_path).is_err());
-
-        let x11_display = r#"{
-            "operation":"configure_wayland",
-            "params":{
-                "target":{"kind":"machine","machine":"test"},
-                "username":"alice",
-                "shell":"/bin/bash",
-                "display":":0"
-            }
-        }"#;
-        assert!(decode_wire_operation(x11_display).is_err());
 
         let invalid_hostname = r#"{
             "operation":"configure_hostname",

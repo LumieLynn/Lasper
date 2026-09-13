@@ -192,9 +192,9 @@ impl Component for DeployStepView {
         self.log_list.render(f, chunks[1]);
 
         let hint = if done && self.release_pending {
-            " Releasing unresolved coordination claim... "
+            " Discarding unresolved deployment state... "
         } else if done && claim_status == DeploymentClaimStatus::ReconciliationRequired {
-            " [r] Release unresolved claim  [Enter/q/Esc] Close "
+            " [r] Discard unresolved state  [Enter/q/Esc] Close "
         } else if done {
             " [Enter/q/Esc] Close "
         } else if self.job.cancellation_requested() {
@@ -245,8 +245,8 @@ impl Component for DeployStepView {
                         && !self.release_pending =>
                 {
                     self.release_dialog = Some(ConfirmationDialog::new(
-                        "Release Unresolved Claim?",
-                        "Release only Lasper's coordination claim? The deployment outcome will remain unknown and durable recovery state will be kept.",
+                        "Discard Unresolved Deployment State?",
+                        "Release Lasper's coordination claim and discard the durable recovery manifest? The deployment outcome remains unknown; inspect any host resources manually.",
                     ));
                     EventResult::Consumed
                 }

@@ -217,8 +217,9 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
         }
         if let DeploymentSource::Copy { source_name } = &request.source {
             return format!(
-                " [CLONE OPERATION]\n\n Source: {source_name}\n Destination: {}\n\n All configuration files (.nspawn) and systemd service\n overrides will be copied automatically.",
-                request.config.name
+                " [CLONE OPERATION]\n\n Source: {source_name}\n Destination: {}\n\n Image data, effective .nspawn settings, and Lasper's service override\n are copied when present.\n\n WARNING: {}",
+                request.config.name,
+                crate::adapters::provisioning::engine::builders::clone::CLONE_IDENTITY_NOTICE,
             );
         }
 
@@ -260,9 +261,8 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 .collect::<Vec<_>>()
                 .join(", ");
             content.push_str(&format!(
-                " Wayland access: {displays} -> {} (default {})\n",
+                " Wayland access: {displays} -> {}\n",
                 intent.target_username(),
-                intent.default_display().as_str(),
             ));
         }
         let rendered = (|| -> Result<String, String> {
@@ -361,12 +361,7 @@ mod tests {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
-            wayland: vec![WaylandGrantIntent::new(
-                "lumie",
-                vec![source.clone()],
-                source.display().clone(),
-            )
-            .unwrap()],
+            wayland: vec![WaylandGrantIntent::new("lumie", vec![source.clone()]).unwrap()],
             allow_unsafe_remote_tar: false,
         }
     }
@@ -375,7 +370,7 @@ mod tests {
     fn preview_uses_the_same_wayland_endpoint_and_bind_policy_as_apply() {
         let adapter = NspawnProvisioningPreparation;
         let idmapped = adapter.preview(&request(PrivateUsersMode::Pick));
-        assert!(idmapped.contains("Wayland access: wayland-0 -> lumie (default wayland-0)"));
+        assert!(idmapped.contains("Wayland access: wayland-0 -> lumie"));
         assert!(idmapped
             .contains("Bind=/run/user/1001/wayland-0:/run/lasper/wayland/1001/wayland-0:idmap"));
 
@@ -390,5 +385,20 @@ mod tests {
         assert!(preview.contains("[ERROR:"));
         assert!(preview.contains("not supported with PrivateUsers=managed"));
         assert!(!preview.contains("/run/lasper/wayland/1001/wayland-0:idmap"));
+    }
+
+    #[test]
+    fn clone_preview_discloses_preserved_guest_identity() {
+        let mut request = request(PrivateUsersMode::Pick);
+        request.source = DeploymentSource::Copy {
+            source_name: "source-machine".into(),
+        };
+
+        let preview = NspawnProvisioningPreparation.preview(&request);
+
+        assert!(preview.contains("Exact clone"));
+        assert!(preview.contains("machine-id"));
+        assert!(preview.contains("SSH host keys"));
+        assert!(preview.contains("Reset guest identity manually"));
     }
 }

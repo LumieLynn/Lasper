@@ -335,6 +335,18 @@ impl Grid {
         self.scrollback_offset = rows.min(self.row0());
     }
 
+    /// Drop history and disable further accumulation after a session exits.
+    pub fn clear_scrollback(&mut self) {
+        let visible_rows = self.size.height as usize;
+        while self.rows.len() > visible_rows {
+            self.rows.pop_front();
+        }
+        self.rows.shrink_to_fit();
+        self.scrollback_len = 0;
+        self.scrollback_offset = 0;
+        self.used_rows = self.used_rows.min(self.size.height);
+    }
+
     pub fn erase_all(&mut self, attrs: Attrs) {
         self.used_rows = 0;
         for row in self.drawing_rows_mut() {

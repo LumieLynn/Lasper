@@ -1,8 +1,10 @@
-use crate::adapters::process::new_command;
+use crate::adapters::process::{new_command, run_bounded_child_command};
 use crate::domain::secret::SecretBytes;
 use std::path::{Path, PathBuf};
-use std::process::{Output, Stdio};
-use tokio::io::AsyncWriteExt;
+use std::process::Output;
+
+pub(crate) const ROOTFS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const MAX_ROOTFS_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
 /// Runs a fixed `systemd-nspawn` executable for typed rootfs operations.
 #[cfg_attr(test, mockall::automock)]
@@ -33,36 +35,19 @@ impl RootfsProcessRunner for DefaultRootfsProcessRunner {
             .arg("--quiet")
             .arg("--settings=no");
         if stdin.is_some() {
-            process.arg("--pipe").stdin(Stdio::piped());
-        } else {
-            process.stdin(Stdio::null());
+            process.arg("--pipe");
         }
-        process.args(command).kill_on_drop(true);
+        process.args(command);
 
-        let mut child = process
-            .spawn()
-            .map_err(|error| contextual_io_error(rootfs, error))?;
-        if let Some(input) = stdin {
-            let mut child_stdin = child.stdin.take().ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "systemd-nspawn stdin was not available for {}",
-                    rootfs.display()
-                ))
-            })?;
-            child_stdin
-                .write_all(input.as_slice())
-                .await
-                .map_err(|error| contextual_io_error(rootfs, error))?;
-            child_stdin
-                .shutdown()
-                .await
-                .map_err(|error| contextual_io_error(rootfs, error))?;
-        }
-
-        child
-            .wait_with_output()
-            .await
-            .map_err(|error| contextual_io_error(rootfs, error))
+        run_bounded_child_command(
+            process,
+            stdin,
+            ROOTFS_COMMAND_TIMEOUT,
+            "systemd-nspawn rootfs helper",
+            MAX_ROOTFS_COMMAND_OUTPUT_BYTES,
+        )
+        .await
+        .map_err(|error| contextual_io_error(rootfs, error))
     }
 }
 

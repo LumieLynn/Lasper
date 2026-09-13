@@ -51,39 +51,40 @@ pub(super) async fn handle<B: DaemonRuntimeQueries>(
             HandleOutcome::Spawned
         }
 
-        RpcMethod::CliInspectMachine => {
+        RpcMethod::SystemdToolsInspectMachine => {
             let inspection: crate::ipc::protocol::InspectMachineRequest =
                 match serde_json::from_value(params) {
                     Ok(request) => request,
                     Err(error) => {
                         return HandleOutcome::Sync(Err(format!(
-                            "invalid cli_inspect_machine request: {error}"
+                            "invalid systemd_tools_inspect_machine request: {error}"
                         )));
                     }
                 };
             let out_tx = out_tx.clone();
             tokio::spawn(async move {
-                let response = match crate::adapters::runtime::cli::get_properties_with_runner(
-                    inspection.machine.as_str(),
-                    inspection.include_nspawn_unit,
-                    &crate::adapters::process::DefaultCommandRunner,
-                )
-                .await
-                {
-                    Ok(properties) => match serde_json::to_value(properties) {
-                        Ok(result) => serde_json::json!({
-                            "jsonrpc":"2.0","id":id,"result":result
-                        }),
+                let response =
+                    match crate::adapters::runtime::systemd_tools::get_properties_with_runner(
+                        inspection.machine.as_str(),
+                        inspection.include_nspawn_unit,
+                        &crate::adapters::process::DefaultCommandRunner,
+                    )
+                    .await
+                    {
+                        Ok(properties) => match serde_json::to_value(properties) {
+                            Ok(result) => serde_json::json!({
+                                "jsonrpc":"2.0","id":id,"result":result
+                            }),
+                            Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
+                                "code":error_code::INTERNAL_ERROR,
+                                "message":error.to_string(),
+                            }}),
+                        },
                         Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
                             "code":error_code::INTERNAL_ERROR,
                             "message":error.to_string(),
                         }}),
-                    },
-                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":error_code::INTERNAL_ERROR,
-                        "message":error.to_string(),
-                    }}),
-                };
+                    };
                 if let Ok(line) = serde_json::to_string(&response) {
                     let _ = out_tx.send(line).await;
                 }
@@ -166,7 +167,7 @@ mod tests {
                     method,
                     RpcMethod::Ping
                         | RpcMethod::AssessTarRuntime
-                        | RpcMethod::CliInspectMachine
+                        | RpcMethod::SystemdToolsInspectMachine
                         | RpcMethod::DbusListMachines
                         | RpcMethod::DbusListImages
                         | RpcMethod::DbusGetProperties

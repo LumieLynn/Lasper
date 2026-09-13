@@ -230,12 +230,16 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
 }
 
 fn map_deployment_error(error: NspawnError) -> DeploymentError {
-    if matches!(
-        error,
+    let process_outcome_unknown = matches!(
+        &error,
         NspawnError::DeploymentProcessStateUnknown(_)
             | NspawnError::DeploymentCancellationRollbackIncomplete(_)
             | NspawnError::DeploymentRollbackIncomplete(_)
-    ) {
+    ) || matches!(
+        &error,
+        NspawnError::Io(_, source) if source.kind() == std::io::ErrorKind::TimedOut
+    );
+    if process_outcome_unknown {
         DeploymentError::reconciliation_required(error.to_string())
     } else if super::engine::is_cancelled_outcome(&error) {
         DeploymentError::cancelled(error.to_string())
@@ -296,5 +300,21 @@ mod tests {
             };
             assert_eq!(backends.storage.get_path(machine), expected_path);
         }
+    }
+
+    #[test]
+    fn timed_out_mutation_requires_reconciliation() {
+        let error = NspawnError::Io(
+            "systemd-nspawn".into(),
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "rootfs helper exceeded its deadline; termination was confirmed",
+            ),
+        );
+
+        let mapped = map_deployment_error(error);
+
+        assert!(mapped.requires_reconciliation());
+        assert!(mapped.retains_resource_claim());
     }
 }

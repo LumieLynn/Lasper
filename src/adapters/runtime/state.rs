@@ -2,7 +2,7 @@
 //!
 //! systemd exposes a small public `sd-login` API over this state directory, but
 //! it does not expose the complete machine property set. This reader is used
-//! only by explicit CLI mode so opening the details pane cannot invoke a D-Bus
+//! only by explicit systemd tools mode so opening the details pane cannot invoke a D-Bus
 //! client indirectly through `machinectl show` or `systemctl show`.
 
 use crate::adapters::error::{NspawnError, Result};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024;
 
 /// Read the leader PID from machined's registration for a validated machine.
-/// The same bounded, no-symlink parser used by CLI inspection protects this
+/// The same bounded, no-symlink parser used by systemd tools inspection protects this
 /// value before it is used as a namespace target.
 pub(crate) fn leader_pid(name: &MachineName) -> std::io::Result<u32> {
     leader_pid_at(
@@ -48,7 +48,9 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
 /// Enumerate runtime registrations without asking machined to inspect the
 /// containers. This mirrors `sd_get_machine_names()` at the public API level:
 /// names come from the runtime directory, while `unit:` helper symlinks and
-/// invalid machine names are ignored.
+/// malformed registration names are ignored. The observation grammar accepts
+/// systemd's trailing-dot hostname form; the stricter `MachineName` type is
+/// still enforced when an operation needs a mutable nspawn identity.
 pub(crate) async fn list_machines_at(path: PathBuf) -> Result<Vec<MachineEntry>> {
     let display_path = path.clone();
     tokio::task::spawn_blocking(move || enumerate_machines(&path))
@@ -83,7 +85,7 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
         let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if MachineName::new(&name).is_err() {
+        if validate_observed_machine_name(&name).is_err() {
             continue;
         }
         let fields = match read_runtime_state(&entry.path(), &name) {
@@ -116,24 +118,15 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
 
 /// Inspect one machine without contacting either systemd D-Bus service.
 pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
-    let name =
-        MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))?;
-    inspect_at(
-        crate::paths::runtime_machine_state(name.as_str()),
-        name,
-        entry,
-    )
-    .await
+    validate_observed_machine_name(name)
+        .map_err(|error| NspawnError::Validation(error.to_string()))?;
+    inspect_at(crate::paths::runtime_machine_state(name), name, entry).await
 }
 
-async fn inspect_at(
-    path: PathBuf,
-    name: MachineName,
-    entry: &MachineEntry,
-) -> Result<MachineProperties> {
+async fn inspect_at(path: PathBuf, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
     let mut properties = entry_properties(entry);
     let display_path = path.display().to_string();
-    let expected_name = name.into_string();
+    let expected_name = name.to_string();
     let read = tokio::task::spawn_blocking(move || read_runtime_state(&path, &expected_name))
         .await
         .map_err(|error| {
@@ -164,6 +157,22 @@ async fn inspect_at(
     }
 
     Ok(properties)
+}
+
+fn validate_observed_machine_name(name: &str) -> std::io::Result<()> {
+    if MachineName::new(name).is_ok() {
+        return Ok(());
+    }
+
+    let without_trailing_dot = name.strip_suffix('.').unwrap_or_default();
+    if !without_trailing_dot.is_empty() && MachineName::new(without_trailing_dot).is_ok() {
+        return Ok(());
+    }
+
+    Err(std::io::Error::new(
+        ErrorKind::InvalidData,
+        format!("invalid systemd machine registration name {name:?}"),
+    ))
 }
 
 fn entry_properties(entry: &MachineEntry) -> MachineProperties {
@@ -388,13 +397,9 @@ mod tests {
         )
         .unwrap();
 
-        let properties = inspect_at(
-            path,
-            MachineName::new("test-machine").unwrap(),
-            &entry("test-machine"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(path, "test-machine", &entry("test-machine"))
+            .await
+            .unwrap();
 
         assert_eq!(properties.source, InspectionSource::RuntimeState);
         assert_eq!(properties.completeness, InspectionCompleteness::RuntimeOnly);
@@ -439,6 +444,11 @@ mod tests {
             "NAME=foreign-vm\nCLASS=vm\nSERVICE=libvirt\n",
         )
         .unwrap();
+        std::fs::write(
+            dir.path().join("trailing-dot."),
+            "NAME=trailing-dot.\nCLASS=container\nSERVICE=systemd-nspawn\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("invalid:name"), "ignored\n").unwrap();
         symlink("a-machine", dir.path().join("unit:machine-a.scope")).unwrap();
         std::fs::create_dir(dir.path().join("directory-entry")).unwrap();
@@ -450,7 +460,7 @@ mod tests {
                 .iter()
                 .map(|machine| machine.name.as_str())
                 .collect::<Vec<_>>(),
-            ["a-machine", "foreign-vm", "z-machine"]
+            ["a-machine", "foreign-vm", "trailing-dot.", "z-machine"]
         );
         assert!(machines
             .iter()
@@ -477,13 +487,9 @@ mod tests {
     #[tokio::test]
     async fn missing_state_returns_snapshot_fields_and_a_diagnostic() {
         let dir = tempfile::tempdir().unwrap();
-        let properties = inspect_at(
-            dir.path().join("missing"),
-            MachineName::new("missing").unwrap(),
-            &entry("missing"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(dir.path().join("missing"), "missing", &entry("missing"))
+            .await
+            .unwrap();
 
         assert_eq!(machine_value(&properties, "Name"), Some("missing"));
         assert!(machine_value(&properties, "RuntimeStateRead")
@@ -499,13 +505,9 @@ mod tests {
         std::fs::write(&target, "NAME=test-machine\n").unwrap();
         symlink(&target, &link).unwrap();
 
-        let properties = inspect_at(
-            link,
-            MachineName::new("test-machine").unwrap(),
-            &entry("test-machine"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(link, "test-machine", &entry("test-machine"))
+            .await
+            .unwrap();
 
         assert!(machine_value(&properties, "RuntimeStateRead").is_some());
         assert!(machine_value(&properties, "RuntimeStateFile").is_none());

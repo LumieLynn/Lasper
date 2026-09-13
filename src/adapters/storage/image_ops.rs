@@ -11,6 +11,9 @@ use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_IMAGE_BYTES: u64 = MAX_DISK_IMAGE_SIZE_BYTES;
+const STORAGE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+const FILESYSTEM_FORMAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const MAX_STORAGE_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
 fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
     match filesystem {
@@ -218,13 +221,14 @@ pub(crate) async fn mount_image(
     let source_string = source_path.to_string_lossy().to_string();
     let mount_string = mount_point.to_string_lossy().to_string();
     let dissect = match runner
-        .run(
+        .run_bounded(
             "systemd-dissect",
             vec![
                 "--mount".into(),
                 source_string.clone(),
                 mount_string.clone(),
             ],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
     {
@@ -302,9 +306,10 @@ pub(crate) async fn unmount_image(
     if mount_exists && is_mount_point(&mount_point).await? {
         let mount_string = mount_point.to_string_lossy().to_string();
         let mut unmount_attempt_error = match runner
-            .run(
+            .run_bounded(
                 "systemd-dissect",
                 vec!["--umount".into(), mount_string.clone()],
+                STORAGE_COMMAND_TIMEOUT,
             )
             .await
         {
@@ -325,7 +330,10 @@ pub(crate) async fn unmount_image(
         };
 
         if is_mount_point(&mount_point).await? {
-            match runner.run("umount", vec![mount_string]).await {
+            match runner
+                .run_bounded("umount", vec![mount_string], STORAGE_COMMAND_TIMEOUT)
+                .await
+            {
                 Ok(fallback) => {
                     log_output("umount", &fallback);
                     unmount_attempt_error = (!fallback.status.success()).then(|| {
@@ -581,7 +589,11 @@ async fn run_mkfs(
         DiskImageFilesystem::Xfs | DiskImageFilesystem::Btrfs => "-f",
     };
     let output = runner
-        .run(program, vec![force.into(), target.clone()])
+        .run_bounded(
+            program,
+            vec![force.into(), target.clone()],
+            FILESYSTEM_FORMAT_TIMEOUT,
+        )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from(program), error))?;
     log_output(program, &output);
@@ -601,25 +613,17 @@ async fn run_command_with_stdin(
     args: Vec<String>,
     input: Vec<u8>,
 ) -> Result<std::process::Output> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = crate::adapters::process::new_command(program)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|error| NspawnError::Io(PathBuf::from(program), error))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| NspawnError::Runtime(format!("{program} stdin was not piped")))?;
-    stdin
-        .write_all(&input)
-        .await
-        .map_err(|error| NspawnError::Io(PathBuf::from(program), error))?;
-    drop(stdin);
-    child
-        .wait_with_output()
-        .await
-        .map_err(|error| NspawnError::Io(PathBuf::from(program), error))
+    let mut command = crate::adapters::process::new_command(program);
+    command.args(args);
+    crate::adapters::process::run_bounded_child_command(
+        command,
+        Some(crate::domain::secret::SecretBytes::new(input)),
+        STORAGE_COMMAND_TIMEOUT,
+        program,
+        MAX_STORAGE_COMMAND_OUTPUT_BYTES,
+    )
+    .await
+    .map_err(|error| NspawnError::Io(PathBuf::from(program), error))
 }
 
 async fn mount_managed_image_fallback(
@@ -700,7 +704,7 @@ async fn prepare_selected_root_partition(
     }
 
     let output = runner
-        .run(
+        .run_bounded(
             "sfdisk",
             vec![
                 "--part-type".into(),
@@ -708,6 +712,7 @@ async fn prepare_selected_root_partition(
                 selected.number().to_string(),
                 discoverable_root_uuid()?.into(),
             ],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| command_io_error("sfdisk", error))?;
@@ -732,17 +737,14 @@ async fn inspect_partition_table(
     runner: &dyn CommandRunner,
 ) -> Result<Option<ImagePartitionTable>> {
     let output = runner
-        .run(
+        .run_bounded(
             "sfdisk",
             vec!["--json".into(), image.to_string_lossy().into_owned()],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| command_io_error("sfdisk", error))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    parse_sfdisk_partition_table(&output.stdout).map(Some)
+    classify_sfdisk_partition_table(image, &output)
 }
 
 pub(crate) fn probe_image_partitions(image: &Path) -> Result<Option<ImagePartitionProbe>> {
@@ -751,22 +753,50 @@ pub(crate) fn probe_image_partitions(image: &Path) -> Result<Option<ImagePartiti
         .arg(image)
         .output()
         .map_err(|error| command_io_error("sfdisk", error))?;
-    if !output.status.success() {
+    classify_sfdisk_partition_table(image, &output).map(|table| {
+        table.map(|table| ImagePartitionProbe {
+            label: table.label,
+            partitions: table
+                .partitions
+                .into_iter()
+                .map(|partition| ImagePartitionInfo {
+                    number: partition.number,
+                    type_id: partition.type_id,
+                })
+                .collect(),
+        })
+    })
+}
+
+fn classify_sfdisk_partition_table(
+    image: &Path,
+    output: &std::process::Output,
+) -> Result<Option<ImagePartitionTable>> {
+    if output.status.success() {
+        return parse_sfdisk_partition_table(&output.stdout).map(Some);
+    }
+    if sfdisk_reports_no_partition_table(output) {
         return Ok(None);
     }
 
-    let table = parse_sfdisk_partition_table(&output.stdout)?;
-    Ok(Some(ImagePartitionProbe {
-        label: table.label,
-        partitions: table
-            .partitions
-            .into_iter()
-            .map(|partition| ImagePartitionInfo {
-                number: partition.number,
-                type_id: partition.type_id,
-            })
-            .collect(),
-    }))
+    Err(NspawnError::cmd_failed(
+        "inspect image partition table",
+        format!("sfdisk --json {}", image.display()),
+        output,
+    ))
+}
+
+fn sfdisk_reports_no_partition_table(output: &std::process::Output) -> bool {
+    const DIAGNOSTIC: &str = ": does not contain a recognized partition table";
+
+    output.stdout.is_empty()
+        && std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+            stderr
+                .trim_end()
+                .lines()
+                .last()
+                .is_some_and(|line| line.starts_with("sfdisk: ") && line.ends_with(DIAGNOSTIC))
+        })
 }
 
 pub(crate) fn partition_type_label(type_id: &str) -> String {
@@ -968,12 +998,13 @@ fn command_io_error(program: &str, error: std::io::Error) -> NspawnError {
 async fn mount_device(device: &Path, mount_point: &Path, runner: &dyn CommandRunner) -> Result<()> {
     validate_block_device(device).await?;
     let output = runner
-        .run(
+        .run_bounded(
             "mount",
             vec![
                 device.to_string_lossy().to_string(),
                 mount_point.to_string_lossy().to_string(),
             ],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("mount"), error))?;
@@ -991,7 +1022,7 @@ async fn mount_device(device: &Path, mount_point: &Path, runner: &dyn CommandRun
 
 async fn attach_loop(image: &Path, runner: &dyn CommandRunner) -> Result<PathBuf> {
     let output = runner
-        .run(
+        .run_bounded(
             "losetup",
             vec![
                 "--find".into(),
@@ -999,6 +1030,7 @@ async fn attach_loop(image: &Path, runner: &dyn CommandRunner) -> Result<PathBuf
                 "--show".into(),
                 image.to_string_lossy().to_string(),
             ],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("losetup"), error))?;
@@ -1018,9 +1050,10 @@ async fn attach_loop(image: &Path, runner: &dyn CommandRunner) -> Result<PathBuf
 async fn detach_loop(loop_device: &Path, runner: &dyn CommandRunner) -> Result<()> {
     validate_loop_device_path(loop_device)?;
     let output = runner
-        .run(
+        .run_bounded(
             "losetup",
             vec!["-d".into(), loop_device.to_string_lossy().to_string()],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("losetup"), error))?;
@@ -1038,7 +1071,7 @@ async fn detach_loop(loop_device: &Path, runner: &dyn CommandRunner) -> Result<(
 
 async fn detach_image_loops(image: &Path, runner: &dyn CommandRunner) -> Result<()> {
     let output = runner
-        .run(
+        .run_bounded(
             "losetup",
             vec![
                 "--json".into(),
@@ -1048,6 +1081,7 @@ async fn detach_image_loops(image: &Path, runner: &dyn CommandRunner) -> Result<
                 "--output".into(),
                 "NAME".into(),
             ],
+            STORAGE_COMMAND_TIMEOUT,
         )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("losetup"), error))?;
@@ -1074,7 +1108,11 @@ fn parse_losetup_devices(content: &[u8]) -> Result<Vec<PathBuf>> {
 
 async fn settle_udev(runner: &dyn CommandRunner) -> Result<()> {
     let output = runner
-        .run("udevadm", vec!["settle".into(), "--timeout=5".into()])
+        .run_bounded(
+            "udevadm",
+            vec!["settle".into(), "--timeout=5".into()],
+            STORAGE_COMMAND_TIMEOUT,
+        )
         .await
         .map_err(|error| NspawnError::Io(PathBuf::from("udevadm"), error))?;
     log_output("udevadm settle", &output);
@@ -1405,9 +1443,10 @@ mod tests {
         let mut runner = crate::adapters::process::MockCommandRunner::new();
         let mut sequence = mockall::Sequence::new();
         runner
-            .expect_run()
-            .withf(|program, args| {
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
                 program == "losetup"
+                    && *timeout == STORAGE_COMMAND_TIMEOUT
                     && args.iter().map(String::as_str).eq([
                         "--json",
                         "--list",
@@ -1419,19 +1458,21 @@ mod tests {
             })
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(|_, _| {
+            .return_once(|_, _, _| {
                 Ok(successful_output(
                     r#"{"loopdevices":[{"name":"/dev/loop7"}]}"#,
                 ))
             });
         runner
-            .expect_run()
-            .withf(|program, args| {
-                program == "losetup" && args.iter().map(String::as_str).eq(["-d", "/dev/loop7"])
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
+                program == "losetup"
+                    && *timeout == STORAGE_COMMAND_TIMEOUT
+                    && args.iter().map(String::as_str).eq(["-d", "/dev/loop7"])
             })
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(|_, _| Ok(successful_output("")));
+            .return_once(|_, _, _| Ok(successful_output("")));
 
         detach_image_loops(image, &runner).await.unwrap();
     }
@@ -1440,7 +1481,7 @@ mod tests {
     async fn failed_unmount_never_detaches_managed_image_loops() {
         let machine = MachineName::new("test").unwrap();
         let mut runner = crate::adapters::process::MockCommandRunner::new();
-        runner.expect_run().times(0);
+        runner.expect_run_bounded().times(0);
 
         let error = finish_successful_unmount(
             &machine,
@@ -1530,6 +1571,32 @@ mod tests {
             }
         }"#;
         assert!(parse_sfdisk_partition_table(injected).is_err());
+    }
+
+    #[test]
+    fn sfdisk_absent_partition_table_is_not_an_error() {
+        let output = failed_output(
+            "sfdisk: /var/lib/machines/test.raw: does not contain a recognized partition table\n",
+        );
+
+        assert!(
+            classify_sfdisk_partition_table(Path::new("/var/lib/machines/test.raw"), &output)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn sfdisk_operational_failure_is_not_misclassified_as_an_empty_image() {
+        let output =
+            failed_output("sfdisk: cannot open /var/lib/machines/test.raw: Permission denied\n");
+
+        let error =
+            classify_sfdisk_partition_table(Path::new("/var/lib/machines/test.raw"), &output)
+                .unwrap_err();
+
+        assert!(error.to_string().contains("Permission denied"));
+        assert!(error.to_string().contains("inspect image partition table"));
     }
 
     #[test]
@@ -1640,17 +1707,20 @@ mod tests {
         let mut sequence = mockall::Sequence::new();
         let metadata_for_result = metadata.clone();
         runner
-            .expect_run()
-            .withf(move |program, args| {
-                program == "sfdisk" && args.iter().map(String::as_str).eq(["--json", image])
+            .expect_run_bounded()
+            .withf(move |program, args, timeout| {
+                program == "sfdisk"
+                    && *timeout == STORAGE_COMMAND_TIMEOUT
+                    && args.iter().map(String::as_str).eq(["--json", image])
             })
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(move |_, _| Ok(successful_output(&metadata_for_result)));
+            .return_once(move |_, _, _| Ok(successful_output(&metadata_for_result)));
         runner
-            .expect_run()
-            .withf(move |program, args| {
+            .expect_run_bounded()
+            .withf(move |program, args, timeout| {
                 program == "sfdisk"
+                    && *timeout == STORAGE_COMMAND_TIMEOUT
                     && args.iter().map(String::as_str).eq([
                         "--part-type",
                         image,
@@ -1660,7 +1730,7 @@ mod tests {
             })
             .times(1)
             .in_sequence(&mut sequence)
-            .return_once(|_, _| Ok(successful_output("")));
+            .return_once(|_, _, _| Ok(successful_output("")));
 
         prepare_selected_root_partition(
             Path::new(image),
@@ -1764,9 +1834,10 @@ mod tests {
         let path = directory.path().join("test.raw");
         let mut runner = crate::adapters::process::MockCommandRunner::new();
         runner
-            .expect_run()
-            .withf(|program, args| {
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
                 program == "mkfs.ext4"
+                    && *timeout == FILESYSTEM_FORMAT_TIMEOUT
                     && args.first().map(String::as_str) == Some("-F")
                     && args
                         .last()
@@ -1774,7 +1845,7 @@ mod tests {
                         .is_some_and(|target| target.ends_with("test.raw"))
             })
             .times(1)
-            .return_once(|_, _| Ok(failed_output("format failed")));
+            .return_once(|_, _, _| Ok(failed_output("format failed")));
 
         let result = create_raw_image_at(
             &path,

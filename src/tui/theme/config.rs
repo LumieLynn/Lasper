@@ -31,7 +31,8 @@ pub struct PartialTheme {
     pub resize_unfocused: Option<ColorDef>,
     pub badge_root: Option<ColorDef>,
     pub badge_readonly: Option<ColorDef>,
-    pub badge_cli: Option<ColorDef>,
+    #[serde(alias = "badge_cli")]
+    pub badge_systemd_tools: Option<ColorDef>,
     pub status_info: Option<ColorDef>,
     pub status_success: Option<ColorDef>,
     pub status_warning: Option<ColorDef>,
@@ -140,7 +141,7 @@ fn merge(partial: &PartialTheme) -> Theme {
     merge_field!(resize_unfocused);
     merge_field!(badge_root);
     merge_field!(badge_readonly);
-    merge_field!(badge_cli);
+    merge_field!(badge_systemd_tools);
     merge_field!(status_info);
     merge_field!(status_success);
     merge_field!(status_warning);

@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const BOOTSTRAP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BootstrapRequest {
@@ -50,7 +52,11 @@ impl BootstrapStore {
         }
         let output = self
             .cmd_runner
-            .run("debootstrap", vec!["--help".into()])
+            .run_bounded(
+                "debootstrap",
+                vec!["--help".into()],
+                BOOTSTRAP_PROBE_TIMEOUT,
+            )
             .await
             .map_err(|error| NspawnError::Io(PathBuf::from("debootstrap --help"), error))?;
         signature_style_from_output(policy, &output.stdout, &output.stderr)

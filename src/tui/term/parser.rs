@@ -46,6 +46,11 @@ impl Parser {
         self.screen.set_scrollback(rows);
     }
 
+    /// Release and disable history for a completed session, preserving its screen.
+    pub fn clear_scrollback(&mut self) {
+        self.screen.clear_scrollback();
+    }
+
     /// Returns a reference to a `Screen` object containing the terminal
     /// state.
     #[must_use]

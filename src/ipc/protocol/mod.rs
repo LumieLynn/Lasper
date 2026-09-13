@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 16;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 20;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -89,6 +89,7 @@ rpc_methods! {
     Ping => ("ping", Query),
     Exit => ("exit", Command),
     CloseSession => ("close_session", Session),
+    PrepareWayland => ("prepare_wayland", Session),
     NspawnConfig => ("nspawn_config", Command),
     SystemdUnit => ("systemd_unit", Command),
     NvidiaState => ("nvidia_state", Command),
@@ -104,7 +105,7 @@ rpc_methods! {
     Rootfs => ("rootfs", Command),
     AssessTarRuntime => ("assess_tar_runtime", Query),
     SystemOperation => ("system_operation", Command),
-    CliInspectMachine => ("cli_inspect_machine", Query),
+    SystemdToolsInspectMachine => ("systemd_tools_inspect_machine", Query),
     DbusListMachines => ("dbus_list_machines", Query),
     DbusListImages => ("dbus_list_images", Query),
     NspawnLaunch => ("nspawn_launch", Command),
@@ -139,6 +140,7 @@ pub(crate) struct FdRequest {
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "method", content = "params")]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum FdOperation {
     #[serde(rename = "spawn_journalctl")]
     Journalctl(SpawnJournalctlParams),
@@ -249,6 +251,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn systemd_tools_routes_use_the_canonical_wire_names() {
+        use crate::application::image_lifecycle::ImageRemoveTransport;
+        use crate::application::machine_lifecycle::MachineControlTransport;
+        use crate::application::operations::ExecutionRoute;
+        use crate::domain::inspection::InspectionSource;
+
+        for value in [
+            serde_json::to_value(ImageRemoveTransport::SystemdTools).unwrap(),
+            serde_json::to_value(MachineControlTransport::SystemdTools).unwrap(),
+            serde_json::to_value(InspectionSource::SystemdTools).unwrap(),
+        ] {
+            assert_eq!(value, "systemd_tools");
+        }
+        assert_eq!(
+            serde_json::to_value(ExecutionRoute::LocalSystemdTools).unwrap(),
+            "local_systemd_tools"
+        );
+        assert_eq!(
+            serde_json::to_value(ExecutionRoute::ElevatedSystemdTools).unwrap(),
+            "elevated_systemd_tools"
+        );
+        assert_eq!(
+            RpcMethod::SystemdToolsInspectMachine.wire_name(),
+            "systemd_tools_inspect_machine"
+        );
+        assert!(RpcMethod::parse("cli_inspect_machine").is_none());
+    }
+
+    #[test]
     fn rpc_method_inventory_round_trips_every_wire_name() {
         let mut names = std::collections::HashSet::new();
         for method in RpcMethod::ALL {
@@ -297,6 +328,7 @@ mod tests {
             size: crate::domain::session::SessionSize::new(80, 24)
                 .unwrap()
                 .into(),
+            launch: crate::ipc::protocol::session::WireTerminalLaunch::DefaultAttachment,
         });
         assert_eq!(terminal.wire_name(), "spawn_terminal");
         assert_eq!(terminal.family(), RpcFamily::Session);

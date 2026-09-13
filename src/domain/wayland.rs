@@ -23,16 +23,12 @@ pub enum WaylandValidationError {
     DuplicateDisplay(WaylandDisplay),
     #[error("Wayland access contains duplicate socket path {0:?}")]
     DuplicateSocketPath(PathBuf),
-    #[error("Default Wayland display {0} is not one of the selected sockets")]
-    DefaultDisplayNotSelected(WaylandDisplay),
     #[error("Resolved Wayland grant has no sockets")]
     ResolvedGrantWithoutSockets,
     #[error("Wayland grant does not match DAC permissions for display {0}")]
     SocketAccessMismatch(WaylandDisplay),
     #[error("Resolved Wayland grant contains duplicate display {0}")]
     DuplicateResolvedDisplay(WaylandDisplay),
-    #[error("Resolved Wayland default display {0} is not granted")]
-    DefaultDisplayNotGranted(WaylandDisplay),
 }
 
 /// A safe Wayland display basename such as `wayland-0` or `compositor.sock`.
@@ -225,7 +221,6 @@ impl HostWaylandSocket {
 pub struct WaylandGrantIntent {
     target_username: String,
     sources: Vec<HostWaylandSocket>,
-    default_display: WaylandDisplay,
 }
 
 impl<'de> Deserialize<'de> for WaylandGrantIntent {
@@ -238,16 +233,13 @@ impl<'de> Deserialize<'de> for WaylandGrantIntent {
         struct Intent {
             target_username: String,
             sources: Vec<HostWaylandSocket>,
-            default_display: WaylandDisplay,
+            #[serde(default)]
+            default_display: Option<WaylandDisplay>,
         }
 
         let intent = Intent::deserialize(deserializer)?;
-        Self::new(
-            intent.target_username,
-            intent.sources,
-            intent.default_display,
-        )
-        .map_err(serde::de::Error::custom)
+        let _legacy_default = intent.default_display;
+        Self::new(intent.target_username, intent.sources).map_err(serde::de::Error::custom)
     }
 }
 
@@ -255,7 +247,6 @@ impl WaylandGrantIntent {
     pub fn new(
         target_username: impl Into<String>,
         sources: Vec<HostWaylandSocket>,
-        default_display: WaylandDisplay,
     ) -> Result<Self, WaylandValidationError> {
         let target_username = target_username.into();
         if target_username.is_empty() {
@@ -286,16 +277,9 @@ impl WaylandGrantIntent {
                 ));
             }
         }
-        if !displays.contains(&default_display) {
-            return Err(WaylandValidationError::DefaultDisplayNotSelected(
-                default_display,
-            ));
-        }
-
         Ok(Self {
             target_username,
             sources,
-            default_display,
         })
     }
 
@@ -305,10 +289,6 @@ impl WaylandGrantIntent {
 
     pub fn sources(&self) -> &[HostWaylandSocket] {
         &self.sources
-    }
-
-    pub fn default_display(&self) -> &WaylandDisplay {
-        &self.default_display
     }
 
     pub fn required_uid(&self) -> u32 {
@@ -372,7 +352,6 @@ impl WaylandSocketGrant {
 pub struct WaylandGrant {
     target: ContainerUserIdentity,
     sockets: Vec<WaylandSocketGrant>,
-    default_display: WaylandDisplay,
     bind_policy: WaylandBindPolicy,
 }
 
@@ -386,18 +365,15 @@ impl<'de> Deserialize<'de> for WaylandGrant {
         struct ResolvedGrant {
             target: ContainerUserIdentity,
             sockets: Vec<WaylandSocketGrant>,
-            default_display: WaylandDisplay,
+            #[serde(default)]
+            default_display: Option<WaylandDisplay>,
             bind_policy: WaylandBindPolicy,
         }
 
         let grant = ResolvedGrant::deserialize(deserializer)?;
-        Self::resolved(
-            grant.target,
-            grant.sockets,
-            grant.default_display,
-            grant.bind_policy,
-        )
-        .map_err(serde::de::Error::custom)
+        let _legacy_default = grant.default_display;
+        Self::resolved(grant.target, grant.sockets, grant.bind_policy)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -405,14 +381,12 @@ impl WaylandGrant {
     pub(crate) fn resolved(
         target: ContainerUserIdentity,
         sockets: Vec<WaylandSocketGrant>,
-        default_display: WaylandDisplay,
         bind_policy: WaylandBindPolicy,
     ) -> Result<Self, WaylandValidationError> {
         if sockets.is_empty() {
             return Err(WaylandValidationError::ResolvedGrantWithoutSockets);
         }
         let mut displays = std::collections::HashSet::new();
-        let mut has_default = false;
         for socket in &sockets {
             if socket.source.write_access_for(&target) != Some(socket.socket_access) {
                 return Err(WaylandValidationError::SocketAccessMismatch(
@@ -424,17 +398,10 @@ impl WaylandGrant {
                     socket.source.display().clone(),
                 ));
             }
-            has_default |= socket.source.display() == &default_display;
-        }
-        if !has_default {
-            return Err(WaylandValidationError::DefaultDisplayNotGranted(
-                default_display,
-            ));
         }
         Ok(Self {
             target,
             sockets,
-            default_display,
             bind_policy,
         })
     }
@@ -452,10 +419,6 @@ impl WaylandGrant {
 
     pub fn sockets(&self) -> &[WaylandSocketGrant] {
         &self.sockets
-    }
-
-    pub fn default_display(&self) -> &WaylandDisplay {
-        &self.default_display
     }
 
     pub fn bind_policy(&self) -> WaylandBindPolicy {
@@ -667,7 +630,6 @@ mod tests {
             },
         )
         .unwrap();
-        let display = socket.display().clone();
         let grant = WaylandGrant::resolved(
             ContainerUserIdentity {
                 username: "alice".into(),
@@ -675,7 +637,6 @@ mod tests {
                 gid: 1000,
             },
             vec![WaylandGrant::socket(socket, WaylandSocketAccess::Owner)],
-            display,
             WaylandBindPolicy::Idmap,
         )
         .unwrap();
@@ -686,40 +647,20 @@ mod tests {
     }
 
     #[test]
-    fn multi_display_intent_requires_one_owner_unique_sources_and_selected_default() {
+    fn multi_display_intent_requires_one_owner_and_unique_sources() {
         let first = socket("wayland-0", "/run/user/1000/wayland-0", 1000, 1);
         let second = socket("wayland-1", "/run/user/1000/wayland-1", 1000, 2);
-        let intent = WaylandGrantIntent::new(
-            "alice",
-            vec![first.clone(), second.clone()],
-            second.display().clone(),
-        )
-        .unwrap();
+        let intent = WaylandGrantIntent::new("alice", vec![first.clone(), second.clone()]).unwrap();
         assert_eq!(intent.sources().len(), 2);
-        assert_eq!(intent.default_display().as_str(), "wayland-1");
 
         assert!(matches!(
-            WaylandGrantIntent::new(
-                "alice",
-                vec![first.clone(), first],
-                WaylandDisplay::new("wayland-0").unwrap(),
-            ),
+            WaylandGrantIntent::new("alice", vec![first.clone(), first]),
             Err(WaylandValidationError::DuplicateDisplay(display))
                 if display.as_str() == "wayland-0"
-        ));
-        assert!(matches!(
-            WaylandGrantIntent::new(
-                "alice",
-                vec![second],
-                WaylandDisplay::new("wayland-9").unwrap(),
-            ),
-            Err(WaylandValidationError::DefaultDisplayNotSelected(display))
-                if display.as_str() == "wayland-9"
         ));
         assert!(WaylandGrantIntent::new(
             "alice",
             vec![socket("wayland-2", "/run/user/1001/wayland-2", 1001, 3,)],
-            WaylandDisplay::new("wayland-2").unwrap(),
         )
         .is_ok());
         assert_eq!(
@@ -729,7 +670,6 @@ mod tests {
                     socket("wayland-0", "/run/user/1000/wayland-0", 1000, 1,),
                     socket("wayland-2", "/run/user/1001/wayland-2", 1001, 3,),
                 ],
-                WaylandDisplay::new("wayland-0").unwrap(),
             )
             .unwrap_err(),
             WaylandValidationError::MixedSocketOwners {

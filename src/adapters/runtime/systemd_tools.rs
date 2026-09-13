@@ -1,10 +1,13 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::session::terminal_attach::TerminalAttachCommand;
+use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 use serde::Deserialize;
+use std::io;
 use std::time::Duration;
 
 const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -75,13 +78,13 @@ fn snapshot_update(
 }
 
 #[derive(Clone)]
-pub struct CliBackend {
+pub struct SystemdToolsBackend {
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
     runtime_machines_dir: std::path::PathBuf,
     nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
-impl CliBackend {
+impl SystemdToolsBackend {
     pub fn new(runner: std::sync::Arc<dyn CommandRunner>) -> Self {
         Self {
             cmd_runner: runner,
@@ -106,8 +109,59 @@ impl CliBackend {
     }
 }
 
+/// Encode one of the closed machine-session requests as a `machinectl`
+/// command.  This is a runtime transport operation: the session layer owns
+/// the request semantics, while this module owns the systemd tools command shape.
+pub(crate) fn machine_session_command(
+    request: MachineSessionRequest,
+) -> io::Result<TerminalAttachCommand> {
+    match request {
+        MachineSessionRequest::Shell(request) => selected_user_shell(request),
+        MachineSessionRequest::LoginPrompt(request) => Ok(
+            crate::adapters::session::terminal_attach::login(request.machine()),
+        ),
+        MachineSessionRequest::WaylandProbe(request) => wayland_probe(request),
+    }
+}
+
+fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttachCommand> {
+    let terminal = request.environment().terminal_environment().clone();
+    let mut args = vec!["--quiet".to_string()];
+    args.extend(
+        request
+            .environment()
+            .assignments()
+            .into_iter()
+            .map(|assignment| format!("--setenv={assignment}")),
+    );
+    args.extend([
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ]);
+    if let Some(command) = request.command() {
+        args.extend(command.argv());
+    }
+    Ok(TerminalAttachCommand::with_terminal_environment(
+        args, terminal,
+    ))
+}
+
+fn wayland_probe(
+    request: crate::adapters::session::WaylandProbeRequest,
+) -> io::Result<TerminalAttachCommand> {
+    let mut args = vec![
+        "--quiet".to_string(),
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ];
+    args.extend(request.args());
+    Ok(TerminalAttachCommand::with_dumb_environment(args))
+}
+
 #[async_trait::async_trait]
-impl RuntimeSource for CliBackend {
+impl RuntimeSource for SystemdToolsBackend {
     async fn is_available(&self) -> bool {
         which::which("machinectl").is_ok()
     }
@@ -156,7 +210,7 @@ impl RuntimeSource for CliBackend {
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         let mut nudge_rx = self.nudge_rx.lock().take().ok_or_else(|| {
             NspawnError::Dbus(zbus::Error::Failure(
-                "watch_events: no nudge channel set on CliBackend".into(),
+                "watch_events: no nudge channel set on SystemdToolsBackend".into(),
             ))
         })?;
 
@@ -199,15 +253,17 @@ impl RuntimeSource for CliBackend {
     }
 }
 
-/// Fixed, non-interactive CLI inspection shared with the elevated daemon.
+/// Fixed, non-interactive systemd tools inspection shared with the elevated daemon.
 pub(crate) async fn get_properties_with_runner(
     name: &str,
     include_nspawn_unit: bool,
     cmd_runner: &dyn CommandRunner,
 ) -> Result<MachineProperties> {
     let name = parse_machine_name(name)?;
-    let mut props =
-        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    let mut props = MachineProperties::from_inspection(
+        InspectionSource::SystemdTools,
+        InspectionCompleteness::Full,
+    );
 
     let machine_args = vec![
         "--no-ask-password".to_string(),
@@ -275,7 +331,7 @@ pub(crate) async fn get_properties_with_runner(
 
     if !failures.is_empty() {
         log::warn!(
-            "partial CLI inspection for {}: {}",
+            "partial systemd tools inspection for {}: {}",
             name,
             failures.join("; ")
         );
@@ -296,8 +352,10 @@ pub(crate) async fn get_image_unit_properties_with_runner(
     let Ok(name) = MachineName::new(name) else {
         return Ok(None);
     };
-    let mut props =
-        MachineProperties::from_inspection(InspectionSource::Cli, InspectionCompleteness::Full);
+    let mut props = MachineProperties::from_inspection(
+        InspectionSource::SystemdTools,
+        InspectionCompleteness::Full,
+    );
     match append_systemd_unit_properties(&name, cmd_runner, &mut props).await? {
         UnitInspection::Present => Ok(Some(props)),
         UnitInspection::NotFound(diagnostic) => {
@@ -393,6 +451,21 @@ async fn append_systemd_unit_properties(
     Ok(UnitInspection::Present)
 }
 
+/// Enrich a runtime-state snapshot with the nspawn unit properties needed for
+/// lifecycle confirmation. The machine registration reader intentionally does
+/// not invoke systemctl; callers opt into this small second query when they
+/// need ActiveState/Result.
+pub(crate) async fn append_nspawn_unit_properties_with_runner(
+    name: &MachineName,
+    cmd_runner: &dyn CommandRunner,
+    props: &mut MachineProperties,
+) -> Result<bool> {
+    match append_systemd_unit_properties(name, cmd_runner, props).await? {
+        UnitInspection::Present => Ok(true),
+        UnitInspection::NotFound(_) => Ok(false),
+    }
+}
+
 fn parse_machine_name(name: &str) -> Result<MachineName> {
     MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
 }
@@ -401,8 +474,15 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 mod tests {
     use super::*;
     use crate::adapters::process::MockCommandRunner;
+    use crate::adapters::session::{
+        MachineShellEnvironment, MachineShellRequest, WaylandProbeRequest,
+    };
+    use crate::application::sessions::{
+        GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
+    };
     use crate::domain::runtime::MachineState;
     use std::os::unix::process::ExitStatusExt;
+    use std::path::Path;
     use std::process::Output;
 
     fn mock_output(status: bool, stdout: &str, stderr: &str) -> Output {
@@ -430,6 +510,158 @@ mod tests {
                 dbus_object_path: None,
             }],
         )
+    }
+
+    #[test]
+    fn selected_user_shell_is_a_fixed_machinectl_argv() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("1000").unwrap();
+        let request = MachineSessionRequest::shell(MachineShellRequest::new(
+            name,
+            user,
+            MachineShellEnvironment::default(),
+        ));
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(
+            command.kind(),
+            crate::domain::session::TerminalAttachmentKind::Login
+        );
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "1000@test-machine"
+            ]
+        );
+    }
+
+    #[test]
+    fn login_prompt_uses_machinectl_login_without_shell_arguments() {
+        let command = machine_session_command(MachineSessionRequest::login_prompt(
+            MachineName::new("test-machine").unwrap(),
+        ))
+        .unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(command.args(), ["--", "login", "test-machine"]);
+    }
+
+    #[test]
+    fn selected_user_shell_appends_guest_command_argv_without_requoting() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+        let request = MachineSessionRequest::shell(
+            MachineShellRequest::new(name, user, MachineShellEnvironment::default()).with_command(
+                GuestCommand::new(
+                    "/usr/bin/kitty",
+                    vec!["--class".into(), "a b".into(), "".into()],
+                )
+                .unwrap(),
+            ),
+        );
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=dumb",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/usr/bin/kitty",
+                "--class",
+                "a b",
+                "",
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_user_shell_forwards_the_typed_terminal_and_wayland_environment() {
+        let name = MachineName::new("test-machine").unwrap();
+        let user = ValidatedGuestUserName::new("alice").unwrap();
+        let terminal = InteractiveShellEnvironment::new(
+            "xterm-kitty".into(),
+            Some("truecolor".into()),
+            Some(String::new()),
+        )
+        .unwrap();
+        let environment = MachineShellEnvironment::shell(
+            terminal,
+            Some(Path::new("/run/lasper/wayland/1000/wayland-1")),
+        )
+        .unwrap();
+        let request =
+            MachineSessionRequest::shell(MachineShellRequest::new(name, user, environment));
+
+        let command = machine_session_command(request).unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            command.args(),
+            [
+                "--quiet",
+                "--setenv=TERM=xterm-kitty",
+                "--setenv=COLORTERM=truecolor",
+                "--setenv=NO_COLOR=",
+                "--setenv=WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-1",
+                "--",
+                "shell",
+                "alice@test-machine",
+            ]
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-kitty"))
+        );
+        assert_eq!(
+            command.get_env("COLORTERM"),
+            Some(std::ffi::OsStr::new("truecolor"))
+        );
+        assert_eq!(command.get_env("NO_COLOR"), Some(std::ffi::OsStr::new("")));
+    }
+
+    #[test]
+    fn machinectl_probe_preserves_the_fixed_program_and_argument_boundaries() {
+        let request = WaylandProbeRequest::target(
+            MachineName::new("test-machine").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        )
+        .unwrap();
+
+        let command =
+            machine_session_command(MachineSessionRequest::wayland_probe(request)).unwrap();
+
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            &command.args()[..6],
+            [
+                "--quiet",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/bin/sh",
+                "-c"
+            ]
+        );
+        assert_eq!(
+            command.args().last().map(String::as_str),
+            Some("/run/lasper/wayland/1000/wayland-1")
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
+        assert_eq!(command.get_env("COLORTERM"), None);
+        assert_eq!(command.get_env("NO_COLOR"), None);
     }
 
     #[test]
@@ -477,8 +709,8 @@ mod tests {
             "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
         )
         .unwrap();
-        let provider =
-            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
+        let provider = SystemdToolsBackend::with_runner(runner)
+            .with_runtime_machines_dir(runtime.path().to_path_buf());
 
         let machines = RuntimeSource::list_machines(&provider).await.unwrap();
 
@@ -518,7 +750,7 @@ mod tests {
                 });
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let images = RuntimeSource::list_images(&provider).await.unwrap();
 
@@ -591,8 +823,8 @@ mod tests {
             "NAME=active\nCLASS=container\nSERVICE=systemd-nspawn\n",
         )
         .unwrap();
-        let provider =
-            CliBackend::with_runner(runner).with_runtime_machines_dir(runtime.path().to_path_buf());
+        let provider = SystemdToolsBackend::with_runner(runner)
+            .with_runtime_machines_dir(runtime.path().to_path_buf());
 
         let snapshot = RuntimeSource::snapshot(&provider).await.unwrap();
 
@@ -629,13 +861,13 @@ mod tests {
                 });
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let props = RuntimeSource::get_properties(&provider, "test-ctr", true)
             .await
             .unwrap();
 
-        assert_eq!(props.source, InspectionSource::Cli);
+        assert_eq!(props.source, InspectionSource::SystemdTools);
         assert_eq!(props.completeness, InspectionCompleteness::Full);
         assert!(props.groups.iter().any(|g| g.name == "Machine"));
         assert!(props.groups.iter().any(|g| g.name == "Systemd"));
@@ -653,14 +885,55 @@ mod tests {
                 .returning(move |_, _, _| Ok(out2.clone()));
             r
         });
-        let provider = CliBackend::with_runner(runner);
+        let provider = SystemdToolsBackend::with_runner(runner);
 
         let result = RuntimeSource::get_properties(&provider, "missing-ctr", true).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn machine_inspection_preserves_both_cli_failure_reasons() {
+    async fn runtime_state_enrichment_reads_the_nspawn_unit_properties() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(1)
+            .withf(|program, args, _| {
+                program == "systemctl"
+                    && *args
+                        == [
+                            "--no-ask-password",
+                            "--",
+                            "show",
+                            "systemd-nspawn@test-machine.service",
+                        ]
+                        .map(String::from)
+            })
+            .returning(|_, _, _| {
+                Ok(mock_output(
+                    true,
+                    "ActiveState=active\nResult=success\n",
+                    "",
+                ))
+            });
+
+        let mut properties = MachineProperties::from_inspection(
+            InspectionSource::RuntimeState,
+            InspectionCompleteness::RuntimeOnly,
+        );
+        let name = MachineName::new("test-machine").unwrap();
+        let present = append_nspawn_unit_properties_with_runner(&name, &runner, &mut properties)
+            .await
+            .unwrap();
+
+        assert!(present);
+        assert_eq!(
+            properties.get_group("Systemd").unwrap()["ActiveState"],
+            "active"
+        );
+    }
+
+    #[tokio::test]
+    async fn machine_inspection_preserves_both_systemd_tools_failure_reasons() {
         let mut runner = MockCommandRunner::new();
         runner
             .expect_run_bounded()

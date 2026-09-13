@@ -51,7 +51,7 @@ pub struct RuntimeCatalog {
     fallback: Arc<dyn RuntimePort>,
     watch_paths: Vec<PathBuf>,
     invalidation_tx: tokio::sync::broadcast::Sender<()>,
-    cli_nudge_tx: Option<tokio::sync::watch::Sender<()>>,
+    poll_nudge_tx: Option<tokio::sync::watch::Sender<()>>,
 }
 
 impl RuntimeCatalog {
@@ -59,7 +59,7 @@ impl RuntimeCatalog {
         primary: Option<Arc<dyn RuntimePort>>,
         fallback: Arc<dyn RuntimePort>,
         watch_paths: Vec<PathBuf>,
-        cli_nudge_tx: Option<tokio::sync::watch::Sender<()>>,
+        poll_nudge_tx: Option<tokio::sync::watch::Sender<()>>,
     ) -> Self {
         let (invalidation_tx, _) = tokio::sync::broadcast::channel(16);
         Self {
@@ -67,13 +67,13 @@ impl RuntimeCatalog {
             fallback,
             watch_paths,
             invalidation_tx,
-            cli_nudge_tx,
+            poll_nudge_tx,
         }
     }
 
     pub fn invalidate(&self) {
         let _ = self.invalidation_tx.send(());
-        if let Some(tx) = &self.cli_nudge_tx {
+        if let Some(tx) = &self.poll_nudge_tx {
             let _ = tx.send(());
         }
     }
@@ -204,13 +204,13 @@ impl RuntimeCatalog {
             tokio::spawn(async move {
                 if let Err(error) = primary.watch(primary_tx).await {
                     log::warn!(
-                        "D-Bus runtime observer unavailable ({}), falling back to CLI polling",
+                        "D-Bus runtime observer unavailable ({}), falling back to systemd tools polling",
                         error
                     );
                     *fallback_reason_for_task.lock() = Some(error.to_string());
                     fallback_active_for_task.store(true, Ordering::Release);
                     if let Err(fallback_error) = fallback.watch(fallback_tx).await {
-                        log::error!("CLI runtime observer stopped: {}", fallback_error);
+                        log::error!("systemd tools runtime observer stopped: {}", fallback_error);
                     }
                 }
             });
@@ -219,7 +219,7 @@ impl RuntimeCatalog {
             let fallback_tx = raw_tx.clone();
             tokio::spawn(async move {
                 if let Err(error) = fallback.watch(fallback_tx).await {
-                    log::error!("CLI runtime observer stopped: {}", error);
+                    log::error!("systemd tools runtime observer stopped: {}", error);
                 }
             });
         }
@@ -485,7 +485,7 @@ mod tests {
         primary
             .expect_snapshot()
             .returning(|| Ok(snapshot("primary")));
-        let fallback = port(ExecutionRoute::LocalCli);
+        let fallback = port(ExecutionRoute::LocalSystemdTools);
         let catalog =
             RuntimeCatalog::new(Some(Arc::new(primary)), Arc::new(fallback), vec![], None);
 
@@ -503,7 +503,7 @@ mod tests {
         primary
             .expect_snapshot()
             .returning(|| Err(RuntimeError::failed("primary failed")));
-        let mut fallback = port(ExecutionRoute::LocalCli);
+        let mut fallback = port(ExecutionRoute::LocalSystemdTools);
         fallback
             .expect_snapshot()
             .returning(|| Ok(snapshot("fallback")));
@@ -513,25 +513,27 @@ mod tests {
         let query = catalog.snapshot().await.unwrap();
 
         assert_eq!(query.value.machines[0].name, "fallback");
-        assert_eq!(query.route, ExecutionRoute::LocalCli);
+        assert_eq!(query.route, ExecutionRoute::LocalSystemdTools);
         assert_eq!(query.fallback.unwrap().from, ExecutionRoute::DirectDbus);
     }
 
     #[tokio::test]
-    async fn cli_only_catalog_never_probes_a_primary() {
-        let mut fallback = port(ExecutionRoute::LocalCli);
-        fallback.expect_snapshot().returning(|| Ok(snapshot("cli")));
+    async fn systemd_tools_only_catalog_never_probes_a_primary() {
+        let mut fallback = port(ExecutionRoute::LocalSystemdTools);
+        fallback
+            .expect_snapshot()
+            .returning(|| Ok(snapshot("systemd-tools")));
         let catalog = RuntimeCatalog::new(None, Arc::new(fallback), vec![], None);
 
         let query = catalog.snapshot().await.unwrap();
 
-        assert_eq!(query.route, ExecutionRoute::LocalCli);
+        assert_eq!(query.route, ExecutionRoute::LocalSystemdTools);
         assert!(query.fallback.is_none());
     }
 
     #[tokio::test]
     async fn inspection_enriches_route_output_from_the_snapshot_entry() {
-        let mut fallback = port(ExecutionRoute::LocalCli);
+        let mut fallback = port(ExecutionRoute::LocalSystemdTools);
         fallback.expect_inspect().returning(|_, _| {
             let mut properties = MachineProperties::default();
             properties.insert(GROUP_SYSTEMD_UNIT, "UnitFileState".into(), "enabled".into());

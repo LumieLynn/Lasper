@@ -70,12 +70,13 @@ impl ResourceInspectionPort for StoreResourceInspection {
     }
 
     async fn inspect_image_unit(&self, name: &str) -> ImageUnitInspection {
-        let properties = crate::adapters::runtime::cli::get_image_unit_properties_with_runner(
-            name,
-            self.local_cmd.as_ref(),
-        )
-        .await
-        .map_err(ResourceInspectionError::backend);
+        let properties =
+            crate::adapters::runtime::systemd_tools::get_image_unit_properties_with_runner(
+                name,
+                self.local_cmd.as_ref(),
+            )
+            .await
+            .map_err(ResourceInspectionError::backend);
         let unit = if matches!(properties, Ok(None)) {
             None
         } else {

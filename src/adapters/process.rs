@@ -1,11 +1,13 @@
 //! Command builder helpers.
 
+use crate::domain::secret::SecretBytes;
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::pin::Pin;
 use std::process::{ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 static DAEMON_CHILD_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
@@ -199,7 +201,9 @@ pub trait CommandRunner: Send + Sync {
     /// Run a short host query with an explicit completion deadline.
     ///
     /// Implementations must terminate the child process group when the
-    /// deadline expires and wait for the child before returning `TimedOut`.
+    /// deadline expires. A `TimedOut` error must state whether child exit was
+    /// confirmed; callers performing mutations must treat either result as an
+    /// unknown operation outcome.
     async fn run_bounded(
         &self,
         program: &str,
@@ -257,46 +261,146 @@ impl CommandRunner for DefaultCommandRunner {
 }
 
 const BOUNDED_TERMINATION_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
+const MAX_BOUNDED_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 
 async fn run_bounded_command(
     program: &str,
     args: Vec<String>,
     timeout: std::time::Duration,
 ) -> std::io::Result<Output> {
-    let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut command = new_command(program);
+    command.args(args);
+    run_bounded_child_command(command, None, timeout, program, MAX_BOUNDED_OUTPUT_BYTES).await
+}
+
+/// Run one configured child in a private process group with bounded captured
+/// output. The command's stdin/stdout/stderr configuration is replaced.
+pub(crate) async fn run_bounded_child_command(
+    mut command: tokio::process::Command,
+    input: Option<SecretBytes>,
+    timeout: std::time::Duration,
+    label: &str,
+    output_limit: usize,
+) -> std::io::Result<Output> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
     command
-        .args(&args_refs)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .as_std_mut()
         .process_group(0);
-    let child = command.spawn()?;
-    let pid = child.id().ok_or_else(|| {
-        std::io::Error::other(format!("bounded command {program} has no process id"))
-    })?;
-    let mut wait = Box::pin(child.wait_with_output());
 
-    if let Ok(result) = tokio::time::timeout(timeout, &mut wait).await {
+    let mut child = command.spawn()?;
+    let pid = child.id().ok_or_else(|| {
+        std::io::Error::other(format!("bounded command {label} has no process id"))
+    })?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take().expect("bounded child stdout was piped");
+    let stderr = child.stderr.take().expect("bounded child stderr was piped");
+
+    let mut completion = Box::pin(async {
+        let write_input = async move {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                stdin.write_all(input.as_slice()).await?;
+                stdin.shutdown().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        let (status, input_result, stdout, stderr) = tokio::join!(
+            child.wait(),
+            write_input,
+            read_bounded_stream(stdout, output_limit),
+            read_bounded_stream(stderr, output_limit),
+        );
+        input_result?;
+        Ok::<Output, std::io::Error>(Output {
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    });
+
+    if let Ok(result) = tokio::time::timeout(timeout, &mut completion).await {
         return result;
     }
+    drop(completion);
 
     log::warn!(
-        "bounded command {program} exceeded its {}ms deadline; terminating process group {pid}",
+        "bounded command {label} exceeded its {}ms deadline; terminating process group {pid}",
         timeout.as_millis()
     );
-    let _ = signal_process_group(pid, libc::SIGTERM);
-    if tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait)
-        .await
-        .is_err()
-    {
-        let _ = signal_process_group(pid, libc::SIGKILL);
-        let _ = tokio::time::timeout(BOUNDED_TERMINATION_GRACE, &mut wait).await;
-    }
-
+    let termination =
+        terminate_child_process_group(&mut child, pid, label, BOUNDED_TERMINATION_GRACE).await;
+    let detail = match termination {
+        Ok(_) => "termination was confirmed".to_string(),
+        Err(error) => format!("process exit was not confirmed: {error}"),
+    };
     Err(std::io::Error::new(
         std::io::ErrorKind::TimedOut,
-        format!("command {program} exceeded its completion deadline"),
+        format!("command {label} exceeded its completion deadline; {detail}"),
     ))
+}
+
+pub(crate) async fn terminate_child_process_group(
+    child: &mut tokio::process::Child,
+    pid: u32,
+    label: &str,
+    grace: std::time::Duration,
+) -> std::io::Result<ExitStatus> {
+    let term_error = signal_process_group(pid, libc::SIGTERM).err();
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        return status;
+    }
+
+    let kill_error = signal_process_group(pid, libc::SIGKILL).err();
+    match tokio::time::timeout(grace, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            let signals = match (term_error, kill_error) {
+                (Some(term), Some(kill)) => {
+                    format!("SIGTERM failed ({term}); SIGKILL failed ({kill})")
+                }
+                (Some(term), None) => format!("SIGTERM failed ({term})"),
+                (None, Some(kill)) => format!("SIGKILL failed ({kill})"),
+                (None, None) => "SIGTERM and SIGKILL were delivered".into(),
+            };
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("could not confirm that {label} exited after {signals}"),
+            ))
+        }
+    }
+}
+
+pub(crate) async fn read_bounded_stream(
+    mut reader: impl AsyncRead + Unpin,
+    limit: usize,
+) -> std::io::Result<Vec<u8>> {
+    const MARKER: &[u8] = b"\n[command output truncated]\n";
+
+    let mut kept = Vec::with_capacity(limit.min(4096));
+    let mut chunk = [0u8; 4096];
+    let mut truncated = false;
+    loop {
+        let count = reader.read(&mut chunk).await?;
+        if count == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(kept.len());
+        let take = count.min(remaining);
+        kept.extend_from_slice(&chunk[..take]);
+        truncated |= take < count;
+    }
+    if truncated {
+        let marker_start = limit.saturating_sub(MARKER.len());
+        kept.truncate(marker_start);
+        kept.extend_from_slice(&MARKER[..MARKER.len().min(limit)]);
+    }
+    Ok(kept)
 }
 
 /// Creates a new `tokio::process::Command` with `LC_ALL=C` set
@@ -492,6 +596,23 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("termination was confirmed"));
+    }
+
+    #[tokio::test]
+    async fn bounded_commands_drain_but_cap_captured_output() {
+        let output = DefaultCommandRunner
+            .run_bounded(
+                "sh",
+                vec!["-c".into(), "head -c 9000000 /dev/zero".into()],
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), MAX_BOUNDED_OUTPUT_BYTES);
+        assert!(output.stdout.ends_with(b"[command output truncated]\n"));
     }
 
     #[test]
