@@ -23,7 +23,7 @@ impl DeploymentClaimControl for DirectDeploymentClaimControl {
             ));
         }
         log::warn!(
-            "[AUDIT] Direct deployment {deployment_id} was explicitly released from session coordination; durable recovery state was retained"
+            "[AUDIT] Direct deployment {deployment_id} was explicitly released from session coordination; the application will discard its durable recovery manifest"
         );
         Ok(())
     }

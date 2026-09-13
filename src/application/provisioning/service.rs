@@ -147,6 +147,23 @@ impl ProvisioningService {
             claim.release_in_progress = true;
         }
 
+        // Capture the durable revision before releasing the in-memory claim.
+        // The explicit confirmation covers both actions: the outcome remains
+        // unknown, and the crash manifest is discarded only after the active
+        // executor no longer holds the coordination claim.
+        let durable_revision = match self.state.unfinished().await {
+            Ok(manifests) => manifests
+                .into_iter()
+                .find(|manifest| manifest.deployment_id == deployment_id)
+                .map(|manifest| manifest.revision),
+            Err(error) => {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(DeploymentError::reconciliation_required(error.to_string()));
+            }
+        };
+
         if let Err(error) = self
             .claim_control
             .release_unresolved(deployment_id, true)
@@ -156,6 +173,20 @@ impl ProvisioningService {
                 claim.release_in_progress = false;
             }
             return Err(error);
+        }
+
+        if let Some(revision) = durable_revision {
+            if let Err(error) = self.state.remove(deployment_id, revision).await {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(DeploymentError::reconciliation_required(format!(
+                    "deployment {deployment_id} claim was released but its durable manifest could not be discarded: {error}"
+                )));
+            }
+            log::warn!(
+                "[AUDIT] Discarded durable unresolved deployment manifest {deployment_id} at revision {revision} after explicit confirmation"
+            );
         }
 
         let claim = self
@@ -589,13 +620,14 @@ mod tests {
     #[tokio::test]
     async fn executor_panic_is_reconciliation_required_and_retains_its_claim() {
         let registry = OperationRegistry::new();
+        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
         let service = ProvisioningService::new(
             Arc::new(RecordingPreflight {
                 calls: AtomicUsize::new(0),
                 safety: RemoteTarSafety::Compatible,
             }),
             Arc::new(PanicExecutor),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            state.clone(),
             recovery(),
             claim_control(),
             Arc::clone(&registry),
@@ -618,6 +650,13 @@ mod tests {
             .is_err());
         assert_eq!(service.unresolved_claims.lock().len(), 1);
 
+        let (request, _) = submission().into_parts();
+        let plan = DeploymentPlan::build(request).unwrap();
+        state
+            .create(DeploymentCrashManifest::prepared(handle.id(), &plan))
+            .await
+            .unwrap();
+
         assert!(service
             .release_unresolved(handle.id(), false)
             .await
@@ -636,6 +675,7 @@ mod tests {
             DeploymentStatus::ReconciliationRequired(_)
         ));
         assert!(service.unresolved_claims.lock().is_empty());
+        assert!(state.unfinished().await.unwrap().is_empty());
         assert!(registry
             .reserve([crate::application::ResourceClaim::exclusive(
                 crate::application::ResourceKey::for_machine(&target),
