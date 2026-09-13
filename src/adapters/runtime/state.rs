@@ -120,19 +120,10 @@ fn enumerate_machines(path: &Path) -> std::io::Result<Vec<MachineEntry>> {
 pub async fn inspect(name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
     validate_observed_machine_name(name)
         .map_err(|error| NspawnError::Validation(error.to_string()))?;
-    inspect_at(
-        crate::paths::runtime_machine_state(name),
-        name,
-        entry,
-    )
-    .await
+    inspect_at(crate::paths::runtime_machine_state(name), name, entry).await
 }
 
-async fn inspect_at(
-    path: PathBuf,
-    name: &str,
-    entry: &MachineEntry,
-) -> Result<MachineProperties> {
+async fn inspect_at(path: PathBuf, name: &str, entry: &MachineEntry) -> Result<MachineProperties> {
     let mut properties = entry_properties(entry);
     let display_path = path.display().to_string();
     let expected_name = name.to_string();
@@ -406,13 +397,9 @@ mod tests {
         )
         .unwrap();
 
-        let properties = inspect_at(
-            path,
-            "test-machine",
-            &entry("test-machine"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(path, "test-machine", &entry("test-machine"))
+            .await
+            .unwrap();
 
         assert_eq!(properties.source, InspectionSource::RuntimeState);
         assert_eq!(properties.completeness, InspectionCompleteness::RuntimeOnly);
@@ -500,13 +487,9 @@ mod tests {
     #[tokio::test]
     async fn missing_state_returns_snapshot_fields_and_a_diagnostic() {
         let dir = tempfile::tempdir().unwrap();
-        let properties = inspect_at(
-            dir.path().join("missing"),
-            "missing",
-            &entry("missing"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(dir.path().join("missing"), "missing", &entry("missing"))
+            .await
+            .unwrap();
 
         assert_eq!(machine_value(&properties, "Name"), Some("missing"));
         assert!(machine_value(&properties, "RuntimeStateRead")
@@ -522,13 +505,9 @@ mod tests {
         std::fs::write(&target, "NAME=test-machine\n").unwrap();
         symlink(&target, &link).unwrap();
 
-        let properties = inspect_at(
-            link,
-            "test-machine",
-            &entry("test-machine"),
-        )
-        .await
-        .unwrap();
+        let properties = inspect_at(link, "test-machine", &entry("test-machine"))
+            .await
+            .unwrap();
 
         assert!(machine_value(&properties, "RuntimeStateRead").is_some());
         assert!(machine_value(&properties, "RuntimeStateFile").is_none());

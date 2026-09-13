@@ -14,6 +14,7 @@ const DEFAULT_LAUNCHER_ROWS: u16 = 24;
 const DETACH_BYTE: u8 = 0x1d;
 const DETACH_COUNT: u8 = 3;
 const DETACH_WINDOW: Duration = Duration::from_secs(1);
+const COMPLETED_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const DETACH_NOTICE: &str = "🪐 Press Ctrl+] three times within 1s to detach...";
 
 #[derive(Debug, Default)]
@@ -166,10 +167,45 @@ pub(crate) async fn run_inherited_terminal(
     let mut detach_sequence = DetachSequence::default();
     let state = loop {
         if let Some(state) = completed.take() {
-            while let Some(chunk) = output.recv().await {
-                stdout.write_all(&chunk).await.map_err(|error| {
-                    SessionError::new(format!("write terminal output: {error}"))
-                })?;
+            // A child can exit while a descendant still holds the PTY slave
+            // open. Do not wait for EOF forever in that case: keep accepting
+            // the detach sequence and give already-buffered output a bounded
+            // grace period before returning the authoritative lifecycle.
+            let mut drain_timeout = Box::pin(tokio::time::sleep(COMPLETED_OUTPUT_DRAIN_TIMEOUT));
+            loop {
+                tokio::select! {
+                    chunk = output.recv() => match chunk {
+                        Some(chunk) => {
+                            stdout.write_all(&chunk).await.map_err(|error| {
+                                SessionError::new(format!("write terminal output: {error}"))
+                            })?;
+                            stdout.flush().await.map_err(|error| {
+                                SessionError::new(format!("flush terminal output: {error}"))
+                            })?;
+                        }
+                        None => break,
+                    },
+                    read = stdin.read(&mut input_buffer) => {
+                        let read = read.map_err(|error| SessionError::new(format!("read terminal input: {error}")))?;
+                        if read == 0 {
+                            break;
+                        }
+                        let filtered = detach_sequence.filter(
+                            &input_buffer[..read],
+                            tokio::time::Instant::now(),
+                        );
+                        if filtered.detach {
+                            stdout.write_all(b"\r\n").await.map_err(|error| {
+                                SessionError::new(format!("write detach newline: {error}"))
+                            })?;
+                            stdout.flush().await.map_err(|error| {
+                                SessionError::new(format!("flush detach newline: {error}"))
+                            })?;
+                            break;
+                        }
+                    }
+                    _ = &mut drain_timeout => break,
+                }
             }
             stdout
                 .flush()
@@ -266,10 +302,25 @@ where
     let mut completed = None;
     let state = loop {
         if let Some(state) = completed.take() {
-            while let Some(chunk) = output.recv().await {
-                destination.write_all(&chunk).await.map_err(|error| {
-                    SessionError::new(format!("write launcher output: {error}"))
-                })?;
+            // The PTY reader may remain open after the child lifecycle has
+            // completed when a descendant inherited the slave descriptor.
+            // Bound the final drain so a launcher cannot wait forever for EOF.
+            let mut drain_timeout = Box::pin(tokio::time::sleep(COMPLETED_OUTPUT_DRAIN_TIMEOUT));
+            loop {
+                tokio::select! {
+                    chunk = output.recv() => match chunk {
+                        Some(chunk) => {
+                            destination.write_all(&chunk).await.map_err(|error| {
+                                SessionError::new(format!("write launcher output: {error}"))
+                            })?;
+                            destination.flush().await.map_err(|error| {
+                                SessionError::new(format!("flush launcher output: {error}"))
+                            })?;
+                        }
+                        None => break,
+                    },
+                    _ = &mut drain_timeout => break,
+                }
             }
             destination
                 .flush()
