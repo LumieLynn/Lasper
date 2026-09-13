@@ -280,6 +280,7 @@ impl App {
             resource_inspection,
             host_operations,
         } = services;
+        let scrollback_lines = config.settings.scrollback_lines;
         Self {
             permissions,
             config,
@@ -320,7 +321,7 @@ impl App {
                 unit_dirty: true,
                 details_dirty: true,
                 detail_refresh: detail_refresh::DetailRefreshState::default(),
-                terminal: TerminalManager::new(session_service),
+                terminal: TerminalManager::new(session_service, scrollback_lines),
             },
             ui: AppUi::new(),
         }
@@ -735,6 +736,7 @@ impl App {
 
             // Drain per-buffer log channels before rendering
             self.data.log_manager.drain_all();
+            self.data.terminal.reclaim_exited_scrollback();
 
             // Detail reads are scheduled after input/observer batches have
             // coalesced, and never execute on the event-handler call stack.

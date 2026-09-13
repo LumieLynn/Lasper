@@ -422,6 +422,7 @@ The following combines the settings, a debootstrap default prefill, a named prof
 elevate = true
 systemd-tools = false
 log-buffer-lines = 10000
+scrollback-lines = 2000
 
 [theme]
 accent = "cyan"

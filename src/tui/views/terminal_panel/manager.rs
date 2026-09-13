@@ -45,6 +45,7 @@ pub struct TerminalSession {
     /// Last resize request successfully queued for the PTY writer.
     queued_size: Option<(u16, u16)>,
     resize_channel_closed: bool,
+    scrollback_reclaimed: bool,
     /// Keeps mouse button tracking active while the pointer leaves the pane.
     mouse_capture: bool,
 }
@@ -125,6 +126,7 @@ pub struct TerminalManager {
     pub clipboard: Option<arboard::Clipboard>,
     session_service: Arc<SessionService>,
     redraw_gate: RedrawGate,
+    scrollback_lines: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +137,7 @@ pub enum TerminalInputStatus {
 }
 
 impl TerminalManager {
-    pub fn new(session_service: Arc<SessionService>) -> Self {
+    pub fn new(session_service: Arc<SessionService>, scrollback_lines: usize) -> Self {
         Self {
             sessions: Vec::new(),
             active_idx: 0,
@@ -146,6 +148,21 @@ impl TerminalManager {
             clipboard: None,
             session_service,
             redraw_gate: RedrawGate::new(),
+            scrollback_lines,
+        }
+    }
+
+    /// Retain the visible terminal screen after a session exits, releasing its
+    /// historical rows while keeping the tab and exit status available.
+    pub(crate) fn reclaim_exited_scrollback(&mut self) {
+        for session in &mut self.sessions {
+            if session.scrollback_reclaimed || session.handle.lifecycle().is_running() {
+                continue;
+            }
+            session.terminal.lock().clear_scrollback();
+            session.scrollback_reclaimed = true;
+            session.scroll_offset = 0;
+            session.selection = TextSelection::default();
         }
     }
 
@@ -250,7 +267,9 @@ impl TerminalManager {
             .take_output()
             .ok_or_else(|| "Internal error: terminal output already attached".to_string())?;
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
-            rows, 80, 10000,
+            rows,
+            80,
+            self.scrollback_lines,
         )));
         terminal.lock().screen.suppress_initial_line_breaks();
         let service = Arc::clone(&self.session_service);
@@ -275,6 +294,7 @@ impl TerminalManager {
             yanked: false,
             queued_size: Some((80, rows)),
             resize_channel_closed: false,
+            scrollback_reclaimed: false,
             mouse_capture: false,
         };
         self.sessions.push(session);
@@ -344,7 +364,9 @@ impl TerminalManager {
             .take_output()
             .ok_or_else(|| "Internal error: terminal output already attached".to_string())?;
         let terminal = Arc::new(parking_lot::Mutex::new(crate::tui::term::Parser::new(
-            rows, cols, 10000,
+            rows,
+            cols,
+            self.scrollback_lines,
         )));
         terminal.lock().screen.suppress_initial_line_breaks();
         let output_task = spawn_output_parser(
@@ -368,6 +390,7 @@ impl TerminalManager {
             yanked: false,
             queued_size: Some((cols, rows)),
             resize_channel_closed: false,
+            scrollback_reclaimed: false,
             mouse_capture: false,
         };
         self.sessions.push(session);
@@ -999,6 +1022,7 @@ mod tests {
                 yanked: false,
                 queued_size: None,
                 resize_channel_closed: false,
+                scrollback_reclaimed: false,
                 mouse_capture: false,
             },
             endpoint,
@@ -1066,7 +1090,7 @@ mod tests {
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut manager = TerminalManager::new(service);
+        let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
         for state in [MachineState::Starting, MachineState::Exiting] {
             let entry = MachineEntry {
                 name: "test".into(),
@@ -1091,7 +1115,7 @@ mod tests {
         });
         let service = Arc::new(SessionService::new(port.clone()));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut manager = TerminalManager::new(service);
+        let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
         let entry = MachineEntry {
             name: "demo".into(),
             class: MachineEntry::NSPAWN_CLASS.into(),
@@ -1119,13 +1143,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finished_hidden_terminals_release_both_screens_without_touching_live_history() {
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))));
+        let mut manager = TerminalManager::new(service, 100);
+        let (finished, finished_endpoint) = test_session(1, "finished");
+        let (running, _running_endpoint) = test_session(2, "running");
+        for session in [&finished, &running] {
+            session
+                .terminal
+                .lock()
+                .screen
+                .process("history\r\n".repeat(50).as_bytes(), &mut Vec::new());
+            assert!(session.terminal.lock().screen().row0_count() > 0);
+        }
+        // The alternate screen hides the primary screen's accumulated history.
+        finished
+            .terminal
+            .lock()
+            .screen
+            .process(b"\x1b[?1049halternate", &mut Vec::new());
+        finished_endpoint.lifecycle.send_replace(
+            crate::domain::session::SessionLifecycle::Exited {
+                success: true,
+                code: Some(0),
+            },
+        );
+        manager.sessions = vec![finished, running];
+        assert!(!manager.is_showing());
+        manager.reclaim_exited_scrollback();
+
+        let mut parser = manager.sessions[0].terminal.lock();
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "a");
+        parser.screen.process(b"\x1b[?1049l", &mut Vec::new());
+        assert_eq!(parser.screen().row0_count(), 0);
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "h");
+        parser
+            .screen
+            .process("tail\r\n".repeat(50).as_bytes(), &mut Vec::new());
+        assert_eq!(parser.screen().row0_count(), 0);
+        assert_eq!(parser.screen().scrollback_len(), 0);
+        drop(parser);
+        assert!(manager.sessions[1].terminal.lock().screen().row0_count() > 0);
+
+        manager.sessions[0].selection.anchor = (0, 1);
+        manager.reclaim_exited_scrollback();
+        assert_eq!(manager.sessions[0].selection.anchor, (0, 1));
+    }
+
+    #[tokio::test]
     async fn duplicate_terminal_tabs_receive_stable_ordinals() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
             DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
-        let mut manager = TerminalManager::new(service);
+        let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
         let (first, _first_endpoint) = test_session(1, "demo");
         let (second, _second_endpoint) = test_session(2, "demo");
         manager.sessions = vec![first, second];
@@ -1141,7 +1217,7 @@ mod tests {
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
-        let mut manager = TerminalManager::new(service);
+        let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
         let (first, _first_endpoint) = test_session(1, "first");
         let (second, _second_endpoint) = test_session(2, "second");
         manager.sessions = vec![first, second];

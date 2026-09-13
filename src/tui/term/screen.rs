@@ -187,6 +187,12 @@ impl Screen {
         self.grid_mut().set_scrollback(rows);
     }
 
+    pub fn clear_scrollback(&mut self) {
+        self.grid.clear_scrollback();
+        self.alternate_grid.clear_scrollback();
+        self.set_scrollback(0);
+    }
+
     pub fn scroll_screen_up(&mut self, n: usize) {
         let pos = usize::saturating_add(self.scrollback(), n);
         self.set_scrollback(pos);

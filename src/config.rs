@@ -11,8 +11,10 @@ use crate::tui::theme::PartialTheme;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
+
 /// General application settings (`[settings]` section).
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
     /// Always request root elevation on startup (equivalent to -e / --elevate).
@@ -23,6 +25,20 @@ pub struct AppSettings {
     /// Maximum log lines retained per container buffer.
     #[serde(rename = "log-buffer-lines")]
     pub log_buffer_lines: usize,
+    /// Maximum terminal scrollback rows retained per embedded session.
+    #[serde(rename = "scrollback-lines")]
+    pub scrollback_lines: usize,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            elevate: false,
+            systemd_tools: false,
+            log_buffer_lines: 0,
+            scrollback_lines: DEFAULT_SCROLLBACK_LINES,
+        }
+    }
 }
 
 /// Top-level sections in lasper.toml.
