@@ -30,6 +30,7 @@ struct RetainedDeploymentClaim {
     _reservation: ResourceReservation,
     status: tokio::sync::watch::Sender<DeploymentClaimStatus>,
     release_in_progress: bool,
+    authority_released: bool,
 }
 
 struct RecoveredDeploymentClaim {
@@ -109,6 +110,7 @@ impl ProvisioningService {
                         _reservation: reservation,
                         status: claim_status.clone(),
                         release_in_progress: false,
+                        authority_released: false,
                     },
                 );
             } else {
@@ -132,7 +134,7 @@ impl ProvisioningService {
                 "releasing an unresolved deployment requires explicit confirmation",
             ));
         }
-        {
+        let release_authority = {
             let mut claims = self.unresolved_claims.lock();
             let claim = claims.get_mut(&deployment_id).ok_or_else(|| {
                 DeploymentError::rejected(format!(
@@ -145,7 +147,8 @@ impl ProvisioningService {
                 )));
             }
             claim.release_in_progress = true;
-        }
+            !claim.authority_released
+        };
 
         // Capture the durable revision before releasing the in-memory claim.
         // The explicit confirmation covers both actions: the outcome remains
@@ -164,15 +167,22 @@ impl ProvisioningService {
             }
         };
 
-        if let Err(error) = self
-            .claim_control
-            .release_unresolved(deployment_id, true)
-            .await
-        {
-            if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
-                claim.release_in_progress = false;
+        if release_authority {
+            if let Err(error) = self
+                .claim_control
+                .release_unresolved(deployment_id, true)
+                .await
+            {
+                if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                    claim.release_in_progress = false;
+                }
+                return Err(error);
             }
-            return Err(error);
+            // The daemon may acknowledge and remove its terminal record after
+            // release. A failed manifest removal must retry only that removal.
+            if let Some(claim) = self.unresolved_claims.lock().get_mut(&deployment_id) {
+                claim.authority_released = true;
+            }
         }
 
         if let Some(revision) = durable_revision {
@@ -366,6 +376,29 @@ mod tests {
     struct PanicExecutor;
 
     struct FailingClaimControl;
+
+    struct RevisingClaimControl {
+        state: Arc<super::super::MemoryDeploymentStatePort>,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl DeploymentClaimControl for RevisingClaimControl {
+        async fn release_unresolved(
+            &self,
+            deployment_id: super::super::DeploymentId,
+            confirmed: bool,
+        ) -> Result<(), DeploymentError> {
+            assert!(confirmed);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut manifest = self.state.unfinished().await.unwrap().pop().unwrap();
+            assert_eq!(manifest.deployment_id, deployment_id);
+            let revision = manifest.revision;
+            manifest.revision += 1;
+            self.state.update(revision, manifest).await.unwrap();
+            Ok(())
+        }
+    }
 
     #[async_trait]
     impl SourcePreflight for RecordingPreflight {
@@ -681,6 +714,55 @@ mod tests {
                 crate::application::ResourceKey::for_machine(&target),
             )])
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn manifest_discard_can_retry_without_releasing_an_acknowledged_daemon_job_again() {
+        let registry = OperationRegistry::new();
+        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
+        let control = Arc::new(RevisingClaimControl {
+            state: state.clone(),
+            calls: AtomicUsize::new(0),
+        });
+        let service = ProvisioningService::new(
+            Arc::new(RecordingPreflight {
+                calls: AtomicUsize::new(0),
+                safety: RemoteTarSafety::Compatible,
+            }),
+            Arc::new(PanicExecutor),
+            state.clone(),
+            recovery(),
+            control.clone(),
+            registry.clone(),
+        );
+        let handle = service.start(submission()).unwrap();
+        wait_until_finished(&handle).await;
+        let (request, _) = submission().into_parts();
+        let plan = DeploymentPlan::build(request).unwrap();
+        state
+            .create(DeploymentCrashManifest::prepared(handle.id(), &plan))
+            .await
+            .unwrap();
+
+        let error = service
+            .release_unresolved(handle.id(), true)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("revision changed"));
+        assert_eq!(
+            handle.claim_status(),
+            DeploymentClaimStatus::ReconciliationRequired
+        );
+        assert!(registry.reserve(plan.resource_claims()).is_err());
+
+        service.release_unresolved(handle.id(), true).await.unwrap();
+        assert_eq!(control.calls.load(Ordering::Relaxed), 1);
+        assert!(state.unfinished().await.unwrap().is_empty());
+        assert!(registry.reserve(plan.resource_claims()).is_ok());
+        assert_eq!(
+            handle.claim_status(),
+            DeploymentClaimStatus::ReleasedUnresolved
+        );
     }
 
     #[tokio::test]
