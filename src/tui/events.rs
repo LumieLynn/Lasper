@@ -29,6 +29,22 @@ pub enum AppEvent {
             crate::application::inspection::ResourceInspectionError,
         >,
     },
+    ConfigurationPreviewed {
+        generation: u64,
+        target: crate::application::configuration::ConfigurationTarget,
+        result: Result<
+            crate::application::configuration::ConfigurationPreview,
+            crate::application::inspection::ResourceInspectionError,
+        >,
+    },
+    ConfigurationApplied {
+        generation: u64,
+        target: crate::application::configuration::ConfigurationTarget,
+        result: Result<
+            crate::application::configuration::ConfigurationApplyReport,
+            crate::application::inspection::ResourceInspectionError,
+        >,
+    },
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
         result: Result<
@@ -74,6 +90,8 @@ impl AppEvent {
             Self::Resize => "resize",
             Self::Tick => "tick",
             Self::ConfigurationInspected { .. } => "configuration-inspected",
+            Self::ConfigurationPreviewed { .. } => "configuration-previewed",
+            Self::ConfigurationApplied { .. } => "configuration-applied",
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",

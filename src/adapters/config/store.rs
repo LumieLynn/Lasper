@@ -7,7 +7,10 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
-use crate::application::configuration::{ConfigurationSnapshot, ConfigurationTarget};
+use crate::application::configuration::{
+    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
+    ConfigurationTarget,
+};
 use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
@@ -80,6 +83,26 @@ impl NspawnConfigStore {
             .ok_or_else(|| {
                 NspawnError::Runtime("configuration inspection returned no snapshot".into())
             })
+    }
+
+    pub(crate) async fn preview_configuration(
+        &self,
+        edit: ConfigurationEdit,
+    ) -> Result<ConfigurationPreview> {
+        self.execute(NspawnConfigOperation::PreviewConfiguration(Box::new(edit)))
+            .await?
+            .preview
+            .ok_or_else(|| NspawnError::Runtime("configuration preview returned no result".into()))
+    }
+
+    pub(crate) async fn apply_configuration(
+        &self,
+        edit: ConfigurationEdit,
+    ) -> Result<ConfigurationApplyReport> {
+        self.execute(NspawnConfigOperation::ApplyConfiguration(Box::new(edit)))
+            .await?
+            .configuration_apply
+            .ok_or_else(|| NspawnError::Runtime("configuration apply returned no result".into()))
     }
 
     pub async fn write_generated(
@@ -222,6 +245,8 @@ pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
     Snapshot(ConfigurationTarget),
+    PreviewConfiguration(Box<ConfigurationEdit>),
+    ApplyConfiguration(Box<ConfigurationEdit>),
     Write(Box<WriteNspawnConfig>),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
@@ -236,12 +261,21 @@ impl NspawnConfigOperation {
             Self::Read(_)
             | Self::Inspect(_)
             | Self::Snapshot(_)
+            | Self::PreviewConfiguration(_)
             | Self::PrepareOciPromotion(_)
             | Self::CleanupSidecarLocks(_) => None,
             Self::Write(request) => Some(request.spec.machine.clone()),
+            Self::ApplyConfiguration(edit) => MachineName::new(edit.target.name()).ok(),
             Self::PromoteOci(request) => Some(request.machine.clone()),
             Self::UpdateGpu(request) => Some(request.machine.clone()),
             Self::Remove(request) => Some(request.machine.clone()),
+        }
+    }
+
+    pub(crate) fn configuration_apply_machine(&self) -> Option<MachineName> {
+        match self {
+            Self::ApplyConfiguration(edit) => MachineName::new(edit.target.name()).ok(),
+            _ => None,
         }
     }
 }
@@ -297,6 +331,10 @@ pub(crate) struct NspawnConfigResult {
     sidecars_cleaned: Option<bool>,
     #[serde(default)]
     snapshot: Option<ConfigurationSnapshot>,
+    #[serde(default)]
+    preview: Option<ConfigurationPreview>,
+    #[serde(default)]
+    configuration_apply: Option<ConfigurationApplyReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -338,6 +376,14 @@ pub(crate) async fn execute_nspawn_config_operation(
     match operation {
         NspawnConfigOperation::Snapshot(target) => Ok(NspawnConfigResult {
             snapshot: Some(configuration::inspect(target).await?),
+            ..Default::default()
+        }),
+        NspawnConfigOperation::PreviewConfiguration(edit) => Ok(NspawnConfigResult {
+            preview: Some(configuration::preview(*edit).await?),
+            ..Default::default()
+        }),
+        NspawnConfigOperation::ApplyConfiguration(edit) => Ok(NspawnConfigResult {
+            configuration_apply: Some(configuration::apply(*edit).await?),
             ..Default::default()
         }),
         NspawnConfigOperation::Read(request) => {

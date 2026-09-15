@@ -607,6 +607,30 @@ impl App {
                     view.finish_query(query, &target, result);
                 }
             }
+            AppEvent::ConfigurationPreviewed {
+                generation,
+                target,
+                result,
+            } => {
+                if let Some(view) = &mut self.ui.configuration {
+                    view.finish_preview(generation, &target, result);
+                }
+            }
+            AppEvent::ConfigurationApplied {
+                generation,
+                target,
+                result,
+            } => {
+                let saved = self
+                    .ui
+                    .configuration
+                    .as_mut()
+                    .and_then(|view| view.finish_apply(generation, &target, result));
+                if let Some(message) = saved {
+                    self.set_status(message, crate::tui::StatusLevel::Success);
+                    self.refresh_configuration();
+                }
+            }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
                     return;

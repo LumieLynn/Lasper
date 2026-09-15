@@ -1,14 +1,17 @@
 //! Configure capability adapter. The store selects direct/elevated execution;
 //! inspection and declaration projection stay inside the configuration adapter.
 
+mod edit;
 mod inspection;
 mod projection;
 
+pub(super) use edit::{apply, preview};
 pub(super) use inspection::inspect;
 
 use super::NspawnConfigStore;
 use crate::application::configuration::{
-    ConfigurationPort, ConfigurationSnapshot, ConfigurationTarget,
+    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPort, ConfigurationPreview,
+    ConfigurationSnapshot, ConfigurationTarget,
 };
 use crate::application::inspection::ResourceInspectionError;
 
@@ -30,6 +33,26 @@ impl ConfigurationPort for StoreConfiguration {
     ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
         self.store
             .configuration_snapshot(target.clone())
+            .await
+            .map_err(ResourceInspectionError::backend)
+    }
+
+    async fn preview(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationPreview, ResourceInspectionError> {
+        self.store
+            .preview_configuration(edit.clone())
+            .await
+            .map_err(ResourceInspectionError::backend)
+    }
+
+    async fn apply(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
+        self.store
+            .apply_configuration(edit.clone())
             .await
             .map_err(ResourceInspectionError::backend)
     }

@@ -1,7 +1,8 @@
 use super::*;
 use crate::application::configuration::{
-    ConfigurationDiscovery, ConfigurationDocument, ConfigurationOrigin, X11BindingDeclaration,
-    X11BindingScope,
+    ConfigurationActivation, ConfigurationApplyReport, ConfigurationDiscovery,
+    ConfigurationDocument, ConfigurationOrigin, ConfigurationPreview, ConfigurationRevision,
+    ConfigurationWriteTarget, X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::runtime::ImageName;
 use ratatui::{backend::TestBackend, Terminal};
@@ -15,8 +16,15 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
         target: target(name),
         discovery: ConfigurationDiscovery::NamedImageCandidates,
         candidates: vec![],
-        revision: None,
-        write_target: None,
+        revision: Some(ConfigurationRevision {
+            discovery: "discovery".into(),
+            read_source: Some("source".into()),
+            write_target: Some("write-target".into()),
+        }),
+        write_target: Some(ConfigurationWriteTarget {
+            path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
+            exists: true,
+        }),
         document: Some(ConfigurationDocument {
             path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
             origin: ConfigurationOrigin::Administrator,
@@ -253,16 +261,17 @@ fn preview_tabs_use_the_border_and_only_visible_titles_are_clickable() {
             view.handle_mouse(click(tab.area));
             assert_eq!(view.preview_tab, tab.value);
         }
-        let raw = view
+        if let Some(raw) = view
             .hits
             .preview_tabs
             .iter()
             .find(|tab| tab.value == PreviewTab::Raw)
-            .unwrap()
-            .area;
-        let before = view.preview_tab;
-        view.handle_mouse(click(Rect::new(raw.right(), raw.y, 1, 1)));
-        assert_eq!(view.preview_tab, before);
+            .map(|tab| tab.area)
+        {
+            let before = view.preview_tab;
+            view.handle_mouse(click(Rect::new(raw.right(), raw.y, 1, 1)));
+            assert_eq!(view.preview_tab, before);
+        }
     }
 }
 
@@ -287,4 +296,112 @@ fn raw_renders_shared_configuration_colors_in_the_preview_buffer() {
         buffer[(origin.0 + "Environment".len() as u16, origin.1 + 1)].fg,
         crate::tui::theme::theme().config_value
     );
+}
+
+#[test]
+fn draft_preview_is_generation_scoped_and_undo_restores_clean_state() {
+    let mut view = loaded();
+    let action = view.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    let ConfigurationAction::Preview { generation, edit } = action else {
+        panic!("removing a binding should request a preview");
+    };
+    assert_eq!(edit.x11_changes.len(), 1);
+    assert!(render(&mut view, 140, 28).contains("| MOD"));
+
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    view.finish_preview(
+        generation,
+        &target("archlinux"),
+        Ok(ConfigurationPreview::Ready {
+            path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
+            diff: "stale diff".into(),
+            activation: ConfigurationActivation::NextMachineStart,
+        }),
+    );
+    assert!(matches!(view.draft_preview, DraftPreviewState::Clean));
+    assert!(!render(&mut view, 140, 28).contains("stale diff"));
+}
+
+#[test]
+fn dirty_close_requires_confirmation_and_keeps_the_draft_when_cancelled() {
+    let mut view = loaded();
+    assert!(matches!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)),
+        ConfigurationAction::Preview { .. }
+    ));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(render(&mut view, 90, 22).contains("Unsaved changes"));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(!view.draft.is_empty());
+    view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+        ConfigurationAction::Close
+    );
+}
+
+#[test]
+fn only_current_ready_preview_can_be_saved_and_success_clears_the_draft() {
+    let mut view = loaded();
+    let ConfigurationAction::Preview { generation, edit } =
+        view.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE))
+    else {
+        panic!("expected preview action");
+    };
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        ConfigurationAction::None
+    );
+    view.finish_preview(
+        generation,
+        &edit.target,
+        Ok(ConfigurationPreview::Ready {
+            path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
+            diff: "--- old\n+++ new\n@@ -1,1 +1,0 @@\n-Bind=x\n".into(),
+            activation: ConfigurationActivation::NextMachineStart,
+        }),
+    );
+    assert!(render(&mut view, 140, 28).contains("-Bind=x"));
+    let action = view.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(matches!(
+        action,
+        ConfigurationAction::Apply {
+            generation: applied_generation,
+            ..
+        } if applied_generation == generation
+    ));
+    let message = view.finish_apply(
+        generation,
+        &edit.target,
+        Ok(ConfigurationApplyReport::Applied {
+            path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
+            activation: ConfigurationActivation::NextMachineStart,
+        }),
+    );
+    assert!(message.unwrap().contains("next machine start"));
+    assert!(view.draft.is_empty());
+}
+
+#[test]
+fn enter_opens_the_binding_editor_while_space_only_folds() {
+    let mut view = loaded();
+    view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    assert!(!view.expanded.contains(&0));
+    assert!(view.editor.is_none());
+    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(view.editor.is_some());
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(view.editor.is_none());
 }

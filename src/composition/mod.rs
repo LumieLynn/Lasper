@@ -234,9 +234,12 @@ pub(crate) fn compose_application_services(
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
     let configuration = Arc::new(
-        crate::application::configuration::ConfigurationService::new(Arc::new(
-            crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
-        )),
+        crate::application::configuration::ConfigurationService::new(
+            Arc::new(
+                crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
+            ),
+            Arc::clone(&operations),
+        ),
     );
     let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
         crate::adapters::inspection::StoreResourceInspection::new(local_cmd, nspawn, systemd_unit),

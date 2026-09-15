@@ -6,6 +6,7 @@ pub(crate) mod query;
 
 use self::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use super::server::DaemonServerState;
+use crate::adapters::config::store::NspawnConfigOperation;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
@@ -229,6 +230,15 @@ pub(super) fn daemon_resource_claims(
                 ResourceClaim::exclusive(ResourceKey::for_machine(&request.machine)),
                 ResourceClaim::shared(ResourceKey::SystemdManager),
             ]
+        }
+        RpcMethod::NspawnConfig => {
+            let operation: NspawnConfigOperation =
+                serde_json::from_value(request.params.clone())
+                    .map_err(|error| format!("invalid nspawn_config request: {error}"))?;
+            operation
+                .configuration_apply_machine()
+                .map(|machine| vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))])
+                .unwrap_or_default()
         }
         RpcMethod::SystemOperation => {
             let wire_operation: crate::ipc::protocol::system::SystemOperation =

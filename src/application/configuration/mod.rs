@@ -8,6 +8,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::application::inspection::ResourceInspectionError;
+use crate::application::operations::ResourceConflict;
+use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 
@@ -170,6 +172,85 @@ pub struct ConfigurationSnapshot {
     pub diagnostics: Vec<String>,
 }
 
+/// A finite configuration draft. The caller identifies declarations from the
+/// inspected revision; it never supplies a host configuration path or a whole
+/// replacement document.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigurationEdit {
+    pub target: ConfigurationTarget,
+    pub base_revision: ConfigurationRevision,
+    pub x11_changes: Vec<X11BindingChange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
+pub enum X11BindingChange {
+    Update {
+        line: usize,
+        source: PathBuf,
+        guest_target: PathBuf,
+        readonly: bool,
+    },
+    Remove {
+        line: usize,
+    },
+}
+
+impl X11BindingChange {
+    pub fn line(&self) -> usize {
+        match self {
+            Self::Update { line, .. } | Self::Remove { line } => *line,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationActivation {
+    NextMachineStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConfigurationPreview {
+    Ready {
+        path: PathBuf,
+        diff: String,
+        activation: ConfigurationActivation,
+    },
+    Unchanged {
+        path: PathBuf,
+    },
+    Blocked {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ConfigurationApplyReport {
+    Applied {
+        path: PathBuf,
+        activation: ConfigurationActivation,
+    },
+    Unchanged {
+        path: PathBuf,
+    },
+    Blocked {
+        reason: String,
+    },
+    Conflict {
+        reason: String,
+    },
+    Busy {
+        reason: String,
+    },
+}
+
 impl fmt::Debug for ConfigurationSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConfigurationSnapshot")
@@ -187,15 +268,29 @@ pub(crate) trait ConfigurationPort: Send + Sync {
         &self,
         target: &ConfigurationTarget,
     ) -> Result<ConfigurationSnapshot, ResourceInspectionError>;
+
+    async fn preview(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationPreview, ResourceInspectionError>;
+
+    async fn apply(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationApplyReport, ResourceInspectionError>;
 }
 
 pub struct ConfigurationService {
     port: Arc<dyn ConfigurationPort>,
+    operations: Arc<OperationRegistry>,
 }
 
 impl ConfigurationService {
-    pub(crate) fn new(port: Arc<dyn ConfigurationPort>) -> Self {
-        Self { port }
+    pub(crate) fn new(
+        port: Arc<dyn ConfigurationPort>,
+        operations: Arc<OperationRegistry>,
+    ) -> Self {
+        Self { port, operations }
     }
 
     pub async fn inspect(
@@ -203,5 +298,112 @@ impl ConfigurationService {
         target: &ConfigurationTarget,
     ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
         self.port.inspect(target).await
+    }
+
+    pub async fn preview(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationPreview, ResourceInspectionError> {
+        self.port.preview(edit).await
+    }
+
+    pub async fn apply(
+        &self,
+        edit: &ConfigurationEdit,
+    ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
+        let key = match &edit.target {
+            ConfigurationTarget::Machine(machine) => ResourceKey::for_machine(machine),
+            ConfigurationTarget::Image(image) => ResourceKey::for_image(image),
+        };
+        let _reservation = match self.operations.reserve([ResourceClaim::exclusive(key)]) {
+            Ok(reservation) => reservation,
+            Err(ResourceConflict { .. }) => {
+                return Ok(ConfigurationApplyReport::Busy {
+                    reason: "Another operation is using this machine configuration".into(),
+                });
+            }
+        };
+        self.port.apply(edit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::Notify;
+
+    struct BlockingPort {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl ConfigurationPort for BlockingPort {
+        async fn inspect(
+            &self,
+            _target: &ConfigurationTarget,
+        ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
+            unreachable!("this test only exercises apply coordination")
+        }
+
+        async fn preview(
+            &self,
+            _edit: &ConfigurationEdit,
+        ) -> Result<ConfigurationPreview, ResourceInspectionError> {
+            unreachable!("this test only exercises apply coordination")
+        }
+
+        async fn apply(
+            &self,
+            _edit: &ConfigurationEdit,
+        ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ConfigurationApplyReport::Applied {
+                path: "/etc/systemd/nspawn/arch.nspawn".into(),
+                activation: ConfigurationActivation::NextMachineStart,
+            })
+        }
+    }
+
+    fn edit() -> ConfigurationEdit {
+        ConfigurationEdit {
+            target: ConfigurationTarget::Machine(MachineName::new("arch").unwrap()),
+            base_revision: ConfigurationRevision {
+                discovery: "discovery".into(),
+                read_source: Some("source".into()),
+                write_target: Some("target".into()),
+            },
+            x11_changes: vec![X11BindingChange::Remove { line: 2 }],
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_reserves_the_machine_configuration_until_the_port_finishes() {
+        let port = Arc::new(BlockingPort {
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        let service = Arc::new(ConfigurationService::new(
+            port.clone(),
+            OperationRegistry::new(),
+        ));
+        let request = edit();
+        let first = {
+            let service = service.clone();
+            let request = request.clone();
+            tokio::spawn(async move { service.apply(&request).await.unwrap() })
+        };
+        port.entered.notified().await;
+
+        assert!(matches!(
+            service.apply(&request).await.unwrap(),
+            ConfigurationApplyReport::Busy { .. }
+        ));
+        port.release.notify_one();
+        assert!(matches!(
+            first.await.unwrap(),
+            ConfigurationApplyReport::Applied { .. }
+        ));
     }
 }

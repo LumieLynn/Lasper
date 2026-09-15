@@ -70,23 +70,12 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                     )));
                 }
             };
-            let out_tx = out_tx.clone();
-            tokio::spawn(async move {
-                let response = match execute_nspawn_config_operation(operation, invoking_uid).await
-                {
-                    Ok(result) => {
-                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result})
-                    }
-                    Err(error) => serde_json::json!({"jsonrpc":"2.0","id":id,"error":{
-                        "code":error_code::INTERNAL_ERROR,
-                        "message":error.to_string(),
-                    }}),
-                };
-                if let Ok(line) = serde_json::to_string(&response) {
-                    let _ = out_tx.send(line).await;
-                }
-            });
-            HandleOutcome::Spawned
+            match execute_nspawn_config_operation(operation, invoking_uid).await {
+                Ok(result) => HandleOutcome::Sync(
+                    serde_json::to_value(result).map_err(|error| error.to_string()),
+                ),
+                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+            }
         }
 
         RpcMethod::SystemdUnit => {

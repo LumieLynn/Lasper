@@ -29,11 +29,57 @@ impl App {
         match action {
             ConfigurationAction::Close => self.ui.configuration = None,
             ConfigurationAction::Refresh => self.refresh_configuration(),
+            ConfigurationAction::Preview { generation, edit } => {
+                let Some(events) = self.ui.app_tx.clone() else {
+                    if let Some(view) = self.ui.configuration.as_mut() {
+                        view.finish_preview(
+                            generation,
+                            &edit.target,
+                            Err(ResourceInspectionError::backend(
+                                "Application event channel is unavailable",
+                            )),
+                        );
+                    }
+                    return;
+                };
+                let task = crate::tui::effects::configuration::preview(
+                    self.data.configuration.clone(),
+                    edit,
+                    generation,
+                    events,
+                );
+                if let Some(view) = self.ui.configuration.as_mut() {
+                    view.track_preview(task);
+                }
+            }
+            ConfigurationAction::Apply { generation, edit } => {
+                let Some(events) = self.ui.app_tx.clone() else {
+                    if let Some(view) = self.ui.configuration.as_mut() {
+                        view.finish_apply(
+                            generation,
+                            &edit.target,
+                            Err(ResourceInspectionError::backend(
+                                "Application event channel is unavailable",
+                            )),
+                        );
+                    }
+                    return;
+                };
+                let task = crate::tui::effects::configuration::apply(
+                    self.data.configuration.clone(),
+                    edit,
+                    generation,
+                    events,
+                );
+                if let Some(view) = self.ui.configuration.as_mut() {
+                    view.track_apply(task);
+                }
+            }
             ConfigurationAction::None => {}
         }
     }
 
-    fn refresh_configuration(&mut self) {
+    pub(super) fn refresh_configuration(&mut self) {
         let Some(view) = self.ui.configuration.as_mut() else {
             return;
         };

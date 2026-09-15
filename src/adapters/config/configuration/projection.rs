@@ -51,6 +51,45 @@ pub(super) fn project(
 
 fn read_bind_declarations(content: &str, snapshot: &mut ConfigurationSnapshot) {
     let mut in_files = false;
+    for_each_logical_line(content, |line, number| {
+        read_logical_line(line, number, &mut in_files, snapshot);
+    });
+}
+
+pub(super) fn bind_destinations(content: &str) -> Vec<(usize, std::path::PathBuf)> {
+    let mut in_files = false;
+    let mut destinations = Vec::new();
+    for_each_logical_line(content, |line, number| {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_files = line.eq_ignore_ascii_case("[Files]");
+            return;
+        }
+        if !in_files {
+            return;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return;
+        };
+        if !matches!(key.trim(), "Bind" | "BindReadOnly") {
+            return;
+        }
+        let Some(fields) = parse_nspawn_bind_fields(value.trim()) else {
+            return;
+        };
+        if fields.is_empty() || fields.len() > 3 || fields[0].is_empty() {
+            return;
+        }
+        let destination = fields
+            .get(1)
+            .filter(|destination| !destination.is_empty())
+            .unwrap_or(&fields[0]);
+        destinations.push((number, destination.into()));
+    });
+    destinations
+}
+
+fn for_each_logical_line(content: &str, mut visit: impl FnMut(&str, usize)) {
     let mut logical = String::new();
     let mut first_line = 1;
     // Match conf-parser.c: ignore comment lines even within a continuation;
@@ -81,11 +120,11 @@ fn read_bind_declarations(content: &str, snapshot: &mut ConfigurationSnapshot) {
             logical.push(' ');
             continue;
         }
-        read_logical_line(&logical, first_line, &mut in_files, snapshot);
+        visit(&logical, first_line);
         logical.clear();
     }
     if !logical.is_empty() {
-        read_logical_line(&logical, first_line, &mut in_files, snapshot);
+        visit(&logical, first_line);
     }
 }
 
@@ -147,7 +186,7 @@ fn read_logical_line(
     });
 }
 
-fn x11_scope(source: &Path) -> Option<X11BindingScope> {
+pub(super) fn x11_scope(source: &Path) -> Option<X11BindingScope> {
     let directory = Path::new("/tmp/.X11-unix");
     if source == directory {
         return Some(X11BindingScope::Directory);

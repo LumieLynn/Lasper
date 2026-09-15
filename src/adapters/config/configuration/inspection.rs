@@ -21,19 +21,21 @@ use crate::application::configuration::{
 use crate::domain::machine::MachineName;
 
 pub(crate) async fn inspect(target: ConfigurationTarget) -> Result<ConfigurationSnapshot> {
-    tokio::task::spawn_blocking(move || {
-        inspect_at(
-            target,
-            Path::new("/etc/systemd/nspawn"),
-            Path::new("/run/systemd/nspawn"),
-            &crate::paths::machines_dir(),
-        )
-    })
-    .await
-    .map_err(|error| NspawnError::Runtime(format!("configuration inspection failed: {error}")))
+    tokio::task::spawn_blocking(move || inspect_now(target))
+        .await
+        .map_err(|error| NspawnError::Runtime(format!("configuration inspection failed: {error}")))
 }
 
-fn inspect_at(
+pub(super) fn inspect_now(target: ConfigurationTarget) -> ConfigurationSnapshot {
+    inspect_at(
+        target,
+        Path::new("/etc/systemd/nspawn"),
+        Path::new("/run/systemd/nspawn"),
+        &crate::paths::machines_dir(),
+    )
+}
+
+pub(super) fn inspect_at(
     target: ConfigurationTarget,
     admin: &Path,
     runtime: &Path,

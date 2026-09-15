@@ -9,9 +9,12 @@ use ratatui::{
 };
 
 use super::navigation::ConfigurationPage;
-use super::{ConfigurationPane, ConfigurationView, HitAreas, InspectionState, PreviewTab};
+use super::{
+    ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
+};
 use crate::application::configuration::{
-    ConfigurationCandidateState, ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
+    ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindingChange,
+    X11BindingDeclaration, X11BindingScope,
 };
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
@@ -32,9 +35,19 @@ impl ConfigurationView {
             ConfigurationTarget::Machine(_) => "machine",
             ConfigurationTarget::Image(_) => "image",
         };
+        let state = if self.saving {
+            "Saving"
+        } else if !self.draft.is_empty() {
+            "MOD"
+        } else if matches!(&self.state, InspectionState::Ready(snapshot) if snapshot.document.is_some())
+        {
+            "SET"
+        } else {
+            "Inspection"
+        };
         frame.render_widget(
             Paragraph::new(format!(
-                " Configure: {} | {kind} | Inspection",
+                " Configure: {} | {kind} | {state}",
                 self.target.name()
             ))
             .style(
@@ -83,11 +96,13 @@ impl ConfigurationView {
         if self.hits.preview.width > 0 {
             self.render_preview(frame);
         }
+        let footer = if self.saving {
+            " Saving configuration..."
+        } else {
+            " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Fold  Enter/e Edit  d Remove  u Undo  Ctrl+S Save  [/] Tabs"
+        };
         frame.render_widget(
-            Paragraph::new(
-                " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Fold  Enter Open  [/] Raw/Checks",
-            )
-            .style(Style::default().fg(theme::theme().hint_fg)),
+            Paragraph::new(footer).style(Style::default().fg(theme::theme().hint_fg)),
             rows[2],
         );
         self.hits.refresh = Rect::new(rows[2].x, rows[2].y, 11.min(rows[2].width), rows[2].height);
@@ -97,6 +112,11 @@ impl ConfigurationView {
             11.min(rows[2].width.saturating_sub(11)),
             rows[2].height,
         );
+        if self.discard.is_some() {
+            self.render_discard_confirmation(frame, area);
+        } else if let Some(editor) = &mut self.editor {
+            editor.render(frame, area);
+        }
     }
 
     fn block(&self, title: &'static str, pane: ConfigurationPane) -> Block<'static> {
@@ -140,6 +160,7 @@ impl ConfigurationView {
                 .map(|(index, bind)| {
                     binding_lines(
                         bind,
+                        self.draft.get(&bind.line),
                         self.expanded.contains(&index),
                         rows[0].width.saturating_sub(3),
                     )
@@ -199,6 +220,42 @@ impl ConfigurationView {
             InspectionState::Loading => Cow::Borrowed("Loading configuration…"),
             InspectionState::Failed(error) => Cow::Borrowed(error),
             InspectionState::Ready(snapshot) => {
+                if self.preview_tab == PreviewTab::Diff {
+                    let mut text = match &self.draft_preview {
+                        DraftPreviewState::Clean => {
+                            "No unsaved changes. Edit or remove an X11 bind to generate a diff."
+                                .to_owned()
+                        }
+                        DraftPreviewState::Loading(generation) => {
+                            format!("Calculating draft #{generation}...")
+                        }
+                        DraftPreviewState::Failed {
+                            generation,
+                            message,
+                        } => format!("Draft #{generation} preview failed:\n{message}"),
+                        DraftPreviewState::Ready {
+                            preview: ConfigurationPreview::Ready { diff, .. },
+                            ..
+                        } => diff.clone(),
+                        DraftPreviewState::Ready {
+                            preview: ConfigurationPreview::Unchanged { .. },
+                            ..
+                        } => "The draft does not change the file bytes.".into(),
+                        DraftPreviewState::Ready {
+                            preview: ConfigurationPreview::Blocked { reason },
+                            ..
+                        } => format!("Draft cannot be applied:\n{reason}"),
+                        DraftPreviewState::Ready {
+                            preview: ConfigurationPreview::Conflict { reason },
+                            ..
+                        } => format!("Configuration changed:\n{reason}"),
+                    };
+                    if let Some(error) = &self.apply_error {
+                        text.push_str("\n\nSave did not complete:\n");
+                        text.push_str(error);
+                    }
+                    return Cow::Owned(text);
+                }
                 if self.preview_tab == PreviewTab::Raw {
                     return Cow::Borrowed(
                         snapshot
@@ -299,6 +356,9 @@ impl ConfigurationView {
             };
             self.preview_cache = Some(match raw {
                 Some(document) => config_text::wrapped_lines(&document.content, inner.width),
+                None if self.preview_tab == PreviewTab::Diff => {
+                    diff_lines(&self.preview_text(), inner.width)
+                }
                 None => soft_wrap_text(&self.preview_text(), inner.width as usize)
                     .into_iter()
                     .map(Line::from)
@@ -321,10 +381,54 @@ impl ConfigurationView {
             inner,
         );
     }
+
+    fn render_discard_confirmation(&self, frame: &mut Frame, area: Rect) {
+        let width = 58.min(area.width);
+        let height = 9.min(area.height);
+        let dialog = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(
+                "Discard the unsaved X11 configuration draft?\n\n[y] Discard    [n/Esc] Keep editing",
+            )
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Unsaved changes ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme::theme().dialog_border_warn)),
+            ),
+            dialog,
+        );
+    }
 }
 
-fn binding_lines(bind: &X11BindingDeclaration, expanded: bool, width: u16) -> Vec<Line<'static>> {
-    let label = match bind.scope {
+fn binding_lines(
+    bind: &X11BindingDeclaration,
+    change: Option<&X11BindingChange>,
+    expanded: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let (source, target, readonly, removed) = match change {
+        Some(X11BindingChange::Update {
+            source,
+            guest_target,
+            readonly,
+            ..
+        }) => (source, guest_target, *readonly, false),
+        Some(X11BindingChange::Remove { .. }) => {
+            (&bind.source, &bind.guest_target, bind.readonly, true)
+        }
+        None => (&bind.source, &bind.guest_target, bind.readonly, false),
+    };
+    let label = match x11_scope_for_label(source).unwrap_or_else(|| bind.scope.clone()) {
         X11BindingScope::Directory => "Socket directory (multiple displays)".to_string(),
         X11BindingScope::Socket { display, alternate } => format!(
             ":{display}{}",
@@ -336,21 +440,24 @@ fn binding_lines(bind: &X11BindingDeclaration, expanded: bool, width: u16) -> Ve
         ),
     };
     let mut lines = vec![Line::from(format!(
-        "{} {label} [line {}]",
+        "{} {label} [line {}]{}",
         if expanded { "[-]" } else { "[+]" },
-        bind.line
+        bind.line,
+        if removed {
+            " [MOD remove]"
+        } else if change.is_some() {
+            " [MOD]"
+        } else {
+            ""
+        }
     ))];
     if expanded {
         lines.extend([
-            Line::from(format!("  Source: {}", bind.source.display())),
-            Line::from(format!("  Guest:  {}", bind.guest_target.display())),
+            Line::from(format!("  Source: {}", source.display())),
+            Line::from(format!("  Guest:  {}", target.display())),
             Line::from(format!(
                 "  {}{}",
-                if bind.readonly {
-                    "Read-only"
-                } else {
-                    "Read-write"
-                },
+                if readonly { "Read-only" } else { "Read-write" },
                 if bind.options.is_empty() {
                     String::new()
                 } else {
@@ -367,6 +474,48 @@ fn binding_lines(bind: &X11BindingDeclaration, expanded: bool, width: u16) -> Ve
             soft_wrap_text(&line.to_string(), width as usize)
                 .into_iter()
                 .map(Line::from)
+        })
+        .collect()
+}
+
+fn x11_scope_for_label(path: &std::path::Path) -> Option<X11BindingScope> {
+    let directory = std::path::Path::new("/tmp/.X11-unix");
+    if path == directory {
+        return Some(X11BindingScope::Directory);
+    }
+    let name = path
+        .parent()
+        .filter(|parent| *parent == directory)
+        .and_then(|_| path.file_name())?
+        .to_str()?
+        .strip_prefix('X')?;
+    let alternate = name.ends_with('_');
+    let number = name.strip_suffix('_').unwrap_or(name).parse().ok()?;
+    Some(X11BindingScope::Socket {
+        display: number,
+        alternate,
+    })
+}
+
+fn diff_lines(content: &str, width: u16) -> Vec<Line<'static>> {
+    let t = theme::theme();
+    content
+        .lines()
+        .flat_map(|line| {
+            let style = if line.starts_with("+++") || line.starts_with("---") {
+                Style::default().fg(t.accent)
+            } else if line.starts_with('+') {
+                Style::default().fg(t.success)
+            } else if line.starts_with('-') {
+                Style::default().fg(t.error)
+            } else if line.starts_with("@@") {
+                Style::default().fg(t.warning)
+            } else {
+                Style::default()
+            };
+            soft_wrap_text(line, width as usize)
+                .into_iter()
+                .map(move |wrapped| Line::styled(wrapped, style))
         })
         .collect()
 }
