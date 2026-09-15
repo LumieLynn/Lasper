@@ -85,7 +85,7 @@ impl ConfigurationView {
         }
         frame.render_widget(
             Paragraph::new(
-                " r Refresh  Esc Close  Tab/⇧Tab Pane  ←/→ Fold  Enter Open  [/] Raw/Checks",
+                " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Fold  Enter Open  [/] Raw/Checks",
             )
             .style(Style::default().fg(theme::theme().hint_fg)),
             rows[2],

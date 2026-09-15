@@ -129,7 +129,7 @@ fn mouse_and_keyboard_select_the_same_panes_and_binding() {
     let binding = view.hits.bindings[0].0;
     view.handle_mouse(click(binding));
     assert!(!view.expanded.contains(&0));
-    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     assert!(view.expanded.contains(&0));
 }
 
@@ -198,10 +198,12 @@ async fn closing_view_cancels_its_pending_inspection() {
 fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed() {
     let mut view = loaded();
     view.pane = ConfigurationPane::Navigation;
-    assert!(render(&mut view, 140, 28).contains(">> X11"));
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains(">> X11"));
+    assert!(screen.contains("> [-] Host Integration"));
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
     assert!(render(&mut view, 140, 28).contains("> [-] Host Integration"));
-    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
     let screen = render(&mut view, 140, 28);
     assert!(screen.contains("> [+] Host Integration"));
     assert!(!screen.contains(">> X11"));

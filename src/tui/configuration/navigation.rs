@@ -189,7 +189,13 @@ impl ConfigurationNavigation {
                 let (indent, pointer, disclosure, label) = match item {
                     NavigationItem::Category(category) => (
                         "",
-                        if selected { "> " } else { "  " },
+                        if selected
+                            || matches!(self.selected, NavigationItem::Page(page) if page.category() == *category)
+                        {
+                            "> "
+                        } else {
+                            "  "
+                        },
                         if self.expanded.contains(category) {
                             "[-] "
                         } else {

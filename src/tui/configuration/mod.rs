@@ -221,7 +221,7 @@ impl ConfigurationView {
                     }
                 }
             }
-            (KeyCode::Enter, KeyModifiers::NONE) => match self.pane {
+            (KeyCode::Enter | KeyCode::Char(' '), KeyModifiers::NONE) => match self.pane {
                 ConfigurationPane::Navigation => {}
                 ConfigurationPane::Content => {
                     if let Some(selected) = self.list.selected() {
