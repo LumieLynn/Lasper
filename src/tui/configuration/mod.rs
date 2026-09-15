@@ -298,7 +298,9 @@ impl ConfigurationView {
     }
 
     fn set_change(&mut self, change: X11BindingChange) -> ConfigurationAction {
-        let line = change.line();
+        let line = change
+            .declaration_line()
+            .expect("the current editor changes existing declarations");
         let unchanged = match (&change, &self.state) {
             (
                 X11BindingChange::Update {

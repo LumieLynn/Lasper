@@ -2,7 +2,7 @@ use super::*;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationDiscovery,
     ConfigurationDocument, ConfigurationOrigin, ConfigurationPreview, ConfigurationRevision,
-    ConfigurationWriteTarget, X11BindingDeclaration, X11BindingScope,
+    ConfigurationWriteTarget, X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::runtime::ImageName;
 use ratatui::{backend::TestBackend, Terminal};
@@ -35,6 +35,10 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
             line: 4, source: "/tmp/.X11-unix".into(), guest_target: "/mnt/host-x11".into(),
             readonly: true, options: vec!["idmap".into()], scope: X11BindingScope::Directory,
         }],
+        x11_bind_recommendation: X11BindRecommendation::Ready {
+            private_users: "pick".into(),
+            idmapped: true,
+        },
         other_bind_count: 0, diagnostics: vec![],
     }
 }

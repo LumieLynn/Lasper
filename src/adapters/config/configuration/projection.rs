@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::config::nspawn_file::{parse_nspawn_bind_fields, NspawnConfig};
 use crate::application::configuration::{
     ConfigurationDiscovery, ConfigurationDocument, ConfigurationOrigin, ConfigurationSnapshot,
-    ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
+    ConfigurationTarget, X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
 };
 
 pub(super) fn project(
@@ -27,10 +27,16 @@ pub(super) fn project(
         revision: None,
         write_target: None,
         x11_bindings: Vec::new(),
+        x11_bind_recommendation: X11BindRecommendation::Ready {
+            private_users: "default (systemd-nspawn@ -U)".into(),
+            idmapped: true,
+        },
         other_bind_count: 0,
         diagnostics: Vec::new(),
     };
     if let Some(config) = config {
+        snapshot.x11_bind_recommendation =
+            x11_bind_recommendation(&config.content, &mut snapshot.diagnostics);
         read_bind_declarations(&config.content, &mut snapshot);
         let origin = match config.path.parent() {
             Some(path) if path == Path::new("/etc/systemd/nspawn") => {
@@ -47,6 +53,88 @@ pub(super) fn project(
         });
     }
     snapshot
+}
+
+fn x11_bind_recommendation(content: &str, diagnostics: &mut Vec<String>) -> X11BindRecommendation {
+    let mut in_exec = false;
+    let mut effective = None;
+    for_each_logical_line(content, |line, number| {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_exec = line == "[Exec]";
+            return;
+        }
+        if !in_exec {
+            return;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return;
+        };
+        if key.trim() != "PrivateUsers" {
+            return;
+        }
+        let value = value.trim();
+        match parse_private_users(value) {
+            Some(policy) => effective = Some(policy),
+            None => diagnostics.push(format!(
+                "Line {number}: invalid PrivateUsers={value} is ignored; the preceding or default value remains effective."
+            )),
+        }
+    });
+    effective.unwrap_or_else(|| X11BindRecommendation::Ready {
+        private_users: "default (systemd-nspawn@ -U)".into(),
+        idmapped: true,
+    })
+}
+
+fn parse_private_users(value: &str) -> Option<X11BindRecommendation> {
+    if matches_ignore_ascii_case(value, &["no", "false", "off", "0", "n"]) {
+        return Some(X11BindRecommendation::Ready {
+            private_users: "no".into(),
+            idmapped: false,
+        });
+    }
+    if matches_ignore_ascii_case(value, &["yes", "true", "on", "1", "y"]) {
+        return Some(X11BindRecommendation::Ready {
+            private_users: "yes".into(),
+            idmapped: true,
+        });
+    }
+    if value.eq_ignore_ascii_case("pick") {
+        return Some(X11BindRecommendation::Ready {
+            private_users: "pick".into(),
+            idmapped: true,
+        });
+    }
+    let normalized = value.to_ascii_lowercase();
+    let reason = match normalized.as_str() {
+        "managed" => {
+            "PrivateUsers=managed does not support Lasper's ordinary idmapped display bind policy"
+        }
+        "identity" => "PrivateUsers=identity is not supported by Lasper's display bind policy",
+        _ if numeric_private_users(value) => {
+            "explicit PrivateUsers UID ranges are not yet supported by Lasper's display bind policy"
+        }
+        _ => return None,
+    };
+    Some(X11BindRecommendation::Unsupported {
+        private_users: normalized,
+        reason: reason.into(),
+    })
+}
+
+fn matches_ignore_ascii_case(value: &str, choices: &[&str]) -> bool {
+    choices
+        .iter()
+        .any(|choice| value.eq_ignore_ascii_case(choice))
+}
+
+fn numeric_private_users(value: &str) -> bool {
+    let (shift, range) = value.split_once(':').unwrap_or((value, "65536"));
+    let (Ok(shift), Ok(range)) = (shift.parse::<u32>(), range.parse::<u32>()) else {
+        return false;
+    };
+    range > 0 && shift <= u32::MAX - range
 }
 
 fn read_bind_declarations(content: &str, snapshot: &mut ConfigurationSnapshot) {
@@ -265,6 +353,55 @@ mod tests {
         );
         assert_eq!(result.other_bind_count, 1);
         assert_eq!(result.diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn private_users_policy_derives_the_display_bind_suffix() {
+        let cases = [
+            ("", true, "default (systemd-nspawn@ -U)"),
+            ("PrivateUsers=no\n", false, "no"),
+            ("PrivateUsers=yes\n", true, "yes"),
+            ("PrivateUsers=pick\n", true, "pick"),
+        ];
+        for (setting, idmapped, label) in cases {
+            let result = snapshot(&format!("[Exec]\n{setting}[Files]\n"));
+            assert_eq!(
+                result.x11_bind_recommendation,
+                X11BindRecommendation::Ready {
+                    private_users: label.into(),
+                    idmapped,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_private_users_modes_are_explicit() {
+        for (value, label) in [
+            ("managed", "managed"),
+            ("identity", "identity"),
+            ("100000:65536", "100000:65536"),
+        ] {
+            let result = snapshot(&format!("[Exec]\nPrivateUsers={value}\n[Files]\n"));
+            assert!(matches!(
+                result.x11_bind_recommendation,
+                X11BindRecommendation::Unsupported { private_users, .. } if private_users == label
+            ));
+        }
+    }
+
+    #[test]
+    fn invalid_private_users_value_keeps_the_preceding_effective_policy() {
+        let result = snapshot("[Exec]\nPrivateUsers=no\nPrivateUsers=not-a-policy\n[Files]\n");
+        assert_eq!(
+            result.x11_bind_recommendation,
+            X11BindRecommendation::Ready {
+                private_users: "no".into(),
+                idmapped: false,
+            }
+        );
+        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics[0].contains("ignored"));
     }
 
     #[test]

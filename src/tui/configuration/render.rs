@@ -417,6 +417,9 @@ fn binding_lines(
     width: u16,
 ) -> Vec<Line<'static>> {
     let (source, target, readonly, removed) = match change {
+        Some(X11BindingChange::Add { .. }) => {
+            unreachable!("new bindings are not rendered as existing declarations")
+        }
         Some(X11BindingChange::Update {
             source,
             guest_target,

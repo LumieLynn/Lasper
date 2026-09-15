@@ -6,12 +6,13 @@ use std::path::{Component, Path, PathBuf};
 
 use super::inspection::{inspect, inspect_at};
 use super::projection::{bind_destinations, x11_scope};
-use crate::adapters::config::nspawn_file::escape_nspawn_bind_path;
+use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_begin_marker};
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationEdit, ConfigurationOrigin,
-    ConfigurationPreview, ConfigurationSnapshot, X11BindingChange, X11BindingDeclaration,
+    ConfigurationPreview, ConfigurationSnapshot, X11BindRecommendation, X11BindingChange,
+    X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::machine::MachineName;
 
@@ -166,7 +167,12 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
         ));
     }
 
-    let mutations = match calculate_mutations(&document.content, &snapshot.x11_bindings, edit) {
+    let mutations = match calculate_mutations(
+        &document.content,
+        &snapshot.x11_bindings,
+        &snapshot.x11_bind_recommendation,
+        edit,
+    ) {
         Ok(mutations) => mutations,
         Err(reason) => return Preparation::Blocked(reason),
     };
@@ -206,27 +212,31 @@ struct Mutation {
     line: usize,
     start: usize,
     end: usize,
-    old: String,
-    new: Option<String>,
+    old: Vec<String>,
+    new: Vec<String>,
     replacement: Option<String>,
 }
 
 fn calculate_mutations(
     content: &str,
     declarations: &[X11BindingDeclaration],
+    recommendation: &X11BindRecommendation,
     edit: &ConfigurationEdit,
 ) -> std::result::Result<Vec<Mutation>, String> {
     let lines = physical_lines(content);
     let mut requested = BTreeMap::new();
+    let mut additions = Vec::new();
     for change in &edit.x11_changes {
-        let line = change.line();
-        if line == 0 {
-            return Err("Declaration line numbers start at one".into());
-        }
-        if requested.insert(line, change).is_some() {
-            return Err(format!(
-                "Line {line} is changed more than once in this draft"
-            ));
+        match change.declaration_line() {
+            Some(0) => return Err("Declaration line numbers start at one".into()),
+            Some(line) => {
+                if requested.insert(line, change).is_some() {
+                    return Err(format!(
+                        "Line {line} is changed more than once in this draft"
+                    ));
+                }
+            }
+            None => additions.push(change),
         }
     }
 
@@ -234,6 +244,9 @@ fn calculate_mutations(
     let final_targets = bind_destinations(content)
         .into_iter()
         .filter_map(|(line, target)| match requested.get(&line) {
+            Some(X11BindingChange::Add { .. }) => {
+                unreachable!("additions are not indexed by declaration line")
+            }
             Some(X11BindingChange::Remove { .. }) => None,
             Some(X11BindingChange::Update { guest_target, .. }) => {
                 Some((line, guest_target.clone()))
@@ -260,6 +273,9 @@ fn calculate_mutations(
         }
 
         let new = match change {
+            X11BindingChange::Add { .. } => {
+                unreachable!("additions are not indexed by declaration line")
+            }
             X11BindingChange::Remove { .. } => None,
             X11BindingChange::Update {
                 source,
@@ -301,15 +317,51 @@ fn calculate_mutations(
             line: line.number,
             start: line.start,
             end: line.end,
-            old: line.body.to_string(),
-            new: new.as_ref().map(|replacement| {
-                replacement
-                    .strip_suffix(line.ending)
-                    .unwrap_or(replacement)
-                    .to_string()
-            }),
+            old: vec![line.body.to_string()],
+            new: new
+                .as_ref()
+                .map(|replacement| {
+                    vec![replacement
+                        .strip_suffix(line.ending)
+                        .unwrap_or(replacement)
+                        .to_string()]
+                })
+                .unwrap_or_default(),
             replacement: new,
         });
+    }
+
+    if !additions.is_empty() {
+        let idmapped = match recommendation {
+            X11BindRecommendation::Ready { idmapped, .. } => *idmapped,
+            X11BindRecommendation::Unsupported { reason, .. } => return Err(reason.clone()),
+        };
+        let mut rendered = Vec::with_capacity(additions.len());
+        let mut occupied_targets = final_targets
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect::<Vec<_>>();
+        for change in additions {
+            let X11BindingChange::Add { source } = change else {
+                unreachable!("changes without declaration lines are additions")
+            };
+            validate_source(source).map_err(|reason| format!("New X11 bind: {reason}"))?;
+            if !matches!(x11_scope(source), Some(X11BindingScope::Socket { .. })) {
+                return Err(format!(
+                    "New X11 bind: {} is not an individual X11 socket endpoint",
+                    source.display()
+                ));
+            }
+            if occupied_targets.iter().any(|target| target == source) {
+                return Err(format!(
+                    "New X11 bind: guest target {} is already used by another bind",
+                    source.display()
+                ));
+            }
+            occupied_targets.push(source.clone());
+            rendered.push(render_new_binding(source, idmapped));
+        }
+        mutations.push(insertion_mutation(content, &lines, &rendered));
     }
     Ok(mutations)
 }
@@ -411,12 +463,121 @@ fn render_binding(
     rendered
 }
 
+fn render_new_binding(source: &Path, idmapped: bool) -> String {
+    let source = escape_nspawn_bind_path(source.to_str().expect("validated UTF-8 path"));
+    let suffix = if idmapped { ":idmap" } else { "" };
+    format!("BindReadOnly={source}:{source}{suffix}")
+}
+
+fn insertion_mutation(content: &str, lines: &[PhysicalLine<'_>], bindings: &[String]) -> Mutation {
+    let ending = preferred_line_ending(content);
+    let mut in_files = false;
+    let mut files_seen = false;
+    let mut offset = content.len();
+    let mut before_line = lines.len().saturating_add(1);
+
+    for line in lines {
+        let trimmed = line.body.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if trimmed.eq_ignore_ascii_case("[Files]") {
+                in_files = true;
+                files_seen = true;
+                offset = line.end;
+                before_line = line.number.saturating_add(1);
+            } else if in_files {
+                in_files = false;
+                offset = line.start;
+                before_line = line.number;
+            }
+        } else if in_files && is_nvidia_begin_marker(line.body) {
+            offset = line.start;
+            before_line = line.number;
+            break;
+        } else if in_files {
+            offset = line.end;
+            before_line = line.number.saturating_add(1);
+        }
+    }
+
+    let mut replacement = String::new();
+    if files_seen {
+        if offset > 0 && !content[..offset].ends_with('\n') {
+            replacement.push_str(ending);
+        }
+    } else {
+        if !content.is_empty() {
+            if !content.ends_with('\n') {
+                replacement.push_str(ending);
+            }
+            let double_ending = format!("{ending}{ending}");
+            if !content.ends_with(&double_ending) {
+                replacement.push_str(ending);
+            }
+        }
+        replacement.push_str("[Files]");
+        replacement.push_str(ending);
+    }
+    for binding in bindings {
+        replacement.push_str(binding);
+        replacement.push_str(ending);
+    }
+    let new = physical_lines(&replacement)
+        .into_iter()
+        .map(|line| line.body.to_string())
+        .collect();
+    Mutation {
+        line: before_line.max(1),
+        start: offset,
+        end: offset,
+        old: Vec::new(),
+        new,
+        replacement: Some(replacement),
+    }
+}
+
+fn preferred_line_ending(content: &str) -> &'static str {
+    match content.find('\n') {
+        Some(index) if content.as_bytes().get(index.wrapping_sub(1)) == Some(&b'\r') => "\r\n",
+        _ => "\n",
+    }
+}
+
 fn render_diff(path: &Path, content: &str, mutations: &[Mutation]) -> String {
     let lines = physical_lines(content);
+    let mut diff = format!("--- {}\n+++ {}\n", path.display(), path.display());
+    if lines.is_empty() {
+        let inserted = mutations
+            .iter()
+            .flat_map(|mutation| mutation.new.iter())
+            .collect::<Vec<_>>();
+        diff.push_str(&format!("@@ -0,0 +1,{} @@\n", inserted.len()));
+        for line in inserted {
+            diff.push('+');
+            diff.push_str(line);
+            diff.push('\n');
+        }
+        return diff;
+    }
+
     let mut ranges = Vec::<(usize, usize)>::new();
     for mutation in mutations {
-        let start = mutation.line.saturating_sub(DIFF_CONTEXT_LINES).max(1);
-        let end = (mutation.line + DIFF_CONTEXT_LINES).min(lines.len());
+        let (start, end) = if mutation.old.is_empty() {
+            let point = mutation.line.clamp(1, lines.len() + 1);
+            (
+                point.saturating_sub(DIFF_CONTEXT_LINES).max(1),
+                point
+                    .saturating_add(DIFF_CONTEXT_LINES.saturating_sub(1))
+                    .min(lines.len()),
+            )
+        } else {
+            (
+                mutation.line.saturating_sub(DIFF_CONTEXT_LINES).max(1),
+                mutation
+                    .line
+                    .saturating_add(DIFF_CONTEXT_LINES)
+                    .min(lines.len()),
+            )
+        };
         match ranges.last_mut() {
             Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
                 *previous_end = (*previous_end).max(end);
@@ -424,32 +585,52 @@ fn render_diff(path: &Path, content: &str, mutations: &[Mutation]) -> String {
             _ => ranges.push((start, end)),
         }
     }
-    let by_line = mutations
+    let replacements = mutations
         .iter()
+        .filter(|mutation| !mutation.old.is_empty())
         .map(|mutation| (mutation.line, mutation))
         .collect::<BTreeMap<_, _>>();
-    let mut diff = format!("--- {}\n+++ {}\n", path.display(), path.display());
     for (start, end) in ranges {
-        let removed_before = mutations
+        let delta_before = mutations
             .iter()
-            .filter(|mutation| mutation.line < start && mutation.new.is_none())
-            .count();
-        let removed_here = mutations
-            .iter()
-            .filter(|mutation| (start..=end).contains(&mutation.line) && mutation.new.is_none())
-            .count();
+            .filter(|mutation| mutation.line < start)
+            .map(|mutation| mutation.new.len() as isize - mutation.old.len() as isize)
+            .sum::<isize>();
         let old_count = end - start + 1;
-        let new_start = start.saturating_sub(removed_before);
-        let new_count = old_count - removed_here;
+        let delta_here = mutations
+            .iter()
+            .filter(|mutation| {
+                if mutation.old.is_empty() {
+                    (start..=end.saturating_add(1)).contains(&mutation.line)
+                } else {
+                    (start..=end).contains(&mutation.line)
+                }
+            })
+            .map(|mutation| mutation.new.len() as isize - mutation.old.len() as isize)
+            .sum::<isize>();
+        let new_start = (start as isize + delta_before).max(0) as usize;
+        let new_count = (old_count as isize + delta_here).max(0) as usize;
         diff.push_str(&format!(
             "@@ -{start},{old_count} +{new_start},{new_count} @@\n"
         ));
         for line_number in start..=end {
-            if let Some(mutation) = by_line.get(&line_number) {
-                diff.push('-');
-                diff.push_str(&mutation.old);
-                diff.push('\n');
-                if let Some(new) = &mutation.new {
+            for mutation in mutations
+                .iter()
+                .filter(|mutation| mutation.old.is_empty() && mutation.line == line_number)
+            {
+                for new in &mutation.new {
+                    diff.push('+');
+                    diff.push_str(new);
+                    diff.push('\n');
+                }
+            }
+            if let Some(mutation) = replacements.get(&line_number) {
+                for old in &mutation.old {
+                    diff.push('-');
+                    diff.push_str(old);
+                    diff.push('\n');
+                }
+                for new in &mutation.new {
                     diff.push('+');
                     diff.push_str(new);
                     diff.push('\n');
@@ -457,6 +638,16 @@ fn render_diff(path: &Path, content: &str, mutations: &[Mutation]) -> String {
             } else if let Some(line) = lines.get(line_number - 1) {
                 diff.push(' ');
                 diff.push_str(line.body);
+                diff.push('\n');
+            }
+        }
+        for mutation in mutations
+            .iter()
+            .filter(|mutation| mutation.old.is_empty() && mutation.line == end + 1)
+        {
+            for new in &mutation.new {
+                diff.push('+');
+                diff.push_str(new);
                 diff.push('\n');
             }
         }
@@ -540,6 +731,190 @@ mod tests {
             change.after,
             "[Files]\nBind=/dev/dri\nBind=/tmp/.X11-unix/X1:/mnt/X1\n"
         );
+    }
+
+    #[test]
+    fn adds_bind_to_the_last_files_section_without_reformatting_crlf_content() {
+        let source =
+            "[Exec]\r\nBoot=yes\r\n[Files]\r\nBind=/dev/dri\r\n[Network]\r\nPrivate=yes\r\n";
+        let (snapshot, revision) = fixture(source);
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0_".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Exec]\r\nBoot=yes\r\n[Files]\r\nBind=/dev/dri\r\nBindReadOnly=/tmp/.X11-unix/X0_:/tmp/.X11-unix/X0_:idmap\r\n[Network]\r\nPrivate=yes\r\n"
+        );
+        assert!(change
+            .diff
+            .contains("+BindReadOnly=/tmp/.X11-unix/X0_:/tmp/.X11-unix/X0_:idmap"));
+        assert!(!change.diff.contains("-Bind=/dev/dri"));
+    }
+
+    #[test]
+    fn adds_a_files_section_when_the_administrator_document_has_none() {
+        let (snapshot, revision) = fixture("[Exec]\nBoot=yes");
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Exec]\nBoot=yes\n\n[Files]\nBindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap\n"
+        );
+        assert!(change.diff.contains("+[Files]"));
+        assert!(change
+            .diff
+            .contains("+BindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap"));
+    }
+
+    #[test]
+    fn adds_to_an_empty_administrator_document() {
+        let (snapshot, revision) = fixture("");
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X1".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Files]\nBindReadOnly=/tmp/.X11-unix/X1:/tmp/.X11-unix/X1:idmap\n"
+        );
+        assert!(change.diff.contains("@@ -0,0 +1,2 @@"));
+    }
+
+    #[test]
+    fn adds_to_the_last_repeated_files_section() {
+        let source = "[Files]\nBind=/dev/dri\n[Exec]\nBoot=yes\n[Files]\nBind=/dev/snd\n[Network]\nPrivate=yes\n";
+        let (snapshot, revision) = fixture(source);
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X2".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Files]\nBind=/dev/dri\n[Exec]\nBoot=yes\n[Files]\nBind=/dev/snd\nBindReadOnly=/tmp/.X11-unix/X2:/tmp/.X11-unix/X2:idmap\n[Network]\nPrivate=yes\n"
+        );
+    }
+
+    #[test]
+    fn additions_reject_existing_and_intra_draft_target_collisions() {
+        let (snapshot, revision) = fixture("[Files]\nBind=/dev/dri:/tmp/.X11-unix/X0\n");
+        let collision = edit(
+            revision.clone(),
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        assert!(matches!(
+            prepare(&snapshot, &collision),
+            Preparation::Blocked(_)
+        ));
+
+        let duplicate = edit(
+            revision,
+            vec![
+                X11BindingChange::Add {
+                    source: "/tmp/.X11-unix/X0".into(),
+                },
+                X11BindingChange::Add {
+                    source: "/tmp/.X11-unix/X0".into(),
+                },
+            ],
+        );
+        assert!(matches!(
+            prepare(&snapshot, &duplicate),
+            Preparation::Blocked(_)
+        ));
+    }
+
+    #[test]
+    fn addition_omits_idmap_only_for_private_users_no() {
+        let (snapshot, revision) = fixture("[Exec]\nPrivateUsers=no\n[Files]\nBind=/dev/dri\n");
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert!(change
+            .after
+            .contains("BindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0\n"));
+        assert!(!change.after.contains("X0:idmap"));
+    }
+
+    #[test]
+    fn unsupported_private_users_policy_blocks_addition() {
+        let (snapshot, revision) = fixture("[Exec]\nPrivateUsers=managed\n[Files]\n");
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        let Preparation::Blocked(reason) = prepare(&snapshot, &request) else {
+            panic!("expected a blocked change");
+        };
+        assert!(reason.contains("PrivateUsers=managed"));
+    }
+
+    #[test]
+    fn additions_are_inserted_before_the_managed_nvidia_block() {
+        let source = "[Files]\nBind=/dev/dri\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nX-Lasper-Nvidia-End=true\n";
+        let (snapshot, revision) = fixture(source);
+        let request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Files]\nBind=/dev/dri\nBindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nX-Lasper-Nvidia-End=true\n"
+        );
+    }
+
+    #[test]
+    fn additions_reject_directory_wide_or_non_x11_sources() {
+        for source in ["/tmp/.X11-unix", "/tmp/not-x11/X0"] {
+            let (snapshot, revision) = fixture("[Files]\n");
+            let request = edit(
+                revision,
+                vec![X11BindingChange::Add {
+                    source: source.into(),
+                }],
+            );
+            assert!(matches!(
+                prepare(&snapshot, &request),
+                Preparation::Blocked(_)
+            ));
+        }
     }
 
     #[test]

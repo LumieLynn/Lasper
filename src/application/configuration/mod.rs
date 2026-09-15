@@ -158,6 +158,21 @@ pub struct X11BindingDeclaration {
     pub scope: X11BindingScope,
 }
 
+/// Policy for a newly selected X11 endpoint. This is derived from the
+/// inspected startup configuration; callers cannot choose a mount suffix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum X11BindRecommendation {
+    Ready {
+        private_users: String,
+        idmapped: bool,
+    },
+    Unsupported {
+        private_users: String,
+        reason: String,
+    },
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationSnapshot {
     pub target: ConfigurationTarget,
@@ -168,6 +183,7 @@ pub struct ConfigurationSnapshot {
     pub revision: Option<ConfigurationRevision>,
     pub write_target: Option<ConfigurationWriteTarget>,
     pub x11_bindings: Vec<X11BindingDeclaration>,
+    pub x11_bind_recommendation: X11BindRecommendation,
     pub other_bind_count: usize,
     pub diagnostics: Vec<String>,
 }
@@ -186,6 +202,9 @@ pub struct ConfigurationEdit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
 pub enum X11BindingChange {
+    Add {
+        source: PathBuf,
+    },
     Update {
         line: usize,
         source: PathBuf,
@@ -198,9 +217,10 @@ pub enum X11BindingChange {
 }
 
 impl X11BindingChange {
-    pub fn line(&self) -> usize {
+    pub fn declaration_line(&self) -> Option<usize> {
         match self {
-            Self::Update { line, .. } | Self::Remove { line } => *line,
+            Self::Add { .. } => None,
+            Self::Update { line, .. } | Self::Remove { line } => Some(*line),
         }
     }
 }
