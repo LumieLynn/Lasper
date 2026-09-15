@@ -1,18 +1,22 @@
 use std::borrow::Cow;
 
 use ratatui::{
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
 
+use super::navigation::ConfigurationPage;
 use super::{ConfigurationPane, ConfigurationView, HitAreas, InspectionState, PreviewTab};
 use crate::application::configuration::{
     ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
 };
+use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
+use crate::tui::widgets::display::config_text;
 use crate::tui::{soft_wrap_text, theme};
+use unicode_width::UnicodeWidthStr;
 
 impl ConfigurationView {
     pub(crate) fn render(&mut self, frame: &mut Frame, area: Rect) {
@@ -44,7 +48,7 @@ impl ConfigurationView {
         let content = rows[1];
         if area.width >= 110 {
             let columns = Layout::horizontal([
-                Constraint::Length(22),
+                Constraint::Length(26),
                 Constraint::Percentage(45),
                 Constraint::Min(0),
             ])
@@ -54,7 +58,7 @@ impl ConfigurationView {
             self.hits.preview = columns[2];
         } else if area.width >= 70 && self.pane != ConfigurationPane::Preview {
             let columns =
-                Layout::horizontal([Constraint::Length(22), Constraint::Min(0)]).split(content);
+                Layout::horizontal([Constraint::Length(26), Constraint::Min(0)]).split(content);
             self.hits.navigation = columns[0];
             self.hits.content = columns[1];
         } else {
@@ -65,21 +69,25 @@ impl ConfigurationView {
             }
         }
         if self.hits.navigation.width > 0 {
-            frame.render_widget(
-                Paragraph::new("Host Integration\n  X11 (view)")
-                    .block(self.block(" Sections ", ConfigurationPane::Navigation)),
+            self.navigation.render(
+                frame,
                 self.hits.navigation,
+                self.pane == ConfigurationPane::Navigation,
             );
         }
         if self.hits.content.width > 0 {
-            self.render_content(frame);
+            match self.navigation.active_page() {
+                ConfigurationPage::X11 => self.render_content(frame),
+            }
         }
         if self.hits.preview.width > 0 {
             self.render_preview(frame);
         }
         frame.render_widget(
-            Paragraph::new(" r Refresh  Esc Close  Tab/⇧Tab Pane  Enter Expand  [/] Checks/Raw")
-                .style(Style::default().fg(theme::theme().hint_fg)),
+            Paragraph::new(
+                " r Refresh  Esc Close  Tab/⇧Tab Pane  ←/→ Fold  Enter Open  [/] Raw/Checks",
+            )
+            .style(Style::default().fg(theme::theme().hint_fg)),
             rows[2],
         );
         self.hits.refresh = Rect::new(rows[2].x, rows[2].y, 11.min(rows[2].width), rows[2].height);
@@ -92,13 +100,17 @@ impl ConfigurationView {
     }
 
     fn block(&self, title: &'static str, pane: ConfigurationPane) -> Block<'static> {
-        Block::default()
-            .title(title)
+        let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(
                 Style::default().fg(crate::tui::widget_border_color(self.pane == pane, true)),
-            )
+            );
+        if title.is_empty() {
+            block
+        } else {
+            block.title(title)
+        }
     }
 
     fn render_content(&mut self, frame: &mut Frame) {
@@ -129,7 +141,7 @@ impl ConfigurationView {
                     binding_lines(
                         bind,
                         self.expanded.contains(&index),
-                        rows[0].width.saturating_sub(2),
+                        rows[0].width.saturating_sub(3),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -141,8 +153,12 @@ impl ConfigurationView {
                         .map(|lines| ListItem::new(Text::from(lines)))
                         .collect::<Vec<_>>(),
                 )
-                .highlight_symbol("› ")
-                .highlight_style(Style::default().fg(theme::theme().accent)),
+                .highlight_symbol(">> ")
+                .highlight_style(
+                    Style::default()
+                        .fg(theme::theme().list_highlight_symbol)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 rows[0],
                 &mut self.list,
             );
@@ -219,51 +235,60 @@ impl ConfigurationView {
     }
 
     fn render_preview(&mut self, frame: &mut Frame) {
-        let block = self.block(" Source / Checks ", ConfigurationPane::Preview);
-        let inner = block.inner(self.hits.preview);
-        frame.render_widget(block, self.hits.preview);
-        let rows = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(inner);
-        let tab_style = |tab| {
-            if self.preview_tab == tab {
+        let tab_widths = PreviewTab::ALL.map(|tab| (tab, tab.label().width()));
+        self.hits.preview_tabs =
+            bordered_title_tab_hitboxes(self.hits.preview, Alignment::Left, &tab_widths, 1);
+        let t = theme::theme();
+        let mut spans = Vec::new();
+        for tab in PreviewTab::ALL {
+            if !spans.is_empty() {
+                spans.push(Span::raw("-"));
+            }
+            let style = if self.preview_tab == tab {
                 Style::default()
-                    .fg(theme::theme().accent)
+                    .fg(if self.pane == ConfigurationPane::Preview {
+                        t.tab_active_focused
+                    } else {
+                        t.tab_active_unfocused
+                    })
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::theme().text_secondary)
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(" Checks  ", tab_style(PreviewTab::Checks)),
-                Span::styled("Raw ", tab_style(PreviewTab::Raw)),
-            ])),
-            rows[0],
-        );
-        self.hits.checks_tab =
-            Rect::new(rows[0].x, rows[0].y, 9.min(rows[0].width), rows[0].height);
-        self.hits.raw_tab = Rect::new(
-            rows[0].x.saturating_add(9),
-            rows[0].y,
-            4.min(rows[0].width.saturating_sub(9)),
-            rows[0].height,
-        );
-        if self.preview_cache.is_none() || self.preview_width != rows[1].width {
-            self.preview_cache = Some(soft_wrap_text(&self.preview_text(), rows[1].width as usize));
-            self.preview_width = rows[1].width;
+                Style::default().fg(t.tab_inactive)
+            };
+            spans.push(Span::styled(tab.label(), style));
+        }
+        let block = self
+            .block("", ConfigurationPane::Preview)
+            .title(Line::from(spans));
+        let inner = block.inner(self.hits.preview);
+        frame.render_widget(block, self.hits.preview);
+        if self.preview_cache.is_none() || self.preview_width != inner.width {
+            let raw = match (&self.state, self.preview_tab) {
+                (InspectionState::Ready(snapshot), PreviewTab::Raw) => snapshot.document.as_ref(),
+                _ => None,
+            };
+            self.preview_cache = Some(match raw {
+                Some(document) => config_text::wrapped_lines(&document.content, inner.width),
+                None => soft_wrap_text(&self.preview_text(), inner.width as usize)
+                    .into_iter()
+                    .map(Line::from)
+                    .collect(),
+            });
+            self.preview_width = inner.width;
         }
         let lines = self.preview_cache.as_ref().expect("preview was built");
-        self.preview_max_scroll = lines.len().saturating_sub(rows[1].height as usize);
+        self.preview_max_scroll = lines.len().saturating_sub(inner.height as usize);
         self.preview_scroll = self.preview_scroll.min(self.preview_max_scroll);
         frame.render_widget(
             Paragraph::new(
                 lines
                     .iter()
                     .skip(self.preview_scroll)
-                    .take(rows[1].height as usize)
-                    .map(|line| Line::from(line.as_str()))
+                    .take(inner.height as usize)
+                    .cloned()
                     .collect::<Vec<_>>(),
             ),
-            rows[1],
+            inner,
         );
     }
 }
@@ -282,7 +307,7 @@ fn binding_lines(bind: &X11BindingDeclaration, expanded: bool, width: u16) -> Ve
     };
     let mut lines = vec![Line::from(format!(
         "{} {label} [line {}]",
-        if expanded { "▾" } else { "▸" },
+        if expanded { "[-]" } else { "[+]" },
         bind.line
     ))];
     if expanded {

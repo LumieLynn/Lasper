@@ -2,16 +2,20 @@
 //! services by the app/effects layer; no workspace selection is borrowed after
 //! opening this view.
 
+mod navigation;
 mod render;
 
 use std::collections::BTreeSet;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
+use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
 use crate::application::configuration::{ConfigurationSnapshot, ConfigurationTarget};
 use crate::application::inspection::ResourceInspectionError;
+use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
+use navigation::ConfigurationNavigation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigurationPane {
@@ -24,6 +28,25 @@ pub(crate) enum ConfigurationPane {
 enum PreviewTab {
     Checks,
     Raw,
+}
+
+impl PreviewTab {
+    const ALL: [Self; 2] = [Self::Raw, Self::Checks];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Raw => " Raw ",
+            Self::Checks => " Checks ",
+        }
+    }
+
+    fn adjacent(self, forward: bool) -> Self {
+        let index = Self::ALL
+            .iter()
+            .position(|tab| *tab == self)
+            .expect("preview tab is listed");
+        Self::ALL[(index + if forward { 1 } else { Self::ALL.len() - 1 }) % Self::ALL.len()]
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,8 +67,7 @@ struct HitAreas {
     navigation: Rect,
     content: Rect,
     preview: Rect,
-    checks_tab: Rect,
-    raw_tab: Rect,
+    preview_tabs: Vec<TitleTabHitbox<PreviewTab>>,
     refresh: Rect,
     close: Rect,
     bindings: Vec<(Rect, usize)>,
@@ -57,13 +79,14 @@ pub(crate) struct ConfigurationView {
     pending: Option<tokio::task::JoinHandle<()>>,
     state: InspectionState,
     pane: ConfigurationPane,
+    navigation: ConfigurationNavigation,
     preview_tab: PreviewTab,
     list: ListState,
     expanded: BTreeSet<usize>,
     preview_scroll: usize,
     preview_max_scroll: usize,
     preview_width: u16,
-    preview_cache: Option<Vec<String>>,
+    preview_cache: Option<Vec<Line<'static>>>,
     hits: HitAreas,
 }
 
@@ -75,6 +98,7 @@ impl ConfigurationView {
             pending: None,
             state: InspectionState::Loading,
             pane: ConfigurationPane::Content,
+            navigation: ConfigurationNavigation::default(),
             preview_tab: PreviewTab::Checks,
             list: ListState::default(),
             expanded: BTreeSet::new(),
@@ -143,7 +167,9 @@ impl ConfigurationView {
     }
 
     fn scroll(&mut self, down: bool) {
-        if self.pane == ConfigurationPane::Preview {
+        if self.pane == ConfigurationPane::Navigation {
+            self.navigation.move_selection(down);
+        } else if self.pane == ConfigurationPane::Preview {
             self.preview_scroll = if down {
                 self.preview_scroll
                     .saturating_add(1)
@@ -177,13 +203,26 @@ impl ConfigurationView {
             (KeyCode::Char('[') | KeyCode::Char(']'), KeyModifiers::NONE)
                 if self.pane == ConfigurationPane::Preview =>
             {
-                self.select_tab(match self.preview_tab {
-                    PreviewTab::Checks => PreviewTab::Raw,
-                    PreviewTab::Raw => PreviewTab::Checks,
-                });
+                self.select_tab(self.preview_tab.adjacent(key.code == KeyCode::Char(']')));
+            }
+            (_, KeyModifiers::NONE) if self.pane == ConfigurationPane::Navigation => {
+                if self.navigation.handle_key(key.code) {
+                    self.pane = ConfigurationPane::Content;
+                }
+            }
+            (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE)
+                if self.pane == ConfigurationPane::Content =>
+            {
+                if let Some(selected) = self.list.selected() {
+                    if key.code == KeyCode::Right {
+                        self.expanded.insert(selected);
+                    } else {
+                        self.expanded.remove(&selected);
+                    }
+                }
             }
             (KeyCode::Enter, KeyModifiers::NONE) => match self.pane {
-                ConfigurationPane::Navigation => self.pane = ConfigurationPane::Content,
+                ConfigurationPane::Navigation => {}
                 ConfigurationPane::Content => {
                     if let Some(selected) = self.list.selected() {
                         if !self.expanded.remove(&selected) {
@@ -207,12 +246,11 @@ impl ConfigurationView {
             if self.hits.close.contains(position) {
                 return ConfigurationAction::Close;
             }
-            if self.hits.checks_tab.contains(position) {
-                self.select_tab(PreviewTab::Checks);
-            } else if self.hits.raw_tab.contains(position) {
-                self.select_tab(PreviewTab::Raw);
+            if let Some(tab) = clicked_title_tab(&self.hits.preview_tabs, mouse) {
+                self.select_tab(tab);
             } else if self.hits.navigation.contains(position) {
                 self.pane = ConfigurationPane::Navigation;
+                self.navigation.click(position);
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
                 if let Some((_, selected)) = self
@@ -237,6 +275,8 @@ impl ConfigurationView {
                 self.pane = ConfigurationPane::Preview;
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
+            } else if self.hits.navigation.contains(position) {
+                self.pane = ConfigurationPane::Navigation;
             } else {
                 return ConfigurationAction::None;
             }

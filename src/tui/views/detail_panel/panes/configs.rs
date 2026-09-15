@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::Style,
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
@@ -29,27 +29,7 @@ pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
         lines.push(Line::from(""));
     }
     if let Some(text) = &data.config_content {
-        lines.extend(text.lines().map(|l| {
-            if l.starts_with('[') && l.ends_with(']') {
-                Line::from(Span::styled(
-                    l.to_owned(),
-                    Style::default()
-                        .fg(t.config_section)
-                        .add_modifier(Modifier::BOLD),
-                ))
-            } else if let Some(pos) = l.find('=') {
-                let (k, v) = l.split_at(pos);
-                Line::from(vec![
-                    Span::styled(k.to_owned(), Style::default().fg(t.config_key)),
-                    Span::styled(v.to_owned(), Style::default().fg(t.config_value)),
-                ])
-            } else {
-                Line::from(Span::styled(
-                    l.to_owned(),
-                    Style::default().fg(t.text_secondary),
-                ))
-            }
-        }));
+        lines.extend(crate::tui::widgets::display::config_text::highlighted_lines(text));
     } else if let Some(error) = &data.config_error {
         lines.push(Line::from(Span::styled(
             format!("Configuration unavailable: {error}"),

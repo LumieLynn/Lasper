@@ -100,7 +100,13 @@ fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Preview);
     render(&mut view, 60, 15);
-    let raw_tab = view.hits.raw_tab;
+    let raw_tab = view
+        .hits
+        .preview_tabs
+        .iter()
+        .find(|tab| tab.value == PreviewTab::Raw)
+        .unwrap()
+        .area;
     view.handle_mouse(click(raw_tab));
     let screen = render(&mut view, 60, 15);
     assert!(screen.contains("PRIVATE_VALUE=secret"));
@@ -185,5 +191,95 @@ async fn closing_view_cancels_its_pending_inspection() {
             .await
             .unwrap()
             .is_err()
+    );
+}
+
+#[test]
+fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed() {
+    let mut view = loaded();
+    view.pane = ConfigurationPane::Navigation;
+    assert!(render(&mut view, 140, 28).contains(">> X11"));
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    assert!(render(&mut view, 140, 28).contains("> [-] Host Integration"));
+    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains("> [+] Host Integration"));
+    assert!(!screen.contains(">> X11"));
+    assert!(screen.contains("/mnt/host-x11"));
+    assert_eq!(view.pane, ConfigurationPane::Navigation);
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert!(render(&mut view, 140, 28).contains(">> X11"));
+    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(view.pane, ConfigurationPane::Content);
+    assert_eq!(view.list.selected(), Some(0));
+    assert!(view.expanded.contains(&0));
+}
+
+#[test]
+fn tree_rows_are_clickable_and_binding_disclosure_is_separate_from_selection() {
+    let mut view = loaded();
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains(">> [-] Socket directory"));
+    let parent = Rect::new(view.hits.navigation.x + 1, view.hits.navigation.y + 1, 1, 1);
+    view.handle_mouse(click(parent));
+    assert!(render(&mut view, 140, 28).contains("> [+] Host Integration"));
+    view.handle_mouse(click(parent));
+    render(&mut view, 140, 28);
+    view.handle_mouse(click(Rect::new(parent.x, parent.y + 1, 1, 1)));
+    assert!(render(&mut view, 140, 28).contains(">> X11"));
+    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+    assert!(render(&mut view, 140, 28).contains(">> [+] Socket directory"));
+    view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+    assert!(render(&mut view, 140, 28).contains(">> [-] Socket directory"));
+}
+
+#[test]
+fn preview_tabs_use_the_border_and_only_visible_titles_are_clickable() {
+    for width in [140, 60, 14, 8] {
+        let mut view = loaded();
+        view.pane = ConfigurationPane::Preview;
+        let screen = render(&mut view, width, 18);
+        assert!(!screen.contains("Source / Checks"));
+        for tab in view.hits.preview_tabs.clone() {
+            assert_eq!(tab.area.y, view.hits.preview.y);
+            assert!(tab.area.right() < view.hits.preview.right());
+            view.handle_mouse(click(tab.area));
+            assert_eq!(view.preview_tab, tab.value);
+        }
+        let raw = view
+            .hits
+            .preview_tabs
+            .iter()
+            .find(|tab| tab.value == PreviewTab::Raw)
+            .unwrap()
+            .area;
+        let before = view.preview_tab;
+        view.handle_mouse(click(Rect::new(raw.right(), raw.y, 1, 1)));
+        assert_eq!(view.preview_tab, before);
+    }
+}
+
+#[test]
+fn raw_renders_shared_configuration_colors_in_the_preview_buffer() {
+    crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
+    let mut view = loaded();
+    view.select_tab(PreviewTab::Raw);
+    let mut terminal = Terminal::new(TestBackend::new(60, 15)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, frame.area()))
+        .unwrap();
+    let origin = (view.hits.preview.x + 1, view.hits.preview.y + 1);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(buffer[origin].symbol(), "[");
+    assert_eq!(buffer[origin].fg, crate::tui::theme::theme().config_section);
+    assert_eq!(
+        buffer[(origin.0, origin.1 + 1)].fg,
+        crate::tui::theme::theme().config_key
+    );
+    assert_eq!(
+        buffer[(origin.0 + "Environment".len() as u16, origin.1 + 1)].fg,
+        crate::tui::theme::theme().config_value
     );
 }
