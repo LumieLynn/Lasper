@@ -233,11 +233,15 @@ pub(crate) fn compose_application_services(
     );
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
+    let x11_endpoints = Arc::new(crate::application::x11::X11EndpointDiscoveryService::new(
+        Arc::new(crate::adapters::platform::x11::HostX11EndpointDiscovery),
+    ));
     let configuration = Arc::new(
         crate::application::configuration::ConfigurationService::new(
             Arc::new(
                 crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
             ),
+            Arc::clone(&x11_endpoints),
             Arc::clone(&operations),
         ),
     );

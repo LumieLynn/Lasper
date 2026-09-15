@@ -6,6 +6,7 @@ pub mod operations;
 pub mod provisioning;
 pub mod runtime;
 pub mod sessions;
+pub mod x11;
 
 pub use image_lifecycle::{ImageLifecycleService, ImageRemovalOutcome};
 pub use inspection::ResourceInspectionService;

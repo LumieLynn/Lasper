@@ -628,7 +628,14 @@ impl App {
                     .and_then(|view| view.finish_apply(generation, &target, result));
                 if let Some(message) = saved {
                     self.set_status(message, crate::tui::StatusLevel::Success);
-                    self.refresh_configuration();
+                    if !self
+                        .ui
+                        .configuration
+                        .as_ref()
+                        .is_some_and(|view| view.restart_confirmation_pending())
+                    {
+                        self.refresh_configuration();
+                    }
                 }
             }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {

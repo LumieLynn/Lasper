@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::application::inspection::ResourceInspectionError;
 use crate::application::operations::ResourceConflict;
+use crate::application::x11::{X11EndpointCatalog, X11EndpointDiscoveryService};
 use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
@@ -184,6 +185,7 @@ pub struct ConfigurationSnapshot {
     pub write_target: Option<ConfigurationWriteTarget>,
     pub x11_bindings: Vec<X11BindingDeclaration>,
     pub x11_bind_recommendation: X11BindRecommendation,
+    pub host_x11: X11EndpointCatalog,
     pub other_bind_count: usize,
     pub diagnostics: Vec<String>,
 }
@@ -302,22 +304,32 @@ pub(crate) trait ConfigurationPort: Send + Sync {
 
 pub struct ConfigurationService {
     port: Arc<dyn ConfigurationPort>,
+    x11_endpoints: Arc<X11EndpointDiscoveryService>,
     operations: Arc<OperationRegistry>,
 }
 
 impl ConfigurationService {
     pub(crate) fn new(
         port: Arc<dyn ConfigurationPort>,
+        x11_endpoints: Arc<X11EndpointDiscoveryService>,
         operations: Arc<OperationRegistry>,
     ) -> Self {
-        Self { port, operations }
+        Self {
+            port,
+            x11_endpoints,
+            operations,
+        }
     }
 
     pub async fn inspect(
         &self,
         target: &ConfigurationTarget,
     ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
-        self.port.inspect(target).await
+        let (snapshot, host_x11) =
+            tokio::join!(self.port.inspect(target), self.x11_endpoints.discover());
+        let mut snapshot = snapshot?;
+        snapshot.host_x11 = host_x11;
+        Ok(snapshot)
     }
 
     pub async fn preview(
@@ -350,7 +362,17 @@ impl ConfigurationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::x11::{X11EndpointCatalog, X11EndpointDiscoveryPort};
     use tokio::sync::Notify;
+
+    struct EmptyX11Endpoints;
+
+    #[async_trait::async_trait]
+    impl X11EndpointDiscoveryPort for EmptyX11Endpoints {
+        async fn discover(&self) -> X11EndpointCatalog {
+            X11EndpointCatalog::default()
+        }
+    }
 
     struct BlockingPort {
         entered: Notify,
@@ -406,6 +428,9 @@ mod tests {
         });
         let service = Arc::new(ConfigurationService::new(
             port.clone(),
+            Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+                EmptyX11Endpoints,
+            ))),
             OperationRegistry::new(),
         ));
         let request = edit();

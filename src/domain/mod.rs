@@ -10,3 +10,4 @@ pub mod session;
 pub mod source;
 pub mod storage;
 pub mod wayland;
+pub mod x11;

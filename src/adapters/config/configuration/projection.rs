@@ -31,6 +31,7 @@ pub(super) fn project(
             private_users: "default (systemd-nspawn@ -U)".into(),
             idmapped: true,
         },
+        host_x11: Default::default(),
         other_bind_count: 0,
         diagnostics: Vec::new(),
     };

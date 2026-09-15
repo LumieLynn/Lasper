@@ -75,6 +75,13 @@ impl App {
                     view.track_apply(task);
                 }
             }
+            ConfigurationAction::Restart(machine) => {
+                self.ui.configuration = None;
+                self.action_runtime_named(
+                    machine.as_str(),
+                    crate::application::MachineRuntimeAction::Reboot,
+                );
+            }
             ConfigurationAction::None => {}
         }
     }
