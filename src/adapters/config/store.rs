@@ -1,4 +1,5 @@
 use super::nspawn_spec::NspawnConfigSpec;
+use super::{configuration, settings_lock, MAX_NSPAWN_CONTENT_BYTES};
 use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
@@ -6,6 +7,7 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
+use crate::application::configuration::{ConfigurationSnapshot, ConfigurationTarget};
 use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
@@ -19,7 +21,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
-const MAX_NSPAWN_CONTENT_BYTES: usize = 1024 * 1024;
 const MAX_NVIDIA_BINDS: usize = 16384;
 const LASPER_OCI_CONFIG_MARKER: &str =
     "# Managed by Lasper: promoted systemd OCI runtime configuration";
@@ -67,6 +68,18 @@ impl NspawnConfigStore {
             }))
             .await?;
         Ok(result.content.map(NspawnConfig::from))
+    }
+
+    pub(crate) async fn configuration_snapshot(
+        &self,
+        target: ConfigurationTarget,
+    ) -> Result<ConfigurationSnapshot> {
+        self.execute(NspawnConfigOperation::Snapshot(target))
+            .await?
+            .snapshot
+            .ok_or_else(|| {
+                NspawnError::Runtime("configuration inspection returned no snapshot".into())
+            })
     }
 
     pub async fn write_generated(
@@ -208,12 +221,29 @@ impl NspawnConfigExecutor for ElevatedNspawnConfigExecutor {
 pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
+    Snapshot(ConfigurationTarget),
     Write(Box<WriteNspawnConfig>),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
     UpdateGpu(Box<UpdateNspawnGpu>),
     Remove(RemoveNspawnConfig),
     CleanupSidecarLocks(CleanupNspawnSidecarLocks),
+}
+
+impl NspawnConfigOperation {
+    fn settings_machine(&self) -> Option<MachineName> {
+        match self {
+            Self::Read(_)
+            | Self::Inspect(_)
+            | Self::Snapshot(_)
+            | Self::PrepareOciPromotion(_)
+            | Self::CleanupSidecarLocks(_) => None,
+            Self::Write(request) => Some(request.spec.machine.clone()),
+            Self::PromoteOci(request) => Some(request.machine.clone()),
+            Self::UpdateGpu(request) => Some(request.machine.clone()),
+            Self::Remove(request) => Some(request.machine.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -257,7 +287,7 @@ pub(crate) struct UpdateNspawnGpu {
     removed_binds: Vec<crate::adapters::platform::nvidia::state::PassthroughBind>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct NspawnConfigResult {
     content: Option<NspawnConfigInspection>,
@@ -265,6 +295,8 @@ pub(crate) struct NspawnConfigResult {
     apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     sidecars_cleaned: Option<bool>,
+    #[serde(default)]
+    snapshot: Option<ConfigurationSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -299,7 +331,15 @@ pub(crate) async fn execute_nspawn_config_operation(
     operation: NspawnConfigOperation,
     invoking_uid: u32,
 ) -> Result<NspawnConfigResult> {
+    let _settings_lock = match operation.settings_machine() {
+        Some(machine) => Some(settings_lock::acquire(machine).await?),
+        None => None,
+    };
     match operation {
+        NspawnConfigOperation::Snapshot(target) => Ok(NspawnConfigResult {
+            snapshot: Some(configuration::inspect(target).await?),
+            ..Default::default()
+        }),
         NspawnConfigOperation::Read(request) => {
             let path = nspawn_path(&request.machine);
             Ok(NspawnConfigResult {
@@ -1035,6 +1075,14 @@ mod tests {
         }"#;
         assert!(serde_json::from_str::<NspawnConfigOperation>(managed_read).is_err());
         assert!(serde_json::from_str::<NspawnConfigOperation>(inspection).is_err());
+        for params in [
+            r#"{"kind":"machine","name":"../escape"}"#,
+            r#"{"kind":"image","name":"../escape"}"#,
+            r#"{"kind":"machine","name":"archlinux","path":"/tmp/untrusted"}"#,
+        ] {
+            let snapshot = format!(r#"{{"operation":"snapshot","params":{params}}}"#);
+            assert!(serde_json::from_str::<NspawnConfigOperation>(&snapshot).is_err());
+        }
     }
 
     #[test]

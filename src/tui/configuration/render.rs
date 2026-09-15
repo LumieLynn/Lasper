@@ -11,7 +11,7 @@ use ratatui::{
 use super::navigation::ConfigurationPage;
 use super::{ConfigurationPane, ConfigurationView, HitAreas, InspectionState, PreviewTab};
 use crate::application::configuration::{
-    ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
+    ConfigurationCandidateState, ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
 };
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
@@ -223,6 +223,36 @@ impl ConfigurationView {
                         String::new(),
                     ]);
                 }
+                for candidate in &snapshot.candidates {
+                    let state = match &candidate.state {
+                        ConfigurationCandidateState::Absent => "Absent",
+                        ConfigurationCandidateState::Selected => "Selected",
+                        ConfigurationCandidateState::NotConsulted => "Not consulted",
+                        ConfigurationCandidateState::Unavailable(_) => "Unavailable",
+                    };
+                    lines.push(format!("{state}: {}", candidate.path.display()));
+                    if let ConfigurationCandidateState::Unavailable(reason) = &candidate.state {
+                        lines.push(reason.clone());
+                    }
+                }
+                if let Some(target) = &snapshot.write_target {
+                    lines.extend([
+                        String::new(),
+                        format!(
+                            "Administrator target: {} ({})",
+                            target.path.display(),
+                            if target.exists { "exists" } else { "absent" }
+                        ),
+                    ]);
+                    if snapshot
+                        .document
+                        .as_ref()
+                        .is_some_and(|source| source.path != target.path)
+                    {
+                        lines.push("The selected source differs from this target. Copying it requires a separate trust and replacement decision.".into());
+                    }
+                }
+                lines.push(String::new());
                 lines.extend([format!("{} recognized X11 bind declaration(s)", snapshot.x11_bindings.len()),
                     format!("{} other bind declaration(s) in Raw", snapshot.other_bind_count), String::new(),
                     "Declarations are shown without a live socket, mount, guest path or authorization check.".into(),

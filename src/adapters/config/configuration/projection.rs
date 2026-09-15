@@ -1,52 +1,31 @@
-//! Read-only Configure projection over the already-composed configuration
-//! store. Parsing stays local; privileged reads use the store's typed route.
+//! Read-only X11 declaration projection. Preserve the original document and
+//! leave unsupported bind syntax visible as diagnostics instead of guessing.
 
 use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
-use super::nspawn_file::{parse_nspawn_bind_fields, NspawnConfig};
-use super::NspawnConfigStore;
+use crate::adapters::config::nspawn_file::{parse_nspawn_bind_fields, NspawnConfig};
 use crate::application::configuration::{
-    ConfigurationDiscovery, ConfigurationDocument, ConfigurationOrigin, ConfigurationPort,
-    ConfigurationSnapshot, ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
+    ConfigurationDiscovery, ConfigurationDocument, ConfigurationOrigin, ConfigurationSnapshot,
+    ConfigurationTarget, X11BindingDeclaration, X11BindingScope,
 };
-use crate::application::inspection::ResourceInspectionError;
 
-pub(crate) struct StoreConfiguration {
-    store: NspawnConfigStore,
-}
-
-impl StoreConfiguration {
-    pub(crate) fn new(store: NspawnConfigStore) -> Self {
-        Self { store }
-    }
-}
-
-#[async_trait::async_trait]
-impl ConfigurationPort for StoreConfiguration {
-    async fn inspect(
-        &self,
-        target: &ConfigurationTarget,
-    ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
-        let config = match target {
-            ConfigurationTarget::Machine(name) => self.store.read(name.as_str()).await,
-            ConfigurationTarget::Image(name) => self.store.inspect(name.as_str()).await,
-        }
-        .map_err(ResourceInspectionError::backend)?;
-        Ok(project(target.clone(), config))
-    }
-}
-
-fn project(target: ConfigurationTarget, config: Option<NspawnConfig>) -> ConfigurationSnapshot {
+pub(super) fn project(
+    target: ConfigurationTarget,
+    config: Option<NspawnConfig>,
+) -> ConfigurationSnapshot {
     let discovery = match &target {
-        ConfigurationTarget::Machine(_) => ConfigurationDiscovery::MachineAdministratorFile,
+        ConfigurationTarget::Machine(_) => ConfigurationDiscovery::MachineNameCandidates,
         ConfigurationTarget::Image(_) => ConfigurationDiscovery::NamedImageCandidates,
     };
     let mut snapshot = ConfigurationSnapshot {
         target,
         discovery,
         document: None,
+        candidates: Vec::new(),
+        revision: None,
+        write_target: None,
         x11_bindings: Vec::new(),
         other_bind_count: 0,
         diagnostics: Vec::new(),

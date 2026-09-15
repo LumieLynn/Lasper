@@ -120,6 +120,17 @@ pub(crate) struct TrustedFile {
 }
 
 impl TrustedDirectory {
+    /// Open a host-owned directory while checking every ancestor. Callers
+    /// choose the location in host composition, never from an RPC path.
+    pub(crate) fn open_or_create(path: &Path, expected_uid: u32) -> Result<Self> {
+        open_or_create_absolute_directory(path, expected_uid, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: &Path) -> Result<Self> {
+        open_or_create_absolute_directory(path, uzers::get_current_uid(), false)
+    }
+
     fn new(file: File, path: PathBuf, expected_uid: u32) -> Result<Self> {
         validate_directory(&file, &path, expected_uid)?;
         Ok(Self {
@@ -239,6 +250,16 @@ impl TrustedDirectory {
         operation: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         self.with_exclusive_lock_inner(target, false, operation)
+    }
+
+    /// The returned file owns the lock. Unlike the cleanup variant, this
+    /// stable lock persists independently of a resource's existence.
+    pub(crate) fn lock_exclusive(&self, target: &str) -> Result<File> {
+        let target = validate_name(target)?;
+        let name = CString::new(format!(".{}.lock", target.to_string_lossy()))
+            .expect("validated target contains no NUL");
+        self.acquire_stable_lock(&name, true)?
+            .ok_or_else(|| NspawnError::Runtime("trusted lock unexpectedly disappeared".into()))
     }
 
     pub(crate) fn with_exclusive_lock_and_cleanup<T>(

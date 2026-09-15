@@ -58,7 +58,7 @@ pub(crate) enum ConfigurationAction {
 
 enum InspectionState {
     Loading,
-    Ready(ConfigurationSnapshot),
+    Ready(Box<ConfigurationSnapshot>),
     Failed(String),
 }
 
@@ -139,7 +139,7 @@ impl ConfigurationView {
                     .with_selected((!snapshot.x11_bindings.is_empty()).then_some(0));
                 self.expanded.clear();
                 self.expanded.insert(0);
-                InspectionState::Ready(snapshot)
+                InspectionState::Ready(Box::new(snapshot))
             }
             Ok(_) => InspectionState::Failed("Inspection returned a different resource".into()),
             Err(error) => InspectionState::Failed(error.to_string()),

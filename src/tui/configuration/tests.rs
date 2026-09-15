@@ -14,6 +14,9 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
     ConfigurationSnapshot {
         target: target(name),
         discovery: ConfigurationDiscovery::NamedImageCandidates,
+        candidates: vec![],
+        revision: None,
+        write_target: None,
         document: Some(ConfigurationDocument {
             path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
             origin: ConfigurationOrigin::Administrator,

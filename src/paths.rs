@@ -70,6 +70,12 @@ pub fn trusted_state_root() -> PathBuf {
     PathBuf::from(DEFAULT_STATE_ROOT)
 }
 
+/// Stable machine-name locks for configuration writers, independent of the
+/// administrator file and its legacy sidecars. Cleared by the host at reboot.
+pub(crate) fn nspawn_settings_locks_dir() -> PathBuf {
+    PathBuf::from("/run/lasper/locks/nspawn")
+}
+
 /// Log directory when running as root: `<trusted_state_root>/logs`
 pub fn log_dir() -> PathBuf {
     trusted_state_root().join("logs")
