@@ -28,7 +28,7 @@ impl LeaderOverlay {
 impl Component for LeaderOverlay {
     fn render(&mut self, f: &mut Frame, content_area: Rect) {
         let width = 32u16.min(content_area.width.saturating_sub(2));
-        let height = 4u16.min(content_area.height.saturating_sub(2));
+        let height = 5u16.min(content_area.height.saturating_sub(2));
         if width < 10 || height < 3 {
             return;
         }
@@ -56,6 +56,7 @@ impl Component for LeaderOverlay {
             Paragraph::new(vec![
                 Line::from(vec![key_span(" t "), hint_span(" selected-user shell")]),
                 Line::from(vec![key_span(" l "), hint_span(" login terminal")]),
+                Line::from(vec![key_span(" e "), hint_span(" Configure")]),
             ]),
             inner,
         );

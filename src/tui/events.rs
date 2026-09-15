@@ -21,6 +21,14 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Resize,
     Tick,
+    ConfigurationInspected {
+        query: u64,
+        target: crate::application::configuration::ConfigurationTarget,
+        result: Result<
+            crate::application::configuration::ConfigurationSnapshot,
+            crate::application::inspection::ResourceInspectionError,
+        >,
+    },
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
         result: Result<
@@ -65,6 +73,7 @@ impl AppEvent {
             Self::Mouse(_) => "mouse",
             Self::Resize => "resize",
             Self::Tick => "tick",
+            Self::ConfigurationInspected { .. } => "configuration-inspected",
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",

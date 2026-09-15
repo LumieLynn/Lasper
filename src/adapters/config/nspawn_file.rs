@@ -50,7 +50,7 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
     Some((source, destination))
 }
 
-fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
+pub(super) fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
     let mut fields = vec![String::new()];
     let mut chars = value.chars().peekable();
     while let Some(character) = chars.next() {

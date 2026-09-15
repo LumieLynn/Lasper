@@ -1,3 +1,4 @@
+pub(crate) mod configuration;
 pub mod nspawn_file;
 pub(crate) mod nspawn_spec;
 pub mod store;

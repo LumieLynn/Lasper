@@ -116,6 +116,10 @@ impl App {
                 self.ui.close_leader();
                 self.spawn_terminal().await;
             }
+            (KeyCode::Char('e'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.configure_focused_resource();
+            }
             _ => {
                 // A leader keymap is intentionally one level deep. Unknown
                 // keys are consumed so they cannot trigger a workspace action.
@@ -242,6 +246,13 @@ impl App {
 impl App {
     async fn handle_modal_key(&mut self, key: KeyEvent) -> bool {
         match self.ui.modal_layer() {
+            Some(ModalLayer::Configuration) => {
+                if let Some(view) = &mut self.ui.configuration {
+                    let action = view.handle_key(key);
+                    self.handle_configuration_action(action);
+                }
+                true
+            }
             Some(ModalLayer::Dialog) => self.handle_dialog_key(key).await,
             Some(ModalLayer::DeleteConfirmation) => self.handle_delete_confirm_key(key),
             Some(ModalLayer::QuitConfirmation) => self.handle_quit_confirm_key(key),
@@ -385,6 +396,9 @@ impl App {
                     self.ui.resource_action_menu = None;
                     use crate::tui::widgets::resource_action_menu::ResourceAction;
                     match action {
+                        Some(ResourceAction::Configure { target }) => {
+                            self.open_configuration(target)
+                        }
                         Some(ResourceAction::StartImage { image }) => {
                             self.action_start_image_named(&image)
                         }
@@ -1089,6 +1103,13 @@ impl App {
         // no mouse behavior.  The priority comes from AppUi::modal_layer(),
         // shared with key dispatch.
         match self.ui.modal_layer() {
+            Some(ModalLayer::Configuration) => {
+                if let Some(view) = &mut self.ui.configuration {
+                    let action = view.handle_mouse(mouse);
+                    self.handle_configuration_action(action);
+                }
+                true
+            }
             Some(ModalLayer::Dialog) => {
                 if let Some(dialog) = &mut self.ui.active_dialog {
                     let _ = dialog.handle_mouse(mouse);

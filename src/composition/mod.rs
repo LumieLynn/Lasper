@@ -18,6 +18,7 @@ use crate::application::{
 use std::sync::Arc;
 
 pub(crate) struct ApplicationServices {
+    pub configuration: Arc<crate::application::configuration::ConfigurationService>,
     pub session: Arc<SessionService>,
     pub runtime: Arc<RuntimeCatalog>,
     pub machine_lifecycle: Arc<MachineLifecycleService>,
@@ -232,11 +233,17 @@ pub(crate) fn compose_application_services(
     );
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
+    let configuration = Arc::new(
+        crate::application::configuration::ConfigurationService::new(Arc::new(
+            crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
+        )),
+    );
     let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
         crate::adapters::inspection::StoreResourceInspection::new(local_cmd, nspawn, systemd_unit),
     )));
 
     ApplicationServices {
+        configuration,
         session,
         runtime,
         machine_lifecycle,

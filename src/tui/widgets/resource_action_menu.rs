@@ -1,3 +1,4 @@
+use crate::application::configuration::ConfigurationTarget;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::core::{Component, EventResult};
@@ -6,6 +7,7 @@ use ratatui::{layout::Rect, Frame};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResourceAction {
+    Configure { target: ConfigurationTarget },
     StartImage { image: String },
     EnableNspawnUnit { image: String },
     DisableNspawnUnit { image: String },
@@ -31,37 +33,42 @@ impl ResourceActionMenu {
     pub fn for_machine(machine: &MachineEntry) -> Self {
         let enabled = machine.access().is_nspawn() && machine.state.accepts_runtime_actions();
         let name = machine.name.clone();
-        Self::new(
-            " [ Machine Actions ] ",
-            vec![
-                ActionItem {
-                    action: ResourceAction::PoweroffMachine {
-                        machine: name.clone(),
-                    },
-                    label: "  ⏹  Power off",
-                    enabled,
+        let mut items = vec![
+            ActionItem {
+                action: ResourceAction::PoweroffMachine {
+                    machine: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::RebootMachine {
-                        machine: name.clone(),
-                    },
-                    label: "  ↻  Reboot",
-                    enabled,
+                label: "  ⏹  Power off",
+                enabled,
+            },
+            ActionItem {
+                action: ResourceAction::RebootMachine {
+                    machine: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::TerminateMachine {
-                        machine: name.clone(),
-                    },
-                    label: "  ⚠  Terminate",
-                    enabled,
+                label: "  ↻  Reboot",
+                enabled,
+            },
+            ActionItem {
+                action: ResourceAction::TerminateMachine {
+                    machine: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::KillMachine { machine: name },
-                    label: "  ☠  Kill (SIGKILL)",
-                    enabled,
-                },
-            ],
-        )
+                label: "  ⚠  Terminate",
+                enabled,
+            },
+            ActionItem {
+                action: ResourceAction::KillMachine { machine: name },
+                label: "  ☠  Kill (SIGKILL)",
+                enabled,
+            },
+        ];
+        if let Ok(target) = ConfigurationTarget::for_machine(machine) {
+            items.push(ActionItem {
+                action: ResourceAction::Configure { target },
+                label: "  Configure",
+                enabled: true,
+            });
+        }
+        Self::new(" [ Machine Actions ] ", items)
     }
 
     pub fn for_image(image: &ImageEntry, machine_present: bool, removing: bool) -> Self {
@@ -70,37 +77,42 @@ impl ResourceActionMenu {
         let removable =
             !ImageEntry::is_protected_name(&image.name) && !machine_present && !removing;
         let name = image.name.clone();
-        Self::new(
-            " [ Image Actions ] ",
-            vec![
-                ActionItem {
-                    action: ResourceAction::StartImage {
-                        image: name.clone(),
-                    },
-                    label: "  ▶  Start image",
-                    enabled: launchable && !machine_present && !removing,
+        let mut items = vec![
+            ActionItem {
+                action: ResourceAction::StartImage {
+                    image: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::EnableNspawnUnit {
-                        image: name.clone(),
-                    },
-                    label: "  ↑  Enable at boot",
-                    enabled: unit_mutable,
+                label: "  ▶  Start image",
+                enabled: launchable && !machine_present && !removing,
+            },
+            ActionItem {
+                action: ResourceAction::EnableNspawnUnit {
+                    image: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::DisableNspawnUnit {
-                        image: name.clone(),
-                    },
-                    label: "  ↓  Disable at boot",
-                    enabled: unit_mutable,
+                label: "  ↑  Enable at boot",
+                enabled: unit_mutable,
+            },
+            ActionItem {
+                action: ResourceAction::DisableNspawnUnit {
+                    image: name.clone(),
                 },
-                ActionItem {
-                    action: ResourceAction::DeleteImage { image: name },
-                    label: "  ✕  Delete image",
-                    enabled: removable,
-                },
-            ],
-        )
+                label: "  ↓  Disable at boot",
+                enabled: unit_mutable,
+            },
+            ActionItem {
+                action: ResourceAction::DeleteImage { image: name },
+                label: "  ✕  Delete image",
+                enabled: removable,
+            },
+        ];
+        if let Ok(target) = ConfigurationTarget::for_image(image) {
+            items.push(ActionItem {
+                action: ResourceAction::Configure { target },
+                label: "  Configure",
+                enabled: true,
+            });
+        }
+        Self::new(" [ Image Actions ] ", items)
     }
 
     fn new(label: &'static str, items: Vec<ActionItem>) -> Self {
@@ -185,11 +197,13 @@ mod tests {
     }
 
     #[test]
-    fn transitioning_machine_has_no_available_runtime_action() {
+    fn transitioning_machine_can_still_inspect_configuration() {
         let machine = MachineEntry::optimistic_nspawn("ubuntu", MachineState::Exiting);
         assert_eq!(
             ResourceActionMenu::for_machine(&machine).selected_action(),
-            None
+            Some(ResourceAction::Configure {
+                target: ConfigurationTarget::for_machine(&machine).unwrap()
+            })
         );
     }
 

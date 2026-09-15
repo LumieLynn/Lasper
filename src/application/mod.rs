@@ -1,3 +1,4 @@
+pub mod configuration;
 pub mod image_lifecycle;
 pub mod inspection;
 pub mod machine_lifecycle;

@@ -36,6 +36,7 @@ impl Component for HelpOverlay {
             key_row("j / ↓", "Select next item", key_style, desc_style),
             key_row("k / ↑", "Select previous item", key_style, desc_style),
             key_row("Tab / Shift+Tab", "Switch panels", key_style, desc_style),
+            key_row("Space, then e", "Configure resource", key_style, desc_style),
             key_row(
                 "[ / ] or Alt+1/2",
                 "Switch image tab",

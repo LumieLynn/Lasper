@@ -9,6 +9,7 @@ pub enum ModalLayer {
     ResourceActionMenu,
     Leader,
     Wizard,
+    Configuration,
     Help,
     QuitConfirmation,
     DeleteConfirmation,

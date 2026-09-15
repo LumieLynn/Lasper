@@ -1,6 +1,7 @@
 //! Main application state and event loop.
 
 pub mod actions;
+mod configuration;
 pub(crate) mod detail_refresh;
 pub mod focus;
 pub mod handlers;
@@ -95,6 +96,8 @@ impl Component for PendingImageRemoval {
 }
 
 pub struct AppUi {
+    pub(crate) configuration: Option<crate::tui::configuration::ConfigurationView>,
+    next_configuration_query: u64,
     /// Semantic destination currently owning focus on the main workspace.
     /// This deliberately distinguishes the two inspector contexts even
     /// though they share one visible detail panel.
@@ -142,6 +145,8 @@ pub struct AppUi {
 impl AppUi {
     pub fn new() -> Self {
         Self {
+            configuration: None,
+            next_configuration_query: 1,
             focus: WorkspaceFocus::Machines,
             prev_focus: WorkspaceFocus::Machines,
             machine_list: MachineListComponent::new(),
@@ -182,6 +187,8 @@ impl AppUi {
             Some(ModalLayer::QuitConfirmation)
         } else if self.show_help {
             Some(ModalLayer::Help)
+        } else if self.configuration.is_some() {
+            Some(ModalLayer::Configuration)
         } else if self.show_wizard {
             Some(ModalLayer::Wizard)
         } else if self.resource_action_menu.is_some() {
@@ -211,6 +218,7 @@ impl AppUi {
 // App
 
 pub struct AppData {
+    pub configuration: std::sync::Arc<crate::application::configuration::ConfigurationService>,
     /// Running systemd-machined instances plus optimistic `Starting` rows.
     /// Persistent images live in `images`.
     pub entries: Vec<MachineEntry>,
@@ -271,6 +279,7 @@ impl App {
         config: std::sync::Arc<crate::config::AppConfig>,
     ) -> Self {
         let ApplicationServices {
+            configuration,
             session: session_service,
             runtime: runtime_catalog,
             machine_lifecycle,
@@ -286,6 +295,7 @@ impl App {
             config,
             should_quit: false,
             data: AppData {
+                configuration,
                 entries: Vec::new(),
                 images: Vec::new(),
                 internal_images: Vec::new(),
@@ -588,6 +598,15 @@ impl App {
             AppEvent::Mouse(mouse) => self.handle_mouse(mouse).await,
             AppEvent::Resize => {}
             AppEvent::Tick => self.tick().await,
+            AppEvent::ConfigurationInspected {
+                query,
+                target,
+                result,
+            } => {
+                if let Some(view) = &mut self.ui.configuration {
+                    view.finish_query(query, &target, result);
+                }
+            }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
                     return;
@@ -959,6 +978,91 @@ mod tests {
             services,
             std::sync::Arc::new(crate::config::AppConfig::default()),
         )
+    }
+
+    #[tokio::test]
+    async fn configure_leader_uses_each_focused_resource_and_blocks_workspace_input() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        for focus in [
+            WorkspaceFocus::Machines,
+            WorkspaceFocus::Images,
+            WorkspaceFocus::MachineInspector,
+            WorkspaceFocus::ImageInspector,
+        ] {
+            let mut app = make_app();
+            app.data.entries = vec![make_entry("running-machine", MachineState::Running)];
+            app.data.images = vec![make_image("image with spaces")];
+            app.ui.focus = focus;
+            app.data.detail_target = match focus {
+                WorkspaceFocus::ImageInspector => DetailTarget::Image {
+                    name: "image with spaces".into(),
+                    internal: false,
+                },
+                _ => DetailTarget::Machine("running-machine".into()),
+            };
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+                .await;
+            let expected = if matches!(
+                focus,
+                WorkspaceFocus::Images | WorkspaceFocus::ImageInspector
+            ) {
+                "image with spaces"
+            } else {
+                "running-machine"
+            };
+            assert_eq!(
+                app.ui.configuration.as_ref().unwrap().target.name(),
+                expected
+            );
+            assert_eq!(app.ui.modal_layer(), Some(ModalLayer::Configuration));
+            assert!(app.ui.leader.is_none());
+            for key in ['t', 'n', 'q', ' ', ']'] {
+                app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                    .await;
+            }
+            app.handle_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            })
+            .await;
+            assert_eq!(app.ui.focus, focus);
+            assert!(!app.should_quit);
+            assert!(!app.ui.show_wizard);
+            assert!(app.ui.leader.is_none());
+            app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                .await;
+            assert!(app.ui.configuration.is_none());
+            assert_eq!(app.ui.focus, focus);
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_menu_keeps_its_original_target_after_catalog_selection_changes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = make_app();
+        let original = make_image("source-image");
+        let mut menu = crate::tui::widgets::resource_action_menu::ResourceActionMenu::for_image(
+            &original, false, false,
+        );
+        for _ in 0..4 {
+            menu.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.ui.resource_action_menu = Some(menu);
+        app.data.images = vec![make_image("different-image")];
+        app.ui.focus = WorkspaceFocus::Images;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await;
+        assert_eq!(
+            app.ui.configuration.as_ref().unwrap().target.name(),
+            "source-image"
+        );
+        assert!(app.ui.resource_action_menu.is_none());
     }
 
     #[tokio::test]

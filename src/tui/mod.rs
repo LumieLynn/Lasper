@@ -74,6 +74,7 @@ pub(crate) fn soft_wrap_text(value: &str, max_width: usize) -> Vec<String> {
 }
 
 pub(crate) mod app;
+pub(crate) mod configuration;
 pub mod core;
 pub(crate) mod effects;
 pub(crate) mod events;

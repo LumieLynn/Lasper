@@ -41,6 +41,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
             w.render(f, area);
         }
     }
+    if let Some(view) = &mut app.ui.configuration {
+        view.render(f, area);
+    }
     if app.ui.show_help {
         crate::tui::widgets::help::HelpOverlay::new().render(f, area);
     }
