@@ -75,6 +75,36 @@ impl App {
                     view.track_apply(task);
                 }
             }
+            ConfigurationAction::CheckX11 {
+                generation,
+                target,
+                host_socket,
+            } => {
+                let configuration_target = ConfigurationTarget::Machine(target.machine().clone());
+                let Some(events) = self.ui.app_tx.clone() else {
+                    if let Some(view) = self.ui.configuration.as_mut() {
+                        view.finish_x11_probe(
+                            generation,
+                            &configuration_target,
+                            Err(crate::application::sessions::SessionError::new(
+                                "Application event channel is unavailable",
+                            )),
+                        );
+                    }
+                    return;
+                };
+                let task = crate::tui::effects::configuration::probe_x11(
+                    self.data.session_service.clone(),
+                    configuration_target,
+                    target,
+                    host_socket,
+                    generation,
+                    events,
+                );
+                if let Some(view) = self.ui.configuration.as_mut() {
+                    view.track_x11_probe(task);
+                }
+            }
             ConfigurationAction::Restart(machine) => {
                 self.ui.configuration = None;
                 self.action_runtime_named(

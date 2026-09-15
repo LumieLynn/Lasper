@@ -194,6 +194,63 @@ impl NspawnConfig {
         Ok(targets)
     }
 
+    /// Find guest mount points that can project one observed standard X11
+    /// endpoint. Exact socket binds and binds of the containing socket
+    /// directory are both recognized; runtime client-path validation remains
+    /// the session resolver's responsibility.
+    pub(crate) async fn x11_targets(
+        &self,
+        socket: &crate::domain::x11::HostX11Socket,
+    ) -> Result<Vec<PathBuf>> {
+        let conf = Ini::load_from_str_noescape(&self.content).map_err(|error| {
+            NspawnError::InvalidConfig(format!("failed to parse {}: {error}", self.path.display()))
+        })?;
+        let source = socket.source();
+        let source_directory = source.parent().expect("validated X11 source has a parent");
+        let source_name = source
+            .file_name()
+            .expect("validated X11 source has a file name");
+        let canonical_directory = tokio::fs::canonicalize(source_directory).await.ok();
+        let mut targets = Vec::new();
+        for files in conf.section_all(Some("Files")) {
+            for (key, value) in files.iter() {
+                let readonly = match key {
+                    "Bind" => false,
+                    "BindReadOnly" => true,
+                    _ => continue,
+                };
+                let Some(bind) = parse_nspawn_bind_value(value, readonly) else {
+                    continue;
+                };
+                let bind_source = Path::new(&bind.source);
+                if !bind_source.is_absolute() {
+                    continue;
+                }
+                let canonical_bind_source = tokio::fs::canonicalize(bind_source).await.ok();
+                let exact_socket = bind_source == source
+                    || canonical_bind_source.as_deref() == Some(socket.canonical_path());
+                let socket_directory = bind_source == source_directory
+                    || canonical_bind_source.as_deref() == canonical_directory.as_deref();
+                let target = if exact_socket {
+                    PathBuf::from(bind.destination)
+                } else if socket_directory {
+                    PathBuf::from(bind.destination).join(source_name)
+                } else {
+                    continue;
+                };
+                if !targets.contains(&target) {
+                    if targets.len() >= 16 {
+                        return Err(NspawnError::InvalidConfig(
+                            "too many targets for one X11 socket".into(),
+                        ));
+                    }
+                    targets.push(target);
+                }
+            }
+        }
+        Ok(targets)
+    }
+
     /// Check if the NVIDIA GPU passthrough is enabled for this container.
     pub fn is_gpu_enabled(&self) -> Result<bool> {
         let conf = Ini::load_from_str(&self.content).map_err(|error| {
@@ -1072,6 +1129,48 @@ mod tests {
             content: format!("[Files]\nBind={}\n", alias.display()),
         };
         assert_eq!(config.wayland_targets(&source).await.unwrap(), vec![alias]);
+    }
+
+    #[tokio::test]
+    async fn x11_targets_expand_directory_binds_and_keep_custom_socket_targets() {
+        let socket = crate::domain::x11::HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o777,
+            123,
+            1000,
+            1000,
+            crate::domain::x11::X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        let config = NspawnConfig {
+            path: PathBuf::from("demo.nspawn"),
+            content: concat!(
+                "[Files]\n",
+                "BindReadOnly=/tmp/.X11-unix:/mnt/x11:idmap\n",
+                "Bind=/tmp/.X11-unix/X0:/custom/display.sock:idmap\n",
+                "BindReadOnly=/tmp/.X11-unix/X1:/ignored\n",
+                "BindReadOnly=/tmp/.X11-unix:/mnt/x11:idmap\n",
+            )
+            .into(),
+        };
+
+        assert_eq!(
+            config.x11_targets(&socket).await.unwrap(),
+            vec![
+                PathBuf::from("/mnt/x11/X0"),
+                PathBuf::from("/custom/display.sock")
+            ]
+        );
     }
 
     #[test]

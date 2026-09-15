@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 20;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 21;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -90,6 +90,7 @@ rpc_methods! {
     Exit => ("exit", Command),
     CloseSession => ("close_session", Session),
     PrepareWayland => ("prepare_wayland", Session),
+    ProbeX11Projection => ("probe_x11_projection", Session),
     NspawnConfig => ("nspawn_config", Command),
     SystemdUnit => ("systemd_unit", Command),
     NvidiaState => ("nvidia_state", Command),

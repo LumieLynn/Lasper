@@ -5,6 +5,7 @@
 //! does not expose either wire shape to the rest of the session workflow.
 
 use super::wayland_probe::WaylandProbeRequest;
+use super::x11_probe::X11ProjectionProbeRequest;
 use crate::application::sessions::{
     GuestCommand, InteractiveShellEnvironment, SessionError, TerminalSessionHandle,
     ValidatedGuestUserName,
@@ -157,6 +158,7 @@ pub(crate) enum MachineSessionRequest {
     Shell(MachineShellRequest),
     LoginPrompt(MachineLoginRequest),
     WaylandProbe(WaylandProbeRequest),
+    X11ProjectionProbe(X11ProjectionProbeRequest),
 }
 
 impl MachineSessionRequest {
@@ -172,11 +174,16 @@ impl MachineSessionRequest {
         Self::WaylandProbe(request)
     }
 
+    pub(crate) fn x11_projection_probe(request: X11ProjectionProbeRequest) -> Self {
+        Self::X11ProjectionProbe(request)
+    }
+
     pub(crate) const fn context(&self) -> &'static str {
         match self {
             Self::Shell(_) => "open selected-user shell",
             Self::LoginPrompt(_) => "open machine login prompt",
             Self::WaylandProbe(_) => "open Wayland projection probe",
+            Self::X11ProjectionProbe(_) => "open X11 projection probe",
         }
     }
 }
@@ -203,6 +210,22 @@ pub(crate) struct MachinePty {
 }
 
 impl MachineSessionTransport {
+    pub(crate) async fn machine_leader(&self, machine: &MachineName) -> Result<u32, SessionError> {
+        match self {
+            Self::Dbus(dbus) => dbus
+                .machine_leader(machine)
+                .await
+                .map_err(|error| map_machine_session_error("inspect machine instance", error)),
+            Self::SystemdTools => crate::adapters::runtime::systemd_tools::machine_leader(machine)
+                .await
+                .map_err(|error| {
+                    SessionError::new(format!(
+                        "inspect machine instance through systemd runtime state: {error}"
+                    ))
+                }),
+        }
+    }
+
     /// Open one closed machine operation using the route selected at
     /// composition time.
     pub(crate) async fn open(
@@ -346,6 +369,17 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(probe.context(), "open Wayland projection probe");
+
+        let probe = MachineSessionRequest::x11_projection_probe(
+            X11ProjectionProbeRequest::new(
+                machine(),
+                user(),
+                Path::new("/mnt/x11/X0"),
+                Path::new("/tmp/.X11-unix/X0"),
+            )
+            .unwrap(),
+        );
+        assert_eq!(probe.context(), "open X11 projection probe");
     }
 
     #[test]

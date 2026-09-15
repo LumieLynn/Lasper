@@ -856,6 +856,13 @@ mod tests {
             panic!("disabled Wayland must not run a probe")
         }
 
+        async fn probe_x11_projection(
+            &self,
+            _request: crate::application::sessions::X11ProjectionProbeRequest,
+        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
+            panic!("CLI preparation must not run an X11 probe")
+        }
+
         async fn open_journal(
             &self,
             _request: JournalSessionRequest,
@@ -921,6 +928,13 @@ mod tests {
                 "simulated Wayland probe failure",
                 "simulated probe hint",
             ))
+        }
+
+        async fn probe_x11_projection(
+            &self,
+            _request: crate::application::sessions::X11ProjectionProbeRequest,
+        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
+            panic!("Wayland fallback tests must not run an X11 probe")
         }
 
         async fn open_journal(

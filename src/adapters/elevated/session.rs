@@ -1,13 +1,16 @@
 use super::ElevatedDaemon;
 use crate::application::sessions::{
-    ObservedGuestIdentity, SessionError, WaylandPreparationRequest, WaylandSessionContext,
+    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
+    SessionError, WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use crate::ipc::protocol::session::{
-    CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, SpawnJournalctlParams,
-    SpawnTerminalParams, SpawnTerminalResponse, WireSessionId, WireSessionLifecycle,
-    WireTerminalLaunch, WireTerminalLifecycleSource, WireTerminalSize,
+    CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, ProbeX11ProjectionParams,
+    ProbeX11ProjectionResponse, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
+    WireSessionId, WireSessionLifecycle, WireTerminalLaunch, WireTerminalLifecycleSource,
+    WireTerminalSize,
 };
 use crate::ipc::protocol::FdOperation;
 use sendfd::RecvWithFd;
@@ -140,6 +143,64 @@ impl ElevatedDaemon {
                 ObservedGuestIdentity::new(uid, gid),
             )),
             PrepareWaylandResponse::Failed { message, hint } => match hint {
+                Some(hint) => Err(SessionError::with_hint(message, hint)),
+                None => Err(SessionError::new(message)),
+            },
+        }
+    }
+
+    pub(crate) async fn probe_x11_projection(
+        &self,
+        request: X11ProjectionProbeRequest,
+    ) -> Result<X11ProjectionContext, SessionError> {
+        let host_socket = request.host_socket.clone();
+        let params = ProbeX11ProjectionParams {
+            probe_id: WireSessionId::new(request.probe_id.get())
+                .map_err(|error| SessionError::new(error.to_string()))?,
+            machine: request.target.machine().clone(),
+            user: request.target.user().clone(),
+            host_socket: request.host_socket,
+        };
+        let params = serde_json::to_value(params)
+            .map_err(|error| SessionError::new(format!("encode X11 validation: {error}")))?;
+        let result = self
+            .rpc_call("probe_x11_projection", params)
+            .await
+            .map_err(|error| SessionError::new(format!("validate X11 through daemon: {error}")))?;
+        let response: ProbeX11ProjectionResponse = serde_json::from_value(result)
+            .map_err(|error| SessionError::new(format!("decode X11 validation: {error}")))?;
+        match response {
+            ProbeX11ProjectionResponse::Ready {
+                guest_mount,
+                guest_client_path,
+                guest_uid,
+                guest_gid,
+                host_uid,
+                host_gid,
+                leader_pid,
+                pid_namespace_device,
+                pid_namespace_inode,
+                user_namespace_device,
+                user_namespace_inode,
+            } => {
+                let instance = ObservedMachineInstance::new(
+                    leader_pid,
+                    ObservedNamespaceIdentity::new(pid_namespace_device, pid_namespace_inode),
+                    ObservedNamespaceIdentity::new(user_namespace_device, user_namespace_inode),
+                );
+                Ok(X11ProjectionContext::verified(
+                    host_socket,
+                    guest_mount,
+                    guest_client_path,
+                    MappedGuestIdentity::verified(
+                        ObservedGuestIdentity::new(guest_uid, guest_gid),
+                        host_uid,
+                        host_gid,
+                        instance,
+                    ),
+                ))
+            }
+            ProbeX11ProjectionResponse::Failed { message, hint } => match hint {
                 Some(hint) => Err(SessionError::with_hint(message, hint)),
                 None => Err(SessionError::new(message)),
             },

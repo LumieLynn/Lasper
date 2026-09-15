@@ -517,3 +517,48 @@ fn machine_apply_prompts_for_restart_and_returns_the_exact_target() {
         ConfigurationAction::Restart(MachineName::new("archlinux").unwrap())
     );
 }
+
+#[test]
+fn machine_x11_check_uses_inline_guest_user_and_keeps_acl_state_separate() {
+    let mut view = loaded_machine();
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(view.x11_content_focus, X11ContentFocus::GuestUser);
+    for character in "alice".chars() {
+        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let ConfigurationAction::CheckX11 {
+        generation,
+        target,
+        host_socket,
+    } = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("inline Check projection should emit the runtime request");
+    };
+    assert_eq!(target.machine().as_str(), "archlinux");
+    assert_eq!(target.user().as_str(), "alice");
+    assert_eq!(host_socket.source(), PathBuf::from("/tmp/.X11-unix/X0"));
+
+    let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
+    let instance =
+        crate::application::sessions::ObservedMachineInstance::new(42, namespace, namespace);
+    let identity = crate::application::sessions::MappedGuestIdentity::verified(
+        crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
+        1_437_402_088,
+        1_437_402_088,
+        instance,
+    );
+    let context = crate::application::sessions::X11ProjectionContext::verified(
+        host_socket,
+        "/mnt/host-x11/X0".into(),
+        "/tmp/.X11-unix/X0".into(),
+        identity,
+    );
+    let configuration_target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
+    view.finish_x11_probe(generation, &configuration_target, Ok(context));
+    let screen = render(&mut view, 140, 30);
+    assert!(screen.contains("Guest uid 1000"));
+    assert!(screen.contains("1437402088"));
+    assert!(screen.contains("X server ACL has not"));
+}

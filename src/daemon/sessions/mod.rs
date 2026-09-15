@@ -9,7 +9,8 @@ pub(crate) mod server;
 use super::dispatch::handler::HandleOutcome;
 use super::server::DaemonServerState;
 use crate::ipc::protocol::session::{
-    CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse,
+    CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, ProbeX11ProjectionParams,
+    ProbeX11ProjectionResponse,
 };
 use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use serde_json::Value;
@@ -86,6 +87,58 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
             };
             HandleOutcome::Sync(serde_json::to_value(response).map_err(|error| error.to_string()))
         }
+        RpcMethod::ProbeX11Projection => {
+            let params: ProbeX11ProjectionParams = match serde_json::from_value(params) {
+                Ok(params) => params,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid probe_x11_projection request: {error}"
+                    )))
+                }
+            };
+            let resolver = crate::adapters::session::X11SessionResolver::new(
+                machine,
+                crate::adapters::config::NspawnConfigStore::direct(),
+            );
+            let result = resolver
+                .probe(crate::application::sessions::X11ProjectionProbeRequest {
+                    probe_id: crate::domain::session::SessionId::new(params.probe_id.get())
+                        .expect("wire session id is non-zero"),
+                    target: crate::application::sessions::ShellTarget::new(
+                        params.machine,
+                        params.user,
+                    ),
+                    host_socket: params.host_socket,
+                })
+                .await;
+            let response = match result {
+                Ok(context) => {
+                    let identity = context.identity();
+                    let guest = identity.guest();
+                    let instance = identity.instance();
+                    let pid_namespace = instance.pid_namespace();
+                    let user_namespace = instance.user_namespace();
+                    ProbeX11ProjectionResponse::Ready {
+                        guest_mount: context.guest_mount().to_path_buf(),
+                        guest_client_path: context.guest_client_path().to_path_buf(),
+                        guest_uid: guest.uid(),
+                        guest_gid: guest.gid(),
+                        host_uid: identity.host_uid(),
+                        host_gid: identity.host_gid(),
+                        leader_pid: instance.leader_pid(),
+                        pid_namespace_device: pid_namespace.device(),
+                        pid_namespace_inode: pid_namespace.inode(),
+                        user_namespace_device: user_namespace.device(),
+                        user_namespace_inode: user_namespace.inode(),
+                    }
+                }
+                Err(error) => ProbeX11ProjectionResponse::Failed {
+                    message: error.to_string(),
+                    hint: error.hint().map(str::to_owned),
+                },
+            };
+            HandleOutcome::Sync(serde_json::to_value(response).map_err(|error| error.to_string()))
+        }
         _ => unreachable!("non-session method routed to session dispatcher"),
     }
 }
@@ -100,7 +153,9 @@ mod tests {
             if method.family() == RpcFamily::Session {
                 assert!(matches!(
                     method,
-                    RpcMethod::CloseSession | RpcMethod::PrepareWayland
+                    RpcMethod::CloseSession
+                        | RpcMethod::PrepareWayland
+                        | RpcMethod::ProbeX11Projection
                 ));
             }
         }

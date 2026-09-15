@@ -2,6 +2,7 @@ use super::{
     JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenError,
     ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionRequest,
     TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
+    X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -89,6 +90,20 @@ impl SessionService {
         host_socket: crate::domain::wayland::HostWaylandSocket,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.prepare_wayland(target, host_socket).await
+    }
+
+    pub async fn test_x11_projection(
+        &self,
+        target: ShellTarget,
+        host_socket: crate::domain::x11::HostX11Socket,
+    ) -> Result<X11ProjectionContext, SessionError> {
+        self.port
+            .probe_x11_projection(X11ProjectionProbeRequest {
+                probe_id: self.allocate_id(),
+                target,
+                host_socket,
+            })
+            .await
     }
 
     pub async fn open_journal(
@@ -197,6 +212,13 @@ mod tests {
                 PathBuf::from("/run/lasper/wayland/1000/wayland-0"),
                 crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
             ))
+        }
+
+        async fn probe_x11_projection(
+            &self,
+            _request: X11ProjectionProbeRequest,
+        ) -> Result<X11ProjectionContext, SessionError> {
+            panic!("unrequested X11 projection probe")
         }
 
         async fn open_journal(

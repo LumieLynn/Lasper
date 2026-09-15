@@ -638,6 +638,15 @@ impl App {
                     }
                 }
             }
+            AppEvent::ConfigurationX11Probed {
+                generation,
+                target,
+                result,
+            } => {
+                if let Some(view) = &mut self.ui.configuration {
+                    view.finish_x11_probe(generation, &target, result);
+                }
+            }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
                     return;

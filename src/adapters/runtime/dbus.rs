@@ -80,6 +80,8 @@ trait Manager {
 )]
 trait Machine {
     #[zbus(property)]
+    fn leader(&self) -> zbus::Result<u32>;
+    #[zbus(property)]
     fn name(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
@@ -141,6 +143,28 @@ impl DbusBackend {
         self.connection_lease()
             .await
             .map(|(_, connection)| connection)
+    }
+
+    pub(crate) async fn machine_leader(&self, name: &MachineName) -> Result<u32> {
+        let (generation, connection) = self
+            .connection_lease()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let leader = self
+            .query_with_deadline(
+                generation,
+                "machine leader",
+                get_machine_leader(&connection, name),
+            )
+            .await
+            .map_err(NspawnError::Dbus)?;
+        if leader == 0 || leader > i32::MAX as u32 {
+            return Err(NspawnError::Runtime(format!(
+                "machine {} reported an invalid leader PID {leader}",
+                name.as_str()
+            )));
+        }
+        Ok(leader)
     }
 
     async fn connection_lease(&self) -> Option<(u64, Connection)> {
@@ -329,6 +353,16 @@ impl DbusBackend {
                 self.open_machine_login(request.machine()).await
             }
             MachineSessionRequest::WaylandProbe(request) => {
+                self.open_machine_shell(
+                    request.machine(),
+                    request.user(),
+                    request.path(),
+                    request.args(),
+                    Vec::new(),
+                )
+                .await
+            }
+            MachineSessionRequest::X11ProjectionProbe(request) => {
                 self.open_machine_shell(
                     request.machine(),
                     request.user(),
@@ -805,6 +839,13 @@ async fn get_machine1_properties(
         map.insert(k, val);
     }
     Ok(map)
+}
+
+async fn get_machine_leader(conn: &Connection, name: &MachineName) -> zbus::Result<u32> {
+    let manager = ManagerProxy::new(conn).await?;
+    let path = manager.get_machine(name.as_str()).await?;
+    let machine = MachineProxy::builder(conn).path(path)?.build().await?;
+    machine.leader().await
 }
 
 async fn get_systemd1_properties(

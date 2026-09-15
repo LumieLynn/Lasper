@@ -121,7 +121,18 @@ pub(crate) fn machine_session_command(
             crate::adapters::session::terminal_attach::login(request.machine()),
         ),
         MachineSessionRequest::WaylandProbe(request) => wayland_probe(request),
+        MachineSessionRequest::X11ProjectionProbe(request) => x11_projection_probe(request),
     }
+}
+
+/// Resolve the running instance through the same bounded machined runtime
+/// state reader used by the systemd-tools backend. This avoids introducing a
+/// hidden D-Bus call when `--systemd-tools` selected the route.
+pub(crate) async fn machine_leader(machine: &MachineName) -> io::Result<u32> {
+    let machine = machine.clone();
+    tokio::task::spawn_blocking(move || crate::adapters::runtime::state::leader_pid(&machine))
+        .await
+        .map_err(|error| io::Error::other(format!("machine leader task failed: {error}")))?
 }
 
 fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttachCommand> {
@@ -149,6 +160,19 @@ fn selected_user_shell(request: MachineShellRequest) -> io::Result<TerminalAttac
 
 fn wayland_probe(
     request: crate::adapters::session::WaylandProbeRequest,
+) -> io::Result<TerminalAttachCommand> {
+    let mut args = vec![
+        "--quiet".to_string(),
+        "--".to_string(),
+        "shell".to_string(),
+        format!("{}@{}", request.user(), request.machine()),
+    ];
+    args.extend(request.args());
+    Ok(TerminalAttachCommand::with_dumb_environment(args))
+}
+
+fn x11_projection_probe(
+    request: crate::adapters::session::X11ProjectionProbeRequest,
 ) -> io::Result<TerminalAttachCommand> {
     let mut args = vec![
         "--quiet".to_string(),
@@ -476,6 +500,7 @@ mod tests {
     use crate::adapters::process::MockCommandRunner;
     use crate::adapters::session::{
         MachineShellEnvironment, MachineShellRequest, WaylandProbeRequest,
+        X11ProjectionProbeRequest,
     };
     use crate::application::sessions::{
         GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
@@ -662,6 +687,37 @@ mod tests {
         assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
         assert_eq!(command.get_env("COLORTERM"), None);
         assert_eq!(command.get_env("NO_COLOR"), None);
+    }
+
+    #[test]
+    fn machinectl_x11_probe_preserves_both_validated_paths_as_arguments() {
+        let request = X11ProjectionProbeRequest::new(
+            MachineName::new("test-machine").unwrap(),
+            ValidatedGuestUserName::new("alice").unwrap(),
+            Path::new("/mnt/x11/X0"),
+            Path::new("/tmp/.X11-unix/X0"),
+        )
+        .unwrap();
+        let command =
+            machine_session_command(MachineSessionRequest::x11_projection_probe(request)).unwrap();
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(
+            &command.args()[..6],
+            [
+                "--quiet",
+                "--",
+                "shell",
+                "alice@test-machine",
+                "/bin/sh",
+                "-c"
+            ]
+        );
+        assert_eq!(
+            &command.args()[command.args().len() - 2..],
+            ["/mnt/x11/X0", "/tmp/.X11-unix/X0"]
+        );
+        let command = command.into_pty_command().unwrap();
+        assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
     }
 
     #[test]

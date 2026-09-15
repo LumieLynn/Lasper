@@ -1,7 +1,8 @@
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
     SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
-    WaylandPreparationRequest, WaylandSessionContext,
+    WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 use crate::domain::session::SessionLifecycle;
 use async_trait::async_trait;
@@ -19,6 +20,7 @@ pub(crate) struct DirectSessionAdapter {
     terminal_policy: DirectTerminalPolicy,
     machine: super::MachineSessionTransport,
     wayland: super::wayland::WaylandSessionResolver,
+    x11: super::x11::X11SessionResolver,
 }
 
 impl DirectSessionAdapter {
@@ -30,7 +32,8 @@ impl DirectSessionAdapter {
         Self {
             terminal_policy,
             machine: machine.clone(),
-            wayland: super::wayland::WaylandSessionResolver::new(machine, nspawn),
+            wayland: super::wayland::WaylandSessionResolver::new(machine.clone(), nspawn.clone()),
+            x11: super::x11::X11SessionResolver::new(machine, nspawn),
         }
     }
 }
@@ -112,6 +115,18 @@ impl SessionPort for DirectSessionAdapter {
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.wayland.prepare(request).await
+    }
+
+    async fn probe_x11_projection(
+        &self,
+        request: X11ProjectionProbeRequest,
+    ) -> Result<X11ProjectionContext, SessionError> {
+        crate::adapters::platform::x11::revalidate_for_desktop(&request.host_socket)
+            .await
+            .map_err(|error| {
+                SessionError::new(format!("revalidate selected X11 display: {error}"))
+            })?;
+        self.x11.probe(request).await
     }
 
     async fn open_journal(

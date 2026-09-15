@@ -18,7 +18,10 @@ use crate::application::configuration::{
     ConfigurationTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
 };
 use crate::application::inspection::ResourceInspectionError;
+use crate::application::sessions::{SessionError, ValidatedGuestUserName, X11ProjectionContext};
+use crate::tui::core::{Component, EventResult};
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
+use crate::tui::widgets::inputs::text_box::TextBox;
 use navigation::ConfigurationNavigation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +71,11 @@ pub(crate) enum ConfigurationAction {
         generation: u64,
         edit: ConfigurationEdit,
     },
+    CheckX11 {
+        generation: u64,
+        target: crate::application::sessions::ShellTarget,
+        host_socket: crate::domain::x11::HostX11Socket,
+    },
     Restart(crate::domain::machine::MachineName),
 }
 
@@ -90,6 +98,29 @@ enum DraftPreviewState {
     },
 }
 
+enum X11ProbeState {
+    Untested,
+    Loading {
+        generation: u64,
+        user: ValidatedGuestUserName,
+    },
+    Ready {
+        generation: u64,
+        context: X11ProjectionContext,
+    },
+    Failed {
+        generation: u64,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11ContentFocus {
+    Bindings,
+    GuestUser,
+    Check,
+}
+
 #[derive(Clone, Copy)]
 enum DiscardIntent {
     Close,
@@ -106,6 +137,8 @@ struct HitAreas {
     close: Rect,
     bindings: Vec<(Rect, usize)>,
     checkboxes: Vec<(Rect, usize)>,
+    guest_user: Rect,
+    check_x11: Rect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -126,6 +159,7 @@ pub(crate) struct ConfigurationView {
     pending: Option<tokio::task::JoinHandle<()>>,
     pending_preview: Option<tokio::task::JoinHandle<()>>,
     pending_apply: Option<tokio::task::JoinHandle<()>>,
+    pending_x11_probe: Option<tokio::task::JoinHandle<()>>,
     state: InspectionState,
     pane: ConfigurationPane,
     navigation: ConfigurationNavigation,
@@ -137,6 +171,10 @@ pub(crate) struct ConfigurationView {
     restart_confirmation: Option<crate::domain::machine::MachineName>,
     saving: bool,
     apply_error: Option<String>,
+    x11_probe_generation: u64,
+    x11_probe: X11ProbeState,
+    x11_content_focus: X11ContentFocus,
+    guest_user: TextBox,
     list: ListState,
     x11_items: Vec<X11ChecklistItem>,
     expanded: BTreeSet<usize>,
@@ -155,6 +193,7 @@ impl ConfigurationView {
             pending: None,
             pending_preview: None,
             pending_apply: None,
+            pending_x11_probe: None,
             state: InspectionState::Loading,
             pane: ConfigurationPane::Content,
             navigation: ConfigurationNavigation::default(),
@@ -166,6 +205,11 @@ impl ConfigurationView {
             restart_confirmation: None,
             saving: false,
             apply_error: None,
+            x11_probe_generation: 0,
+            x11_probe: X11ProbeState::Untested,
+            x11_content_focus: X11ContentFocus::Bindings,
+            guest_user: TextBox::new(" Guest user ", String::new())
+                .with_validator(validate_guest_user),
             list: ListState::default(),
             x11_items: Vec::new(),
             expanded: BTreeSet::new(),
@@ -181,6 +225,7 @@ impl ConfigurationView {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
+        self.invalidate_x11_probe();
         self.query = query;
         self.cancel_preview();
         self.draft.clear();
@@ -207,6 +252,34 @@ impl ConfigurationView {
         self.pending_apply = Some(task);
     }
 
+    pub(crate) fn track_x11_probe(&mut self, task: tokio::task::JoinHandle<()>) {
+        if let Some(previous) = self.pending_x11_probe.replace(task) {
+            previous.abort();
+        }
+    }
+
+    pub(crate) fn finish_x11_probe(
+        &mut self,
+        generation: u64,
+        target: &ConfigurationTarget,
+        result: Result<X11ProjectionContext, SessionError>,
+    ) {
+        if generation != self.x11_probe_generation || target != &self.target {
+            return;
+        }
+        self.pending_x11_probe.take();
+        self.x11_probe = match result {
+            Ok(context) => X11ProbeState::Ready {
+                generation,
+                context,
+            },
+            Err(error) => X11ProbeState::Failed {
+                generation,
+                message: error.to_string(),
+            },
+        };
+    }
+
     pub(crate) fn finish_query(
         &mut self,
         query: u64,
@@ -229,6 +302,8 @@ impl ConfigurationView {
             Ok(_) => InspectionState::Failed("Inspection returned a different resource".into()),
             Err(error) => InspectionState::Failed(error.to_string()),
         };
+        self.x11_content_focus = X11ContentFocus::Bindings;
+        self.sync_x11_input_focus();
         self.preview_scroll = 0;
         self.preview_cache = None;
     }
@@ -384,6 +459,183 @@ impl ConfigurationView {
         }
     }
 
+    fn request_x11_probe(&mut self) -> ConfigurationAction {
+        let machine = match &self.target {
+            ConfigurationTarget::Machine(machine) => machine.clone(),
+            ConfigurationTarget::Image(_) => {
+                self.set_x11_probe_error(
+                    "X11 runtime checks require a running machine, not an image",
+                );
+                return ConfigurationAction::None;
+            }
+        };
+        if let Err(error) = self.guest_user.validate() {
+            self.set_x11_probe_error(error);
+            return ConfigurationAction::None;
+        }
+        let user = match ValidatedGuestUserName::new(self.guest_user.value()) {
+            Ok(user) => user,
+            Err(error) => {
+                self.set_x11_probe_error(error.to_string());
+                return ConfigurationAction::None;
+            }
+        };
+        let Some(host_socket) = self.selected_host_x11_socket() else {
+            self.set_x11_probe_error(
+                "Select an X11 declaration or live endpoint before checking runtime access",
+            );
+            return ConfigurationAction::None;
+        };
+        if let Some(previous) = self.pending_x11_probe.take() {
+            previous.abort();
+        }
+        self.x11_probe_generation = self
+            .x11_probe_generation
+            .checked_add(1)
+            .expect("X11 probe generation exhausted");
+        let generation = self.x11_probe_generation;
+        self.x11_probe = X11ProbeState::Loading {
+            generation,
+            user: user.clone(),
+        };
+        ConfigurationAction::CheckX11 {
+            generation,
+            target: crate::application::sessions::ShellTarget::new(machine, user),
+            host_socket,
+        }
+    }
+
+    fn set_x11_probe_error(&mut self, message: impl Into<String>) {
+        self.x11_probe_generation = self
+            .x11_probe_generation
+            .checked_add(1)
+            .expect("X11 probe generation exhausted");
+        self.x11_probe = X11ProbeState::Failed {
+            generation: self.x11_probe_generation,
+            message: message.into(),
+        };
+    }
+
+    fn invalidate_x11_probe(&mut self) {
+        if let Some(task) = self.pending_x11_probe.take() {
+            task.abort();
+        }
+        self.x11_probe_generation = self
+            .x11_probe_generation
+            .checked_add(1)
+            .expect("X11 probe generation exhausted");
+        self.x11_probe = X11ProbeState::Untested;
+    }
+
+    fn selected_host_x11_socket(&self) -> Option<crate::domain::x11::HostX11Socket> {
+        let InspectionState::Ready(snapshot) = &self.state else {
+            return None;
+        };
+        let item = self
+            .list
+            .selected()
+            .and_then(|index| self.x11_items.get(index));
+        match item {
+            Some(X11ChecklistItem::Available(source)) => snapshot
+                .host_x11
+                .sockets
+                .iter()
+                .find(|socket| socket.source() == source)
+                .cloned(),
+            Some(X11ChecklistItem::Declaration(line)) => {
+                let binding = snapshot
+                    .x11_bindings
+                    .iter()
+                    .find(|binding| binding.line == *line)?;
+                match binding.scope {
+                    crate::application::configuration::X11BindingScope::Socket { .. } => snapshot
+                        .host_x11
+                        .sockets
+                        .iter()
+                        .find(|socket| socket.source() == binding.source)
+                        .cloned(),
+                    crate::application::configuration::X11BindingScope::Directory => {
+                        snapshot
+                            .host_x11
+                            .preferred_display
+                            .and_then(|display| {
+                                snapshot.host_x11.sockets.iter().find(|socket| {
+                                    socket.display() == display && !socket.alternate()
+                                })
+                            })
+                            .or_else(|| {
+                                snapshot
+                                    .host_x11
+                                    .sockets
+                                    .iter()
+                                    .find(|socket| !socket.alternate())
+                            })
+                            .cloned()
+                    }
+                }
+            }
+            None => snapshot
+                .host_x11
+                .preferred_display
+                .and_then(|display| {
+                    snapshot
+                        .host_x11
+                        .sockets
+                        .iter()
+                        .find(|socket| socket.display() == display && !socket.alternate())
+                })
+                .cloned(),
+        }
+    }
+
+    fn set_x11_content_focus(&mut self, focus: X11ContentFocus) {
+        self.x11_content_focus = focus;
+        self.sync_x11_input_focus();
+    }
+
+    fn select_x11_item(&mut self, index: usize) {
+        if self.list.selected() == Some(index) {
+            return;
+        }
+        self.list.select(Some(index));
+        self.invalidate_x11_probe();
+    }
+
+    fn sync_x11_input_focus(&mut self) {
+        self.guest_user.set_focus(
+            self.pane == ConfigurationPane::Content
+                && self.x11_content_focus == X11ContentFocus::GuestUser,
+        );
+    }
+
+    fn move_x11_content_focus(&mut self, down: bool) {
+        match (self.x11_content_focus, down) {
+            (X11ContentFocus::Bindings, true) => {
+                let current = self.list.selected().unwrap_or(0);
+                if current + 1 < self.x11_items.len() {
+                    self.select_x11_item(current + 1);
+                } else if matches!(self.target, ConfigurationTarget::Machine(_)) {
+                    self.set_x11_content_focus(X11ContentFocus::GuestUser);
+                }
+            }
+            (X11ContentFocus::Bindings, false) => {
+                let current = self.list.selected().unwrap_or(0);
+                self.select_x11_item(current.saturating_sub(1));
+            }
+            (X11ContentFocus::GuestUser, true) => {
+                self.set_x11_content_focus(X11ContentFocus::Check)
+            }
+            (X11ContentFocus::GuestUser, false) if !self.x11_items.is_empty() => {
+                self.select_x11_item(self.x11_items.len() - 1);
+                self.set_x11_content_focus(X11ContentFocus::Bindings);
+            }
+            (X11ContentFocus::Check, false) => {
+                self.set_x11_content_focus(X11ContentFocus::GuestUser)
+            }
+            _ => {}
+        }
+    }
+
     fn request_close_or_refresh(&mut self, intent: DiscardIntent) -> ConfigurationAction {
         if self.saving {
             self.apply_error = Some("A configuration save is still in progress".into());
@@ -443,10 +695,12 @@ impl ConfigurationView {
             (Content, false) | (Navigation, true) => Preview,
             (Preview, false) | (Content, true) => Navigation,
         };
+        self.sync_x11_input_focus();
     }
 
     fn select_tab(&mut self, tab: PreviewTab) {
         self.pane = ConfigurationPane::Preview;
+        self.sync_x11_input_focus();
         if self.preview_tab != tab {
             self.preview_tab = tab;
             self.preview_scroll = 0;
@@ -465,13 +719,8 @@ impl ConfigurationView {
             } else {
                 self.preview_scroll.saturating_sub(1)
             };
-        } else if self.pane == ConfigurationPane::Content && !self.x11_items.is_empty() {
-            let current = self.list.selected().unwrap_or(0);
-            self.list.select(Some(if down {
-                (current + 1).min(self.x11_items.len() - 1)
-            } else {
-                current.saturating_sub(1)
-            }));
+        } else if self.pane == ConfigurationPane::Content {
+            self.move_x11_content_focus(down);
         }
     }
 
@@ -481,6 +730,36 @@ impl ConfigurationView {
         }
         if self.discard.is_some() {
             return self.handle_discard_key(key);
+        }
+        if self.pane == ConfigurationPane::Content
+            && self.x11_content_focus == X11ContentFocus::GuestUser
+        {
+            match key.code {
+                KeyCode::Esc => {
+                    self.set_x11_content_focus(X11ContentFocus::Bindings);
+                    return ConfigurationAction::None;
+                }
+                KeyCode::Up => {
+                    self.move_x11_content_focus(false);
+                    return ConfigurationAction::None;
+                }
+                KeyCode::Down | KeyCode::Enter => {
+                    if self.guest_user.validate().is_ok() {
+                        self.set_x11_content_focus(X11ContentFocus::Check);
+                    }
+                    return ConfigurationAction::None;
+                }
+                KeyCode::Tab | KeyCode::BackTab => {}
+                _ => {
+                    let before = self.guest_user.value().to_owned();
+                    if self.guest_user.handle_key(key) == EventResult::Consumed {
+                        if self.guest_user.value() != before {
+                            self.invalidate_x11_probe();
+                        }
+                        return ConfigurationAction::None;
+                    }
+                }
+            }
         }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
@@ -524,10 +803,12 @@ impl ConfigurationView {
             (_, KeyModifiers::NONE) if self.pane == ConfigurationPane::Navigation => {
                 if self.navigation.handle_key(key.code) {
                     self.pane = ConfigurationPane::Content;
+                    self.sync_x11_input_focus();
                 }
             }
             (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE)
-                if self.pane == ConfigurationPane::Content =>
+                if self.pane == ConfigurationPane::Content
+                    && self.x11_content_focus == X11ContentFocus::Bindings =>
             {
                 if let Some(selected) = self.list.selected() {
                     if key.code == KeyCode::Right {
@@ -539,11 +820,22 @@ impl ConfigurationView {
             }
             (KeyCode::Char(' '), KeyModifiers::NONE) => match self.pane {
                 ConfigurationPane::Navigation => {}
-                ConfigurationPane::Content => return self.toggle_selected_x11(),
+                ConfigurationPane::Content => match self.x11_content_focus {
+                    X11ContentFocus::Bindings => return self.toggle_selected_x11(),
+                    X11ContentFocus::GuestUser => {}
+                    X11ContentFocus::Check => return self.request_x11_probe(),
+                },
                 ConfigurationPane::Preview => {}
             },
             (KeyCode::Enter, KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                self.toggle_selected_details();
+                match self.x11_content_focus {
+                    X11ContentFocus::Bindings => self.toggle_selected_details(),
+                    X11ContentFocus::GuestUser => {}
+                    X11ContentFocus::Check => return self.request_x11_probe(),
+                }
+            }
+            (KeyCode::Char('c'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
+                return self.request_x11_probe();
             }
             _ => {}
         }
@@ -566,28 +858,39 @@ impl ConfigurationView {
                 self.select_tab(tab);
             } else if self.hits.navigation.contains(position) {
                 self.pane = ConfigurationPane::Navigation;
+                self.sync_x11_input_focus();
                 self.navigation.click(position);
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
-                let toggle = self
-                    .hits
-                    .checkboxes
-                    .iter()
-                    .find(|(area, _)| area.contains(position))
-                    .map(|(_, selected)| *selected);
-                if let Some((_, selected)) = self
-                    .hits
-                    .bindings
-                    .iter()
-                    .find(|(area, _)| area.contains(position))
-                {
-                    self.list.select(Some(*selected));
-                    if toggle == Some(*selected) {
-                        return self.toggle_selected_x11();
+                if self.hits.guest_user.contains(position) {
+                    self.set_x11_content_focus(X11ContentFocus::GuestUser);
+                } else if self.hits.check_x11.contains(position) {
+                    self.set_x11_content_focus(X11ContentFocus::Check);
+                    return self.request_x11_probe();
+                } else {
+                    self.set_x11_content_focus(X11ContentFocus::Bindings);
+                    let toggle = self
+                        .hits
+                        .checkboxes
+                        .iter()
+                        .find(|(area, _)| area.contains(position))
+                        .map(|(_, selected)| *selected);
+                    if let Some(selected) = self
+                        .hits
+                        .bindings
+                        .iter()
+                        .find(|(area, _)| area.contains(position))
+                        .map(|(_, selected)| *selected)
+                    {
+                        self.select_x11_item(selected);
+                        if toggle == Some(selected) {
+                            return self.toggle_selected_x11();
+                        }
                     }
                 }
             } else if self.hits.preview.contains(position) {
                 self.pane = ConfigurationPane::Preview;
+                self.sync_x11_input_focus();
             }
         } else if matches!(
             mouse.kind,
@@ -602,6 +905,7 @@ impl ConfigurationView {
             } else {
                 return ConfigurationAction::None;
             }
+            self.sync_x11_input_focus();
             self.scroll(mouse.kind == MouseEventKind::ScrollDown);
         }
         ConfigurationAction::None
@@ -666,12 +970,21 @@ fn declaration_is_recommended(
         && binding.options.iter().any(|option| option == "idmap") == *idmapped
 }
 
+fn validate_guest_user(value: &str) -> Result<(), String> {
+    ValidatedGuestUserName::new(value)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 impl Drop for ConfigurationView {
     fn drop(&mut self) {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
         if let Some(task) = self.pending_preview.take() {
+            task.abort();
+        }
+        if let Some(task) = self.pending_x11_probe.take() {
             task.abort();
         }
         // Applying is a mutation. Dropping a JoinHandle detaches it so direct

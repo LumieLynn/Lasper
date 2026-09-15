@@ -1,6 +1,16 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum X11ValidationError {
+    #[error("X11 endpoint source is not the standard path for display :{display}")]
+    InvalidSource { display: u16 },
+    #[error("X11 endpoint canonical path must be absolute: {0:?}")]
+    CanonicalPathNotAbsolute(PathBuf),
+    #[error("X11 endpoint peer PID is outside the Linux PID range: {0}")]
+    InvalidPeerPid(u32),
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,7 +26,7 @@ pub struct X11SocketRevision {
 /// `source` is the stable path written to an nspawn declaration. The canonical
 /// path and socket/peer identities are observations for this discovery only;
 /// they must be revalidated before a future runtime authorization operation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostX11Socket {
     display: u16,
@@ -30,6 +40,45 @@ pub struct HostX11Socket {
     peer_uid: u32,
     peer_gid: u32,
     revision: X11SocketRevision,
+}
+
+impl<'de> Deserialize<'de> for HostX11Socket {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Evidence {
+            display: u16,
+            alternate: bool,
+            source: PathBuf,
+            canonical_path: PathBuf,
+            owner_uid: u32,
+            owner_gid: u32,
+            mode: u32,
+            peer_pid: u32,
+            peer_uid: u32,
+            peer_gid: u32,
+            revision: X11SocketRevision,
+        }
+
+        let evidence = Evidence::deserialize(deserializer)?;
+        Self::from_verified_parts(
+            evidence.display,
+            evidence.alternate,
+            evidence.source,
+            evidence.canonical_path,
+            evidence.owner_uid,
+            evidence.owner_gid,
+            evidence.mode,
+            evidence.peer_pid,
+            evidence.peer_uid,
+            evidence.peer_gid,
+            evidence.revision,
+        )
+        .map_err(serde::de::Error::custom)
+    }
 }
 
 impl HostX11Socket {
@@ -46,15 +95,20 @@ impl HostX11Socket {
         peer_uid: u32,
         peer_gid: u32,
         revision: X11SocketRevision,
-    ) -> Option<Self> {
+    ) -> Result<Self, X11ValidationError> {
         let expected = format!("X{display}{}", if alternate { "_" } else { "" });
         if source.parent() != Some(Path::new("/tmp/.X11-unix"))
             || source.file_name().and_then(|name| name.to_str()) != Some(expected.as_str())
-            || !canonical_path.is_absolute()
         {
-            return None;
+            return Err(X11ValidationError::InvalidSource { display });
         }
-        Some(Self {
+        if !canonical_path.is_absolute() {
+            return Err(X11ValidationError::CanonicalPathNotAbsolute(canonical_path));
+        }
+        if peer_pid == 0 || peer_pid > i32::MAX as u32 {
+            return Err(X11ValidationError::InvalidPeerPid(peer_pid));
+        }
+        Ok(Self {
             display,
             alternate,
             source,
@@ -103,5 +157,43 @@ impl HostX11Socket {
 
     pub fn revision(&self) -> X11SocketRevision {
         self.revision
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket() -> HostX11Socket {
+        HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o777,
+            42,
+            1000,
+            1000,
+            X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn wire_round_trip_revalidates_endpoint_invariants() {
+        let encoded = serde_json::to_value(socket()).unwrap();
+        let decoded: HostX11Socket = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, socket());
+
+        let mut invalid = encoded;
+        invalid["source"] = serde_json::json!("/run/user/1000/not-an-x11-socket");
+        assert!(serde_json::from_value::<HostX11Socket>(invalid).is_err());
     }
 }

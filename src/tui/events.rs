@@ -45,6 +45,14 @@ pub enum AppEvent {
             crate::application::inspection::ResourceInspectionError,
         >,
     },
+    ConfigurationX11Probed {
+        generation: u64,
+        target: crate::application::configuration::ConfigurationTarget,
+        result: Result<
+            crate::application::sessions::X11ProjectionContext,
+            crate::application::sessions::SessionError,
+        >,
+    },
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
         result: Result<
@@ -92,6 +100,7 @@ impl AppEvent {
             Self::ConfigurationInspected { .. } => "configuration-inspected",
             Self::ConfigurationPreviewed { .. } => "configuration-previewed",
             Self::ConfigurationApplied { .. } => "configuration-applied",
+            Self::ConfigurationX11Probed { .. } => "configuration-x11-probed",
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",

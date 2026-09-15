@@ -962,6 +962,13 @@ mod tests {
             Err(SessionError::new("configured Wayland target is stale"))
         }
 
+        async fn probe_x11_projection(
+            &self,
+            _request: crate::application::sessions::X11ProjectionProbeRequest,
+        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
+            panic!("Wayland terminal tests must not run an X11 probe")
+        }
+
         async fn open_journal(
             &self,
             request: JournalSessionRequest,

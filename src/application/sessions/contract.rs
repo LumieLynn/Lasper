@@ -1,6 +1,7 @@
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::x11::HostX11Socket;
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
@@ -457,6 +458,49 @@ impl WaylandSessionContext {
     }
 }
 
+/// Fresh evidence that one startup-configured X11 endpoint reaches the
+/// standard client path for a selected guest account. X server ACL state is a
+/// separate user-side observation and is intentionally absent here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11ProjectionContext {
+    host_socket: HostX11Socket,
+    guest_mount: PathBuf,
+    guest_client_path: PathBuf,
+    identity: MappedGuestIdentity,
+}
+
+impl X11ProjectionContext {
+    pub(crate) fn verified(
+        host_socket: HostX11Socket,
+        guest_mount: PathBuf,
+        guest_client_path: PathBuf,
+        identity: MappedGuestIdentity,
+    ) -> Self {
+        Self {
+            host_socket,
+            guest_mount,
+            guest_client_path,
+            identity,
+        }
+    }
+
+    pub fn host_socket(&self) -> &HostX11Socket {
+        &self.host_socket
+    }
+
+    pub fn guest_mount(&self) -> &Path {
+        &self.guest_mount
+    }
+
+    pub fn guest_client_path(&self) -> &Path {
+        &self.guest_client_path
+    }
+
+    pub const fn identity(&self) -> MappedGuestIdentity {
+        self.identity
+    }
+}
+
 /// Closed, feature-owned environment allowlist for `OpenMachineShell`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TypedSessionEnvironment {
@@ -553,6 +597,13 @@ pub struct WaylandPreparationRequest {
     pub host_socket: HostWaylandSocket,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11ProjectionProbeRequest {
+    pub probe_id: SessionId,
+    pub target: ShellTarget,
+    pub host_socket: HostX11Socket,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedGuestIdentity {
     uid: u32,
@@ -570,6 +621,106 @@ impl ObservedGuestIdentity {
 
     pub fn gid(self) -> u32 {
         self.gid
+    }
+}
+
+/// Kernel identity of one namespace observed through procfs. Device and inode
+/// are kept together because an inode alone is not a complete file identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedNamespaceIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl ObservedNamespaceIdentity {
+    pub(crate) const fn new(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+
+    pub const fn device(self) -> u64 {
+        self.device
+    }
+
+    pub const fn inode(self) -> u64 {
+        self.inode
+    }
+}
+
+/// Runtime instance against which a guest-to-host identity mapping was
+/// observed. A later machine restart invalidates the evidence even if the
+/// machine name is unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObservedMachineInstance {
+    leader_pid: u32,
+    pid_namespace: ObservedNamespaceIdentity,
+    user_namespace: ObservedNamespaceIdentity,
+}
+
+impl ObservedMachineInstance {
+    pub(crate) const fn new(
+        leader_pid: u32,
+        pid_namespace: ObservedNamespaceIdentity,
+        user_namespace: ObservedNamespaceIdentity,
+    ) -> Self {
+        Self {
+            leader_pid,
+            pid_namespace,
+            user_namespace,
+        }
+    }
+
+    pub const fn leader_pid(self) -> u32 {
+        self.leader_pid
+    }
+
+    pub const fn pid_namespace(self) -> ObservedNamespaceIdentity {
+        self.pid_namespace
+    }
+
+    pub const fn user_namespace(self) -> ObservedNamespaceIdentity {
+        self.user_namespace
+    }
+}
+
+/// A selected guest account and the UID/GID seen for it by the host kernel.
+/// This is runtime evidence, not a prediction from `PrivateUsers=`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MappedGuestIdentity {
+    guest: ObservedGuestIdentity,
+    host_uid: u32,
+    host_gid: u32,
+    instance: ObservedMachineInstance,
+}
+
+impl MappedGuestIdentity {
+    pub(crate) const fn verified(
+        guest: ObservedGuestIdentity,
+        host_uid: u32,
+        host_gid: u32,
+        instance: ObservedMachineInstance,
+    ) -> Self {
+        Self {
+            guest,
+            host_uid,
+            host_gid,
+            instance,
+        }
+    }
+
+    pub const fn guest(self) -> ObservedGuestIdentity {
+        self.guest
+    }
+
+    pub const fn host_uid(self) -> u32 {
+        self.host_uid
+    }
+
+    pub const fn host_gid(self) -> u32 {
+        self.host_gid
+    }
+
+    pub const fn instance(self) -> ObservedMachineInstance {
+        self.instance
     }
 }
 
@@ -643,6 +794,11 @@ pub trait SessionPort: Send + Sync + 'static {
         &self,
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError>;
+
+    async fn probe_x11_projection(
+        &self,
+        request: X11ProjectionProbeRequest,
+    ) -> Result<X11ProjectionContext, SessionError>;
 
     async fn open_journal(
         &self,

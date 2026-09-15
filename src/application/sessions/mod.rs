@@ -5,10 +5,11 @@ mod service;
 pub use contract::{
     GuestCommand, GuestCommandError, GuestUserNameError, InteractiveShellEnvironment,
     InteractiveShellEnvironmentError, JournalSessionHandle, JournalSessionRequest,
-    ObservedGuestIdentity, SessionError, SessionPort, SessionSendStatus, ShellOpenError,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
-    TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
-    WaylandSessionContext, WaylandShellRequest,
+    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
+    SessionError, SessionPort, SessionSendStatus, ShellOpenError, ShellOpenIntent, ShellTarget,
+    TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest, ValidatedGuestUserName,
+    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 pub use service::SessionService;
 

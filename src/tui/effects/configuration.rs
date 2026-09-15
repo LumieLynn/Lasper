@@ -98,3 +98,36 @@ pub(crate) fn apply(
             .await;
     })
 }
+
+pub(crate) fn probe_x11(
+    service: Arc<crate::application::sessions::SessionService>,
+    configuration_target: ConfigurationTarget,
+    target: crate::application::sessions::ShellTarget,
+    host_socket: crate::domain::x11::HostX11Socket,
+    generation: u64,
+    events: tokio::sync::mpsc::Sender<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(
+            Duration::from_secs(15),
+            AssertUnwindSafe(service.test_x11_projection(target, host_socket)).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(crate::application::sessions::SessionError::new(
+                "X11 projection check stopped unexpectedly",
+            )),
+            Err(_) => Err(crate::application::sessions::SessionError::new(
+                "X11 projection check timed out",
+            )),
+        };
+        let _ = events
+            .send(AppEvent::ConfigurationX11Probed {
+                generation,
+                target: configuration_target,
+                result,
+            })
+            .await;
+    })
+}

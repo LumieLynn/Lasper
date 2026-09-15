@@ -8,12 +8,15 @@
 
 mod direct;
 mod elevated;
+mod instance;
 mod machine;
 mod pty;
 pub(crate) mod terminal_attach;
 pub(crate) mod terminal_io;
 mod wayland;
 mod wayland_probe;
+mod x11;
+mod x11_probe;
 
 use crate::application::sessions::{SessionPort, SessionService};
 use std::sync::Arc;
@@ -26,6 +29,8 @@ pub(crate) use machine::{
 };
 pub(crate) use wayland::WaylandSessionResolver;
 pub(crate) use wayland_probe::WaylandProbeRequest;
+pub(crate) use x11::X11SessionResolver;
+pub(crate) use x11_probe::X11ProjectionProbeRequest;
 
 pub(crate) enum SessionRoute {
     Direct {

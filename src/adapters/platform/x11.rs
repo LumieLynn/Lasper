@@ -37,6 +37,71 @@ impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
     }
 }
 
+/// Re-run the authenticated X11 setup from the invoking desktop process and
+/// require the endpoint evidence to remain byte-for-byte current.
+pub(crate) async fn revalidate_for_desktop(socket: &HostX11Socket) -> Result<(), String> {
+    let socket = socket.clone();
+    tokio::task::spawn_blocking(move || {
+        let current = inspect_endpoint(
+            socket.display(),
+            socket.alternate(),
+            socket.source().to_path_buf(),
+        )?;
+        if current != socket {
+            return Err(format!(
+                "{} changed after X11 endpoint discovery",
+                socket.source().display()
+            ));
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("X11 endpoint revalidation task failed: {error}"))?
+}
+
+/// Revalidate filesystem and peer-process evidence without relying on the
+/// caller's Xauthority. The privileged side uses this after an authenticated
+/// client has already completed `revalidate_for_desktop`.
+pub(crate) async fn projection_socket_identities(
+    socket: &HostX11Socket,
+) -> Result<Vec<(u64, u64)>, String> {
+    let socket = socket.clone();
+    tokio::task::spawn_blocking(move || {
+        let selected = inspect_endpoint_peer_only(
+            socket.display(),
+            socket.alternate(),
+            socket.source().to_path_buf(),
+        )?;
+        if selected != socket {
+            return Err(format!(
+                "{} changed after X11 endpoint discovery",
+                socket.source().display()
+            ));
+        }
+        let mut identities = vec![(socket.revision().device, socket.revision().inode)];
+        if socket.alternate() {
+            let standard = inspect_endpoint_peer_only(
+                socket.display(),
+                false,
+                Path::new(X11_SOCKET_DIRECTORY).join(format!("X{}", socket.display())),
+            )?;
+            if standard.peer_identity() != socket.peer_identity() {
+                return Err(format!(
+                    "standard and alternate endpoints for :{} no longer belong to the same X server",
+                    socket.display()
+                ));
+            }
+            let identity = (standard.revision().device, standard.revision().inode);
+            if !identities.contains(&identity) {
+                identities.push(identity);
+            }
+        }
+        Ok(identities)
+    })
+    .await
+    .map_err(|error| format!("X11 projection evidence task failed: {error}"))?
+}
+
 fn discover_sync() -> X11EndpointCatalog {
     let preferred_display = std::env::var("DISPLAY")
         .ok()
@@ -214,7 +279,44 @@ fn inspect_endpoint(
             ctime_nanoseconds: metadata.ctime_nsec(),
         },
     )
-    .ok_or_else(|| "X11 endpoint evidence did not match its standard source path".into())
+    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
+}
+
+fn inspect_endpoint_peer_only(
+    display: u16,
+    alternate: bool,
+    source: PathBuf,
+) -> Result<HostX11Socket, String> {
+    let canonical_path = fs::canonicalize(&source)
+        .map_err(|error| format!("resolve {}: {error}", source.display()))?;
+    let metadata = fs::metadata(&canonical_path)
+        .map_err(|error| format!("inspect {}: {error}", canonical_path.display()))?;
+    if !metadata.file_type().is_socket() {
+        return Err(format!("{} is not a Unix socket", source.display()));
+    }
+    let stream = UnixStream::connect(&source)
+        .map_err(|error| format!("connect to {}: {error}", source.display()))?;
+    let peer = peer_credentials(&stream)?;
+    drop(stream);
+    HostX11Socket::from_verified_parts(
+        display,
+        alternate,
+        source,
+        canonical_path,
+        metadata.uid(),
+        metadata.gid(),
+        metadata.permissions().mode(),
+        peer.0,
+        peer.1,
+        peer.2,
+        X11SocketRevision {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            ctime_seconds: metadata.ctime(),
+            ctime_nanoseconds: metadata.ctime_nsec(),
+        },
+    )
+    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
 }
 
 fn peer_credentials(stream: &UnixStream) -> Result<(u32, u32, u32), String> {

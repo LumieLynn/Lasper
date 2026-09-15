@@ -2,7 +2,8 @@ use crate::adapters::elevated::{pipe_reader, ElevatedDaemon};
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
     SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
-    WaylandPreparationRequest, WaylandSessionContext,
+    WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 use crate::domain::session::SessionLifecycle;
 use crate::ipc::protocol::session::WireTerminalLaunch;
@@ -127,6 +128,18 @@ impl SessionPort for ElevatedSessionAdapter {
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.daemon.prepare_wayland(request).await
+    }
+
+    async fn probe_x11_projection(
+        &self,
+        request: X11ProjectionProbeRequest,
+    ) -> Result<X11ProjectionContext, SessionError> {
+        crate::adapters::platform::x11::revalidate_for_desktop(&request.host_socket)
+            .await
+            .map_err(|error| {
+                SessionError::new(format!("revalidate selected X11 display: {error}"))
+            })?;
+        self.daemon.probe_x11_projection(request).await
     }
 
     async fn open_journal(

@@ -4,6 +4,7 @@ use crate::application::sessions::{
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::x11::HostX11Socket;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::num::NonZeroU16;
@@ -128,6 +129,38 @@ pub(crate) enum PrepareWaylandResponse {
         guest_socket: PathBuf,
         uid: u32,
         gid: u32,
+    },
+    Failed {
+        message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hint: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProbeX11ProjectionParams {
+    pub probe_id: WireSessionId,
+    pub machine: MachineName,
+    pub user: ValidatedGuestUserName,
+    pub host_socket: HostX11Socket,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum ProbeX11ProjectionResponse {
+    Ready {
+        guest_mount: PathBuf,
+        guest_client_path: PathBuf,
+        guest_uid: u32,
+        guest_gid: u32,
+        host_uid: u32,
+        host_gid: u32,
+        leader_pid: u32,
+        pid_namespace_device: u64,
+        pid_namespace_inode: u64,
+        user_namespace_device: u64,
+        user_namespace_inode: u64,
     },
     Failed {
         message: String,

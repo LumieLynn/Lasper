@@ -11,13 +11,14 @@ use ratatui::{
 use super::navigation::ConfigurationPage;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
-    X11ChecklistItem,
+    X11ChecklistItem, X11ContentFocus, X11ProbeState,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
     X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::x11::HostX11Socket;
+use crate::tui::core::Component;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
 use crate::tui::{soft_wrap_text, theme};
@@ -101,7 +102,7 @@ impl ConfigurationView {
         let footer = if self.saving {
             " Saving configuration..."
         } else {
-            " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Check  Enter Fold  Ctrl+S Save  [/] Tabs"
+            " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Toggle  Enter Fold  c Check  Ctrl+S Save  [/] Tabs"
         };
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(theme::theme().hint_fg)),
@@ -141,7 +142,7 @@ impl ConfigurationView {
         frame.render_widget(block, self.hits.content);
         let rows = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(4),
+            Constraint::Length(9),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -180,9 +181,13 @@ impl ConfigurationView {
                 )
                 .highlight_symbol(">> ")
                 .highlight_style(
-                    Style::default()
-                        .fg(theme::theme().list_highlight_symbol)
-                        .add_modifier(Modifier::BOLD),
+                    if self.x11_content_focus == X11ContentFocus::Bindings {
+                        Style::default()
+                            .fg(theme::theme().list_highlight_symbol)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme::theme().text_secondary)
+                    },
                 ),
                 rows[0],
                 &mut self.list,
@@ -202,23 +207,97 @@ impl ConfigurationView {
                 y += height;
             }
         }
-        frame.render_widget(
-            Paragraph::new(
-                "Not queried. A startup bind does not establish current X server access.",
-            )
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Current access ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded),
-            ),
-            rows[1],
-        );
+        self.render_current_x11_access(frame, rows[1]);
         frame.render_widget(
             Paragraph::new("Operation history: not loaded")
                 .style(Style::default().fg(theme::theme().text_secondary)),
             rows[2],
+        );
+    }
+
+    fn render_current_x11_access(&mut self, frame: &mut Frame, area: Rect) {
+        let title = self
+            .selected_host_x11_socket()
+            .map(|socket| format!(" Current access: :{} ", socket.display()))
+            .unwrap_or_else(|| " Current access ".into());
+        let block = Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(crate::tui::widget_border_color(
+                self.pane == ConfigurationPane::Content
+                    && self.x11_content_focus != X11ContentFocus::Bindings,
+                matches!(self.target, ConfigurationTarget::Machine(_)),
+            )));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if !matches!(self.target, ConfigurationTarget::Machine(_)) {
+            frame.render_widget(
+                Paragraph::new(
+                    "Runtime X11 checks become available after this image is started as a machine.",
+                )
+                .style(Style::default().fg(theme::theme().text_secondary))
+                .wrap(Wrap { trim: false }),
+                inner,
+            );
+            return;
+        }
+        let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(inner);
+        let status = match &self.x11_probe {
+            X11ProbeState::Untested => {
+                "Not queried. A startup bind does not establish current X server access.".into()
+            }
+            X11ProbeState::Loading { generation, user } => {
+                format!("Check #{generation}: validating the running projection for {user}…")
+            }
+            X11ProbeState::Ready {
+                generation,
+                context,
+            } => {
+                let identity = context.identity();
+                format!(
+                    "Check #{generation}: projection ready. Guest uid {} maps to host uid {}.\n{} → {} → {}\nX server ACL has not been queried yet.",
+                    identity.guest().uid(),
+                    identity.host_uid(),
+                    context.host_socket().source().display(),
+                    context.guest_mount().display(),
+                    context.guest_client_path().display(),
+                )
+            }
+            X11ProbeState::Failed {
+                generation,
+                message,
+            } => format!("Check #{generation} failed: {message}"),
+        };
+        frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), rows[0]);
+        let controls =
+            Layout::horizontal([Constraint::Min(16), Constraint::Length(20)]).split(rows[1]);
+        self.hits.guest_user = controls[0];
+        self.hits.check_x11 = controls[1];
+        self.guest_user.render(frame, controls[0]);
+        let focused = self.pane == ConfigurationPane::Content
+            && self.x11_content_focus == X11ContentFocus::Check;
+        frame.render_widget(
+            Paragraph::new(" Check projection ")
+                .alignment(Alignment::Center)
+                .style(if focused {
+                    Style::default()
+                        .fg(theme::theme().button_focused_fg)
+                        .bg(theme::theme().button_focused_bg)
+                } else {
+                    Style::default().fg(theme::theme().button_unfocused_fg)
+                })
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(if focused {
+                            theme::theme().button_border_focused
+                        } else {
+                            theme::theme().button_border_unfocused
+                        })),
+                ),
+            controls[1],
         );
     }
 
@@ -565,7 +644,10 @@ fn declaration_lines(
         .host_x11
         .sockets
         .iter()
-        .any(|socket| socket.source() == source);
+        .any(|socket| match bind.scope {
+            X11BindingScope::Directory => socket.source().parent() == Some(source.as_path()),
+            X11BindingScope::Socket { .. } => socket.source() == source,
+        });
     let mut lines = vec![Line::from(format!(
         "{check} {disclosure} {label} [line {}]{modified}",
         bind.line
