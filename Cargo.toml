@@ -8,6 +8,10 @@ description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
 name = "lasper"
 path = "src/main.rs"
 
+[[example]]
+name = "x11-inspect"
+path = "tools/x11-inspect.rs"
+
 [dependencies]
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
@@ -61,6 +65,7 @@ zeroize = "1.8"
 [dev-dependencies]
 mockall = "0.13"
 tokio = { version = "1", features = ["test-util"] }
+x11rb = { version = "0.13.2", default-features = false }
 
 [profile.release]
 opt-level = "s"

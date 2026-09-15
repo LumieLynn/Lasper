@@ -1067,6 +1067,7 @@ dependencies = [
  "uuid",
  "uzers",
  "which",
+ "x11rb",
  "zbus",
  "zeroize",
 ]
