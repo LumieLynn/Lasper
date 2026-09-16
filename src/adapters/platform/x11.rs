@@ -7,15 +7,16 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::ConnectionExt;
+use x11rb::protocol::xproto::{ConnectionExt, Family, HostMode};
 use x11rb::reexports::x11rb_protocol::{parse_display, xauth};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
 use crate::application::x11::{
-    X11AclEntry, X11AclSnapshot, X11DesktopAccessError, X11DesktopAccessPort, X11EndpointCatalog,
+    X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationRequest,
+    X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11EndpointCatalog,
     X11EndpointDiscoveryPort,
 };
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
@@ -25,6 +26,7 @@ const ENDPOINT_IO_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_DISCOVERED_DISPLAYS: usize = 16;
 const MAX_ACL_ENTRIES: usize = 1024;
 const MAX_ACL_BYTES: usize = 64 * 1024;
+const GRANT_RECORD_VERSION: u32 = 1;
 
 type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32));
 
@@ -58,6 +60,19 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!("X11 ACL query task failed: {error}"))
+            })?
+            .map_err(X11DesktopAccessError::new)
+    }
+
+    async fn ensure(
+        &self,
+        request: &X11AuthorizationRequest,
+    ) -> Result<X11DesktopAuthorization, X11DesktopAccessError> {
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || ensure_access_sync(&request))
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!("X11 authorization task failed: {error}"))
             })?
             .map_err(X11DesktopAccessError::new)
     }
@@ -294,12 +309,20 @@ fn inspect_endpoint(
 fn snapshot_acl_sync(socket: &HostX11Socket) -> Result<X11AclSnapshot, String> {
     require_current_socket(socket, "before querying its ACL")?;
     let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let snapshot = read_acl(&connection, socket.display())?;
+    require_current_socket(socket, "while querying its ACL")?;
+    Ok(snapshot)
+}
+
+fn read_acl(
+    connection: &RustConnection<DefaultStream>,
+    display: u16,
+) -> Result<X11AclSnapshot, String> {
     let reply = connection
         .list_hosts()
-        .map_err(|error| format!("send ListHosts to :{}: {error}", socket.display()))?
+        .map_err(|error| format!("send ListHosts to :{display}: {error}"))?
         .reply()
-        .map_err(|error| format!("read ListHosts from :{}: {error}", socket.display()))?;
-    require_current_socket(socket, "while querying its ACL")?;
+        .map_err(|error| format!("read ListHosts from :{display}: {error}"))?;
 
     if reply.hosts.len() > MAX_ACL_ENTRIES {
         return Err(format!(
@@ -321,6 +344,294 @@ fn snapshot_acl_sync(socket: &HostX11Socket) -> Result<X11AclSnapshot, String> {
         entries.push(X11AclEntry::from_wire(host.family.into(), host.address));
     }
     Ok(X11AclSnapshot::from_wire(reply.mode.into(), entries))
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
+enum GrantRecordPhase {
+    Pending,
+    ConfirmedAdded,
+    OutcomeUnknown { reason: String },
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedX11GrantRecord {
+    version: u32,
+    record_id: String,
+    phase: GrantRecordPhase,
+    created_unix_millis: u64,
+    caller_uid: u32,
+    boot_id: String,
+    machine: String,
+    guest_user: String,
+    guest_uid: u32,
+    guest_gid: u32,
+    host_uid: u32,
+    host_gid: u32,
+    machine_leader_pid: u32,
+    machine_pid_namespace: (u64, u64),
+    machine_user_namespace: (u64, u64),
+    display: u16,
+    alternate_endpoint: bool,
+    source: PathBuf,
+    canonical_source: PathBuf,
+    socket_revision: X11SocketRevision,
+    server_peer: (u32, u32, u32),
+    server_peer_start_time: u64,
+    acl_family: u8,
+    acl_address: Vec<u8>,
+}
+
+impl ManagedX11GrantRecord {
+    fn pending(
+        request: &X11AuthorizationRequest,
+        record_id: String,
+        server_peer_start_time: u64,
+    ) -> Result<Self, String> {
+        let projection = request.projection();
+        let identity = projection.identity();
+        let instance = identity.instance();
+        let pid_namespace = instance.pid_namespace();
+        let user_namespace = instance.user_namespace();
+        let host_uid = identity.host_uid();
+        Ok(Self {
+            version: GRANT_RECORD_VERSION,
+            record_id,
+            phase: GrantRecordPhase::Pending,
+            created_unix_millis: unix_millis()?,
+            caller_uid: uzers::get_effective_uid(),
+            boot_id: host_boot_id()?,
+            machine: request.target().machine().as_str().to_owned(),
+            guest_user: request.target().user().as_str().to_owned(),
+            guest_uid: identity.guest().uid(),
+            guest_gid: identity.guest().gid(),
+            host_uid,
+            host_gid: identity.host_gid(),
+            machine_leader_pid: instance.leader_pid(),
+            machine_pid_namespace: (pid_namespace.device(), pid_namespace.inode()),
+            machine_user_namespace: (user_namespace.device(), user_namespace.inode()),
+            display: projection.host_socket().display(),
+            alternate_endpoint: projection.host_socket().alternate(),
+            source: projection.host_socket().source().to_path_buf(),
+            canonical_source: projection.host_socket().canonical_path().to_path_buf(),
+            socket_revision: projection.host_socket().revision(),
+            server_peer: projection.host_socket().peer_identity(),
+            server_peer_start_time,
+            acl_family: Family::SERVER_INTERPRETED.into(),
+            acl_address: numeric_local_user_address(host_uid),
+        })
+    }
+}
+
+struct X11RuntimeState {
+    access: crate::adapters::trusted_state::TrustedDirectory,
+    grants: crate::adapters::trusted_state::TrustedDirectory,
+}
+
+impl X11RuntimeState {
+    fn open() -> Result<Self, String> {
+        let uid = uzers::get_effective_uid();
+        let runtime = user_runtime_directory(uid)?;
+        let runtime =
+            crate::adapters::trusted_state::TrustedDirectory::open_existing(&runtime, uid)
+                .map_err(|error| format!("open user runtime directory: {error}"))?;
+        let lasper = runtime
+            .open_or_create_child("lasper", 0o700)
+            .map_err(|error| format!("open Lasper runtime directory: {error}"))?;
+        let access = lasper
+            .open_or_create_child("x11-access", 0o700)
+            .map_err(|error| format!("open X11 access runtime directory: {error}"))?;
+        let grants = access
+            .open_or_create_child("grants", 0o700)
+            .map_err(|error| format!("open X11 grant record directory: {error}"))?;
+        Ok(Self { access, grants })
+    }
+
+    fn lock(&self) -> Result<std::fs::File, String> {
+        self.access
+            .lock_exclusive("acl")
+            .map_err(|error| format!("lock X11 access operations: {error}"))
+    }
+
+    fn write(&self, file_name: &str, record: &ManagedX11GrantRecord) -> Result<(), String> {
+        let bytes = serde_json::to_vec(record)
+            .map_err(|error| format!("serialize X11 grant record: {error}"))?;
+        self.grants
+            .write_atomic(file_name, &bytes, 0o600)
+            .map_err(|error| format!("persist X11 grant record: {error}"))
+    }
+}
+
+fn ensure_access_sync(
+    request: &X11AuthorizationRequest,
+) -> Result<X11DesktopAuthorization, String> {
+    let state = X11RuntimeState::open()?;
+    let _lock = state.lock()?;
+    let projection = request.projection();
+    let socket = projection.host_socket();
+    require_current_socket(socket, "before authorizing access")?;
+    let server_peer_start_time = x11_peer_start_time(socket)?;
+    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let before = read_acl(&connection, socket.display())?;
+    require_current_socket(socket, "before changing its ACL")?;
+
+    match before.mode() {
+        crate::application::x11::X11AccessControlMode::Disabled => {
+            return Ok(X11DesktopAuthorization::new(
+                before,
+                X11AuthorizationDisposition::AccessControlDisabled,
+            ));
+        }
+        crate::application::x11::X11AccessControlMode::Unknown(mode) => {
+            return Err(format!(
+                "X server returned unsupported access-control mode {mode}; no ACL change was attempted"
+            ));
+        }
+        crate::application::x11::X11AccessControlMode::Enabled => {}
+    }
+
+    let host_uid = projection.identity().host_uid();
+    if before.has_numeric_local_user(host_uid) {
+        return Ok(X11DesktopAuthorization::new(
+            before,
+            X11AuthorizationDisposition::PreExisting,
+        ));
+    }
+
+    let record_id = uuid::Uuid::new_v4().simple().to_string();
+    let file_name = format!("grant-{record_id}.json");
+    let mut record =
+        ManagedX11GrantRecord::pending(request, record_id.clone(), server_peer_start_time)?;
+    state.write(&file_name, &record)?;
+
+    let (change_result, observed) = insert_and_observe(&connection, socket.display(), host_uid);
+
+    let socket_result = require_current_socket(socket, "while authorizing access");
+    let server_result = x11_peer_start_time(socket).and_then(|current| {
+        (current == server_peer_start_time)
+            .then_some(())
+            .ok_or_else(|| "X server process changed while authorizing access".to_owned())
+    });
+    if authorization_was_confirmed(
+        &change_result,
+        &observed,
+        &socket_result,
+        &server_result,
+        host_uid,
+    ) {
+        let after = observed.expect("confirmed observation is successful");
+        record.phase = GrantRecordPhase::ConfirmedAdded;
+        state.write(&file_name, &record).map_err(|error| {
+            format!(
+                "X11 access was added, but its operation record could not be finalized ({error}); the pending record was preserved"
+            )
+        })?;
+        return Ok(X11DesktopAuthorization::new(
+            after,
+            X11AuthorizationDisposition::Added { record_id },
+        ));
+    }
+
+    let reason = [
+        change_result.err(),
+        observed
+            .err()
+            .map(|error| format!("confirmation query: {error}")),
+        socket_result
+            .err()
+            .map(|error| format!("endpoint revalidation: {error}")),
+        server_result
+            .err()
+            .map(|error| format!("server generation: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ");
+    let reason = if reason.is_empty() {
+        format!("localuser:#{host_uid} was absent after the X server round trip")
+    } else {
+        reason
+    };
+    record.phase = GrantRecordPhase::OutcomeUnknown {
+        reason: reason.clone(),
+    };
+    let record_result = state.write(&file_name, &record);
+    Err(match record_result {
+        Ok(()) => format!(
+            "X11 authorization outcome is unknown: {reason}; operation record {record_id} was preserved"
+        ),
+        Err(record_error) => format!(
+            "X11 authorization outcome is unknown: {reason}; additionally, the pending operation record could not be updated: {record_error}"
+        ),
+    })
+}
+
+fn insert_and_observe(
+    connection: &RustConnection<DefaultStream>,
+    display: u16,
+    host_uid: u32,
+) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
+    let address = numeric_local_user_address(host_uid);
+    let change_result =
+        match connection.change_hosts(HostMode::INSERT, Family::SERVER_INTERPRETED, &address) {
+            Ok(cookie) => cookie
+                .check()
+                .map_err(|error| format!("insert localuser:#{host_uid}: {error}")),
+            Err(error) => Err(format!("send localuser:#{host_uid} insertion: {error}")),
+        };
+    let observed = read_acl(connection, display);
+    (change_result, observed)
+}
+
+fn authorization_was_confirmed(
+    change: &Result<(), String>,
+    observation: &Result<X11AclSnapshot, String>,
+    socket: &Result<(), String>,
+    server: &Result<(), String>,
+    host_uid: u32,
+) -> bool {
+    change.is_ok()
+        && socket.is_ok()
+        && server.is_ok()
+        && observation
+            .as_ref()
+            .is_ok_and(|snapshot| snapshot.has_numeric_local_user(host_uid))
+}
+
+fn numeric_local_user_address(uid: u32) -> Vec<u8> {
+    format!("localuser\0#{uid}").into_bytes()
+}
+
+fn user_runtime_directory(uid: u32) -> Result<PathBuf, String> {
+    let path = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    if !path.is_absolute() {
+        return Err(format!(
+            "XDG_RUNTIME_DIR must be absolute: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn host_boot_id() -> Result<String, String> {
+    let value = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map_err(|error| format!("read host boot identity: {error}"))?;
+    uuid::Uuid::parse_str(value.trim())
+        .map(|value| value.to_string())
+        .map_err(|error| format!("parse host boot identity: {error}"))
+}
+
+fn unix_millis() -> Result<u64, String> {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("read system time: {error}"))?
+        .as_millis();
+    u64::try_from(millis).map_err(|_| "system time exceeds the X11 record format".into())
 }
 
 fn require_current_socket(socket: &HostX11Socket, phase: &str) -> Result<(), String> {
@@ -423,9 +734,30 @@ fn peer_credentials(stream: &UnixStream) -> Result<(u32, u32, u32), String> {
     Ok((pid, credentials.uid, credentials.gid))
 }
 
+fn x11_peer_start_time(socket: &HostX11Socket) -> Result<u64, String> {
+    let (pid, _, _) = socket.peer_identity();
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .map_err(|error| format!("read X server process identity for pid {pid}: {error}"))?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields)
+        .ok_or_else(|| format!("X server process {pid} stat has no command terminator"))?;
+    fields
+        .split_whitespace()
+        .nth(19)
+        .ok_or_else(|| format!("X server process {pid} stat has no start time"))?
+        .parse()
+        .map_err(|error| format!("X server process {pid} start time is invalid: {error}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::sessions::{
+        MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance,
+        ObservedNamespaceIdentity, ShellTarget, ValidatedGuestUserName, X11ProjectionContext,
+    };
+    use crate::domain::x11::X11SocketRevision;
 
     #[test]
     fn display_and_socket_names_are_kept_distinct() {
@@ -436,5 +768,87 @@ mod tests {
         assert_eq!(parse_standard_socket_name("X12"), Some(12));
         assert_eq!(parse_standard_socket_name("X0_"), None);
         assert_eq!(parse_standard_socket_name("X"), None);
+    }
+
+    #[test]
+    fn an_observed_entry_is_not_claimed_when_change_hosts_failed() {
+        let uid = 1_437_402_088;
+        let observed = Ok(X11AclSnapshot::from_wire(
+            1,
+            vec![X11AclEntry::from_wire(
+                Family::SERVER_INTERPRETED.into(),
+                numeric_local_user_address(uid),
+            )],
+        ));
+        let endpoint = Ok(());
+        let server = Ok(());
+
+        assert!(!authorization_was_confirmed(
+            &Err("external race".into()),
+            &observed,
+            &endpoint,
+            &server,
+            uid,
+        ));
+        assert!(authorization_was_confirmed(
+            &Ok(()),
+            &observed,
+            &endpoint,
+            &server,
+            uid,
+        ));
+    }
+
+    #[test]
+    fn grant_records_are_versioned_and_reject_unknown_fields() {
+        let namespace = ObservedNamespaceIdentity::new(1, 2);
+        let identity = MappedGuestIdentity::verified(
+            ObservedGuestIdentity::new(1000, 1000),
+            1_437_402_088,
+            1_437_402_088,
+            ObservedMachineInstance::new(42, namespace, namespace),
+        );
+        let socket = HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o755,
+            42,
+            1000,
+            1000,
+            X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        let projection = X11ProjectionContext::verified(
+            socket,
+            "/mnt/host-x11/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            identity,
+        );
+        let request = X11AuthorizationRequest::new(
+            ShellTarget::new(
+                crate::domain::machine::MachineName::new("archlinux").unwrap(),
+                ValidatedGuestUserName::new("alice").unwrap(),
+            ),
+            projection,
+        );
+        let record = ManagedX11GrantRecord::pending(&request, "record-1".into(), 77).unwrap();
+        let value = serde_json::to_value(&record).unwrap();
+        let decoded: ManagedX11GrantRecord = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(decoded.record_id, "record-1");
+        assert_eq!(decoded.server_peer_start_time, 77);
+        assert_eq!(decoded.acl_address, b"localuser\0#1437402088".to_vec());
+
+        let mut unknown = value;
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<ManagedX11GrantRecord>(unknown).is_err());
     }
 }

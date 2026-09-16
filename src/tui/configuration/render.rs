@@ -11,7 +11,7 @@ use ratatui::{
 use super::navigation::ConfigurationPage;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
-    X11CheckState, X11ChecklistItem, X11ContentFocus,
+    X11AuthorizationPresentation, X11CheckState, X11ChecklistItem, X11ContentFocus,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
@@ -116,7 +116,9 @@ impl ConfigurationView {
             11.min(rows[2].width.saturating_sub(11)),
             rows[2].height,
         );
-        if self.restart_confirmation.is_some() {
+        if self.x11_authorization_confirmation.is_some() {
+            self.render_x11_authorization_confirmation(frame, area);
+        } else if self.restart_confirmation.is_some() {
             self.render_restart_confirmation(frame, area);
         } else if self.discard.is_some() {
             self.render_discard_confirmation(frame, area);
@@ -251,31 +253,56 @@ impl ConfigurationView {
             X11CheckState::Loading { generation, user } => {
                 format!("Check #{generation}: validating projection and X server ACL for {user}…")
             }
-            X11CheckState::Ready { generation, check } => {
+            X11CheckState::Authorizing {
+                generation,
+                user,
+                host_uid,
+            } => format!(
+                "Authorization #{generation}: adding exact localuser:#{host_uid} access for {user}…"
+            ),
+            X11CheckState::Ready {
+                generation,
+                check,
+                authorization,
+            } => {
                 let context = check.projection();
                 let identity = context.identity();
-                let acl_status = match check.mapped_uid_status() {
-                    X11MappedUidAclStatus::AccessControlDisabled => {
-                        "X server access control is disabled.".to_owned()
+                let acl_status = match authorization {
+                    Some(X11AuthorizationPresentation::Added { record_id }) => format!(
+                        "Exact localuser:#{} entry is present (Lasper record {}).",
+                        identity.host_uid(),
+                        &record_id[..record_id.len().min(12)]
+                    ),
+                    Some(X11AuthorizationPresentation::PreExisting) => format!(
+                        "Exact localuser:#{} entry was already present (external/unmanaged).",
+                        identity.host_uid()
+                    ),
+                    Some(X11AuthorizationPresentation::AccessControlDisabled) => {
+                        "X server access control is disabled; no entry was added.".to_owned()
                     }
-                    X11MappedUidAclStatus::ExactNumericEntryPresent => format!(
-                        "Exact localuser:#{} entry is present (external/unmanaged).",
-                        identity.host_uid()
-                    ),
-                    X11MappedUidAclStatus::ExactNumericEntryAbsent => format!(
-                        "No exact localuser:#{} entry was observed.",
-                        identity.host_uid()
-                    ),
-                    X11MappedUidAclStatus::UnknownMode {
-                        exact_numeric_entry_present,
-                    } => format!(
-                        "Unknown ACL mode; exact numeric entry {}.",
-                        if exact_numeric_entry_present {
-                            "is present"
-                        } else {
-                            "was not observed"
+                    None => match check.mapped_uid_status() {
+                        X11MappedUidAclStatus::AccessControlDisabled => {
+                            "X server access control is disabled.".to_owned()
                         }
-                    ),
+                        X11MappedUidAclStatus::ExactNumericEntryPresent => format!(
+                            "Exact localuser:#{} entry is present; ownership records are not loaded.",
+                            identity.host_uid()
+                        ),
+                        X11MappedUidAclStatus::ExactNumericEntryAbsent => format!(
+                            "No exact localuser:#{} entry was observed.",
+                            identity.host_uid()
+                        ),
+                        X11MappedUidAclStatus::UnknownMode {
+                            exact_numeric_entry_present,
+                        } => format!(
+                            "Unknown ACL mode; exact numeric entry {}.",
+                            if exact_numeric_entry_present {
+                                "is present"
+                            } else {
+                                "was not observed"
+                            }
+                        ),
+                    },
                 };
                 format!(
                     "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}\n{}",
@@ -293,8 +320,17 @@ impl ConfigurationView {
             } => format!("Check #{generation} failed: {message}"),
         };
         frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), rows[0]);
-        let controls =
-            Layout::horizontal([Constraint::Min(16), Constraint::Length(20)]).split(rows[1]);
+        let can_authorize = self.can_authorize_x11();
+        let controls = if can_authorize {
+            Layout::horizontal([
+                Constraint::Min(16),
+                Constraint::Length(18),
+                Constraint::Length(18),
+            ])
+            .split(rows[1])
+        } else {
+            Layout::horizontal([Constraint::Min(16), Constraint::Length(20)]).split(rows[1])
+        };
         self.hits.guest_user = controls[0];
         self.hits.check_x11 = controls[1];
         self.guest_user.render(frame, controls[0]);
@@ -322,6 +358,33 @@ impl ConfigurationView {
                 ),
             controls[1],
         );
+        if can_authorize {
+            self.hits.authorize_x11 = controls[2];
+            let focused = self.pane == ConfigurationPane::Content
+                && self.x11_content_focus == X11ContentFocus::Authorize;
+            frame.render_widget(
+                Paragraph::new(" Authorize ")
+                    .alignment(Alignment::Center)
+                    .style(if focused {
+                        Style::default()
+                            .fg(theme::theme().button_focused_fg)
+                            .bg(theme::theme().button_focused_bg)
+                    } else {
+                        Style::default().fg(theme::theme().button_unfocused_fg)
+                    })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if focused {
+                                theme::theme().button_border_focused
+                            } else {
+                                theme::theme().button_border_unfocused
+                            })),
+                    ),
+                controls[2],
+            );
+        }
     }
 
     fn preview_text(&self) -> Cow<'_, str> {
@@ -575,6 +638,40 @@ impl ConfigurationView {
             .block(
                 Block::default()
                     .title(" Restart machine? ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme::theme().dialog_border_warn)),
+            ),
+            dialog,
+        );
+    }
+
+    fn render_x11_authorization_confirmation(&self, frame: &mut Frame, area: Rect) {
+        let Some(intent) = &self.x11_authorization_confirmation else {
+            return;
+        };
+        let width = 76.min(area.width);
+        let height = 13.min(area.height);
+        let dialog = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Allow host UID {} to open new connections to X11 display :{}?\n\nThis ACL entry applies to every host process with that UID, not only {}@{}. It remains until explicitly revoked, removed externally, or the X server resets. Closing Lasper does not revoke it.\n\n[y] Authorize    [n/Esc] Cancel",
+                intent.host_uid,
+                intent.host_socket.display(),
+                intent.target.user(),
+                intent.target.machine(),
+            ))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Authorize X11 access? ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme::theme().dialog_border_warn)),

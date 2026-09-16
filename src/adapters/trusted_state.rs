@@ -126,6 +126,22 @@ impl TrustedDirectory {
         open_or_create_absolute_directory(path, expected_uid, true)
     }
 
+    /// Open an already-created runtime root owned by `expected_uid`. Unlike
+    /// `open_or_create`, this does not require system-owned ancestors such as
+    /// `/run/user` to have the same owner. All later child traversal remains
+    /// relative to the held directory FD.
+    pub(crate) fn open_existing(path: &Path, expected_uid: u32) -> Result<Self> {
+        if !path.is_absolute() {
+            return Err(NspawnError::Validation(format!(
+                "trusted state root must be absolute: {}",
+                path.display()
+            )));
+        }
+        let file =
+            open_directory(path).map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+        Self::new(file, path.to_path_buf(), expected_uid)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(path: &Path) -> Result<Self> {
         open_or_create_absolute_directory(path, uzers::get_current_uid(), false)
@@ -140,7 +156,7 @@ impl TrustedDirectory {
         })
     }
 
-    fn open_or_create_child(&self, name: &str, mode: u32) -> Result<Self> {
+    pub(crate) fn open_or_create_child(&self, name: &str, mode: u32) -> Result<Self> {
         let name = validate_name(name)?;
         let file = open_or_create_directory_at(self.file.as_raw_fd(), &name, mode, &self.path)?;
         Self::new(
@@ -730,6 +746,27 @@ mod tests {
 
         assert_eq!(first, second);
         assert!(first.contains(&"deployment-one.json".to_string()));
+    }
+
+    #[test]
+    fn existing_user_runtime_root_creates_children_relative_to_its_directory_fd() {
+        let temporary = tempfile::tempdir().unwrap();
+        let owner = temporary.path().metadata().unwrap().uid();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = TrustedDirectory::open_existing(temporary.path(), owner).unwrap();
+        let access = runtime
+            .open_or_create_child("lasper", 0o700)
+            .unwrap()
+            .open_or_create_child("x11-access", 0o700)
+            .unwrap();
+        access.write_atomic("record.json", b"{}", 0o600).unwrap();
+
+        assert_eq!(
+            std::fs::read(temporary.path().join("lasper/x11-access/record.json")).unwrap(),
+            b"{}"
+        );
+        std::os::unix::fs::symlink("/tmp", temporary.path().join("redirect")).unwrap();
+        assert!(runtime.open_or_create_child("redirect", 0o700).is_err());
     }
 
     #[test]

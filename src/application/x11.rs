@@ -106,7 +106,7 @@ impl X11AclSnapshot {
         &self.entries
     }
 
-    fn has_numeric_local_user(&self, uid: u32) -> bool {
+    pub(crate) fn has_numeric_local_user(&self, uid: u32) -> bool {
         self.entries
             .iter()
             .any(|entry| entry.is_numeric_local_user(uid))
@@ -128,6 +128,61 @@ pub struct X11AccessCheck {
     projection: X11ProjectionContext,
     acl: X11AclSnapshot,
     mapped_uid_status: X11MappedUidAclStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11AuthorizationRequest {
+    target: ShellTarget,
+    projection: X11ProjectionContext,
+}
+
+impl X11AuthorizationRequest {
+    pub(crate) fn new(target: ShellTarget, projection: X11ProjectionContext) -> Self {
+        Self { target, projection }
+    }
+
+    pub(crate) fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
+    pub(crate) fn projection(&self) -> &X11ProjectionContext {
+        &self.projection
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum X11AuthorizationDisposition {
+    AccessControlDisabled,
+    PreExisting,
+    Added { record_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11DesktopAuthorization {
+    acl: X11AclSnapshot,
+    disposition: X11AuthorizationDisposition,
+}
+
+impl X11DesktopAuthorization {
+    pub(crate) fn new(acl: X11AclSnapshot, disposition: X11AuthorizationDisposition) -> Self {
+        Self { acl, disposition }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11Authorization {
+    check: X11AccessCheck,
+    disposition: X11AuthorizationDisposition,
+}
+
+impl X11Authorization {
+    pub fn check(&self) -> &X11AccessCheck {
+        &self.check
+    }
+
+    pub fn disposition(&self) -> &X11AuthorizationDisposition {
+        &self.disposition
+    }
 }
 
 impl X11AccessCheck {
@@ -182,7 +237,7 @@ impl X11DesktopAccessError {
 pub enum X11AccessError {
     #[error("{0}")]
     Projection(#[source] SessionError),
-    #[error("X server ACL query failed: {0}")]
+    #[error("X11 desktop access operation failed: {0}")]
     Desktop(#[source] X11DesktopAccessError),
 }
 
@@ -192,6 +247,11 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
         &self,
         socket: &HostX11Socket,
     ) -> Result<X11AclSnapshot, X11DesktopAccessError>;
+
+    async fn ensure(
+        &self,
+        request: &X11AuthorizationRequest,
+    ) -> Result<X11DesktopAuthorization, X11DesktopAccessError>;
 }
 
 /// Combines runtime namespace evidence with a caller-owned X server query.
@@ -222,6 +282,28 @@ impl X11AccessService {
         let projection = projection.map_err(X11AccessError::Projection)?;
         let acl = acl.map_err(X11AccessError::Desktop)?;
         Ok(X11AccessCheck::from_observations(projection, acl))
+    }
+
+    pub async fn authorize(
+        &self,
+        target: ShellTarget,
+        socket: HostX11Socket,
+    ) -> Result<X11Authorization, X11AccessError> {
+        let projection = self
+            .sessions
+            .test_x11_projection(target.clone(), socket)
+            .await
+            .map_err(X11AccessError::Projection)?;
+        let request = X11AuthorizationRequest::new(target, projection.clone());
+        let desktop = self
+            .desktop
+            .ensure(&request)
+            .await
+            .map_err(X11AccessError::Desktop)?;
+        Ok(X11Authorization {
+            check: X11AccessCheck::from_observations(projection, desktop.acl),
+            disposition: desktop.disposition,
+        })
     }
 }
 

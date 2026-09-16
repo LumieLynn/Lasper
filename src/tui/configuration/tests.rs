@@ -87,6 +87,32 @@ fn loaded_machine() -> ConfigurationView {
     view
 }
 
+fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
+    let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
+    let instance =
+        crate::application::sessions::ObservedMachineInstance::new(42, namespace, namespace);
+    let identity = crate::application::sessions::MappedGuestIdentity::verified(
+        crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
+        1_437_402_088,
+        1_437_402_088,
+        instance,
+    );
+    let context = crate::application::sessions::X11ProjectionContext::verified(
+        host_socket,
+        "/mnt/host-x11/X0".into(),
+        "/tmp/.X11-unix/X0".into(),
+        identity,
+    );
+    let acl = crate::application::x11::X11AclSnapshot::from_wire(
+        1,
+        entries
+            .iter()
+            .map(|address| crate::application::x11::X11AclEntry::from_wire(5, address.to_vec()))
+            .collect(),
+    );
+    crate::application::x11::X11AccessCheck::from_observations(context, acl)
+}
+
 fn render(view: &mut ConfigurationView, width: u16, height: u16) -> String {
     crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -540,34 +566,55 @@ fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
     assert_eq!(target.user().as_str(), "alice");
     assert_eq!(host_socket.source(), PathBuf::from("/tmp/.X11-unix/X0"));
 
-    let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
-    let instance =
-        crate::application::sessions::ObservedMachineInstance::new(42, namespace, namespace);
-    let identity = crate::application::sessions::MappedGuestIdentity::verified(
-        crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
-        1_437_402_088,
-        1_437_402_088,
-        instance,
-    );
-    let context = crate::application::sessions::X11ProjectionContext::verified(
-        host_socket,
-        "/mnt/host-x11/X0".into(),
-        "/tmp/.X11-unix/X0".into(),
-        identity,
-    );
     let configuration_target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    let acl = crate::application::x11::X11AclSnapshot::from_wire(
-        1,
-        vec![crate::application::x11::X11AclEntry::from_wire(
-            5,
-            b"localuser\0#1437402088".to_vec(),
-        )],
-    );
-    let check = crate::application::x11::X11AccessCheck::from_observations(context, acl);
+    let check = x11_check(host_socket, &[b"localuser\0#1437402088"]);
     view.finish_x11_check(generation, &configuration_target, Ok(check));
     let screen = render(&mut view, 140, 30);
     assert!(screen.contains("guest uid 1000"));
     assert!(screen.contains("1437402088"));
-    assert!(screen.contains("external/unmanaged"));
+    assert!(screen.contains("ownership") || screen.contains("records"));
     assert!(screen.contains("localuser entries: #1437402088"));
+    assert!(!screen.contains(" Authorize "));
+}
+
+#[test]
+fn missing_exact_x11_entry_requires_scope_confirmation_before_authorization() {
+    let mut view = loaded_machine();
+    view.guest_user.set_value("alice".into());
+    let host_socket = view.selected_host_x11_socket().unwrap();
+    let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
+    view.x11_check_generation = 8;
+    view.finish_x11_check(8, &target, Ok(x11_check(host_socket.clone(), &[])));
+
+    let screen = render(&mut view, 140, 30);
+    assert!(screen.contains(" Authorize "));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    let confirmation = render(&mut view, 140, 30);
+    assert!(confirmation.contains("Authorize X11 access?"));
+    assert!(confirmation.contains("every host process with that UID"));
+    assert!(confirmation.contains("Closing Lasper does not revoke it"));
+
+    let ConfigurationAction::AuthorizeX11 {
+        generation,
+        target: shell_target,
+        host_socket: selected_socket,
+    } = view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+    else {
+        panic!("confirmation should emit one typed authorization request");
+    };
+    assert_eq!(generation, 9);
+    assert_eq!(shell_target.machine().as_str(), "archlinux");
+    assert_eq!(shell_target.user().as_str(), "alice");
+    assert_eq!(selected_socket, host_socket);
+    assert!(matches!(
+        view.x11_check,
+        X11CheckState::Authorizing {
+            generation: 9,
+            host_uid: 1_437_402_088,
+            ..
+        }
+    ));
 }

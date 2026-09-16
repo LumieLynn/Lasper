@@ -53,6 +53,14 @@ pub enum AppEvent {
             crate::application::x11::X11AccessError,
         >,
     },
+    ConfigurationX11Authorized {
+        generation: u64,
+        target: crate::application::configuration::ConfigurationTarget,
+        result: Result<
+            crate::application::x11::X11Authorization,
+            crate::application::x11::X11AccessError,
+        >,
+    },
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
         result: Result<
@@ -101,6 +109,7 @@ impl AppEvent {
             Self::ConfigurationPreviewed { .. } => "configuration-previewed",
             Self::ConfigurationApplied { .. } => "configuration-applied",
             Self::ConfigurationX11Checked { .. } => "configuration-x11-checked",
+            Self::ConfigurationX11Authorized { .. } => "configuration-x11-authorized",
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",

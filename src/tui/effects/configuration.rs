@@ -133,3 +133,40 @@ pub(crate) fn check_x11(
             .await;
     })
 }
+
+pub(crate) fn authorize_x11(
+    service: Arc<crate::application::x11::X11AccessService>,
+    configuration_target: ConfigurationTarget,
+    target: crate::application::sessions::ShellTarget,
+    host_socket: crate::domain::x11::HostX11Socket,
+    generation: u64,
+    events: tokio::sync::mpsc::Sender<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(
+            Duration::from_secs(15),
+            AssertUnwindSafe(service.authorize(target, host_socket)).catch_unwind(),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(crate::application::x11::X11AccessError::Desktop(
+                crate::application::x11::X11DesktopAccessError::new(
+                    "X11 authorization stopped unexpectedly; inspect the current ACL before retrying",
+                ),
+            )),
+            Err(_) => Err(crate::application::x11::X11AccessError::Desktop(
+                crate::application::x11::X11DesktopAccessError::new(
+                    "X11 authorization timed out; inspect the current ACL before retrying",
+                ),
+            )),
+        };
+        let _ = events
+            .send(AppEvent::ConfigurationX11Authorized {
+                generation,
+                target: configuration_target,
+                result,
+            })
+            .await;
+    })
+}

@@ -650,6 +650,34 @@ impl App {
                     view.finish_x11_check(generation, &target, result);
                 }
             }
+            AppEvent::ConfigurationX11Authorized {
+                generation,
+                target,
+                result,
+            } => {
+                if let Some(view) = &mut self.ui.configuration {
+                    view.finish_x11_authorization(generation, &target, result);
+                } else {
+                    let (message, level) = match result {
+                        Ok(authorization) => {
+                            let message = match authorization.disposition() {
+                                crate::application::x11::X11AuthorizationDisposition::Added {
+                                    ..
+                                } => "X11 access authorized; the operation record was saved",
+                                crate::application::x11::X11AuthorizationDisposition::PreExisting => {
+                                    "X11 access was already present; no Lasper ownership was recorded"
+                                }
+                                crate::application::x11::X11AuthorizationDisposition::AccessControlDisabled => {
+                                    "X11 access control is disabled; no ACL entry was added"
+                                }
+                            };
+                            (message.to_owned(), crate::tui::StatusLevel::Success)
+                        }
+                        Err(error) => (error.to_string(), crate::tui::StatusLevel::Error),
+                    };
+                    self.set_status(message, level);
+                }
+            }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
                     return;
