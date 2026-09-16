@@ -26,30 +26,48 @@ while read -r key _real effective _rest; do
         Gid:) egid=$effective ;;
     esac
 done < /proc/self/status
+userns_stat=$(LC_ALL=C stat -Lc '%d:%i' -- /proc/self/ns/user) || exit 1
+userns_device=${userns_stat%%:*}
+userns_inode=${userns_stat#*:}
+socket_state() {
+    if [ ! -e "$1" ]; then
+        printf '%s' MISSING
+    elif [ ! -S "$1" ]; then
+        printf '%s' NOT_SOCKET
+    elif [ ! -w "$1" ]; then
+        printf '%s' DENIED
+    else
+        printf '%s' ACCESSIBLE
+    fi
+}
+mount_state=$(socket_state "$1")
+client_state=$(socket_state "$2")
+mount_stat=
+client_stat=
+if [ "$mount_state" = ACCESSIBLE ] || [ "$mount_state" = DENIED ]; then
+    mount_stat=$(LC_ALL=C stat -Lc '%d:%i' -- "$1") || exit 1
+fi
+if [ "$client_state" = ACCESSIBLE ] || [ "$client_state" = DENIED ]; then
+    client_stat=$(LC_ALL=C stat -Lc '%d:%i' -- "$2") || exit 1
+fi
 printf '%s\n' \
     'LASPER_X11_PROJECTION_PROBE_V1' \
     "EUID=$euid" \
-    "EGID=$egid"
-LC_ALL=C stat -Lc 'USERNS_DEVICE=%d
-USERNS_INODE=%i' -- /proc/self/ns/user || exit 1
-probe_socket() {
-    if [ ! -e "$1" ]; then
-        state=MISSING
-    elif [ ! -S "$1" ]; then
-        state=NOT_SOCKET
-    elif [ ! -w "$1" ]; then
-        state=DENIED
-    else
-        state=ACCESSIBLE
-    fi
-    printf '%s=%s\n' "$2" "$state"
-    if [ "$state" = ACCESSIBLE ] || [ "$state" = DENIED ]; then
-        LC_ALL=C stat -Lc "${2}_DEVICE=%d
-${2}_INODE=%i" -- "$1" || exit 1
-    fi
-}
-probe_socket "$1" MOUNT
-probe_socket "$2" CLIENT
+    "EGID=$egid" \
+    "USERNS_DEVICE=$userns_device" \
+    "USERNS_INODE=$userns_inode" \
+    "MOUNT=$mount_state"
+if [ -n "$mount_stat" ]; then
+    printf '%s\n' \
+        "MOUNT_DEVICE=${mount_stat%%:*}" \
+        "MOUNT_INODE=${mount_stat#*:}"
+fi
+printf '%s\n' "CLIENT=$client_state"
+if [ -n "$client_stat" ]; then
+    printf '%s\n' \
+        "CLIENT_DEVICE=${client_stat%%:*}" \
+        "CLIENT_INODE=${client_stat#*:}"
+fi
 printf '%s\n' 'RESULT=READY'
 "#;
 
@@ -328,9 +346,10 @@ fn parse_x11_probe(bytes: &[u8]) -> Result<X11ProjectionProbeObservation, Sessio
                 "CLIENT_INODE",
             )?,
             _ => {
-                return Err(SessionError::new(
-                    "X11 projection probe returned an unknown field",
-                ))
+                return Err(SessionError::new(format!(
+                    "X11 projection probe returned an unknown field: {}",
+                    escaped_field_key(key)
+                )))
             }
         }
     }
@@ -463,6 +482,22 @@ fn escaped_output_tail(bytes: &[u8]) -> String {
     preview
 }
 
+fn escaped_field_key(bytes: &[u8]) -> String {
+    const PREVIEW_BYTES: usize = 96;
+    let mut preview = String::new();
+    for byte in bytes.iter().take(PREVIEW_BYTES) {
+        preview.extend(std::ascii::escape_default(*byte).map(char::from));
+    }
+    if bytes.len() > PREVIEW_BYTES {
+        preview.push_str("...");
+    }
+    if preview.is_empty() {
+        "<empty>".into()
+    } else {
+        preview
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +578,26 @@ mod tests {
                 .as_bytes()
         )
         .is_err());
+    }
+
+    #[test]
+    fn parser_uses_the_last_frame_after_assignment_like_terminal_noise() {
+        let observation = parse_x11_probe(
+            b"PAM_STATUS=ready\r\nLASPER_X11_PROJECTION_PROBE_V1\r\nEUID=1000\r\nEGID=1001\r\nUSERNS_DEVICE=4\r\nUSERNS_INODE=5\r\nMOUNT=MISSING\r\nCLIENT=MISSING\r\nRESULT=READY\r\n",
+        )
+        .unwrap();
+
+        assert_eq!(observation.identity, ObservedGuestIdentity::new(1000, 1001));
+    }
+
+    #[test]
+    fn unknown_field_error_identifies_the_bounded_escaped_key() {
+        let error = parse_x11_probe(
+            b"LASPER_X11_PROJECTION_PROBE_V1\nEUID=1000\nPAM_\x1b=unexpected\nRESULT=READY\n",
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(r"PAM_\x1b"));
     }
 
     #[test]
