@@ -10,17 +10,27 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use x11rb::connection::Connection;
+use x11rb::protocol::xproto::ConnectionExt;
 use x11rb::reexports::x11rb_protocol::{parse_display, xauth};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
-use crate::application::x11::{X11EndpointCatalog, X11EndpointDiscoveryPort};
+use crate::application::x11::{
+    X11AclEntry, X11AclSnapshot, X11DesktopAccessError, X11DesktopAccessPort, X11EndpointCatalog,
+    X11EndpointDiscoveryPort,
+};
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
 const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
 const ENDPOINT_IO_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_DISCOVERED_DISPLAYS: usize = 16;
+const MAX_ACL_ENTRIES: usize = 1024;
+const MAX_ACL_BYTES: usize = 64 * 1024;
+
+type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32));
 
 pub(crate) struct HostX11EndpointDiscovery;
+
+pub(crate) struct HostX11DesktopAccess;
 
 #[async_trait::async_trait]
 impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
@@ -34,6 +44,22 @@ impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
                 ..Default::default()
             },
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl X11DesktopAccessPort for HostX11DesktopAccess {
+    async fn snapshot(
+        &self,
+        socket: &HostX11Socket,
+    ) -> Result<X11AclSnapshot, X11DesktopAccessError> {
+        let socket = socket.clone();
+        tokio::task::spawn_blocking(move || snapshot_acl_sync(&socket))
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!("X11 ACL query task failed: {error}"))
+            })?
+            .map_err(X11DesktopAccessError::new)
     }
 }
 
@@ -228,24 +254,7 @@ fn inspect_endpoint(
         return Err(format!("{} is not a Unix socket", source.display()));
     }
 
-    let stream = UnixStream::connect(&source)
-        .map_err(|error| format!("connect to {}: {error}", source.display()))?;
-    stream
-        .set_read_timeout(Some(ENDPOINT_IO_TIMEOUT))
-        .map_err(|error| format!("set X11 read deadline: {error}"))?;
-    stream
-        .set_write_timeout(Some(ENDPOINT_IO_TIMEOUT))
-        .map_err(|error| format!("set X11 write deadline: {error}"))?;
-    let peer = peer_credentials(&stream)?;
-    let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
-        .map_err(|error| format!("prepare X11 connection: {error}"))?;
-    let authority = xauth::get_auth(family, &address, display)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
-    let connection =
-        RustConnection::connect_to_stream_with_auth_info(stream, 0, authority.0, authority.1)
-            .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
+    let (connection, peer) = authenticated_connection(&source, display)?;
     let _ = connection.setup();
 
     let final_canonical = fs::canonicalize(&source)
@@ -280,6 +289,75 @@ fn inspect_endpoint(
         },
     )
     .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
+}
+
+fn snapshot_acl_sync(socket: &HostX11Socket) -> Result<X11AclSnapshot, String> {
+    require_current_socket(socket, "before querying its ACL")?;
+    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let reply = connection
+        .list_hosts()
+        .map_err(|error| format!("send ListHosts to :{}: {error}", socket.display()))?
+        .reply()
+        .map_err(|error| format!("read ListHosts from :{}: {error}", socket.display()))?;
+    require_current_socket(socket, "while querying its ACL")?;
+
+    if reply.hosts.len() > MAX_ACL_ENTRIES {
+        return Err(format!(
+            "X server returned {} ACL entries; the safety limit is {MAX_ACL_ENTRIES}",
+            reply.hosts.len()
+        ));
+    }
+    let mut total_bytes = 0usize;
+    let mut entries = Vec::with_capacity(reply.hosts.len());
+    for host in reply.hosts {
+        total_bytes = total_bytes
+            .checked_add(host.address.len())
+            .ok_or("X11 ACL byte count overflowed")?;
+        if total_bytes > MAX_ACL_BYTES {
+            return Err(format!(
+                "X server returned more than {MAX_ACL_BYTES} bytes of ACL entries"
+            ));
+        }
+        entries.push(X11AclEntry::from_wire(host.family.into(), host.address));
+    }
+    Ok(X11AclSnapshot::from_wire(reply.mode.into(), entries))
+}
+
+fn require_current_socket(socket: &HostX11Socket, phase: &str) -> Result<(), String> {
+    let current = inspect_endpoint_peer_only(
+        socket.display(),
+        socket.alternate(),
+        socket.source().to_path_buf(),
+    )?;
+    if &current != socket {
+        return Err(format!("{} changed {phase}", socket.source().display()));
+    }
+    Ok(())
+}
+
+fn authenticated_connection(
+    source: &Path,
+    display: u16,
+) -> Result<AuthenticatedX11Connection, String> {
+    let stream = UnixStream::connect(source)
+        .map_err(|error| format!("connect to {}: {error}", source.display()))?;
+    stream
+        .set_read_timeout(Some(ENDPOINT_IO_TIMEOUT))
+        .map_err(|error| format!("set X11 read deadline: {error}"))?;
+    stream
+        .set_write_timeout(Some(ENDPOINT_IO_TIMEOUT))
+        .map_err(|error| format!("set X11 write deadline: {error}"))?;
+    let peer = peer_credentials(&stream)?;
+    let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
+        .map_err(|error| format!("prepare X11 connection: {error}"))?;
+    let authority = xauth::get_auth(family, &address, display)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let connection =
+        RustConnection::connect_to_stream_with_auth_info(stream, 0, authority.0, authority.1)
+            .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
+    Ok((connection, peer))
 }
 
 fn inspect_endpoint_peer_only(

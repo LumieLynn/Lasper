@@ -18,7 +18,8 @@ use crate::application::configuration::{
     ConfigurationTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
 };
 use crate::application::inspection::ResourceInspectionError;
-use crate::application::sessions::{SessionError, ValidatedGuestUserName, X11ProjectionContext};
+use crate::application::sessions::ValidatedGuestUserName;
+use crate::application::x11::{X11AccessCheck, X11AccessError};
 use crate::tui::core::{Component, EventResult};
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
 use crate::tui::widgets::inputs::text_box::TextBox;
@@ -98,7 +99,7 @@ enum DraftPreviewState {
     },
 }
 
-enum X11ProbeState {
+enum X11CheckState {
     Untested,
     Loading {
         generation: u64,
@@ -106,7 +107,7 @@ enum X11ProbeState {
     },
     Ready {
         generation: u64,
-        context: X11ProjectionContext,
+        check: Box<X11AccessCheck>,
     },
     Failed {
         generation: u64,
@@ -159,7 +160,7 @@ pub(crate) struct ConfigurationView {
     pending: Option<tokio::task::JoinHandle<()>>,
     pending_preview: Option<tokio::task::JoinHandle<()>>,
     pending_apply: Option<tokio::task::JoinHandle<()>>,
-    pending_x11_probe: Option<tokio::task::JoinHandle<()>>,
+    pending_x11_check: Option<tokio::task::JoinHandle<()>>,
     state: InspectionState,
     pane: ConfigurationPane,
     navigation: ConfigurationNavigation,
@@ -171,8 +172,8 @@ pub(crate) struct ConfigurationView {
     restart_confirmation: Option<crate::domain::machine::MachineName>,
     saving: bool,
     apply_error: Option<String>,
-    x11_probe_generation: u64,
-    x11_probe: X11ProbeState,
+    x11_check_generation: u64,
+    x11_check: X11CheckState,
     x11_content_focus: X11ContentFocus,
     guest_user: TextBox,
     list: ListState,
@@ -193,7 +194,7 @@ impl ConfigurationView {
             pending: None,
             pending_preview: None,
             pending_apply: None,
-            pending_x11_probe: None,
+            pending_x11_check: None,
             state: InspectionState::Loading,
             pane: ConfigurationPane::Content,
             navigation: ConfigurationNavigation::default(),
@@ -205,8 +206,8 @@ impl ConfigurationView {
             restart_confirmation: None,
             saving: false,
             apply_error: None,
-            x11_probe_generation: 0,
-            x11_probe: X11ProbeState::Untested,
+            x11_check_generation: 0,
+            x11_check: X11CheckState::Untested,
             x11_content_focus: X11ContentFocus::Bindings,
             guest_user: TextBox::new(" Guest user ", String::new())
                 .with_validator(validate_guest_user),
@@ -225,7 +226,7 @@ impl ConfigurationView {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
-        self.invalidate_x11_probe();
+        self.invalidate_x11_check();
         self.query = query;
         self.cancel_preview();
         self.draft.clear();
@@ -252,28 +253,28 @@ impl ConfigurationView {
         self.pending_apply = Some(task);
     }
 
-    pub(crate) fn track_x11_probe(&mut self, task: tokio::task::JoinHandle<()>) {
-        if let Some(previous) = self.pending_x11_probe.replace(task) {
+    pub(crate) fn track_x11_check(&mut self, task: tokio::task::JoinHandle<()>) {
+        if let Some(previous) = self.pending_x11_check.replace(task) {
             previous.abort();
         }
     }
 
-    pub(crate) fn finish_x11_probe(
+    pub(crate) fn finish_x11_check(
         &mut self,
         generation: u64,
         target: &ConfigurationTarget,
-        result: Result<X11ProjectionContext, SessionError>,
+        result: Result<X11AccessCheck, X11AccessError>,
     ) {
-        if generation != self.x11_probe_generation || target != &self.target {
+        if generation != self.x11_check_generation || target != &self.target {
             return;
         }
-        self.pending_x11_probe.take();
-        self.x11_probe = match result {
-            Ok(context) => X11ProbeState::Ready {
+        self.pending_x11_check.take();
+        self.x11_check = match result {
+            Ok(check) => X11CheckState::Ready {
                 generation,
-                context,
+                check: Box::new(check),
             },
-            Err(error) => X11ProbeState::Failed {
+            Err(error) => X11CheckState::Failed {
                 generation,
                 message: error.to_string(),
             },
@@ -459,42 +460,42 @@ impl ConfigurationView {
         }
     }
 
-    fn request_x11_probe(&mut self) -> ConfigurationAction {
+    fn request_x11_check(&mut self) -> ConfigurationAction {
         let machine = match &self.target {
             ConfigurationTarget::Machine(machine) => machine.clone(),
             ConfigurationTarget::Image(_) => {
-                self.set_x11_probe_error(
+                self.set_x11_check_error(
                     "X11 runtime checks require a running machine, not an image",
                 );
                 return ConfigurationAction::None;
             }
         };
         if let Err(error) = self.guest_user.validate() {
-            self.set_x11_probe_error(error);
+            self.set_x11_check_error(error);
             return ConfigurationAction::None;
         }
         let user = match ValidatedGuestUserName::new(self.guest_user.value()) {
             Ok(user) => user,
             Err(error) => {
-                self.set_x11_probe_error(error.to_string());
+                self.set_x11_check_error(error.to_string());
                 return ConfigurationAction::None;
             }
         };
         let Some(host_socket) = self.selected_host_x11_socket() else {
-            self.set_x11_probe_error(
+            self.set_x11_check_error(
                 "Select an X11 declaration or live endpoint before checking runtime access",
             );
             return ConfigurationAction::None;
         };
-        if let Some(previous) = self.pending_x11_probe.take() {
+        if let Some(previous) = self.pending_x11_check.take() {
             previous.abort();
         }
-        self.x11_probe_generation = self
-            .x11_probe_generation
+        self.x11_check_generation = self
+            .x11_check_generation
             .checked_add(1)
-            .expect("X11 probe generation exhausted");
-        let generation = self.x11_probe_generation;
-        self.x11_probe = X11ProbeState::Loading {
+            .expect("X11 check generation exhausted");
+        let generation = self.x11_check_generation;
+        self.x11_check = X11CheckState::Loading {
             generation,
             user: user.clone(),
         };
@@ -505,26 +506,26 @@ impl ConfigurationView {
         }
     }
 
-    fn set_x11_probe_error(&mut self, message: impl Into<String>) {
-        self.x11_probe_generation = self
-            .x11_probe_generation
+    fn set_x11_check_error(&mut self, message: impl Into<String>) {
+        self.x11_check_generation = self
+            .x11_check_generation
             .checked_add(1)
-            .expect("X11 probe generation exhausted");
-        self.x11_probe = X11ProbeState::Failed {
-            generation: self.x11_probe_generation,
+            .expect("X11 check generation exhausted");
+        self.x11_check = X11CheckState::Failed {
+            generation: self.x11_check_generation,
             message: message.into(),
         };
     }
 
-    fn invalidate_x11_probe(&mut self) {
-        if let Some(task) = self.pending_x11_probe.take() {
+    fn invalidate_x11_check(&mut self) {
+        if let Some(task) = self.pending_x11_check.take() {
             task.abort();
         }
-        self.x11_probe_generation = self
-            .x11_probe_generation
+        self.x11_check_generation = self
+            .x11_check_generation
             .checked_add(1)
-            .expect("X11 probe generation exhausted");
-        self.x11_probe = X11ProbeState::Untested;
+            .expect("X11 check generation exhausted");
+        self.x11_check = X11CheckState::Untested;
     }
 
     fn selected_host_x11_socket(&self) -> Option<crate::domain::x11::HostX11Socket> {
@@ -598,7 +599,7 @@ impl ConfigurationView {
             return;
         }
         self.list.select(Some(index));
-        self.invalidate_x11_probe();
+        self.invalidate_x11_check();
     }
 
     fn sync_x11_input_focus(&mut self) {
@@ -754,7 +755,7 @@ impl ConfigurationView {
                     let before = self.guest_user.value().to_owned();
                     if self.guest_user.handle_key(key) == EventResult::Consumed {
                         if self.guest_user.value() != before {
-                            self.invalidate_x11_probe();
+                            self.invalidate_x11_check();
                         }
                         return ConfigurationAction::None;
                     }
@@ -823,7 +824,7 @@ impl ConfigurationView {
                 ConfigurationPane::Content => match self.x11_content_focus {
                     X11ContentFocus::Bindings => return self.toggle_selected_x11(),
                     X11ContentFocus::GuestUser => {}
-                    X11ContentFocus::Check => return self.request_x11_probe(),
+                    X11ContentFocus::Check => return self.request_x11_check(),
                 },
                 ConfigurationPane::Preview => {}
             },
@@ -831,11 +832,11 @@ impl ConfigurationView {
                 match self.x11_content_focus {
                     X11ContentFocus::Bindings => self.toggle_selected_details(),
                     X11ContentFocus::GuestUser => {}
-                    X11ContentFocus::Check => return self.request_x11_probe(),
+                    X11ContentFocus::Check => return self.request_x11_check(),
                 }
             }
             (KeyCode::Char('c'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                return self.request_x11_probe();
+                return self.request_x11_check();
             }
             _ => {}
         }
@@ -866,7 +867,7 @@ impl ConfigurationView {
                     self.set_x11_content_focus(X11ContentFocus::GuestUser);
                 } else if self.hits.check_x11.contains(position) {
                     self.set_x11_content_focus(X11ContentFocus::Check);
-                    return self.request_x11_probe();
+                    return self.request_x11_check();
                 } else {
                     self.set_x11_content_focus(X11ContentFocus::Bindings);
                     let toggle = self
@@ -984,7 +985,7 @@ impl Drop for ConfigurationView {
         if let Some(task) = self.pending_preview.take() {
             task.abort();
         }
-        if let Some(task) = self.pending_x11_probe.take() {
+        if let Some(task) = self.pending_x11_check.take() {
             task.abort();
         }
         // Applying is a mutation. Dropping a JoinHandle detaches it so direct

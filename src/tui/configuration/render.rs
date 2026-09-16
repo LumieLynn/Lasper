@@ -11,12 +11,13 @@ use ratatui::{
 use super::navigation::ConfigurationPage;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
-    X11ChecklistItem, X11ContentFocus, X11ProbeState,
+    X11CheckState, X11ChecklistItem, X11ContentFocus,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
     X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
+use crate::application::x11::{X11AclSnapshot, X11MappedUidAclStatus};
 use crate::domain::x11::HostX11Socket;
 use crate::tui::core::Component;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
@@ -142,7 +143,7 @@ impl ConfigurationView {
         frame.render_widget(block, self.hits.content);
         let rows = Layout::vertical([
             Constraint::Min(0),
-            Constraint::Length(9),
+            Constraint::Length(11),
             Constraint::Length(1),
         ])
         .split(inner);
@@ -243,28 +244,50 @@ impl ConfigurationView {
             return;
         }
         let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(inner);
-        let status = match &self.x11_probe {
-            X11ProbeState::Untested => {
+        let status = match &self.x11_check {
+            X11CheckState::Untested => {
                 "Not queried. A startup bind does not establish current X server access.".into()
             }
-            X11ProbeState::Loading { generation, user } => {
-                format!("Check #{generation}: validating the running projection for {user}…")
+            X11CheckState::Loading { generation, user } => {
+                format!("Check #{generation}: validating projection and X server ACL for {user}…")
             }
-            X11ProbeState::Ready {
-                generation,
-                context,
-            } => {
+            X11CheckState::Ready { generation, check } => {
+                let context = check.projection();
                 let identity = context.identity();
+                let acl_status = match check.mapped_uid_status() {
+                    X11MappedUidAclStatus::AccessControlDisabled => {
+                        "X server access control is disabled.".to_owned()
+                    }
+                    X11MappedUidAclStatus::ExactNumericEntryPresent => format!(
+                        "Exact localuser:#{} entry is present (external/unmanaged).",
+                        identity.host_uid()
+                    ),
+                    X11MappedUidAclStatus::ExactNumericEntryAbsent => format!(
+                        "No exact localuser:#{} entry was observed.",
+                        identity.host_uid()
+                    ),
+                    X11MappedUidAclStatus::UnknownMode {
+                        exact_numeric_entry_present,
+                    } => format!(
+                        "Unknown ACL mode; exact numeric entry {}.",
+                        if exact_numeric_entry_present {
+                            "is present"
+                        } else {
+                            "was not observed"
+                        }
+                    ),
+                };
                 format!(
-                    "Check #{generation}: projection ready. Guest uid {} maps to host uid {}.\n{} → {} → {}\nX server ACL has not been queried yet.",
+                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}\n{}",
                     identity.guest().uid(),
                     identity.host_uid(),
                     context.host_socket().source().display(),
                     context.guest_mount().display(),
                     context.guest_client_path().display(),
+                    x11_acl_summary(check.acl()),
                 )
             }
-            X11ProbeState::Failed {
+            X11CheckState::Failed {
                 generation,
                 message,
             } => format!("Check #{generation} failed: {message}"),
@@ -278,7 +301,7 @@ impl ConfigurationView {
         let focused = self.pane == ConfigurationPane::Content
             && self.x11_content_focus == X11ContentFocus::Check;
         frame.render_widget(
-            Paragraph::new(" Check projection ")
+            Paragraph::new(" Check access ")
                 .alignment(Alignment::Center)
                 .style(if focused {
                     Style::default()
@@ -722,6 +745,44 @@ fn available_socket_lines(
         ]);
     }
     lines
+}
+
+fn x11_acl_summary(snapshot: &X11AclSnapshot) -> String {
+    let local_users = snapshot
+        .entries()
+        .iter()
+        .filter_map(|entry| entry.server_interpreted())
+        .filter_map(|(kind, value)| (kind == "localuser").then_some(value))
+        .collect::<Vec<_>>();
+    if local_users.is_empty() {
+        return format!(
+            "ACL localuser entries: none ({} total).",
+            snapshot.entries().len()
+        );
+    }
+
+    let shown = local_users
+        .iter()
+        .take(3)
+        .map(|value| {
+            value
+                .chars()
+                .flat_map(char::escape_default)
+                .take(48)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remainder = local_users.len().saturating_sub(3);
+    format!(
+        "ACL localuser entries: {shown}{} ({} total).",
+        if remainder == 0 {
+            String::new()
+        } else {
+            format!(", +{remainder} more")
+        },
+        snapshot.entries().len()
+    )
 }
 
 fn diff_lines(content: &str, width: u16) -> Vec<Line<'static>> {

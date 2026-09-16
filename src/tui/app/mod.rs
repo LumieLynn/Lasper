@@ -219,6 +219,7 @@ impl AppUi {
 
 pub struct AppData {
     pub configuration: std::sync::Arc<crate::application::configuration::ConfigurationService>,
+    pub x11_access: std::sync::Arc<crate::application::x11::X11AccessService>,
     /// Running systemd-machined instances plus optimistic `Starting` rows.
     /// Persistent images live in `images`.
     pub entries: Vec<MachineEntry>,
@@ -281,6 +282,7 @@ impl App {
         let ApplicationServices {
             configuration,
             session: session_service,
+            x11_access,
             runtime: runtime_catalog,
             machine_lifecycle,
             image_lifecycle,
@@ -296,6 +298,7 @@ impl App {
             should_quit: false,
             data: AppData {
                 configuration,
+                x11_access,
                 entries: Vec::new(),
                 images: Vec::new(),
                 internal_images: Vec::new(),
@@ -638,13 +641,13 @@ impl App {
                     }
                 }
             }
-            AppEvent::ConfigurationX11Probed {
+            AppEvent::ConfigurationX11Checked {
                 generation,
                 target,
                 result,
             } => {
                 if let Some(view) = &mut self.ui.configuration {
-                    view.finish_x11_probe(generation, &target, result);
+                    view.finish_x11_check(generation, &target, result);
                 }
             }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {

@@ -519,7 +519,7 @@ fn machine_apply_prompts_for_restart_and_returns_the_exact_target() {
 }
 
 #[test]
-fn machine_x11_check_uses_inline_guest_user_and_keeps_acl_state_separate() {
+fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
     let mut view = loaded_machine();
     view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -556,9 +556,18 @@ fn machine_x11_check_uses_inline_guest_user_and_keeps_acl_state_separate() {
         identity,
     );
     let configuration_target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    view.finish_x11_probe(generation, &configuration_target, Ok(context));
+    let acl = crate::application::x11::X11AclSnapshot::from_wire(
+        1,
+        vec![crate::application::x11::X11AclEntry::from_wire(
+            5,
+            b"localuser\0#1437402088".to_vec(),
+        )],
+    );
+    let check = crate::application::x11::X11AccessCheck::from_observations(context, acl);
+    view.finish_x11_check(generation, &configuration_target, Ok(check));
     let screen = render(&mut view, 140, 30);
-    assert!(screen.contains("Guest uid 1000"));
+    assert!(screen.contains("guest uid 1000"));
     assert!(screen.contains("1437402088"));
-    assert!(screen.contains("X server ACL has not"));
+    assert!(screen.contains("external/unmanaged"));
+    assert!(screen.contains("localuser entries: #1437402088"));
 }

@@ -20,6 +20,7 @@ use std::sync::Arc;
 pub(crate) struct ApplicationServices {
     pub configuration: Arc<crate::application::configuration::ConfigurationService>,
     pub session: Arc<SessionService>,
+    pub x11_access: Arc<crate::application::x11::X11AccessService>,
     pub runtime: Arc<RuntimeCatalog>,
     pub machine_lifecycle: Arc<MachineLifecycleService>,
     pub image_lifecycle: Arc<ImageLifecycleService>,
@@ -236,6 +237,10 @@ pub(crate) fn compose_application_services(
     let x11_endpoints = Arc::new(crate::application::x11::X11EndpointDiscoveryService::new(
         Arc::new(crate::adapters::platform::x11::HostX11EndpointDiscovery),
     ));
+    let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
+        Arc::clone(&session),
+        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess),
+    ));
     let configuration = Arc::new(
         crate::application::configuration::ConfigurationService::new(
             Arc::new(
@@ -252,6 +257,7 @@ pub(crate) fn compose_application_services(
     ApplicationServices {
         configuration,
         session,
+        x11_access,
         runtime,
         machine_lifecycle,
         image_lifecycle,
