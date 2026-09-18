@@ -13,7 +13,7 @@ use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
     X11AuthorizationPresentation, X11CheckState, X11ChecklistItem, X11ContentFocus,
     X11GrantAssessmentPresentation, X11GrantHistoryPresentation, X11GrantHistoryStatusPresentation,
-    X11GrantStatusPresentation,
+    X11GrantStatusPresentation, X11RevocationPresentation,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
@@ -120,6 +120,8 @@ impl ConfigurationView {
         );
         if self.x11_authorization_confirmation.is_some() {
             self.render_x11_authorization_confirmation(frame, area);
+        } else if self.x11_revocation_confirmation.is_some() {
+            self.render_x11_revocation_confirmation(frame, area);
         } else if self.restart_confirmation.is_some() {
             self.render_restart_confirmation(frame, area);
         } else if self.discard.is_some() {
@@ -258,27 +260,44 @@ impl ConfigurationView {
             } => format!(
                 "Authorization #{generation}: adding exact localuser:#{host_uid} access for {user}…"
             ),
+            X11CheckState::Revoking {
+                generation,
+                user,
+                record_id,
+            } => format!(
+                "Revocation #{generation}: removing Lasper record {} for {user}…",
+                &record_id[..record_id.len().min(12)]
+            ),
             X11CheckState::Ready {
                 generation,
                 check,
                 assessment,
                 authorization,
+                revocation,
             } => {
                 let context = check.projection();
                 let identity = context.identity();
                 let acl_status = x11_grant_status(assessment, identity.host_uid());
-                let action = match authorization {
-                    Some(X11AuthorizationPresentation::Added { record_id }) => format!(
+                let action = match (authorization, revocation) {
+                    (_, Some(X11RevocationPresentation::Revoked { record_id })) => format!(
+                        " Last action revoked record {}.",
+                        &record_id[..record_id.len().min(12)]
+                    ),
+                    (_, Some(X11RevocationPresentation::AlreadyAbsent { record_id })) => format!(
+                        " Last action finalized already-absent record {}.",
+                        &record_id[..record_id.len().min(12)]
+                    ),
+                    (Some(X11AuthorizationPresentation::Added { record_id }), _) => format!(
                         " Last action created record {}.",
                         &record_id[..record_id.len().min(12)]
                     ),
-                    Some(X11AuthorizationPresentation::PreExisting) => {
+                    (Some(X11AuthorizationPresentation::PreExisting), _) => {
                         " Last action reused the existing entry without claiming it.".to_owned()
                     }
-                    Some(X11AuthorizationPresentation::AccessControlDisabled) => {
+                    (Some(X11AuthorizationPresentation::AccessControlDisabled), _) => {
                         " No entry was added.".to_owned()
                     }
-                    None => String::new(),
+                    (None, None) => String::new(),
                 };
                 format!(
                     "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}{action}\n{}",
@@ -297,7 +316,8 @@ impl ConfigurationView {
         };
         frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), rows[0]);
         let can_authorize = self.can_authorize_x11();
-        let controls = if can_authorize {
+        let can_revoke = self.can_revoke_x11();
+        let controls = if can_authorize || can_revoke {
             Layout::horizontal([
                 Constraint::Min(16),
                 Constraint::Length(18),
@@ -309,6 +329,8 @@ impl ConfigurationView {
         };
         self.hits.guest_user = controls[0];
         self.hits.check_x11 = controls[1];
+        self.hits.authorize_x11 = Rect::default();
+        self.hits.revoke_x11 = Rect::default();
         self.guest_user.render(frame, controls[0]);
         let focused = self.pane == ConfigurationPane::Content
             && self.x11_content_focus == X11ContentFocus::Check;
@@ -360,6 +382,32 @@ impl ConfigurationView {
                     ),
                 controls[2],
             );
+        } else if can_revoke {
+            self.hits.revoke_x11 = controls[2];
+            let focused = self.pane == ConfigurationPane::Content
+                && self.x11_content_focus == X11ContentFocus::Revoke;
+            frame.render_widget(
+                Paragraph::new(" Revoke ")
+                    .alignment(Alignment::Center)
+                    .style(if focused {
+                        Style::default()
+                            .fg(theme::theme().button_focused_fg)
+                            .bg(theme::theme().button_focused_bg)
+                    } else {
+                        Style::default().fg(theme::theme().button_unfocused_fg)
+                    })
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(if focused {
+                                theme::theme().button_border_focused
+                            } else {
+                                theme::theme().button_border_unfocused
+                            })),
+                    ),
+                controls[2],
+            );
         }
     }
 
@@ -373,9 +421,9 @@ impl ConfigurationView {
         frame.render_widget(block, area);
         let text = match &self.x11_check {
             X11CheckState::Ready { assessment, .. } => x11_history_text(assessment),
-            X11CheckState::Loading { .. } | X11CheckState::Authorizing { .. } => {
-                "Loading grant records…".to_owned()
-            }
+            X11CheckState::Loading { .. }
+            | X11CheckState::Authorizing { .. }
+            | X11CheckState::Revoking { .. } => "Loading grant records…".to_owned(),
             X11CheckState::Failed { .. } => {
                 "Current records were not assessed because the check failed.".to_owned()
             }
@@ -674,6 +722,38 @@ impl ConfigurationView {
             .block(
                 Block::default()
                     .title(" Authorize X11 access? ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme::theme().dialog_border_warn)),
+            ),
+            dialog,
+        );
+    }
+
+    fn render_x11_revocation_confirmation(&self, frame: &mut Frame, area: Rect) {
+        let Some(intent) = &self.x11_revocation_confirmation else {
+            return;
+        };
+        let width = 76.min(area.width);
+        let height = 12.min(area.height);
+        let dialog = Rect::new(
+            area.x + area.width.saturating_sub(width) / 2,
+            area.y + area.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, dialog);
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Remove Lasper-managed localuser:#{} access from X11 display :{}?\n\nThis removes access for every host process with that UID. The record is retained as revoked for audit history.\n\n[y] Revoke    [n/Esc] Cancel",
+                intent.host_uid,
+                intent.host_socket.display(),
+            ))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(" Revoke X11 access? ")
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme::theme().dialog_border_warn)),

@@ -21,8 +21,8 @@ use crate::application::sessions::{
 use crate::application::x11::{
     X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationRequest,
     X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11DesktopObservation,
-    X11EndpointCatalog, X11EndpointDiscoveryPort, X11GrantRecordCatalog, X11GrantRecordEvidence,
-    X11GrantRecordPhase,
+    X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort, X11GrantRecordCatalog,
+    X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition, X11RevokeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
@@ -83,6 +83,19 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!("X11 authorization task failed: {error}"))
+            })?
+            .map_err(X11DesktopAccessError::new)
+    }
+
+    async fn revoke(
+        &self,
+        request: &X11RevokeRequest,
+    ) -> Result<X11DesktopRevocation, X11DesktopAccessError> {
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || revoke_access_sync(&request))
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!("X11 revocation task failed: {error}"))
             })?
             .map_err(X11DesktopAccessError::new)
     }
@@ -363,6 +376,7 @@ fn read_acl(
 enum GrantRecordPhase {
     Pending,
     ConfirmedAdded,
+    Revoked,
     OutcomeUnknown { reason: String },
 }
 
@@ -483,6 +497,7 @@ impl ManagedX11GrantRecord {
         let phase = match self.phase {
             GrantRecordPhase::Pending => X11GrantRecordPhase::Pending,
             GrantRecordPhase::ConfirmedAdded => X11GrantRecordPhase::ConfirmedAdded,
+            GrantRecordPhase::Revoked => X11GrantRecordPhase::Revoked,
             GrantRecordPhase::OutcomeUnknown { reason } => {
                 if reason.len() > MAX_GRANT_REASON_BYTES || reason.chars().any(char::is_control) {
                     return Err("recorded outcome reason is invalid".into());
@@ -862,6 +877,172 @@ fn ensure_access_sync(
     })
 }
 
+fn revoke_access_sync(request: &X11RevokeRequest) -> Result<X11DesktopRevocation, String> {
+    let state = X11RuntimeState::open_existing()?
+        .ok_or_else(|| "X11 grant record storage does not exist".to_owned())?;
+    let _lock = state.lock()?;
+    let records = state.load_records();
+    if !records.complete {
+        let detail = records
+            .diagnostics
+            .first()
+            .map(String::as_str)
+            .unwrap_or("the grant record set is incomplete");
+        return Err(format!(
+            "X11 revocation was not attempted because Lasper cannot safely inspect its grant records: {detail}"
+        ));
+    }
+
+    let record_id = request.record_id();
+    if !valid_record_id(record_id) {
+        return Err("X11 revocation record ID is invalid".to_owned());
+    }
+    let file_name = format!("grant-{record_id}.json");
+    let file = state
+        .grants
+        .read_bounded(&file_name, MAX_GRANT_RECORD_BYTES)
+        .map_err(|error| format!("read X11 grant record {record_id}: {error}"))?
+        .ok_or_else(|| format!("X11 grant record {record_id} does not exist"))?;
+    if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
+        return Err(format!(
+            "X11 grant record {record_id} is not owned by the invoking user"
+        ));
+    }
+    let mut record: ManagedX11GrantRecord = serde_json::from_slice(&file.bytes)
+        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+    let evidence = record
+        .clone()
+        .into_evidence(&file_name)
+        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+    if !matches!(evidence.phase, X11GrantRecordPhase::ConfirmedAdded) {
+        return Err(format!(
+            "X11 grant record {record_id} is not an active confirmed grant"
+        ));
+    }
+
+    let projection = request.projection();
+    let socket = projection.host_socket();
+    let current_uid = uzers::get_effective_uid();
+    if evidence.caller_uid != current_uid {
+        return Err("X11 grant record belongs to another invoking user".to_owned());
+    }
+    if evidence.target != *request.target()
+        || evidence.identity != projection.identity()
+        || evidence.display != socket.display()
+        || evidence.alternate_endpoint != socket.alternate()
+        || evidence.source != socket.source()
+        || evidence.canonical_source != socket.canonical_path()
+        || evidence.socket_revision != socket.revision()
+        || evidence.server_peer != socket.peer_identity()
+    {
+        return Err(
+            "X11 grant record does not match the current machine instance or endpoint".to_owned(),
+        );
+    }
+    let current_boot_id = host_boot_id()?;
+    if evidence.boot_id != current_boot_id {
+        return Err("X11 grant record belongs to another host boot".to_owned());
+    }
+    require_current_socket(socket, "before revoking access")?;
+    let current_server_start = x11_peer_start_time(socket)?;
+    if current_server_start != evidence.server_peer_start_time {
+        return Err("X11 server generation changed since the grant was created".to_owned());
+    }
+    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let before = read_acl(&connection, socket.display())?;
+    require_current_socket(socket, "before changing its ACL")?;
+    match before.mode() {
+        crate::application::x11::X11AccessControlMode::Disabled => {
+            return Err("X11 access control is disabled; no ACL revoke was attempted".to_owned())
+        }
+        crate::application::x11::X11AccessControlMode::Unknown(mode) => {
+            return Err(format!(
+            "X server returned unsupported access-control mode {mode}; no ACL revoke was attempted"
+        ))
+        }
+        crate::application::x11::X11AccessControlMode::Enabled => {}
+    }
+
+    if !before.contains(&evidence.acl_entry) {
+        record.phase = GrantRecordPhase::Revoked;
+        state.write(&file_name, &record).map_err(|error| {
+            format!(
+                "the exact ACL entry was already absent, but operation record {record_id} could not be finalized: {error}"
+            )
+        })?;
+        return Ok(X11DesktopRevocation::new(
+            desktop_observation(socket, before, Some(&state)),
+            X11RevocationDisposition::AlreadyAbsent {
+                record_id: record_id.to_owned(),
+            },
+        ));
+    }
+
+    let (change_result, observed) =
+        remove_and_observe(&connection, socket.display(), evidence.identity.host_uid());
+    let socket_result = require_current_socket(socket, "while revoking access");
+    let server_result = x11_peer_start_time(socket).and_then(|current| {
+        (current == evidence.server_peer_start_time)
+            .then_some(())
+            .ok_or_else(|| "X11 server process changed while revoking access".to_owned())
+    });
+    let confirmed = change_result.is_ok()
+        && socket_result.is_ok()
+        && server_result.is_ok()
+        && observed
+            .as_ref()
+            .is_ok_and(|snapshot| !snapshot.contains(&evidence.acl_entry));
+    if confirmed {
+        let after = observed.expect("confirmed observation is successful");
+        record.phase = GrantRecordPhase::Revoked;
+        state.write(&file_name, &record).map_err(|error| {
+            format!(
+                "X11 access was revoked, but operation record {record_id} could not be finalized ({error}); the confirmed record was preserved"
+            )
+        })?;
+        return Ok(X11DesktopRevocation::new(
+            desktop_observation(socket, after, Some(&state)),
+            X11RevocationDisposition::Revoked {
+                record_id: record_id.to_owned(),
+            },
+        ));
+    }
+
+    let reason = [
+        change_result.err(),
+        observed
+            .err()
+            .map(|error| format!("confirmation query: {error}")),
+        socket_result
+            .err()
+            .map(|error| format!("endpoint revalidation: {error}")),
+        server_result
+            .err()
+            .map(|error| format!("server generation: {error}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join("; ");
+    let reason = if reason.is_empty() {
+        "the exact ACL entry was still present after the X server round trip".to_owned()
+    } else {
+        reason
+    };
+    record.phase = GrantRecordPhase::OutcomeUnknown {
+        reason: reason.clone(),
+    };
+    let record_result = state.write(&file_name, &record);
+    Err(match record_result {
+        Ok(()) => format!(
+            "X11 revocation outcome is unknown: {reason}; operation record {record_id} was preserved"
+        ),
+        Err(record_error) => format!(
+            "X11 revocation outcome is unknown: {reason}; additionally, the operation record could not be updated: {record_error}"
+        ),
+    })
+}
+
 fn insert_and_observe(
     connection: &RustConnection<DefaultStream>,
     display: u16,
@@ -874,6 +1055,23 @@ fn insert_and_observe(
                 .check()
                 .map_err(|error| format!("insert localuser:#{host_uid}: {error}")),
             Err(error) => Err(format!("send localuser:#{host_uid} insertion: {error}")),
+        };
+    let observed = read_acl(connection, display);
+    (change_result, observed)
+}
+
+fn remove_and_observe(
+    connection: &RustConnection<DefaultStream>,
+    display: u16,
+    host_uid: u32,
+) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
+    let address = numeric_local_user_address(host_uid);
+    let change_result =
+        match connection.change_hosts(HostMode::DELETE, Family::SERVER_INTERPRETED, &address) {
+            Ok(cookie) => cookie
+                .check()
+                .map_err(|error| format!("remove localuser:#{host_uid}: {error}")),
+            Err(error) => Err(format!("send localuser:#{host_uid} removal: {error}")),
         };
     let observed = read_acl(connection, display);
     (change_result, observed)
@@ -1141,6 +1339,12 @@ mod tests {
         assert_eq!(decoded.record_id, record_id);
         assert_eq!(decoded.server_peer_start_time, 77);
         assert_eq!(decoded.acl_address, b"localuser\0#1437402088".to_vec());
+
+        let mut revoked = decoded.clone();
+        revoked.phase = GrantRecordPhase::Revoked;
+        let revoked_value = serde_json::to_value(&revoked).unwrap();
+        let decoded_revoked: ManagedX11GrantRecord = serde_json::from_value(revoked_value).unwrap();
+        assert!(matches!(decoded_revoked.phase, GrantRecordPhase::Revoked));
 
         let mut unknown = value;
         unknown["unexpected"] = serde_json::json!(true);

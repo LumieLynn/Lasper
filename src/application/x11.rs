@@ -113,7 +113,7 @@ impl X11AclSnapshot {
             .any(|entry| entry.is_numeric_local_user(uid))
     }
 
-    fn contains(&self, entry: &X11AclEntry) -> bool {
+    pub(crate) fn contains(&self, entry: &X11AclEntry) -> bool {
         self.entries.contains(entry)
     }
 }
@@ -122,6 +122,7 @@ impl X11AclSnapshot {
 pub(crate) enum X11GrantRecordPhase {
     Pending,
     ConfirmedAdded,
+    Revoked,
     OutcomeUnknown { reason: String },
 }
 
@@ -301,6 +302,39 @@ pub(crate) struct X11AuthorizationRequest {
     projection: X11ProjectionContext,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11RevokeRequest {
+    target: ShellTarget,
+    projection: X11ProjectionContext,
+    record_id: String,
+}
+
+impl X11RevokeRequest {
+    pub(crate) fn new(
+        target: ShellTarget,
+        projection: X11ProjectionContext,
+        record_id: String,
+    ) -> Self {
+        Self {
+            target,
+            projection,
+            record_id,
+        }
+    }
+
+    pub(crate) fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
+    pub(crate) fn projection(&self) -> &X11ProjectionContext {
+        &self.projection
+    }
+
+    pub(crate) fn record_id(&self) -> &str {
+        &self.record_id
+    }
+}
+
 impl X11AuthorizationRequest {
     pub(crate) fn new(target: ShellTarget, projection: X11ProjectionContext) -> Self {
         Self { target, projection }
@@ -323,6 +357,12 @@ pub enum X11AuthorizationDisposition {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum X11RevocationDisposition {
+    Revoked { record_id: String },
+    AlreadyAbsent { record_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11DesktopAuthorization {
     observation: X11DesktopObservation,
     disposition: X11AuthorizationDisposition,
@@ -341,9 +381,43 @@ impl X11DesktopAuthorization {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11DesktopRevocation {
+    observation: X11DesktopObservation,
+    disposition: X11RevocationDisposition,
+}
+
+impl X11DesktopRevocation {
+    pub(crate) fn new(
+        observation: X11DesktopObservation,
+        disposition: X11RevocationDisposition,
+    ) -> Self {
+        Self {
+            observation,
+            disposition,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X11Authorization {
     check: X11AccessCheck,
     disposition: X11AuthorizationDisposition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11Revocation {
+    check: X11AccessCheck,
+    disposition: X11RevocationDisposition,
+}
+
+impl X11Revocation {
+    pub fn check(&self) -> &X11AccessCheck {
+        &self.check
+    }
+
+    pub fn disposition(&self) -> &X11RevocationDisposition {
+        &self.disposition
+    }
 }
 
 impl X11Authorization {
@@ -449,6 +523,14 @@ fn assess_grants(
                     X11GrantHistoryStatus::OutcomeUnknown,
                     format!("authorization outcome is unknown: {reason}"),
                 ),
+                X11GrantRecordPhase::Revoked if !entry_present => (
+                    X11GrantHistoryStatus::Absent,
+                    "the exact ACL entry was revoked by Lasper and is absent".to_owned(),
+                ),
+                X11GrantRecordPhase::Revoked => (
+                    X11GrantHistoryStatus::Historical,
+                    "the record was revoked, but the exact ACL entry is present again".to_owned(),
+                ),
                 X11GrantRecordPhase::ConfirmedAdded if !entry_present => (
                     X11GrantHistoryStatus::Absent,
                     "the confirmed exact ACL entry is no longer present".to_owned(),
@@ -472,6 +554,9 @@ fn assess_grants(
                     }
                     if record.identity != projection.identity() {
                         differences.push("machine instance or mapped identity changed");
+                    }
+                    if endpoint_changed {
+                        differences.push("selected X11 endpoint changed");
                     }
                     if current_key && differences.is_empty() {
                         (
@@ -591,6 +676,11 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
         &self,
         request: &X11AuthorizationRequest,
     ) -> Result<X11DesktopAuthorization, X11DesktopAccessError>;
+
+    async fn revoke(
+        &self,
+        request: &X11RevokeRequest,
+    ) -> Result<X11DesktopRevocation, X11DesktopAccessError>;
 }
 
 /// Combines runtime namespace evidence with a caller-owned X server query.
@@ -645,6 +735,33 @@ impl X11AccessService {
             .await
             .map_err(X11AccessError::Desktop)?;
         Ok(X11Authorization {
+            check: X11AccessCheck::from_desktop_observation(
+                target,
+                projection,
+                desktop.observation,
+            ),
+            disposition: desktop.disposition,
+        })
+    }
+
+    pub async fn revoke(
+        &self,
+        target: ShellTarget,
+        socket: HostX11Socket,
+        record_id: String,
+    ) -> Result<X11Revocation, X11AccessError> {
+        let projection = self
+            .sessions
+            .test_x11_projection(target.clone(), socket)
+            .await
+            .map_err(X11AccessError::Projection)?;
+        let request = X11RevokeRequest::new(target.clone(), projection.clone(), record_id);
+        let desktop = self
+            .desktop
+            .revoke(&request)
+            .await
+            .map_err(X11AccessError::Desktop)?;
+        Ok(X11Revocation {
             check: X11AccessCheck::from_desktop_observation(
                 target,
                 projection,
@@ -870,6 +987,21 @@ mod tests {
         assert_eq!(
             absent.grant_assessment().history()[0].status(),
             X11GrantHistoryStatus::Absent
+        );
+
+        let revoked = assessed_check(
+            Some(X11GrantRecordPhase::Revoked),
+            true,
+            true,
+            Some("11111111-1111-4111-8111-111111111111"),
+        );
+        assert_eq!(
+            revoked.grant_assessment().status(),
+            &X11GrantAssessmentStatus::Historical
+        );
+        assert_eq!(
+            revoked.grant_assessment().history()[0].status(),
+            X11GrantHistoryStatus::Historical
         );
     }
 

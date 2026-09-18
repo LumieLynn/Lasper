@@ -139,6 +139,40 @@ impl App {
                     view.track_x11_authorization(task);
                 }
             }
+            ConfigurationAction::RevokeX11 {
+                generation,
+                target,
+                host_socket,
+                record_id,
+            } => {
+                let configuration_target = ConfigurationTarget::Machine(target.machine().clone());
+                let Some(events) = self.ui.app_tx.clone() else {
+                    if let Some(view) = self.ui.configuration.as_mut() {
+                        view.finish_x11_revocation(
+                            generation,
+                            &configuration_target,
+                            Err(crate::application::x11::X11AccessError::Desktop(
+                                crate::application::x11::X11DesktopAccessError::new(
+                                    "Application event channel is unavailable; no revocation was attempted",
+                                ),
+                            )),
+                        );
+                    }
+                    return;
+                };
+                let task = crate::tui::effects::configuration::revoke_x11(
+                    self.data.x11_access.clone(),
+                    configuration_target,
+                    target,
+                    host_socket,
+                    record_id,
+                    generation,
+                    events,
+                );
+                if let Some(view) = self.ui.configuration.as_mut() {
+                    view.track_x11_revocation(task);
+                }
+            }
             ConfigurationAction::Restart(machine) => {
                 self.ui.configuration = None;
                 self.action_runtime_named(

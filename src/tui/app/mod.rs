@@ -678,6 +678,31 @@ impl App {
                     self.set_status(message, level);
                 }
             }
+            AppEvent::ConfigurationX11Revoked {
+                generation,
+                target,
+                result,
+            } => {
+                if let Some(view) = &mut self.ui.configuration {
+                    view.finish_x11_revocation(generation, &target, result);
+                } else {
+                    let (message, level) = match result {
+                        Ok(revocation) => {
+                            let message = match revocation.disposition() {
+                                crate::application::x11::X11RevocationDisposition::Revoked {
+                                    ..
+                                } => "X11 access revoked; the operation record was retained",
+                                crate::application::x11::X11RevocationDisposition::AlreadyAbsent {
+                                    ..
+                                } => "X11 access was already absent; the operation record was finalized",
+                            };
+                            (message.to_owned(), crate::tui::StatusLevel::Success)
+                        }
+                        Err(error) => (error.to_string(), crate::tui::StatusLevel::Error),
+                    };
+                    self.set_status(message, level);
+                }
+            }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {
                     return;
