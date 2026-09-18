@@ -166,6 +166,29 @@ impl TrustedDirectory {
         )
     }
 
+    /// Open an existing child relative to this held directory FD. A missing
+    /// child is ordinary absence; symlinks and untrusted directory metadata are
+    /// still rejected.
+    pub(crate) fn open_existing_child(&self, name: &str) -> Result<Option<Self>> {
+        let name = validate_name(name)?;
+        let file = match open_file_at(
+            self.file.as_raw_fd(),
+            &name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(map_open_error(&self.path, &name, error)),
+        };
+        Self::new(
+            file,
+            self.path.join(name.to_str().unwrap()),
+            self.expected_uid,
+        )
+        .map(Some)
+    }
+
     pub(crate) fn expected_uid(&self) -> u32 {
         self.expected_uid
     }
@@ -767,6 +790,21 @@ mod tests {
         );
         std::os::unix::fs::symlink("/tmp", temporary.path().join("redirect")).unwrap();
         assert!(runtime.open_or_create_child("redirect", 0o700).is_err());
+    }
+
+    #[test]
+    fn existing_child_lookup_distinguishes_absence_and_rejects_symlinks() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = temporary.path().metadata().unwrap().uid();
+        let runtime = TrustedDirectory::open_existing(temporary.path(), owner).unwrap();
+        assert!(runtime.open_existing_child("missing").unwrap().is_none());
+
+        runtime.open_or_create_child("records", 0o700).unwrap();
+        assert!(runtime.open_existing_child("records").unwrap().is_some());
+
+        std::os::unix::fs::symlink("records", temporary.path().join("redirect")).unwrap();
+        assert!(runtime.open_existing_child("redirect").is_err());
     }
 
     #[test]

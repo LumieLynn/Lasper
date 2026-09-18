@@ -14,11 +14,17 @@ use x11rb::protocol::xproto::{ConnectionExt, Family, HostMode};
 use x11rb::reexports::x11rb_protocol::{parse_display, xauth};
 use x11rb::rust_connection::{DefaultStream, RustConnection};
 
+use crate::application::sessions::{
+    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
+    ShellTarget, ValidatedGuestUserName,
+};
 use crate::application::x11::{
     X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationRequest,
-    X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11EndpointCatalog,
-    X11EndpointDiscoveryPort,
+    X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11DesktopObservation,
+    X11EndpointCatalog, X11EndpointDiscoveryPort, X11GrantRecordCatalog, X11GrantRecordEvidence,
+    X11GrantRecordPhase,
 };
+use crate::domain::machine::MachineName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
 const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
@@ -27,6 +33,10 @@ const MAX_DISCOVERED_DISPLAYS: usize = 16;
 const MAX_ACL_ENTRIES: usize = 1024;
 const MAX_ACL_BYTES: usize = 64 * 1024;
 const GRANT_RECORD_VERSION: u32 = 1;
+const MAX_GRANT_RECORDS: usize = 256;
+const MAX_GRANT_RECORD_BYTES: usize = 16 * 1024;
+const MAX_GRANT_DIAGNOSTICS: usize = 16;
+const MAX_GRANT_REASON_BYTES: usize = 2048;
 
 type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32));
 
@@ -54,9 +64,9 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
     async fn snapshot(
         &self,
         socket: &HostX11Socket,
-    ) -> Result<X11AclSnapshot, X11DesktopAccessError> {
+    ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
         let socket = socket.clone();
-        tokio::task::spawn_blocking(move || snapshot_acl_sync(&socket))
+        tokio::task::spawn_blocking(move || snapshot_desktop_sync(&socket))
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!("X11 ACL query task failed: {error}"))
@@ -306,12 +316,14 @@ fn inspect_endpoint(
     .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
 }
 
-fn snapshot_acl_sync(socket: &HostX11Socket) -> Result<X11AclSnapshot, String> {
+fn snapshot_desktop_sync(socket: &HostX11Socket) -> Result<X11DesktopObservation, String> {
     require_current_socket(socket, "before querying its ACL")?;
     let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
-    let snapshot = read_acl(&connection, socket.display())?;
+    let acl = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "while querying its ACL")?;
-    Ok(snapshot)
+    let observation = desktop_observation(socket, acl, None);
+    require_current_socket(socket, "while assessing its grant records")?;
+    Ok(observation)
 }
 
 fn read_acl(
@@ -422,6 +434,104 @@ impl ManagedX11GrantRecord {
             acl_address: numeric_local_user_address(host_uid),
         })
     }
+
+    fn into_evidence(self, file_name: &str) -> Result<X11GrantRecordEvidence, String> {
+        if self.version != GRANT_RECORD_VERSION {
+            return Err(format!("unsupported record version {}", self.version));
+        }
+        let expected_name = format!("grant-{}.json", self.record_id);
+        if file_name != expected_name || !valid_record_id(&self.record_id) {
+            return Err("record ID does not match its filename".into());
+        }
+        let boot_id = uuid::Uuid::parse_str(&self.boot_id)
+            .map_err(|error| format!("invalid host boot identity: {error}"))?
+            .to_string();
+        let machine = MachineName::new(self.machine)
+            .map_err(|error| format!("invalid machine name: {error}"))?;
+        let guest_user = ValidatedGuestUserName::new(self.guest_user)
+            .map_err(|error| format!("invalid guest user: {error}"))?;
+        if self.machine_leader_pid == 0
+            || self.machine_leader_pid > i32::MAX as u32
+            || self.machine_pid_namespace.1 == 0
+            || self.machine_user_namespace.1 == 0
+        {
+            return Err("recorded machine instance is invalid".into());
+        }
+        if self.server_peer.0 == 0 || self.server_peer.0 > i32::MAX as u32 {
+            return Err("recorded X server PID is invalid".into());
+        }
+        if self.server_peer_start_time == 0 {
+            return Err("recorded X server start time is invalid".into());
+        }
+        let expected_source = Path::new(X11_SOCKET_DIRECTORY).join(format!(
+            "X{}{}",
+            self.display,
+            if self.alternate_endpoint { "_" } else { "" }
+        ));
+        if self.source != expected_source
+            || !self.canonical_source.is_absolute()
+            || self.socket_revision.inode == 0
+        {
+            return Err("recorded X11 endpoint path is invalid".into());
+        }
+        let expected_acl = numeric_local_user_address(self.host_uid);
+        if self.acl_family != u8::from(Family::SERVER_INTERPRETED)
+            || self.acl_address != expected_acl
+        {
+            return Err("recorded ACL key is not the exact mapped numeric localuser".into());
+        }
+        let phase = match self.phase {
+            GrantRecordPhase::Pending => X11GrantRecordPhase::Pending,
+            GrantRecordPhase::ConfirmedAdded => X11GrantRecordPhase::ConfirmedAdded,
+            GrantRecordPhase::OutcomeUnknown { reason } => {
+                if reason.len() > MAX_GRANT_REASON_BYTES || reason.chars().any(char::is_control) {
+                    return Err("recorded outcome reason is invalid".into());
+                }
+                X11GrantRecordPhase::OutcomeUnknown { reason }
+            }
+        };
+        let pid_namespace = ObservedNamespaceIdentity::new(
+            self.machine_pid_namespace.0,
+            self.machine_pid_namespace.1,
+        );
+        let user_namespace = ObservedNamespaceIdentity::new(
+            self.machine_user_namespace.0,
+            self.machine_user_namespace.1,
+        );
+        Ok(X11GrantRecordEvidence {
+            record_id: self.record_id,
+            phase,
+            created_unix_millis: self.created_unix_millis,
+            caller_uid: self.caller_uid,
+            boot_id,
+            target: ShellTarget::new(machine, guest_user),
+            identity: MappedGuestIdentity::verified(
+                ObservedGuestIdentity::new(self.guest_uid, self.guest_gid),
+                self.host_uid,
+                self.host_gid,
+                ObservedMachineInstance::new(
+                    self.machine_leader_pid,
+                    pid_namespace,
+                    user_namespace,
+                ),
+            ),
+            display: self.display,
+            alternate_endpoint: self.alternate_endpoint,
+            source: self.source,
+            canonical_source: self.canonical_source,
+            socket_revision: self.socket_revision,
+            server_peer: self.server_peer,
+            server_peer_start_time: self.server_peer_start_time,
+            acl_entry: X11AclEntry::from_wire(self.acl_family, self.acl_address),
+        })
+    }
+}
+
+fn valid_record_id(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 struct X11RuntimeState {
@@ -448,6 +558,33 @@ impl X11RuntimeState {
         Ok(Self { access, grants })
     }
 
+    fn open_existing() -> Result<Option<Self>, String> {
+        let uid = uzers::get_effective_uid();
+        let runtime = user_runtime_directory(uid)?;
+        let runtime =
+            crate::adapters::trusted_state::TrustedDirectory::open_existing(&runtime, uid)
+                .map_err(|error| format!("open user runtime directory: {error}"))?;
+        let Some(lasper) = runtime
+            .open_existing_child("lasper")
+            .map_err(|error| format!("open Lasper runtime directory: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let Some(access) = lasper
+            .open_existing_child("x11-access")
+            .map_err(|error| format!("open X11 access runtime directory: {error}"))?
+        else {
+            return Ok(None);
+        };
+        let Some(grants) = access
+            .open_existing_child("grants")
+            .map_err(|error| format!("open X11 grant record directory: {error}"))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Self { access, grants }))
+    }
+
     fn lock(&self) -> Result<std::fs::File, String> {
         self.access
             .lock_exclusive("acl")
@@ -461,6 +598,151 @@ impl X11RuntimeState {
             .write_atomic(file_name, &bytes, 0o600)
             .map_err(|error| format!("persist X11 grant record: {error}"))
     }
+
+    fn load_records(&self) -> X11GrantRecordCatalog {
+        load_grant_records_from(&self.grants, uzers::get_effective_uid())
+    }
+}
+
+fn load_existing_grant_records() -> X11GrantRecordCatalog {
+    match X11RuntimeState::open_existing() {
+        Ok(Some(state)) => state.load_records(),
+        Ok(None) => X11GrantRecordCatalog::empty(),
+        Err(error) => X11GrantRecordCatalog::unavailable(format!(
+            "X11 grant records could not be inspected: {error}"
+        )),
+    }
+}
+
+fn load_grant_records_from(
+    grants: &crate::adapters::trusted_state::TrustedDirectory,
+    expected_uid: u32,
+) -> X11GrantRecordCatalog {
+    let mut names = match grants.entry_names() {
+        Ok(names) => names
+            .into_iter()
+            .filter(|name| {
+                name.strip_prefix("grant-")
+                    .and_then(|value| value.strip_suffix(".json"))
+                    .is_some()
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return X11GrantRecordCatalog::unavailable(format!(
+                "X11 grant record directory could not be listed: {error}"
+            ));
+        }
+    };
+    names.sort();
+    let mut complete = true;
+    let mut diagnostics = Vec::new();
+    let mut omitted_diagnostics = 0usize;
+    if names.len() > MAX_GRANT_RECORDS {
+        complete = false;
+        let excess = names.len() - MAX_GRANT_RECORDS;
+        names.truncate(MAX_GRANT_RECORDS);
+        push_grant_diagnostic(
+            &mut diagnostics,
+            &mut omitted_diagnostics,
+            format!(
+                "X11 grant record count exceeded {MAX_GRANT_RECORDS}; {excess} records were not read"
+            ),
+        );
+    }
+
+    let mut records = Vec::with_capacity(names.len());
+    for name in names {
+        let record = (|| {
+            let file = grants
+                .read_bounded(&name, MAX_GRANT_RECORD_BYTES)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "record disappeared while it was being read".to_owned())?;
+            if file.uid != expected_uid || file.mode & 0o077 != 0 {
+                return Err(format!(
+                    "record must be owned by uid {expected_uid} and inaccessible to group/other"
+                ));
+            }
+            serde_json::from_slice::<ManagedX11GrantRecord>(&file.bytes)
+                .map_err(|error| format!("invalid record JSON: {error}"))?
+                .into_evidence(&name)
+        })();
+        match record {
+            Ok(record) => records.push(record),
+            Err(error) => {
+                complete = false;
+                push_grant_diagnostic(
+                    &mut diagnostics,
+                    &mut omitted_diagnostics,
+                    format!("{name:?}: {}", bounded_record_diagnostic(&error)),
+                );
+            }
+        }
+    }
+    if omitted_diagnostics > 0 {
+        diagnostics.push(format!(
+            "{omitted_diagnostics} additional X11 grant record diagnostics were omitted"
+        ));
+    }
+    X11GrantRecordCatalog {
+        records,
+        diagnostics,
+        complete,
+    }
+}
+
+fn push_grant_diagnostic(diagnostics: &mut Vec<String>, omitted: &mut usize, message: String) {
+    if diagnostics.len() < MAX_GRANT_DIAGNOSTICS.saturating_sub(1) {
+        diagnostics.push(message);
+    } else {
+        *omitted += 1;
+    }
+}
+
+fn bounded_record_diagnostic(message: &str) -> String {
+    const MAX_BYTES: usize = 512;
+    let mut rendered = String::new();
+    for character in message.chars() {
+        let escaped = character.escape_default().to_string();
+        if rendered.len().saturating_add(escaped.len()) > MAX_BYTES {
+            rendered.push_str("...");
+            break;
+        }
+        rendered.push_str(&escaped);
+    }
+    rendered
+}
+
+fn desktop_observation(
+    socket: &HostX11Socket,
+    acl: X11AclSnapshot,
+    state: Option<&X11RuntimeState>,
+) -> X11DesktopObservation {
+    let mut diagnostics = Vec::new();
+    let host_boot_id = match host_boot_id() {
+        Ok(value) => Some(value),
+        Err(error) => {
+            diagnostics.push(format!("X11 server continuity: {error}"));
+            None
+        }
+    };
+    let server_peer_start_time = match x11_peer_start_time(socket) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            diagnostics.push(format!("X11 server continuity: {error}"));
+            None
+        }
+    };
+    let records = state
+        .map(X11RuntimeState::load_records)
+        .unwrap_or_else(load_existing_grant_records);
+    X11DesktopObservation::new(
+        acl,
+        uzers::get_effective_uid(),
+        host_boot_id,
+        server_peer_start_time,
+        records,
+        diagnostics,
+    )
 }
 
 fn ensure_access_sync(
@@ -479,7 +761,7 @@ fn ensure_access_sync(
     match before.mode() {
         crate::application::x11::X11AccessControlMode::Disabled => {
             return Ok(X11DesktopAuthorization::new(
-                before,
+                desktop_observation(socket, before, Some(&state)),
                 X11AuthorizationDisposition::AccessControlDisabled,
             ));
         }
@@ -494,8 +776,20 @@ fn ensure_access_sync(
     let host_uid = projection.identity().host_uid();
     if before.has_numeric_local_user(host_uid) {
         return Ok(X11DesktopAuthorization::new(
-            before,
+            desktop_observation(socket, before, Some(&state)),
             X11AuthorizationDisposition::PreExisting,
+        ));
+    }
+
+    let existing_records = state.load_records();
+    if !existing_records.complete {
+        let detail = existing_records
+            .diagnostics
+            .first()
+            .map(String::as_str)
+            .unwrap_or("the grant record set is incomplete");
+        return Err(format!(
+            "X11 authorization was not attempted because Lasper cannot safely inspect its existing grant records: {detail}"
         ));
     }
 
@@ -528,7 +822,7 @@ fn ensure_access_sync(
             )
         })?;
         return Ok(X11DesktopAuthorization::new(
-            after,
+            desktop_observation(socket, after, Some(&state)),
             X11AuthorizationDisposition::Added { record_id },
         ));
     }
@@ -840,15 +1134,62 @@ mod tests {
             ),
             projection,
         );
-        let record = ManagedX11GrantRecord::pending(&request, "record-1".into(), 77).unwrap();
+        let record_id = "0123456789abcdef0123456789abcdef";
+        let record = ManagedX11GrantRecord::pending(&request, record_id.into(), 77).unwrap();
         let value = serde_json::to_value(&record).unwrap();
         let decoded: ManagedX11GrantRecord = serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(decoded.record_id, "record-1");
+        assert_eq!(decoded.record_id, record_id);
         assert_eq!(decoded.server_peer_start_time, 77);
         assert_eq!(decoded.acl_address, b"localuser\0#1437402088".to_vec());
 
         let mut unknown = value;
         unknown["unexpected"] = serde_json::json!(true);
         assert!(serde_json::from_value::<ManagedX11GrantRecord>(unknown).is_err());
+
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let owner = temporary.path().metadata().unwrap().uid();
+        let grants = crate::adapters::trusted_state::TrustedDirectory::open_existing(
+            temporary.path(),
+            owner,
+        )
+        .unwrap()
+        .open_or_create_child("grants", 0o700)
+        .unwrap();
+        let file_name = format!("grant-{record_id}.json");
+        grants
+            .write_atomic(&file_name, &serde_json::to_vec(&record).unwrap(), 0o600)
+            .unwrap();
+        let catalog = load_grant_records_from(&grants, owner);
+        assert!(catalog.complete);
+        assert!(catalog.diagnostics.is_empty());
+        assert_eq!(catalog.records.len(), 1);
+        assert_eq!(catalog.records[0].record_id, record_id);
+
+        grants
+            .write_atomic(
+                "grant-invalid.json",
+                &serde_json::to_vec(&record).unwrap(),
+                0o600,
+            )
+            .unwrap();
+        grants
+            .write_atomic(
+                "grant-ffffffffffffffffffffffffffffffff.json",
+                b"not-json",
+                0o600,
+            )
+            .unwrap();
+        let catalog = load_grant_records_from(&grants, owner);
+        assert!(!catalog.complete);
+        assert_eq!(catalog.records.len(), 1);
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("invalid record JSON")));
+        assert!(catalog
+            .diagnostics
+            .iter()
+            .any(|message| message.contains("record ID does not match")));
     }
 }

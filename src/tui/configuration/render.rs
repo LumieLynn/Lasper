@@ -12,12 +12,14 @@ use super::navigation::ConfigurationPage;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
     X11AuthorizationPresentation, X11CheckState, X11ChecklistItem, X11ContentFocus,
+    X11GrantAssessmentPresentation, X11GrantHistoryPresentation, X11GrantHistoryStatusPresentation,
+    X11GrantStatusPresentation,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
     X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
-use crate::application::x11::{X11AclSnapshot, X11MappedUidAclStatus};
+use crate::application::x11::X11AclSnapshot;
 use crate::domain::x11::HostX11Socket;
 use crate::tui::core::Component;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
@@ -146,7 +148,7 @@ impl ConfigurationView {
         let rows = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(11),
-            Constraint::Length(1),
+            Constraint::Length(5),
         ])
         .split(inner);
         let message = match &self.state {
@@ -211,11 +213,7 @@ impl ConfigurationView {
             }
         }
         self.render_current_x11_access(frame, rows[1]);
-        frame.render_widget(
-            Paragraph::new("Operation history: not loaded")
-                .style(Style::default().fg(theme::theme().text_secondary)),
-            rows[2],
-        );
+        self.render_x11_history(frame, rows[2]);
     }
 
     fn render_current_x11_access(&mut self, frame: &mut Frame, area: Rect) {
@@ -263,49 +261,27 @@ impl ConfigurationView {
             X11CheckState::Ready {
                 generation,
                 check,
+                assessment,
                 authorization,
             } => {
                 let context = check.projection();
                 let identity = context.identity();
-                let acl_status = match authorization {
+                let acl_status = x11_grant_status(assessment, identity.host_uid());
+                let action = match authorization {
                     Some(X11AuthorizationPresentation::Added { record_id }) => format!(
-                        "Exact localuser:#{} entry is present (Lasper record {}).",
-                        identity.host_uid(),
+                        " Last action created record {}.",
                         &record_id[..record_id.len().min(12)]
                     ),
-                    Some(X11AuthorizationPresentation::PreExisting) => format!(
-                        "Exact localuser:#{} entry was already present (external/unmanaged).",
-                        identity.host_uid()
-                    ),
-                    Some(X11AuthorizationPresentation::AccessControlDisabled) => {
-                        "X server access control is disabled; no entry was added.".to_owned()
+                    Some(X11AuthorizationPresentation::PreExisting) => {
+                        " Last action reused the existing entry without claiming it.".to_owned()
                     }
-                    None => match check.mapped_uid_status() {
-                        X11MappedUidAclStatus::AccessControlDisabled => {
-                            "X server access control is disabled.".to_owned()
-                        }
-                        X11MappedUidAclStatus::ExactNumericEntryPresent => format!(
-                            "Exact localuser:#{} entry is present; ownership records are not loaded.",
-                            identity.host_uid()
-                        ),
-                        X11MappedUidAclStatus::ExactNumericEntryAbsent => format!(
-                            "No exact localuser:#{} entry was observed.",
-                            identity.host_uid()
-                        ),
-                        X11MappedUidAclStatus::UnknownMode {
-                            exact_numeric_entry_present,
-                        } => format!(
-                            "Unknown ACL mode; exact numeric entry {}.",
-                            if exact_numeric_entry_present {
-                                "is present"
-                            } else {
-                                "was not observed"
-                            }
-                        ),
-                    },
+                    Some(X11AuthorizationPresentation::AccessControlDisabled) => {
+                        " No entry was added.".to_owned()
+                    }
+                    None => String::new(),
                 };
                 format!(
-                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}\n{}",
+                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}{action}\n{}",
                     identity.guest().uid(),
                     identity.host_uid(),
                     context.host_socket().source().display(),
@@ -385,6 +361,32 @@ impl ConfigurationView {
                 controls[2],
             );
         }
+    }
+
+    fn render_x11_history(&self, frame: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title(" Operation history ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::theme().text_secondary));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let text = match &self.x11_check {
+            X11CheckState::Ready { assessment, .. } => x11_history_text(assessment),
+            X11CheckState::Loading { .. } | X11CheckState::Authorizing { .. } => {
+                "Loading grant records…".to_owned()
+            }
+            X11CheckState::Failed { .. } => {
+                "Current records were not assessed because the check failed.".to_owned()
+            }
+            X11CheckState::Untested => "Not queried. Run Check access to load records.".to_owned(),
+        };
+        frame.render_widget(
+            Paragraph::new(text)
+                .style(Style::default().fg(theme::theme().text_secondary))
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
     }
 
     fn preview_text(&self) -> Cow<'_, str> {
@@ -679,6 +681,65 @@ impl ConfigurationView {
             dialog,
         );
     }
+}
+
+fn x11_grant_status(assessment: &X11GrantAssessmentPresentation, host_uid: u32) -> String {
+    match &assessment.status {
+        X11GrantStatusPresentation::AccessControlDisabled => {
+            "X server access control is disabled.".to_owned()
+        }
+        X11GrantStatusPresentation::Managed { record_id } => format!(
+            "Exact localuser:#{host_uid} entry is managed by Lasper record {}.",
+            &record_id[..record_id.len().min(12)]
+        ),
+        X11GrantStatusPresentation::PreExisting => format!(
+            "Exact localuser:#{host_uid} entry is present but is external/unmanaged."
+        ),
+        X11GrantStatusPresentation::Historical => format!(
+            "Exact localuser:#{host_uid} entry has historical Lasper records, but current ownership is unconfirmed."
+        ),
+        X11GrantStatusPresentation::Absent => {
+            format!("No exact localuser:#{host_uid} entry was observed.")
+        }
+        X11GrantStatusPresentation::OutcomeUnknown => format!(
+            "Exact localuser:#{host_uid} ownership is unknown; managed actions are disabled."
+        ),
+    }
+}
+
+fn x11_history_text(assessment: &X11GrantAssessmentPresentation) -> String {
+    let Some(latest) = assessment.history.first() else {
+        return assessment
+            .diagnostics
+            .first()
+            .map(|diagnostic| format!("No usable managed record. {diagnostic}"))
+            .unwrap_or_else(|| {
+                "No Lasper-created grant records match this machine, user, and display.".to_owned()
+            });
+    };
+    let status = match latest.status {
+        X11GrantHistoryStatusPresentation::Managed => "Managed",
+        X11GrantHistoryStatusPresentation::Historical => "Historical",
+        X11GrantHistoryStatusPresentation::Absent => "Absent",
+        X11GrantHistoryStatusPresentation::OutcomeUnknown => "Outcome unknown",
+    };
+    let mut lines = vec![format!(
+        "{status}: {} · host uid {}",
+        short_record_id(latest),
+        latest.host_uid
+    )];
+    lines.push(latest.detail.clone());
+    let remaining = assessment.history.len().saturating_sub(1);
+    if remaining > 0 {
+        lines.push(format!("{remaining} older matching record(s)"));
+    } else if let Some(diagnostic) = assessment.diagnostics.first() {
+        lines.push(format!("Record warning: {diagnostic}"));
+    }
+    lines.join("\n")
+}
+
+fn short_record_id(entry: &X11GrantHistoryPresentation) -> &str {
+    &entry.record_id[..entry.record_id.len().min(12)]
 }
 
 fn x11_item_lines(

@@ -20,7 +20,8 @@ use crate::application::configuration::{
 use crate::application::inspection::ResourceInspectionError;
 use crate::application::sessions::ValidatedGuestUserName;
 use crate::application::x11::{
-    X11AccessCheck, X11AccessError, X11Authorization, X11MappedUidAclStatus,
+    X11AccessCheck, X11AccessError, X11Authorization, X11GrantAssessmentStatus,
+    X11MappedUidAclStatus,
 };
 use crate::tui::core::{Component, EventResult};
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
@@ -120,6 +121,7 @@ enum X11CheckState {
     Ready {
         generation: u64,
         check: Box<X11AccessCheck>,
+        assessment: X11GrantAssessmentPresentation,
         authorization: Option<X11AuthorizationPresentation>,
     },
     Failed {
@@ -133,6 +135,88 @@ enum X11AuthorizationPresentation {
     AccessControlDisabled,
     PreExisting,
     Added { record_id: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum X11GrantStatusPresentation {
+    AccessControlDisabled,
+    Managed { record_id: String },
+    PreExisting,
+    Historical,
+    Absent,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct X11GrantHistoryPresentation {
+    record_id: String,
+    host_uid: u32,
+    status: X11GrantHistoryStatusPresentation,
+    detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11GrantHistoryStatusPresentation {
+    Managed,
+    Historical,
+    Absent,
+    OutcomeUnknown,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct X11GrantAssessmentPresentation {
+    status: X11GrantStatusPresentation,
+    history: Vec<X11GrantHistoryPresentation>,
+    diagnostics: Vec<String>,
+    records_complete: bool,
+}
+
+impl X11GrantAssessmentPresentation {
+    fn from_check(check: &X11AccessCheck) -> Self {
+        let assessment = check.grant_assessment();
+        let status = match assessment.status() {
+            X11GrantAssessmentStatus::AccessControlDisabled => {
+                X11GrantStatusPresentation::AccessControlDisabled
+            }
+            X11GrantAssessmentStatus::Managed { record_id } => {
+                X11GrantStatusPresentation::Managed {
+                    record_id: record_id.clone(),
+                }
+            }
+            X11GrantAssessmentStatus::PreExisting => X11GrantStatusPresentation::PreExisting,
+            X11GrantAssessmentStatus::Historical => X11GrantStatusPresentation::Historical,
+            X11GrantAssessmentStatus::Absent => X11GrantStatusPresentation::Absent,
+            X11GrantAssessmentStatus::OutcomeUnknown => X11GrantStatusPresentation::OutcomeUnknown,
+        };
+        Self {
+            status,
+            history: assessment
+                .history()
+                .iter()
+                .map(|entry| X11GrantHistoryPresentation {
+                    record_id: entry.record_id().to_owned(),
+                    host_uid: entry.host_uid(),
+                    status: match entry.status() {
+                        crate::application::x11::X11GrantHistoryStatus::Managed => {
+                            X11GrantHistoryStatusPresentation::Managed
+                        }
+                        crate::application::x11::X11GrantHistoryStatus::Historical => {
+                            X11GrantHistoryStatusPresentation::Historical
+                        }
+                        crate::application::x11::X11GrantHistoryStatus::Absent => {
+                            X11GrantHistoryStatusPresentation::Absent
+                        }
+                        crate::application::x11::X11GrantHistoryStatus::OutcomeUnknown => {
+                            X11GrantHistoryStatusPresentation::OutcomeUnknown
+                        }
+                    },
+                    detail: entry.detail().to_owned(),
+                })
+                .collect(),
+            diagnostics: assessment.diagnostics().to_vec(),
+            records_complete: assessment.records_complete(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -304,11 +388,15 @@ impl ConfigurationView {
         }
         self.pending_x11_check.take();
         self.x11_check = match result {
-            Ok(check) => X11CheckState::Ready {
-                generation,
-                check: Box::new(check),
-                authorization: None,
-            },
+            Ok(check) => {
+                let assessment = X11GrantAssessmentPresentation::from_check(&check);
+                X11CheckState::Ready {
+                    generation,
+                    check: Box::new(check),
+                    assessment,
+                    authorization: None,
+                }
+            }
             Err(error) => X11CheckState::Failed {
                 generation,
                 message: error.to_string(),
@@ -332,6 +420,7 @@ impl ConfigurationView {
         self.pending_x11_authorization.take();
         self.x11_check = match result {
             Ok(authorization) => {
+                let assessment = X11GrantAssessmentPresentation::from_check(authorization.check());
                 let presentation = match authorization.disposition() {
                     crate::application::x11::X11AuthorizationDisposition::AccessControlDisabled => {
                         X11AuthorizationPresentation::AccessControlDisabled
@@ -348,6 +437,7 @@ impl ConfigurationView {
                 X11CheckState::Ready {
                     generation,
                     check: Box::new(authorization.check().clone()),
+                    assessment,
                     authorization: Some(presentation),
                 }
             }
@@ -589,8 +679,12 @@ impl ConfigurationView {
     fn can_authorize_x11(&self) -> bool {
         matches!(
             &self.x11_check,
-            X11CheckState::Ready { check, .. }
-                if check.mapped_uid_status() == X11MappedUidAclStatus::ExactNumericEntryAbsent
+            X11CheckState::Ready {
+                check,
+                assessment,
+                ..
+            } if check.mapped_uid_status() == X11MappedUidAclStatus::ExactNumericEntryAbsent
+                && assessment.records_complete
         ) && self.pending_x11_authorization.is_none()
     }
 

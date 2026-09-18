@@ -110,7 +110,14 @@ fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
             .map(|address| crate::application::x11::X11AclEntry::from_wire(5, address.to_vec()))
             .collect(),
     );
-    crate::application::x11::X11AccessCheck::from_observations(context, acl)
+    crate::application::x11::X11AccessCheck::from_observations(
+        crate::application::sessions::ShellTarget::new(
+            MachineName::new("archlinux").unwrap(),
+            crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
+        ),
+        context,
+        acl,
+    )
 }
 
 fn render(view: &mut ConfigurationView, width: u16, height: u16) -> String {
@@ -164,7 +171,8 @@ fn wide_view_separates_navigation_declarations_and_runtime_access() {
     assert!(screen.contains("Host Integration"));
     assert!(screen.contains("/mnt/host-x11"));
     assert!(screen.contains("Current access"));
-    assert!(screen.contains("Operation history: not loaded"));
+    assert!(screen.contains("Operation history"));
+    assert!(screen.contains("Run Check access to load records"));
     assert!(!screen.contains("PRIVATE_VALUE"));
     assert!(!screen.contains("MOD"));
     assert!(!view.hits.navigation.intersects(view.hits.content));
@@ -572,7 +580,8 @@ fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
     let screen = render(&mut view, 140, 30);
     assert!(screen.contains("guest uid 1000"));
     assert!(screen.contains("1437402088"));
-    assert!(screen.contains("ownership") || screen.contains("records"));
+    assert!(screen.contains("external/unmanaged"));
+    assert!(screen.contains("No Lasper-created grant records"));
     assert!(screen.contains("localuser entries: #1437402088"));
     assert!(!screen.contains(" Authorize "));
 }
