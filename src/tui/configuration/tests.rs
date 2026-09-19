@@ -62,6 +62,7 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
         },
         host_x11: crate::application::x11::X11EndpointCatalog {
             sockets: vec![host_socket],
+            sources: vec![],
             preferred_display: Some(0),
             diagnostics: vec![],
         },
@@ -88,6 +89,15 @@ fn loaded_machine() -> ConfigurationView {
 }
 
 fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
+    x11_check_with_access(host_socket, entries, true, true)
+}
+
+fn x11_check_with_access(
+    host_socket: HostX11Socket,
+    entries: &[&[u8]],
+    mount_writable: bool,
+    client_writable: bool,
+) -> X11AccessCheck {
     let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
     let instance =
         crate::application::sessions::ObservedMachineInstance::new(42, namespace, namespace);
@@ -101,6 +111,10 @@ fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
         host_socket,
         "/mnt/host-x11/X0".into(),
         "/tmp/.X11-unix/X0".into(),
+        crate::application::sessions::X11FilesystemAccess::observed(
+            mount_writable,
+            client_writable,
+        ),
         identity,
     );
     let acl = crate::application::x11::X11AclSnapshot::from_wire(
@@ -121,12 +135,7 @@ fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
 }
 
 fn render(view: &mut ConfigurationView, width: u16, height: u16) -> String {
-    crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
-    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    terminal
-        .draw(|frame| view.render(frame, frame.area()))
-        .unwrap();
-    let buffer = terminal.backend().buffer();
+    let buffer = render_buffer(view, width, height);
     (0..height)
         .map(|y| {
             (0..width)
@@ -135,6 +144,15 @@ fn render(view: &mut ConfigurationView, width: u16, height: u16) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn render_buffer(view: &mut ConfigurationView, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal
+        .draw(|frame| view.render(frame, frame.area()))
+        .unwrap();
+    terminal.backend().buffer().clone()
 }
 
 fn click(area: Rect) -> MouseEvent {
@@ -493,6 +511,71 @@ fn space_changes_the_check_state_while_enter_only_folds() {
 }
 
 #[test]
+fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
+    use crate::application::x11::{X11SourceObservation, X11SourceState};
+    use ratatui::style::Color;
+
+    for (state, label, color) in [
+        (X11SourceState::Missing, "[! Missing]", Color::Red),
+        (
+            X11SourceState::Invalid("Not a directory".into()),
+            "[! Invalid]",
+            Color::Red,
+        ),
+        (
+            X11SourceState::Unverified("Authentication failed".into()),
+            "[! Unverified]",
+            Color::Yellow,
+        ),
+    ] {
+        let mut inspected = snapshot("archlinux");
+        inspected.host_x11.sockets.clear();
+        inspected.host_x11.sources.push(X11SourceObservation {
+            source: "/tmp/.X11-unix".into(),
+            state,
+        });
+        let mut view = ConfigurationView::new(target("archlinux"));
+        view.begin_query(3);
+        view.finish_query(3, &target("archlinux"), Ok(inspected));
+        view.expanded.clear();
+        let buffer = render_buffer(&mut view, 160, 28);
+        let (x, y) = (0..28)
+            .flat_map(|y| (0..160).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                x + label.len() as u16 <= 160
+                    && label
+                        .chars()
+                        .enumerate()
+                        .all(|(offset, c)| buffer[(x + offset as u16, y)].symbol() == c.to_string())
+            })
+            .expect("folded selected source must show its status");
+        assert_eq!(buffer[(x, y)].fg, color, "selected status lost its color");
+        assert!(render(&mut view, 160, 28).contains("[x] ▸ Socket directory"));
+        assert!(
+            view.draft.is_empty(),
+            "observation must not remove a declaration"
+        );
+    }
+}
+
+#[test]
+fn an_unobserved_source_is_not_claimed_to_be_missing() {
+    let mut inspected = snapshot("archlinux");
+    inspected.host_x11.sockets.clear();
+    let mut view = ConfigurationView::new(target("archlinux"));
+    view.begin_query(3);
+    view.finish_query(3, &target("archlinux"), Ok(inspected));
+    view.expanded.clear();
+    let screen = render(&mut view, 160, 28);
+    assert!(screen.contains("[! Not observed]"));
+    assert!(!screen.contains("[! Missing]"));
+
+    view.begin_query(4);
+    view.finish_query(4, &target("archlinux"), Ok(snapshot("archlinux")));
+    assert!(!render(&mut view, 160, 28).contains("[! Not observed]"));
+}
+
+#[test]
 fn available_endpoint_check_generates_add_and_checking_again_cancels_it() {
     let mut view = loaded();
     view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -584,6 +667,25 @@ fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
     assert!(screen.contains("No Lasper-created grant records"));
     assert!(screen.contains("localuser entries: #1437402088"));
     assert!(!screen.contains(" Authorize "));
+}
+
+#[test]
+fn pathname_permission_failure_is_visible_without_blocking_authorization() {
+    let mut view = loaded_machine();
+    view.guest_user.set_value("alice".into());
+    let host_socket = view.selected_host_x11_socket().unwrap();
+    let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
+    view.x11_check_generation = 8;
+    view.finish_x11_check(
+        8,
+        &target,
+        Ok(x11_check_with_access(host_socket, &[], false, false)),
+    );
+
+    let screen = render(&mut view, 160, 30);
+    assert!(screen.contains("Pathname: denied at both guest paths; abstract route not tested."));
+    assert!(screen.contains(" Authorize "));
+    assert!(!screen.contains("failed:"));
 }
 
 #[test]

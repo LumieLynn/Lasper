@@ -19,7 +19,7 @@ use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
     X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
-use crate::application::x11::X11AclSnapshot;
+use crate::application::x11::{X11AclSnapshot, X11SourceState};
 use crate::domain::x11::HostX11Socket;
 use crate::tui::core::Component;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
@@ -183,17 +183,29 @@ impl ConfigurationView {
                 List::new(
                     entries
                         .into_iter()
-                        .map(|lines| ListItem::new(Text::from(lines)))
+                        .enumerate()
+                        .map(|(index, lines)| {
+                            let style = if self.list.selected() == Some(index) {
+                                Style::default().fg(
+                                    if self.x11_content_focus == X11ContentFocus::Bindings {
+                                        theme::theme().list_highlight_symbol
+                                    } else {
+                                        theme::theme().text_secondary
+                                    },
+                                )
+                            } else {
+                                Style::default()
+                            };
+                            ListItem::new(Text::from(lines)).style(style)
+                        })
                         .collect::<Vec<_>>(),
                 )
                 .highlight_symbol(">> ")
                 .highlight_style(
                     if self.x11_content_focus == X11ContentFocus::Bindings {
-                        Style::default()
-                            .fg(theme::theme().list_highlight_symbol)
-                            .add_modifier(Modifier::BOLD)
+                        Style::default().add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().fg(theme::theme().text_secondary)
+                        Style::default()
                     },
                 ),
                 rows[0],
@@ -278,6 +290,7 @@ impl ConfigurationView {
                 let context = check.projection();
                 let identity = context.identity();
                 let acl_status = x11_grant_status(assessment, identity.host_uid());
+                let pathname_access = x11_pathname_access_summary(context.filesystem_access());
                 let action = match (authorization, revocation) {
                     (_, Some(X11RevocationPresentation::Revoked { record_id })) => format!(
                         " Last action revoked record {}.",
@@ -300,7 +313,7 @@ impl ConfigurationView {
                     (None, None) => String::new(),
                 };
                 format!(
-                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{acl_status}{action}\n{}",
+                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{pathname_access}\n{acl_status}{action}\n{}",
                     identity.guest().uid(),
                     identity.host_uid(),
                     context.host_socket().source().display(),
@@ -763,6 +776,20 @@ impl ConfigurationView {
     }
 }
 
+fn x11_pathname_access_summary(
+    access: crate::application::sessions::X11FilesystemAccess,
+) -> &'static str {
+    if access.fully_writable() {
+        return "Pathname transport: writable at both guest paths.";
+    }
+    match (access.mount_writable(), access.client_writable()) {
+        (false, false) => "Pathname: denied at both guest paths; abstract route not tested.",
+        (false, true) => "Pathname: denied at guest mount; abstract route not tested.",
+        (true, false) => "Pathname: denied at client path; abstract route not tested.",
+        (true, true) => unreachable!("handled above"),
+    }
+}
+
 fn x11_grant_status(assessment: &X11GrantAssessmentPresentation, host_uid: u32) -> String {
     match &assessment.status {
         X11GrantStatusPresentation::AccessControlDisabled => {
@@ -861,9 +888,10 @@ fn x11_item_lines(
     lines
         .into_iter()
         .flat_map(|line| {
+            let style = line.style;
             soft_wrap_text(&line.to_string(), width as usize)
                 .into_iter()
-                .map(Line::from)
+                .map(move |text| Line::styled(text, style))
         })
         .collect()
 }
@@ -909,10 +937,42 @@ fn declaration_lines(
             X11BindingScope::Directory => socket.source().parent() == Some(source.as_path()),
             X11BindingScope::Socket { .. } => socket.source() == source,
         });
-    let mut lines = vec![Line::from(format!(
-        "{check} {disclosure} {label} [line {}]{modified}",
-        bind.line
-    ))];
+    let state = snapshot
+        .host_x11
+        .sources
+        .iter()
+        .find(|observation| observation.source == *source)
+        .map(|observation| &observation.state);
+    let (badge, detail, color) = if live {
+        ("", "observed now", None)
+    } else {
+        match state {
+            Some(X11SourceState::Missing) => (
+                " [! Missing]",
+                "Source path is missing on the host. The configured bind is retained; refresh after changing desktop sessions.",
+                Some(theme::theme().error),
+            ),
+            Some(X11SourceState::Invalid(reason)) => (
+                " [! Invalid]", reason.as_str(), Some(theme::theme().error),
+            ),
+            Some(X11SourceState::Unverified(reason)) => (
+                " [! Unverified]", reason.as_str(), Some(theme::theme().warning),
+            ),
+            _ => (
+                " [! Not observed]",
+                "No authenticated endpoint was observed. This does not establish that the source is missing. Refresh or inspect Checks for details.",
+                Some(theme::theme().warning),
+            ),
+        }
+    };
+    let style = color.map_or(Style::default(), |color| Style::default().fg(color));
+    let mut lines = vec![Line::styled(
+        format!(
+            "{check} {disclosure} {label}{badge} [line {}]{modified}",
+            bind.line
+        ),
+        style,
+    )];
     if expanded {
         lines.extend([
             Line::from(format!("    Source: {}", source.display())),
@@ -926,14 +986,7 @@ fn declaration_lines(
                     format!("; {}", bind.options.join(","))
                 }
             )),
-            Line::from(format!(
-                "    Host endpoint: {}",
-                if live {
-                    "observed now"
-                } else {
-                    "not observed now"
-                }
-            )),
+            Line::styled(format!("    Host endpoint: {detail}"), style),
             Line::from(""),
         ]);
     }

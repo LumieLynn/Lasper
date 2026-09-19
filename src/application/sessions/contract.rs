@@ -458,14 +458,47 @@ impl WaylandSessionContext {
     }
 }
 
-/// Fresh evidence that one startup-configured X11 endpoint reaches the
-/// standard client path for a selected guest account. X server ACL state is a
+/// Filesystem permission observations for the two guest-visible pathname
+/// endpoints of an X11 projection. These do not describe abstract-socket
+/// reachability or whether a client library will select that transport.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct X11FilesystemAccess {
+    mount_writable: bool,
+    client_writable: bool,
+}
+
+impl X11FilesystemAccess {
+    pub(crate) const fn observed(mount_writable: bool, client_writable: bool) -> Self {
+        Self {
+            mount_writable,
+            client_writable,
+        }
+    }
+
+    pub const fn mount_writable(self) -> bool {
+        self.mount_writable
+    }
+
+    pub const fn client_writable(self) -> bool {
+        self.client_writable
+    }
+
+    pub const fn fully_writable(self) -> bool {
+        self.mount_writable && self.client_writable
+    }
+}
+
+/// Fresh evidence that one startup-configured X11 projection preserves the
+/// selected host endpoint's identity at the guest mount and standard client
+/// paths. Pathname permissions are retained separately because an X client
+/// may instead use the Linux abstract transport. X server ACL state remains a
 /// separate user-side observation and is intentionally absent here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X11ProjectionContext {
     host_socket: HostX11Socket,
     guest_mount: PathBuf,
     guest_client_path: PathBuf,
+    filesystem_access: X11FilesystemAccess,
     identity: MappedGuestIdentity,
 }
 
@@ -474,12 +507,14 @@ impl X11ProjectionContext {
         host_socket: HostX11Socket,
         guest_mount: PathBuf,
         guest_client_path: PathBuf,
+        filesystem_access: X11FilesystemAccess,
         identity: MappedGuestIdentity,
     ) -> Self {
         Self {
             host_socket,
             guest_mount,
             guest_client_path,
+            filesystem_access,
             identity,
         }
     }
@@ -494,6 +529,10 @@ impl X11ProjectionContext {
 
     pub fn guest_client_path(&self) -> &Path {
         &self.guest_client_path
+    }
+
+    pub const fn filesystem_access(&self) -> X11FilesystemAccess {
+        self.filesystem_access
     }
 
     pub const fn identity(&self) -> MappedGuestIdentity {

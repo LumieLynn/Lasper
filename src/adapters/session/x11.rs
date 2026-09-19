@@ -12,7 +12,8 @@ use super::x11_probe::{
 use super::{MachineSessionRequest, MachineSessionTransport};
 use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
-    SessionError, TerminalSessionHandle, X11ProjectionContext, X11ProjectionProbeRequest,
+    SessionError, TerminalSessionHandle, X11FilesystemAccess, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 use crate::domain::session::SessionSize;
 use std::path::{Path, PathBuf};
@@ -70,7 +71,7 @@ impl X11SessionResolver {
                 &mount_target,
                 &client_path,
             ) {
-                Ok(()) => {
+                Ok(filesystem_access) => {
                     let identity = instance
                         .mapped_identity(observation.identity, observation.user_namespace)?;
                     let current_instance =
@@ -92,6 +93,7 @@ impl X11SessionResolver {
                         request.host_socket,
                         mount_target,
                         client_path,
+                        filesystem_access,
                         identity,
                     ));
                 }
@@ -116,21 +118,25 @@ fn validate_projection(
     expected_client_identities: &[(u64, u64)],
     mount_target: &Path,
     client_path: &Path,
-) -> Result<(), SessionError> {
-    validate_socket_access(
+) -> Result<X11FilesystemAccess, SessionError> {
+    let mount_writable = validate_socket_access(
         observation.mount.access,
         observation.mount.identity,
         &[(source_revision.device, source_revision.inode)],
         "X11 mount target",
         mount_target,
     )?;
-    validate_socket_access(
+    let client_writable = validate_socket_access(
         observation.client.access,
         observation.client.identity,
         expected_client_identities,
         "X11 client path",
         client_path,
-    )
+    )?;
+    Ok(X11FilesystemAccess::observed(
+        mount_writable,
+        client_writable,
+    ))
 }
 
 fn validate_socket_access(
@@ -139,16 +145,15 @@ fn validate_socket_access(
     expected_identities: &[(u64, u64)],
     label: &str,
     path: &Path,
-) -> Result<(), SessionError> {
+) -> Result<bool, SessionError> {
     let detail = match access {
-        X11SocketAccess::Accessible => {
+        X11SocketAccess::Accessible | X11SocketAccess::Denied => {
             if identity.is_some_and(|identity| expected_identities.contains(&identity)) {
-                return Ok(());
+                return Ok(access == X11SocketAccess::Accessible);
             }
             "is not the selected host X11 server socket (the bind may be stale)"
         }
         X11SocketAccess::Missing => "is missing",
-        X11SocketAccess::Denied => "is not accessible to the selected guest user",
         X11SocketAccess::NotSocket => "is not a socket",
     };
     Err(SessionError::with_hint(
@@ -247,9 +252,17 @@ mod tests {
             access: X11SocketAccess::Missing,
             identity: None,
         };
-        assert!(validate_socket_access(
+        assert!(!validate_socket_access(
             denied.access,
             Some((10, 20)),
+            &[(10, 20)],
+            "target",
+            Path::new("/socket")
+        )
+        .unwrap());
+        assert!(validate_socket_access(
+            denied.access,
+            Some((10, 21)),
             &[(10, 20)],
             "target",
             Path::new("/socket")

@@ -325,10 +325,13 @@ impl ConfigurationService {
         &self,
         target: &ConfigurationTarget,
     ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
-        let (snapshot, host_x11) =
-            tokio::join!(self.port.inspect(target), self.x11_endpoints.discover());
-        let mut snapshot = snapshot?;
-        snapshot.host_x11 = host_x11;
+        let mut snapshot = self.port.inspect(target).await?;
+        let sources = snapshot
+            .x11_bindings
+            .iter()
+            .map(|binding| binding.source.clone())
+            .collect::<Vec<_>>();
+        snapshot.host_x11 = self.x11_endpoints.discover(&sources).await;
         Ok(snapshot)
     }
 
@@ -369,7 +372,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl X11EndpointDiscoveryPort for EmptyX11Endpoints {
-        async fn discover(&self) -> X11EndpointCatalog {
+        async fn discover(&self, _configured_sources: &[PathBuf]) -> X11EndpointCatalog {
             X11EndpointCatalog::default()
         }
     }

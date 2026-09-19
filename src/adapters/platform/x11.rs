@@ -23,6 +23,7 @@ use crate::application::x11::{
     X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11DesktopObservation,
     X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort, X11GrantRecordCatalog,
     X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition, X11RevokeRequest,
+    X11SourceObservation, X11SourceState,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
@@ -30,6 +31,7 @@ use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
 const ENDPOINT_IO_TIMEOUT: Duration = Duration::from_millis(750);
 const MAX_DISCOVERED_DISPLAYS: usize = 16;
+const MAX_INSPECTED_SOURCES: usize = 64;
 const MAX_ACL_ENTRIES: usize = 1024;
 const MAX_ACL_BYTES: usize = 64 * 1024;
 const GRANT_RECORD_VERSION: u32 = 1;
@@ -46,8 +48,9 @@ pub(crate) struct HostX11DesktopAccess;
 
 #[async_trait::async_trait]
 impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
-    async fn discover(&self) -> X11EndpointCatalog {
-        match tokio::task::spawn_blocking(discover_sync).await {
+    async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog {
+        let configured_sources = configured_sources.to_vec();
+        match tokio::task::spawn_blocking(move || discover_sync(&configured_sources)).await {
             Ok(catalog) => catalog,
             Err(error) => X11EndpointCatalog {
                 diagnostics: vec![format!(
@@ -166,7 +169,7 @@ pub(crate) async fn projection_socket_identities(
     .map_err(|error| format!("X11 projection evidence task failed: {error}"))?
 }
 
-fn discover_sync() -> X11EndpointCatalog {
+fn discover_sync(configured_sources: &[PathBuf]) -> X11EndpointCatalog {
     let preferred_display = std::env::var("DISPLAY")
         .ok()
         .and_then(|display| parse_local_display(&display));
@@ -175,6 +178,23 @@ fn discover_sync() -> X11EndpointCatalog {
         ..Default::default()
     };
     let directory = Path::new(X11_SOCKET_DIRECTORY);
+    let mut sources = BTreeSet::new();
+    for source in configured_sources {
+        if sources.contains(source) {
+            continue;
+        }
+        if sources.len() == MAX_INSPECTED_SOURCES {
+            catalog.diagnostics.push(format!(
+                "Only {MAX_INSPECTED_SOURCES} configured X11 sources were inspected; remaining sources are unverified."
+            ));
+            break;
+        }
+        sources.insert(source.clone());
+        catalog.sources.push(X11SourceObservation {
+            source: source.clone(),
+            state: inspect_source(source, directory),
+        });
+    }
     if let Err(reason) = validate_socket_directory(directory) {
         catalog.diagnostics.push(reason);
         return catalog;
@@ -214,11 +234,11 @@ fn discover_sync() -> X11EndpointCatalog {
         let standard = match inspect_endpoint(display, false, standard_path) {
             Ok(standard) => standard,
             Err(error) => {
-                if preferred_display == Some(display) {
-                    catalog.diagnostics.push(format!(
-                        "Current DISPLAY :{display} is unavailable: {error}"
-                    ));
-                }
+                record_endpoint_failure(
+                    &mut catalog,
+                    &directory.join(format!("X{display}")),
+                    &error,
+                );
                 continue;
             }
         };
@@ -226,14 +246,27 @@ fn discover_sync() -> X11EndpointCatalog {
         catalog.sockets.push(standard);
 
         let alternate_path = directory.join(format!("X{display}_"));
-        if let Ok(alternate) = inspect_endpoint(display, true, alternate_path) {
-            if alternate.peer_identity() == peer {
+        match inspect_endpoint(display, true, alternate_path.clone()) {
+            Ok(alternate) if alternate.peer_identity() == peer => {
                 catalog.sockets.push(alternate);
-            } else {
-                catalog.diagnostics.push(format!(
-                    ":{display} alternate endpoint belongs to a different server process and was ignored"
-                ));
             }
+            Ok(_) => record_endpoint_failure(
+                &mut catalog,
+                &alternate_path,
+                "alternate endpoint does not belong to the standard endpoint's peer process",
+            ),
+            Err(error) if sources.contains(&alternate_path) => {
+                record_endpoint_failure(&mut catalog, &alternate_path, &error);
+            }
+            Err(_) => {}
+        }
+    }
+    for observation in &mut catalog.sources {
+        if catalog.sockets.iter().any(|socket| {
+            socket.source() == observation.source
+                || (observation.source == directory && socket.source().parent() == Some(directory))
+        }) {
+            observation.state = X11SourceState::Observed;
         }
     }
     catalog.sockets.sort_by_key(|socket| {
@@ -244,6 +277,49 @@ fn discover_sync() -> X11EndpointCatalog {
         )
     });
     catalog
+}
+
+fn inspect_source(source: &Path, directory: &Path) -> X11SourceState {
+    let is_directory = source == directory;
+    let is_socket_path = source.parent() == Some(directory)
+        && source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                parse_standard_socket_name(name.strip_suffix('_').unwrap_or(name)).is_some()
+            });
+    if !is_directory && !is_socket_path {
+        return X11SourceState::Unverified("Source is outside local X11 discovery scope.".into());
+    }
+    match fs::metadata(source) {
+        Ok(metadata) if is_directory && metadata.is_dir() => X11SourceState::Unverified(
+            "Directory exists, but no authenticated X11 endpoint was observed inside it. See Checks for discovery diagnostics.".into(),
+        ),
+        Ok(metadata) if !is_directory && metadata.file_type().is_socket() => X11SourceState::Unverified(
+            "Socket exists, but its X11 endpoint has not been verified. See Checks for discovery diagnostics.".into(),
+        ),
+        Ok(_) => X11SourceState::Invalid(format!(
+            "Expected a {} at this source.",
+            if is_directory { "directory" } else { "Unix socket" },
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => X11SourceState::Missing,
+        Err(error) => X11SourceState::Unverified(format!("Cannot inspect source: {error}")),
+    }
+}
+
+fn record_endpoint_failure(catalog: &mut X11EndpointCatalog, source: &Path, reason: &str) {
+    catalog
+        .diagnostics
+        .push(format!("{}: {reason}", source.display()));
+    if let Some(observation) = catalog
+        .sources
+        .iter_mut()
+        .find(|entry| entry.source == source)
+    {
+        if matches!(observation.state, X11SourceState::Unverified(_)) {
+            observation.state = X11SourceState::Unverified(reason.to_owned());
+        }
+    }
 }
 
 fn parse_local_display(value: &str) -> Option<u16> {
@@ -1263,6 +1339,48 @@ mod tests {
     }
 
     #[test]
+    fn source_observation_distinguishes_missing_invalid_and_unverified() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path();
+        let source = directory.join("X0");
+        assert_eq!(inspect_source(&source, directory), X11SourceState::Missing);
+
+        fs::write(&source, "not a socket").unwrap();
+        assert!(matches!(
+            inspect_source(&source, directory),
+            X11SourceState::Invalid(_)
+        ));
+        fs::remove_file(&source).unwrap();
+
+        let _listener = std::os::unix::net::UnixListener::bind(&source).unwrap();
+        assert!(matches!(
+            inspect_source(&source, directory),
+            X11SourceState::Unverified(_)
+        ));
+        assert!(matches!(
+            inspect_source(directory, directory),
+            X11SourceState::Unverified(_)
+        ));
+        assert!(matches!(
+            inspect_source(Path::new("/outside/X0"), directory),
+            X11SourceState::Unverified(_)
+        ));
+
+        let mut catalog = X11EndpointCatalog {
+            sources: vec![X11SourceObservation {
+                source: source.clone(),
+                state: inspect_source(&source, directory),
+            }],
+            ..Default::default()
+        };
+        record_endpoint_failure(&mut catalog, &source, "X11 authentication failed");
+        assert_eq!(
+            catalog.sources[0].state,
+            X11SourceState::Unverified("X11 authentication failed".into())
+        );
+    }
+
+    #[test]
     fn an_observed_entry_is_not_claimed_when_change_hosts_failed() {
         let uid = 1_437_402_088;
         let observed = Ok(X11AclSnapshot::from_wire(
@@ -1323,6 +1441,7 @@ mod tests {
             socket,
             "/mnt/host-x11/X0".into(),
             "/tmp/.X11-unix/X0".into(),
+            crate::application::sessions::X11FilesystemAccess::observed(true, true),
             identity,
         );
         let request = X11AuthorizationRequest::new(

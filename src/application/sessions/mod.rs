@@ -8,8 +8,8 @@ pub use contract::{
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
     SessionError, SessionPort, SessionSendStatus, ShellOpenError, ShellOpenIntent, ShellTarget,
     TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest, ValidatedGuestUserName,
-    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest, X11ProjectionContext,
-    X11ProjectionProbeRequest,
+    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest, X11FilesystemAccess,
+    X11ProjectionContext, X11ProjectionProbeRequest,
 };
 pub use service::SessionService;
 

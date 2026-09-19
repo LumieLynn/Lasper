@@ -121,6 +121,8 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     ProbeX11ProjectionResponse::Ready {
                         guest_mount: context.guest_mount().to_path_buf(),
                         guest_client_path: context.guest_client_path().to_path_buf(),
+                        mount_writable: context.filesystem_access().mount_writable(),
+                        client_writable: context.filesystem_access().client_writable(),
                         guest_uid: guest.uid(),
                         guest_gid: guest.gid(),
                         host_uid: identity.host_uid(),

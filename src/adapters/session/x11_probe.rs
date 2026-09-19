@@ -18,6 +18,9 @@ const MAX_PROBE_LINE_BYTES: usize = 1024;
 const MAX_TARGET_PATH_BYTES: usize = 4096;
 const PROBE_MAGIC: &[u8] = b"LASPER_X11_PROJECTION_PROBE_V1";
 
+// Linux pathname AF_UNIX connect requires write access to the socket, not
+// read/execute bits or mode 0666. This does not test an abstract socket or an
+// X11 setup handshake. Keep that distinction when reporting probe results.
 const X11_PROBE_SCRIPT: &str = r#"euid=
 egid=
 while read -r key _real effective _rest; do
@@ -539,6 +542,45 @@ mod tests {
             observation.user_namespace,
             ObservedNamespaceIdentity::new(userns.dev(), userns.ino())
         );
+    }
+
+    #[test]
+    fn pathname_probe_agrees_with_kernel_connect_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        // Root can bypass DAC; run the permission comparison as an ordinary
+        // user. The actual uid-mapped guest check uses that guest's identity.
+        if uzers::get_effective_uid() == 0 {
+            return;
+        }
+        let runtime = tempfile::tempdir().unwrap();
+        let socket = runtime.path().join("X0");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let request = X11ProjectionProbeRequest::new(machine(), user(), &socket, &socket).unwrap();
+        for (mode, expected) in [
+            (0o100, X11SocketAccess::Denied),
+            (0o500, X11SocketAccess::Denied),
+            (0o200, X11SocketAccess::Accessible),
+            (0o600, X11SocketAccess::Accessible),
+        ] {
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(mode)).unwrap();
+            let output = std::process::Command::new(request.path())
+                .args(&request.args()[1..])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let observation = parse_x11_probe(&output.stdout).unwrap();
+            assert_eq!(observation.mount.access, expected, "mode {mode:04o}");
+            assert_eq!(observation.client.access, expected, "mode {mode:04o}");
+            match UnixStream::connect(&socket) {
+                Ok(_) => assert_eq!(expected, X11SocketAccess::Accessible),
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    assert_eq!(expected, X11SocketAccess::Denied);
+                }
+            }
+        }
     }
 
     #[tokio::test]

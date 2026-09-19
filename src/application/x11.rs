@@ -13,13 +13,32 @@ const LOCAL_USER_KIND: &[u8] = b"localuser";
 #[serde(deny_unknown_fields)]
 pub struct X11EndpointCatalog {
     pub sockets: Vec<HostX11Socket>,
+    /// Observations of configured sources, including sources that could not
+    /// become authenticated endpoints. Absence from `sockets` is not absence
+    /// from the filesystem.
+    pub sources: Vec<X11SourceObservation>,
     pub preferred_display: Option<u16>,
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct X11SourceObservation {
+    pub source: PathBuf,
+    pub state: X11SourceState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
+pub enum X11SourceState {
+    Observed,
+    Missing,
+    Invalid(String),
+    Unverified(String),
+}
+
 #[async_trait::async_trait]
 pub(crate) trait X11EndpointDiscoveryPort: Send + Sync {
-    async fn discover(&self) -> X11EndpointCatalog;
+    async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog;
 }
 
 pub(crate) struct X11EndpointDiscoveryService {
@@ -31,8 +50,8 @@ impl X11EndpointDiscoveryService {
         Self { port }
     }
 
-    pub async fn discover(&self) -> X11EndpointCatalog {
-        self.port.discover().await
+    pub async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog {
+        self.port.discover(configured_sources).await
     }
 }
 
@@ -777,7 +796,7 @@ mod tests {
     use super::*;
     use crate::application::sessions::{
         MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance,
-        ObservedNamespaceIdentity, ValidatedGuestUserName,
+        ObservedNamespaceIdentity, ValidatedGuestUserName, X11FilesystemAccess,
     };
     use crate::domain::machine::MachineName;
     use crate::domain::x11::X11SocketRevision;
@@ -806,6 +825,7 @@ mod tests {
             .unwrap(),
             "/mnt/host-x11/X0".into(),
             "/tmp/.X11-unix/X0".into(),
+            X11FilesystemAccess::observed(true, true),
             MappedGuestIdentity::verified(
                 ObservedGuestIdentity::new(1000, 1000),
                 host_uid,

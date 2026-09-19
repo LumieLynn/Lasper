@@ -152,6 +152,8 @@ pub(crate) enum ProbeX11ProjectionResponse {
     Ready {
         guest_mount: PathBuf,
         guest_client_path: PathBuf,
+        mount_writable: bool,
+        client_writable: bool,
         guest_uid: u32,
         guest_gid: u32,
         host_uid: u32,

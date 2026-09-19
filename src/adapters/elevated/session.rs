@@ -173,6 +173,8 @@ impl ElevatedDaemon {
             ProbeX11ProjectionResponse::Ready {
                 guest_mount,
                 guest_client_path,
+                mount_writable,
+                client_writable,
                 guest_uid,
                 guest_gid,
                 host_uid,
@@ -192,6 +194,10 @@ impl ElevatedDaemon {
                     host_socket,
                     guest_mount,
                     guest_client_path,
+                    crate::application::sessions::X11FilesystemAccess::observed(
+                        mount_writable,
+                        client_writable,
+                    ),
                     MappedGuestIdentity::verified(
                         ObservedGuestIdentity::new(guest_uid, guest_gid),
                         host_uid,
