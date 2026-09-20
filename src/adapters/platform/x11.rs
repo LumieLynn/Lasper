@@ -39,6 +39,9 @@ const MAX_GRANT_RECORDS: usize = 256;
 const MAX_GRANT_RECORD_BYTES: usize = 16 * 1024;
 const MAX_GRANT_DIAGNOSTICS: usize = 16;
 const MAX_GRANT_REASON_BYTES: usize = 2048;
+const MACHINE_CLAIM_VERSION: u32 = 1;
+const MAX_MACHINE_CLAIMS: usize = 256;
+const MAX_MACHINE_CLAIM_BYTES: usize = 16 * 1024;
 
 type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32));
 
@@ -618,6 +621,184 @@ impl ManagedX11GrantRecord {
     }
 }
 
+/// The exact desktop ACL identity owned by one Lasper grant.  A machine
+/// claim references this value instead of treating a display number as an
+/// ownership key: the X server generation, endpoint revision, and mapped UID
+/// are all part of the key.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedX11GrantKey {
+    host_uid: u32,
+    display: u16,
+    alternate_endpoint: bool,
+    source: PathBuf,
+    canonical_source: PathBuf,
+    socket_revision: X11SocketRevision,
+    server_peer: (u32, u32, u32),
+    server_peer_start_time: u64,
+    acl_family: u8,
+    acl_address: Vec<u8>,
+}
+
+impl ManagedX11GrantKey {
+    fn from_record(record: &ManagedX11GrantRecord) -> Self {
+        Self {
+            host_uid: record.host_uid,
+            display: record.display,
+            alternate_endpoint: record.alternate_endpoint,
+            source: record.source.clone(),
+            canonical_source: record.canonical_source.clone(),
+            socket_revision: record.socket_revision,
+            server_peer: record.server_peer,
+            server_peer_start_time: record.server_peer_start_time,
+            acl_family: record.acl_family,
+            acl_address: record.acl_address.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        let expected_source = Path::new(X11_SOCKET_DIRECTORY).join(format!(
+            "X{}{}",
+            self.display,
+            if self.alternate_endpoint { "_" } else { "" }
+        ));
+        if self.source != expected_source
+            || !self.canonical_source.is_absolute()
+            || self.socket_revision.inode == 0
+        {
+            return Err("machine claim contains an invalid X11 endpoint key".into());
+        }
+        if self.server_peer.0 == 0 || self.server_peer.0 > i32::MAX as u32 {
+            return Err("machine claim contains an invalid X server PID".into());
+        }
+        if self.server_peer_start_time == 0 {
+            return Err("machine claim contains an invalid X server generation".into());
+        }
+        if self.acl_family != u8::from(Family::SERVER_INTERPRETED)
+            || self.acl_address != numeric_local_user_address(self.host_uid)
+        {
+            return Err(
+                "machine claim does not contain the exact numeric localuser ACL key".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
+enum MachineClaimPhase {
+    Active,
+    Ended,
+    NeedsReview { reason: String },
+    Unknown { reason: String },
+}
+
+/// A lifecycle claim is deliberately separate from the grant operation
+/// record.  The grant record answers “what ACL mutation happened”; this file
+/// answers “which currently-running system-scope machine instance may keep
+/// that exact ACL key alive”.  Keeping the two records separate lets future
+/// reconciliation end a claim without rewriting operation history.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedX11MachineClaim {
+    version: u32,
+    claim_id: String,
+    grant_record_id: String,
+    phase: MachineClaimPhase,
+    created_unix_millis: u64,
+    boot_id: String,
+    machine: String,
+    guest_user: String,
+    guest_uid: u32,
+    guest_gid: u32,
+    host_gid: u32,
+    machine_leader_pid: u32,
+    machine_pid_namespace: (u64, u64),
+    machine_user_namespace: (u64, u64),
+    key: ManagedX11GrantKey,
+}
+
+impl ManagedX11MachineClaim {
+    fn active_from_record(record: &ManagedX11GrantRecord) -> Self {
+        Self {
+            version: MACHINE_CLAIM_VERSION,
+            claim_id: record.record_id.clone(),
+            grant_record_id: record.record_id.clone(),
+            phase: MachineClaimPhase::Active,
+            created_unix_millis: record.created_unix_millis,
+            boot_id: record.boot_id.clone(),
+            machine: record.machine.clone(),
+            guest_user: record.guest_user.clone(),
+            guest_uid: record.guest_uid,
+            guest_gid: record.guest_gid,
+            host_gid: record.host_gid,
+            machine_leader_pid: record.machine_leader_pid,
+            machine_pid_namespace: record.machine_pid_namespace,
+            machine_user_namespace: record.machine_user_namespace,
+            key: ManagedX11GrantKey::from_record(record),
+        }
+    }
+
+    fn validate(&self, file_name: &str) -> Result<(), String> {
+        if self.version != MACHINE_CLAIM_VERSION {
+            return Err(format!(
+                "unsupported machine claim version {}",
+                self.version
+            ));
+        }
+        if !valid_record_id(&self.claim_id)
+            || self.claim_id != self.grant_record_id
+            || file_name != format!("claim-{}.json", self.claim_id)
+            || !valid_record_id(&self.grant_record_id)
+        {
+            return Err("machine claim ID does not match its filename or grant record".into());
+        }
+        uuid::Uuid::parse_str(&self.boot_id)
+            .map_err(|error| format!("invalid machine claim host boot identity: {error}"))?;
+        MachineName::new(self.machine.clone())
+            .map_err(|error| format!("invalid machine claim machine name: {error}"))?;
+        ValidatedGuestUserName::new(self.guest_user.clone())
+            .map_err(|error| format!("invalid machine claim guest user: {error}"))?;
+        if self.machine_leader_pid == 0
+            || self.machine_leader_pid > i32::MAX as u32
+            || self.machine_pid_namespace.1 == 0
+            || self.machine_user_namespace.1 == 0
+        {
+            return Err("machine claim contains an invalid machine instance".into());
+        }
+        self.key.validate()?;
+        if let MachineClaimPhase::NeedsReview { reason } | MachineClaimPhase::Unknown { reason } =
+            &self.phase
+        {
+            if reason.is_empty()
+                || reason.len() > MAX_GRANT_REASON_BYTES
+                || reason.chars().any(char::is_control)
+            {
+                return Err("machine claim state reason is invalid".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct MachineClaimCatalog {
+    claims: Vec<ManagedX11MachineClaim>,
+    diagnostics: Vec<String>,
+    complete: bool,
+}
+
+impl Default for MachineClaimCatalog {
+    fn default() -> Self {
+        Self {
+            claims: Vec::new(),
+            diagnostics: Vec::new(),
+            complete: true,
+        }
+    }
+}
+
 fn valid_record_id(value: &str) -> bool {
     value.len() == 32
         && value
@@ -628,6 +809,7 @@ fn valid_record_id(value: &str) -> bool {
 struct X11RuntimeState {
     access: crate::adapters::trusted_state::TrustedDirectory,
     grants: crate::adapters::trusted_state::TrustedDirectory,
+    claims: Option<crate::adapters::trusted_state::TrustedDirectory>,
 }
 
 impl X11RuntimeState {
@@ -646,7 +828,14 @@ impl X11RuntimeState {
         let grants = access
             .open_or_create_child("grants", 0o700)
             .map_err(|error| format!("open X11 grant record directory: {error}"))?;
-        Ok(Self { access, grants })
+        let claims = access
+            .open_or_create_child("claims", 0o700)
+            .map_err(|error| format!("open X11 machine claim directory: {error}"))?;
+        Ok(Self {
+            access,
+            grants,
+            claims: Some(claims),
+        })
     }
 
     fn open_existing() -> Result<Option<Self>, String> {
@@ -673,7 +862,14 @@ impl X11RuntimeState {
         else {
             return Ok(None);
         };
-        Ok(Some(Self { access, grants }))
+        let claims = access
+            .open_existing_child("claims")
+            .map_err(|error| format!("open X11 machine claim directory: {error}"))?;
+        Ok(Some(Self {
+            access,
+            grants,
+            claims,
+        }))
     }
 
     fn lock(&self) -> Result<std::fs::File, String> {
@@ -690,8 +886,57 @@ impl X11RuntimeState {
             .map_err(|error| format!("persist X11 grant record: {error}"))
     }
 
+    fn write_claim(&self, claim: &ManagedX11MachineClaim) -> Result<(), String> {
+        let claims = self
+            .claims
+            .as_ref()
+            .ok_or_else(|| "X11 machine claim directory is unavailable".to_owned())?;
+        let file_name = format!("claim-{}.json", claim.claim_id);
+        claim.validate(&file_name)?;
+        let bytes = serde_json::to_vec(claim)
+            .map_err(|error| format!("serialize X11 machine claim: {error}"))?;
+        claims
+            .write_atomic(&file_name, &bytes, 0o600)
+            .map_err(|error| format!("persist X11 machine claim: {error}"))
+    }
+
+    /// End the claim associated with one grant record. Older runtime state
+    /// has no claim directory; that is an ordinary compatibility case and is
+    /// intentionally treated as a no-op.
+    fn end_claim(&self, grant_record_id: &str) -> Result<(), String> {
+        let Some(claims) = self.claims.as_ref() else {
+            return Ok(());
+        };
+        let file_name = format!("claim-{grant_record_id}.json");
+        let Some(file) = claims
+            .read_bounded(&file_name, MAX_MACHINE_CLAIM_BYTES)
+            .map_err(|error| format!("read X11 machine claim {grant_record_id}: {error}"))?
+        else {
+            return Ok(());
+        };
+        if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
+            return Err(format!(
+                "X11 machine claim {grant_record_id} is not owned by the invoking user"
+            ));
+        }
+        let mut claim: ManagedX11MachineClaim = serde_json::from_slice(&file.bytes)
+            .map_err(|error| format!("invalid X11 machine claim {grant_record_id}: {error}"))?;
+        claim
+            .validate(&file_name)
+            .map_err(|error| format!("invalid X11 machine claim {grant_record_id}: {error}"))?;
+        claim.phase = MachineClaimPhase::Ended;
+        self.write_claim(&claim)
+    }
+
     fn load_records(&self) -> X11GrantRecordCatalog {
         load_grant_records_from(&self.grants, uzers::get_effective_uid())
+    }
+
+    fn load_claims(&self) -> MachineClaimCatalog {
+        self.claims
+            .as_ref()
+            .map(|claims| load_machine_claims_from(claims, uzers::get_effective_uid()))
+            .unwrap_or_default()
     }
 }
 
@@ -702,6 +947,20 @@ fn load_existing_grant_records() -> X11GrantRecordCatalog {
         Err(error) => X11GrantRecordCatalog::unavailable(format!(
             "X11 grant records could not be inspected: {error}"
         )),
+    }
+}
+
+fn load_existing_machine_claims() -> MachineClaimCatalog {
+    match X11RuntimeState::open_existing() {
+        Ok(Some(state)) => state.load_claims(),
+        Ok(None) => MachineClaimCatalog::default(),
+        Err(error) => MachineClaimCatalog {
+            diagnostics: vec![format!(
+                "X11 machine claims could not be inspected: {error}"
+            )],
+            complete: false,
+            ..Default::default()
+        },
     }
 }
 
@@ -781,6 +1040,95 @@ fn load_grant_records_from(
     }
 }
 
+fn load_machine_claims_from(
+    claims: &crate::adapters::trusted_state::TrustedDirectory,
+    expected_uid: u32,
+) -> MachineClaimCatalog {
+    let mut names = match claims.entry_names() {
+        Ok(names) => names
+            .into_iter()
+            .filter(|name| {
+                name.strip_prefix("claim-")
+                    .and_then(|value| value.strip_suffix(".json"))
+                    .is_some()
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return MachineClaimCatalog {
+                diagnostics: vec![format!(
+                    "X11 machine claim directory could not be listed: {error}"
+                )],
+                complete: false,
+                ..Default::default()
+            }
+        }
+    };
+    names.sort();
+    let mut complete = true;
+    let mut diagnostics = Vec::new();
+    let mut omitted_diagnostics = 0usize;
+    if names.len() > MAX_MACHINE_CLAIMS {
+        complete = false;
+        let excess = names.len() - MAX_MACHINE_CLAIMS;
+        names.truncate(MAX_MACHINE_CLAIMS);
+        push_claim_diagnostic(
+            &mut diagnostics,
+            &mut omitted_diagnostics,
+            format!(
+                "X11 machine claim count exceeded {MAX_MACHINE_CLAIMS}; {excess} claims were not read"
+            ),
+        );
+    }
+
+    let mut loaded = Vec::with_capacity(names.len());
+    for name in names {
+        let claim = (|| {
+            let file = claims
+                .read_bounded(&name, MAX_MACHINE_CLAIM_BYTES)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "claim disappeared while it was being read".to_owned())?;
+            if file.uid != expected_uid || file.mode & 0o077 != 0 {
+                return Err(format!(
+                    "claim must be owned by uid {expected_uid} and inaccessible to group/other"
+                ));
+            }
+            let claim = serde_json::from_slice::<ManagedX11MachineClaim>(&file.bytes)
+                .map_err(|error| format!("invalid claim JSON: {error}"))?;
+            claim.validate(&name)?;
+            Ok(claim)
+        })();
+        match claim {
+            Ok(claim) => loaded.push(claim),
+            Err(error) => {
+                complete = false;
+                push_claim_diagnostic(
+                    &mut diagnostics,
+                    &mut omitted_diagnostics,
+                    format!("{name:?}: {}", bounded_record_diagnostic(&error)),
+                );
+            }
+        }
+    }
+    if omitted_diagnostics > 0 {
+        diagnostics.push(format!(
+            "{omitted_diagnostics} additional X11 machine claim diagnostics were omitted"
+        ));
+    }
+    MachineClaimCatalog {
+        claims: loaded,
+        diagnostics,
+        complete,
+    }
+}
+
+fn push_claim_diagnostic(diagnostics: &mut Vec<String>, omitted: &mut usize, message: String) {
+    if diagnostics.len() < MAX_GRANT_DIAGNOSTICS.saturating_sub(1) {
+        diagnostics.push(message);
+    } else {
+        *omitted += 1;
+    }
+}
+
 fn push_grant_diagnostic(diagnostics: &mut Vec<String>, omitted: &mut usize, message: String) {
     if diagnostics.len() < MAX_GRANT_DIAGNOSTICS.saturating_sub(1) {
         diagnostics.push(message);
@@ -826,6 +1174,10 @@ fn desktop_observation(
     let records = state
         .map(X11RuntimeState::load_records)
         .unwrap_or_else(load_existing_grant_records);
+    let claims = state
+        .map(X11RuntimeState::load_claims)
+        .unwrap_or_else(load_existing_machine_claims);
+    diagnostics.extend(claims.diagnostics.iter().cloned());
     X11DesktopObservation::new(
         acl,
         uzers::get_effective_uid(),
@@ -841,6 +1193,17 @@ fn ensure_access_sync(
 ) -> Result<X11DesktopAuthorization, String> {
     let state = X11RuntimeState::open()?;
     let _lock = state.lock()?;
+    let existing_claims = state.load_claims();
+    if !existing_claims.complete {
+        let detail = existing_claims
+            .diagnostics
+            .first()
+            .map(String::as_str)
+            .unwrap_or("the machine claim set is incomplete");
+        return Err(format!(
+            "X11 authorization was not attempted because Lasper cannot safely inspect its machine claims: {detail}"
+        ));
+    }
     let projection = request.projection();
     let socket = projection.host_socket();
     require_current_socket(socket, "before authorizing access")?;
@@ -931,6 +1294,18 @@ fn ensure_access_sync(
                 "X11 access was added, but its operation record could not be finalized ({error}); the pending record was preserved"
             )
         })?;
+        if let Err(claim_error) =
+            state.write_claim(&ManagedX11MachineClaim::active_from_record(&record))
+        {
+            let reason = format!(
+                "X11 access was confirmed, but its machine claim could not be persisted: {claim_error}"
+            );
+            record.phase = GrantRecordPhase::OutcomeUnknown {
+                reason: reason.clone(),
+            };
+            let _ = state.write(&file_name, &record);
+            return Err(reason);
+        }
         return Ok(X11DesktopAuthorization::new(
             desktop_observation(socket, after, Some(&state)),
             X11AuthorizationDisposition::Added { record_id },
@@ -1011,6 +1386,21 @@ fn revoke_access_sync(request: &X11RevokeRequest) -> Result<X11DesktopRevocation
             "X11 revocation was not attempted because Lasper cannot safely inspect its grant records: {detail}"
         ));
     }
+    let claims = state.load_claims();
+    if !claims.complete {
+        let detail = claims
+            .diagnostics
+            .first()
+            .map(String::as_str)
+            .unwrap_or("the machine claim set is incomplete");
+        return Err(format!(
+            "X11 revocation was not attempted because Lasper cannot safely inspect its machine claims: {detail}"
+        ));
+    }
+    let claim_is_active = claims.claims.iter().any(|claim| {
+        claim.grant_record_id == request.record_id()
+            && matches!(&claim.phase, MachineClaimPhase::Active)
+    });
 
     let record_id = request.record_id();
     if !valid_record_id(record_id) {
@@ -1089,6 +1479,13 @@ fn revoke_access_sync(request: &X11RevokeRequest) -> Result<X11DesktopRevocation
                 "the exact ACL entry was already absent, but operation record {record_id} could not be finalized: {error}"
             )
         })?;
+        if claim_is_active {
+            state.end_claim(record_id).map_err(|error| {
+                format!(
+                    "the exact ACL entry was already absent and the grant record was finalized, but its machine claim could not be ended: {error}"
+                )
+            })?;
+        }
         return Ok(X11DesktopRevocation::new(
             desktop_observation(socket, before, Some(&state)),
             X11RevocationDisposition::AlreadyAbsent {
@@ -1119,6 +1516,13 @@ fn revoke_access_sync(request: &X11RevokeRequest) -> Result<X11DesktopRevocation
                 "X11 access was revoked, but operation record {record_id} could not be finalized ({error}); the confirmed record was preserved"
             )
         })?;
+        if claim_is_active {
+            state.end_claim(record_id).map_err(|error| {
+                format!(
+                    "X11 access was revoked and the grant record was finalized, but its machine claim could not be ended: {error}"
+                )
+            })?;
+        }
         return Ok(X11DesktopRevocation::new(
             desktop_observation(socket, after, Some(&state)),
             X11RevocationDisposition::Revoked {
@@ -1502,6 +1906,32 @@ mod tests {
         assert_eq!(decoded.server_peer_start_time, 77);
         assert_eq!(decoded.acl_address, b"localuser\0#1437402088".to_vec());
 
+        let claim = ManagedX11MachineClaim::active_from_record(&decoded);
+        claim.validate(&format!("claim-{record_id}.json")).unwrap();
+        let claim_value = serde_json::to_value(&claim).unwrap();
+        let decoded_claim: ManagedX11MachineClaim =
+            serde_json::from_value(claim_value.clone()).unwrap();
+        assert_eq!(decoded_claim.claim_id, record_id);
+        assert!(matches!(decoded_claim.phase, MachineClaimPhase::Active));
+        let mut review_claim = decoded_claim.clone();
+        review_claim.phase = MachineClaimPhase::NeedsReview {
+            reason: "machine registration changed".into(),
+        };
+        review_claim
+            .validate(&format!("claim-{record_id}.json"))
+            .unwrap();
+        let mut invalid_claim = claim_value;
+        invalid_claim["key"]["acl_address"] = serde_json::json!([1, 2, 3]);
+        let invalid_claim: ManagedX11MachineClaim = serde_json::from_value(invalid_claim).unwrap();
+        assert!(invalid_claim
+            .validate(&format!("claim-{record_id}.json"))
+            .is_err());
+        let invalid_claim: ManagedX11MachineClaim =
+            serde_json::from_value(serde_json::to_value(&claim).unwrap()).unwrap();
+        assert!(invalid_claim
+            .validate("claim-ffffffffffffffffffffffffffffffff.json")
+            .is_err());
+
         let mut revoked = decoded.clone();
         revoked.phase = GrantRecordPhase::Revoked;
         let revoked_value = serde_json::to_value(&revoked).unwrap();
@@ -1522,15 +1952,34 @@ mod tests {
         .unwrap()
         .open_or_create_child("grants", 0o700)
         .unwrap();
+        let claims = crate::adapters::trusted_state::TrustedDirectory::open_existing(
+            temporary.path(),
+            owner,
+        )
+        .unwrap()
+        .open_or_create_child("claims", 0o700)
+        .unwrap();
         let file_name = format!("grant-{record_id}.json");
         grants
             .write_atomic(&file_name, &serde_json::to_vec(&record).unwrap(), 0o600)
+            .unwrap();
+        claims
+            .write_atomic(
+                &format!("claim-{record_id}.json"),
+                &serde_json::to_vec(&claim).unwrap(),
+                0o600,
+            )
             .unwrap();
         let catalog = load_grant_records_from(&grants, owner);
         assert!(catalog.complete);
         assert!(catalog.diagnostics.is_empty());
         assert_eq!(catalog.records.len(), 1);
         assert_eq!(catalog.records[0].record_id, record_id);
+        let claim_catalog = load_machine_claims_from(&claims, owner);
+        assert!(claim_catalog.complete);
+        assert!(claim_catalog.diagnostics.is_empty());
+        assert_eq!(claim_catalog.claims.len(), 1);
+        assert_eq!(claim_catalog.claims[0].grant_record_id, record_id);
         let explicit = X11AuthorizationRequest::for_explicit_session(
             request.target().clone(),
             request.projection().clone(),
