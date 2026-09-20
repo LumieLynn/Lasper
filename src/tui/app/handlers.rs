@@ -116,6 +116,10 @@ impl App {
                 self.ui.close_leader();
                 self.spawn_terminal().await;
             }
+            (KeyCode::Char('x'), modifiers) if modifiers.is_empty() => {
+                self.ui.close_leader();
+                self.spawn_x11_shell_prompt().await;
+            }
             (KeyCode::Char('e'), modifiers) if modifiers.is_empty() => {
                 self.ui.close_leader();
                 self.configure_focused_resource();

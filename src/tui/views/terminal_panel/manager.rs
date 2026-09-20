@@ -5,6 +5,7 @@ use crate::application::sessions::{
     ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
     ValidatedGuestUserName, WaylandShellRequest,
 };
+use crate::application::x11::X11AccessService;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
@@ -15,7 +16,7 @@ use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use super::shell_prompt::run_builtin_shell_prompt;
+use super::shell_prompt::{run_builtin_shell_prompt, BuiltinShellMode};
 
 #[cfg(target_os = "linux")]
 use arboard::SetExtLinux;
@@ -243,6 +244,31 @@ impl TerminalManager {
         rows: u16,
         app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
     ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_builtin_shell_prompt(entry, rows, app_tx, BuiltinShellMode::Standard)
+            .await
+    }
+
+    /// Start the same embedded selected-user loop with an explicit Host X11
+    /// gate. The prompt performs a read-only preview and obtains confirmation
+    /// for the selected account before the access service may touch the ACL.
+    pub async fn spawn_x11_shell_prompt(
+        &mut self,
+        entry: &MachineEntry,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+        x11_access: Arc<X11AccessService>,
+    ) -> Result<SpawnedTerminalSession, String> {
+        self.spawn_builtin_shell_prompt(entry, rows, app_tx, BuiltinShellMode::HostX11(x11_access))
+            .await
+    }
+
+    async fn spawn_builtin_shell_prompt(
+        &mut self,
+        entry: &MachineEntry,
+        rows: u16,
+        app_tx: &Option<tokio::sync::mpsc::Sender<AppEvent>>,
+        mode: BuiltinShellMode,
+    ) -> Result<SpawnedTerminalSession, String> {
         if !entry.access().is_nspawn() {
             return Err(format!(
                 "Machine {} is read-only because Lasper did not identify it as an nspawn machine",
@@ -273,7 +299,9 @@ impl TerminalManager {
         )));
         terminal.lock().screen.suppress_initial_line_breaks();
         let service = Arc::clone(&self.session_service);
-        tokio::spawn(run_builtin_shell_prompt(endpoint, service, machine, size));
+        tokio::spawn(run_builtin_shell_prompt(
+            endpoint, service, machine, size, mode,
+        ));
         let output_task = spawn_output_parser(
             output,
             Arc::clone(&terminal),

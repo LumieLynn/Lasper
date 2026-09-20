@@ -511,7 +511,7 @@ fn report_x11_preparation(preparation: &X11SessionPreparation) {
     let projection = preparation.check().projection();
     match preparation.disposition() {
         X11AuthorizationDisposition::Added { .. } => eprintln!(
-            "🪐 Authorized Host X11 :{display} for mapped uid #{}; this X-server ACL entry remains until it is revoked from Configure or the X server exits.",
+            "🪐 Authorized Host X11 :{display} for mapped uid #{}; this X-server ACL entry outlives the shell, so revoke it from Configure when no longer needed (an external ACL change or X-server reset may also remove it).",
             projection.identity().host_uid()
         ),
         X11AuthorizationDisposition::AccessControlDisabled => eprintln!(

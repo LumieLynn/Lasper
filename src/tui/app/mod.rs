@@ -1910,10 +1910,33 @@ mod tests {
                 .await;
             assert!(app.ui.leader_active());
 
-            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+            app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE))
                 .await;
             assert!(!app.ui.leader_active());
             assert!(app.ui.resource_action_menu.is_none());
+        }
+
+        #[tokio::test]
+        async fn leader_x_opens_an_explicit_host_x11_prompt() {
+            let mut app = app_with_machine_and_image();
+            let (tx, _rx) = tokio::sync::mpsc::channel(4);
+            app.ui.app_tx = Some(tx);
+
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+                .await;
+
+            assert!(!app.ui.leader_active());
+            assert_eq!(app.data.terminal.sessions.len(), 1);
+            assert!(app.data.terminal.is_showing());
+            assert_eq!(app.ui.focus, WorkspaceFocus::Terminal);
+            assert!(app
+                .ui
+                .status_message
+                .as_ref()
+                .is_some_and(|(message, _)| message.contains("Host X11 shell prompt")));
+            app.data.terminal.close_active();
         }
 
         #[tokio::test]

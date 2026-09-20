@@ -1009,6 +1009,33 @@ impl App {
         }
     }
 
+    pub async fn spawn_x11_shell_prompt(&mut self) {
+        let Some(entry) = self.terminal_entry_for_focus() else {
+            return;
+        };
+        if !self.ui.focus.is_terminal() {
+            self.ui.prev_focus = self.ui.focus;
+        }
+        let rows = self.ui.pane_height.max(10);
+        let x11_access = std::sync::Arc::clone(&self.data.x11_access);
+        match self
+            .data
+            .terminal
+            .spawn_x11_shell_prompt(&entry, rows, &self.ui.app_tx, x11_access)
+            .await
+        {
+            Ok(_) => {
+                self.set_focus(crate::tui::app::WorkspaceFocus::Terminal);
+                self.request_detail_refresh();
+                self.set_status(
+                    format!("Opened Host X11 shell prompt for {}", entry.name),
+                    crate::tui::StatusLevel::Info,
+                );
+            }
+            Err(msg) => self.set_status(msg, crate::tui::StatusLevel::Error),
+        }
+    }
+
     pub async fn spawn_terminal(&mut self) {
         let Some(entry) = self.terminal_entry_for_focus() else {
             return;
