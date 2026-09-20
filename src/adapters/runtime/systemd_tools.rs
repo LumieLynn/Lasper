@@ -610,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_user_shell_forwards_the_typed_terminal_and_wayland_environment() {
+    fn selected_user_shell_forwards_the_closed_typed_environment() {
         let name = MachineName::new("test-machine").unwrap();
         let user = ValidatedGuestUserName::new("alice").unwrap();
         let terminal = InteractiveShellEnvironment::new(
@@ -622,6 +622,7 @@ mod tests {
         let environment = MachineShellEnvironment::shell(
             terminal,
             Some(Path::new("/run/lasper/wayland/1000/wayland-1")),
+            Some(1),
         )
         .unwrap();
         let request =
@@ -638,6 +639,7 @@ mod tests {
                 "--setenv=COLORTERM=truecolor",
                 "--setenv=NO_COLOR=",
                 "--setenv=WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-1",
+                "--setenv=DISPLAY=:1",
                 "--",
                 "shell",
                 "alice@test-machine",
@@ -653,6 +655,7 @@ mod tests {
             Some(std::ffi::OsStr::new("truecolor"))
         );
         assert_eq!(command.get_env("NO_COLOR"), Some(std::ffi::OsStr::new("")));
+        assert_eq!(command.get_env("DISPLAY"), None);
     }
 
     #[test]

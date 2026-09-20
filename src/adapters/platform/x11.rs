@@ -19,11 +19,11 @@ use crate::application::sessions::{
     ShellTarget, ValidatedGuestUserName,
 };
 use crate::application::x11::{
-    X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationRequest,
-    X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization, X11DesktopObservation,
-    X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort, X11GrantRecordCatalog,
-    X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition, X11RevokeRequest,
-    X11SourceObservation, X11SourceState,
+    X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationPurpose,
+    X11AuthorizationRequest, X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization,
+    X11DesktopObservation, X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort,
+    X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition,
+    X11RevokeRequest, X11SourceObservation, X11SourceState,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
@@ -883,6 +883,25 @@ fn ensure_access_sync(
             "X11 authorization was not attempted because Lasper cannot safely inspect its existing grant records: {detail}"
         ));
     }
+    if request.purpose() == X11AuthorizationPurpose::ExplicitSession {
+        if let Some(record) = current_generation_record(
+            &existing_records,
+            request,
+            server_peer_start_time,
+            &host_boot_id()?,
+        ) {
+            let phase = match &record.phase {
+                X11GrantRecordPhase::Pending => "pending",
+                X11GrantRecordPhase::ConfirmedAdded => "confirmed but now absent",
+                X11GrantRecordPhase::Revoked => "revoked",
+                X11GrantRecordPhase::OutcomeUnknown { .. } => "outcome unknown",
+            };
+            return Err(format!(
+                "X11 session authorization was not recreated because grant record {} for this machine instance and X server is {phase}; review the record and authorize access explicitly from Configure > Host Integration > X11",
+                record.record_id
+            ));
+        }
+    }
 
     let record_id = uuid::Uuid::new_v4().simple().to_string();
     let file_name = format!("grant-{record_id}.json");
@@ -950,6 +969,30 @@ fn ensure_access_sync(
         Err(record_error) => format!(
             "X11 authorization outcome is unknown: {reason}; additionally, the pending operation record could not be updated: {record_error}"
         ),
+    })
+}
+
+fn current_generation_record<'a>(
+    catalog: &'a X11GrantRecordCatalog,
+    request: &X11AuthorizationRequest,
+    server_peer_start_time: u64,
+    boot_id: &str,
+) -> Option<&'a X11GrantRecordEvidence> {
+    let projection = request.projection();
+    let desired_entry = X11AclEntry::from_wire(
+        Family::SERVER_INTERPRETED.into(),
+        numeric_local_user_address(projection.identity().host_uid()),
+    );
+    let caller_uid = uzers::get_effective_uid();
+    catalog.records.iter().find(|record| {
+        record.target == *request.target()
+            && record.display == projection.host_socket().display()
+            && record.caller_uid == caller_uid
+            && record.boot_id == boot_id
+            && record.identity == projection.identity()
+            && record.server_peer == projection.host_socket().peer_identity()
+            && record.server_peer_start_time == server_peer_start_time
+            && record.acl_entry == desired_entry
     })
 }
 
@@ -1488,6 +1531,22 @@ mod tests {
         assert!(catalog.diagnostics.is_empty());
         assert_eq!(catalog.records.len(), 1);
         assert_eq!(catalog.records[0].record_id, record_id);
+        let explicit = X11AuthorizationRequest::for_explicit_session(
+            request.target().clone(),
+            request.projection().clone(),
+        );
+        assert_eq!(explicit.purpose(), X11AuthorizationPurpose::ExplicitSession);
+        assert!(
+            current_generation_record(&catalog, &explicit, 77, &catalog.records[0].boot_id,)
+                .is_some()
+        );
+        assert!(current_generation_record(
+            &catalog,
+            &explicit,
+            77,
+            "22222222-2222-4222-8222-222222222222",
+        )
+        .is_none());
 
         grants
             .write_atomic(

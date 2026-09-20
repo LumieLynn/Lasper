@@ -57,9 +57,17 @@ impl SessionService {
         &self,
         intent: ShellOpenIntent,
     ) -> Result<TerminalSessionHandle, ShellOpenError> {
+        if intent
+            .x11()
+            .is_some_and(|context| context.target() != intent.target())
+        {
+            return Err(ShellOpenError::X11Context(SessionError::new(
+                "prepared X11 access belongs to a different shell target",
+            )));
+        }
         let terminal_environment = intent.terminal_environment().clone();
         let command = intent.command().cloned();
-        let environment = match intent.wayland() {
+        let mut environment = match intent.wayland() {
             WaylandShellRequest::Disabled => {
                 TypedSessionEnvironment::terminal(terminal_environment)
             }
@@ -70,6 +78,9 @@ impl SessionService {
                     .map_err(ShellOpenError::WaylandPreparation)?,
             ),
         };
+        if let Some(context) = intent.x11().cloned() {
+            environment = environment.with_x11(context);
+        }
         let target = intent.target();
         self.port
             .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
@@ -151,6 +162,7 @@ mod tests {
     };
     use crate::domain::session::TerminalAttachmentKind;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
+    use crate::domain::x11::{HostX11Socket, X11SocketRevision};
     use parking_lot::Mutex;
     use std::path::PathBuf;
 
@@ -158,6 +170,7 @@ mod tests {
     struct RecordingPort {
         ids: Mutex<Vec<SessionId>>,
         terminal_wayland_contexts: Mutex<Vec<bool>>,
+        terminal_x11_contexts: Mutex<Vec<bool>>,
         terminal_terms: Mutex<Vec<String>>,
         terminal_commands: Mutex<Vec<Option<String>>>,
     }
@@ -186,6 +199,11 @@ mod tests {
                 &request.launch,
                 TerminalLaunch::SelectedUserShell { environment, .. }
                     if environment.wayland_context().is_some()
+            ));
+            self.terminal_x11_contexts.lock().push(matches!(
+                &request.launch,
+                TerminalLaunch::SelectedUserShell { environment, .. }
+                    if environment.x11_context().is_some()
             ));
             if let TerminalLaunch::SelectedUserShell { environment, .. } = &request.launch {
                 self.terminal_terms
@@ -228,6 +246,51 @@ mod tests {
             self.ids.lock().push(request.id);
             Ok(journal_session_channel(request.id).0)
         }
+    }
+
+    fn shell_target(machine: &str) -> ShellTarget {
+        ShellTarget::new(
+            MachineName::new(machine).unwrap(),
+            crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
+        )
+    }
+
+    fn prepared_x11(target: ShellTarget) -> crate::application::sessions::X11SessionContext {
+        let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
+        let socket = HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o755,
+            42,
+            1000,
+            1000,
+            X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        let projection = X11ProjectionContext::verified(
+            socket,
+            "/mnt/host-x11/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            crate::application::sessions::X11FilesystemAccess::observed(true, true),
+            crate::application::sessions::MappedGuestIdentity::verified(
+                crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
+                1_437_402_088,
+                1_437_402_088,
+                crate::application::sessions::ObservedMachineInstance::new(
+                    42, namespace, namespace,
+                ),
+            ),
+        );
+        crate::application::sessions::X11SessionContext::prepared(target, projection)
     }
 
     #[tokio::test]
@@ -315,5 +378,35 @@ mod tests {
             *port.terminal_commands.lock(),
             [Some("/usr/bin/kitty".into())]
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_x11_context_is_target_bound_and_carried_without_reprobing() {
+        let port = Arc::new(RecordingPort::default());
+        let service = SessionService::new(port.clone());
+        let target = shell_target("test");
+        let intent = ShellOpenIntent::new(
+            target.clone(),
+            WaylandShellRequest::Disabled,
+            crate::application::sessions::InteractiveShellEnvironment::default(),
+            SessionSize::new(80, 24).unwrap(),
+        )
+        .with_x11(prepared_x11(target));
+
+        let _terminal = service.open_shell(intent).await.unwrap();
+        assert_eq!(*port.terminal_x11_contexts.lock(), [true]);
+
+        let mismatched = ShellOpenIntent::new(
+            shell_target("other"),
+            WaylandShellRequest::Disabled,
+            crate::application::sessions::InteractiveShellEnvironment::default(),
+            SessionSize::new(80, 24).unwrap(),
+        )
+        .with_x11(prepared_x11(shell_target("test")));
+        assert!(matches!(
+            service.open_shell(mismatched).await,
+            Err(ShellOpenError::X11Context(_))
+        ));
+        assert_eq!(*port.terminal_x11_contexts.lock(), [true]);
     }
 }

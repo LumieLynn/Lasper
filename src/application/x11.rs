@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use crate::application::sessions::{
     MappedGuestIdentity, SessionError, SessionService, ShellTarget, X11ProjectionContext,
+    X11SessionContext,
 };
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
@@ -319,6 +320,13 @@ pub struct X11AccessCheck {
 pub(crate) struct X11AuthorizationRequest {
     target: ShellTarget,
     projection: X11ProjectionContext,
+    purpose: X11AuthorizationPurpose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum X11AuthorizationPurpose {
+    Manual,
+    ExplicitSession,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -356,7 +364,22 @@ impl X11RevokeRequest {
 
 impl X11AuthorizationRequest {
     pub(crate) fn new(target: ShellTarget, projection: X11ProjectionContext) -> Self {
-        Self { target, projection }
+        Self {
+            target,
+            projection,
+            purpose: X11AuthorizationPurpose::Manual,
+        }
+    }
+
+    pub(crate) fn for_explicit_session(
+        target: ShellTarget,
+        projection: X11ProjectionContext,
+    ) -> Self {
+        Self {
+            target,
+            projection,
+            purpose: X11AuthorizationPurpose::ExplicitSession,
+        }
     }
 
     pub(crate) fn target(&self) -> &ShellTarget {
@@ -365,6 +388,10 @@ impl X11AuthorizationRequest {
 
     pub(crate) fn projection(&self) -> &X11ProjectionContext {
         &self.projection
+    }
+
+    pub(crate) const fn purpose(&self) -> X11AuthorizationPurpose {
+        self.purpose
     }
 }
 
@@ -421,6 +448,37 @@ impl X11DesktopRevocation {
 pub struct X11Authorization {
     check: X11AccessCheck,
     disposition: X11AuthorizationDisposition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X11SessionSelection {
+    Current,
+    Display(u16),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11SessionPreparation {
+    context: X11SessionContext,
+    check: X11AccessCheck,
+    disposition: X11AuthorizationDisposition,
+}
+
+impl X11SessionPreparation {
+    pub fn context(&self) -> &X11SessionContext {
+        &self.context
+    }
+
+    pub fn check(&self) -> &X11AccessCheck {
+        &self.check
+    }
+
+    pub fn disposition(&self) -> &X11AuthorizationDisposition {
+        &self.disposition
+    }
+
+    pub fn into_context(self) -> X11SessionContext {
+        self.context
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -678,6 +736,8 @@ impl X11DesktopAccessError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum X11AccessError {
+    #[error("X11 display selection failed: {0}")]
+    Selection(String),
     #[error("{0}")]
     Projection(#[source] SessionError),
     #[error("X11 desktop access operation failed: {0}")]
@@ -707,15 +767,21 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
 /// the projection half is routed through the elevated daemon.
 pub struct X11AccessService {
     sessions: Arc<SessionService>,
+    endpoints: Arc<X11EndpointDiscoveryService>,
     desktop: Arc<dyn X11DesktopAccessPort>,
 }
 
 impl X11AccessService {
     pub(crate) fn new(
         sessions: Arc<SessionService>,
+        endpoints: Arc<X11EndpointDiscoveryService>,
         desktop: Arc<dyn X11DesktopAccessPort>,
     ) -> Self {
-        Self { sessions, desktop }
+        Self {
+            sessions,
+            endpoints,
+            desktop,
+        }
     }
 
     pub async fn check(
@@ -763,6 +829,62 @@ impl X11AccessService {
         })
     }
 
+    /// Prepare one explicitly requested Host X11 session. Endpoint discovery
+    /// and projection probing are read-only; the desktop ACL is considered
+    /// only after one startup-configured projection has been proven usable.
+    pub async fn prepare_session(
+        &self,
+        target: ShellTarget,
+        selection: X11SessionSelection,
+    ) -> Result<X11SessionPreparation, X11AccessError> {
+        let catalog = self.endpoints.discover(&[]).await;
+        let (display, candidates) =
+            select_session_endpoints(catalog, selection).map_err(X11AccessError::Selection)?;
+
+        let mut failures = Vec::new();
+        let mut selected = None;
+        for socket in candidates {
+            match self
+                .sessions
+                .test_x11_projection(target.clone(), socket.clone())
+                .await
+            {
+                Ok(projection) => {
+                    selected = Some(projection);
+                    break;
+                }
+                Err(error) => failures.push(format!("{}: {error}", socket.source().display())),
+            }
+        }
+        let projection = selected.ok_or_else(|| {
+            X11AccessError::Projection(SessionError::with_hint(
+                format!(
+                    "no usable startup-configured projection was found for X11 display :{display}: {}",
+                    failures.join("; ")
+                ),
+                "Configure the selected X11 socket while the machine is stopped, then start or restart it.",
+            ))
+        })?;
+
+        let request =
+            X11AuthorizationRequest::for_explicit_session(target.clone(), projection.clone());
+        let desktop = self
+            .desktop
+            .ensure(&request)
+            .await
+            .map_err(X11AccessError::Desktop)?;
+        let check = X11AccessCheck::from_desktop_observation(
+            target.clone(),
+            projection.clone(),
+            desktop.observation,
+        );
+        Ok(X11SessionPreparation {
+            context: X11SessionContext::prepared(target, projection),
+            check,
+            disposition: desktop.disposition,
+        })
+    }
+
     pub async fn revoke(
         &self,
         target: ShellTarget,
@@ -791,38 +913,107 @@ impl X11AccessService {
     }
 }
 
+fn select_session_endpoints(
+    catalog: X11EndpointCatalog,
+    selection: X11SessionSelection,
+) -> Result<(u16, Vec<HostX11Socket>), String> {
+    let display = match selection {
+        X11SessionSelection::Current => catalog.preferred_display.ok_or_else(|| {
+            "the current DISPLAY does not identify a local X11 server; select one explicitly with --with-x11=:N"
+                .to_owned()
+        })?,
+        X11SessionSelection::Display(display) => display,
+    };
+    let mut candidates = catalog
+        .sockets
+        .iter()
+        .filter(|socket| socket.display() == display)
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(HostX11Socket::alternate);
+    if !candidates.is_empty() {
+        return Ok((display, candidates));
+    }
+
+    let mut available = catalog
+        .sockets
+        .iter()
+        .map(HostX11Socket::display)
+        .collect::<Vec<_>>();
+    available.sort_unstable();
+    available.dedup();
+    let available = if available.is_empty() {
+        "none".to_owned()
+    } else {
+        available
+            .into_iter()
+            .map(|display| format!(":{display}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let diagnostic = catalog
+        .diagnostics
+        .first()
+        .map(|message| format!("; discovery: {message}"))
+        .unwrap_or_default();
+    Err(format!(
+        "X11 display :{display} was not discovered (available: {available}){diagnostic}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::application::sessions::{
-        MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance,
-        ObservedNamespaceIdentity, ValidatedGuestUserName, X11FilesystemAccess,
+        JournalSessionHandle, JournalSessionRequest, MappedGuestIdentity, ObservedGuestIdentity,
+        ObservedMachineInstance, ObservedNamespaceIdentity, SessionPort, TerminalSessionHandle,
+        TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
+        WaylandSessionContext, X11FilesystemAccess, X11ProjectionProbeRequest,
     };
     use crate::domain::machine::MachineName;
+    use crate::domain::wayland::HostWaylandSocket;
     use crate::domain::x11::X11SocketRevision;
+    use parking_lot::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn projection(host_uid: u32) -> X11ProjectionContext {
+        projection_for_socket(host_socket(0, false, 2), host_uid)
+    }
+
+    fn host_socket(display: u16, alternate: bool, inode: u64) -> HostX11Socket {
+        HostX11Socket::from_verified_parts(
+            display,
+            alternate,
+            format!(
+                "/tmp/.X11-unix/X{display}{}",
+                if alternate { "_" } else { "" }
+            )
+            .into(),
+            format!(
+                "/tmp/.X11-unix/X{display}{}",
+                if alternate { "_" } else { "" }
+            )
+            .into(),
+            1000,
+            1000,
+            0o755,
+            42,
+            1000,
+            1000,
+            X11SocketRevision {
+                device: 1,
+                inode,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap()
+    }
+
+    fn projection_for_socket(socket: HostX11Socket, host_uid: u32) -> X11ProjectionContext {
         let namespace = ObservedNamespaceIdentity::new(1, 2);
         X11ProjectionContext::verified(
-            HostX11Socket::from_verified_parts(
-                0,
-                false,
-                "/tmp/.X11-unix/X0".into(),
-                "/tmp/.X11-unix/X0".into(),
-                1000,
-                1000,
-                0o777,
-                42,
-                1000,
-                1000,
-                X11SocketRevision {
-                    device: 1,
-                    inode: 2,
-                    ctime_seconds: 3,
-                    ctime_nanoseconds: 4,
-                },
-            )
-            .unwrap(),
+            socket,
             "/mnt/host-x11/X0".into(),
             "/tmp/.X11-unix/X0".into(),
             X11FilesystemAccess::observed(true, true),
@@ -1043,5 +1234,192 @@ mod tests {
             &X11GrantAssessmentStatus::OutcomeUnknown
         );
         assert!(!incomplete.grant_assessment().records_complete());
+    }
+
+    #[test]
+    fn session_endpoint_selection_is_local_exact_and_standard_first() {
+        let catalog = X11EndpointCatalog {
+            sockets: vec![
+                host_socket(2, true, 23),
+                host_socket(1, false, 11),
+                host_socket(2, false, 22),
+            ],
+            preferred_display: Some(2),
+            ..Default::default()
+        };
+        let (display, sockets) =
+            select_session_endpoints(catalog.clone(), X11SessionSelection::Current).unwrap();
+        assert_eq!(display, 2);
+        assert_eq!(sockets.len(), 2);
+        assert!(!sockets[0].alternate());
+        assert!(sockets[1].alternate());
+
+        let (display, sockets) =
+            select_session_endpoints(catalog, X11SessionSelection::Display(1)).unwrap();
+        assert_eq!(display, 1);
+        assert_eq!(sockets.len(), 1);
+        assert!(!sockets[0].alternate());
+    }
+
+    #[test]
+    fn current_session_selection_requires_a_local_display() {
+        let error =
+            select_session_endpoints(X11EndpointCatalog::default(), X11SessionSelection::Current)
+                .unwrap_err();
+        assert!(error.contains("current DISPLAY"));
+
+        let error = select_session_endpoints(
+            X11EndpointCatalog {
+                sockets: vec![host_socket(1, false, 11)],
+                diagnostics: vec!["bounded diagnostic".into()],
+                ..Default::default()
+            },
+            X11SessionSelection::Display(2),
+        )
+        .unwrap_err();
+        assert!(error.contains("available: :1"));
+        assert!(error.contains("bounded diagnostic"));
+    }
+
+    struct StaticEndpointPort(X11EndpointCatalog);
+
+    #[async_trait::async_trait]
+    impl X11EndpointDiscoveryPort for StaticEndpointPort {
+        async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog {
+            assert!(configured_sources.is_empty());
+            self.0.clone()
+        }
+    }
+
+    struct ProjectionPort {
+        probes: Mutex<Vec<bool>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionPort for ProjectionPort {
+        async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket> {
+            Vec::new()
+        }
+
+        async fn automatic_wayland(
+            &self,
+            _machine: &MachineName,
+        ) -> Result<Option<HostWaylandSocket>, SessionError> {
+            Ok(None)
+        }
+
+        async fn open_terminal(
+            &self,
+            _request: TerminalSessionRequest,
+        ) -> Result<TerminalSessionHandle, SessionError> {
+            panic!("X11 preparation must not open a user terminal")
+        }
+
+        async fn prepare_wayland(
+            &self,
+            _request: WaylandPreparationRequest,
+        ) -> Result<WaylandSessionContext, SessionError> {
+            panic!("X11 preparation must not prepare Wayland")
+        }
+
+        async fn probe_x11_projection(
+            &self,
+            request: X11ProjectionProbeRequest,
+        ) -> Result<X11ProjectionContext, SessionError> {
+            self.probes.lock().push(request.host_socket.alternate());
+            if !request.host_socket.alternate() {
+                return Err(SessionError::new("standard endpoint is not projected"));
+            }
+            Ok(projection_for_socket(request.host_socket, 1_437_402_088))
+        }
+
+        async fn open_journal(
+            &self,
+            _request: JournalSessionRequest,
+        ) -> Result<JournalSessionHandle, SessionError> {
+            panic!("X11 preparation must not open a journal")
+        }
+    }
+
+    struct RecordingDesktopPort {
+        ensures: AtomicUsize,
+        purposes: Mutex<Vec<X11AuthorizationPurpose>>,
+    }
+
+    #[async_trait::async_trait]
+    impl X11DesktopAccessPort for RecordingDesktopPort {
+        async fn snapshot(
+            &self,
+            _socket: &HostX11Socket,
+        ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
+            panic!("explicit session preparation uses the atomic ensure operation")
+        }
+
+        async fn ensure(
+            &self,
+            request: &X11AuthorizationRequest,
+        ) -> Result<X11DesktopAuthorization, X11DesktopAccessError> {
+            self.ensures.fetch_add(1, Ordering::Relaxed);
+            self.purposes.lock().push(request.purpose());
+            let uid = request.projection().identity().host_uid();
+            Ok(X11DesktopAuthorization::new(
+                X11DesktopObservation::new(
+                    X11AclSnapshot::from_wire(
+                        1,
+                        vec![X11AclEntry::from_wire(
+                            SERVER_INTERPRETED_FAMILY,
+                            format!("localuser\0#{uid}").into_bytes(),
+                        )],
+                    ),
+                    1000,
+                    None,
+                    None,
+                    X11GrantRecordCatalog::empty(),
+                    Vec::new(),
+                ),
+                X11AuthorizationDisposition::PreExisting,
+            ))
+        }
+
+        async fn revoke(
+            &self,
+            _request: &X11RevokeRequest,
+        ) -> Result<X11DesktopRevocation, X11DesktopAccessError> {
+            panic!("X11 preparation must not revoke access")
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_session_tries_projected_endpoint_before_one_atomic_acl_ensure() {
+        let projection_port = Arc::new(ProjectionPort {
+            probes: Mutex::new(Vec::new()),
+        });
+        let sessions = Arc::new(SessionService::new(projection_port.clone()));
+        let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+            StaticEndpointPort(X11EndpointCatalog {
+                sockets: vec![host_socket(0, false, 2), host_socket(0, true, 3)],
+                preferred_display: Some(0),
+                ..Default::default()
+            }),
+        )));
+        let desktop = Arc::new(RecordingDesktopPort {
+            ensures: AtomicUsize::new(0),
+            purposes: Mutex::new(Vec::new()),
+        });
+        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
+
+        let prepared = service
+            .prepare_session(target(), X11SessionSelection::Current)
+            .await
+            .unwrap();
+
+        assert_eq!(prepared.context().display(), 0);
+        assert!(prepared.context().projection().host_socket().alternate());
+        assert_eq!(*projection_port.probes.lock(), [false, true]);
+        assert_eq!(desktop.ensures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            *desktop.purposes.lock(),
+            [X11AuthorizationPurpose::ExplicitSession]
+        );
     }
 }

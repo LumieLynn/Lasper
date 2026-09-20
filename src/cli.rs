@@ -12,6 +12,10 @@ use crate::application::sessions::{
     ShellOpenIntent, ShellTarget, TerminalSessionHandle, ValidatedGuestUserName,
     WaylandShellRequest,
 };
+use crate::application::x11::{
+    X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
+    X11SessionSelection,
+};
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 
@@ -43,6 +47,7 @@ pub(crate) struct ShellCommand {
     io_mode: ShellIoMode,
     target: ShellTarget,
     wayland: ShellWaylandSelection,
+    x11: ShellX11Selection,
     command: Option<GuestCommand>,
     allow_wayland_fallback: bool,
     want_elevation: bool,
@@ -85,6 +90,13 @@ enum ShellWaylandSelection {
     Automatic,
     Display(WaylandDisplay),
     Disabled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellX11Selection {
+    Disabled,
+    Current,
+    Display(u16),
 }
 
 struct HelpPage<'a> {
@@ -222,10 +234,10 @@ fn help_text() -> String {
     ))
     .usage("lasper [FLAGS]")
     .usage(
-        "lasper [--elevate] [--systemd-tools] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
+        "lasper [--elevate] [--systemd-tools] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] [--with-x11[=:N]] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
     )
     .usage(
-        "lasper [--systemd-tools] launch [--wayland[=DISPLAY] | --no-wayland] USER@MACHINE [--] COMMAND [ARGUMENT...]",
+        "lasper [--systemd-tools] launch [--wayland[=DISPLAY] | --no-wayland] [--with-x11[=:N]] USER@MACHINE [--] COMMAND [ARGUMENT...]",
     )
     .section(
         HelpSection::new("FLAGS")
@@ -251,6 +263,10 @@ fn help_text() -> String {
                 "Open without Wayland validation or environment",
             )
             .entry(
+                "--with-x11[=:N]",
+                "Explicitly prepare Host X11 access for the current or selected display",
+            )
+            .entry(
                 "--quiet",
                 "Suppress Wayland fallback and detach notices",
             )
@@ -263,6 +279,9 @@ fn help_text() -> String {
             )
             .paragraph(
                 "`launch` is for Terminal=false desktop entries, always uses the caller's authority, and waits for the guest command while forwarding its output.",
+            )
+            .paragraph(
+                "Host X11 is never enabled implicitly. --with-x11 uses the current local DISPLAY; --with-x11=:N selects one server exactly. A failed X11 preparation is a hard error and never falls back.",
             ),
     )
     .section(
@@ -335,13 +354,20 @@ fn shell_command_arguments(args: &[String]) -> Option<(ShellIoMode, Vec<String>)
         })
 }
 
-pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) -> i32 {
+pub(crate) async fn run_shell(
+    command: ShellCommand,
+    sessions: &SessionService,
+    x11_access: &X11AccessService,
+) -> i32 {
     let io_mode = command.io_mode();
     let requested_command = command.command().cloned();
     let allow_wayland_fallback = command.allows_wayland_fallback();
     let quiet = command.is_quiet();
     let ShellCommand {
-        target, wayland, ..
+        target,
+        wayland,
+        x11,
+        ..
     } = command;
     let (wayland, discovery_fallback) =
         match resolve_wayland_request(sessions, &target, wayland).await {
@@ -372,6 +398,36 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
         }
         ShellIoMode::Launcher => crate::adapters::session::terminal_io::launcher_terminal_size(),
     };
+    let x11 = match x11 {
+        ShellX11Selection::Disabled => None,
+        ShellX11Selection::Current => {
+            match x11_access
+                .prepare_session(target.clone(), X11SessionSelection::Current)
+                .await
+            {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    report_x11_error(&error);
+                    return 1;
+                }
+            }
+        }
+        ShellX11Selection::Display(display) => {
+            match x11_access
+                .prepare_session(target.clone(), X11SessionSelection::Display(display))
+                .await
+            {
+                Ok(preparation) => Some(preparation),
+                Err(error) => {
+                    report_x11_error(&error);
+                    return 1;
+                }
+            }
+        }
+    };
+    if let Some(preparation) = &x11 {
+        report_x11_preparation(preparation);
+    }
     let mut intent = ShellOpenIntent::new(
         target,
         wayland,
@@ -380,6 +436,9 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
     );
     if let Some(command) = requested_command {
         intent = intent.with_command(command);
+    }
+    if let Some(preparation) = x11 {
+        intent = intent.with_x11(preparation.into_context());
     }
     let (handle, probe_fallback) = match open_shell_with_wayland_fallback(
         sessions,
@@ -434,6 +493,37 @@ pub(crate) async fn run_shell(command: ShellCommand, sessions: &SessionService) 
             report_shell_error(context, &error);
             1
         }
+    }
+}
+
+fn report_x11_error(error: &X11AccessError) {
+    eprintln!("lasper: failed to prepare Host X11 session: {error}");
+    if let X11AccessError::Projection(error) = error {
+        if let Some(hint) = error.hint() {
+            eprintln!("lasper: hint: {hint}");
+        }
+    }
+}
+
+fn report_x11_preparation(preparation: &X11SessionPreparation) {
+    let context = preparation.context();
+    let display = context.display();
+    let projection = preparation.check().projection();
+    match preparation.disposition() {
+        X11AuthorizationDisposition::Added { .. } => eprintln!(
+            "🪐 Authorized Host X11 :{display} for mapped uid #{}; this X-server ACL entry remains until it is revoked from Configure or the X server exits.",
+            projection.identity().host_uid()
+        ),
+        X11AuthorizationDisposition::AccessControlDisabled => eprintln!(
+            "lasper: warning: X11 access control is disabled on :{display}; no per-user ACL entry was added"
+        ),
+        X11AuthorizationDisposition::PreExisting => {}
+    }
+    if !projection.filesystem_access().client_writable() {
+        eprintln!(
+            "lasper: warning: {} is not writable by the selected guest user; compatible clients may still use the Linux abstract X11 transport",
+            projection.guest_client_path().display()
+        );
     }
 }
 
@@ -573,6 +663,8 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
     let mut target = None;
     let mut wayland = ShellWaylandSelection::Automatic;
     let mut selection_was_explicit = false;
+    let mut x11 = ShellX11Selection::Disabled;
+    let mut x11_was_explicit = false;
     let mut command_program = None;
     let mut command_args = Vec::new();
     let mut command_started = false;
@@ -613,6 +705,25 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
             }
             wayland = requested_wayland;
             selection_was_explicit = true;
+            index += 1;
+            continue;
+        }
+
+        let requested_x11 = if argument == "--with-x11" {
+            Some(ShellX11Selection::Current)
+        } else if let Some(display) = argument.strip_prefix("--with-x11=") {
+            Some(ShellX11Selection::Display(parse_x11_display(display)?))
+        } else {
+            None
+        };
+        if let Some(requested_x11) = requested_x11 {
+            if x11_was_explicit {
+                return Err(format!(
+                    "{command_name} accepts only one Host X11 selection option"
+                ));
+            }
+            x11 = requested_x11;
+            x11_was_explicit = true;
             index += 1;
             continue;
         }
@@ -689,12 +800,25 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         io_mode,
         target,
         wayland,
+        x11,
         command,
         allow_wayland_fallback,
         want_elevation,
         want_systemd_tools,
         quiet,
     })
+}
+
+fn parse_x11_display(value: &str) -> Result<u16, String> {
+    let Some(number) = value.strip_prefix(':') else {
+        return Err("--with-x11= requires a local display in :N form".into());
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("--with-x11= requires a local display in :N form".into());
+    }
+    number
+        .parse()
+        .map_err(|_| "--with-x11 display number is outside the u16 range".into())
 }
 
 fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
@@ -1037,11 +1161,31 @@ mod tests {
         assert_eq!(command.target.user().as_str(), "alice");
         assert_eq!(command.target.machine().as_str(), "demo");
         assert_eq!(command.wayland, ShellWaylandSelection::Automatic);
+        assert_eq!(command.x11, ShellX11Selection::Disabled);
         assert!(command.allows_wayland_fallback());
         assert!(command.command().is_none());
         assert!(!command.wants_elevation());
         assert!(!command.wants_systemd_tools());
         assert!(!command.is_quiet());
+    }
+
+    #[test]
+    fn host_x11_requires_explicit_current_or_exact_selection() {
+        let current = parse_interactive(&arguments(&["--with-x11", "alice@demo"])).unwrap();
+        assert_eq!(current.x11, ShellX11Selection::Current);
+
+        let exact = parse_interactive(&arguments(&["alice@demo", "--with-x11=:12"])).unwrap();
+        assert_eq!(exact.x11, ShellX11Selection::Display(12));
+
+        for args in [
+            arguments(&["--with-x11=", "alice@demo"]),
+            arguments(&["--with-x11=12", "alice@demo"]),
+            arguments(&["--with-x11=:1.0", "alice@demo"]),
+            arguments(&["--with-x11=:65536", "alice@demo"]),
+            arguments(&["--with-x11", "--with-x11=:1", "alice@demo"]),
+        ] {
+            assert!(parse_interactive(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
@@ -1250,6 +1394,8 @@ mod tests {
         assert!(normalized.contains("Press Ctrl+] three times within one second to detach."));
         assert!(normalized.contains("Wayland selection falls back"));
         assert!(normalized.contains("--quiet Suppress Wayland fallback and detach notices"));
+        assert!(normalized.contains("--with-x11[=:N] Explicitly prepare Host X11 access"));
+        assert!(normalized.contains("Host X11 is never enabled implicitly."));
         assert_eq!(WAYLAND_FALLBACK_NOTICE, "🪐 Continuing without Wayland...");
     }
 

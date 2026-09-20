@@ -369,6 +369,7 @@ impl WaylandShellRequest {
 pub struct ShellOpenIntent {
     target: ShellTarget,
     wayland: WaylandShellRequest,
+    x11: Option<X11SessionContext>,
     terminal_environment: InteractiveShellEnvironment,
     command: Option<GuestCommand>,
     size: SessionSize,
@@ -384,6 +385,7 @@ impl ShellOpenIntent {
         Self {
             target,
             wayland,
+            x11: None,
             terminal_environment,
             command: None,
             size,
@@ -401,12 +403,21 @@ impl ShellOpenIntent {
         self
     }
 
+    pub fn with_x11(mut self, context: X11SessionContext) -> Self {
+        self.x11 = Some(context);
+        self
+    }
+
     pub fn target(&self) -> &ShellTarget {
         &self.target
     }
 
     pub fn wayland(&self) -> &WaylandShellRequest {
         &self.wayland
+    }
+
+    pub fn x11(&self) -> Option<&X11SessionContext> {
+        self.x11.as_ref()
     }
 
     pub fn terminal_environment(&self) -> &InteractiveShellEnvironment {
@@ -540,11 +551,43 @@ impl X11ProjectionContext {
     }
 }
 
+/// Prepared X11 access for one selected-user shell.
+///
+/// The projection is fresh runtime evidence, while construction of this
+/// context additionally means the invoking desktop user has completed the
+/// X-server ACL preparation required for this exact target.  Keeping the
+/// target alongside the evidence prevents a prepared authorization from
+/// being attached to another machine or guest account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct X11SessionContext {
+    target: ShellTarget,
+    projection: X11ProjectionContext,
+}
+
+impl X11SessionContext {
+    pub(crate) fn prepared(target: ShellTarget, projection: X11ProjectionContext) -> Self {
+        Self { target, projection }
+    }
+
+    pub fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
+    pub fn projection(&self) -> &X11ProjectionContext {
+        &self.projection
+    }
+
+    pub fn display(&self) -> u16 {
+        self.projection.host_socket().display()
+    }
+}
+
 /// Closed, feature-owned environment allowlist for `OpenMachineShell`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TypedSessionEnvironment {
     terminal: InteractiveShellEnvironment,
     wayland: Option<WaylandSessionContext>,
+    x11: Option<X11SessionContext>,
 }
 
 impl TypedSessionEnvironment {
@@ -552,6 +595,7 @@ impl TypedSessionEnvironment {
         Self {
             terminal,
             wayland: None,
+            x11: None,
         }
     }
 
@@ -562,7 +606,13 @@ impl TypedSessionEnvironment {
         Self {
             terminal,
             wayland: Some(context),
+            x11: None,
         }
+    }
+
+    pub(crate) fn with_x11(mut self, context: X11SessionContext) -> Self {
+        self.x11 = Some(context);
+        self
     }
 
     pub(crate) fn terminal_environment(&self) -> &InteractiveShellEnvironment {
@@ -571,6 +621,10 @@ impl TypedSessionEnvironment {
 
     pub(crate) fn wayland_context(&self) -> Option<&WaylandSessionContext> {
         self.wayland.as_ref()
+    }
+
+    pub(crate) fn x11_context(&self) -> Option<&X11SessionContext> {
+        self.x11.as_ref()
     }
 }
 
@@ -802,6 +856,8 @@ impl From<std::io::Error> for SessionError {
 #[derive(Debug, thiserror::Error)]
 pub enum ShellOpenError {
     #[error("{0}")]
+    X11Context(#[source] SessionError),
+    #[error("{0}")]
     WaylandPreparation(#[source] SessionError),
     #[error("{0}")]
     Terminal(#[source] SessionError),
@@ -810,7 +866,9 @@ pub enum ShellOpenError {
 impl ShellOpenError {
     pub fn session_error(&self) -> &SessionError {
         match self {
-            Self::WaylandPreparation(error) | Self::Terminal(error) => error,
+            Self::X11Context(error) | Self::WaylandPreparation(error) | Self::Terminal(error) => {
+                error
+            }
         }
     }
 }

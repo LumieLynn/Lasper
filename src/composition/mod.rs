@@ -31,12 +31,17 @@ pub(crate) struct ApplicationServices {
     pub host_operations: HostOperationTracker,
 }
 
+pub(crate) struct ProcessShellServices {
+    pub session: Arc<SessionService>,
+    pub x11_access: Arc<crate::application::x11::X11AccessService>,
+}
+
 /// Compose the process-level shell through the same authority and transport
 /// matrix as the TUI session service.
-pub(crate) fn compose_process_shell_service(
+pub(crate) fn compose_process_shell_services(
     mode: &CompositionMode,
     systemd_tools: bool,
-) -> Arc<SessionService> {
+) -> ProcessShellServices {
     let route = match mode {
         CompositionMode::Elevated(daemon) => crate::adapters::session::SessionRoute::Elevated {
             daemon: Arc::clone(daemon),
@@ -53,7 +58,17 @@ pub(crate) fn compose_process_shell_service(
             }
         }
     };
-    crate::adapters::session::compose_session_service(route)
+    let session = crate::adapters::session::compose_session_service(route);
+    let x11_endpoints = compose_x11_endpoint_discovery();
+    let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
+        Arc::clone(&session),
+        x11_endpoints,
+        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess),
+    ));
+    ProcessShellServices {
+        session,
+        x11_access,
+    }
 }
 
 pub(crate) fn compose_application_services(
@@ -234,11 +249,10 @@ pub(crate) fn compose_application_services(
     );
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service();
-    let x11_endpoints = Arc::new(crate::application::x11::X11EndpointDiscoveryService::new(
-        Arc::new(crate::adapters::platform::x11::HostX11EndpointDiscovery),
-    ));
+    let x11_endpoints = compose_x11_endpoint_discovery();
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
         Arc::clone(&session),
+        Arc::clone(&x11_endpoints),
         Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess),
     ));
     let configuration = Arc::new(
@@ -266,6 +280,12 @@ pub(crate) fn compose_application_services(
         resource_inspection,
         host_operations,
     }
+}
+
+fn compose_x11_endpoint_discovery() -> Arc<crate::application::x11::X11EndpointDiscoveryService> {
+    Arc::new(crate::application::x11::X11EndpointDiscoveryService::new(
+        Arc::new(crate::adapters::platform::x11::HostX11EndpointDiscovery),
+    ))
 }
 
 fn select_machine_session_transport(

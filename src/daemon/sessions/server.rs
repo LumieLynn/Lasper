@@ -143,6 +143,7 @@ pub(crate) async fn spawn_terminal(
             user,
             terminal,
             wayland,
+            x11_display,
             command,
         } => {
             let command = match command
@@ -165,34 +166,44 @@ pub(crate) async fn spawn_terminal(
                 crate::adapters::config::NspawnConfigStore::direct(),
                 invoking_uid,
             );
-            let environment = match wayland {
+            let wayland_context = match wayland {
                 Some(host_socket) => {
                     let result = resolver
                         .prepare(crate::application::sessions::WaylandPreparationRequest {
                             probe_id: next_probe_id(),
                             target,
-                            host_socket,
+                            host_socket: *host_socket,
                         })
                         .await;
                     match result {
-                        Ok(context) => {
-                            crate::application::sessions::TypedSessionEnvironment::wayland(
-                                (*terminal).clone(),
-                                context,
-                            )
-                        }
+                        Ok(context) => Some(context),
                         Err(error) => {
                             send_session_error(&stream, "Wayland shell validation failed", &error);
                             return;
                         }
                     }
                 }
-                None => crate::application::sessions::TypedSessionEnvironment::terminal(*terminal),
+                None => None,
             };
-            let environment = match resolver.environment(&environment).await {
-                Ok(environment) => environment,
+            let wayland_display = match resolver.guest_display(wayland_context.as_ref()).await {
+                Ok(display) => display,
                 Err(error) => {
                     send_session_error(&stream, "Wayland environment validation failed", &error);
+                    return;
+                }
+            };
+            let environment = match crate::adapters::session::MachineShellEnvironment::shell(
+                *terminal,
+                wayland_display.as_deref(),
+                x11_display,
+            ) {
+                Ok(environment) => environment,
+                Err(error) => {
+                    send_session_error(
+                        &stream,
+                        "selected-user shell environment validation failed",
+                        &error,
+                    );
                     return;
                 }
             };

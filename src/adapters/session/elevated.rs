@@ -57,14 +57,32 @@ impl SessionPort for ElevatedSessionAdapter {
                 user,
                 environment,
                 command,
-            } => WireTerminalLaunch::SelectedUserShell {
-                user,
-                terminal: Box::new(environment.terminal_environment().clone()),
-                wayland: environment
-                    .wayland_context()
-                    .map(|context| context.host_socket().clone()),
-                command: command.map(Into::into),
-            },
+            } => {
+                let x11_display = match environment.x11_context() {
+                    Some(context) => {
+                        crate::adapters::platform::x11::revalidate_for_desktop(
+                            context.projection().host_socket(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            SessionError::new(format!(
+                                "revalidate prepared X11 display before elevated shell: {error}"
+                            ))
+                        })?;
+                        Some(context.display())
+                    }
+                    None => None,
+                };
+                WireTerminalLaunch::SelectedUserShell {
+                    user,
+                    terminal: Box::new(environment.terminal_environment().clone()),
+                    wayland: environment
+                        .wayland_context()
+                        .map(|context| Box::new(context.host_socket().clone())),
+                    x11_display,
+                    command: command.map(Into::into),
+                }
+            }
         };
         let spawned = self
             .daemon

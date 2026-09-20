@@ -69,8 +69,40 @@ impl SessionPort for DirectSessionAdapter {
                 environment,
                 command,
             } => {
-                self.wayland
-                    .open_selected_user_shell(id, machine, user, *environment, command, size)
+                let wayland_display = self
+                    .wayland
+                    .guest_display(environment.wayland_context())
+                    .await?;
+                let x11_display = match environment.x11_context() {
+                    Some(context) => {
+                        crate::adapters::platform::x11::revalidate_for_desktop(
+                            context.projection().host_socket(),
+                        )
+                        .await
+                        .map_err(|error| {
+                            SessionError::new(format!(
+                                "revalidate prepared X11 display before opening shell: {error}"
+                            ))
+                        })?;
+                        Some(context.display())
+                    }
+                    None => None,
+                };
+                let shell_environment = super::MachineShellEnvironment::shell(
+                    environment.terminal_environment().clone(),
+                    wayland_display.as_deref(),
+                    x11_display,
+                )
+                .map_err(|error| {
+                    SessionError::new(format!("build selected-user shell environment: {error}"))
+                })?;
+                let request = super::MachineShellRequest::new(machine, user, shell_environment);
+                let request = match command {
+                    Some(command) => request.with_command(command),
+                    None => request,
+                };
+                self.machine
+                    .open_local(super::MachineSessionRequest::shell(request), id, size)
                     .await
             }
             // Root may attach by namespace when the guest has no bus. Native

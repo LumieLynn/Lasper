@@ -87,8 +87,8 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
             std::process::exit(1);
         }
     };
-    let sessions = crate::composition::compose_process_shell_service(&mode, systemd_tools);
-    let code = crate::cli::run_shell(command, &sessions).await;
+    let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
+    let code = crate::cli::run_shell(command, &services.session, &services.x11_access).await;
     if let Some(daemon) = daemon {
         daemon.exit().await;
     }

@@ -9,7 +9,7 @@ pub use contract::{
     SessionError, SessionPort, SessionSendStatus, ShellOpenError, ShellOpenIntent, ShellTarget,
     TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest, ValidatedGuestUserName,
     WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest, X11FilesystemAccess,
-    X11ProjectionContext, X11ProjectionProbeRequest,
+    X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
 };
 pub use service::SessionService;
 

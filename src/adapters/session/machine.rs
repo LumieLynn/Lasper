@@ -22,16 +22,19 @@ const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4096;
 pub(crate) struct MachineShellEnvironment {
     terminal: InteractiveShellEnvironment,
     wayland_display: Option<String>,
+    x11_display: Option<u16>,
 }
 
 impl MachineShellEnvironment {
     pub(crate) fn shell(
         terminal: InteractiveShellEnvironment,
-        display: Option<&Path>,
+        wayland_display: Option<&Path>,
+        x11_display: Option<u16>,
     ) -> Result<Self, MachineShellEnvironmentError> {
         Ok(Self {
             terminal,
-            wayland_display: display.map(validate_absolute_path).transpose()?,
+            wayland_display: wayland_display.map(validate_absolute_path).transpose()?,
+            x11_display,
         })
     }
 
@@ -45,6 +48,9 @@ impl MachineShellEnvironment {
         }
         if let Some(display) = &self.wayland_display {
             assignments.push(format!("WAYLAND_DISPLAY={display}"));
+        }
+        if let Some(display) = self.x11_display {
+            assignments.push(format!("DISPLAY=:{display}"));
         }
         assignments
     }
@@ -322,6 +328,7 @@ mod tests {
         let environment = MachineShellEnvironment::shell(
             terminal,
             Some(Path::new("/run/lasper/wayland/1000/wayland-0")),
+            Some(1),
         )
         .unwrap();
         assert_eq!(
@@ -331,10 +338,11 @@ mod tests {
                 "COLORTERM=truecolor",
                 "NO_COLOR=",
                 "WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0",
+                "DISPLAY=:1",
             ]
         );
         assert_eq!(
-            MachineShellEnvironment::shell(InteractiveShellEnvironment::default(), None)
+            MachineShellEnvironment::shell(InteractiveShellEnvironment::default(), None, None)
                 .unwrap()
                 .assignments(),
             ["TERM=dumb"]
@@ -347,6 +355,7 @@ mod tests {
             assert!(MachineShellEnvironment::shell(
                 InteractiveShellEnvironment::default(),
                 Some(Path::new(path)),
+                None,
             )
             .is_err());
         }

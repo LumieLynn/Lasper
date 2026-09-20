@@ -107,7 +107,12 @@ pub(crate) enum WireTerminalLaunch {
         user: ValidatedGuestUserName,
         terminal: Box<InteractiveShellEnvironment>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        wayland: Option<HostWaylandSocket>,
+        wayland: Option<Box<HostWaylandSocket>>,
+        /// Display number from a user-side prepared X11 session context.
+        /// The privileged daemon may inject `DISPLAY`, but never queries or
+        /// mutates the invoking user's X server ACL.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        x11_display: Option<u16>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         command: Option<WireGuestCommand>,
     },
@@ -367,6 +372,7 @@ mod tests {
             user: ValidatedGuestUserName::new("alice").unwrap(),
             terminal: Box::new(InteractiveShellEnvironment::default()),
             wayland: None,
+            x11_display: Some(1),
             command: Some(
                 GuestCommand::new("/usr/bin/kitty", vec!["--single-instance".into()])
                     .unwrap()
@@ -378,6 +384,7 @@ mod tests {
             encoded["command"]["program"],
             serde_json::Value::String("/usr/bin/kitty".into())
         );
+        assert_eq!(encoded["x11_display"], serde_json::json!(1));
 
         assert!(
             serde_json::from_value::<WireTerminalLaunch>(serde_json::json!({

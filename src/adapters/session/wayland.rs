@@ -3,13 +3,10 @@
 
 use super::wayland_probe::WaylandProbeRequest;
 use super::wayland_probe::{WaylandProbeObservation, WaylandTargetAccess};
-use super::{
-    MachineSessionRequest, MachineSessionTransport, MachineShellEnvironment, MachineShellRequest,
-};
+use super::{MachineSessionRequest, MachineSessionTransport};
 use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
-    GuestCommand, SessionError, TerminalSessionHandle, TypedSessionEnvironment,
-    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext,
+    SessionError, TerminalSessionHandle, WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -92,40 +89,17 @@ impl WaylandSessionResolver {
         automatic_wayland(&self.nspawn, machine).await
     }
 
-    pub(crate) async fn environment(
+    pub(crate) async fn guest_display(
         &self,
-        environment: &TypedSessionEnvironment,
-    ) -> Result<MachineShellEnvironment, SessionError> {
-        let display = match environment.wayland_context() {
+        context: Option<&WaylandSessionContext>,
+    ) -> Result<Option<std::path::PathBuf>, SessionError> {
+        match context {
             Some(context) => {
                 revalidate_host_socket(context.host_socket(), self.authorized_uid).await?;
-                Some(context.guest_socket())
+                Ok(Some(context.guest_socket().to_path_buf()))
             }
-            None => None,
-        };
-        MachineShellEnvironment::shell(environment.terminal_environment().clone(), display).map_err(
-            |error| SessionError::new(format!("build selected-user shell environment: {error}")),
-        )
-    }
-
-    pub(crate) async fn open_selected_user_shell(
-        &self,
-        id: SessionId,
-        machine: MachineName,
-        user: ValidatedGuestUserName,
-        environment: TypedSessionEnvironment,
-        command: Option<GuestCommand>,
-        size: SessionSize,
-    ) -> Result<TerminalSessionHandle, SessionError> {
-        let shell_environment = self.environment(&environment).await?;
-        let request = MachineShellRequest::new(machine, user, shell_environment);
-        let request = match command {
-            Some(command) => request.with_command(command),
-            None => request,
-        };
-        self.machine
-            .open_local(MachineSessionRequest::shell(request), id, size)
-            .await
+            None => Ok(None),
+        }
     }
 }
 
