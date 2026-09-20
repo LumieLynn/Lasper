@@ -87,6 +87,14 @@ impl X11AclEntry {
         Self { family, address }
     }
 
+    pub(crate) const fn family(&self) -> u8 {
+        self.family
+    }
+
+    pub(crate) fn address(&self) -> &[u8] {
+        &self.address
+    }
+
     pub fn server_interpreted(&self) -> Option<(&str, &str)> {
         if self.family != SERVER_INTERPRETED_FAMILY {
             return None;
@@ -406,6 +414,49 @@ pub enum X11AuthorizationDisposition {
 pub enum X11RevocationDisposition {
     Revoked { record_id: String },
     AlreadyAbsent { record_id: String },
+}
+
+/// Result of one bounded machine-lifecycle reconcile pass for one live X11
+/// endpoint. A pending ID means the machine registration has disappeared but
+/// the grace/revalidation state is not yet sufficient to revoke its ACL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11ReconcileReport {
+    display: u16,
+    revoked_record_ids: Vec<String>,
+    pending_record_ids: Vec<String>,
+    diagnostics: Vec<String>,
+}
+
+impl X11ReconcileReport {
+    pub(crate) fn new(
+        display: u16,
+        revoked_record_ids: Vec<String>,
+        pending_record_ids: Vec<String>,
+        diagnostics: Vec<String>,
+    ) -> Self {
+        Self {
+            display,
+            revoked_record_ids,
+            pending_record_ids,
+            diagnostics,
+        }
+    }
+
+    pub(crate) const fn display(&self) -> u16 {
+        self.display
+    }
+
+    pub(crate) fn revoked_record_ids(&self) -> &[String] {
+        &self.revoked_record_ids
+    }
+
+    pub(crate) fn pending_record_ids(&self) -> &[String] {
+        &self.pending_record_ids
+    }
+
+    pub(crate) fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -776,6 +827,15 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
         &self,
         request: &X11RevokeRequest,
     ) -> Result<X11DesktopRevocation, X11DesktopAccessError>;
+
+    async fn reconcile(
+        &self,
+        _socket: &HostX11Socket,
+    ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
+        Err(X11DesktopAccessError::new(
+            "X11 lifecycle reconcile is not available on this desktop access adapter",
+        ))
+    }
 }
 
 /// Combines runtime namespace evidence with a caller-owned X server query.
@@ -994,6 +1054,39 @@ impl X11AccessService {
             ),
             disposition: desktop.disposition,
         })
+    }
+
+    /// Run one bounded, system-scope machine claim reconcile pass. The
+    /// endpoint catalog is discovered in the invoking desktop process; the
+    /// adapter only receives verified live X11 endpoints and never receives a
+    /// target user-scope machine selector. Endpoint-local failures are
+    /// returned as diagnostics so one broken display cannot prevent cleanup on
+    /// another display.
+    pub(crate) async fn reconcile(&self) -> Result<Vec<X11ReconcileReport>, X11AccessError> {
+        let catalog = self.endpoints.discover(&[]).await;
+        if catalog.sockets.is_empty() {
+            return Err(X11AccessError::Selection(
+                catalog
+                    .diagnostics
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "no live local X11 endpoint was discovered".into()),
+            ));
+        }
+        let mut reports = Vec::with_capacity(catalog.sockets.len());
+        for socket in catalog.sockets {
+            let report = match self.desktop.reconcile(&socket).await {
+                Ok(report) => report,
+                Err(error) => X11ReconcileReport::new(
+                    socket.display(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![error.to_string()],
+                ),
+            };
+            reports.push(report);
+        }
+        Ok(reports)
     }
 }
 
@@ -1478,6 +1571,7 @@ mod tests {
     struct RecordingDesktopPort {
         snapshots: AtomicUsize,
         ensures: AtomicUsize,
+        reconciles: AtomicUsize,
         purposes: Mutex<Vec<X11AuthorizationPurpose>>,
     }
 
@@ -1530,6 +1624,19 @@ mod tests {
         ) -> Result<X11DesktopRevocation, X11DesktopAccessError> {
             panic!("X11 preparation must not revoke access")
         }
+
+        async fn reconcile(
+            &self,
+            socket: &HostX11Socket,
+        ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
+            self.reconciles.fetch_add(1, Ordering::Relaxed);
+            Ok(X11ReconcileReport::new(
+                socket.display(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ))
+        }
     }
 
     #[tokio::test]
@@ -1548,6 +1655,7 @@ mod tests {
         let desktop = Arc::new(RecordingDesktopPort {
             snapshots: AtomicUsize::new(0),
             ensures: AtomicUsize::new(0),
+            reconciles: AtomicUsize::new(0),
             purposes: Mutex::new(Vec::new()),
         });
         let service = X11AccessService::new(sessions, endpoints, desktop.clone());
@@ -1569,6 +1677,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_reconcile_routes_each_discovered_local_endpoint() {
+        let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
+            probes: Mutex::new(Vec::new()),
+        })));
+        let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+            StaticEndpointPort(X11EndpointCatalog {
+                sockets: vec![host_socket(0, false, 2), host_socket(1, false, 4)],
+                preferred_display: Some(0),
+                ..Default::default()
+            }),
+        )));
+        let desktop = Arc::new(RecordingDesktopPort {
+            snapshots: AtomicUsize::new(0),
+            ensures: AtomicUsize::new(0),
+            reconciles: AtomicUsize::new(0),
+            purposes: Mutex::new(Vec::new()),
+        });
+        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
+
+        let reports = service.reconcile().await.unwrap();
+
+        assert_eq!(
+            reports
+                .iter()
+                .map(X11ReconcileReport::display)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
     async fn session_preview_is_read_only_and_uses_the_selected_projection() {
         let projection_port = Arc::new(ProjectionPort {
             probes: Mutex::new(Vec::new()),
@@ -1584,6 +1724,7 @@ mod tests {
         let desktop = Arc::new(RecordingDesktopPort {
             snapshots: AtomicUsize::new(0),
             ensures: AtomicUsize::new(0),
+            reconciles: AtomicUsize::new(0),
             purposes: Mutex::new(Vec::new()),
         });
         let service = X11AccessService::new(sessions, endpoints, desktop.clone());
@@ -1618,6 +1759,7 @@ mod tests {
         let desktop = Arc::new(RecordingDesktopPort {
             snapshots: AtomicUsize::new(0),
             ensures: AtomicUsize::new(0),
+            reconciles: AtomicUsize::new(0),
             purposes: Mutex::new(Vec::new()),
         });
         let service = X11AccessService::new(sessions, endpoints, desktop.clone());

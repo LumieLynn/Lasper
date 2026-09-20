@@ -22,8 +22,8 @@ use crate::application::x11::{
     X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationPurpose,
     X11AuthorizationRequest, X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization,
     X11DesktopObservation, X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort,
-    X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition,
-    X11RevokeRequest, X11SourceObservation, X11SourceState,
+    X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase, X11ReconcileReport,
+    X11RevocationDisposition, X11RevokeRequest, X11SourceObservation, X11SourceState,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
@@ -103,6 +103,19 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!("X11 revocation task failed: {error}"))
+            })?
+            .map_err(X11DesktopAccessError::new)
+    }
+
+    async fn reconcile(
+        &self,
+        socket: &HostX11Socket,
+    ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
+        let socket = socket.clone();
+        tokio::task::spawn_blocking(move || reconcile_sync(&socket))
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!("X11 reconcile task failed: {error}"))
             })?
             .map_err(X11DesktopAccessError::new)
     }
@@ -657,6 +670,21 @@ impl ManagedX11GrantKey {
         }
     }
 
+    fn from_evidence(record: &X11GrantRecordEvidence) -> Self {
+        Self {
+            host_uid: record.identity.host_uid(),
+            display: record.display,
+            alternate_endpoint: record.alternate_endpoint,
+            source: record.source.clone(),
+            canonical_source: record.canonical_source.clone(),
+            socket_revision: record.socket_revision,
+            server_peer: record.server_peer,
+            server_peer_start_time: record.server_peer_start_time,
+            acl_family: record.acl_entry.family(),
+            acl_address: record.acl_entry.address().to_vec(),
+        }
+    }
+
     fn validate(&self) -> Result<(), String> {
         let expected_source = Path::new(X11_SOCKET_DIRECTORY).join(format!(
             "X{}{}",
@@ -1155,6 +1183,22 @@ enum SystemMachineRegistration {
 /// never consults the desktop user's runtime machine directory: claims on
 /// this branch belong to system-scope nspawn machines.
 fn system_machine_registration(machine: &str) -> SystemMachineRegistration {
+    let state_dir = crate::paths::runtime_machines_dir();
+    match fs::symlink_metadata(&state_dir) {
+        Ok(metadata) if metadata.file_type().is_dir() => {}
+        Ok(_) => {
+            return SystemMachineRegistration::Unknown(format!(
+                "system machined runtime path is not a directory: {}",
+                state_dir.display()
+            ));
+        }
+        Err(error) => {
+            return SystemMachineRegistration::Unknown(format!(
+                "cannot inspect system machined runtime directory {}: {error}",
+                state_dir.display()
+            ));
+        }
+    }
     let path = crate::paths::runtime_machine_state(machine);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => SystemMachineRegistration::Present,
@@ -1306,6 +1350,388 @@ fn machine_claim_diagnostics(
         }
     }
     diagnostics
+}
+
+#[derive(Clone, Debug)]
+enum ReconcileClaimStatus {
+    Active,
+    Pending,
+    Ready,
+    Blocked(String),
+}
+
+#[derive(Clone, Debug)]
+struct ReconcileClaim {
+    claim_id: String,
+    record_id: String,
+    key: ManagedX11GrantKey,
+    status: ReconcileClaimStatus,
+}
+
+#[derive(Clone, Debug)]
+struct ReconcileGroup {
+    key: ManagedX11GrantKey,
+    claims: Vec<ReconcileClaim>,
+}
+
+impl ReconcileGroup {
+    fn new(claim: ReconcileClaim) -> Self {
+        Self {
+            key: claim.key.clone(),
+            claims: vec![claim],
+        }
+    }
+
+    fn add(&mut self, claim: ReconcileClaim) {
+        self.claims.push(claim);
+    }
+
+    fn blocked(&self) -> bool {
+        self.claims.iter().any(|claim| {
+            matches!(
+                &claim.status,
+                ReconcileClaimStatus::Active | ReconcileClaimStatus::Blocked(_)
+            )
+        })
+    }
+
+    fn pending(&self) -> bool {
+        self.claims
+            .iter()
+            .any(|claim| matches!(&claim.status, ReconcileClaimStatus::Pending))
+    }
+
+    fn ready(&self) -> bool {
+        !self.claims.is_empty()
+            && self
+                .claims
+                .iter()
+                .all(|claim| matches!(&claim.status, ReconcileClaimStatus::Ready))
+    }
+}
+
+fn claim_key_matches_socket(
+    key: &ManagedX11GrantKey,
+    socket: &HostX11Socket,
+    server_peer_start_time: u64,
+) -> bool {
+    key.display == socket.display()
+        && key.alternate_endpoint == socket.alternate()
+        && key.source == socket.source()
+        && key.canonical_source == socket.canonical_path()
+        && key.socket_revision == socket.revision()
+        && key.server_peer == socket.peer_identity()
+        && key.server_peer_start_time == server_peer_start_time
+}
+
+fn mark_claim_phase_sync(
+    state: &X11RuntimeState,
+    claim: &ManagedX11MachineClaim,
+    phase: MachineClaimPhase,
+) -> Result<(), String> {
+    let mut updated = claim.clone();
+    updated.phase = phase;
+    state.write_claim(&updated)
+}
+
+fn mark_record_phase_sync(
+    state: &X11RuntimeState,
+    record_id: &str,
+    phase: GrantRecordPhase,
+) -> Result<(), String> {
+    let file_name = format!("grant-{record_id}.json");
+    let file = state
+        .grants
+        .read_bounded(&file_name, MAX_GRANT_RECORD_BYTES)
+        .map_err(|error| format!("read X11 grant record {record_id}: {error}"))?
+        .ok_or_else(|| format!("X11 grant record {record_id} does not exist"))?;
+    if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
+        return Err(format!(
+            "X11 grant record {record_id} is not owned by the invoking user"
+        ));
+    }
+    let mut record: ManagedX11GrantRecord = serde_json::from_slice(&file.bytes)
+        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+    record
+        .clone()
+        .into_evidence(&file_name)
+        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+    record.phase = phase;
+    state.write(&file_name, &record)
+}
+
+fn push_reconcile_diagnostic(diagnostics: &mut Vec<String>, message: impl Into<String>) {
+    if diagnostics.len() < MAX_GRANT_DIAGNOSTICS {
+        diagnostics.push(message.into());
+    }
+}
+
+fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileReport, String> {
+    let Some(state) = X11RuntimeState::open_existing()? else {
+        return Ok(X11ReconcileReport::new(
+            socket.display(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    };
+    let _lock = state.lock()?;
+    let claims = state.load_claims();
+    if !claims.complete {
+        return Err(claims
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 machine claim set is incomplete".into()));
+    }
+    let records = state.load_records();
+    if !records.complete {
+        return Err(records
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 grant record set is incomplete".into()));
+    }
+    if claims.claims.is_empty() {
+        return Ok(X11ReconcileReport::new(
+            socket.display(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+
+    let current_socket = inspect_endpoint_peer_only(
+        socket.display(),
+        socket.alternate(),
+        socket.source().to_path_buf(),
+    )?;
+    if current_socket != *socket {
+        return Err(format!(
+            "{} changed before X11 lifecycle reconcile",
+            socket.source().display()
+        ));
+    }
+    let server_peer_start_time = x11_peer_start_time(socket)?;
+    let current_boot_id = host_boot_id()?;
+    let now = unix_millis()?;
+    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let mut acl = read_acl(&connection, socket.display())?;
+    require_current_socket(socket, "before X11 lifecycle reconcile")?;
+    if !matches!(
+        acl.mode(),
+        crate::application::x11::X11AccessControlMode::Enabled
+    ) {
+        return Err("X11 ACL lifecycle reconcile requires enabled access control".into());
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut groups = Vec::<ReconcileGroup>::new();
+    for claim in claims.claims.iter() {
+        if !claim_key_matches_socket(&claim.key, socket, server_peer_start_time) {
+            continue;
+        }
+        let status = match &claim.phase {
+            MachineClaimPhase::Ended => continue,
+            MachineClaimPhase::NeedsReview { reason } => {
+                ReconcileClaimStatus::Blocked(reason.clone())
+            }
+            MachineClaimPhase::Unknown { reason } => ReconcileClaimStatus::Blocked(reason.clone()),
+            MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. } => {
+                let registration = system_machine_registration(&claim.machine);
+                match observe_machine_claim(
+                    claim,
+                    Some(current_boot_id.as_str()),
+                    registration,
+                    now,
+                ) {
+                    Some(MachineClaimObservation::Active) => ReconcileClaimStatus::Active,
+                    Some(MachineClaimObservation::EndedCandidate) => {
+                        let phase = MachineClaimPhase::CleanupPending {
+                            since_unix_millis: now,
+                        };
+                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
+                            ReconcileClaimStatus::Blocked(format!(
+                                "could not persist cleanup-pending state: {error}"
+                            ))
+                        } else {
+                            ReconcileClaimStatus::Pending
+                        }
+                    }
+                    Some(MachineClaimObservation::CleanupPending { .. }) => {
+                        ReconcileClaimStatus::Pending
+                    }
+                    Some(MachineClaimObservation::CleanupReady) => ReconcileClaimStatus::Ready,
+                    Some(MachineClaimObservation::NeedsReview(reason)) => {
+                        let phase = MachineClaimPhase::NeedsReview {
+                            reason: reason.clone(),
+                        };
+                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
+                            ReconcileClaimStatus::Blocked(format!(
+                                "{reason}; could not persist review state: {error}"
+                            ))
+                        } else {
+                            ReconcileClaimStatus::Blocked(reason)
+                        }
+                    }
+                    Some(MachineClaimObservation::Unknown(reason)) => {
+                        let phase = MachineClaimPhase::Unknown {
+                            reason: reason.clone(),
+                        };
+                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
+                            ReconcileClaimStatus::Blocked(format!(
+                                "{reason}; could not persist unknown state: {error}"
+                            ))
+                        } else {
+                            ReconcileClaimStatus::Blocked(reason)
+                        }
+                    }
+                    None => ReconcileClaimStatus::Blocked(
+                        "machine claim lifecycle could not be observed".into(),
+                    ),
+                }
+            }
+        };
+        let reconcile_claim = ReconcileClaim {
+            claim_id: claim.claim_id.clone(),
+            record_id: claim.grant_record_id.clone(),
+            key: claim.key.clone(),
+            status,
+        };
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.key == reconcile_claim.key)
+        {
+            group.add(reconcile_claim);
+        } else {
+            groups.push(ReconcileGroup::new(reconcile_claim));
+        }
+    }
+
+    let mut revoked_record_ids = Vec::new();
+    let mut pending_record_ids = Vec::new();
+    for group in groups {
+        for claim in &group.claims {
+            if let ReconcileClaimStatus::Blocked(reason) = &claim.status {
+                push_reconcile_diagnostic(
+                    &mut diagnostics,
+                    format!(
+                        "claim {} not eligible for cleanup: {reason}",
+                        claim.claim_id
+                    ),
+                );
+            }
+            if matches!(&claim.status, ReconcileClaimStatus::Pending) {
+                pending_record_ids.push(claim.record_id.clone());
+            }
+        }
+        if group.blocked() {
+            continue;
+        }
+        if group.pending() {
+            continue;
+        }
+        if !group.ready() {
+            continue;
+        }
+
+        let mut matching_records = Vec::new();
+        let mut invalid_record = None;
+        for claim in &group.claims {
+            let Some(record) = records.records.iter().find(|record| {
+                record.record_id == claim.record_id
+                    && matches!(&record.phase, X11GrantRecordPhase::ConfirmedAdded)
+                    && ManagedX11GrantKey::from_evidence(record) == group.key
+            }) else {
+                invalid_record = Some(format!(
+                    "claim {} has no matching confirmed grant record",
+                    claim.claim_id
+                ));
+                break;
+            };
+            matching_records.push(record);
+        }
+        if let Some(reason) = invalid_record {
+            push_reconcile_diagnostic(&mut diagnostics, reason);
+            continue;
+        }
+
+        let acl_entry = X11AclEntry::from_wire(group.key.acl_family, group.key.acl_address.clone());
+        if acl.contains(&acl_entry) {
+            let (change, observed) =
+                remove_and_observe(&connection, socket.display(), group.key.host_uid);
+            let socket_result = require_current_socket(socket, "while revoking a stopped machine");
+            let server_result = x11_peer_start_time(socket).and_then(|current| {
+                (current == server_peer_start_time)
+                    .then_some(())
+                    .ok_or_else(|| {
+                        "X11 server process changed while revoking a stopped machine".to_owned()
+                    })
+            });
+            if change.is_err() || socket_result.is_err() || server_result.is_err() {
+                let reason = [
+                    change.err(),
+                    observed
+                        .err()
+                        .map(|error| format!("ACL confirmation: {error}")),
+                    socket_result.err(),
+                    server_result
+                        .err()
+                        .map(|error| format!("server generation: {error}")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+                for claim in &group.claims {
+                    let _ = mark_claim_phase_sync(
+                        &state,
+                        claims
+                            .claims
+                            .iter()
+                            .find(|candidate| candidate.claim_id == claim.claim_id)
+                            .expect("reconcile claim came from catalog"),
+                        MachineClaimPhase::Unknown {
+                            reason: reason.clone(),
+                        },
+                    );
+                }
+                push_reconcile_diagnostic(
+                    &mut diagnostics,
+                    format!("X11 revoke outcome is unknown: {reason}"),
+                );
+                continue;
+            }
+            acl = observed?;
+            if acl.contains(&acl_entry) {
+                push_reconcile_diagnostic(
+                    &mut diagnostics,
+                    "exact X11 ACL entry remained after stopped-machine revoke".to_owned(),
+                );
+                continue;
+            }
+        }
+
+        for record in matching_records {
+            mark_record_phase_sync(&state, &record.record_id, GrantRecordPhase::Revoked)?;
+            revoked_record_ids.push(record.record_id.clone());
+        }
+        for claim in &group.claims {
+            let original = claims
+                .claims
+                .iter()
+                .find(|candidate| candidate.claim_id == claim.claim_id)
+                .expect("reconcile claim came from catalog");
+            mark_claim_phase_sync(&state, original, MachineClaimPhase::Ended)?;
+        }
+    }
+
+    Ok(X11ReconcileReport::new(
+        socket.display(),
+        revoked_record_ids,
+        pending_record_ids,
+        diagnostics,
+    ))
 }
 
 fn bounded_record_diagnostic(message: &str) -> String {

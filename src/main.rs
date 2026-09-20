@@ -88,6 +88,11 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
         }
     };
     let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
+    if command.requests_x11() {
+        if let Err(error) = services.x11_access.reconcile().await {
+            log::debug!("X11 lifecycle reconcile unavailable before shell: {error}");
+        }
+    }
     let code = crate::cli::run_shell(command, &services.session, &services.x11_access).await;
     if let Some(daemon) = daemon {
         daemon.exit().await;
@@ -149,6 +154,37 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     let log_buffer_lines = app_settings.log_buffer_lines;
     let services =
         crate::composition::compose_application_services(composition_mode, want_systemd_tools);
+    match services.x11_access.reconcile().await {
+        Ok(reports) => {
+            for report in reports {
+                if !report.revoked_record_ids().is_empty()
+                    || !report.pending_record_ids().is_empty()
+                    || !report.diagnostics().is_empty()
+                {
+                    log::debug!(
+                        "X11 lifecycle reconcile for :{}: revoked={}, pending={}, diagnostics={}",
+                        report.display(),
+                        report.revoked_record_ids().len(),
+                        report.pending_record_ids().len(),
+                        report.diagnostics().len(),
+                    );
+                    for diagnostic in report.diagnostics() {
+                        log::debug!(
+                            "X11 lifecycle reconcile :{}: {diagnostic}",
+                            report.display()
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            // Reconcile is deliberately best-effort at startup.  A missing
+            // local X server or an unavailable machine observation must not
+            // prevent the TUI from managing machines; the next activation or
+            // explicit X11 operation can retry the bounded pass.
+            log::debug!("X11 lifecycle reconcile unavailable at startup: {error}");
+        }
+    }
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
         None
     } else {

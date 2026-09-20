@@ -83,6 +83,10 @@ impl ShellCommand {
     pub(crate) const fn is_quiet(&self) -> bool {
         self.quiet
     }
+
+    pub(crate) const fn requests_x11(&self) -> bool {
+        !matches!(self.x11, ShellX11Selection::Disabled)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
