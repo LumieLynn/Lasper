@@ -42,6 +42,7 @@ const MAX_GRANT_REASON_BYTES: usize = 2048;
 const MACHINE_CLAIM_VERSION: u32 = 1;
 const MAX_MACHINE_CLAIMS: usize = 256;
 const MAX_MACHINE_CLAIM_BYTES: usize = 16 * 1024;
+const CLAIM_RECONCILE_GRACE_MILLIS: u64 = 2_000;
 
 type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32));
 
@@ -685,10 +686,11 @@ impl ManagedX11GrantKey {
     }
 }
 
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
 enum MachineClaimPhase {
     Active,
+    CleanupPending { since_unix_millis: u64 },
     Ended,
     NeedsReview { reason: String },
     Unknown { reason: String },
@@ -776,6 +778,11 @@ impl ManagedX11MachineClaim {
                 || reason.chars().any(char::is_control)
             {
                 return Err("machine claim state reason is invalid".into());
+            }
+        }
+        if let MachineClaimPhase::CleanupPending { since_unix_millis } = self.phase {
+            if since_unix_millis == 0 {
+                return Err("machine claim cleanup-pending timestamp is invalid".into());
             }
         }
         Ok(())
@@ -1169,6 +1176,8 @@ fn system_machine_registration(machine: &str) -> SystemMachineRegistration {
 enum MachineClaimObservation {
     Active,
     EndedCandidate,
+    CleanupPending { since_unix_millis: u64 },
+    CleanupReady,
     NeedsReview(String),
     Unknown(String),
 }
@@ -1177,8 +1186,12 @@ fn observe_machine_claim(
     claim: &ManagedX11MachineClaim,
     current_boot_id: Option<&str>,
     registration: SystemMachineRegistration,
+    now_unix_millis: u64,
 ) -> Option<MachineClaimObservation> {
-    if !matches!(&claim.phase, MachineClaimPhase::Active) {
+    if !matches!(
+        &claim.phase,
+        MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. }
+    ) {
         return None;
     }
     let Some(current_boot_id) = current_boot_id else {
@@ -1191,11 +1204,62 @@ fn observe_machine_claim(
             "claim belongs to an earlier host boot".into(),
         ));
     }
-    Some(match registration {
-        SystemMachineRegistration::Present => MachineClaimObservation::Active,
-        SystemMachineRegistration::Absent => MachineClaimObservation::EndedCandidate,
-        SystemMachineRegistration::Unknown(reason) => MachineClaimObservation::Unknown(reason),
-    })
+    match (&claim.phase, registration) {
+        (MachineClaimPhase::Active, SystemMachineRegistration::Present) => {
+            Some(MachineClaimObservation::Active)
+        }
+        (MachineClaimPhase::Active, SystemMachineRegistration::Absent) => {
+            Some(MachineClaimObservation::EndedCandidate)
+        }
+        (MachineClaimPhase::Active, SystemMachineRegistration::Unknown(reason)) => {
+            Some(MachineClaimObservation::Unknown(reason))
+        }
+        (MachineClaimPhase::CleanupPending { .. }, SystemMachineRegistration::Present) => {
+            Some(MachineClaimObservation::NeedsReview(
+                "machine registration reappeared before cleanup; explicit preparation is required"
+                    .into(),
+            ))
+        }
+        (
+            MachineClaimPhase::CleanupPending { since_unix_millis },
+            SystemMachineRegistration::Absent,
+        ) => Some(
+            if now_unix_millis.saturating_sub(*since_unix_millis) >= CLAIM_RECONCILE_GRACE_MILLIS {
+                MachineClaimObservation::CleanupReady
+            } else {
+                MachineClaimObservation::CleanupPending {
+                    since_unix_millis: *since_unix_millis,
+                }
+            },
+        ),
+        (
+            MachineClaimPhase::CleanupPending {
+                since_unix_millis: _,
+            },
+            SystemMachineRegistration::Unknown(reason),
+        ) => Some(MachineClaimObservation::Unknown(reason)),
+        _ => None,
+    }
+}
+
+fn proposed_claim_phase(
+    claim: &ManagedX11MachineClaim,
+    current_boot_id: Option<&str>,
+    registration: SystemMachineRegistration,
+    now_unix_millis: u64,
+) -> Option<MachineClaimPhase> {
+    match observe_machine_claim(claim, current_boot_id, registration, now_unix_millis)? {
+        MachineClaimObservation::Active
+        | MachineClaimObservation::CleanupPending { .. }
+        | MachineClaimObservation::CleanupReady => None,
+        MachineClaimObservation::EndedCandidate => Some(MachineClaimPhase::CleanupPending {
+            since_unix_millis: now_unix_millis,
+        }),
+        MachineClaimObservation::NeedsReview(reason) => {
+            Some(MachineClaimPhase::NeedsReview { reason })
+        }
+        MachineClaimObservation::Unknown(reason) => Some(MachineClaimPhase::Unknown { reason }),
+    }
 }
 
 fn machine_claim_diagnostics(
@@ -1203,22 +1267,37 @@ fn machine_claim_diagnostics(
     current_boot_id: Option<&str>,
 ) -> Vec<String> {
     let mut diagnostics = claims.diagnostics.clone();
+    let now = unix_millis().unwrap_or(0);
     for claim in &claims.claims {
-        let Some(observation) = observe_machine_claim(
-            claim,
-            current_boot_id,
-            system_machine_registration(&claim.machine),
-        ) else {
+        let registration = system_machine_registration(&claim.machine);
+        let proposed = proposed_claim_phase(claim, current_boot_id, registration.clone(), now);
+        let Some(observation) = observe_machine_claim(claim, current_boot_id, registration, now)
+        else {
             continue;
         };
-        let detail = match observation {
+        let mut detail = match observation {
             MachineClaimObservation::Active => "system machine registration is present".to_owned(),
             MachineClaimObservation::EndedCandidate => {
                 "system machine registration is absent; cleanup is only a candidate".to_owned()
             }
+            MachineClaimObservation::CleanupPending { since_unix_millis } => {
+                format!("cleanup pending since unix millisecond {since_unix_millis}")
+            }
+            MachineClaimObservation::CleanupReady => {
+                "machine registration stayed absent; cleanup is ready for a guarded reconcile"
+                    .to_owned()
+            }
             MachineClaimObservation::NeedsReview(reason)
             | MachineClaimObservation::Unknown(reason) => reason,
         };
+        if let Some(phase) = proposed {
+            detail.push_str(match phase {
+                MachineClaimPhase::CleanupPending { .. } => "; next state: cleanup pending",
+                MachineClaimPhase::NeedsReview { .. } => "; next state: needs review",
+                MachineClaimPhase::Unknown { .. } => "; next state: unknown",
+                MachineClaimPhase::Active | MachineClaimPhase::Ended => "",
+            });
+        }
         if diagnostics.len() < MAX_GRANT_DIAGNOSTICS {
             diagnostics.push(format!(
                 "X11 machine claim {} for {}: {detail}",
@@ -2005,6 +2084,7 @@ mod tests {
                 &claim,
                 Some(claim.boot_id.as_str()),
                 SystemMachineRegistration::Present,
+                1,
             ),
             Some(MachineClaimObservation::Active)
         );
@@ -2013,19 +2093,56 @@ mod tests {
                 &claim,
                 Some(claim.boot_id.as_str()),
                 SystemMachineRegistration::Absent,
+                1,
             ),
             Some(MachineClaimObservation::EndedCandidate)
+        );
+        assert_eq!(
+            proposed_claim_phase(
+                &claim,
+                Some(claim.boot_id.as_str()),
+                SystemMachineRegistration::Absent,
+                123,
+            ),
+            Some(MachineClaimPhase::CleanupPending {
+                since_unix_millis: 123
+            })
+        );
+        let mut pending = claim.clone();
+        pending.phase = MachineClaimPhase::CleanupPending {
+            since_unix_millis: 100,
+        };
+        assert_eq!(
+            observe_machine_claim(
+                &pending,
+                Some(pending.boot_id.as_str()),
+                SystemMachineRegistration::Absent,
+                100 + CLAIM_RECONCILE_GRACE_MILLIS - 1,
+            ),
+            Some(MachineClaimObservation::CleanupPending {
+                since_unix_millis: 100
+            })
+        );
+        assert_eq!(
+            observe_machine_claim(
+                &pending,
+                Some(pending.boot_id.as_str()),
+                SystemMachineRegistration::Absent,
+                100 + CLAIM_RECONCILE_GRACE_MILLIS,
+            ),
+            Some(MachineClaimObservation::CleanupReady)
         );
         assert!(matches!(
             observe_machine_claim(
                 &claim,
                 Some("22222222-2222-4222-8222-222222222222"),
                 SystemMachineRegistration::Present,
+                1,
             ),
             Some(MachineClaimObservation::NeedsReview(_))
         ));
         assert!(matches!(
-            observe_machine_claim(&claim, None, SystemMachineRegistration::Present),
+            observe_machine_claim(&claim, None, SystemMachineRegistration::Present, 1),
             Some(MachineClaimObservation::Unknown(_))
         ));
         let claim_value = serde_json::to_value(&claim).unwrap();
