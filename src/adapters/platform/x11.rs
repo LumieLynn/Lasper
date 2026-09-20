@@ -625,7 +625,7 @@ impl ManagedX11GrantRecord {
 /// claim references this value instead of treating a display number as an
 /// ownership key: the X server generation, endpoint revision, and mapped UID
 /// are all part of the key.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ManagedX11GrantKey {
     host_uid: u32,
@@ -1137,6 +1137,98 @@ fn push_grant_diagnostic(diagnostics: &mut Vec<String>, omitted: &mut usize, mes
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SystemMachineRegistration {
+    Present,
+    Absent,
+    Unknown(String),
+}
+
+/// Observe only the system machined registration directory. This helper
+/// never consults the desktop user's runtime machine directory: claims on
+/// this branch belong to system-scope nspawn machines.
+fn system_machine_registration(machine: &str) -> SystemMachineRegistration {
+    let path = crate::paths::runtime_machine_state(machine);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.file_type().is_file() => SystemMachineRegistration::Present,
+        Ok(_) => SystemMachineRegistration::Unknown(format!(
+            "system machine registration is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            SystemMachineRegistration::Absent
+        }
+        Err(error) => SystemMachineRegistration::Unknown(format!(
+            "cannot inspect system machine registration {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MachineClaimObservation {
+    Active,
+    EndedCandidate,
+    NeedsReview(String),
+    Unknown(String),
+}
+
+fn observe_machine_claim(
+    claim: &ManagedX11MachineClaim,
+    current_boot_id: Option<&str>,
+    registration: SystemMachineRegistration,
+) -> Option<MachineClaimObservation> {
+    if !matches!(&claim.phase, MachineClaimPhase::Active) {
+        return None;
+    }
+    let Some(current_boot_id) = current_boot_id else {
+        return Some(MachineClaimObservation::Unknown(
+            "host boot identity is unavailable".into(),
+        ));
+    };
+    if claim.boot_id != current_boot_id {
+        return Some(MachineClaimObservation::NeedsReview(
+            "claim belongs to an earlier host boot".into(),
+        ));
+    }
+    Some(match registration {
+        SystemMachineRegistration::Present => MachineClaimObservation::Active,
+        SystemMachineRegistration::Absent => MachineClaimObservation::EndedCandidate,
+        SystemMachineRegistration::Unknown(reason) => MachineClaimObservation::Unknown(reason),
+    })
+}
+
+fn machine_claim_diagnostics(
+    claims: &MachineClaimCatalog,
+    current_boot_id: Option<&str>,
+) -> Vec<String> {
+    let mut diagnostics = claims.diagnostics.clone();
+    for claim in &claims.claims {
+        let Some(observation) = observe_machine_claim(
+            claim,
+            current_boot_id,
+            system_machine_registration(&claim.machine),
+        ) else {
+            continue;
+        };
+        let detail = match observation {
+            MachineClaimObservation::Active => "system machine registration is present".to_owned(),
+            MachineClaimObservation::EndedCandidate => {
+                "system machine registration is absent; cleanup is only a candidate".to_owned()
+            }
+            MachineClaimObservation::NeedsReview(reason)
+            | MachineClaimObservation::Unknown(reason) => reason,
+        };
+        if diagnostics.len() < MAX_GRANT_DIAGNOSTICS {
+            diagnostics.push(format!(
+                "X11 machine claim {} for {}: {detail}",
+                claim.claim_id, claim.machine
+            ));
+        }
+    }
+    diagnostics
+}
+
 fn bounded_record_diagnostic(message: &str) -> String {
     const MAX_BYTES: usize = 512;
     let mut rendered = String::new();
@@ -1177,7 +1269,7 @@ fn desktop_observation(
     let claims = state
         .map(X11RuntimeState::load_claims)
         .unwrap_or_else(load_existing_machine_claims);
-    diagnostics.extend(claims.diagnostics.iter().cloned());
+    diagnostics.extend(machine_claim_diagnostics(&claims, host_boot_id.as_deref()));
     X11DesktopObservation::new(
         acl,
         uzers::get_effective_uid(),
@@ -1908,6 +2000,34 @@ mod tests {
 
         let claim = ManagedX11MachineClaim::active_from_record(&decoded);
         claim.validate(&format!("claim-{record_id}.json")).unwrap();
+        assert_eq!(
+            observe_machine_claim(
+                &claim,
+                Some(claim.boot_id.as_str()),
+                SystemMachineRegistration::Present,
+            ),
+            Some(MachineClaimObservation::Active)
+        );
+        assert_eq!(
+            observe_machine_claim(
+                &claim,
+                Some(claim.boot_id.as_str()),
+                SystemMachineRegistration::Absent,
+            ),
+            Some(MachineClaimObservation::EndedCandidate)
+        );
+        assert!(matches!(
+            observe_machine_claim(
+                &claim,
+                Some("22222222-2222-4222-8222-222222222222"),
+                SystemMachineRegistration::Present,
+            ),
+            Some(MachineClaimObservation::NeedsReview(_))
+        ));
+        assert!(matches!(
+            observe_machine_claim(&claim, None, SystemMachineRegistration::Present),
+            Some(MachineClaimObservation::Unknown(_))
+        ));
         let claim_value = serde_json::to_value(&claim).unwrap();
         let decoded_claim: ManagedX11MachineClaim =
             serde_json::from_value(claim_value.clone()).unwrap();
