@@ -48,7 +48,21 @@ type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32
 
 pub(crate) struct HostX11EndpointDiscovery;
 
-pub(crate) struct HostX11DesktopAccess;
+pub(crate) struct HostX11DesktopAccess {
+    activation_backend: crate::adapters::platform::x11_activation::ActivationBackend,
+}
+
+impl HostX11DesktopAccess {
+    pub(crate) fn new(systemd_tools: bool) -> Self {
+        Self {
+            activation_backend: if systemd_tools {
+                crate::adapters::platform::x11_activation::ActivationBackend::SystemdTools
+            } else {
+                crate::adapters::platform::x11_activation::ActivationBackend::Dbus
+            },
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
@@ -118,6 +132,25 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
                 X11DesktopAccessError::new(format!("X11 reconcile task failed: {error}"))
             })?
             .map_err(X11DesktopAccessError::new)
+    }
+
+    async fn ensure_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
+        let has_active_claims = tokio::task::spawn_blocking(has_active_claims_sync)
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!(
+                    "X11 claim activation inspection task failed: {error}"
+                ))
+            })?
+            .map_err(X11DesktopAccessError::new)?;
+        if !has_active_claims {
+            return Ok(());
+        }
+        crate::adapters::platform::x11_activation::ensure_system_machine_path_activation(
+            self.activation_backend,
+        )
+        .await
+        .map_err(X11DesktopAccessError::new)
     }
 }
 
@@ -973,6 +1006,26 @@ impl X11RuntimeState {
             .map(|claims| load_machine_claims_from(claims, uzers::get_effective_uid()))
             .unwrap_or_default()
     }
+}
+
+fn has_active_claims_sync() -> Result<bool, String> {
+    let Some(state) = X11RuntimeState::open_existing()? else {
+        return Ok(false);
+    };
+    let claims = state.load_claims();
+    if !claims.complete {
+        return Err(claims
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 machine claim set is incomplete".into()));
+    }
+    Ok(claims.claims.iter().any(|claim| {
+        matches!(
+            &claim.phase,
+            MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. }
+        )
+    }))
 }
 
 fn load_existing_grant_records() -> X11GrantRecordCatalog {

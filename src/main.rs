@@ -43,6 +43,12 @@ fn main() -> Result<()> {
                 options.daemon_pid,
             ));
         }
+        crate::cli::CliDispatch::Application(options) if options.internal_x11_reconcile => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime.block_on(run_x11_reconcile(options.want_systemd_tools))?;
+        }
         crate::cli::CliDispatch::Application(options) => {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -51,6 +57,27 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
+    let mode =
+        crate::composition::CompositionMode::new(crate::composition::PermissionLevel::User, None)?;
+    let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
+    match services.x11_access.reconcile().await {
+        Ok(reports) => {
+            for report in reports {
+                for diagnostic in report.diagnostics() {
+                    log::debug!(
+                        "X11 lifecycle reconcile :{}: {diagnostic}",
+                        report.display()
+                    );
+                }
+            }
+        }
+        Err(crate::application::x11::X11AccessError::Selection(_)) => {}
+        Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+    }
     Ok(())
 }
 
@@ -184,6 +211,9 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
             // explicit X11 operation can retry the bounded pass.
             log::debug!("X11 lifecycle reconcile unavailable at startup: {error}");
         }
+    }
+    if let Err(error) = services.x11_access.ensure_reconcile_activation().await {
+        log::debug!("X11 lifecycle activation unavailable at startup: {error}");
     }
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
         None

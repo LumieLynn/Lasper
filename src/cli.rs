@@ -24,6 +24,7 @@ const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
 pub(crate) struct CliOptions {
     pub(crate) want_elevation: bool,
     pub(crate) want_systemd_tools: bool,
+    pub(crate) internal_x11_reconcile: bool,
     pub(crate) is_daemon: bool,
     pub(crate) fd_sock: Option<PathBuf>,
     pub(crate) rpc_sock: Option<PathBuf>,
@@ -829,6 +830,7 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
     let mut options = CliOptions {
         want_elevation: false,
         want_systemd_tools: false,
+        internal_x11_reconcile: false,
         is_daemon: false,
         fd_sock: None,
         rpc_sock: None,
@@ -848,6 +850,7 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
             }
             "--elevate" | "-e" => options.want_elevation = true,
             "--systemd-tools" | "-s" | "--cli-mode" | "-c" => options.want_systemd_tools = true,
+            "--internal-x11-reconcile" => options.internal_x11_reconcile = true,
             "--daemon" => options.is_daemon = true,
             "--fd-sock" => {
                 i += 1;
@@ -1106,6 +1109,14 @@ mod tests {
             }
         }
         assert!(!parse_flags(&[]).unwrap().want_systemd_tools);
+    }
+
+    #[test]
+    fn internal_x11_reconcile_flag_is_hidden_from_public_routes() {
+        let options = parse_flags(&arguments(&["--internal-x11-reconcile"])).unwrap();
+        assert!(options.internal_x11_reconcile);
+        assert!(!options.want_elevation);
+        assert!(!options.want_systemd_tools);
     }
 
     #[test]

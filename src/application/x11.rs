@@ -637,6 +637,10 @@ impl X11AccessCheck {
     pub fn grant_assessment(&self) -> &X11GrantAssessment {
         &self.grant_assessment
     }
+
+    pub(crate) fn push_diagnostic(&mut self, diagnostic: impl Into<String>) {
+        self.grant_assessment.diagnostics.push(diagnostic.into());
+    }
 }
 
 fn assess_grants(
@@ -836,6 +840,12 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
             "X11 lifecycle reconcile is not available on this desktop access adapter",
         ))
     }
+
+    async fn ensure_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
+        Err(X11DesktopAccessError::new(
+            "X11 lifecycle activation is not available on this desktop access adapter",
+        ))
+    }
 }
 
 /// Combines runtime namespace evidence with a caller-owned X server query.
@@ -895,12 +905,15 @@ impl X11AccessService {
             .ensure(&request)
             .await
             .map_err(X11AccessError::Desktop)?;
+        let mut check =
+            X11AccessCheck::from_desktop_observation(target, projection, desktop.observation);
+        if let Err(error) = self.desktop.ensure_reconcile_activation().await {
+            check.push_diagnostic(format!(
+                "external-stop X11 reconcile is unavailable: {error}"
+            ));
+        }
         Ok(X11Authorization {
-            check: X11AccessCheck::from_desktop_observation(
-                target,
-                projection,
-                desktop.observation,
-            ),
+            check,
             disposition: desktop.disposition,
         })
     }
@@ -982,11 +995,16 @@ impl X11AccessService {
             .ensure(&request)
             .await
             .map_err(X11AccessError::Desktop)?;
-        let check = X11AccessCheck::from_desktop_observation(
+        let mut check = X11AccessCheck::from_desktop_observation(
             target.clone(),
             projection.clone(),
             desktop.observation,
         );
+        if let Err(error) = self.desktop.ensure_reconcile_activation().await {
+            check.push_diagnostic(format!(
+                "external-stop X11 reconcile is unavailable: {error}"
+            ));
+        }
         Ok(X11SessionPreparation {
             context: X11SessionContext::prepared(target, projection),
             check,
@@ -1087,6 +1105,13 @@ impl X11AccessService {
             reports.push(report);
         }
         Ok(reports)
+    }
+
+    pub(crate) async fn ensure_reconcile_activation(&self) -> Result<(), X11AccessError> {
+        self.desktop
+            .ensure_reconcile_activation()
+            .await
+            .map_err(X11AccessError::Desktop)
     }
 }
 

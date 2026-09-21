@@ -1,0 +1,253 @@
+//! Runtime user-manager activation for system-scope X11 machine claims.
+//!
+//! These units are a lifecycle wake-up mechanism only. They never transport
+//! X11 traffic and never select or manage a user-scope nspawn machine.
+
+use crate::adapters::process::{command_diagnostic, CommandRunner, DefaultCommandRunner};
+use crate::adapters::trusted_state::TrustedDirectory;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+const PATH_UNIT: &str = "lasper-x11-machine.path";
+const SERVICE_UNIT: &str = "lasper-x11-reconcile.service";
+const UNIT_MARKER: &str = "# Managed by Lasper: X11 system-machine reconcile v1";
+const MAX_UNIT_BYTES: usize = 16 * 1024;
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivationBackend {
+    Dbus,
+    SystemdTools,
+}
+
+impl ActivationBackend {
+    fn systemd_tools_flag(self) -> &'static str {
+        match self {
+            Self::Dbus => "",
+            Self::SystemdTools => " --systemd-tools",
+        }
+    }
+}
+
+/// Install and start the user-manager path watcher for the invoking desktop
+/// user. The target machine scope remains system scope; the user manager is
+/// only an unprivileged lifecycle trigger.
+pub(crate) async fn ensure_system_machine_path_activation(
+    backend: ActivationBackend,
+) -> Result<(), String> {
+    let units = tokio::task::spawn_blocking(move || prepare_units(backend))
+        .await
+        .map_err(|error| format!("X11 activation preparation task failed: {error}"))??;
+
+    match backend {
+        ActivationBackend::Dbus => start_with_dbus().await,
+        ActivationBackend::SystemdTools => start_with_systemd_tools().await,
+    }
+    .map_err(|error| {
+        format!(
+            "X11 activation manager could not start {}: {error}",
+            units.path_name
+        )
+    })
+}
+
+struct PreparedUnits {
+    path_name: &'static str,
+}
+
+fn prepare_units(backend: ActivationBackend) -> Result<PreparedUnits, String> {
+    let uid = uzers::get_effective_uid();
+    let runtime = runtime_directory(uid)?;
+    let runtime = TrustedDirectory::open_existing(&runtime, uid)
+        .map_err(|error| format!("open XDG runtime directory: {error}"))?;
+    let systemd = match runtime
+        .open_existing_child("systemd")
+        .map_err(|error| format!("open user systemd runtime directory: {error}"))?
+    {
+        Some(systemd) => systemd,
+        None => runtime
+            .open_or_create_child("systemd", 0o755)
+            .map_err(|error| format!("create user systemd runtime directory: {error}"))?,
+    };
+    let units = match systemd
+        .open_existing_child("user")
+        .map_err(|error| format!("open user unit directory: {error}"))?
+    {
+        Some(units) => units,
+        None => systemd
+            .open_or_create_child("user", 0o700)
+            .map_err(|error| format!("create user runtime unit directory: {error}"))?,
+    };
+
+    let executable = validated_executable(uid)?;
+    let executable = systemd_exec_arg(&executable);
+    let service = format!(
+        "{UNIT_MARKER}\n[Unit]\nDescription=Lasper X11 system-machine reconcile\n\n[Service]\nType=oneshot\nExecStart={executable}{flag}\nUMask=0077\n",
+        flag = backend.systemd_tools_flag(),
+    );
+    let path = format!(
+        "{UNIT_MARKER}\n[Unit]\nDescription=Wake Lasper X11 reconcile after system machine changes\n\n[Path]\nPathChanged=/run/systemd/machines\nUnit={SERVICE_UNIT}\n\n[Install]\nWantedBy=default.target\n",
+    );
+    units
+        .with_exclusive_lock("x11-activation", || {
+            ensure_unit(&units, SERVICE_UNIT, service.as_bytes())?;
+            ensure_unit(&units, PATH_UNIT, path.as_bytes())
+        })
+        .map_err(|error| format!("write X11 runtime units: {error}"))?;
+    Ok(PreparedUnits {
+        path_name: PATH_UNIT,
+    })
+}
+
+fn ensure_unit(
+    units: &TrustedDirectory,
+    name: &str,
+    expected: &[u8],
+) -> Result<(), crate::adapters::error::NspawnError> {
+    if let Some(existing) = units.read_bounded(name, MAX_UNIT_BYTES)? {
+        if existing.uid != units.expected_uid() || existing.mode & 0o077 != 0 {
+            return Err(crate::adapters::error::NspawnError::Validation(format!(
+                "Lasper runtime unit has unsafe ownership or mode: {}",
+                name
+            )));
+        }
+        if existing.bytes == expected {
+            return Ok(());
+        }
+        if !existing.bytes.starts_with(UNIT_MARKER.as_bytes()) {
+            return Err(crate::adapters::error::NspawnError::Validation(format!(
+                "refusing to replace an external user runtime unit: {name}"
+            )));
+        }
+    }
+    units.write_atomic(name, expected, 0o600)
+}
+
+fn runtime_directory(uid: u32) -> Result<PathBuf, String> {
+    let path = std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    if !path.is_absolute() {
+        return Err(format!(
+            "XDG_RUNTIME_DIR must be absolute: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+fn validated_executable(uid: u32) -> Result<PathBuf, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("resolve current Lasper executable: {error}"))?;
+    let metadata = std::fs::symlink_metadata(&executable)
+        .map_err(|error| format!("inspect current Lasper executable: {error}"))?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(format!(
+            "current Lasper executable is not a private regular file: {}",
+            executable.display()
+        ));
+    }
+    Ok(executable)
+}
+
+fn systemd_exec_arg(path: &Path) -> String {
+    let mut escaped = String::with_capacity(path.as_os_str().len() + 2);
+    escaped.push('\'');
+    for character in path.to_string_lossy().chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\'' => escaped.push_str("'\\''"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+async fn start_with_systemd_tools() -> Result<(), String> {
+    let runner = DefaultCommandRunner;
+    for args in [
+        vec![
+            "--user".into(),
+            "--no-ask-password".into(),
+            "daemon-reload".into(),
+        ],
+        vec![
+            "--user".into(),
+            "--no-ask-password".into(),
+            "start".into(),
+            PATH_UNIT.into(),
+        ],
+    ] {
+        let output = runner
+            .run_bounded("systemctl", args, COMMAND_TIMEOUT)
+            .await
+            .map_err(|error| format!("run systemctl --user: {error}"))?;
+        if !output.status.success() {
+            return Err(command_diagnostic(&output));
+        }
+    }
+    Ok(())
+}
+
+async fn start_with_dbus() -> Result<(), String> {
+    let connection = tokio::time::timeout(COMMAND_TIMEOUT, zbus::Connection::session())
+        .await
+        .map_err(|_| "connect to the user D-Bus timed out".to_owned())?
+        .map_err(|error| format!("connect to the user D-Bus: {error}"))?;
+    let proxy = tokio::time::timeout(
+        COMMAND_TIMEOUT,
+        zbus::Proxy::new(
+            &connection,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+        ),
+    )
+    .await
+    .map_err(|_| "create user systemd manager proxy timed out".to_owned())?
+    .map_err(|error| format!("create user systemd manager proxy: {error}"))?;
+    tokio::time::timeout(COMMAND_TIMEOUT, proxy.call::<_, _, ()>("Reload", &()))
+        .await
+        .map_err(|_| "reload user manager timed out".to_owned())?
+        .map_err(|error| format!("reload user manager: {error}"))?;
+    tokio::time::timeout(
+        COMMAND_TIMEOUT,
+        proxy.call::<_, _, zbus::zvariant::OwnedObjectPath>("StartUnit", &(PATH_UNIT, "fail")),
+    )
+    .await
+    .map_err(|_| "start X11 path unit timed out".to_owned())?
+    .map_err(|error| format!("start X11 path unit: {error}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executable_path_uses_systemd_safe_single_quoting() {
+        assert_eq!(
+            systemd_exec_arg(Path::new("/tmp/Lasper\"x\\y")),
+            "'/tmp/Lasper\"x\\\\y'"
+        );
+        assert_eq!(
+            systemd_exec_arg(Path::new("/tmp/Lasper'x")),
+            "'/tmp/Lasper'\\''x'"
+        );
+    }
+
+    #[test]
+    fn activation_backend_only_adds_the_explicit_tools_flag() {
+        assert_eq!(ActivationBackend::Dbus.systemd_tools_flag(), "");
+        assert_eq!(
+            ActivationBackend::SystemdTools.systemd_tools_flag(),
+            " --systemd-tools"
+        );
+    }
+}

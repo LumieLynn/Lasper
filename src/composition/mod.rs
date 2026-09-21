@@ -63,7 +63,9 @@ pub(crate) fn compose_process_shell_services(
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
         Arc::clone(&session),
         x11_endpoints,
-        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess),
+        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess::new(
+            systemd_tools,
+        )),
     ));
     ProcessShellServices {
         session,
@@ -253,7 +255,9 @@ pub(crate) fn compose_application_services(
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
         Arc::clone(&session),
         Arc::clone(&x11_endpoints),
-        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess),
+        Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess::new(
+            systemd_tools,
+        )),
     ));
     let configuration = Arc::new(
         crate::application::configuration::ConfigurationService::new(
