@@ -18,9 +18,6 @@ use std::sync::Arc;
 
 use super::shell_prompt::{run_builtin_shell_prompt, BuiltinShellMode};
 
-#[cfg(target_os = "linux")]
-use arboard::SetExtLinux;
-
 /// In-progress mouse text selection.
 /// Row is stored as row0-relative: 0 = first drawing row, negative = scrollback.
 /// Col is the cell column within the row.
@@ -123,8 +120,6 @@ pub struct TerminalManager {
     pub term_area: Rect,
     /// Last rendered title-tab areas, used before terminal mouse forwarding.
     pub(super) tab_hitboxes: Vec<TitleTabHitbox<usize>>,
-    /// Long-lived clipboard instance so data survives on Linux (ownership model).
-    pub clipboard: Option<arboard::Clipboard>,
     session_service: Arc<SessionService>,
     redraw_gate: RedrawGate,
     scrollback_lines: usize,
@@ -146,7 +141,6 @@ impl TerminalManager {
             maximized: false,
             term_area: Rect::default(),
             tab_hitboxes: Vec::new(),
-            clipboard: None,
             session_service,
             redraw_gate: RedrawGate::new(),
             scrollback_lines,
@@ -568,7 +562,7 @@ impl TerminalManager {
                 KeyCode::Char('y') => {
                     if let Some(s) = self.sessions.get_mut(idx) {
                         if s.selection.anchor != s.selection.extent {
-                            copy_selection(s, &mut self.clipboard, CopyTarget::Clipboard);
+                            copy_selection(s, CopyTarget::Clipboard);
                             s.yanked = true;
                         }
                     }
@@ -756,7 +750,7 @@ impl TerminalManager {
             MouseEventKind::Up(MouseButton::Left) if session.selection.active => {
                 session.selection.active = false;
                 session.mouse_capture = false;
-                copy_selection(session, &mut self.clipboard, CopyTarget::Primary);
+                copy_selection(session, CopyTarget::Primary);
             }
             MouseEventKind::ScrollUp => {
                 adjust_scroll(session, |off, max| off.saturating_add(3).min(max));
@@ -853,11 +847,7 @@ enum CopyTarget {
     Clipboard,
 }
 
-fn copy_selection(
-    session: &TerminalSession,
-    clipboard: &mut Option<arboard::Clipboard>,
-    target: CopyTarget,
-) {
+fn copy_selection(session: &TerminalSession, target: CopyTarget) {
     let (ar, ac) = session.selection.anchor;
     let (er, ec) = session.selection.extent;
     if ar == er && ac == ec {
@@ -876,35 +866,12 @@ fn copy_selection(
         return;
     }
 
-    // Lazily initialise clipboard on first copy.
-    if clipboard.is_none() {
-        match arboard::Clipboard::new() {
-            Ok(c) => *clipboard = Some(c),
-            Err(e) => {
-                log::error!("Failed to open clipboard: {e}");
-                return;
-            }
-        }
-    }
-
-    if let Some(ref mut cb) = clipboard {
-        match target {
-            CopyTarget::Clipboard => {
-                if let Err(e) = cb.set_text(&text) {
-                    log::error!("Failed to copy to CLIPBOARD: {e}");
-                }
-            }
-            CopyTarget::Primary => {
-                #[cfg(target_os = "linux")]
-                if let Err(e) = cb
-                    .set()
-                    .clipboard(arboard::LinuxClipboardKind::Primary)
-                    .text(&text)
-                {
-                    log::error!("Failed to copy to PRIMARY: {e}");
-                }
-            }
-        }
+    let target = match target {
+        CopyTarget::Clipboard => super::osc52::SelectionTarget::Clipboard,
+        CopyTarget::Primary => super::osc52::SelectionTarget::Primary,
+    };
+    if let Err(error) = super::osc52::set(target, &text) {
+        log::error!("Failed to send OSC 52 clipboard sequence: {error}");
     }
 }
 
