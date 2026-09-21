@@ -841,7 +841,7 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
         ))
     }
 
-    async fn ensure_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
+    async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
         Err(X11DesktopAccessError::new(
             "X11 lifecycle activation is not available on this desktop access adapter",
         ))
@@ -907,7 +907,7 @@ impl X11AccessService {
             .map_err(X11AccessError::Desktop)?;
         let mut check =
             X11AccessCheck::from_desktop_observation(target, projection, desktop.observation);
-        if let Err(error) = self.desktop.ensure_reconcile_activation().await {
+        if let Err(error) = self.desktop.synchronize_reconcile_activation().await {
             check.push_diagnostic(format!(
                 "external-stop X11 reconcile is unavailable: {error}"
             ));
@@ -1000,7 +1000,7 @@ impl X11AccessService {
             projection.clone(),
             desktop.observation,
         );
-        if let Err(error) = self.desktop.ensure_reconcile_activation().await {
+        if let Err(error) = self.desktop.synchronize_reconcile_activation().await {
             check.push_diagnostic(format!(
                 "external-stop X11 reconcile is unavailable: {error}"
             ));
@@ -1064,6 +1064,9 @@ impl X11AccessService {
             .revoke(&request)
             .await
             .map_err(X11AccessError::Desktop)?;
+        if let Err(error) = self.desktop.synchronize_reconcile_activation().await {
+            log::debug!("X11 lifecycle activation sync unavailable after revoke: {error}");
+        }
         Ok(X11Revocation {
             check: X11AccessCheck::from_desktop_observation(
                 target,
@@ -1107,9 +1110,9 @@ impl X11AccessService {
         Ok(reports)
     }
 
-    pub(crate) async fn ensure_reconcile_activation(&self) -> Result<(), X11AccessError> {
+    pub(crate) async fn synchronize_reconcile_activation(&self) -> Result<(), X11AccessError> {
         self.desktop
-            .ensure_reconcile_activation()
+            .synchronize_reconcile_activation()
             .await
             .map_err(X11AccessError::Desktop)
     }

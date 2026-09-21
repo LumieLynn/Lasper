@@ -52,6 +52,19 @@ pub(crate) async fn ensure_system_machine_path_activation(
     })
 }
 
+/// Synchronize the watcher with the claim catalog. No active claim means
+/// there is no reason to leave a path unit loaded in the user manager.
+pub(crate) async fn synchronize_system_machine_path_activation(
+    backend: ActivationBackend,
+    active_claims: bool,
+) -> Result<(), String> {
+    if active_claims {
+        ensure_system_machine_path_activation(backend).await
+    } else {
+        remove_system_machine_path_activation(backend).await
+    }
+}
+
 struct PreparedUnits {
     path_name: &'static str,
 }
@@ -122,6 +135,74 @@ fn ensure_unit(
         }
     }
     units.write_atomic(name, expected, 0o600)
+}
+
+async fn remove_system_machine_path_activation(backend: ActivationBackend) -> Result<(), String> {
+    let Some(units) = tokio::task::spawn_blocking(open_existing_unit_directory)
+        .await
+        .map_err(|error| format!("X11 activation cleanup task failed: {error}"))??
+    else {
+        return Ok(());
+    };
+    let validation_units = units.clone();
+    tokio::task::spawn_blocking(move || validate_owned_units(&validation_units))
+        .await
+        .map_err(|error| format!("X11 activation ownership check failed: {error}"))??;
+
+    stop_path_unit(backend).await?;
+    tokio::task::spawn_blocking(move || {
+        units
+            .with_exclusive_lock("x11-activation", || {
+                units.remove_unlocked(PATH_UNIT)?;
+                units.remove_unlocked(SERVICE_UNIT)
+            })
+            .map_err(|error| format!("remove X11 runtime units: {error}"))
+    })
+    .await
+    .map_err(|error| format!("X11 activation removal task failed: {error}"))??;
+    reload_manager(backend).await
+}
+
+fn open_existing_unit_directory() -> Result<Option<TrustedDirectory>, String> {
+    let uid = uzers::get_effective_uid();
+    let runtime = runtime_directory(uid)?;
+    if !runtime.exists() {
+        return Ok(None);
+    }
+    let runtime = TrustedDirectory::open_existing(&runtime, uid)
+        .map_err(|error| format!("open XDG runtime directory: {error}"))?;
+    let Some(systemd) = runtime
+        .open_existing_child("systemd")
+        .map_err(|error| format!("open user systemd runtime directory: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let units = systemd
+        .open_existing_child("user")
+        .map_err(|error| format!("open user unit directory: {error}"))?;
+    Ok(units)
+}
+
+fn validate_owned_units(units: &TrustedDirectory) -> Result<(), String> {
+    for name in [PATH_UNIT, SERVICE_UNIT] {
+        let Some(file) = units
+            .read_bounded(name, MAX_UNIT_BYTES)
+            .map_err(|error| format!("read X11 runtime unit {name}: {error}"))?
+        else {
+            return Err(format!("X11 runtime unit {name} is missing"));
+        };
+        if file.uid != units.expected_uid() || file.mode & 0o077 != 0 {
+            return Err(format!(
+                "X11 runtime unit {name} has unsafe ownership or mode"
+            ));
+        }
+        if !file.bytes.starts_with(UNIT_MARKER.as_bytes()) {
+            return Err(format!(
+                "refusing to remove an external user runtime unit: {name}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn runtime_directory(uid: u32) -> Result<PathBuf, String> {
@@ -195,15 +276,91 @@ async fn start_with_systemd_tools() -> Result<(), String> {
     Ok(())
 }
 
-async fn start_with_dbus() -> Result<(), String> {
-    let connection = tokio::time::timeout(COMMAND_TIMEOUT, zbus::Connection::session())
+async fn stop_path_unit(backend: ActivationBackend) -> Result<(), String> {
+    match backend {
+        ActivationBackend::Dbus => {
+            let connection = connect_user_bus().await?;
+            let proxy = manager_proxy(&connection).await?;
+            tokio::time::timeout(
+                COMMAND_TIMEOUT,
+                proxy.call::<_, _, zbus::zvariant::OwnedObjectPath>(
+                    "StopUnit",
+                    &(PATH_UNIT, "replace"),
+                ),
+            )
+            .await
+            .map_err(|_| "stop X11 path unit timed out".to_owned())?
+            .map_err(|error| format!("stop X11 path unit: {error}"))?;
+            Ok(())
+        }
+        ActivationBackend::SystemdTools => {
+            let output = DefaultCommandRunner
+                .run_bounded(
+                    "systemctl",
+                    vec![
+                        "--user".into(),
+                        "--no-ask-password".into(),
+                        "stop".into(),
+                        PATH_UNIT.into(),
+                    ],
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .map_err(|error| format!("run systemctl --user stop: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(command_diagnostic(&output))
+            }
+        }
+    }
+}
+
+async fn reload_manager(backend: ActivationBackend) -> Result<(), String> {
+    match backend {
+        ActivationBackend::Dbus => {
+            let connection = connect_user_bus().await?;
+            let proxy = manager_proxy(&connection).await?;
+            tokio::time::timeout(COMMAND_TIMEOUT, proxy.call::<_, _, ()>("Reload", &()))
+                .await
+                .map_err(|_| "reload user manager timed out".to_owned())?
+                .map_err(|error| format!("reload user manager: {error}"))?;
+            Ok(())
+        }
+        ActivationBackend::SystemdTools => {
+            let output = DefaultCommandRunner
+                .run_bounded(
+                    "systemctl",
+                    vec![
+                        "--user".into(),
+                        "--no-ask-password".into(),
+                        "daemon-reload".into(),
+                    ],
+                    COMMAND_TIMEOUT,
+                )
+                .await
+                .map_err(|error| format!("run systemctl --user daemon-reload: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(command_diagnostic(&output))
+            }
+        }
+    }
+}
+
+async fn connect_user_bus() -> Result<zbus::Connection, String> {
+    tokio::time::timeout(COMMAND_TIMEOUT, zbus::Connection::session())
         .await
         .map_err(|_| "connect to the user D-Bus timed out".to_owned())?
-        .map_err(|error| format!("connect to the user D-Bus: {error}"))?;
-    let proxy = tokio::time::timeout(
+        .map_err(|error| format!("connect to the user D-Bus: {error}"))
+}
+
+async fn manager_proxy(connection: &zbus::Connection) -> Result<zbus::Proxy<'_>, String> {
+    tokio::time::timeout(
         COMMAND_TIMEOUT,
         zbus::Proxy::new(
-            &connection,
+            connection,
             "org.freedesktop.systemd1",
             "/org/freedesktop/systemd1",
             "org.freedesktop.systemd1.Manager",
@@ -211,7 +368,12 @@ async fn start_with_dbus() -> Result<(), String> {
     )
     .await
     .map_err(|_| "create user systemd manager proxy timed out".to_owned())?
-    .map_err(|error| format!("create user systemd manager proxy: {error}"))?;
+    .map_err(|error| format!("create user systemd manager proxy: {error}"))
+}
+
+async fn start_with_dbus() -> Result<(), String> {
+    let connection = connect_user_bus().await?;
+    let proxy = manager_proxy(&connection).await?;
     tokio::time::timeout(COMMAND_TIMEOUT, proxy.call::<_, _, ()>("Reload", &()))
         .await
         .map_err(|_| "reload user manager timed out".to_owned())?

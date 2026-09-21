@@ -134,7 +134,7 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
             .map_err(X11DesktopAccessError::new)
     }
 
-    async fn ensure_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
+    async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
         let has_active_claims = tokio::task::spawn_blocking(has_active_claims_sync)
             .await
             .map_err(|error| {
@@ -143,11 +143,9 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
                 ))
             })?
             .map_err(X11DesktopAccessError::new)?;
-        if !has_active_claims {
-            return Ok(());
-        }
-        crate::adapters::platform::x11_activation::ensure_system_machine_path_activation(
+        crate::adapters::platform::x11_activation::synchronize_system_machine_path_activation(
             self.activation_backend,
+            has_active_claims,
         )
         .await
         .map_err(X11DesktopAccessError::new)

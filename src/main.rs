@@ -78,6 +78,10 @@ async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
         Err(crate::application::x11::X11AccessError::Selection(_)) => {}
         Err(error) => return Err(anyhow::anyhow!(error.to_string())),
     }
+    services
+        .x11_access
+        .synchronize_reconcile_activation()
+        .await?;
     Ok(())
 }
 
@@ -212,7 +216,7 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
             log::debug!("X11 lifecycle reconcile unavailable at startup: {error}");
         }
     }
-    if let Err(error) = services.x11_access.ensure_reconcile_activation().await {
+    if let Err(error) = services.x11_access.synchronize_reconcile_activation().await {
         log::debug!("X11 lifecycle activation unavailable at startup: {error}");
     }
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
