@@ -6,6 +6,7 @@
 //! client indirectly through `machinectl show` or `systemctl show`.
 
 use crate::adapters::error::{NspawnError, Result};
+use crate::application::sessions::{ObservedMachineInstance, ObservedNamespaceIdentity};
 use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_MACHINE,
 };
@@ -13,7 +14,7 @@ use crate::domain::machine::MachineName;
 use crate::domain::runtime::{MachineAddressObservation, MachineEntry, MachineState};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const MAX_RUNTIME_STATE_BYTES: u64 = 64 * 1024;
@@ -30,6 +31,44 @@ pub(crate) fn leader_pid(name: &MachineName) -> std::io::Result<u32> {
 
 pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result<u32> {
     let fields = read_runtime_state(path, expected_name)?;
+    parse_leader_pid(&fields)
+}
+
+/// Read the kernel identity of the machine currently registered under a name.
+/// The registration file supplies the leader PID; procfs supplies namespace
+/// identities so a rapid same-name restart cannot be mistaken for the old
+/// machine instance.
+pub(crate) fn machine_instance_at(
+    path: &Path,
+    expected_name: &str,
+) -> std::io::Result<ObservedMachineInstance> {
+    let fields = read_runtime_state(path, expected_name)?;
+    let leader = parse_leader_pid(&fields)?;
+    let proc = PathBuf::from(format!("/proc/{leader}"));
+    let before = namespace_pair(&proc)?;
+
+    // Read the registration again after procfs inspection. A replacement can
+    // reuse a PID, so the namespace identity and the registration leader must
+    // both remain stable across the observation.
+    let current_fields = read_runtime_state(path, expected_name)?;
+    if parse_leader_pid(&current_fields)? != leader {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            "machine leader changed during registration inspection",
+        ));
+    }
+    let after = namespace_pair(&proc)?;
+    if before != after {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            "machine namespaces changed during registration inspection",
+        ));
+    }
+
+    Ok(ObservedMachineInstance::new(leader, before.0, before.1))
+}
+
+fn parse_leader_pid(fields: &HashMap<String, String>) -> std::io::Result<u32> {
     let value = fields.get("LEADER").ok_or_else(|| {
         std::io::Error::new(ErrorKind::InvalidData, "runtime state has no LEADER field")
     })?;
@@ -43,6 +82,23 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
         ));
     }
     Ok(pid)
+}
+
+fn namespace_pair(
+    proc: &Path,
+) -> std::io::Result<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)> {
+    Ok((
+        namespace_identity(&proc.join("ns/pid"))?,
+        namespace_identity(&proc.join("ns/user"))?,
+    ))
+}
+
+fn namespace_identity(path: &Path) -> std::io::Result<ObservedNamespaceIdentity> {
+    let metadata = std::fs::metadata(path)?;
+    Ok(ObservedNamespaceIdentity::new(
+        metadata.dev(),
+        metadata.ino(),
+    ))
 }
 
 /// Enumerate runtime registrations without asking machined to inspect the

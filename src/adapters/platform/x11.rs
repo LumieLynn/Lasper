@@ -846,6 +846,20 @@ impl ManagedX11MachineClaim {
         }
         Ok(())
     }
+
+    fn matches_machine_instance(&self, instance: ObservedMachineInstance) -> bool {
+        self.machine_leader_pid == instance.leader_pid()
+            && self.machine_pid_namespace
+                == (
+                    instance.pid_namespace().device(),
+                    instance.pid_namespace().inode(),
+                )
+            && self.machine_user_namespace
+                == (
+                    instance.user_namespace().device(),
+                    instance.user_namespace().inode(),
+                )
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1225,7 +1239,10 @@ fn push_grant_diagnostic(diagnostics: &mut Vec<String>, omitted: &mut usize, mes
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum SystemMachineRegistration {
-    Present,
+    Present {
+        leader_pid: u32,
+        instance: Option<ObservedMachineInstance>,
+    },
     Absent,
     Unknown(String),
 }
@@ -1252,7 +1269,44 @@ fn system_machine_registration(machine: &str) -> SystemMachineRegistration {
     }
     let path = crate::paths::runtime_machine_state(machine);
     match fs::symlink_metadata(&path) {
-        Ok(metadata) if metadata.file_type().is_file() => SystemMachineRegistration::Present,
+        Ok(metadata) if metadata.file_type().is_file() => {
+            let leader_pid = match crate::adapters::runtime::state::leader_pid_at(&path, machine) {
+                Ok(leader_pid) => leader_pid,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return match fs::symlink_metadata(&path) {
+                        Err(current) if current.kind() == std::io::ErrorKind::NotFound => {
+                            SystemMachineRegistration::Absent
+                        }
+                        _ => SystemMachineRegistration::Unknown(format!(
+                            "system machine registration changed during leader inspection {}: {error}",
+                            path.display()
+                        )),
+                    };
+                }
+                Err(error) => {
+                    return SystemMachineRegistration::Unknown(format!(
+                        "cannot inspect system machine leader {}: {error}",
+                        path.display()
+                    ));
+                }
+            };
+            match crate::adapters::runtime::state::machine_instance_at(&path, machine) {
+                Ok(instance) => SystemMachineRegistration::Present {
+                    leader_pid,
+                    instance: Some(instance),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    SystemMachineRegistration::Present {
+                        leader_pid,
+                        instance: None,
+                    }
+                }
+                Err(error) => SystemMachineRegistration::Unknown(format!(
+                    "cannot inspect system machine instance {}: {error}",
+                    path.display()
+                )),
+            }
+        }
         Ok(_) => SystemMachineRegistration::Unknown(format!(
             "system machine registration is not a regular file: {}",
             path.display()
@@ -1300,20 +1354,63 @@ fn observe_machine_claim(
         ));
     }
     match (&claim.phase, registration) {
-        (MachineClaimPhase::Active, SystemMachineRegistration::Present) => {
-            Some(MachineClaimObservation::Active)
-        }
+        (
+            MachineClaimPhase::Active,
+            SystemMachineRegistration::Present {
+                leader_pid,
+                instance: Some(instance),
+            },
+        ) if claim.matches_machine_instance(instance) => Some(MachineClaimObservation::Active),
+        (
+            MachineClaimPhase::Active,
+            SystemMachineRegistration::Present {
+                leader_pid: _,
+                instance: Some(_),
+            },
+        ) => Some(MachineClaimObservation::NeedsReview(
+            "machine registration belongs to a different machine instance".into(),
+        )),
+        (
+            MachineClaimPhase::Active,
+            SystemMachineRegistration::Present {
+                leader_pid,
+                instance: None,
+            },
+        ) if leader_pid == claim.machine_leader_pid => Some(MachineClaimObservation::Unknown(
+            "machine namespace identity is unavailable; cleanup is blocked".into(),
+        )),
+        (
+            MachineClaimPhase::Active,
+            SystemMachineRegistration::Present {
+                leader_pid: _,
+                instance: None,
+            },
+        ) => Some(MachineClaimObservation::NeedsReview(
+            "machine leader changed but namespace identity is unavailable".into(),
+        )),
         (MachineClaimPhase::Active, SystemMachineRegistration::Absent) => {
             Some(MachineClaimObservation::EndedCandidate)
         }
         (MachineClaimPhase::Active, SystemMachineRegistration::Unknown(reason)) => {
             Some(MachineClaimObservation::Unknown(reason))
         }
-        (MachineClaimPhase::CleanupPending { .. }, SystemMachineRegistration::Present) => {
-            Some(MachineClaimObservation::NeedsReview(
+        (
+            MachineClaimPhase::CleanupPending { .. },
+            SystemMachineRegistration::Present {
+                leader_pid,
+                instance,
+            },
+        ) => {
+            let reason = if instance
+                .is_some_and(|instance| claim.matches_machine_instance(instance))
+            {
                 "machine registration reappeared before cleanup; explicit preparation is required"
-                    .into(),
-            ))
+            } else if leader_pid == claim.machine_leader_pid && instance.is_none() {
+                "machine registration reappeared but namespace identity is unavailable; explicit preparation is required"
+            } else {
+                "a different machine instance reappeared before cleanup; explicit preparation is required"
+            };
+            Some(MachineClaimObservation::NeedsReview(reason.into()))
         }
         (
             MachineClaimPhase::CleanupPending { since_unix_millis },
@@ -2556,11 +2653,25 @@ mod tests {
 
         let claim = ManagedX11MachineClaim::active_from_record(&decoded);
         claim.validate(&format!("claim-{record_id}.json")).unwrap();
+        let claim_instance = ObservedMachineInstance::new(
+            claim.machine_leader_pid,
+            ObservedNamespaceIdentity::new(
+                claim.machine_pid_namespace.0,
+                claim.machine_pid_namespace.1,
+            ),
+            ObservedNamespaceIdentity::new(
+                claim.machine_user_namespace.0,
+                claim.machine_user_namespace.1,
+            ),
+        );
         assert_eq!(
             observe_machine_claim(
                 &claim,
                 Some(claim.boot_id.as_str()),
-                SystemMachineRegistration::Present,
+                SystemMachineRegistration::Present {
+                    leader_pid: claim_instance.leader_pid(),
+                    instance: Some(claim_instance),
+                },
                 1,
             ),
             Some(MachineClaimObservation::Active)
@@ -2613,14 +2724,49 @@ mod tests {
             observe_machine_claim(
                 &claim,
                 Some("22222222-2222-4222-8222-222222222222"),
-                SystemMachineRegistration::Present,
+                SystemMachineRegistration::Present {
+                    leader_pid: claim_instance.leader_pid(),
+                    instance: Some(claim_instance),
+                },
                 1,
             ),
             Some(MachineClaimObservation::NeedsReview(_))
         ));
         assert!(matches!(
-            observe_machine_claim(&claim, None, SystemMachineRegistration::Present, 1),
+            observe_machine_claim(
+                &claim,
+                None,
+                SystemMachineRegistration::Present {
+                    leader_pid: claim_instance.leader_pid(),
+                    instance: Some(claim_instance),
+                },
+                1,
+            ),
             Some(MachineClaimObservation::Unknown(_))
+        ));
+        let replacement_instance = ObservedMachineInstance::new(
+            claim.machine_leader_pid.saturating_add(1),
+            ObservedNamespaceIdentity::new(
+                claim.machine_pid_namespace.0,
+                claim.machine_pid_namespace.1.saturating_add(1),
+            ),
+            ObservedNamespaceIdentity::new(
+                claim.machine_user_namespace.0,
+                claim.machine_user_namespace.1.saturating_add(1),
+            ),
+        );
+        assert!(matches!(
+            observe_machine_claim(
+                &claim,
+                Some(claim.boot_id.as_str()),
+                SystemMachineRegistration::Present {
+                    leader_pid: replacement_instance.leader_pid(),
+                    instance: Some(replacement_instance),
+                },
+                1,
+            ),
+            Some(MachineClaimObservation::NeedsReview(reason))
+                if reason.contains("different machine instance")
         ));
         let claim_value = serde_json::to_value(&claim).unwrap();
         let decoded_claim: ManagedX11MachineClaim =
