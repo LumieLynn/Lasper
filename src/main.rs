@@ -61,10 +61,12 @@ fn main() -> Result<()> {
 }
 
 async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
+    let loaded_config = crate::config::load_config();
+    let systemd_tools = systemd_tools || loaded_config.config.settings.systemd_tools;
     let mode =
         crate::composition::CompositionMode::new(crate::composition::PermissionLevel::User, None)?;
     let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
-    match services.x11_access.reconcile().await {
+    match services.x11_access.reconcile_after_machine_event().await {
         Ok(reports) => {
             for report in reports {
                 for diagnostic in report.diagnostics() {

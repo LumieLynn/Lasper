@@ -21,22 +21,13 @@ pub(crate) enum ActivationBackend {
     SystemdTools,
 }
 
-impl ActivationBackend {
-    fn systemd_tools_flag(self) -> &'static str {
-        match self {
-            Self::Dbus => "",
-            Self::SystemdTools => " --systemd-tools",
-        }
-    }
-}
-
 /// Install and start the user-manager path watcher for the invoking desktop
 /// user. The target machine scope remains system scope; the user manager is
 /// only an unprivileged lifecycle trigger.
 pub(crate) async fn ensure_system_machine_path_activation(
     backend: ActivationBackend,
 ) -> Result<(), String> {
-    let units = tokio::task::spawn_blocking(move || prepare_units(backend))
+    let units = tokio::task::spawn_blocking(prepare_units)
         .await
         .map_err(|error| format!("X11 activation preparation task failed: {error}"))??;
 
@@ -69,7 +60,7 @@ struct PreparedUnits {
     path_name: &'static str,
 }
 
-fn prepare_units(backend: ActivationBackend) -> Result<PreparedUnits, String> {
+fn prepare_units() -> Result<PreparedUnits, String> {
     let uid = uzers::get_effective_uid();
     let runtime = runtime_directory(uid)?;
     let runtime = TrustedDirectory::open_existing(&runtime, uid)
@@ -95,10 +86,7 @@ fn prepare_units(backend: ActivationBackend) -> Result<PreparedUnits, String> {
 
     let executable = validated_executable(uid)?;
     let executable = systemd_exec_arg(&executable);
-    let service = format!(
-        "{UNIT_MARKER}\n[Unit]\nDescription=Lasper X11 system-machine reconcile\n\n[Service]\nType=oneshot\nExecStart={executable}{flag}\nUMask=0077\n",
-        flag = backend.systemd_tools_flag(),
-    );
+    let service = reconcile_service_contents(&executable);
     let path = format!(
         "{UNIT_MARKER}\n[Unit]\nDescription=Wake Lasper X11 reconcile after system machine changes\n\n[Path]\nPathChanged=/run/systemd/machines\nUnit={SERVICE_UNIT}\n\n[Install]\nWantedBy=default.target\n",
     );
@@ -111,6 +99,12 @@ fn prepare_units(backend: ActivationBackend) -> Result<PreparedUnits, String> {
     Ok(PreparedUnits {
         path_name: PATH_UNIT,
     })
+}
+
+fn reconcile_service_contents(executable: &str) -> String {
+    format!(
+        "{UNIT_MARKER}\n[Unit]\nDescription=Lasper X11 system-machine reconcile\n\n[Service]\nType=oneshot\nExecStart={executable} --internal-x11-reconcile\nUMask=0077\n"
+    )
 }
 
 fn ensure_unit(
@@ -411,12 +405,10 @@ mod tests {
     }
 
     #[test]
-    fn activation_backend_only_adds_the_explicit_tools_flag() {
-        assert_eq!(ActivationBackend::Dbus.systemd_tools_flag(), "");
-        assert_eq!(
-            ActivationBackend::SystemdTools.systemd_tools_flag(),
-            " --systemd-tools"
-        );
+    fn reconcile_service_uses_only_the_internal_entry() {
+        let service = reconcile_service_contents("'/usr/local/bin/lasper'");
+        assert!(service.contains("ExecStart='/usr/local/bin/lasper' --internal-x11-reconcile\n"));
+        assert!(!service.contains("--systemd-tools"));
     }
 
     #[test]

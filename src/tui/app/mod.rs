@@ -773,6 +773,27 @@ impl App {
                 self.refresh();
             }
             AppEvent::MachineLifecycleFinished(outcome) => {
+                if machine_action_can_change_x11_lifecycle(outcome.action) {
+                    let x11_access = std::sync::Arc::clone(&self.data.x11_access);
+                    tokio::spawn(async move {
+                        match x11_access.reconcile_after_machine_event().await {
+                            Ok(_) => {
+                                if let Err(error) =
+                                    x11_access.synchronize_reconcile_activation().await
+                                {
+                                    log::debug!(
+                                        "X11 lifecycle activation sync after machine action unavailable: {error}"
+                                    );
+                                }
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "X11 lifecycle reconcile after machine action unavailable: {error}"
+                                );
+                            }
+                        }
+                    });
+                }
                 let (message, level) = machine_outcome_status(outcome);
                 self.refresh();
                 self.set_status(message, level);
@@ -960,6 +981,20 @@ impl App {
     }
 }
 
+fn machine_action_can_change_x11_lifecycle(
+    action: crate::application::MachineLifecycleAction,
+) -> bool {
+    matches!(
+        action,
+        crate::application::MachineLifecycleAction::Runtime(
+            crate::application::MachineRuntimeAction::Terminate
+                | crate::application::MachineRuntimeAction::Poweroff
+                | crate::application::MachineRuntimeAction::Reboot
+                | crate::application::MachineRuntimeAction::Kill { .. }
+        )
+    )
+}
+
 fn machine_outcome_status(
     outcome: crate::application::MachineLifecycleOutcome,
 ) -> (String, crate::tui::StatusLevel) {
@@ -1033,6 +1068,32 @@ mod tests {
 
         assert!(!production.contains("ExecutionContext"));
         assert!(!production.contains("crate::adapters"));
+    }
+
+    #[test]
+    fn only_machine_runtime_actions_schedule_x11_lifecycle_reconcile() {
+        use crate::application::{MachineLifecycleAction, MachineRuntimeAction};
+
+        assert!(machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Runtime(MachineRuntimeAction::Poweroff)
+        ));
+        assert!(machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Runtime(MachineRuntimeAction::Terminate)
+        ));
+        assert!(machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Runtime(MachineRuntimeAction::Reboot)
+        ));
+        assert!(machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Runtime(MachineRuntimeAction::Kill {
+                signal: crate::domain::machine::AllowedSignal::Kill,
+            })
+        ));
+        assert!(!machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Launch
+        ));
+        assert!(!machine_action_can_change_x11_lifecycle(
+            MachineLifecycleAction::Unit(crate::application::NspawnUnitAction::Enable)
+        ));
     }
 
     fn make_entry(name: &str, state: MachineState) -> MachineEntry {

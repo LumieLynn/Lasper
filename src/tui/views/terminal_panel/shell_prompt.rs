@@ -6,8 +6,8 @@ use crate::application::sessions::{
     WaylandShellRequest, X11SessionContext,
 };
 use crate::application::x11::{
-    X11AccessCheck, X11AccessError, X11AccessService, X11AuthorizationDisposition,
-    X11MappedUidAclStatus, X11SessionPreparation, X11SessionPreview, X11SessionSelection,
+    X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
+    X11SessionSelection,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionLifecycle, SessionSize};
@@ -57,7 +57,6 @@ pub(super) async fn run_builtin_shell_prompt(
     let mut line = Vec::new();
     let mut size = initial_size;
     let mut root_confirmation = None;
-    let mut x11_confirmation: Option<X11SessionPreview> = None;
     loop {
         tokio::select! {
             _ = &mut close => {
@@ -76,46 +75,6 @@ pub(super) async fn run_builtin_shell_prompt(
                         for byte in bytes {
                             match byte {
                                 b'\r' | b'\n' => {
-                                    if let Some(preview) = x11_confirmation.take() {
-                                        let confirmed = line == b"YES";
-                                        line.clear();
-                                        if !confirmed {
-                                            let message = format!(
-                                                "\r\nHost X11 request cancelled.\r\n{prompt}"
-                                            );
-                                            let _ = send_output(&output, message.into_bytes()).await;
-                                            continue;
-                                        }
-
-                                        let _ = send_output(&output, b"\r\n".to_vec()).await;
-                                        match enter_shell(
-                                            &service,
-                                            &mode,
-                                            ShellEntryRequest {
-                                                target: preview.target().clone(),
-                                                confirmed_x11: Some(preview),
-                                                size,
-                                            },
-                                            ShellBridge {
-                                                output: &output,
-                                                commands: &mut commands,
-                                                close: &mut close,
-                                            },
-                                        ).await {
-                                            ShellEntryResult::Closed => {
-                                                let _ = lifecycle.send(SessionLifecycle::Closed);
-                                                return;
-                                            }
-                                            ShellEntryResult::Finished(message) => {
-                                                let _ = send_output(
-                                                    &output,
-                                                    format!("{message}{prompt}").into_bytes(),
-                                                ).await;
-                                            }
-                                        }
-                                        continue;
-                                    }
-
                                     if line.is_empty() {
                                         let _ = send_output(&output, b"\r\n".to_vec()).await;
                                         let _ = send_output(&output, prompt.as_bytes().to_vec()).await;
@@ -143,42 +102,12 @@ pub(super) async fn run_builtin_shell_prompt(
                                         continue;
                                     }
                                     root_confirmation = None;
-                                    if let Some(x11_access) = mode.x11_access() {
-                                        let target = ShellTarget::new(machine.clone(), user.clone());
-                                        match x11_access
-                                            .preview_session(target.clone(), X11SessionSelection::Current)
-                                            .await
-                                        {
-                                            Ok(preview) => {
-                                                let message = x11_confirmation_message(
-                                                    preview.target(),
-                                                    preview.check(),
-                                                );
-                                                x11_confirmation = Some(preview);
-                                                let _ = send_output(&output, message.into_bytes()).await;
-                                            }
-                                            Err(error) => {
-                                                let message = format!(
-                                                    "\r\n{}{}",
-                                                    x11_error_message(
-                                                        "failed to inspect Host X11 session",
-                                                        &error,
-                                                    ),
-                                                    prompt,
-                                                );
-                                                let _ = send_output(&output, message.into_bytes()).await;
-                                            }
-                                        }
-                                        continue;
-                                    }
-
                                     let _ = send_output(&output, b"\r\n".to_vec()).await;
                                     match enter_shell(
                                         &service,
                                         &mode,
                                         ShellEntryRequest {
                                             target: ShellTarget::new(machine.clone(), user),
-                                            confirmed_x11: None,
                                             size,
                                         },
                                         ShellBridge {
@@ -206,14 +135,9 @@ pub(super) async fn run_builtin_shell_prompt(
                                 0x03 => {
                                     line.clear();
                                     root_confirmation = None;
-                                    let prefix = if x11_confirmation.take().is_some() {
-                                        "^C\r\nHost X11 request cancelled.\r\n"
-                                    } else {
-                                        "^C\r\n"
-                                    };
                                     let _ = send_output(
                                         &output,
-                                        format!("{prefix}{prompt}").into_bytes(),
+                                        format!("^C\r\n{prompt}").into_bytes(),
                                     ).await;
                                 }
                                 0x08 | 0x7f if !line.is_empty() => {
@@ -237,44 +161,6 @@ pub(super) async fn run_builtin_shell_prompt(
     }
 }
 
-fn x11_confirmation_message(target: &ShellTarget, check: &X11AccessCheck) -> String {
-    let projection = check.projection();
-    let identity = projection.identity();
-    let display = projection.host_socket().display();
-    let access = match check.mapped_uid_status() {
-        X11MappedUidAclStatus::AccessControlDisabled => {
-            "X-server access control is disabled; no per-user ACL entry is currently required"
-                .to_owned()
-        }
-        X11MappedUidAclStatus::ExactNumericEntryPresent => {
-            "the exact numeric localuser ACL entry is already present".to_owned()
-        }
-        X11MappedUidAclStatus::ExactNumericEntryAbsent => {
-            "Lasper will request an exact numeric localuser ACL entry".to_owned()
-        }
-        X11MappedUidAclStatus::UnknownMode {
-            exact_numeric_entry_present,
-        } => format!(
-            "the X-server access-control mode is unknown; exact entry present: {exact_numeric_entry_present}"
-        ),
-    };
-    format!(
-        "\r\nHost X11 access for {}@{}\r\n\
-         Display: :{display} via {}\r\n\
-         Guest UID: {}  ->  mapped host UID: #{}\r\n\
-         Access: {access}.\r\n\
-         Scope: localuser:#{} may act as an X11 client on this X server.\r\n\
-         Lifetime: a Lasper-created entry outlives this shell; revoke it in Configure when no longer needed. External ACL changes or an X-server reset may also remove it.\r\n\
-         Type YES to continue: ",
-        target.user(),
-        target.machine(),
-        projection.host_socket().source().display(),
-        identity.guest().uid(),
-        identity.host_uid(),
-        identity.host_uid(),
-    )
-}
-
 enum ShellEntryResult {
     Closed,
     Finished(String),
@@ -282,7 +168,6 @@ enum ShellEntryResult {
 
 struct ShellEntryRequest {
     target: ShellTarget,
-    confirmed_x11: Option<X11SessionPreview>,
     size: SessionSize,
 }
 
@@ -298,13 +183,12 @@ async fn enter_shell(
     request: ShellEntryRequest,
     bridge: ShellBridge<'_>,
 ) -> ShellEntryResult {
-    let ShellEntryRequest {
-        target,
-        confirmed_x11,
-        size,
-    } = request;
-    let x11 = match (mode.x11_access(), confirmed_x11) {
-        (Some(access), Some(preview)) => match access.prepare_previewed_session(preview).await {
+    let ShellEntryRequest { target, size } = request;
+    let x11 = match mode.x11_access() {
+        Some(access) => match access
+            .prepare_session(target.clone(), X11SessionSelection::Current)
+            .await
+        {
             Ok(preparation) => {
                 let _ = send_output(
                     bridge.output,
@@ -320,17 +204,7 @@ async fn enter_shell(
                 ));
             }
         },
-        (Some(_), None) => {
-            return ShellEntryResult::Finished(
-                "lasper: Host X11 confirmation evidence is unavailable\r\n".into(),
-            );
-        }
-        (None, Some(_)) => {
-            return ShellEntryResult::Finished(
-                "lasper: unexpected Host X11 confirmation evidence\r\n".into(),
-            );
-        }
-        (None, None) => None,
+        None => None,
     };
 
     match open_shell(service, target, x11, size).await {
@@ -510,14 +384,8 @@ async fn send_output(
 mod tests {
     use super::*;
     use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
-    use crate::application::sessions::{
-        terminal_session_channel, MappedGuestIdentity, ObservedGuestIdentity,
-        ObservedMachineInstance, ObservedNamespaceIdentity, SessionSendStatus, X11FilesystemAccess,
-        X11ProjectionContext,
-    };
-    use crate::application::x11::X11AclSnapshot;
+    use crate::application::sessions::{terminal_session_channel, SessionSendStatus};
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
-    use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
     fn prompt_service() -> Arc<SessionService> {
         Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
@@ -525,55 +393,6 @@ mod tests {
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))))
-    }
-
-    fn x11_check() -> (ShellTarget, X11AccessCheck) {
-        let machine = MachineName::new("demo").unwrap();
-        let user = ValidatedGuestUserName::new("alice").unwrap();
-        let target = ShellTarget::new(machine, user);
-        let socket = HostX11Socket::from_verified_parts(
-            0,
-            false,
-            "/tmp/.X11-unix/X0".into(),
-            "/tmp/.X11-unix/X0".into(),
-            1000,
-            1000,
-            0o755,
-            42,
-            1000,
-            1000,
-            X11SocketRevision {
-                device: 1,
-                inode: 2,
-                ctime_seconds: 3,
-                ctime_nanoseconds: 4,
-            },
-        )
-        .unwrap();
-        let instance = ObservedMachineInstance::new(
-            7,
-            ObservedNamespaceIdentity::new(1, 2),
-            ObservedNamespaceIdentity::new(3, 4),
-        );
-        let identity = MappedGuestIdentity::verified(
-            ObservedGuestIdentity::new(1000, 1000),
-            1_437_402_088,
-            1_437_402_088,
-            instance,
-        );
-        let projection = X11ProjectionContext::verified(
-            socket,
-            "/mnt/host-x11".into(),
-            "/tmp/.X11-unix/X0".into(),
-            X11FilesystemAccess::observed(true, false),
-            identity,
-        );
-        let check = X11AccessCheck::from_observations(
-            target.clone(),
-            projection,
-            X11AclSnapshot::from_wire(1, Vec::new()),
-        );
-        (target, check)
     }
 
     #[tokio::test]
@@ -601,21 +420,6 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-    }
-
-    #[test]
-    fn host_x11_confirmation_exposes_identity_scope_and_lifetime() {
-        let (target, check) = x11_check();
-
-        let message = x11_confirmation_message(&target, &check);
-
-        assert!(message.contains("Host X11 access for alice@demo"));
-        assert!(message.contains("Display: :0 via /tmp/.X11-unix/X0"));
-        assert!(message.contains("Guest UID: 1000  ->  mapped host UID: #1437402088"));
-        assert!(message.contains("localuser:#1437402088 may act as an X11 client"));
-        assert!(message.contains("outlives this shell"));
-        assert!(message.contains("External ACL changes or an X-server reset may also remove it"));
-        assert!(message.contains("Type YES to continue:"));
     }
 
     #[tokio::test]

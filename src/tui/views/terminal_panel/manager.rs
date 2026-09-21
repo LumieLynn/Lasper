@@ -248,9 +248,8 @@ impl TerminalManager {
             .await
     }
 
-    /// Start the same embedded selected-user loop with an explicit Host X11
-    /// gate. The prompt performs a read-only preview and obtains confirmation
-    /// for the selected account before the access service may touch the ACL.
+    /// Start the same embedded selected-user loop with explicit Host X11
+    /// preparation using the same authorization path as `lasper shell`.
     pub async fn spawn_x11_shell_prompt(
         &mut self,
         entry: &MachineEntry,

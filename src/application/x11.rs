@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::application::sessions::{
     MappedGuestIdentity, SessionError, SessionService, ShellTarget, X11ProjectionContext,
@@ -9,6 +10,8 @@ use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
 const SERVER_INTERPRETED_FAMILY: u8 = 5;
 const LOCAL_USER_KIND: &[u8] = b"localuser";
+const MACHINE_LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(2_100);
+const MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -508,22 +511,6 @@ pub enum X11SessionSelection {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct X11SessionPreview {
-    target: ShellTarget,
-    check: X11AccessCheck,
-}
-
-impl X11SessionPreview {
-    pub fn target(&self) -> &ShellTarget {
-        &self.target
-    }
-
-    pub fn check(&self) -> &X11AccessCheck {
-        &self.check
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X11SessionPreparation {
     context: X11SessionContext,
     check: X11AccessCheck,
@@ -918,30 +905,6 @@ impl X11AccessService {
         })
     }
 
-    /// Inspect the exact projection and desktop ACL that an explicit Host X11
-    /// session would use, without changing the X server.  Interactive callers
-    /// use this evidence to present an informed confirmation before invoking
-    /// [`Self::prepare_previewed_session`]. The latter deliberately resolves
-    /// and probes the endpoint again after the human pause rather than treating
-    /// this preview as authorization evidence.
-    pub async fn preview_session(
-        &self,
-        target: ShellTarget,
-        selection: X11SessionSelection,
-    ) -> Result<X11SessionPreview, X11AccessError> {
-        let projection = self
-            .resolve_session_projection(target.clone(), selection)
-            .await?;
-        let observation = self
-            .desktop
-            .snapshot(projection.host_socket())
-            .await
-            .map_err(X11AccessError::Desktop)?;
-        let check =
-            X11AccessCheck::from_desktop_observation(target.clone(), projection, observation);
-        Ok(X11SessionPreview { target, check })
-    }
-
     /// Prepare one explicitly requested Host X11 session. Endpoint discovery
     /// and projection probing are read-only; the desktop ACL is considered
     /// only after one startup-configured projection has been proven usable.
@@ -955,32 +918,6 @@ impl X11AccessService {
             .await?;
 
         self.prepare_resolved_session(target, projection).await
-    }
-
-    /// Complete an interactive request after displaying a read-only preview.
-    /// The target, display, machine instance, endpoint and mapped identity must
-    /// still be exactly the evidence the user confirmed. The desktop adapter
-    /// performs its own fresh ACL query under the operation lock afterwards.
-    pub async fn prepare_previewed_session(
-        &self,
-        preview: X11SessionPreview,
-    ) -> Result<X11SessionPreparation, X11AccessError> {
-        let display = preview.check.projection().host_socket().display();
-        let projection = self
-            .resolve_session_projection(
-                preview.target.clone(),
-                X11SessionSelection::Display(display),
-            )
-            .await?;
-        if projection != *preview.check.projection() {
-            return Err(X11AccessError::Projection(SessionError::with_hint(
-                "the X11 projection changed while confirmation was pending",
-                "Review the current Host X11 details and confirm the request again.",
-            )));
-        }
-
-        self.prepare_resolved_session(preview.target, projection)
-            .await
     }
 
     async fn prepare_resolved_session(
@@ -1110,6 +1047,23 @@ impl X11AccessService {
         Ok(reports)
     }
 
+    /// Reconcile after a system machine lifecycle event. A stop command may
+    /// return before machined removes its registration, while the first pass
+    /// after removal only records a cleanup-pending timestamp. Three bounded
+    /// passes cover both races: still-present -> pending -> grace elapsed.
+    /// Neither the in-process stop path nor the user-manager path worker relies
+    /// on a second filesystem event.
+    pub(crate) async fn reconcile_after_machine_event(
+        &self,
+    ) -> Result<Vec<X11ReconcileReport>, X11AccessError> {
+        let mut reports = self.reconcile().await?;
+        for _ in 1..MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS {
+            tokio::time::sleep(MACHINE_LIFECYCLE_RETRY_DELAY).await;
+            reports = self.reconcile().await?;
+        }
+        Ok(reports)
+    }
+
     pub(crate) async fn synchronize_reconcile_activation(&self) -> Result<(), X11AccessError> {
         self.desktop
             .synchronize_reconcile_activation()
@@ -1179,6 +1133,7 @@ mod tests {
     use crate::domain::wayland::HostWaylandSocket;
     use crate::domain::x11::X11SocketRevision;
     use parking_lot::Mutex;
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn projection(host_uid: u32) -> X11ProjectionContext {
@@ -1546,56 +1501,6 @@ mod tests {
         }
     }
 
-    struct ChangingProjectionPort {
-        probes: AtomicUsize,
-    }
-
-    #[async_trait::async_trait]
-    impl SessionPort for ChangingProjectionPort {
-        async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket> {
-            Vec::new()
-        }
-
-        async fn automatic_wayland(
-            &self,
-            _machine: &MachineName,
-        ) -> Result<Option<HostWaylandSocket>, SessionError> {
-            Ok(None)
-        }
-
-        async fn open_terminal(
-            &self,
-            _request: TerminalSessionRequest,
-        ) -> Result<TerminalSessionHandle, SessionError> {
-            panic!("X11 confirmation must not open a user terminal")
-        }
-
-        async fn prepare_wayland(
-            &self,
-            _request: WaylandPreparationRequest,
-        ) -> Result<WaylandSessionContext, SessionError> {
-            panic!("X11 confirmation must not prepare Wayland")
-        }
-
-        async fn probe_x11_projection(
-            &self,
-            request: X11ProjectionProbeRequest,
-        ) -> Result<X11ProjectionContext, SessionError> {
-            let generation = self.probes.fetch_add(1, Ordering::Relaxed) as u32;
-            Ok(projection_for_socket(
-                request.host_socket,
-                1_437_402_088 + generation,
-            ))
-        }
-
-        async fn open_journal(
-            &self,
-            _request: JournalSessionRequest,
-        ) -> Result<JournalSessionHandle, SessionError> {
-            panic!("X11 confirmation must not open a journal")
-        }
-    }
-
     struct RecordingDesktopPort {
         snapshots: AtomicUsize,
         ensures: AtomicUsize,
@@ -1664,6 +1569,46 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             ))
+        }
+    }
+
+    struct SequencedDesktopPort {
+        reports: Mutex<VecDeque<X11ReconcileReport>>,
+        reconciles: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl X11DesktopAccessPort for SequencedDesktopPort {
+        async fn snapshot(
+            &self,
+            _socket: &HostX11Socket,
+        ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
+            panic!("lifecycle retry test must not query desktop snapshots")
+        }
+
+        async fn ensure(
+            &self,
+            _request: &X11AuthorizationRequest,
+        ) -> Result<X11DesktopAuthorization, X11DesktopAccessError> {
+            panic!("lifecycle retry test must not authorize access")
+        }
+
+        async fn revoke(
+            &self,
+            _request: &X11RevokeRequest,
+        ) -> Result<X11DesktopRevocation, X11DesktopAccessError> {
+            panic!("lifecycle retry test must not revoke through the session API")
+        }
+
+        async fn reconcile(
+            &self,
+            _socket: &HostX11Socket,
+        ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
+            self.reconciles.fetch_add(1, Ordering::Relaxed);
+            self.reports
+                .lock()
+                .pop_front()
+                .ok_or_else(|| X11DesktopAccessError::new("missing lifecycle test report"))
         }
     }
 
@@ -1736,47 +1681,11 @@ mod tests {
         assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 2);
     }
 
-    #[tokio::test]
-    async fn session_preview_is_read_only_and_uses_the_selected_projection() {
-        let projection_port = Arc::new(ProjectionPort {
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_event_reconcile_covers_stop_pending_and_cleanup_ready() {
+        let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
             probes: Mutex::new(Vec::new()),
-        });
-        let sessions = Arc::new(SessionService::new(projection_port.clone()));
-        let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
-            StaticEndpointPort(X11EndpointCatalog {
-                sockets: vec![host_socket(0, false, 2), host_socket(0, true, 3)],
-                preferred_display: Some(0),
-                ..Default::default()
-            }),
-        )));
-        let desktop = Arc::new(RecordingDesktopPort {
-            snapshots: AtomicUsize::new(0),
-            ensures: AtomicUsize::new(0),
-            reconciles: AtomicUsize::new(0),
-            purposes: Mutex::new(Vec::new()),
-        });
-        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
-
-        let preview = service
-            .preview_session(target(), X11SessionSelection::Current)
-            .await
-            .unwrap();
-
-        assert_eq!(preview.target(), &target());
-        assert_eq!(preview.check().projection().host_socket().display(), 0);
-        assert!(preview.check().projection().host_socket().alternate());
-        assert_eq!(*projection_port.probes.lock(), [false, true]);
-        assert_eq!(desktop.snapshots.load(Ordering::Relaxed), 1);
-        assert_eq!(desktop.ensures.load(Ordering::Relaxed), 0);
-        assert!(desktop.purposes.lock().is_empty());
-    }
-
-    #[tokio::test]
-    async fn previewed_session_rejects_changed_identity_before_acl_mutation() {
-        let projection_port = Arc::new(ChangingProjectionPort {
-            probes: AtomicUsize::new(0),
-        });
-        let sessions = Arc::new(SessionService::new(projection_port.clone()));
+        })));
         let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
             StaticEndpointPort(X11EndpointCatalog {
                 sockets: vec![host_socket(0, false, 2)],
@@ -1784,26 +1693,24 @@ mod tests {
                 ..Default::default()
             }),
         )));
-        let desktop = Arc::new(RecordingDesktopPort {
-            snapshots: AtomicUsize::new(0),
-            ensures: AtomicUsize::new(0),
+        let desktop = Arc::new(SequencedDesktopPort {
+            reports: Mutex::new(VecDeque::from([
+                X11ReconcileReport::new(0, Vec::new(), Vec::new(), Vec::new()),
+                X11ReconcileReport::new(0, Vec::new(), vec!["pending".into()], Vec::new()),
+                X11ReconcileReport::new(0, vec!["revoked".into()], Vec::new(), Vec::new()),
+            ])),
             reconciles: AtomicUsize::new(0),
-            purposes: Mutex::new(Vec::new()),
         });
         let service = X11AccessService::new(sessions, endpoints, desktop.clone());
-        let preview = service
-            .preview_session(target(), X11SessionSelection::Current)
-            .await
-            .unwrap();
 
-        let error = service
-            .prepare_previewed_session(preview)
-            .await
-            .unwrap_err();
+        let task = tokio::spawn(async move { service.reconcile_after_machine_event().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(MACHINE_LIFECYCLE_RETRY_DELAY).await;
+        tokio::time::advance(MACHINE_LIFECYCLE_RETRY_DELAY).await;
+        let reports = task.await.unwrap().unwrap();
 
-        assert!(error.to_string().contains("changed while confirmation"));
-        assert_eq!(projection_port.probes.load(Ordering::Relaxed), 2);
-        assert_eq!(desktop.snapshots.load(Ordering::Relaxed), 1);
-        assert_eq!(desktop.ensures.load(Ordering::Relaxed), 0);
+        assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 3);
+        assert_eq!(reports[0].revoked_record_ids(), ["revoked"]);
+        assert!(reports[0].pending_record_ids().is_empty());
     }
 }
