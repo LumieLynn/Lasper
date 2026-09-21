@@ -224,16 +224,22 @@ fn validated_executable(uid: u32) -> Result<PathBuf, String> {
         .map_err(|error| format!("resolve current Lasper executable: {error}"))?;
     let metadata = std::fs::symlink_metadata(&executable)
         .map_err(|error| format!("inspect current Lasper executable: {error}"))?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != uid
-        || metadata.permissions().mode() & 0o022 != 0
-    {
+    if !executable_metadata_is_safe(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.permissions().mode(),
+        uid,
+    ) {
         return Err(format!(
             "current Lasper executable is not a private regular file: {}",
             executable.display()
         ));
     }
     Ok(executable)
+}
+
+fn executable_metadata_is_safe(is_regular: bool, owner: u32, mode: u32, uid: u32) -> bool {
+    is_regular && (owner == uid || owner == 0) && mode & 0o022 == 0 && mode & 0o111 != 0
 }
 
 fn systemd_exec_arg(path: &Path) -> String {
@@ -411,5 +417,14 @@ mod tests {
             ActivationBackend::SystemdTools.systemd_tools_flag(),
             " --systemd-tools"
         );
+    }
+
+    #[test]
+    fn packaged_root_owned_executable_is_valid_for_user_activation() {
+        assert!(executable_metadata_is_safe(true, 0, 0o755, 1000));
+        assert!(executable_metadata_is_safe(true, 1000, 0o755, 1000));
+        assert!(!executable_metadata_is_safe(true, 2000, 0o755, 1000));
+        assert!(!executable_metadata_is_safe(true, 0, 0o775, 1000));
+        assert!(!executable_metadata_is_safe(true, 0, 0o644, 1000));
     }
 }
