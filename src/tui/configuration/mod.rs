@@ -105,6 +105,30 @@ enum DraftPreviewState {
     },
 }
 
+enum ConfigurationPageState {
+    X11(X11PageState),
+}
+
+impl Default for ConfigurationPageState {
+    fn default() -> Self {
+        Self::X11(X11PageState::default())
+    }
+}
+
+impl ConfigurationPageState {
+    fn x11(&self) -> &X11PageState {
+        match self {
+            Self::X11(page) => page,
+        }
+    }
+
+    fn x11_mut(&mut self) -> &mut X11PageState {
+        match self {
+            Self::X11(page) => page,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum DiscardIntent {
     Close,
@@ -138,7 +162,7 @@ pub(crate) struct ConfigurationView {
     restart_confirmation: Option<crate::domain::machine::MachineName>,
     saving: bool,
     apply_error: Option<String>,
-    x11: X11PageState,
+    page: ConfigurationPageState,
     preview_scroll: usize,
     preview_max_scroll: usize,
     preview_width: u16,
@@ -164,7 +188,7 @@ impl ConfigurationView {
             restart_confirmation: None,
             saving: false,
             apply_error: None,
-            x11: X11PageState::default(),
+            page: ConfigurationPageState::default(),
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_width: 0,
@@ -177,10 +201,10 @@ impl ConfigurationView {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
-        self.x11.begin_query();
+        self.page.x11_mut().begin_query();
         self.query = query;
         self.cancel_preview();
-        self.x11.clear_draft();
+        self.page.x11_mut().clear_draft();
         self.draft_preview = DraftPreviewState::Clean;
         self.discard = None;
         self.restart_confirmation = None;
@@ -204,7 +228,7 @@ impl ConfigurationView {
     }
 
     pub(crate) fn track_x11_check(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.x11.track_check(task);
+        self.page.x11_mut().track_check(task);
     }
 
     pub(crate) fn finish_x11_check(
@@ -213,12 +237,13 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11AccessCheck, X11AccessError>,
     ) {
-        self.x11
+        self.page
+            .x11_mut()
             .finish_check(generation, target, &self.target, result);
     }
 
     pub(crate) fn track_x11_authorization(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.x11.track_authorization(task);
+        self.page.x11_mut().track_authorization(task);
     }
 
     pub(crate) fn finish_x11_authorization(
@@ -227,12 +252,13 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11Authorization, X11AccessError>,
     ) {
-        self.x11
+        self.page
+            .x11_mut()
             .finish_authorization(generation, target, &self.target, result);
     }
 
     pub(crate) fn track_x11_revocation(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.x11.track_revocation(task);
+        self.page.x11_mut().track_revocation(task);
     }
 
     pub(crate) fn finish_x11_revocation(
@@ -241,7 +267,8 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<crate::application::x11::X11Revocation, X11AccessError>,
     ) {
-        self.x11
+        self.page
+            .x11_mut()
             .finish_revocation(generation, target, &self.target, result);
     }
 
@@ -257,7 +284,7 @@ impl ConfigurationView {
         self.pending.take();
         self.state = match result {
             Ok(snapshot) if snapshot.target == self.target => {
-                self.x11.finish_query(&snapshot);
+                self.page.x11_mut().finish_query(&snapshot);
                 InspectionState::Ready(Box::new(snapshot))
             }
             Ok(_) => InspectionState::Failed("Inspection returned a different resource".into()),
@@ -275,7 +302,7 @@ impl ConfigurationView {
     ) {
         if generation != self.draft_generation
             || target != &self.target
-            || self.x11.draft_is_empty()
+            || self.page.x11().draft_is_empty()
         {
             return;
         }
@@ -306,7 +333,7 @@ impl ConfigurationView {
         self.saving = false;
         match result {
             Ok(ConfigurationApplyReport::Applied { .. }) => {
-                self.x11.clear_draft();
+                self.page.x11_mut().clear_draft();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 self.restart_confirmation = match &self.target {
@@ -316,7 +343,7 @@ impl ConfigurationView {
                 Some("X11 configuration saved; it takes effect on the next machine start".into())
             }
             Ok(ConfigurationApplyReport::Unchanged { .. }) => {
-                self.x11.clear_draft();
+                self.page.x11_mut().clear_draft();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 Some("Configuration is already up to date".into())
@@ -351,7 +378,7 @@ impl ConfigurationView {
         Some(ConfigurationEdit {
             target: self.target.clone(),
             base_revision: snapshot.revision.clone()?,
-            x11_changes: self.x11.draft_changes(),
+            x11_changes: self.page.x11().draft_changes(),
         })
     }
 
@@ -359,7 +386,7 @@ impl ConfigurationView {
         if self.saving {
             return ConfigurationAction::None;
         }
-        if !self.x11.toggle_selected() {
+        if !self.page.x11_mut().toggle_selected() {
             return ConfigurationAction::None;
         }
         self.draft_changed()
@@ -374,7 +401,7 @@ impl ConfigurationView {
         self.apply_error = None;
         self.preview_scroll = 0;
         self.preview_cache = None;
-        if self.x11.draft_is_empty() {
+        if self.page.x11().draft_is_empty() {
             self.draft_preview = DraftPreviewState::Clean;
             return ConfigurationAction::None;
         }
@@ -395,14 +422,16 @@ impl ConfigurationView {
     }
 
     fn toggle_selected_details(&mut self) {
-        self.x11.toggle_selected_details();
+        self.page.x11_mut().toggle_selected_details();
     }
 
     fn open_x11_access_dialog(&mut self) {
         let InspectionState::Ready(snapshot) = &self.state else {
             return;
         };
-        self.x11.open_access_dialog(&self.target, snapshot);
+        self.page
+            .x11_mut()
+            .open_access_dialog(&self.target, snapshot);
     }
 
     fn request_close_or_refresh(&mut self, intent: DiscardIntent) -> ConfigurationAction {
@@ -411,7 +440,7 @@ impl ConfigurationView {
             self.preview_cache = None;
             return ConfigurationAction::None;
         }
-        if !self.x11.draft_is_empty() {
+        if !self.page.x11().draft_is_empty() {
             self.discard = Some(intent);
             return ConfigurationAction::None;
         }
@@ -425,7 +454,7 @@ impl ConfigurationView {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let intent = self.discard.take().expect("discard intent is visible");
-                self.x11.clear_draft();
+                self.page.x11_mut().clear_draft();
                 match intent {
                     DiscardIntent::Close => ConfigurationAction::Close,
                     DiscardIntent::Refresh => ConfigurationAction::Refresh,
@@ -487,13 +516,14 @@ impl ConfigurationView {
                 self.preview_scroll.saturating_sub(1)
             };
         } else if self.pane == ConfigurationPane::Content {
-            self.x11
+            self.page
+                .x11_mut()
                 .move_focus(down, matches!(self.target, ConfigurationTarget::Machine(_)));
         }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ConfigurationAction {
-        if let Some(action) = self.x11.handle_access_key(key) {
+        if let Some(action) = self.page.x11_mut().handle_access_key(key) {
             return action;
         }
         if self.restart_confirmation.is_some() {
@@ -547,22 +577,25 @@ impl ConfigurationView {
                 }
             }
             (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE)
-                if self.pane == ConfigurationPane::Content && self.x11.is_bindings_focused() =>
+                if self.pane == ConfigurationPane::Content
+                    && self.page.x11().is_bindings_focused() =>
             {
-                if let Some(selected) = self.x11.selected_index() {
-                    self.x11.set_expanded(selected, key.code == KeyCode::Right);
+                if let Some(selected) = self.page.x11().selected_index() {
+                    self.page
+                        .x11_mut()
+                        .set_expanded(selected, key.code == KeyCode::Right);
                 }
             }
             (KeyCode::Char(' '), KeyModifiers::NONE) => match self.pane {
                 ConfigurationPane::Navigation => {}
-                ConfigurationPane::Content if self.x11.is_bindings_focused() => {
+                ConfigurationPane::Content if self.page.x11().is_bindings_focused() => {
                     return self.toggle_selected_x11();
                 }
                 ConfigurationPane::Content => self.open_x11_access_dialog(),
                 ConfigurationPane::Preview => {}
             },
             (KeyCode::Enter, KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                if self.x11.is_bindings_focused() {
+                if self.page.x11().is_bindings_focused() {
                     self.toggle_selected_details();
                 } else {
                     self.open_x11_access_dialog();
@@ -577,7 +610,7 @@ impl ConfigurationView {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> ConfigurationAction {
-        if self.x11.access_dialog_is_open()
+        if self.page.x11().access_dialog_is_open()
             || self.discard.is_some()
             || self.restart_confirmation.is_some()
         {
@@ -601,10 +634,10 @@ impl ConfigurationView {
                 if self.hits.x11.access.contains(position)
                     && matches!(self.target, ConfigurationTarget::Machine(_))
                 {
-                    self.x11.set_runtime_access_focus();
+                    self.page.x11_mut().set_runtime_access_focus();
                     self.open_x11_access_dialog();
                 } else {
-                    self.x11.set_bindings_focus();
+                    self.page.x11_mut().set_bindings_focus();
                     let toggle = self
                         .hits
                         .x11
@@ -620,7 +653,7 @@ impl ConfigurationView {
                         .find(|(area, _)| area.contains(position))
                         .map(|(_, selected)| *selected)
                     {
-                        self.x11.select_item(selected);
+                        self.page.x11_mut().select_item(selected);
                         if toggle == Some(selected) {
                             return self.toggle_selected_x11();
                         }

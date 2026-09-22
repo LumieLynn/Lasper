@@ -36,7 +36,7 @@ impl ConfigurationView {
         };
         let state = if self.saving {
             "Saving"
-        } else if !self.x11.draft_is_empty() {
+        } else if !self.page.x11().draft_is_empty() {
             "MOD"
         } else if matches!(&self.state, InspectionState::Ready(snapshot) if snapshot.document.is_some())
         {
@@ -90,7 +90,7 @@ impl ConfigurationView {
         if self.hits.content.width > 0 {
             match self.navigation.active_page() {
                 ConfigurationPage::X11 => {
-                    self.hits.x11 = self.x11.render_content(
+                    self.hits.x11 = self.page.x11_mut().render_content(
                         frame,
                         self.hits.content,
                         &self.state,
@@ -142,7 +142,7 @@ impl ConfigurationView {
         } else if self.discard.is_some() {
             self.render_discard_confirmation(frame, area);
         }
-        self.x11.render_access_dialog(frame, area);
+        self.page.x11_mut().render_access_dialog(frame, area);
     }
 
     fn block(&self, title: &'static str, pane: ConfigurationPane) -> Block<'static> {
