@@ -10,8 +10,8 @@ use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_be
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::configuration::{
-    ConfigurationActivation, ConfigurationApplyReport, ConfigurationEdit, ConfigurationOrigin,
-    ConfigurationPreview, ConfigurationSnapshot, X11BindRecommendation, X11BindingChange,
+    ConfigurationActivation, ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview,
+    ConfigurationSnapshot, ConfigurationWriteError, X11BindRecommendation, X11BindingChange,
     X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::machine::MachineName;
@@ -123,44 +123,16 @@ struct PreparedChange {
 }
 
 fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Preparation {
-    if snapshot.target != edit.target {
-        return Preparation::Blocked(
-            "The draft target does not match the inspected resource".into(),
-        );
-    }
-    let Some(revision) = &snapshot.revision else {
-        return Preparation::Blocked(
-            "Configuration discovery was incomplete; resolve the source error before editing"
-                .into(),
-        );
-    };
-    if revision != &edit.base_revision {
-        return Preparation::Conflict(
-            "The selected configuration source or file revision changed; refresh before saving"
-                .into(),
-        );
-    }
-    let Some(document) = &snapshot.document else {
-        return Preparation::Blocked(
-            "No existing administrator configuration contains this declaration".into(),
-        );
-    };
-    if document.origin != ConfigurationOrigin::Administrator {
-        return Preparation::Blocked(format!(
-            "{} is inspect-only; creating an administrator file would change source precedence",
-            document.origin.label()
-        ));
-    }
-    let Some(write_target) = &snapshot.write_target else {
-        return Preparation::Blocked(
-            "This resource cannot be mapped to a safe administrator write target".into(),
-        );
-    };
-    if !write_target.exists || write_target.path != document.path {
-        return Preparation::Blocked(
-            "The selected source is not the existing administrator write target".into(),
-        );
-    }
+    let context =
+        match snapshot.write_context(&edit.target, &edit.base_revision) {
+            Ok(context) => context,
+            Err(ConfigurationWriteError::RevisionChanged) => return Preparation::Conflict(
+                "The selected configuration source or file revision changed; refresh before saving"
+                    .into(),
+            ),
+            Err(error) => return Preparation::Blocked(error.to_string()),
+        };
+    let document = context.document;
     if edit.x11_changes.len() > MAX_X11_CHANGES {
         return Preparation::Blocked(format!(
             "A single draft may change at most {MAX_X11_CHANGES} X11 declarations"
@@ -660,6 +632,7 @@ mod tests {
     use super::*;
     use crate::adapters::config::configuration::projection::project;
     use crate::adapters::config::nspawn_file::NspawnConfig;
+    use crate::application::configuration::ConfigurationOrigin;
     use crate::application::configuration::{
         ConfigurationRevision, ConfigurationTarget, ConfigurationWriteTarget,
     };

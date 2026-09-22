@@ -160,6 +160,66 @@ pub struct ConfigurationSnapshot {
     pub diagnostics: Vec<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConfigurationWriteError {
+    #[error("The draft target does not match the inspected resource")]
+    TargetMismatch,
+    #[error("Configuration discovery was incomplete; resolve the source error before editing")]
+    DiscoveryIncomplete,
+    #[error("The selected configuration source or file revision changed; refresh before saving")]
+    RevisionChanged,
+    #[error("No existing administrator configuration contains this declaration")]
+    NoDocument,
+    #[error("{0} is inspect-only; creating an administrator file would change source precedence")]
+    NonAdministratorSource(String),
+    #[error("This resource cannot be mapped to a safe administrator write target")]
+    NoWriteTarget,
+    #[error("The selected source is not the existing administrator write target")]
+    WriteTargetMismatch,
+}
+
+/// Common, validated write facts shared by every configuration page.
+///
+/// Page adapters may use the document bytes to calculate their own bounded
+/// mutations, but they must not reimplement source precedence or revision
+/// checks.
+pub(crate) struct ConfigurationWriteContext<'a> {
+    pub(crate) document: &'a ConfigurationDocument,
+}
+
+impl ConfigurationSnapshot {
+    pub(crate) fn write_context<'a>(
+        &'a self,
+        target: &ConfigurationTarget,
+        base_revision: &ConfigurationRevision,
+    ) -> Result<ConfigurationWriteContext<'a>, ConfigurationWriteError> {
+        if &self.target != target {
+            return Err(ConfigurationWriteError::TargetMismatch);
+        }
+        let Some(revision) = &self.revision else {
+            return Err(ConfigurationWriteError::DiscoveryIncomplete);
+        };
+        if revision != base_revision {
+            return Err(ConfigurationWriteError::RevisionChanged);
+        }
+        let Some(document) = &self.document else {
+            return Err(ConfigurationWriteError::NoDocument);
+        };
+        if document.origin != ConfigurationOrigin::Administrator {
+            return Err(ConfigurationWriteError::NonAdministratorSource(
+                document.origin.label().into(),
+            ));
+        }
+        let Some(write_target) = &self.write_target else {
+            return Err(ConfigurationWriteError::NoWriteTarget);
+        };
+        if !write_target.exists || write_target.path != document.path {
+            return Err(ConfigurationWriteError::WriteTargetMismatch);
+        }
+        Ok(ConfigurationWriteContext { document })
+    }
+}
+
 /// A finite configuration draft. The caller identifies declarations from the
 /// inspected revision; it never supplies a host configuration path or a whole
 /// replacement document.
