@@ -3,6 +3,12 @@ use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WaylandSocketCatalog {
+    pub sockets: Vec<HostWaylandSocket>,
+    pub preferred_display: Option<WaylandDisplay>,
+}
+
 /// Returns runtime-directory candidates in discovery priority order.
 ///
 /// `XDG_RUNTIME_DIR` is authoritative when present, including non-standard
@@ -27,7 +33,13 @@ fn runtime_dir_candidates_from(
 /// Discovers session sockets and captures evidence that can be revalidated by
 /// the privileged configuration writer immediately before applying a bind.
 pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
-    discover_wayland_sockets_from(
+    discover_wayland_socket_catalog().await.sockets
+}
+
+/// Discovers session sockets and retains the display selected by the invoking
+/// desktop environment, when that display is present in the verified catalog.
+pub(crate) async fn discover_wayland_socket_catalog() -> WaylandSocketCatalog {
+    discover_wayland_socket_catalog_from(
         invoking_uid(),
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var_os("WAYLAND_DISPLAY"),
@@ -70,11 +82,22 @@ async fn current_wayland_socket_from(
     discover_absolute_wayland_socket(&path, uid).await.map(Some)
 }
 
+#[cfg(test)]
 async fn discover_wayland_sockets_from(
     session_uid: u32,
     xdg_runtime: Option<std::ffi::OsString>,
     configured_display: Option<std::ffi::OsString>,
 ) -> Vec<HostWaylandSocket> {
+    discover_wayland_socket_catalog_from(session_uid, xdg_runtime, configured_display)
+        .await
+        .sockets
+}
+
+async fn discover_wayland_socket_catalog_from(
+    session_uid: u32,
+    xdg_runtime: Option<std::ffi::OsString>,
+    configured_display: Option<std::ffi::OsString>,
+) -> WaylandSocketCatalog {
     let mut last_error = None;
     let configured_path = configured_display.map(PathBuf::from);
     let preferred_socket =
@@ -105,27 +128,36 @@ async fn discover_wayland_sockets_from(
         };
         let mut sockets = discover_wayland_sockets_in(&runtime, session_uid).await;
         if !sockets.is_empty() {
-            if let Some(preferred) = preferred_socket.as_ref() {
+            let preferred_display = if let Some(preferred) = preferred_socket.as_ref() {
                 sockets.retain(|socket| {
                     socket.display() != preferred.display()
                         && socket.canonical_path() != preferred.canonical_path()
                 });
                 sockets.insert(0, preferred.clone());
+                Some(preferred.display().clone())
             } else {
                 prioritize_display(&mut sockets, preferred_display.as_ref());
-            }
-            return sockets;
+                preferred_display
+                    .filter(|display| sockets.iter().any(|socket| socket.display() == display))
+            };
+            return WaylandSocketCatalog {
+                sockets,
+                preferred_display,
+            };
         }
     }
 
     if let Some(preferred) = preferred_socket {
-        return vec![preferred];
+        return WaylandSocketCatalog {
+            preferred_display: Some(preferred.display().clone()),
+            sockets: vec![preferred],
+        };
     }
 
     if let Some(error) = last_error {
         log::warn!("Wayland socket discovery unavailable: {error}");
     }
-    Vec::new()
+    WaylandSocketCatalog::default()
 }
 
 async fn discover_absolute_wayland_socket(

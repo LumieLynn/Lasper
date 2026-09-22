@@ -295,6 +295,7 @@ impl Wizard {
                         .map(|user| user.username.clone());
                     let mut editor = crate::tui::widgets::dialogs::user_editor::UserEditor::new(
                         self.draft.passthrough.wayland_sockets.clone(),
+                        self.draft.host.preferred_wayland_display.clone(),
                         wayland_owner.as_deref(),
                         |u| AppMessage::Wizard(WizardMessage::UserAdded(u)),
                     );
@@ -313,6 +314,7 @@ impl Wizard {
                         .map(|(_, user)| user.username.clone());
                     let mut editor = crate::tui::widgets::dialogs::user_editor::UserEditor::new(
                         self.draft.passthrough.wayland_sockets.clone(),
+                        self.draft.host.preferred_wayland_display.clone(),
                         wayland_owner.as_deref(),
                         move |u| AppMessage::Wizard(WizardMessage::UserUpdated(idx, u)),
                     )

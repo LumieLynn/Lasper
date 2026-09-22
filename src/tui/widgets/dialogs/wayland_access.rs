@@ -1,4 +1,4 @@
-use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::inputs::button::Button;
 use crate::tui::widgets::lists::checklist::Checklist;
@@ -27,8 +27,14 @@ pub struct WaylandAccessDialog {
 }
 
 impl WaylandAccessDialog {
-    pub fn new(available: Vec<HostWaylandSocket>, initial: Option<&WaylandAccessDraft>) -> Self {
-        let mut sockets = Checklist::new("Wayland Displays", available.clone(), socket_label);
+    pub fn new(
+        available: Vec<HostWaylandSocket>,
+        preferred_display: Option<WaylandDisplay>,
+        initial: Option<&WaylandAccessDraft>,
+    ) -> Self {
+        let mut sockets = Checklist::new("Wayland Displays", available.clone(), move |socket| {
+            socket_label(socket, preferred_display.as_ref())
+        });
         if let Some(initial) = initial {
             sockets.set_checked(
                 available
@@ -81,10 +87,16 @@ fn checked_sockets(checklist: &Checklist<HostWaylandSocket>) -> Vec<HostWaylandS
         .collect()
 }
 
-fn socket_label(socket: &HostWaylandSocket) -> String {
+fn socket_label(socket: &HostWaylandSocket, preferred_display: Option<&WaylandDisplay>) -> String {
+    let current_marker = if preferred_display.is_some_and(|display| display == socket.display()) {
+        "  (current WAYLAND_DISPLAY)"
+    } else {
+        ""
+    };
     format!(
-        "{}  uid {}  mode {:04o}",
+        "{}{}  uid {}  mode {:04o}",
         socket.display().as_str(),
+        current_marker,
         socket.owner_uid(),
         socket.mode(),
     )
@@ -215,10 +227,24 @@ mod tests {
         let first = socket("wayland-0", 1);
         let second = socket("wayland-1", 2);
         let initial = WaylandAccessDraft::new(vec![first.clone(), second.clone()]).unwrap();
-        let dialog = WaylandAccessDialog::new(vec![first, second], Some(&initial));
+        let dialog = WaylandAccessDialog::new(
+            vec![first, second],
+            Some(WaylandDisplay::new("wayland-0").unwrap()),
+            Some(&initial),
+        );
 
         let result = dialog.try_submit().unwrap();
         assert_eq!(result.sockets.len(), 2);
         assert_eq!(result.sockets[1].display().as_str(), "wayland-1");
+    }
+
+    #[test]
+    fn current_display_marker_follows_the_socket_name() {
+        let socket = socket("wayland-0", 1);
+        let current = WaylandDisplay::new("wayland-0").unwrap();
+        let label = socket_label(&socket, Some(&current));
+
+        assert!(label.starts_with("wayland-0  (current WAYLAND_DISPLAY)  uid "));
+        assert!(!socket_label(&socket, None).contains("current WAYLAND_DISPLAY"));
     }
 }

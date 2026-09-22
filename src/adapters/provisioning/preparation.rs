@@ -73,6 +73,8 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             };
 
         let x11 = crate::adapters::platform::x11::discover_host_x11_sockets().await;
+        let wayland =
+            crate::adapters::platform::capabilities::discover_wayland_socket_catalog().await;
 
         Ok(ProvisioningHostSnapshot {
             storage_backends,
@@ -82,8 +84,8 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             bridges: crate::adapters::platform::network::detect_bridges().await,
             physical_interfaces: crate::adapters::platform::network::detect_physical_interfaces()
                 .await,
-            wayland_sockets: crate::adapters::platform::capabilities::discover_wayland_sockets()
-                .await,
+            wayland_sockets: wayland.sockets,
+            preferred_wayland_display: wayland.preferred_display,
             x11_sockets: x11.sockets,
             preferred_x11_display: x11.preferred_display,
             nvidia_toolkit_installed: crate::adapters::platform::nvidia::nvidia_ctk_available(),

@@ -1,6 +1,6 @@
 use crate::domain::provisioning::{validate_login_shell, validate_login_username};
 use crate::domain::secret::validate_chpasswd_secret;
-use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
 use crate::tui::widgets::dialogs::wayland_access::WaylandAccessDialog;
 use crate::tui::widgets::inputs::button::Button;
@@ -38,6 +38,7 @@ pub struct UserEditor {
     sudoer: Checkbox,
     wayland_toggle: Checkbox,
     wayland_sockets: Vec<HostWaylandSocket>,
+    preferred_wayland_display: Option<WaylandDisplay>,
     wayland: Option<WaylandAccessDraft>,
     wayland_dialog: Option<WaylandAccessDialog>,
     btn_ok: Button,
@@ -61,6 +62,7 @@ fn validate_shell(shell: &str) -> Result<(), String> {
 impl UserEditor {
     pub fn new(
         wayland_sockets: Vec<HostWaylandSocket>,
+        preferred_wayland_display: Option<WaylandDisplay>,
         wayland_owner: Option<&str>,
         on_submit: impl Fn(UserDraft) -> AppMessage + 'static,
     ) -> Self {
@@ -78,6 +80,7 @@ impl UserEditor {
             sudoer: Checkbox::new("Add to sudo/wheel group", false),
             wayland_toggle: Checkbox::new(label, false).with_enabled(available),
             wayland_sockets,
+            preferred_wayland_display,
             wayland: None,
             wayland_dialog: None,
             btn_ok: Button::new("OK", || AppMessage::Wizard(WizardMessage::DialogSubmit)),
@@ -123,8 +126,11 @@ impl UserEditor {
     }
 
     fn open_wayland_dialog(&mut self) {
-        let mut dialog =
-            WaylandAccessDialog::new(self.wayland_sockets.clone(), self.wayland.as_ref());
+        let mut dialog = WaylandAccessDialog::new(
+            self.wayland_sockets.clone(),
+            self.preferred_wayland_display.clone(),
+            self.wayland.as_ref(),
+        );
         dialog.set_focus(true);
         for component in active_comps!(self) {
             component.set_focus(false);
@@ -338,7 +344,7 @@ mod tests {
 
     #[test]
     fn another_users_grant_disables_wayland_access() {
-        let editor = UserEditor::new(vec![socket()], Some("alice"), |_| {
+        let editor = UserEditor::new(vec![socket()], None, Some("alice"), |_| {
             AppMessage::Wizard(WizardMessage::DialogCancel)
         });
 
@@ -348,7 +354,7 @@ mod tests {
 
     #[test]
     fn escape_closes_only_the_nested_wayland_dialog() {
-        let mut editor = UserEditor::new(vec![socket()], None, |_| {
+        let mut editor = UserEditor::new(vec![socket()], None, None, |_| {
             AppMessage::Wizard(WizardMessage::DialogCancel)
         });
         editor.focus.active_idx = 4;
@@ -367,7 +373,7 @@ mod tests {
     #[test]
     fn compact_terminal_keeps_wayland_control_and_buttons_visible() {
         crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
-        let mut editor = UserEditor::new(vec![socket()], None, |_| {
+        let mut editor = UserEditor::new(vec![socket()], None, None, |_| {
             AppMessage::Wizard(WizardMessage::DialogCancel)
         });
         let backend = TestBackend::new(80, 24);
