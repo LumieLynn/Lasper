@@ -14,6 +14,10 @@ use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 
+mod x11;
+
+pub use x11::{X11BindRecommendation, X11BindingChange, X11BindingDeclaration, X11BindingScope};
+
 /// A catalog resource to inspect, not an arbitrary path or a claim that an
 /// image and a running machine with the same name share a launch source.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,40 +144,6 @@ pub struct ConfigurationWriteTarget {
     pub exists: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum X11BindingScope {
-    Directory,
-    Socket { display: u16, alternate: bool },
-}
-
-/// A declaration recognizable from the standard host X11 path. The display
-/// number is a filename hint, not evidence of a live server or authorization.
-#[derive(Serialize, Deserialize)]
-pub struct X11BindingDeclaration {
-    pub line: usize,
-    pub source: PathBuf,
-    pub guest_target: PathBuf,
-    pub readonly: bool,
-    pub options: Vec<String>,
-    pub scope: X11BindingScope,
-}
-
-/// Policy for a newly selected X11 endpoint. This is derived from the
-/// inspected startup configuration; callers cannot choose a mount suffix.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum X11BindRecommendation {
-    Ready {
-        private_users: String,
-        idmapped: bool,
-    },
-    Unsupported {
-        private_users: String,
-        reason: String,
-    },
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct ConfigurationSnapshot {
     pub target: ConfigurationTarget,
@@ -199,32 +169,6 @@ pub struct ConfigurationEdit {
     pub target: ConfigurationTarget,
     pub base_revision: ConfigurationRevision,
     pub x11_changes: Vec<X11BindingChange>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "change", rename_all = "snake_case", deny_unknown_fields)]
-pub enum X11BindingChange {
-    Add {
-        source: PathBuf,
-    },
-    Update {
-        line: usize,
-        source: PathBuf,
-        guest_target: PathBuf,
-        readonly: bool,
-    },
-    Remove {
-        line: usize,
-    },
-}
-
-impl X11BindingChange {
-    pub fn declaration_line(&self) -> Option<usize> {
-        match self {
-            Self::Add { .. } => None,
-            Self::Update { line, .. } | Self::Remove { line } => Some(*line),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
