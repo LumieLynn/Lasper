@@ -8,6 +8,7 @@ use crate::domain::provisioning::{
     BindMount, CreateUser, NetworkMode, PortForward, PrivateUsersMode,
 };
 use crate::domain::storage::DiskImageConfig;
+use crate::domain::x11::X11BindIntent;
 use serde::{Deserialize, Serialize};
 
 /// Complete provisioning configuration for a new machine.
@@ -20,6 +21,10 @@ pub struct MachineProvisioningConfig {
     pub network: Option<NetworkMode>,
     pub port_forwards: Vec<PortForward>,
     pub bind_mounts: Vec<BindMount>,
+    /// Explicit host X11 endpoint binds selected from the Host Integration
+    /// workflow. Runtime X11 ACL authorization is separate from this field.
+    #[serde(default)]
+    pub x11_binds: Vec<X11BindIntent>,
     /// Device files to bind-mount (read-write).
     pub device_binds: Vec<String>,
     /// Paths to bind-mount (read-only).
@@ -55,6 +60,7 @@ impl Default for MachineProvisioningConfig {
             network: Default::default(),
             port_forwards: Default::default(),
             bind_mounts: Default::default(),
+            x11_binds: Default::default(),
             device_binds: Default::default(),
             readonly_binds: Default::default(),
             privileged: Default::default(),

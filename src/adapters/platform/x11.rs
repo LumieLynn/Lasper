@@ -48,6 +48,22 @@ type AuthenticatedX11Connection = (RustConnection<DefaultStream>, (u32, u32, u32
 
 pub(crate) struct HostX11EndpointDiscovery;
 
+/// Discover host X11 endpoints for provisioning UI. This is observation only:
+/// it authenticates the invoking desktop connection but never changes ACLs.
+pub(crate) async fn discover_host_x11_sockets() -> X11EndpointCatalog {
+    match tokio::task::spawn_blocking(|| discover_sync(&[])).await {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            let diagnostic = format!("X11 endpoint discovery stopped unexpectedly: {error}");
+            log::warn!("{diagnostic}");
+            X11EndpointCatalog {
+                diagnostics: vec![diagnostic],
+                ..Default::default()
+            }
+        }
+    }
+}
+
 pub(crate) struct HostX11DesktopAccess {
     activation_backend: crate::adapters::platform::x11_activation::ActivationBackend,
 }

@@ -315,6 +315,7 @@ mod tests {
             gpu_passthrough_all: false,
             nvidia_gpu,
             nvidia_profile: None,
+            x11_sockets: Vec::new(),
         }
     }
 

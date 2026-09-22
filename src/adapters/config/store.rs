@@ -16,10 +16,11 @@ use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
 use crate::domain::wayland::{WaylandBindPolicy, WaylandGrant};
+use crate::domain::x11::X11BindIntent;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -920,6 +921,7 @@ async fn write_generated_at(
 ) -> Result<ResourceApplyStatus> {
     spec.validate()?;
     validate_custom_bind_sources(spec).await?;
+    validate_x11_bind_sources(&spec.x11_binds).await?;
     let mut wayland_binds = Vec::new();
     for grant in wayland {
         let sockets = validate_wayland_grant(spec, grant, invoking_uid).await?;
@@ -956,6 +958,37 @@ async fn validate_custom_bind_sources(spec: &NspawnConfigSpec) -> Result<()> {
                 )));
             }
             Err(error) => return Err(NspawnError::Io(source, error)),
+        }
+    }
+    Ok(())
+}
+
+async fn validate_x11_bind_sources(binds: &[X11BindIntent]) -> Result<()> {
+    for bind in binds {
+        let source = bind.socket().source();
+        let canonical = tokio::fs::canonicalize(source)
+            .await
+            .map_err(|error| NspawnError::Io(source.to_path_buf(), error))?;
+        if canonical != bind.socket().canonical_path() {
+            return Err(NspawnError::Validation(format!(
+                "X11 bind source changed since discovery: {}",
+                source.display()
+            )));
+        }
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(|error| NspawnError::Io(canonical.clone(), error))?;
+        let revision = bind.socket().revision();
+        if !metadata.file_type().is_socket()
+            || metadata.dev() != revision.device
+            || metadata.ino() != revision.inode
+            || metadata.ctime() != revision.ctime_seconds
+            || metadata.ctime_nsec() != revision.ctime_nanoseconds
+        {
+            return Err(NspawnError::Validation(format!(
+                "X11 bind endpoint changed since discovery: {}",
+                source.display()
+            )));
         }
     }
     Ok(())

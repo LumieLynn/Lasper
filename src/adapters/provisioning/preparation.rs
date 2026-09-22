@@ -72,6 +72,8 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 Err(error) => HostCapability::unavailable(error.to_string()),
             };
 
+        let x11 = crate::adapters::platform::x11::discover_host_x11_sockets().await;
+
         Ok(ProvisioningHostSnapshot {
             storage_backends,
             tools,
@@ -82,6 +84,8 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 .await,
             wayland_sockets: crate::adapters::platform::capabilities::discover_wayland_sockets()
                 .await,
+            x11_sockets: x11.sockets,
+            preferred_x11_display: x11.preferred_display,
             nvidia_toolkit_installed: crate::adapters::platform::nvidia::nvidia_ctk_available(),
         })
     }

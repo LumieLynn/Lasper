@@ -2,8 +2,9 @@ use crate::adapters::error::{NspawnError, Result};
 use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::{GuestHostname, MachineName};
 use crate::domain::provisioning::{BindMount, NetworkMode, PortForward, PrivateUsersMode};
+use crate::domain::x11::X11BindIntent;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAX_CONFIG_ITEMS: usize = 4096;
 
@@ -24,6 +25,8 @@ pub struct NspawnConfigSpec {
     pub resolv_conf: Option<ResolvConfMode>,
     pub port_forwards: Vec<NspawnPortForward>,
     pub bind_mounts: Vec<BindMount>,
+    #[serde(default)]
+    pub x11_binds: Vec<X11BindIntent>,
     pub device_binds: Vec<String>,
     pub readonly_binds: Vec<String>,
     pub privileged: bool,
@@ -37,6 +40,17 @@ pub struct NspawnConfigSpec {
 
 impl NspawnConfigSpec {
     pub fn validate(&self) -> Result<()> {
+        if !self.x11_binds.is_empty()
+            && matches!(
+                self.private_users,
+                Some(PrivateUsersMode::Managed | PrivateUsersMode::Identity)
+            )
+        {
+            return Err(NspawnError::Validation(
+                "Host X11 socket binds are not supported with PrivateUsers=managed or identity"
+                    .into(),
+            ));
+        }
         let expected_resolv_conf = ResolvConfMode::for_network(self.network.as_ref());
         if self.resolv_conf != expected_resolv_conf {
             return Err(NspawnError::Validation(format!(
@@ -66,6 +80,7 @@ impl NspawnConfigSpec {
 
         if self.port_forwards.len() > MAX_CONFIG_ITEMS
             || self.bind_mounts.len() > MAX_CONFIG_ITEMS
+            || self.x11_binds.len() > MAX_CONFIG_ITEMS
             || self.device_binds.len() > MAX_CONFIG_ITEMS
             || self.readonly_binds.len() > MAX_CONFIG_ITEMS
         {
@@ -94,6 +109,30 @@ impl NspawnConfigSpec {
         for bind in &self.bind_mounts {
             validate_absolute_path("bind source", &bind.source)?;
             validate_absolute_path("bind target", &bind.target)?;
+        }
+        let mut x11_targets = std::collections::HashSet::new();
+        x11_targets.extend(
+            self.bind_mounts
+                .iter()
+                .map(|bind| Path::new(&bind.target).to_path_buf()),
+        );
+        x11_targets.extend(self.device_binds.iter().map(PathBuf::from));
+        x11_targets.extend(self.readonly_binds.iter().map(PathBuf::from));
+        for bind in &self.x11_binds {
+            let source = bind.socket().source().to_str().ok_or_else(|| {
+                NspawnError::Validation("X11 bind source is not valid UTF-8".into())
+            })?;
+            let target = bind.target().to_str().ok_or_else(|| {
+                NspawnError::Validation("X11 bind target is not valid UTF-8".into())
+            })?;
+            validate_absolute_path("X11 bind source", source)?;
+            validate_absolute_path("X11 bind target", target)?;
+            if !x11_targets.insert(bind.target().to_path_buf()) {
+                return Err(NspawnError::Validation(format!(
+                    "X11 bind target conflicts with another bind: {}",
+                    bind.target().display()
+                )));
+            }
         }
         for bind in &self.device_binds {
             validate_absolute_path("device bind", bind)?;
@@ -126,6 +165,7 @@ impl TryFrom<&MachineProvisioningConfig> for NspawnConfigSpec {
                 .map(NspawnPortForward::try_from)
                 .collect::<Result<Vec<_>>>()?,
             bind_mounts: config.bind_mounts.clone(),
+            x11_binds: config.x11_binds.clone(),
             device_binds: config.device_binds.clone(),
             readonly_binds: config.readonly_binds.clone(),
             privileged: config.privileged,

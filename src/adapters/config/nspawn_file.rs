@@ -1,6 +1,7 @@
 use super::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::wayland::WaylandBind;
+use crate::domain::provisioning::{IdmapSuffix, PrivateUsersMode};
 use crate::domain::wayland::WaylandBindPolicy;
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
@@ -587,6 +588,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
         || !spec.readonly_binds.is_empty()
         || !spec.bind_mounts.is_empty()
         || !wayland_binds.is_empty()
+        || !spec.x11_binds.is_empty()
         || passthrough_all_drm
         || spec.nvidia_gpu;
 
@@ -628,6 +630,18 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
             };
             let source = validated_nspawn_path("Wayland socket path", wayland_bind.source())?;
             let target = validated_nspawn_path("Wayland container path", wayland_bind.target())?;
+            let source = escape_nspawn_bind_path(source);
+            let target = escape_nspawn_bind_path(target);
+            files.append("Bind", format!("{source}:{target}{suffix}"));
+        }
+
+        for x11_bind in &spec.x11_binds {
+            let suffix = match spec.private_users {
+                Some(PrivateUsersMode::No) => IdmapSuffix::Noidmap,
+                _ => IdmapSuffix::Idmap,
+            };
+            let source = validated_nspawn_path("X11 socket path", x11_bind.socket().source())?;
+            let target = validated_nspawn_path("X11 container path", x11_bind.target())?;
             let source = escape_nspawn_bind_path(source);
             let target = escape_nspawn_bind_path(target);
             files.append("Bind", format!("{source}:{target}{suffix}"));
@@ -1222,6 +1236,48 @@ mod tests {
             content.contains(r"BindReadOnly=/srv/source\:one\\two:/mnt/target\:one\\two:noidmap"),
             "{content}"
         );
+    }
+
+    #[test]
+    fn x11_binds_use_the_effective_user_namespace_policy() {
+        let socket = crate::domain::x11::HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o777,
+            42,
+            1000,
+            1000,
+            crate::domain::x11::X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        let intent = crate::domain::x11::X11BindIntent::same_path(socket);
+
+        let idmapped = MachineProvisioningConfig {
+            name: "idmapped".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            x11_binds: vec![intent.clone()],
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&idmapped).unwrap();
+        assert!(content.contains("Bind=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap"));
+
+        let noidmap = MachineProvisioningConfig {
+            name: "noidmap".into(),
+            private_users: Some(PrivateUsersMode::No),
+            x11_binds: vec![intent],
+            ..Default::default()
+        };
+        let content = nspawn_config_content(&noidmap).unwrap();
+        assert!(content.contains("Bind=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:noidmap"));
     }
 
     #[test]

@@ -75,6 +75,8 @@ pub fn build_view(
                 &context.passthrough.extract_config(),
                 context.network.network_mode(),
                 context.user.users.iter().any(|user| user.wayland.is_some()),
+                context.host.preferred_x11_display,
+                context.host.x11_sockets.clone(),
                 context.passthrough.discovered_gpus.clone(),
                 context.passthrough.hardware_scanning,
             ))

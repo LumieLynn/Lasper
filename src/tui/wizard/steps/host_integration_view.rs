@@ -1,5 +1,6 @@
 use crate::application::provisioning::HostGpuDevice;
 use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
+use crate::domain::x11::HostX11Socket;
 use crate::tui::core::{Component, EventResult, FocusTracker};
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::lists::checklist::Checklist;
@@ -38,6 +39,8 @@ macro_rules! layout_items {
         let privilege_warning_height = $self
             .privilege_warning
             .required_height($self.scroll_area.width.max(20));
+        let has_x11_sockets = !$self.x11_sockets.items().is_empty();
+        let x11_height = ($self.x11_sockets.items().len() as u16 + 2).min(8);
 
         let mut items: Vec<(&mut dyn Component, u16, bool)> = Vec::new();
 
@@ -56,6 +59,12 @@ macro_rules! layout_items {
 
         items.push((&mut $self.privileged, 3, true));
         items.push((&mut $self.private_users, 3, true));
+
+        if has_x11_sockets {
+            items.push((&mut $self.x11_sockets, x11_height, true));
+        } else {
+            items.push((&mut $self.x11_empty, 3, false));
+        }
 
         if is_privileged {
             items.push((
@@ -99,6 +108,8 @@ pub struct HostIntegrationStepView {
     hardware_scanning: bool,
     private_network: bool,
     wayland_access_configured: bool,
+    x11_sockets: Checklist<HostX11Socket>,
+    x11_empty: TextBlock,
 }
 
 impl HostIntegrationStepView {
@@ -106,6 +117,8 @@ impl HostIntegrationStepView {
         initial_data: &PassthroughConfig,
         nw_mode: Option<NetworkMode>,
         wayland_access_configured: bool,
+        preferred_x11_display: Option<u16>,
+        discovered_x11_sockets: Vec<HostX11Socket>,
         discovered_gpus: Vec<HostGpuDevice>,
         hardware_scanning: bool,
     ) -> Self {
@@ -155,6 +168,36 @@ impl HostIntegrationStepView {
         });
         gpu_list.set_checked(checked_indices);
 
+        let selected_x11 = discovered_x11_sockets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, socket)| {
+                initial_data
+                    .x11_sockets
+                    .iter()
+                    .any(|selected| selected.source() == socket.source())
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let mut x11_sockets = Checklist::new(
+            "Select Host X11 socket(s)",
+            discovered_x11_sockets,
+            move |socket| {
+                format!(
+                    ":{}{}{}  {}",
+                    socket.display(),
+                    if socket.alternate() { "_" } else { "" },
+                    if preferred_x11_display == Some(socket.display()) && !socket.alternate() {
+                        "  (current DISPLAY)"
+                    } else {
+                        ""
+                    },
+                    socket.source().display()
+                )
+            },
+        );
+        x11_sockets.set_checked(selected_x11);
+
         let warning_text = "Enabled setting: [Exec] Capability=all. This grants every Linux capability, including system and mount administration, device and raw I/O access, network administration, kernel/module controls, and process tracing. PrivateUsers and networking remain controlled by their separate settings. A compromised container may take over the host.";
 
         let mut view = Self {
@@ -199,6 +242,11 @@ impl HostIntegrationStepView {
             hardware_scanning,
             private_network: nw_mode.as_ref().is_some_and(NetworkMode::is_private),
             wayland_access_configured,
+            x11_sockets,
+            x11_empty: TextBlock::new(
+                " Host X11 ",
+                "No verified filesystem X11 endpoints were found in the current desktop session. Host X11 integration can be configured later when a display becomes available.",
+            ),
         };
 
         view.update_focus();
@@ -271,6 +319,27 @@ impl HostIntegrationStepView {
         selected_nodes.sort();
         selected_nodes.dedup();
         selected_nodes
+    }
+
+    fn selected_x11_sockets(&self) -> Vec<HostX11Socket> {
+        self.x11_sockets
+            .items()
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.x11_sockets.checked_indices().contains(index))
+            .map(|(_, socket)| socket.clone())
+            .collect()
+    }
+
+    fn toggle_x11_selection(&mut self) {
+        let Some(selected) = self.x11_sockets.selected_idx() else {
+            return;
+        };
+        let mut checked = self.x11_sockets.checked_indices().clone();
+        if !checked.insert(selected) {
+            checked.remove(&selected);
+        }
+        self.x11_sockets.set_checked(checked.into_iter().collect());
     }
 }
 
@@ -374,6 +443,11 @@ impl Component for HostIntegrationStepView {
             self.update_focus();
             return EventResult::Consumed;
         }
+        if key.code == KeyCode::Char(' ') && self.x11_sockets.is_focused() {
+            self.toggle_x11_selection();
+            self.update_focus();
+            return EventResult::Consumed;
+        }
 
         let res = delegate_wizard_navigation!(self, key, active_comps);
 
@@ -415,6 +489,10 @@ impl Component for HostIntegrationStepView {
         if self.private_users.selected_idx() == 2 && self.wayland_access_configured {
             return Err("Wayland access is not supported with PrivateUsers=managed".into());
         }
+        if !self.x11_sockets.checked_indices().is_empty() && self.private_users.selected_idx() == 2
+        {
+            return Err("Host X11 socket binds are not supported with PrivateUsers=managed".into());
+        }
         Ok(())
     }
 
@@ -439,6 +517,7 @@ impl StepComponent for HostIntegrationStepView {
         };
 
         ctx.passthrough.selected_gpu_nodes = self.selected_gpu_nodes();
+        ctx.passthrough.x11_sockets = self.selected_x11_sockets();
     }
 
     fn render_step(&mut self, f: &mut Frame, area: Rect, _context: &WizardDraft) {
@@ -449,6 +528,7 @@ impl StepComponent for HostIntegrationStepView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::x11::X11SocketRevision;
     use ratatui::{
         backend::TestBackend,
         buffer::Buffer,
@@ -493,11 +573,14 @@ mod tests {
             gpu_passthrough_all: false,
             nvidia_gpu: false,
             nvidia_profile: None,
+            x11_sockets: Vec::new(),
         };
         let mut view = HostIntegrationStepView::new(
             &config,
             Some(NetworkMode::Host),
             false,
+            None,
+            Vec::new(),
             Vec::new(),
             false,
         );
@@ -531,6 +614,7 @@ mod tests {
             gpu_passthrough_all: false,
             nvidia_gpu: false,
             nvidia_profile: None,
+            x11_sockets: Vec::new(),
         };
         let first_gpu = HostGpuDevice {
             display_name: "First DRM GPU".into(),
@@ -552,6 +636,8 @@ mod tests {
             &config,
             Some(NetworkMode::Host),
             false,
+            None,
+            Vec::new(),
             gpus.clone(),
             false,
         );
@@ -628,11 +714,103 @@ mod tests {
             &restored_config,
             Some(NetworkMode::Host),
             false,
+            None,
+            Vec::new(),
             gpus,
             false,
         );
         assert!(restored_view.gpu_all_selected());
         assert_eq!(restored_view.gpu_list.checked_indices().len(), 4);
         assert_eq!(restored_view.selected_gpu_nodes(), vec!["/dev/mali"]);
+    }
+
+    #[test]
+    fn x11_selection_supports_multiple_endpoints_and_marks_current_display() {
+        crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
+        let socket = |name: &str, alternate: bool| {
+            HostX11Socket::from_verified_parts(
+                0,
+                alternate,
+                format!("/tmp/.X11-unix/{name}").into(),
+                format!("/tmp/.X11-unix/{name}").into(),
+                1000,
+                1000,
+                0o777,
+                42,
+                1000,
+                1000,
+                X11SocketRevision {
+                    device: 1,
+                    inode: if alternate { 2 } else { 1 },
+                    ctime_seconds: 3,
+                    ctime_nanoseconds: 4,
+                },
+            )
+            .unwrap()
+        };
+        let standard = socket("X0", false);
+        let alternate = socket("X0_", true);
+        let config = PassthroughConfig {
+            bind_mounts: Vec::new(),
+            device_binds: Vec::new(),
+            privileged: false,
+            private_users: None,
+            graphics_acceleration: false,
+            gpu_passthrough_all: false,
+            nvidia_gpu: false,
+            nvidia_profile: None,
+            x11_sockets: Vec::new(),
+        };
+        let mut view = HostIntegrationStepView::new(
+            &config,
+            Some(NetworkMode::Host),
+            false,
+            Some(0),
+            vec![standard.clone(), alternate.clone()],
+            Vec::new(),
+            false,
+        );
+
+        assert!(view.selected_x11_sockets().is_empty());
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rendered = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("(current DISPLAY)"));
+
+        view.focus.active_idx = 3;
+        view.update_focus();
+        assert_eq!(view.x11_sockets.selected_idx(), Some(0));
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Char(' '),
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert_eq!(view.selected_x11_sockets(), vec![standard.clone()]);
+
+        assert_eq!(
+            view.handle_key(KeyEvent::new(
+                KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            )),
+            EventResult::Consumed
+        );
+        assert_eq!(view.x11_sockets.selected_idx(), Some(1));
+        view.handle_key(KeyEvent::new(
+            KeyCode::Char(' '),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(view.selected_x11_sockets(), vec![standard, alternate]);
     }
 }

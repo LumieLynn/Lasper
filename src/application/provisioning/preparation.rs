@@ -2,6 +2,7 @@ use super::{DeploymentError, DeploymentRequest};
 use crate::domain::nvidia::NvidiaFileCategory;
 use crate::domain::storage::{DiskImageFilesystem, DiskImagePartition};
 use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::x11::HostX11Socket;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -61,6 +62,8 @@ pub struct ProvisioningHostSnapshot {
     pub bridges: Vec<String>,
     pub physical_interfaces: Vec<String>,
     pub wayland_sockets: Vec<HostWaylandSocket>,
+    pub x11_sockets: Vec<HostX11Socket>,
+    pub preferred_x11_display: Option<u16>,
     pub nvidia_toolkit_installed: bool,
 }
 
@@ -82,6 +85,8 @@ impl Default for ProvisioningHostSnapshot {
             bridges: Vec::new(),
             physical_interfaces: Vec::new(),
             wayland_sockets: Vec::new(),
+            x11_sockets: Vec::new(),
+            preferred_x11_display: None,
             nvidia_toolkit_installed: false,
         }
     }

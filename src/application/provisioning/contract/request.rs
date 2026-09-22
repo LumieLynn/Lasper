@@ -78,6 +78,32 @@ impl DeploymentRequest {
                 )));
             }
         }
+        if !self.config.x11_binds.is_empty()
+            && matches!(
+                self.config.private_users,
+                Some(
+                    crate::domain::provisioning::PrivateUsersMode::Managed
+                        | crate::domain::provisioning::PrivateUsersMode::Identity
+                )
+            )
+        {
+            return Err(super::job::DeploymentError::rejected(
+                "Host X11 socket binds are not supported with PrivateUsers=managed or identity",
+            ));
+        }
+        let mut x11_targets = std::collections::HashSet::new();
+        for bind in &self.config.x11_binds {
+            if !self.source.supports_rootfs_configuration() {
+                return Err(super::job::DeploymentError::rejected(
+                    "Host X11 socket binds require a deployment source that supports rootfs configuration",
+                ));
+            }
+            if !x11_targets.insert(bind.target().to_path_buf()) {
+                return Err(super::job::DeploymentError::rejected(
+                    "an X11 bind target may be selected only once",
+                ));
+            }
+        }
         let mut wayland_targets = std::collections::HashSet::new();
         let mut wayland_sources = std::collections::HashSet::new();
         for intent in &self.wayland {

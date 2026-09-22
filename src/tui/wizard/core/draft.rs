@@ -16,6 +16,7 @@ use crate::domain::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
 use crate::domain::wayland::{HostWaylandSocket, WaylandGrantIntent, WaylandValidationError};
+use crate::domain::x11::{HostX11Socket, X11BindIntent};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +91,7 @@ pub struct PassthroughConfig {
     pub gpu_passthrough_all: bool,
     pub nvidia_gpu: bool,
     pub nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+    pub x11_sockets: Vec<HostX11Socket>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -543,6 +545,7 @@ pub struct PassthroughState {
     pub nvidia_toolkit_installed: bool,
     pub selected_gpu_nodes: Vec<String>,
     pub wayland_sockets: Vec<HostWaylandSocket>,
+    pub x11_sockets: Vec<HostX11Socket>,
     pub bind_mounts: Vec<BindMount>,
 
     // Advanced NVIDIA passthrough
@@ -594,6 +597,7 @@ impl PassthroughState {
             } else {
                 None
             },
+            x11_sockets: self.x11_sockets.clone(),
         }
     }
 }
@@ -730,6 +734,7 @@ impl WizardDraft {
                 nvidia_toolkit_installed: host.nvidia_toolkit_installed,
                 selected_gpu_nodes: vec![],
                 wayland_sockets: host.wayland_sockets.clone(),
+                x11_sockets: vec![],
                 bind_mounts: vec![],
                 nvidia_passthrough_mode: crate::domain::nvidia::NvidiaPassthroughMode::Mirror,
                 nvidia_gpu_device: "all".to_string(),
@@ -824,12 +829,18 @@ impl WizardDraft {
                     .map(|access| access.intent_for(&user.username))
             })
             .collect();
+        let x11_binds = passthrough
+            .x11_sockets
+            .into_iter()
+            .map(X11BindIntent::same_path)
+            .collect();
         let config = crate::application::provisioning::MachineProvisioningConfig {
             name: basic.name,
             guest_hostname: basic.guest_hostname,
             network: network.mode,
             port_forwards: network.port_forwards,
             bind_mounts: passthrough.bind_mounts,
+            x11_binds,
             device_binds: passthrough.device_binds,
             readonly_binds: Vec::new(),
             privileged: passthrough.privileged,
@@ -1279,6 +1290,7 @@ mod tests {
             nvidia_toolkit_installed: true,
             selected_gpu_nodes: vec![],
             wayland_sockets: vec![],
+            x11_sockets: vec![],
             bind_mounts: vec![],
             nvidia_passthrough_mode: crate::domain::nvidia::NvidiaPassthroughMode::Mirror,
             nvidia_gpu_device: "all".to_string(),
