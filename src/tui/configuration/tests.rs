@@ -2,12 +2,14 @@ use super::*;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationDiscovery,
     ConfigurationDocument, ConfigurationOrigin, ConfigurationPreview, ConfigurationRevision,
-    ConfigurationWriteTarget, X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
+    ConfigurationWriteTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
+    X11BindingScope,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::ImageName;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 use ratatui::{backend::TestBackend, Terminal};
+use std::path::PathBuf;
 
 fn target(name: &str) -> ConfigurationTarget {
     ConfigurationTarget::Image(ImageName::new(name).unwrap())
@@ -176,7 +178,7 @@ fn begin_x11_access_check(
         view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(view.x11_access_dialog.is_some());
+    assert!(view.x11.access_dialog_is_open());
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     for character in guest_user.chars() {
         view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
@@ -229,7 +231,7 @@ fn wide_view_separates_navigation_declarations_and_runtime_access() {
 #[test]
 fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     let mut view = loaded();
-    let selected = view.list.selected();
+    let selected = view.x11.selected_index();
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Preview);
     render(&mut view, 60, 15);
@@ -244,8 +246,8 @@ fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     let screen = render(&mut view, 60, 15);
     assert!(screen.contains("PRIVATE_VALUE=secret"));
     assert!(screen.contains("Esc Close"));
-    assert_eq!(view.list.selected(), selected);
-    assert!(view.expanded.contains(&0));
+    assert_eq!(view.x11.selected_index(), selected);
+    assert!(view.x11.is_expanded(0));
     let close = view.hits.close;
     assert_eq!(view.handle_mouse(click(close)), ConfigurationAction::Close);
 }
@@ -259,20 +261,20 @@ fn mouse_and_keyboard_select_the_same_panes_and_binding() {
     assert_eq!(view.pane, ConfigurationPane::Navigation);
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Content);
-    let binding = view.hits.bindings[0].0;
+    let binding = view.hits.x11.bindings[0].0;
     view.handle_mouse(click(binding));
-    assert!(view.expanded.contains(&0));
+    assert!(view.x11.is_expanded(0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!view.expanded.contains(&0));
+    assert!(!view.x11.is_expanded(0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(view.expanded.contains(&0));
+    assert!(view.x11.is_expanded(0));
 }
 
 #[test]
 fn clicking_the_checkbox_uses_the_same_desired_state_transition_as_space() {
     let mut view = loaded();
     render(&mut view, 140, 28);
-    let checkbox = view.hits.checkboxes[0].0;
+    let checkbox = view.hits.x11.checkboxes[0].0;
     let ConfigurationAction::Preview { edit, .. } = view.handle_mouse(click(checkbox)) else {
         panic!("clicking a checked declaration should request its removal preview");
     };
@@ -361,8 +363,8 @@ fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed()
     assert!(render(&mut view, 140, 28).contains(">> X11"));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Content);
-    assert_eq!(view.list.selected(), Some(0));
-    assert!(view.expanded.contains(&0));
+    assert_eq!(view.x11.selected_index(), Some(0));
+    assert!(view.x11.is_expanded(0));
 }
 
 #[test]
@@ -477,7 +479,7 @@ fn dirty_close_requires_confirmation_and_keeps_the_draft_when_cancelled() {
         view.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(!view.draft.is_empty());
+    assert!(!view.x11.draft_is_empty());
     view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(
         view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
@@ -524,7 +526,7 @@ fn only_current_ready_preview_can_be_saved_and_success_clears_the_draft() {
         }),
     );
     assert!(message.unwrap().contains("next machine start"));
-    assert!(view.draft.is_empty());
+    assert!(view.x11.draft_is_empty());
 }
 
 #[test]
@@ -534,9 +536,9 @@ fn space_changes_the_check_state_while_enter_only_folds() {
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
         ConfigurationAction::Preview { .. }
     ));
-    assert!(view.expanded.contains(&0));
+    assert!(view.x11.is_expanded(0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!view.expanded.contains(&0));
+    assert!(!view.x11.is_expanded(0));
 }
 
 #[test]
@@ -566,7 +568,7 @@ fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
         let mut view = ConfigurationView::new(target("archlinux"));
         view.begin_query(3);
         view.finish_query(3, &target("archlinux"), Ok(inspected));
-        view.expanded.clear();
+        view.x11.clear_expanded();
         let buffer = render_buffer(&mut view, 160, 28);
         let (x, y) = (0..28)
             .flat_map(|y| (0..160).map(move |x| (x, y)))
@@ -581,7 +583,7 @@ fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
         assert_eq!(buffer[(x, y)].fg, color, "selected status lost its color");
         assert!(render(&mut view, 160, 28).contains("[x] > Socket directory"));
         assert!(
-            view.draft.is_empty(),
+            view.x11.draft_is_empty(),
             "observation must not remove a declaration"
         );
     }
@@ -594,7 +596,7 @@ fn an_unobserved_source_is_not_claimed_to_be_missing() {
     let mut view = ConfigurationView::new(target("archlinux"));
     view.begin_query(3);
     view.finish_query(3, &target("archlinux"), Ok(inspected));
-    view.expanded.clear();
+    view.x11.clear_expanded();
     let screen = render(&mut view, 160, 28);
     assert!(screen.contains("[! Not observed]"));
     assert!(!screen.contains("[! Missing]"));
@@ -624,7 +626,7 @@ fn available_endpoint_check_generates_add_and_checking_again_cancels_it() {
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(view.draft.is_empty());
+    assert!(view.x11.draft_is_empty());
 }
 
 #[test]
@@ -733,12 +735,12 @@ fn x11_access_dialog_selects_each_display_from_the_keyboard() {
 fn runtime_access_entry_opens_a_nested_dialog_and_escape_only_closes_it() {
     let mut view = loaded_machine();
     render(&mut view, 140, 30);
-    let access_entry = view.hits.x11_access;
+    let access_entry = view.hits.x11.access;
     assert_eq!(
         view.handle_mouse(click(access_entry)),
         ConfigurationAction::None
     );
-    assert!(view.x11_access_dialog.is_some());
+    assert!(view.x11.access_dialog_is_open());
 
     for (width, height) in [(60, 15), (30, 8), (1, 1)] {
         render(&mut view, width, height);
@@ -747,7 +749,7 @@ fn runtime_access_entry_opens_a_nested_dialog_and_escape_only_closes_it() {
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(view.x11_access_dialog.is_none());
+    assert!(!view.x11.access_dialog_is_open());
     assert_eq!(
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ConfigurationAction::Close

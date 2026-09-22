@@ -4,24 +4,21 @@
 
 mod navigation;
 mod render;
-
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+mod x11;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::ListState;
 
 use crate::application::configuration::{
     ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
-    ConfigurationTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
+    ConfigurationTarget,
 };
 use crate::application::inspection::ResourceInspectionError;
 use crate::application::x11::{X11AccessCheck, X11AccessError, X11Authorization};
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
-use crate::tui::widgets::dialogs::x11_access::{X11AccessDialog, X11AccessDialogAction};
 use navigation::ConfigurationNavigation;
+use x11::{X11HitAreas, X11PageState};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigurationPane {
@@ -108,12 +105,6 @@ enum DraftPreviewState {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum X11ContentFocus {
-    Bindings,
-    RuntimeAccess,
-}
-
 #[derive(Clone, Copy)]
 enum DiscardIntent {
     Close,
@@ -128,21 +119,7 @@ struct HitAreas {
     preview_tabs: Vec<TitleTabHitbox<PreviewTab>>,
     refresh: Rect,
     close: Rect,
-    bindings: Vec<(Rect, usize)>,
-    checkboxes: Vec<(Rect, usize)>,
-    x11_access: Rect,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum X11DraftKey {
-    Declaration(usize),
-    Addition(PathBuf),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum X11ChecklistItem {
-    Declaration(usize),
-    Available(PathBuf),
+    x11: X11HitAreas,
 }
 
 pub(crate) struct ConfigurationView {
@@ -156,17 +133,12 @@ pub(crate) struct ConfigurationView {
     navigation: ConfigurationNavigation,
     preview_tab: PreviewTab,
     draft_generation: u64,
-    draft: BTreeMap<X11DraftKey, X11BindingChange>,
     draft_preview: DraftPreviewState,
     discard: Option<DiscardIntent>,
     restart_confirmation: Option<crate::domain::machine::MachineName>,
     saving: bool,
     apply_error: Option<String>,
-    x11_content_focus: X11ContentFocus,
-    pub(super) x11_access_dialog: Option<X11AccessDialog>,
-    list: ListState,
-    x11_items: Vec<X11ChecklistItem>,
-    expanded: BTreeSet<usize>,
+    x11: X11PageState,
     preview_scroll: usize,
     preview_max_scroll: usize,
     preview_width: u16,
@@ -187,17 +159,12 @@ impl ConfigurationView {
             navigation: ConfigurationNavigation::default(),
             preview_tab: PreviewTab::Checks,
             draft_generation: 0,
-            draft: BTreeMap::new(),
             draft_preview: DraftPreviewState::Clean,
             discard: None,
             restart_confirmation: None,
             saving: false,
             apply_error: None,
-            x11_content_focus: X11ContentFocus::Bindings,
-            x11_access_dialog: None,
-            list: ListState::default(),
-            x11_items: Vec::new(),
-            expanded: BTreeSet::new(),
+            x11: X11PageState::default(),
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_width: 0,
@@ -210,12 +177,11 @@ impl ConfigurationView {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
-        self.x11_access_dialog = None;
+        self.x11.begin_query();
         self.query = query;
         self.cancel_preview();
-        self.draft.clear();
+        self.x11.clear_draft();
         self.draft_preview = DraftPreviewState::Clean;
-        self.x11_items.clear();
         self.discard = None;
         self.restart_confirmation = None;
         self.apply_error = None;
@@ -238,11 +204,7 @@ impl ConfigurationView {
     }
 
     pub(crate) fn track_x11_check(&mut self, task: tokio::task::JoinHandle<()>) {
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.track_check(task);
-        } else {
-            task.abort();
-        }
+        self.x11.track_check(task);
     }
 
     pub(crate) fn finish_x11_check(
@@ -251,20 +213,12 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11AccessCheck, X11AccessError>,
     ) {
-        if target != &self.target {
-            return;
-        }
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.finish_check(generation, result);
-        }
+        self.x11
+            .finish_check(generation, target, &self.target, result);
     }
 
     pub(crate) fn track_x11_authorization(&mut self, task: tokio::task::JoinHandle<()>) {
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.track_authorization(task);
-        } else {
-            task.abort();
-        }
+        self.x11.track_authorization(task);
     }
 
     pub(crate) fn finish_x11_authorization(
@@ -273,20 +227,12 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11Authorization, X11AccessError>,
     ) {
-        if target != &self.target {
-            return;
-        }
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.finish_authorization(generation, result);
-        }
+        self.x11
+            .finish_authorization(generation, target, &self.target, result);
     }
 
     pub(crate) fn track_x11_revocation(&mut self, task: tokio::task::JoinHandle<()>) {
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.track_revocation(task);
-        } else {
-            task.abort();
-        }
+        self.x11.track_revocation(task);
     }
 
     pub(crate) fn finish_x11_revocation(
@@ -295,12 +241,8 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<crate::application::x11::X11Revocation, X11AccessError>,
     ) {
-        if target != &self.target {
-            return;
-        }
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            dialog.finish_revocation(generation, result);
-        }
+        self.x11
+            .finish_revocation(generation, target, &self.target, result);
     }
 
     pub(crate) fn finish_query(
@@ -315,17 +257,12 @@ impl ConfigurationView {
         self.pending.take();
         self.state = match result {
             Ok(snapshot) if snapshot.target == self.target => {
-                self.x11_items = x11_checklist_items(&snapshot);
-                self.list =
-                    ListState::default().with_selected((!self.x11_items.is_empty()).then_some(0));
-                self.expanded.clear();
-                self.expanded.insert(0);
+                self.x11.finish_query(&snapshot);
                 InspectionState::Ready(Box::new(snapshot))
             }
             Ok(_) => InspectionState::Failed("Inspection returned a different resource".into()),
             Err(error) => InspectionState::Failed(error.to_string()),
         };
-        self.x11_content_focus = X11ContentFocus::Bindings;
         self.preview_scroll = 0;
         self.preview_cache = None;
     }
@@ -336,7 +273,10 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<ConfigurationPreview, ResourceInspectionError>,
     ) {
-        if generation != self.draft_generation || target != &self.target || self.draft.is_empty() {
+        if generation != self.draft_generation
+            || target != &self.target
+            || self.x11.draft_is_empty()
+        {
             return;
         }
         self.pending_preview.take();
@@ -366,7 +306,7 @@ impl ConfigurationView {
         self.saving = false;
         match result {
             Ok(ConfigurationApplyReport::Applied { .. }) => {
-                self.draft.clear();
+                self.x11.clear_draft();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 self.restart_confirmation = match &self.target {
@@ -376,7 +316,7 @@ impl ConfigurationView {
                 Some("X11 configuration saved; it takes effect on the next machine start".into())
             }
             Ok(ConfigurationApplyReport::Unchanged { .. }) => {
-                self.draft.clear();
+                self.x11.clear_draft();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 Some("Configuration is already up to date".into())
@@ -411,7 +351,7 @@ impl ConfigurationView {
         Some(ConfigurationEdit {
             target: self.target.clone(),
             base_revision: snapshot.revision.clone()?,
-            x11_changes: self.draft.values().cloned().collect(),
+            x11_changes: self.x11.draft_changes(),
         })
     }
 
@@ -419,26 +359,8 @@ impl ConfigurationView {
         if self.saving {
             return ConfigurationAction::None;
         }
-        let Some(item) = self
-            .list
-            .selected()
-            .and_then(|index| self.x11_items.get(index))
-            .cloned()
-        else {
+        if !self.x11.toggle_selected() {
             return ConfigurationAction::None;
-        };
-        let (key, change) = match item {
-            X11ChecklistItem::Declaration(line) => (
-                X11DraftKey::Declaration(line),
-                X11BindingChange::Remove { line },
-            ),
-            X11ChecklistItem::Available(source) => (
-                X11DraftKey::Addition(source.clone()),
-                X11BindingChange::Add { source },
-            ),
-        };
-        if self.draft.remove(&key).is_none() {
-            self.draft.insert(key, change);
         }
         self.draft_changed()
     }
@@ -452,7 +374,7 @@ impl ConfigurationView {
         self.apply_error = None;
         self.preview_scroll = 0;
         self.preview_cache = None;
-        if self.draft.is_empty() {
+        if self.x11.draft_is_empty() {
             self.draft_preview = DraftPreviewState::Clean;
             return ConfigurationAction::None;
         }
@@ -473,156 +395,14 @@ impl ConfigurationView {
     }
 
     fn toggle_selected_details(&mut self) {
-        let Some(selected) = self.list.selected() else {
-            return;
-        };
-        if !self.expanded.remove(&selected) {
-            self.expanded.insert(selected);
-        }
+        self.x11.toggle_selected_details();
     }
 
     fn open_x11_access_dialog(&mut self) {
-        let ConfigurationTarget::Machine(machine) = &self.target else {
-            return;
-        };
         let InspectionState::Ready(snapshot) = &self.state else {
             return;
         };
-        let selected = self.selected_host_x11_socket();
-        self.x11_access_dialog = Some(X11AccessDialog::new(
-            machine.clone(),
-            snapshot.host_x11.sockets.clone(),
-            selected.as_ref(),
-        ));
-    }
-
-    fn handle_x11_access_action(&mut self, action: X11AccessDialogAction) -> ConfigurationAction {
-        match action {
-            X11AccessDialogAction::None => ConfigurationAction::None,
-            X11AccessDialogAction::Close => {
-                self.x11_access_dialog = None;
-                ConfigurationAction::None
-            }
-            X11AccessDialogAction::Check {
-                generation,
-                target,
-                host_socket,
-            } => ConfigurationAction::CheckX11 {
-                generation,
-                target,
-                host_socket,
-            },
-            X11AccessDialogAction::Authorize {
-                generation,
-                target,
-                host_socket,
-            } => ConfigurationAction::AuthorizeX11 {
-                generation,
-                target,
-                host_socket,
-            },
-            X11AccessDialogAction::Revoke {
-                generation,
-                target,
-                host_socket,
-                record_id,
-            } => ConfigurationAction::RevokeX11 {
-                generation,
-                target,
-                host_socket,
-                record_id,
-            },
-        }
-    }
-
-    fn selected_host_x11_socket(&self) -> Option<crate::domain::x11::HostX11Socket> {
-        let InspectionState::Ready(snapshot) = &self.state else {
-            return None;
-        };
-        let item = self
-            .list
-            .selected()
-            .and_then(|index| self.x11_items.get(index));
-        match item {
-            Some(X11ChecklistItem::Available(source)) => snapshot
-                .host_x11
-                .sockets
-                .iter()
-                .find(|socket| socket.source() == source)
-                .cloned(),
-            Some(X11ChecklistItem::Declaration(line)) => {
-                let binding = snapshot
-                    .x11_bindings
-                    .iter()
-                    .find(|binding| binding.line == *line)?;
-                match binding.scope {
-                    crate::application::configuration::X11BindingScope::Socket { .. } => snapshot
-                        .host_x11
-                        .sockets
-                        .iter()
-                        .find(|socket| socket.source() == binding.source)
-                        .cloned(),
-                    crate::application::configuration::X11BindingScope::Directory => {
-                        snapshot
-                            .host_x11
-                            .preferred_display
-                            .and_then(|display| {
-                                snapshot.host_x11.sockets.iter().find(|socket| {
-                                    socket.display() == display && !socket.alternate()
-                                })
-                            })
-                            .or_else(|| {
-                                snapshot
-                                    .host_x11
-                                    .sockets
-                                    .iter()
-                                    .find(|socket| !socket.alternate())
-                            })
-                            .cloned()
-                    }
-                }
-            }
-            None => snapshot
-                .host_x11
-                .preferred_display
-                .and_then(|display| {
-                    snapshot
-                        .host_x11
-                        .sockets
-                        .iter()
-                        .find(|socket| socket.display() == display && !socket.alternate())
-                })
-                .cloned(),
-        }
-    }
-
-    fn select_x11_item(&mut self, index: usize) {
-        if self.list.selected() == Some(index) {
-            return;
-        }
-        self.list.select(Some(index));
-    }
-
-    fn move_x11_content_focus(&mut self, down: bool) {
-        match (self.x11_content_focus, down) {
-            (X11ContentFocus::Bindings, true) => {
-                let current = self.list.selected().unwrap_or(0);
-                if current + 1 < self.x11_items.len() {
-                    self.select_x11_item(current + 1);
-                } else if matches!(self.target, ConfigurationTarget::Machine(_)) {
-                    self.x11_content_focus = X11ContentFocus::RuntimeAccess;
-                }
-            }
-            (X11ContentFocus::Bindings, false) => {
-                let current = self.list.selected().unwrap_or(0);
-                self.select_x11_item(current.saturating_sub(1));
-            }
-            (X11ContentFocus::RuntimeAccess, false) if !self.x11_items.is_empty() => {
-                self.select_x11_item(self.x11_items.len() - 1);
-                self.x11_content_focus = X11ContentFocus::Bindings;
-            }
-            _ => {}
-        }
+        self.x11.open_access_dialog(&self.target, snapshot);
     }
 
     fn request_close_or_refresh(&mut self, intent: DiscardIntent) -> ConfigurationAction {
@@ -631,7 +411,7 @@ impl ConfigurationView {
             self.preview_cache = None;
             return ConfigurationAction::None;
         }
-        if !self.draft.is_empty() {
+        if !self.x11.draft_is_empty() {
             self.discard = Some(intent);
             return ConfigurationAction::None;
         }
@@ -645,7 +425,7 @@ impl ConfigurationView {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let intent = self.discard.take().expect("discard intent is visible");
-                self.draft.clear();
+                self.x11.clear_draft();
                 match intent {
                     DiscardIntent::Close => ConfigurationAction::Close,
                     DiscardIntent::Refresh => ConfigurationAction::Refresh,
@@ -707,14 +487,14 @@ impl ConfigurationView {
                 self.preview_scroll.saturating_sub(1)
             };
         } else if self.pane == ConfigurationPane::Content {
-            self.move_x11_content_focus(down);
+            self.x11
+                .move_focus(down, matches!(self.target, ConfigurationTarget::Machine(_)));
         }
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ConfigurationAction {
-        if let Some(dialog) = &mut self.x11_access_dialog {
-            let action = dialog.handle_key(key);
-            return self.handle_x11_access_action(action);
+        if let Some(action) = self.x11.handle_access_key(key) {
+            return action;
         }
         if self.restart_confirmation.is_some() {
             return self.handle_restart_confirmation_key(key);
@@ -767,29 +547,25 @@ impl ConfigurationView {
                 }
             }
             (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE)
-                if self.pane == ConfigurationPane::Content
-                    && self.x11_content_focus == X11ContentFocus::Bindings =>
+                if self.pane == ConfigurationPane::Content && self.x11.is_bindings_focused() =>
             {
-                if let Some(selected) = self.list.selected() {
-                    if key.code == KeyCode::Right {
-                        self.expanded.insert(selected);
-                    } else {
-                        self.expanded.remove(&selected);
-                    }
+                if let Some(selected) = self.x11.selected_index() {
+                    self.x11.set_expanded(selected, key.code == KeyCode::Right);
                 }
             }
             (KeyCode::Char(' '), KeyModifiers::NONE) => match self.pane {
                 ConfigurationPane::Navigation => {}
-                ConfigurationPane::Content => match self.x11_content_focus {
-                    X11ContentFocus::Bindings => return self.toggle_selected_x11(),
-                    X11ContentFocus::RuntimeAccess => self.open_x11_access_dialog(),
-                },
+                ConfigurationPane::Content if self.x11.is_bindings_focused() => {
+                    return self.toggle_selected_x11();
+                }
+                ConfigurationPane::Content => self.open_x11_access_dialog(),
                 ConfigurationPane::Preview => {}
             },
             (KeyCode::Enter, KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                match self.x11_content_focus {
-                    X11ContentFocus::Bindings => self.toggle_selected_details(),
-                    X11ContentFocus::RuntimeAccess => self.open_x11_access_dialog(),
+                if self.x11.is_bindings_focused() {
+                    self.toggle_selected_details();
+                } else {
+                    self.open_x11_access_dialog();
                 }
             }
             (KeyCode::Char('c'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
@@ -801,7 +577,7 @@ impl ConfigurationView {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> ConfigurationAction {
-        if self.x11_access_dialog.is_some()
+        if self.x11.access_dialog_is_open()
             || self.discard.is_some()
             || self.restart_confirmation.is_some()
         {
@@ -822,27 +598,29 @@ impl ConfigurationView {
                 self.navigation.click(position);
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
-                if self.hits.x11_access.contains(position)
+                if self.hits.x11.access.contains(position)
                     && matches!(self.target, ConfigurationTarget::Machine(_))
                 {
-                    self.x11_content_focus = X11ContentFocus::RuntimeAccess;
+                    self.x11.set_runtime_access_focus();
                     self.open_x11_access_dialog();
                 } else {
-                    self.x11_content_focus = X11ContentFocus::Bindings;
+                    self.x11.set_bindings_focus();
                     let toggle = self
                         .hits
+                        .x11
                         .checkboxes
                         .iter()
                         .find(|(area, _)| area.contains(position))
                         .map(|(_, selected)| *selected);
                     if let Some(selected) = self
                         .hits
+                        .x11
                         .bindings
                         .iter()
                         .find(|(area, _)| area.contains(position))
                         .map(|(_, selected)| *selected)
                     {
-                        self.select_x11_item(selected);
+                        self.x11.select_item(selected);
                         if toggle == Some(selected) {
                             return self.toggle_selected_x11();
                         }
@@ -868,64 +646,6 @@ impl ConfigurationView {
         }
         ConfigurationAction::None
     }
-
-    fn x11_item_change(&self, item: &X11ChecklistItem) -> Option<&X11BindingChange> {
-        let key = match item {
-            X11ChecklistItem::Declaration(line) => X11DraftKey::Declaration(*line),
-            X11ChecklistItem::Available(source) => X11DraftKey::Addition(source.clone()),
-        };
-        self.draft.get(&key)
-    }
-
-    fn x11_item_checked(&self, item: &X11ChecklistItem) -> bool {
-        match item {
-            X11ChecklistItem::Declaration(_) => !matches!(
-                self.x11_item_change(item),
-                Some(X11BindingChange::Remove { .. })
-            ),
-            X11ChecklistItem::Available(_) => {
-                matches!(
-                    self.x11_item_change(item),
-                    Some(X11BindingChange::Add { .. })
-                )
-            }
-        }
-    }
-}
-
-fn x11_checklist_items(snapshot: &ConfigurationSnapshot) -> Vec<X11ChecklistItem> {
-    let mut items = snapshot
-        .x11_bindings
-        .iter()
-        .map(|binding| X11ChecklistItem::Declaration(binding.line))
-        .collect::<Vec<_>>();
-    let recommended = snapshot
-        .x11_bindings
-        .iter()
-        .filter(|binding| declaration_is_recommended(binding, &snapshot.x11_bind_recommendation))
-        .map(|binding| binding.source.as_path())
-        .collect::<BTreeSet<_>>();
-    items.extend(
-        snapshot
-            .host_x11
-            .sockets
-            .iter()
-            .filter(|socket| !recommended.contains(socket.source()))
-            .map(|socket| X11ChecklistItem::Available(socket.source().to_path_buf())),
-    );
-    items
-}
-
-fn declaration_is_recommended(
-    binding: &X11BindingDeclaration,
-    recommendation: &X11BindRecommendation,
-) -> bool {
-    let X11BindRecommendation::Ready { idmapped, .. } = recommendation else {
-        return false;
-    };
-    binding.readonly
-        && binding.source == binding.guest_target
-        && binding.options.iter().any(|option| option == "idmap") == *idmapped
 }
 
 impl Drop for ConfigurationView {
