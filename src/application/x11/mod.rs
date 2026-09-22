@@ -8,9 +8,12 @@ use crate::application::sessions::{
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
 mod catalog;
+mod session;
 
 pub use catalog::{X11EndpointCatalog, X11SourceObservation, X11SourceState};
 pub(crate) use catalog::{X11EndpointDiscoveryPort, X11EndpointDiscoveryService};
+use session::select_session_endpoints;
+pub use session::{X11SessionPreparation, X11SessionSelection};
 
 const SERVER_INTERPRETED_FAMILY: u8 = 5;
 const LOCAL_USER_KIND: &[u8] = b"localuser";
@@ -473,37 +476,6 @@ impl X11DesktopRevocation {
 pub struct X11Authorization {
     check: X11AccessCheck,
     disposition: X11AuthorizationDisposition,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum X11SessionSelection {
-    Current,
-    Display(u16),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct X11SessionPreparation {
-    context: X11SessionContext,
-    check: X11AccessCheck,
-    disposition: X11AuthorizationDisposition,
-}
-
-impl X11SessionPreparation {
-    pub fn context(&self) -> &X11SessionContext {
-        &self.context
-    }
-
-    pub fn check(&self) -> &X11AccessCheck {
-        &self.check
-    }
-
-    pub fn disposition(&self) -> &X11AuthorizationDisposition {
-        &self.disposition
-    }
-
-    pub fn into_context(self) -> X11SessionContext {
-        self.context
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1036,54 +1008,6 @@ impl X11AccessService {
             .await
             .map_err(X11AccessError::Desktop)
     }
-}
-
-fn select_session_endpoints(
-    catalog: X11EndpointCatalog,
-    selection: X11SessionSelection,
-) -> Result<(u16, Vec<HostX11Socket>), String> {
-    let display = match selection {
-        X11SessionSelection::Current => catalog.preferred_display.ok_or_else(|| {
-            "the current DISPLAY does not identify a local X11 server; select one explicitly with --with-x11=:N"
-                .to_owned()
-        })?,
-        X11SessionSelection::Display(display) => display,
-    };
-    let mut candidates = catalog
-        .sockets
-        .iter()
-        .filter(|socket| socket.display() == display)
-        .cloned()
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(HostX11Socket::alternate);
-    if !candidates.is_empty() {
-        return Ok((display, candidates));
-    }
-
-    let mut available = catalog
-        .sockets
-        .iter()
-        .map(HostX11Socket::display)
-        .collect::<Vec<_>>();
-    available.sort_unstable();
-    available.dedup();
-    let available = if available.is_empty() {
-        "none".to_owned()
-    } else {
-        available
-            .into_iter()
-            .map(|display| format!(":{display}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let diagnostic = catalog
-        .diagnostics
-        .first()
-        .map(|message| format!("; discovery: {message}"))
-        .unwrap_or_default();
-    Err(format!(
-        "X11 display :{display} was not discovered (available: {available}){diagnostic}"
-    ))
 }
 
 #[cfg(test)]
