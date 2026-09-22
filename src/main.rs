@@ -12,6 +12,30 @@ mod logging;
 mod paths;
 mod tui;
 
+// Shell sessions spend most of their lifetime forwarding terminal I/O. A
+// current-thread runtime keeps the idle path to one scheduler thread; PTY
+// adapters still obtain blocking workers on demand when a direct attachment
+// needs them.
+const SHELL_MAX_BLOCKING_THREADS: usize = 4;
+const DAEMON_MAX_BLOCKING_THREADS: usize = 8;
+const TUI_WORKER_THREADS: usize = 2;
+const TUI_MAX_BLOCKING_THREADS: usize = 8;
+
+fn build_current_thread_runtime(max_blocking_threads: usize) -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking_threads)
+        .build()?)
+}
+
+fn build_tui_runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(TUI_WORKER_THREADS)
+        .max_blocking_threads(TUI_MAX_BLOCKING_THREADS)
+        .enable_all()
+        .build()?)
+}
+
 fn main() -> Result<()> {
     // 1. Parse CLI flags — all early exits happen here, before terminal
     //    takeover, so raw-mode / alternate-screen restoration is never needed.
@@ -24,18 +48,14 @@ fn main() -> Result<()> {
 
     match dispatch {
         crate::cli::CliDispatch::Shell(command) => {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
             let code = runtime.block_on(run_shell_command(command));
             std::process::exit(code);
         }
         // 1b. Internal daemon mode — run as root child process with its
         //     dedicated current-thread runtime.
         crate::cli::CliDispatch::Application(options) if options.is_daemon => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let runtime = build_current_thread_runtime(DAEMON_MAX_BLOCKING_THREADS)?;
             runtime.block_on(crate::daemon::daemon_main(
                 options.fd_sock,
                 options.rpc_sock,
@@ -44,15 +64,11 @@ fn main() -> Result<()> {
             ));
         }
         crate::cli::CliDispatch::Application(options) if options.internal_x11_reconcile => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
+            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
             runtime.block_on(run_x11_reconcile(options.want_systemd_tools))?;
         }
         crate::cli::CliDispatch::Application(options) => {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()?;
+            let runtime = build_tui_runtime()?;
             runtime.block_on(run_application(options))?;
         }
     }
