@@ -7,6 +7,15 @@ pub enum AppMessage {
     Container(ContainerMessage),
     List(ListMessage),
     Session(SessionMessage),
+    Configuration(ConfigurationMessage),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ConfigurationMessage {
+    CheckX11,
+    AuthorizeX11,
+    RevokeX11,
+    CloseX11Access,
 }
 
 #[derive(Debug, PartialEq)]

@@ -164,6 +164,35 @@ fn click(area: Rect) -> MouseEvent {
     }
 }
 
+fn begin_x11_access_check(
+    view: &mut ConfigurationView,
+    guest_user: &str,
+) -> (
+    u64,
+    crate::application::sessions::ShellTarget,
+    HostX11Socket,
+) {
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(view.x11_access_dialog.is_some());
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for character in guest_user.chars() {
+        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let ConfigurationAction::CheckX11 {
+        generation,
+        target,
+        host_socket,
+    } = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("X11 access dialog should emit the runtime check request");
+    };
+    (generation, target, host_socket)
+}
+
 #[test]
 fn stale_query_and_wrong_target_results_cannot_replace_current_snapshot() {
     let mut view = loaded();
@@ -188,9 +217,9 @@ fn wide_view_separates_navigation_declarations_and_runtime_access() {
     let screen = render(&mut view, 140, 28);
     assert!(screen.contains("Host Integration"));
     assert!(screen.contains("/mnt/host-x11"));
-    assert!(screen.contains("Current access"));
-    assert!(screen.contains("Operation history"));
-    assert!(screen.contains("Run Check access to load records"));
+    assert!(screen.contains("Runtime access is available for running machines"));
+    assert!(!screen.contains("Current access"));
+    assert!(!screen.contains("Operation history"));
     assert!(!screen.contains("PRIVATE_VALUE"));
     assert!(!screen.contains("MOD"));
     assert!(!view.hits.navigation.intersects(view.hits.content));
@@ -248,7 +277,7 @@ fn clicking_the_checkbox_uses_the_same_desired_state_transition_as_space() {
         panic!("clicking a checked declaration should request its removal preview");
     };
     assert_eq!(edit.x11_changes, [X11BindingChange::Remove { line: 4 }]);
-    assert!(render(&mut view, 140, 28).contains("[ ] ▾ Socket directory"));
+    assert!(render(&mut view, 140, 28).contains("[ ] ∨ Socket directory"));
 }
 
 #[test]
@@ -340,7 +369,7 @@ fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed()
 fn tree_rows_are_clickable_and_binding_disclosure_is_separate_from_selection() {
     let mut view = loaded();
     let screen = render(&mut view, 140, 28);
-    assert!(screen.contains(">> [x] ▾ Socket directory"));
+    assert!(screen.contains(">> [x] ∨ Socket directory"));
     let parent = Rect::new(view.hits.navigation.x + 1, view.hits.navigation.y + 1, 1, 1);
     view.handle_mouse(click(parent));
     assert!(render(&mut view, 140, 28).contains("> [+] Host Integration"));
@@ -350,9 +379,9 @@ fn tree_rows_are_clickable_and_binding_disclosure_is_separate_from_selection() {
     assert!(render(&mut view, 140, 28).contains(">> X11"));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
-    assert!(render(&mut view, 140, 28).contains(">> [x] ▸ Socket directory"));
+    assert!(render(&mut view, 140, 28).contains(">> [x] > Socket directory"));
     view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-    assert!(render(&mut view, 140, 28).contains(">> [x] ▾ Socket directory"));
+    assert!(render(&mut view, 140, 28).contains(">> [x] ∨ Socket directory"));
 }
 
 #[test]
@@ -550,7 +579,7 @@ fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
             })
             .expect("folded selected source must show its status");
         assert_eq!(buffer[(x, y)].fg, color, "selected status lost its color");
-        assert!(render(&mut view, 160, 28).contains("[x] ▸ Socket directory"));
+        assert!(render(&mut view, 160, 28).contains("[x] > Socket directory"));
         assert!(
             view.draft.is_empty(),
             "observation must not remove a declaration"
@@ -590,7 +619,7 @@ fn available_endpoint_check_generates_add_and_checking_again_cancels_it() {
             source: "/tmp/.X11-unix/X0".into(),
         }]
     );
-    assert!(render(&mut view, 140, 28).contains("[x] ▸ :0 X0"));
+    assert!(render(&mut view, 140, 28).contains("[x] > :0 X0"));
     assert_eq!(
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
         ConfigurationAction::None
@@ -636,23 +665,9 @@ fn machine_apply_prompts_for_restart_and_returns_the_exact_target() {
 }
 
 #[test]
-fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
+fn machine_x11_access_dialog_checks_guest_projection_and_reports_acl_state() {
     let mut view = loaded_machine();
-    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    assert_eq!(view.x11_content_focus, X11ContentFocus::GuestUser);
-    for character in "alice".chars() {
-        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
-    }
-    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-    let ConfigurationAction::CheckX11 {
-        generation,
-        target,
-        host_socket,
-    } = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-    else {
-        panic!("inline Check projection should emit the runtime request");
-    };
+    let (generation, target, host_socket) = begin_x11_access_check(&mut view, "alice");
     assert_eq!(target.machine().as_str(), "archlinux");
     assert_eq!(target.user().as_str(), "alice");
     assert_eq!(host_socket.source(), PathBuf::from("/tmp/.X11-unix/X0"));
@@ -666,18 +681,86 @@ fn machine_x11_check_uses_inline_guest_user_and_reports_acl_state() {
     assert!(screen.contains("external/unmanaged"));
     assert!(screen.contains("No Lasper-created grant records"));
     assert!(screen.contains("localuser entries: #1437402088"));
-    assert!(!screen.contains(" Authorize "));
+}
+
+#[test]
+fn x11_access_dialog_selects_each_display_from_the_keyboard() {
+    let second = HostX11Socket::from_verified_parts(
+        1,
+        false,
+        "/tmp/.X11-unix/X1".into(),
+        "/tmp/.X11-unix/X1".into(),
+        1000,
+        1000,
+        0o755,
+        43,
+        1000,
+        1000,
+        X11SocketRevision {
+            device: 1,
+            inode: 3,
+            ctime_seconds: 3,
+            ctime_nanoseconds: 4,
+        },
+    )
+    .unwrap();
+    let machine = MachineName::new("archlinux").unwrap();
+    let target = ConfigurationTarget::Machine(machine.clone());
+    let mut inspected = snapshot("archlinux");
+    inspected.target = target.clone();
+    inspected.discovery = ConfigurationDiscovery::MachineNameCandidates;
+    inspected.host_x11.sockets.push(second.clone());
+    let mut view = ConfigurationView::new(target.clone());
+    view.begin_query(3);
+    view.finish_query(3, &target, Ok(inspected));
+
+    view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for character in "alice".chars() {
+        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let ConfigurationAction::CheckX11 { host_socket, .. } =
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("selected display should be checked");
+    };
+    assert_eq!(host_socket, second);
+}
+
+#[test]
+fn runtime_access_entry_opens_a_nested_dialog_and_escape_only_closes_it() {
+    let mut view = loaded_machine();
+    render(&mut view, 140, 30);
+    let access_entry = view.hits.x11_access;
+    assert_eq!(
+        view.handle_mouse(click(access_entry)),
+        ConfigurationAction::None
+    );
+    assert!(view.x11_access_dialog.is_some());
+
+    for (width, height) in [(60, 15), (30, 8), (1, 1)] {
+        render(&mut view, width, height);
+    }
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(view.x11_access_dialog.is_none());
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        ConfigurationAction::Close
+    );
 }
 
 #[test]
 fn pathname_permission_failure_is_visible_without_blocking_authorization() {
     let mut view = loaded_machine();
-    view.guest_user.set_value("alice".into());
-    let host_socket = view.selected_host_x11_socket().unwrap();
+    let (generation, _, host_socket) = begin_x11_access_check(&mut view, "alice");
     let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    view.x11_check_generation = 8;
     view.finish_x11_check(
-        8,
+        generation,
         &target,
         Ok(x11_check_with_access(host_socket, &[], false, false)),
     );
@@ -691,11 +774,13 @@ fn pathname_permission_failure_is_visible_without_blocking_authorization() {
 #[test]
 fn missing_exact_x11_entry_requires_scope_confirmation_before_authorization() {
     let mut view = loaded_machine();
-    view.guest_user.set_value("alice".into());
-    let host_socket = view.selected_host_x11_socket().unwrap();
+    let (check_generation, _, host_socket) = begin_x11_access_check(&mut view, "alice");
     let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    view.x11_check_generation = 8;
-    view.finish_x11_check(8, &target, Ok(x11_check(host_socket.clone(), &[])));
+    view.finish_x11_check(
+        check_generation,
+        &target,
+        Ok(x11_check(host_socket.clone(), &[])),
+    );
 
     let screen = render(&mut view, 140, 30);
     assert!(screen.contains(" Authorize "));
@@ -716,16 +801,9 @@ fn missing_exact_x11_entry_requires_scope_confirmation_before_authorization() {
     else {
         panic!("confirmation should emit one typed authorization request");
     };
-    assert_eq!(generation, 9);
+    assert_eq!(generation, check_generation + 1);
     assert_eq!(shell_target.machine().as_str(), "archlinux");
     assert_eq!(shell_target.user().as_str(), "alice");
     assert_eq!(selected_socket, host_socket);
-    assert!(matches!(
-        view.x11_check,
-        X11CheckState::Authorizing {
-            generation: 9,
-            host_uid: 1_437_402_088,
-            ..
-        }
-    ));
+    assert!(render(&mut view, 140, 30).contains(&format!("Authorization #{generation}")));
 }

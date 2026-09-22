@@ -28,6 +28,13 @@ impl Button {
         self.enabled = enabled;
         self
     }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        if !enabled {
+            self.focused = false;
+        }
+    }
 }
 
 impl Component for Button {

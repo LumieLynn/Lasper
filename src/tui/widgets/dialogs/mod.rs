@@ -162,3 +162,4 @@ pub mod shell;
 pub mod unclassified_file;
 pub mod user_editor;
 pub mod wayland_access;
+pub mod x11_access;

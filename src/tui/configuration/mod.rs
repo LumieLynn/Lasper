@@ -18,14 +18,9 @@ use crate::application::configuration::{
     ConfigurationTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
 };
 use crate::application::inspection::ResourceInspectionError;
-use crate::application::sessions::ValidatedGuestUserName;
-use crate::application::x11::{
-    X11AccessCheck, X11AccessError, X11Authorization, X11GrantAssessmentStatus,
-    X11MappedUidAclStatus,
-};
-use crate::tui::core::{Component, EventResult};
+use crate::application::x11::{X11AccessCheck, X11AccessError, X11Authorization};
 use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
-use crate::tui::widgets::inputs::text_box::TextBox;
+use crate::tui::widgets::dialogs::x11_access::{X11AccessDialog, X11AccessDialogAction};
 use navigation::ConfigurationNavigation;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,152 +108,10 @@ enum DraftPreviewState {
     },
 }
 
-enum X11CheckState {
-    Untested,
-    Loading {
-        generation: u64,
-        user: ValidatedGuestUserName,
-    },
-    Authorizing {
-        generation: u64,
-        user: ValidatedGuestUserName,
-        host_uid: u32,
-    },
-    Revoking {
-        generation: u64,
-        user: ValidatedGuestUserName,
-        record_id: String,
-    },
-    Ready {
-        generation: u64,
-        check: Box<X11AccessCheck>,
-        assessment: X11GrantAssessmentPresentation,
-        authorization: Option<X11AuthorizationPresentation>,
-        revocation: Option<X11RevocationPresentation>,
-    },
-    Failed {
-        generation: u64,
-        message: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum X11AuthorizationPresentation {
-    AccessControlDisabled,
-    PreExisting,
-    Added { record_id: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum X11RevocationPresentation {
-    Revoked { record_id: String },
-    AlreadyAbsent { record_id: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum X11GrantStatusPresentation {
-    AccessControlDisabled,
-    Managed { record_id: String },
-    PreExisting,
-    Historical,
-    Absent,
-    OutcomeUnknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct X11GrantHistoryPresentation {
-    record_id: String,
-    host_uid: u32,
-    status: X11GrantHistoryStatusPresentation,
-    detail: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum X11GrantHistoryStatusPresentation {
-    Managed,
-    Historical,
-    Absent,
-    OutcomeUnknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct X11GrantAssessmentPresentation {
-    status: X11GrantStatusPresentation,
-    history: Vec<X11GrantHistoryPresentation>,
-    diagnostics: Vec<String>,
-    records_complete: bool,
-}
-
-impl X11GrantAssessmentPresentation {
-    fn from_check(check: &X11AccessCheck) -> Self {
-        let assessment = check.grant_assessment();
-        let status = match assessment.status() {
-            X11GrantAssessmentStatus::AccessControlDisabled => {
-                X11GrantStatusPresentation::AccessControlDisabled
-            }
-            X11GrantAssessmentStatus::Managed { record_id } => {
-                X11GrantStatusPresentation::Managed {
-                    record_id: record_id.clone(),
-                }
-            }
-            X11GrantAssessmentStatus::PreExisting => X11GrantStatusPresentation::PreExisting,
-            X11GrantAssessmentStatus::Historical => X11GrantStatusPresentation::Historical,
-            X11GrantAssessmentStatus::Absent => X11GrantStatusPresentation::Absent,
-            X11GrantAssessmentStatus::OutcomeUnknown => X11GrantStatusPresentation::OutcomeUnknown,
-        };
-        Self {
-            status,
-            history: assessment
-                .history()
-                .iter()
-                .map(|entry| X11GrantHistoryPresentation {
-                    record_id: entry.record_id().to_owned(),
-                    host_uid: entry.host_uid(),
-                    status: match entry.status() {
-                        crate::application::x11::X11GrantHistoryStatus::Managed => {
-                            X11GrantHistoryStatusPresentation::Managed
-                        }
-                        crate::application::x11::X11GrantHistoryStatus::Historical => {
-                            X11GrantHistoryStatusPresentation::Historical
-                        }
-                        crate::application::x11::X11GrantHistoryStatus::Absent => {
-                            X11GrantHistoryStatusPresentation::Absent
-                        }
-                        crate::application::x11::X11GrantHistoryStatus::OutcomeUnknown => {
-                            X11GrantHistoryStatusPresentation::OutcomeUnknown
-                        }
-                    },
-                    detail: entry.detail().to_owned(),
-                })
-                .collect(),
-            diagnostics: assessment.diagnostics().to_vec(),
-            records_complete: assessment.records_complete(),
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum X11ContentFocus {
     Bindings,
-    GuestUser,
-    Check,
-    Authorize,
-    Revoke,
-}
-
-#[derive(Clone, Debug)]
-struct PendingX11Authorization {
-    target: crate::application::sessions::ShellTarget,
-    host_socket: crate::domain::x11::HostX11Socket,
-    host_uid: u32,
-}
-
-#[derive(Clone, Debug)]
-struct PendingX11Revocation {
-    target: crate::application::sessions::ShellTarget,
-    host_socket: crate::domain::x11::HostX11Socket,
-    record_id: String,
-    host_uid: u32,
+    RuntimeAccess,
 }
 
 #[derive(Clone, Copy)]
@@ -277,10 +130,7 @@ struct HitAreas {
     close: Rect,
     bindings: Vec<(Rect, usize)>,
     checkboxes: Vec<(Rect, usize)>,
-    guest_user: Rect,
-    check_x11: Rect,
-    authorize_x11: Rect,
-    revoke_x11: Rect,
+    x11_access: Rect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -301,9 +151,6 @@ pub(crate) struct ConfigurationView {
     pending: Option<tokio::task::JoinHandle<()>>,
     pending_preview: Option<tokio::task::JoinHandle<()>>,
     pending_apply: Option<tokio::task::JoinHandle<()>>,
-    pending_x11_check: Option<tokio::task::JoinHandle<()>>,
-    pending_x11_authorization: Option<tokio::task::JoinHandle<()>>,
-    pending_x11_revocation: Option<tokio::task::JoinHandle<()>>,
     state: InspectionState,
     pane: ConfigurationPane,
     navigation: ConfigurationNavigation,
@@ -313,14 +160,10 @@ pub(crate) struct ConfigurationView {
     draft_preview: DraftPreviewState,
     discard: Option<DiscardIntent>,
     restart_confirmation: Option<crate::domain::machine::MachineName>,
-    x11_authorization_confirmation: Option<PendingX11Authorization>,
-    x11_revocation_confirmation: Option<PendingX11Revocation>,
     saving: bool,
     apply_error: Option<String>,
-    x11_check_generation: u64,
-    x11_check: X11CheckState,
     x11_content_focus: X11ContentFocus,
-    guest_user: TextBox,
+    pub(super) x11_access_dialog: Option<X11AccessDialog>,
     list: ListState,
     x11_items: Vec<X11ChecklistItem>,
     expanded: BTreeSet<usize>,
@@ -339,9 +182,6 @@ impl ConfigurationView {
             pending: None,
             pending_preview: None,
             pending_apply: None,
-            pending_x11_check: None,
-            pending_x11_authorization: None,
-            pending_x11_revocation: None,
             state: InspectionState::Loading,
             pane: ConfigurationPane::Content,
             navigation: ConfigurationNavigation::default(),
@@ -351,15 +191,10 @@ impl ConfigurationView {
             draft_preview: DraftPreviewState::Clean,
             discard: None,
             restart_confirmation: None,
-            x11_authorization_confirmation: None,
-            x11_revocation_confirmation: None,
             saving: false,
             apply_error: None,
-            x11_check_generation: 0,
-            x11_check: X11CheckState::Untested,
             x11_content_focus: X11ContentFocus::Bindings,
-            guest_user: TextBox::new(" Guest user ", String::new())
-                .with_validator(validate_guest_user),
+            x11_access_dialog: None,
             list: ListState::default(),
             x11_items: Vec::new(),
             expanded: BTreeSet::new(),
@@ -375,7 +210,7 @@ impl ConfigurationView {
         if let Some(task) = self.pending.take() {
             task.abort();
         }
-        self.invalidate_x11_check();
+        self.x11_access_dialog = None;
         self.query = query;
         self.cancel_preview();
         self.draft.clear();
@@ -383,8 +218,6 @@ impl ConfigurationView {
         self.x11_items.clear();
         self.discard = None;
         self.restart_confirmation = None;
-        self.x11_authorization_confirmation = None;
-        self.x11_revocation_confirmation = None;
         self.apply_error = None;
         self.state = InspectionState::Loading;
         self.preview_cache = None;
@@ -405,8 +238,10 @@ impl ConfigurationView {
     }
 
     pub(crate) fn track_x11_check(&mut self, task: tokio::task::JoinHandle<()>) {
-        if let Some(previous) = self.pending_x11_check.replace(task) {
-            previous.abort();
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.track_check(task);
+        } else {
+            task.abort();
         }
     }
 
@@ -416,30 +251,20 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11AccessCheck, X11AccessError>,
     ) {
-        if generation != self.x11_check_generation || target != &self.target {
+        if target != &self.target {
             return;
         }
-        self.pending_x11_check.take();
-        self.x11_check = match result {
-            Ok(check) => {
-                let assessment = X11GrantAssessmentPresentation::from_check(&check);
-                X11CheckState::Ready {
-                    generation,
-                    check: Box::new(check),
-                    assessment,
-                    authorization: None,
-                    revocation: None,
-                }
-            }
-            Err(error) => X11CheckState::Failed {
-                generation,
-                message: error.to_string(),
-            },
-        };
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.finish_check(generation, result);
+        }
     }
 
     pub(crate) fn track_x11_authorization(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.pending_x11_authorization = Some(task);
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.track_authorization(task);
+        } else {
+            task.abort();
+        }
     }
 
     pub(crate) fn finish_x11_authorization(
@@ -448,46 +273,20 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<X11Authorization, X11AccessError>,
     ) {
-        if generation != self.x11_check_generation || target != &self.target {
+        if target != &self.target {
             return;
         }
-        self.pending_x11_authorization.take();
-        self.x11_check = match result {
-            Ok(authorization) => {
-                let assessment = X11GrantAssessmentPresentation::from_check(authorization.check());
-                let presentation = match authorization.disposition() {
-                    crate::application::x11::X11AuthorizationDisposition::AccessControlDisabled => {
-                        X11AuthorizationPresentation::AccessControlDisabled
-                    }
-                    crate::application::x11::X11AuthorizationDisposition::PreExisting => {
-                        X11AuthorizationPresentation::PreExisting
-                    }
-                    crate::application::x11::X11AuthorizationDisposition::Added { record_id } => {
-                        X11AuthorizationPresentation::Added {
-                            record_id: record_id.clone(),
-                        }
-                    }
-                };
-                X11CheckState::Ready {
-                    generation,
-                    check: Box::new(authorization.check().clone()),
-                    assessment,
-                    authorization: Some(presentation),
-                    revocation: None,
-                }
-            }
-            Err(error) => X11CheckState::Failed {
-                generation,
-                message: error.to_string(),
-            },
-        };
-        if self.x11_content_focus == X11ContentFocus::Authorize && !self.can_authorize_x11() {
-            self.set_x11_content_focus(X11ContentFocus::Check);
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.finish_authorization(generation, result);
         }
     }
 
     pub(crate) fn track_x11_revocation(&mut self, task: tokio::task::JoinHandle<()>) {
-        self.pending_x11_revocation = Some(task);
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.track_revocation(task);
+        } else {
+            task.abort();
+        }
     }
 
     pub(crate) fn finish_x11_revocation(
@@ -496,40 +295,11 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<crate::application::x11::X11Revocation, X11AccessError>,
     ) {
-        if generation != self.x11_check_generation || target != &self.target {
+        if target != &self.target {
             return;
         }
-        self.pending_x11_revocation.take();
-        self.x11_check = match result {
-            Ok(revocation) => {
-                let assessment = X11GrantAssessmentPresentation::from_check(revocation.check());
-                let presentation = match revocation.disposition() {
-                    crate::application::x11::X11RevocationDisposition::Revoked { record_id } => {
-                        X11RevocationPresentation::Revoked {
-                            record_id: record_id.clone(),
-                        }
-                    }
-                    crate::application::x11::X11RevocationDisposition::AlreadyAbsent {
-                        record_id,
-                    } => X11RevocationPresentation::AlreadyAbsent {
-                        record_id: record_id.clone(),
-                    },
-                };
-                X11CheckState::Ready {
-                    generation,
-                    check: Box::new(revocation.check().clone()),
-                    assessment,
-                    authorization: None,
-                    revocation: Some(presentation),
-                }
-            }
-            Err(error) => X11CheckState::Failed {
-                generation,
-                message: error.to_string(),
-            },
-        };
-        if self.x11_content_focus == X11ContentFocus::Revoke && !self.can_revoke_x11() {
-            self.set_x11_content_focus(X11ContentFocus::Check);
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.finish_revocation(generation, result);
         }
     }
 
@@ -556,7 +326,6 @@ impl ConfigurationView {
             Err(error) => InspectionState::Failed(error.to_string()),
         };
         self.x11_content_focus = X11ContentFocus::Bindings;
-        self.sync_x11_input_focus();
         self.preview_scroll = 0;
         self.preview_cache = None;
     }
@@ -712,205 +481,58 @@ impl ConfigurationView {
         }
     }
 
-    fn request_x11_check(&mut self) -> ConfigurationAction {
-        let machine = match &self.target {
-            ConfigurationTarget::Machine(machine) => machine.clone(),
-            ConfigurationTarget::Image(_) => {
-                self.set_x11_check_error(
-                    "X11 runtime checks require a running machine, not an image",
-                );
-                return ConfigurationAction::None;
-            }
-        };
-        if let Err(error) = self.guest_user.validate() {
-            self.set_x11_check_error(error);
-            return ConfigurationAction::None;
-        }
-        let user = match ValidatedGuestUserName::new(self.guest_user.value()) {
-            Ok(user) => user,
-            Err(error) => {
-                self.set_x11_check_error(error.to_string());
-                return ConfigurationAction::None;
-            }
-        };
-        let Some(host_socket) = self.selected_host_x11_socket() else {
-            self.set_x11_check_error(
-                "Select an X11 declaration or live endpoint before checking runtime access",
-            );
-            return ConfigurationAction::None;
-        };
-        if let Some(previous) = self.pending_x11_check.take() {
-            previous.abort();
-        }
-        self.x11_check_generation = self
-            .x11_check_generation
-            .checked_add(1)
-            .expect("X11 check generation exhausted");
-        let generation = self.x11_check_generation;
-        self.x11_check = X11CheckState::Loading {
-            generation,
-            user: user.clone(),
-        };
-        ConfigurationAction::CheckX11 {
-            generation,
-            target: crate::application::sessions::ShellTarget::new(machine, user),
-            host_socket,
-        }
-    }
-
-    fn can_authorize_x11(&self) -> bool {
-        matches!(
-            &self.x11_check,
-            X11CheckState::Ready {
-                check,
-                assessment,
-                ..
-            } if check.mapped_uid_status() == X11MappedUidAclStatus::ExactNumericEntryAbsent
-                && assessment.records_complete
-        ) && self.pending_x11_authorization.is_none()
-    }
-
-    fn can_revoke_x11(&self) -> bool {
-        matches!(
-            &self.x11_check,
-            X11CheckState::Ready { assessment, .. }
-                if matches!(assessment.status, X11GrantStatusPresentation::Managed { .. })
-        ) && self.pending_x11_revocation.is_none()
-    }
-
-    fn request_x11_authorization_confirmation(&mut self) -> ConfigurationAction {
-        if !self.can_authorize_x11() {
-            return ConfigurationAction::None;
-        }
+    fn open_x11_access_dialog(&mut self) {
         let ConfigurationTarget::Machine(machine) = &self.target else {
-            return ConfigurationAction::None;
+            return;
         };
-        let Ok(user) = ValidatedGuestUserName::new(self.guest_user.value()) else {
-            return ConfigurationAction::None;
+        let InspectionState::Ready(snapshot) = &self.state else {
+            return;
         };
-        let X11CheckState::Ready { check, .. } = &self.x11_check else {
-            return ConfigurationAction::None;
-        };
-        self.x11_authorization_confirmation = Some(PendingX11Authorization {
-            target: crate::application::sessions::ShellTarget::new(machine.clone(), user),
-            host_socket: check.projection().host_socket().clone(),
-            host_uid: check.projection().identity().host_uid(),
-        });
-        ConfigurationAction::None
+        let selected = self.selected_host_x11_socket();
+        self.x11_access_dialog = Some(X11AccessDialog::new(
+            machine.clone(),
+            snapshot.host_x11.sockets.clone(),
+            selected.as_ref(),
+        ));
     }
 
-    fn handle_x11_authorization_confirmation_key(&mut self, key: KeyEvent) -> ConfigurationAction {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let Some(intent) = self.x11_authorization_confirmation.take() else {
-                    return ConfigurationAction::None;
-                };
-                self.x11_check_generation = self
-                    .x11_check_generation
-                    .checked_add(1)
-                    .expect("X11 check generation exhausted");
-                let generation = self.x11_check_generation;
-                self.x11_check = X11CheckState::Authorizing {
-                    generation,
-                    user: intent.target.user().clone(),
-                    host_uid: intent.host_uid,
-                };
-                ConfigurationAction::AuthorizeX11 {
-                    generation,
-                    target: intent.target,
-                    host_socket: intent.host_socket,
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.x11_authorization_confirmation = None;
+    fn handle_x11_access_action(&mut self, action: X11AccessDialogAction) -> ConfigurationAction {
+        match action {
+            X11AccessDialogAction::None => ConfigurationAction::None,
+            X11AccessDialogAction::Close => {
+                self.x11_access_dialog = None;
                 ConfigurationAction::None
             }
-            _ => ConfigurationAction::None,
+            X11AccessDialogAction::Check {
+                generation,
+                target,
+                host_socket,
+            } => ConfigurationAction::CheckX11 {
+                generation,
+                target,
+                host_socket,
+            },
+            X11AccessDialogAction::Authorize {
+                generation,
+                target,
+                host_socket,
+            } => ConfigurationAction::AuthorizeX11 {
+                generation,
+                target,
+                host_socket,
+            },
+            X11AccessDialogAction::Revoke {
+                generation,
+                target,
+                host_socket,
+                record_id,
+            } => ConfigurationAction::RevokeX11 {
+                generation,
+                target,
+                host_socket,
+                record_id,
+            },
         }
-    }
-
-    fn request_x11_revocation_confirmation(&mut self) -> ConfigurationAction {
-        if !self.can_revoke_x11() {
-            return ConfigurationAction::None;
-        }
-        let ConfigurationTarget::Machine(machine) = &self.target else {
-            return ConfigurationAction::None;
-        };
-        let Ok(user) = ValidatedGuestUserName::new(self.guest_user.value()) else {
-            return ConfigurationAction::None;
-        };
-        let X11CheckState::Ready {
-            check,
-            assessment:
-                X11GrantAssessmentPresentation {
-                    status: X11GrantStatusPresentation::Managed { record_id },
-                    ..
-                },
-            ..
-        } = &self.x11_check
-        else {
-            return ConfigurationAction::None;
-        };
-        self.x11_revocation_confirmation = Some(PendingX11Revocation {
-            target: crate::application::sessions::ShellTarget::new(machine.clone(), user),
-            host_socket: check.projection().host_socket().clone(),
-            record_id: record_id.clone(),
-            host_uid: check.projection().identity().host_uid(),
-        });
-        ConfigurationAction::None
-    }
-
-    fn handle_x11_revocation_confirmation_key(&mut self, key: KeyEvent) -> ConfigurationAction {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let Some(intent) = self.x11_revocation_confirmation.take() else {
-                    return ConfigurationAction::None;
-                };
-                self.x11_check_generation = self
-                    .x11_check_generation
-                    .checked_add(1)
-                    .expect("X11 check generation exhausted");
-                let generation = self.x11_check_generation;
-                self.x11_check = X11CheckState::Revoking {
-                    generation,
-                    user: intent.target.user().clone(),
-                    record_id: intent.record_id.clone(),
-                };
-                ConfigurationAction::RevokeX11 {
-                    generation,
-                    target: intent.target,
-                    host_socket: intent.host_socket,
-                    record_id: intent.record_id,
-                }
-            }
-            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
-                self.x11_revocation_confirmation = None;
-                ConfigurationAction::None
-            }
-            _ => ConfigurationAction::None,
-        }
-    }
-
-    fn set_x11_check_error(&mut self, message: impl Into<String>) {
-        self.x11_check_generation = self
-            .x11_check_generation
-            .checked_add(1)
-            .expect("X11 check generation exhausted");
-        self.x11_check = X11CheckState::Failed {
-            generation: self.x11_check_generation,
-            message: message.into(),
-        };
-    }
-
-    fn invalidate_x11_check(&mut self) {
-        if let Some(task) = self.pending_x11_check.take() {
-            task.abort();
-        }
-        self.x11_check_generation = self
-            .x11_check_generation
-            .checked_add(1)
-            .expect("X11 check generation exhausted");
-        self.x11_check = X11CheckState::Untested;
     }
 
     fn selected_host_x11_socket(&self) -> Option<crate::domain::x11::HostX11Socket> {
@@ -974,24 +596,11 @@ impl ConfigurationView {
         }
     }
 
-    fn set_x11_content_focus(&mut self, focus: X11ContentFocus) {
-        self.x11_content_focus = focus;
-        self.sync_x11_input_focus();
-    }
-
     fn select_x11_item(&mut self, index: usize) {
         if self.list.selected() == Some(index) {
             return;
         }
         self.list.select(Some(index));
-        self.invalidate_x11_check();
-    }
-
-    fn sync_x11_input_focus(&mut self) {
-        self.guest_user.set_focus(
-            self.pane == ConfigurationPane::Content
-                && self.x11_content_focus == X11ContentFocus::GuestUser,
-        );
     }
 
     fn move_x11_content_focus(&mut self, down: bool) {
@@ -1001,33 +610,17 @@ impl ConfigurationView {
                 if current + 1 < self.x11_items.len() {
                     self.select_x11_item(current + 1);
                 } else if matches!(self.target, ConfigurationTarget::Machine(_)) {
-                    self.set_x11_content_focus(X11ContentFocus::GuestUser);
+                    self.x11_content_focus = X11ContentFocus::RuntimeAccess;
                 }
             }
             (X11ContentFocus::Bindings, false) => {
                 let current = self.list.selected().unwrap_or(0);
                 self.select_x11_item(current.saturating_sub(1));
             }
-            (X11ContentFocus::GuestUser, true) => {
-                self.set_x11_content_focus(X11ContentFocus::Check)
-            }
-            (X11ContentFocus::GuestUser, false) if !self.x11_items.is_empty() => {
+            (X11ContentFocus::RuntimeAccess, false) if !self.x11_items.is_empty() => {
                 self.select_x11_item(self.x11_items.len() - 1);
-                self.set_x11_content_focus(X11ContentFocus::Bindings);
+                self.x11_content_focus = X11ContentFocus::Bindings;
             }
-            (X11ContentFocus::Check, false) => {
-                self.set_x11_content_focus(X11ContentFocus::GuestUser)
-            }
-            (X11ContentFocus::Check, true) if self.can_authorize_x11() => {
-                self.set_x11_content_focus(X11ContentFocus::Authorize)
-            }
-            (X11ContentFocus::Check, true) if self.can_revoke_x11() => {
-                self.set_x11_content_focus(X11ContentFocus::Revoke)
-            }
-            (X11ContentFocus::Authorize, false) => {
-                self.set_x11_content_focus(X11ContentFocus::Check)
-            }
-            (X11ContentFocus::Revoke, false) => self.set_x11_content_focus(X11ContentFocus::Check),
             _ => {}
         }
     }
@@ -1091,12 +684,10 @@ impl ConfigurationView {
             (Content, false) | (Navigation, true) => Preview,
             (Preview, false) | (Content, true) => Navigation,
         };
-        self.sync_x11_input_focus();
     }
 
     fn select_tab(&mut self, tab: PreviewTab) {
         self.pane = ConfigurationPane::Preview;
-        self.sync_x11_input_focus();
         if self.preview_tab != tab {
             self.preview_tab = tab;
             self.preview_scroll = 0;
@@ -1121,57 +712,15 @@ impl ConfigurationView {
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ConfigurationAction {
-        if self.x11_authorization_confirmation.is_some() {
-            return self.handle_x11_authorization_confirmation_key(key);
-        }
-        if self.x11_revocation_confirmation.is_some() {
-            return self.handle_x11_revocation_confirmation_key(key);
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            let action = dialog.handle_key(key);
+            return self.handle_x11_access_action(action);
         }
         if self.restart_confirmation.is_some() {
             return self.handle_restart_confirmation_key(key);
         }
         if self.discard.is_some() {
             return self.handle_discard_key(key);
-        }
-        if matches!(
-            self.x11_check,
-            X11CheckState::Authorizing { .. } | X11CheckState::Revoking { .. }
-        ) {
-            return if key.code == KeyCode::Esc {
-                self.request_close_or_refresh(DiscardIntent::Close)
-            } else {
-                ConfigurationAction::None
-            };
-        }
-        if self.pane == ConfigurationPane::Content
-            && self.x11_content_focus == X11ContentFocus::GuestUser
-        {
-            match key.code {
-                KeyCode::Esc => {
-                    self.set_x11_content_focus(X11ContentFocus::Bindings);
-                    return ConfigurationAction::None;
-                }
-                KeyCode::Up => {
-                    self.move_x11_content_focus(false);
-                    return ConfigurationAction::None;
-                }
-                KeyCode::Down | KeyCode::Enter => {
-                    if self.guest_user.validate().is_ok() {
-                        self.set_x11_content_focus(X11ContentFocus::Check);
-                    }
-                    return ConfigurationAction::None;
-                }
-                KeyCode::Tab | KeyCode::BackTab => {}
-                _ => {
-                    let before = self.guest_user.value().to_owned();
-                    if self.guest_user.handle_key(key) == EventResult::Consumed {
-                        if self.guest_user.value() != before {
-                            self.invalidate_x11_check();
-                        }
-                        return ConfigurationAction::None;
-                    }
-                }
-            }
         }
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => {
@@ -1215,7 +764,6 @@ impl ConfigurationView {
             (_, KeyModifiers::NONE) if self.pane == ConfigurationPane::Navigation => {
                 if self.navigation.handle_key(key.code) {
                     self.pane = ConfigurationPane::Content;
-                    self.sync_x11_input_focus();
                 }
             }
             (KeyCode::Left | KeyCode::Right, KeyModifiers::NONE)
@@ -1234,34 +782,18 @@ impl ConfigurationView {
                 ConfigurationPane::Navigation => {}
                 ConfigurationPane::Content => match self.x11_content_focus {
                     X11ContentFocus::Bindings => return self.toggle_selected_x11(),
-                    X11ContentFocus::GuestUser => {}
-                    X11ContentFocus::Check => return self.request_x11_check(),
-                    X11ContentFocus::Authorize => {
-                        return self.request_x11_authorization_confirmation()
-                    }
-                    X11ContentFocus::Revoke => return self.request_x11_revocation_confirmation(),
+                    X11ContentFocus::RuntimeAccess => self.open_x11_access_dialog(),
                 },
                 ConfigurationPane::Preview => {}
             },
             (KeyCode::Enter, KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
                 match self.x11_content_focus {
                     X11ContentFocus::Bindings => self.toggle_selected_details(),
-                    X11ContentFocus::GuestUser => {}
-                    X11ContentFocus::Check => return self.request_x11_check(),
-                    X11ContentFocus::Authorize => {
-                        return self.request_x11_authorization_confirmation()
-                    }
-                    X11ContentFocus::Revoke => return self.request_x11_revocation_confirmation(),
+                    X11ContentFocus::RuntimeAccess => self.open_x11_access_dialog(),
                 }
             }
             (KeyCode::Char('c'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                return self.request_x11_check();
-            }
-            (KeyCode::Char('a'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                return self.request_x11_authorization_confirmation();
-            }
-            (KeyCode::Char('d'), KeyModifiers::NONE) if self.pane == ConfigurationPane::Content => {
-                return self.request_x11_revocation_confirmation();
+                self.open_x11_access_dialog();
             }
             _ => {}
         }
@@ -1269,14 +801,9 @@ impl ConfigurationView {
     }
 
     pub(crate) fn handle_mouse(&mut self, mouse: MouseEvent) -> ConfigurationAction {
-        if self.discard.is_some()
+        if self.x11_access_dialog.is_some()
+            || self.discard.is_some()
             || self.restart_confirmation.is_some()
-            || self.x11_authorization_confirmation.is_some()
-            || self.x11_revocation_confirmation.is_some()
-            || matches!(
-                self.x11_check,
-                X11CheckState::Authorizing { .. } | X11CheckState::Revoking { .. }
-            )
         {
             return ConfigurationAction::None;
         }
@@ -1292,23 +819,16 @@ impl ConfigurationView {
                 self.select_tab(tab);
             } else if self.hits.navigation.contains(position) {
                 self.pane = ConfigurationPane::Navigation;
-                self.sync_x11_input_focus();
                 self.navigation.click(position);
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
-                if self.hits.guest_user.contains(position) {
-                    self.set_x11_content_focus(X11ContentFocus::GuestUser);
-                } else if self.hits.check_x11.contains(position) {
-                    self.set_x11_content_focus(X11ContentFocus::Check);
-                    return self.request_x11_check();
-                } else if self.hits.authorize_x11.contains(position) {
-                    self.set_x11_content_focus(X11ContentFocus::Authorize);
-                    return self.request_x11_authorization_confirmation();
-                } else if self.hits.revoke_x11.contains(position) {
-                    self.set_x11_content_focus(X11ContentFocus::Revoke);
-                    return self.request_x11_revocation_confirmation();
+                if self.hits.x11_access.contains(position)
+                    && matches!(self.target, ConfigurationTarget::Machine(_))
+                {
+                    self.x11_content_focus = X11ContentFocus::RuntimeAccess;
+                    self.open_x11_access_dialog();
                 } else {
-                    self.set_x11_content_focus(X11ContentFocus::Bindings);
+                    self.x11_content_focus = X11ContentFocus::Bindings;
                     let toggle = self
                         .hits
                         .checkboxes
@@ -1330,7 +850,6 @@ impl ConfigurationView {
                 }
             } else if self.hits.preview.contains(position) {
                 self.pane = ConfigurationPane::Preview;
-                self.sync_x11_input_focus();
             }
         } else if matches!(
             mouse.kind,
@@ -1345,7 +864,6 @@ impl ConfigurationView {
             } else {
                 return ConfigurationAction::None;
             }
-            self.sync_x11_input_focus();
             self.scroll(mouse.kind == MouseEventKind::ScrollDown);
         }
         ConfigurationAction::None
@@ -1410,12 +928,6 @@ fn declaration_is_recommended(
         && binding.options.iter().any(|option| option == "idmap") == *idmapped
 }
 
-fn validate_guest_user(value: &str) -> Result<(), String> {
-    ValidatedGuestUserName::new(value)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
 impl Drop for ConfigurationView {
     fn drop(&mut self) {
         if let Some(task) = self.pending.take() {
@@ -1424,16 +936,9 @@ impl Drop for ConfigurationView {
         if let Some(task) = self.pending_preview.take() {
             task.abort();
         }
-        if let Some(task) = self.pending_x11_check.take() {
-            task.abort();
-        }
-        // Applying is a mutation. Dropping a JoinHandle detaches it so direct
-        // and elevated execution can still reach a definite outcome. X11
-        // authorization has the same rule: its pending/outcome record must be
-        // finalized even if the Configure view closes.
+        // Applying is a mutation. Dropping the JoinHandle detaches it so direct
+        // and elevated execution can still reach a definite outcome.
         self.pending_apply.take();
-        self.pending_x11_authorization.take();
-        self.pending_x11_revocation.take();
     }
 }
 

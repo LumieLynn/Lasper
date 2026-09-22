@@ -11,17 +11,14 @@ use ratatui::{
 use super::navigation::ConfigurationPage;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
-    X11AuthorizationPresentation, X11CheckState, X11ChecklistItem, X11ContentFocus,
-    X11GrantAssessmentPresentation, X11GrantHistoryPresentation, X11GrantHistoryStatusPresentation,
-    X11GrantStatusPresentation, X11RevocationPresentation,
+    X11ChecklistItem, X11ContentFocus,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
     X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
-use crate::application::x11::{X11AclSnapshot, X11SourceState};
+use crate::application::x11::X11SourceState;
 use crate::domain::x11::HostX11Socket;
-use crate::tui::core::Component;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
 use crate::tui::{soft_wrap_text, theme};
@@ -121,7 +118,7 @@ impl ConfigurationView {
                 footer_key("Enter"),
                 footer_hint(" Fold"),
                 footer_key("c"),
-                footer_hint(" Check"),
+                footer_hint(" Access"),
                 footer_key("Ctrl+S"),
                 footer_hint(" Save"),
                 footer_key("[/]"),
@@ -136,14 +133,13 @@ impl ConfigurationView {
             11.min(rows[2].width.saturating_sub(11)),
             rows[2].height,
         );
-        if self.x11_authorization_confirmation.is_some() {
-            self.render_x11_authorization_confirmation(frame, area);
-        } else if self.x11_revocation_confirmation.is_some() {
-            self.render_x11_revocation_confirmation(frame, area);
-        } else if self.restart_confirmation.is_some() {
+        if self.restart_confirmation.is_some() {
             self.render_restart_confirmation(frame, area);
         } else if self.discard.is_some() {
             self.render_discard_confirmation(frame, area);
+        }
+        if let Some(dialog) = &mut self.x11_access_dialog {
+            dialog.render(frame, area);
         }
     }
 
@@ -165,12 +161,7 @@ impl ConfigurationView {
         let block = self.block(" X11 ", ConfigurationPane::Content);
         let inner = block.inner(self.hits.content);
         frame.render_widget(block, self.hits.content);
-        let rows = Layout::vertical([
-            Constraint::Min(0),
-            Constraint::Length(11),
-            Constraint::Length(5),
-        ])
-        .split(inner);
+        let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(inner);
         let message = match &self.state {
             InspectionState::Loading => Some("Loading configuration…"),
             InspectionState::Failed(error) => Some(error.as_str()),
@@ -244,131 +235,26 @@ impl ConfigurationView {
                 y += height;
             }
         }
-        self.render_current_x11_access(frame, rows[1]);
-        self.render_x11_history(frame, rows[2]);
+        self.render_x11_access_entry(frame, rows[1]);
     }
 
-    fn render_current_x11_access(&mut self, frame: &mut Frame, area: Rect) {
-        let title = self
-            .selected_host_x11_socket()
-            .map(|socket| format!(" Current access: :{} ", socket.display()))
-            .unwrap_or_else(|| " Current access ".into());
-        let block = Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(crate::tui::widget_border_color(
-                self.pane == ConfigurationPane::Content
-                    && self.x11_content_focus != X11ContentFocus::Bindings,
-                matches!(self.target, ConfigurationTarget::Machine(_)),
-            )));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        if !matches!(self.target, ConfigurationTarget::Machine(_)) {
-            frame.render_widget(
-                Paragraph::new(
-                    "Runtime X11 checks become available after this image is started as a machine.",
-                )
-                .style(Style::default().fg(theme::theme().text_secondary))
-                .wrap(Wrap { trim: false }),
-                inner,
-            );
-            return;
-        }
-        let rows = Layout::vertical([Constraint::Min(2), Constraint::Length(3)]).split(inner);
-        let status = match &self.x11_check {
-            X11CheckState::Untested => {
-                "Not queried. A startup bind does not establish current X server access.".into()
-            }
-            X11CheckState::Loading { generation, user } => {
-                format!("Check #{generation}: validating projection and X server ACL for {user}…")
-            }
-            X11CheckState::Authorizing {
-                generation,
-                user,
-                host_uid,
-            } => format!(
-                "Authorization #{generation}: adding exact localuser:#{host_uid} access for {user}…"
-            ),
-            X11CheckState::Revoking {
-                generation,
-                user,
-                record_id,
-            } => format!(
-                "Revocation #{generation}: removing Lasper record {} for {user}…",
-                &record_id[..record_id.len().min(12)]
-            ),
-            X11CheckState::Ready {
-                generation,
-                check,
-                assessment,
-                authorization,
-                revocation,
-            } => {
-                let context = check.projection();
-                let identity = context.identity();
-                let acl_status = x11_grant_status(assessment, identity.host_uid());
-                let pathname_access = x11_pathname_access_summary(context.filesystem_access());
-                let action = match (authorization, revocation) {
-                    (_, Some(X11RevocationPresentation::Revoked { record_id })) => format!(
-                        " Last action revoked record {}.",
-                        &record_id[..record_id.len().min(12)]
-                    ),
-                    (_, Some(X11RevocationPresentation::AlreadyAbsent { record_id })) => format!(
-                        " Last action finalized already-absent record {}.",
-                        &record_id[..record_id.len().min(12)]
-                    ),
-                    (Some(X11AuthorizationPresentation::Added { record_id }), _) => format!(
-                        " Last action created record {}.",
-                        &record_id[..record_id.len().min(12)]
-                    ),
-                    (Some(X11AuthorizationPresentation::PreExisting), _) => {
-                        " Last action reused the existing entry without claiming it.".to_owned()
-                    }
-                    (Some(X11AuthorizationPresentation::AccessControlDisabled), _) => {
-                        " No entry was added.".to_owned()
-                    }
-                    (None, None) => String::new(),
-                };
-                format!(
-                    "Check #{generation}: guest uid {} maps to host uid {}.\n{} → {} → {}\n{pathname_access}\n{acl_status}{action}\n{}",
-                    identity.guest().uid(),
-                    identity.host_uid(),
-                    context.host_socket().source().display(),
-                    context.guest_mount().display(),
-                    context.guest_client_path().display(),
-                    x11_acl_summary(check.acl()),
-                )
-            }
-            X11CheckState::Failed {
-                generation,
-                message,
-            } => format!("Check #{generation} failed: {message}"),
-        };
-        frame.render_widget(Paragraph::new(status).wrap(Wrap { trim: false }), rows[0]);
-        let can_authorize = self.can_authorize_x11();
-        let can_revoke = self.can_revoke_x11();
-        let controls = if can_authorize || can_revoke {
-            Layout::horizontal([
-                Constraint::Min(16),
-                Constraint::Length(18),
-                Constraint::Length(18),
-            ])
-            .split(rows[1])
+    fn render_x11_access_entry(&mut self, frame: &mut Frame, area: Rect) {
+        let enabled = matches!(self.target, ConfigurationTarget::Machine(_));
+        let focused = enabled
+            && self.pane == ConfigurationPane::Content
+            && self.x11_content_focus == X11ContentFocus::RuntimeAccess;
+        self.hits.x11_access = area;
+        let label = if enabled {
+            " Runtime access... "
         } else {
-            Layout::horizontal([Constraint::Min(16), Constraint::Length(20)]).split(rows[1])
+            " Runtime access is available for running machines "
         };
-        self.hits.guest_user = controls[0];
-        self.hits.check_x11 = controls[1];
-        self.hits.authorize_x11 = Rect::default();
-        self.hits.revoke_x11 = Rect::default();
-        self.guest_user.render(frame, controls[0]);
-        let focused = self.pane == ConfigurationPane::Content
-            && self.x11_content_focus == X11ContentFocus::Check;
         frame.render_widget(
-            Paragraph::new(" Check access ")
+            Paragraph::new(label)
                 .alignment(Alignment::Center)
-                .style(if focused {
+                .style(if !enabled {
+                    Style::default().fg(theme::theme().text_dim)
+                } else if focused {
                     Style::default()
                         .fg(theme::theme().button_focused_fg)
                         .bg(theme::theme().button_focused_bg)
@@ -379,92 +265,15 @@ impl ConfigurationView {
                     Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(if focused {
+                        .border_style(Style::default().fg(if !enabled {
+                            theme::theme().border_disabled
+                        } else if focused {
                             theme::theme().button_border_focused
                         } else {
                             theme::theme().button_border_unfocused
                         })),
                 ),
-            controls[1],
-        );
-        if can_authorize {
-            self.hits.authorize_x11 = controls[2];
-            let focused = self.pane == ConfigurationPane::Content
-                && self.x11_content_focus == X11ContentFocus::Authorize;
-            frame.render_widget(
-                Paragraph::new(" Authorize ")
-                    .alignment(Alignment::Center)
-                    .style(if focused {
-                        Style::default()
-                            .fg(theme::theme().button_focused_fg)
-                            .bg(theme::theme().button_focused_bg)
-                    } else {
-                        Style::default().fg(theme::theme().button_unfocused_fg)
-                    })
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if focused {
-                                theme::theme().button_border_focused
-                            } else {
-                                theme::theme().button_border_unfocused
-                            })),
-                    ),
-                controls[2],
-            );
-        } else if can_revoke {
-            self.hits.revoke_x11 = controls[2];
-            let focused = self.pane == ConfigurationPane::Content
-                && self.x11_content_focus == X11ContentFocus::Revoke;
-            frame.render_widget(
-                Paragraph::new(" Revoke ")
-                    .alignment(Alignment::Center)
-                    .style(if focused {
-                        Style::default()
-                            .fg(theme::theme().button_focused_fg)
-                            .bg(theme::theme().button_focused_bg)
-                    } else {
-                        Style::default().fg(theme::theme().button_unfocused_fg)
-                    })
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if focused {
-                                theme::theme().button_border_focused
-                            } else {
-                                theme::theme().button_border_unfocused
-                            })),
-                    ),
-                controls[2],
-            );
-        }
-    }
-
-    fn render_x11_history(&self, frame: &mut Frame, area: Rect) {
-        let block = Block::default()
-            .title(" Operation history ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme::theme().text_secondary));
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
-        let text = match &self.x11_check {
-            X11CheckState::Ready { assessment, .. } => x11_history_text(assessment),
-            X11CheckState::Loading { .. }
-            | X11CheckState::Authorizing { .. }
-            | X11CheckState::Revoking { .. } => "Loading grant records…".to_owned(),
-            X11CheckState::Failed { .. } => {
-                "Current records were not assessed because the check failed.".to_owned()
-            }
-            X11CheckState::Untested => "Not queried. Run Check access to load records.".to_owned(),
-        };
-        frame.render_widget(
-            Paragraph::new(text)
-                .style(Style::default().fg(theme::theme().text_secondary))
-                .wrap(Wrap { trim: false }),
-            inner,
+            area,
         );
     }
 
@@ -726,72 +535,6 @@ impl ConfigurationView {
             dialog,
         );
     }
-
-    fn render_x11_authorization_confirmation(&self, frame: &mut Frame, area: Rect) {
-        let Some(intent) = &self.x11_authorization_confirmation else {
-            return;
-        };
-        let width = 76.min(area.width);
-        let height = 13.min(area.height);
-        let dialog = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Allow host UID {} to open new connections to X11 display :{}?\n\nThis ACL entry applies to every host process with that UID, not only {}@{}. It remains until explicitly revoked, removed externally, or the X server resets. Closing Lasper does not revoke it.\n\n[y] Authorize    [n/Esc] Cancel",
-                intent.host_uid,
-                intent.host_socket.display(),
-                intent.target.user(),
-                intent.target.machine(),
-            ))
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Authorize X11 access? ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme::theme().dialog_border_warn)),
-            ),
-            dialog,
-        );
-    }
-
-    fn render_x11_revocation_confirmation(&self, frame: &mut Frame, area: Rect) {
-        let Some(intent) = &self.x11_revocation_confirmation else {
-            return;
-        };
-        let width = 76.min(area.width);
-        let height = 12.min(area.height);
-        let dialog = Rect::new(
-            area.x + area.width.saturating_sub(width) / 2,
-            area.y + area.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
-        frame.render_widget(Clear, dialog);
-        frame.render_widget(
-            Paragraph::new(format!(
-                "Remove Lasper-managed localuser:#{} access from X11 display :{}?\n\nThis removes access for every host process with that UID. The record is retained as revoked for audit history.\n\n[y] Revoke    [n/Esc] Cancel",
-                intent.host_uid,
-                intent.host_socket.display(),
-            ))
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(" Revoke X11 access? ")
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme::theme().dialog_border_warn)),
-            ),
-            dialog,
-        );
-    }
 }
 
 fn footer_key(text: &'static str) -> Span<'static> {
@@ -812,79 +555,6 @@ fn footer_hint_last(text: &'static str) -> Span<'static> {
     )
 }
 
-fn x11_pathname_access_summary(
-    access: crate::application::sessions::X11FilesystemAccess,
-) -> &'static str {
-    if access.fully_writable() {
-        return "Pathname transport: writable at both guest paths.";
-    }
-    match (access.mount_writable(), access.client_writable()) {
-        (false, false) => "Pathname: denied at both guest paths; abstract route not tested.",
-        (false, true) => "Pathname: denied at guest mount; abstract route not tested.",
-        (true, false) => "Pathname: denied at client path; abstract route not tested.",
-        (true, true) => unreachable!("handled above"),
-    }
-}
-
-fn x11_grant_status(assessment: &X11GrantAssessmentPresentation, host_uid: u32) -> String {
-    match &assessment.status {
-        X11GrantStatusPresentation::AccessControlDisabled => {
-            "X server access control is disabled.".to_owned()
-        }
-        X11GrantStatusPresentation::Managed { record_id } => format!(
-            "Exact localuser:#{host_uid} entry is managed by Lasper record {}.",
-            &record_id[..record_id.len().min(12)]
-        ),
-        X11GrantStatusPresentation::PreExisting => format!(
-            "Exact localuser:#{host_uid} entry is present but is external/unmanaged."
-        ),
-        X11GrantStatusPresentation::Historical => format!(
-            "Exact localuser:#{host_uid} entry has historical Lasper records, but current ownership is unconfirmed."
-        ),
-        X11GrantStatusPresentation::Absent => {
-            format!("No exact localuser:#{host_uid} entry was observed.")
-        }
-        X11GrantStatusPresentation::OutcomeUnknown => format!(
-            "Exact localuser:#{host_uid} ownership is unknown; managed actions are disabled."
-        ),
-    }
-}
-
-fn x11_history_text(assessment: &X11GrantAssessmentPresentation) -> String {
-    let Some(latest) = assessment.history.first() else {
-        return assessment
-            .diagnostics
-            .first()
-            .map(|diagnostic| format!("No usable managed record. {diagnostic}"))
-            .unwrap_or_else(|| {
-                "No Lasper-created grant records match this machine, user, and display.".to_owned()
-            });
-    };
-    let status = match latest.status {
-        X11GrantHistoryStatusPresentation::Managed => "Managed",
-        X11GrantHistoryStatusPresentation::Historical => "Historical",
-        X11GrantHistoryStatusPresentation::Absent => "Absent",
-        X11GrantHistoryStatusPresentation::OutcomeUnknown => "Outcome unknown",
-    };
-    let mut lines = vec![format!(
-        "{status}: {} · host uid {}",
-        short_record_id(latest),
-        latest.host_uid
-    )];
-    lines.push(latest.detail.clone());
-    let remaining = assessment.history.len().saturating_sub(1);
-    if remaining > 0 {
-        lines.push(format!("{remaining} older matching record(s)"));
-    } else if let Some(diagnostic) = assessment.diagnostics.first() {
-        lines.push(format!("Record warning: {diagnostic}"));
-    }
-    lines.join("\n")
-}
-
-fn short_record_id(entry: &X11GrantHistoryPresentation) -> &str {
-    &entry.record_id[..entry.record_id.len().min(12)]
-}
-
 fn x11_item_lines(
     item: &X11ChecklistItem,
     snapshot: &crate::application::configuration::ConfigurationSnapshot,
@@ -893,7 +563,7 @@ fn x11_item_lines(
     expanded: bool,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let disclosure = if expanded { "▾" } else { "▸" };
+    let disclosure = if expanded { "∨" } else { ">" };
     let check = if checked { "[x]" } else { "[ ]" };
     let lines = match item {
         X11ChecklistItem::Declaration(line) => {
@@ -1072,44 +742,6 @@ fn available_socket_lines(
         ]);
     }
     lines
-}
-
-fn x11_acl_summary(snapshot: &X11AclSnapshot) -> String {
-    let local_users = snapshot
-        .entries()
-        .iter()
-        .filter_map(|entry| entry.server_interpreted())
-        .filter_map(|(kind, value)| (kind == "localuser").then_some(value))
-        .collect::<Vec<_>>();
-    if local_users.is_empty() {
-        return format!(
-            "ACL localuser entries: none ({} total).",
-            snapshot.entries().len()
-        );
-    }
-
-    let shown = local_users
-        .iter()
-        .take(3)
-        .map(|value| {
-            value
-                .chars()
-                .flat_map(char::escape_default)
-                .take(48)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let remainder = local_users.len().saturating_sub(3);
-    format!(
-        "ACL localuser entries: {shown}{} ({} total).",
-        if remainder == 0 {
-            String::new()
-        } else {
-            format!(", +{remainder} more")
-        },
-        snapshot.entries().len()
-    )
 }
 
 fn diff_lines(content: &str, width: u16) -> Vec<Line<'static>> {
