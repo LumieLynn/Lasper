@@ -3,63 +3,34 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::application::sessions::{
-    MappedGuestIdentity, SessionError, SessionService, ShellTarget, X11ProjectionContext,
-    X11SessionContext,
+    MappedGuestIdentity, SessionError, ShellTarget, X11ProjectionContext, X11SessionContext,
 };
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
+
+mod catalog;
+
+pub use catalog::{X11EndpointCatalog, X11SourceObservation, X11SourceState};
+pub(crate) use catalog::{X11EndpointDiscoveryPort, X11EndpointDiscoveryService};
 
 const SERVER_INTERPRETED_FAMILY: u8 = 5;
 const LOCAL_USER_KIND: &[u8] = b"localuser";
 const MACHINE_LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(2_100);
 const MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS: usize = 3;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct X11EndpointCatalog {
-    pub sockets: Vec<HostX11Socket>,
-    /// Observations of configured sources, including sources that could not
-    /// become authenticated endpoints. Absence from `sockets` is not absence
-    /// from the filesystem.
-    pub sources: Vec<X11SourceObservation>,
-    pub preferred_display: Option<u16>,
-    pub diagnostics: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct X11SourceObservation {
-    pub source: PathBuf,
-    pub state: X11SourceState,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "state", content = "reason", rename_all = "snake_case")]
-pub enum X11SourceState {
-    Observed,
-    Missing,
-    Invalid(String),
-    Unverified(String),
-}
-
+/// Runtime projection capability required by X11 access management.
+///
+/// The implementation may be direct or elevated, but the X11 application
+/// service must not know which session transport provides the probe.
 #[async_trait::async_trait]
-pub(crate) trait X11EndpointDiscoveryPort: Send + Sync {
-    async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog;
+pub(crate) trait X11ProjectionPort: Send + Sync {
+    async fn probe(
+        &self,
+        target: ShellTarget,
+        host_socket: HostX11Socket,
+    ) -> Result<X11ProjectionContext, SessionError>;
 }
 
-pub(crate) struct X11EndpointDiscoveryService {
-    port: Arc<dyn X11EndpointDiscoveryPort>,
-}
-
-impl X11EndpointDiscoveryService {
-    pub(crate) fn new(port: Arc<dyn X11EndpointDiscoveryPort>) -> Self {
-        Self { port }
-    }
-
-    pub async fn discover(&self, configured_sources: &[PathBuf]) -> X11EndpointCatalog {
-        self.port.discover(configured_sources).await
-    }
-}
-
-/// Access-control mode reported by one X server's `ListHosts` reply.
+/// Access-control mode reported by one X server's ListHosts reply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X11AccessControlMode {
     Enabled,
@@ -839,19 +810,19 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
 /// The desktop query always stays in the invoking user's process, even when
 /// the projection half is routed through the elevated daemon.
 pub struct X11AccessService {
-    sessions: Arc<SessionService>,
+    projection: Arc<dyn X11ProjectionPort>,
     endpoints: Arc<X11EndpointDiscoveryService>,
     desktop: Arc<dyn X11DesktopAccessPort>,
 }
 
 impl X11AccessService {
     pub(crate) fn new(
-        sessions: Arc<SessionService>,
+        projection: Arc<dyn X11ProjectionPort>,
         endpoints: Arc<X11EndpointDiscoveryService>,
         desktop: Arc<dyn X11DesktopAccessPort>,
     ) -> Self {
         Self {
-            sessions,
+            projection,
             endpoints,
             desktop,
         }
@@ -863,8 +834,7 @@ impl X11AccessService {
         socket: HostX11Socket,
     ) -> Result<X11AccessCheck, X11AccessError> {
         let (projection, observation) = tokio::join!(
-            self.sessions
-                .test_x11_projection(target.clone(), socket.clone()),
+            self.projection.probe(target.clone(), socket.clone()),
             self.desktop.snapshot(&socket),
         );
         let projection = projection.map_err(X11AccessError::Projection)?;
@@ -882,8 +852,8 @@ impl X11AccessService {
         socket: HostX11Socket,
     ) -> Result<X11Authorization, X11AccessError> {
         let projection = self
-            .sessions
-            .test_x11_projection(target.clone(), socket)
+            .projection
+            .probe(target.clone(), socket)
             .await
             .map_err(X11AccessError::Projection)?;
         let request = X11AuthorizationRequest::new(target.clone(), projection.clone());
@@ -961,11 +931,7 @@ impl X11AccessService {
         let mut failures = Vec::new();
         let mut selected = None;
         for socket in candidates {
-            match self
-                .sessions
-                .test_x11_projection(target.clone(), socket.clone())
-                .await
-            {
+            match self.projection.probe(target.clone(), socket.clone()).await {
                 Ok(projection) => {
                     selected = Some(projection);
                     break;
@@ -991,8 +957,8 @@ impl X11AccessService {
         record_id: String,
     ) -> Result<X11Revocation, X11AccessError> {
         let projection = self
-            .sessions
-            .test_x11_projection(target.clone(), socket)
+            .projection
+            .probe(target.clone(), socket)
             .await
             .map_err(X11AccessError::Projection)?;
         let request = X11RevokeRequest::new(target.clone(), projection.clone(), record_id);
@@ -1125,9 +1091,10 @@ mod tests {
     use super::*;
     use crate::application::sessions::{
         JournalSessionHandle, JournalSessionRequest, MappedGuestIdentity, ObservedGuestIdentity,
-        ObservedMachineInstance, ObservedNamespaceIdentity, SessionPort, TerminalSessionHandle,
-        TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
-        WaylandSessionContext, X11FilesystemAccess, X11ProjectionProbeRequest,
+        ObservedMachineInstance, ObservedNamespaceIdentity, SessionPort, SessionService,
+        TerminalSessionHandle, TerminalSessionRequest, ValidatedGuestUserName,
+        WaylandPreparationRequest, WaylandSessionContext, X11FilesystemAccess,
+        X11ProjectionProbeRequest,
     };
     use crate::domain::machine::MachineName;
     use crate::domain::wayland::HostWaylandSocket;
@@ -1135,6 +1102,25 @@ mod tests {
     use parking_lot::Mutex;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SessionProjectionPort {
+        session: Arc<SessionService>,
+    }
+
+    #[async_trait::async_trait]
+    impl X11ProjectionPort for SessionProjectionPort {
+        async fn probe(
+            &self,
+            target: ShellTarget,
+            host_socket: HostX11Socket,
+        ) -> Result<X11ProjectionContext, SessionError> {
+            self.session.test_x11_projection(target, host_socket).await
+        }
+    }
+
+    fn session_projection_port(session: Arc<SessionService>) -> Arc<dyn X11ProjectionPort> {
+        Arc::new(SessionProjectionPort { session })
+    }
 
     fn projection(host_uid: u32) -> X11ProjectionContext {
         projection_for_socket(host_socket(0, false, 2), host_uid)
@@ -1631,7 +1617,11 @@ mod tests {
             reconciles: AtomicUsize::new(0),
             purposes: Mutex::new(Vec::new()),
         });
-        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
+        let service = X11AccessService::new(
+            session_projection_port(sessions),
+            endpoints,
+            desktop.clone(),
+        );
 
         let prepared = service
             .prepare_session(target(), X11SessionSelection::Current)
@@ -1667,7 +1657,11 @@ mod tests {
             reconciles: AtomicUsize::new(0),
             purposes: Mutex::new(Vec::new()),
         });
-        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
+        let service = X11AccessService::new(
+            session_projection_port(sessions),
+            endpoints,
+            desktop.clone(),
+        );
 
         let reports = service.reconcile().await.unwrap();
 
@@ -1701,7 +1695,11 @@ mod tests {
             ])),
             reconciles: AtomicUsize::new(0),
         });
-        let service = X11AccessService::new(sessions, endpoints, desktop.clone());
+        let service = X11AccessService::new(
+            session_projection_port(sessions),
+            endpoints,
+            desktop.clone(),
+        );
 
         let task = tokio::spawn(async move { service.reconcile_after_machine_event().await });
         tokio::task::yield_now().await;

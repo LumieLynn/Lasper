@@ -32,6 +32,33 @@ pub(crate) use wayland_probe::WaylandProbeRequest;
 pub(crate) use x11::X11SessionResolver;
 pub(crate) use x11_probe::X11ProjectionProbeRequest;
 
+/// Adapts the selected session transport to the narrow projection capability
+/// consumed by X11 access management. Keeping this adapter in composition
+/// prevents the X11 application service from depending on SessionService.
+pub(crate) struct X11ProjectionAdapter {
+    session: Arc<SessionService>,
+}
+
+impl X11ProjectionAdapter {
+    pub(crate) fn new(session: Arc<SessionService>) -> Self {
+        Self { session }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::application::x11::X11ProjectionPort for X11ProjectionAdapter {
+    async fn probe(
+        &self,
+        target: crate::application::sessions::ShellTarget,
+        host_socket: crate::domain::x11::HostX11Socket,
+    ) -> Result<
+        crate::application::sessions::X11ProjectionContext,
+        crate::application::sessions::SessionError,
+    > {
+        self.session.test_x11_projection(target, host_socket).await
+    }
+}
+
 pub(crate) enum SessionRoute {
     Direct {
         policy: DirectTerminalPolicy,

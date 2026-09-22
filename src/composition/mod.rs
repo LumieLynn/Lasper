@@ -61,7 +61,9 @@ pub(crate) fn compose_process_shell_services(
     let session = crate::adapters::session::compose_session_service(route);
     let x11_endpoints = compose_x11_endpoint_discovery();
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
-        Arc::clone(&session),
+        Arc::new(crate::adapters::session::X11ProjectionAdapter::new(
+            Arc::clone(&session),
+        )),
         x11_endpoints,
         Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess::new(
             systemd_tools,
@@ -253,7 +255,9 @@ pub(crate) fn compose_application_services(
         crate::adapters::provisioning::compose_provisioning_preparation_service();
     let x11_endpoints = compose_x11_endpoint_discovery();
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
-        Arc::clone(&session),
+        Arc::new(crate::adapters::session::X11ProjectionAdapter::new(
+            Arc::clone(&session),
+        )),
         Arc::clone(&x11_endpoints),
         Arc::new(crate::adapters::platform::x11::HostX11DesktopAccess::new(
             systemd_tools,

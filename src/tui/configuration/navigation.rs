@@ -1,5 +1,10 @@
-//! Two-level section navigation. Categories and actual pages have separate
-//! identities; collapsing a category does not discard the active page.
+//! Configuration section navigation.
+//!
+//! The visible tree is backed by a small static route registry rather than a
+//! pair of category/page switches. It is intentionally data-driven at the
+//! navigation boundary while page-local controls remain owned by each page.
+//! This keeps the current two-level UI simple and leaves room for deeper
+//! sections without changing selection or collapse semantics.
 
 use std::collections::BTreeSet;
 
@@ -20,57 +25,74 @@ pub(super) enum ConfigurationPage {
 }
 
 impl ConfigurationPage {
-    fn label(self) -> &'static str {
+    fn node(self) -> NavigationNodeId {
         match self {
-            Self::X11 => "X11",
-        }
-    }
-    fn category(self) -> Category {
-        match self {
-            Self::X11 => Category::HostIntegration,
+            Self::X11 => NavigationNodeId::X11,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Category {
+enum NavigationNodeId {
     HostIntegration,
+    X11,
 }
 
-impl Category {
-    const ALL: &'static [Self] = &[Self::HostIntegration];
-    fn label(self) -> &'static str {
-        match self {
-            Self::HostIntegration => "Host Integration",
-        }
-    }
-    fn pages(self) -> &'static [ConfigurationPage] {
-        match self {
-            Self::HostIntegration => &[ConfigurationPage::X11],
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationNodeKind {
+    Section,
+    Page(ConfigurationPage),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NavigationNode {
+    parent: Option<NavigationNodeId>,
+    label: &'static str,
+    kind: NavigationNodeKind,
+    children: &'static [NavigationNodeId],
+}
+
+const ROOT_NODES: &[NavigationNodeId] = &[NavigationNodeId::HostIntegration];
+const HOST_INTEGRATION_CHILDREN: &[NavigationNodeId] = &[NavigationNodeId::X11];
+const NO_CHILDREN: &[NavigationNodeId] = &[];
+
+fn node(id: NavigationNodeId) -> NavigationNode {
+    match id {
+        NavigationNodeId::HostIntegration => NavigationNode {
+            parent: None,
+            label: "Host Integration",
+            kind: NavigationNodeKind::Section,
+            children: HOST_INTEGRATION_CHILDREN,
+        },
+        NavigationNodeId::X11 => NavigationNode {
+            parent: Some(NavigationNodeId::HostIntegration),
+            label: "X11",
+            kind: NavigationNodeKind::Page(ConfigurationPage::X11),
+            children: NO_CHILDREN,
+        },
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NavigationItem {
-    Category(Category),
-    Page(ConfigurationPage),
+struct VisibleNode {
+    id: NavigationNodeId,
+    depth: usize,
 }
 
 pub(super) struct ConfigurationNavigation {
-    selected: NavigationItem,
+    selected: NavigationNodeId,
     active: ConfigurationPage,
-    expanded: BTreeSet<Category>,
+    expanded: BTreeSet<NavigationNodeId>,
     list: ListState,
-    hits: Vec<(Rect, NavigationItem)>,
+    hits: Vec<(Rect, NavigationNodeId)>,
 }
 
 impl Default for ConfigurationNavigation {
     fn default() -> Self {
         Self {
-            selected: NavigationItem::Page(ConfigurationPage::X11),
+            selected: ConfigurationPage::X11.node(),
             active: ConfigurationPage::X11,
-            expanded: BTreeSet::from([Category::HostIntegration]),
+            expanded: BTreeSet::from([NavigationNodeId::HostIntegration]),
             list: ListState::default(),
             hits: Vec::new(),
         }
@@ -82,63 +104,67 @@ impl ConfigurationNavigation {
         self.active
     }
 
-    fn visible_items(&self) -> Vec<NavigationItem> {
-        Category::ALL
-            .iter()
-            .flat_map(|category| {
-                std::iter::once(NavigationItem::Category(*category)).chain(
-                    category
-                        .pages()
-                        .iter()
-                        .filter(|_| self.expanded.contains(category))
-                        .copied()
-                        .map(NavigationItem::Page),
-                )
-            })
-            .collect()
+    fn visible_items(&self) -> Vec<VisibleNode> {
+        let mut visible = Vec::new();
+        for id in ROOT_NODES {
+            self.push_visible(*id, 0, &mut visible);
+        }
+        visible
+    }
+
+    fn push_visible(&self, id: NavigationNodeId, depth: usize, visible: &mut Vec<VisibleNode>) {
+        visible.push(VisibleNode { id, depth });
+        if !self.expanded.contains(&id) {
+            return;
+        }
+        for child in node(id).children {
+            self.push_visible(*child, depth + 1, visible);
+        }
     }
 
     pub(super) fn move_selection(&mut self, down: bool) {
         let items = self.visible_items();
         let selected = items
             .iter()
-            .position(|item| *item == self.selected)
+            .position(|item| item.id == self.selected)
             .unwrap_or(0);
         let next = if down {
-            (selected + 1).min(items.len() - 1)
+            (selected + 1).min(items.len().saturating_sub(1))
         } else {
             selected.saturating_sub(1)
         };
-        self.selected = items[next];
+        if let Some(item) = items.get(next) {
+            self.selected = item.id;
+        }
     }
 
     /// Return true when the user enters a page's content pane.
     pub(super) fn handle_key(&mut self, key: KeyCode) -> bool {
         match key {
-            KeyCode::Left | KeyCode::Char('h') => match self.selected {
-                NavigationItem::Page(page) => {
-                    self.selected = NavigationItem::Category(page.category())
+            KeyCode::Left | KeyCode::Char('h') => {
+                let current = node(self.selected);
+                if let Some(parent) = current.parent {
+                    self.selected = parent;
+                } else {
+                    self.expanded.remove(&self.selected);
                 }
-                NavigationItem::Category(category) => {
-                    self.expanded.remove(&category);
-                }
-            },
-            KeyCode::Right | KeyCode::Char('l') => match self.selected {
-                NavigationItem::Category(category) => {
-                    if !self.expanded.insert(category) {
-                        self.selected = NavigationItem::Page(category.pages()[0]);
+            }
+            KeyCode::Right | KeyCode::Char('l') => match node(self.selected).kind {
+                NavigationNodeKind::Section => {
+                    if !self.expanded.insert(self.selected) {
+                        if let Some(first_child) = node(self.selected).children.first() {
+                            self.selected = *first_child;
+                        }
                     }
                 }
-                NavigationItem::Page(page) => {
+                NavigationNodeKind::Page(page) => {
                     self.active = page;
                     return true;
                 }
             },
-            KeyCode::Enter | KeyCode::Char(' ') => match self.selected {
-                NavigationItem::Category(category) => {
-                    self.toggle_category(category);
-                }
-                NavigationItem::Page(page) => {
+            KeyCode::Enter | KeyCode::Char(' ') => match node(self.selected).kind {
+                NavigationNodeKind::Section => self.toggle_section(self.selected),
+                NavigationNodeKind::Page(page) => {
                     self.active = page;
                     return true;
                 }
@@ -148,26 +174,37 @@ impl ConfigurationNavigation {
         false
     }
 
-    fn toggle_category(&mut self, category: Category) {
-        if !self.expanded.remove(&category) {
-            self.expanded.insert(category);
+    fn toggle_section(&mut self, id: NavigationNodeId) {
+        if !self.expanded.remove(&id) {
+            self.expanded.insert(id);
         }
     }
 
     pub(super) fn click(&mut self, position: Position) {
-        let Some(item) = self
+        let Some(id) = self
             .hits
             .iter()
             .find(|(area, _)| area.contains(position))
-            .map(|(_, item)| *item)
+            .map(|(_, id)| *id)
         else {
             return;
         };
-        self.selected = item;
-        match item {
-            NavigationItem::Category(category) => self.toggle_category(category),
-            NavigationItem::Page(page) => self.active = page,
+        self.selected = id;
+        match node(id).kind {
+            NavigationNodeKind::Section => self.toggle_section(id),
+            NavigationNodeKind::Page(page) => self.active = page,
         }
+    }
+
+    fn is_active_descendant(&self, id: NavigationNodeId) -> bool {
+        let mut current = self.active.node();
+        while let Some(parent) = node(current).parent {
+            if parent == id {
+                return true;
+            }
+            current = parent;
+        }
+        false
     }
 
     pub(super) fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
@@ -180,32 +217,23 @@ impl ConfigurationNavigation {
         let inner = block.inner(area);
         let items = self.visible_items();
         self.list
-            .select(items.iter().position(|item| *item == self.selected));
+            .select(items.iter().position(|item| item.id == self.selected));
         let t = theme::theme();
         let entries = items
             .iter()
             .map(|item| {
-                let selected = *item == self.selected;
-                let (indent, pointer, disclosure, label) = match item {
-                    NavigationItem::Category(category) => (
-                        "",
-                        if selected
-                            || matches!(self.selected, NavigationItem::Page(page) if page.category() == *category)
-                        {
-                            "> "
-                        } else {
-                            "  "
-                        },
-                        if self.expanded.contains(category) {
-                            "[-] "
-                        } else {
-                            "[+] "
-                        },
-                        category.label(),
-                    ),
-                    NavigationItem::Page(page) => {
-                        ("  ", if selected { ">> " } else { "   " }, "", page.label())
-                    }
+                let selected = item.id == self.selected;
+                let current = node(item.id);
+                let indent = "  ".repeat(item.depth);
+                let pointer = if selected || self.is_active_descendant(item.id) {
+                    ">".repeat(item.depth + 1) + " "
+                } else {
+                    " ".repeat(item.depth + 1) + " "
+                };
+                let disclosure = match current.kind {
+                    NavigationNodeKind::Section if self.expanded.contains(&item.id) => "[-] ",
+                    NavigationNodeKind::Section => "[+] ",
+                    NavigationNodeKind::Page(_) => "",
                 };
                 let mut cursor = Style::default().fg(if focused {
                     t.list_cursor_focused
@@ -229,7 +257,7 @@ impl ConfigurationNavigation {
                     Span::raw(indent),
                     Span::styled(pointer, cursor),
                     Span::styled(disclosure, text),
-                    Span::styled(label, text),
+                    Span::styled(current.label, text),
                 ]))
             })
             .collect::<Vec<_>>();
@@ -242,7 +270,7 @@ impl ConfigurationNavigation {
         {
             self.hits.push((
                 Rect::new(inner.x, inner.y + row as u16, inner.width, 1),
-                item,
+                item.id,
             ));
         }
     }
