@@ -103,14 +103,32 @@ impl ConfigurationView {
             self.render_preview(frame);
         }
         let footer = if self.saving {
-            " Saving configuration..."
+            Line::from(Span::styled(
+                " Saving configuration...",
+                Style::default().fg(theme::theme().hint_fg),
+            ))
         } else {
-            " r Refresh  Esc Close  Tab/⇧Tab Pane  Space Toggle  Enter Fold  c Check  Ctrl+S Save  [/] Tabs"
+            Line::from(vec![
+                Span::raw(" "),
+                footer_key("r"),
+                footer_hint(" Refresh"),
+                footer_key("Esc"),
+                footer_hint(" Close"),
+                footer_key("Tab/⇧Tab"),
+                footer_hint(" Pane"),
+                footer_key("Space"),
+                footer_hint(" Toggle"),
+                footer_key("Enter"),
+                footer_hint(" Fold"),
+                footer_key("c"),
+                footer_hint(" Check"),
+                footer_key("Ctrl+S"),
+                footer_hint(" Save"),
+                footer_key("[/]"),
+                footer_hint_last(" Tabs"),
+            ])
         };
-        frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(theme::theme().hint_fg)),
-            rows[2],
-        );
+        frame.render_widget(Paragraph::new(footer), rows[2]);
         self.hits.refresh = Rect::new(rows[2].x, rows[2].y, 11.min(rows[2].width), rows[2].height);
         self.hits.close = Rect::new(
             rows[2].x.saturating_add(11),
@@ -774,6 +792,24 @@ impl ConfigurationView {
             dialog,
         );
     }
+}
+
+fn footer_key(text: &'static str) -> Span<'static> {
+    Span::styled(text, Style::default().fg(theme::theme().key_hint_fg))
+}
+
+fn footer_hint(text: &'static str) -> Span<'static> {
+    Span::styled(
+        format!("{}, ", text.trim_end()),
+        Style::default().fg(theme::theme().hint_fg),
+    )
+}
+
+fn footer_hint_last(text: &'static str) -> Span<'static> {
+    Span::styled(
+        text.trim_end().to_owned(),
+        Style::default().fg(theme::theme().hint_fg),
+    )
 }
 
 fn x11_pathname_access_summary(

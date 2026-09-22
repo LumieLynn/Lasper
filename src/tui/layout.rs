@@ -235,7 +235,7 @@ fn split_left_column(area: Rect, machines_pct: u16) -> std::rc::Rc<[Rect]> {
 fn render_status(f: &mut Frame, app: &App, area: Rect) {
     let t = theme::theme();
     let line = if app.ui.leader_active() {
-        Line::from(vec![kspan("[Esc]"), hspan(" close leader")])
+        Line::from(vec![kspan("[Esc]"), hspan_last(" close leader")])
     } else if let Some((msg, level)) = &app.ui.status_message {
         let color = t.status_color(level);
         Line::from(vec![
@@ -249,80 +249,80 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
             _ => " no vertical split",
         };
         Line::from(vec![
-            kspan("[Esc/R/q]"),
+            kspan("Esc/R/q"),
             hspan(" exit resize "),
-            kspan("[←/h →/l]"),
+            kspan("←/h | →/l"),
             hspan(" list width "),
-            kspan("[↓/j ↑/k]"),
-            hspan(vertical_hint),
+            kspan("↓/j | ↑/k"),
+            hspan_last(vertical_hint),
         ])
     } else {
         match app.ui.focus {
             WorkspaceFocus::Machines => Line::from(vec![
-                kspan("[j/k]"),
+                kspan("j/k"),
                 hspan(" nav "),
-                kspan("[S]"),
+                kspan("S"),
                 hspan(" poweroff "),
-                kspan("[x/⏎]"),
+                kspan("x/⏎"),
                 hspan(" actions "),
-                kspan("[t]"),
+                kspan("t"),
                 hspan(" shell "),
-                kspan("[n/a]"),
+                kspan("n/a"),
                 hspan(" new "),
-                kspan("[Tab/⇧Tab]"),
+                kspan("Tab/⇧Tab"),
                 hspan(" panels "),
-                kspan("[Space]"),
+                kspan("Space"),
                 hspan(" leader "),
-                kspan("[?]"),
-                hspan(" help"),
+                kspan("?"),
+                hspan_last(" help"),
             ]),
             WorkspaceFocus::Images if app.ui.image_list.shows_internal() => {
-                let mut spans = vec![kspan("[j/k]"), hspan(" nav ")];
+                let mut spans = vec![kspan("j/k"), hspan(" nav ")];
                 if app.selected_image().is_some_and(|image| {
                     !crate::domain::runtime::ImageEntry::is_protected_name(&image.name)
                 }) {
                     spans.extend([kspan("[D]"), hspan(" delete internal ")]);
                 }
                 spans.extend([
-                    kspan("[[/]]"),
+                    kspan("[/]"),
                     hspan(" image tabs "),
-                    kspan("[r]"),
+                    kspan("r"),
                     hspan(" refresh "),
-                    kspan("[Tab/⇧Tab]"),
+                    kspan("Tab/⇧Tab"),
                     hspan(" panels "),
-                    kspan("[Space]"),
+                    kspan("Space"),
                     hspan(" leader "),
-                    kspan("[?]"),
-                    hspan(" help"),
+                    kspan("?"),
+                    hspan_last(" help"),
                 ]);
                 Line::from(spans)
             }
             WorkspaceFocus::Images => {
                 let mut spans = vec![
-                    kspan("[j/k]"),
+                    kspan("j/k"),
                     hspan(" nav "),
-                    kspan("[s]"),
+                    kspan("s"),
                     hspan(" start "),
-                    kspan("[x/⏎]"),
+                    kspan("x/⏎"),
                     hspan(" actions "),
-                    kspan("[D]"),
+                    kspan("D"),
                     hspan(" delete "),
-                    kspan("[r]"),
+                    kspan("r"),
                     hspan(" refresh "),
                 ];
                 if app
                     .focused_image_resource()
                     .is_some_and(|image| app.image_has_running_machine(image))
                 {
-                    spans.extend([kspan("[t]"), hspan(" shell ")]);
+                    spans.extend([kspan("t"), hspan(" shell ")]);
                 }
                 spans.extend([
-                    kspan("[[/]]"),
+                    kspan("[/]"),
                     hspan(" image tabs "),
-                    kspan("[Tab/⇧Tab]"),
+                    kspan("Tab/⇧Tab"),
                     hspan(" panels "),
-                    kspan("[Space]"),
-                    hspan(" leader"),
+                    kspan("Space"),
+                    hspan_last(" leader"),
                 ]);
                 Line::from(spans)
             }
@@ -332,22 +332,22 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                 )
                 .len()
                 {
-                    1 => "[Alt+1]",
-                    2 => "[Alt+1..2]",
-                    3 => "[Alt+1..3]",
-                    4 => "[Alt+1..4]",
-                    _ => "[Alt+1..5]",
+                    1 => "Alt+1",
+                    2 => "Alt+1..2",
+                    3 => "Alt+1..3",
+                    4 => "Alt+1..4",
+                    _ => "Alt+1..5",
                 };
                 let mut spans = vec![
                     kspan(pane_hint),
                     hspan(" panes "),
-                    kspan("[[/]]"),
+                    kspan("[/]"),
                     hspan(" cycle "),
-                    kspan("[↑/↓ | j/k]"),
+                    kspan("↑/↓ | j/k"),
                     hspan(" scroll "),
-                    kspan("[PgUp/Dn]"),
+                    kspan("PgUp/Dn"),
                     hspan(" page "),
-                    kspan("[Tab/⇧Tab]"),
+                    kspan("Tab/⇧Tab"),
                     hspan(" panels "),
                 ];
                 let terminal_available = if app.data.detail_target.is_image() {
@@ -357,15 +357,15 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     true
                 };
                 if terminal_available {
-                    spans.extend([kspan("[t]"), hspan(" shell ")]);
+                    spans.extend([kspan("t"), hspan(" shell ")]);
                 }
                 spans.extend([
-                    kspan("[Space]"),
+                    kspan("Space"),
                     hspan(" leader "),
-                    kspan("[?]"),
+                    kspan("?"),
                     hspan(" help "),
-                    kspan("[q]"),
-                    hspan(" quit"),
+                    kspan("q"),
+                    hspan_last(" quit"),
                 ]);
                 Line::from(spans)
             }
@@ -378,10 +378,10 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                     .unwrap_or(false);
                 if insert_mode {
                     Line::from(vec![
-                        kspan("[Alt+x]"),
+                        kspan("Alt+x"),
                         hspan(" exit insert mode "),
-                        kspan("[Alt+1..9]"),
-                        hspan(" switch tabs"),
+                        kspan("Alt+1..9"),
+                        hspan_last(" switch tabs"),
                     ])
                 } else {
                     let t_label = if app.data.terminal.maximized {
@@ -390,22 +390,22 @@ fn render_status(f: &mut Frame, app: &App, area: Rect) {
                         " maximize "
                     };
                     Line::from(vec![
-                        kspan("[i/⏎/Alt+x]"),
+                        kspan("i/⏎/Alt+x"),
                         hspan(" insert mode "),
-                        kspan("[Alt+1..9 / [/]]"),
+                        kspan("Alt+1..9 / [/]"),
                         hspan(" switch tabs "),
-                        kspan("[Tab/⇧Tab]"),
+                        kspan("Tab/⇧Tab"),
                         hspan(" panels "),
-                        kspan("[T]"),
+                        kspan("T"),
                         hspan(t_label),
-                        kspan("[t]"),
+                        kspan("t"),
                         hspan(" shell "),
-                        kspan("[x]"),
+                        kspan("x"),
                         hspan(" close tab "),
-                        kspan("[y]"),
+                        kspan("y"),
                         hspan(" yank "),
-                        kspan("[q]"),
-                        hspan(" quit"),
+                        kspan("q"),
+                        hspan_last(" quit"),
                     ])
                 }
             }
@@ -419,7 +419,14 @@ fn kspan(s: &'static str) -> Span<'static> {
     Span::styled(s, Style::default().fg(theme::theme().key_hint_fg))
 }
 fn hspan(s: &'static str) -> Span<'static> {
-    Span::styled(s, Style::default().fg(theme::theme().hint_fg))
+    let text = format!("{}, ", s.trim_end());
+    Span::styled(text, Style::default().fg(theme::theme().hint_fg))
+}
+fn hspan_last(s: &'static str) -> Span<'static> {
+    Span::styled(
+        s.trim_end().to_string(),
+        Style::default().fg(theme::theme().hint_fg),
+    )
 }
 
 #[cfg(test)]
