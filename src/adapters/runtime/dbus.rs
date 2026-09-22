@@ -832,7 +832,7 @@ async fn get_machine1_properties(
     let props_proxy = b.build().await?;
     let interface: zbus::names::InterfaceName =
         "org.freedesktop.machine1.Machine".try_into().unwrap();
-    let all_props = props_proxy.get_all(Some(interface).into()).await?;
+    let all_props = props_proxy.get_all(interface).await?;
     let mut map = HashMap::new();
     for (k, v) in all_props {
         let val = crate::adapters::runtime::formatting::format_property(&k, &v.into());
@@ -871,7 +871,7 @@ async fn get_systemd1_properties(
     let props_proxy = b.build().await?;
 
     let interface: zbus::names::InterfaceName = "org.freedesktop.systemd1.Unit".try_into().unwrap();
-    let all_props = props_proxy.get_all(Some(interface).into()).await?;
+    let all_props = props_proxy.get_all(interface).await?;
     let mut map = HashMap::new();
     for (k, v) in all_props {
         let val = crate::adapters::runtime::formatting::format_property(&k, &v.into());
@@ -881,7 +881,7 @@ async fn get_systemd1_properties(
     // Also fetch Service interface properties
     let svc_interface: zbus::names::InterfaceName =
         "org.freedesktop.systemd1.Service".try_into().unwrap();
-    if let Ok(svc_props) = props_proxy.get_all(Some(svc_interface).into()).await {
+    if let Ok(svc_props) = props_proxy.get_all(svc_interface).await {
         for (k, v) in svc_props {
             let val = crate::adapters::runtime::formatting::format_property(&k, &v.into());
             map.insert(k, val);
@@ -932,12 +932,12 @@ mod tests {
     #[test]
     fn enable_unit_files_uses_systemd_manager_signature() {
         let body = enable_unit_files_body("systemd-nspawn@test.service");
-        let message = zbus::Message::method("/org/freedesktop/systemd1", "EnableUnitFiles")
+        let message = zbus::Message::method_call("/org/freedesktop/systemd1", "EnableUnitFiles")
             .unwrap()
             .build(&body)
             .unwrap();
 
-        assert_eq!(message.body().signature().unwrap().as_str(), "asbb");
+        assert_eq!(message.body().signature().to_string_no_parens(), "asbb");
         assert_eq!(body.0, ["systemd-nspawn@test.service"]);
         assert!(!body.1, "runtime must remain disabled");
         assert!(!body.2, "force must remain disabled");
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn machine1_session_bodies_match_the_upstream_xml_signatures() {
-        let shell = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineShell")
+        let shell = zbus::Message::method_call("/org/freedesktop/machine1", "OpenMachineShell")
             .unwrap()
             .build(&(
                 "demo",
@@ -955,13 +955,13 @@ mod tests {
                 vec!["WAYLAND_DISPLAY=/run/lasper/wayland/1000/wayland-0"],
             ))
             .unwrap();
-        assert_eq!(shell.body().signature().unwrap().as_str(), "sssasas");
+        assert_eq!(shell.body().signature().to_string_no_parens(), "sssasas");
 
-        let login = zbus::Message::method("/org/freedesktop/machine1", "OpenMachineLogin")
+        let login = zbus::Message::method_call("/org/freedesktop/machine1", "OpenMachineLogin")
             .unwrap()
             .build(&("demo",))
             .unwrap();
-        assert_eq!(login.body().signature().unwrap().as_str(), "s");
+        assert_eq!(login.body().signature().to_string_no_parens(), "s");
     }
 
     #[test]
@@ -1010,7 +1010,7 @@ mod tests {
             .expect("test error name")
             .to_owned()
             .into();
-        let message = zbus::Message::method("/test", "Failure")
+        let message = zbus::Message::method_call("/test", "Failure")
             .expect("test method message")
             .build(&())
             .expect("test message body");

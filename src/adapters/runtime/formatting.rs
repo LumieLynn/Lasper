@@ -126,7 +126,7 @@ pub fn format_dbus_value(v: &Value<'_>) -> String {
             }
         }
         Value::ObjectPath(p) => p.as_str().to_string(),
-        Value::Signature(s) => s.as_str().to_string(),
+        Value::Signature(s) => s.to_string(),
 
         Value::Array(arr) => {
             if arr.is_empty() {

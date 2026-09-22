@@ -296,7 +296,7 @@ mod tests {
             .expect("test error name")
             .to_owned()
             .into();
-        let message = zbus::Message::method("/test", "Failure")
+        let message = zbus::Message::method_call("/test", "Failure")
             .expect("test method message")
             .build(&())
             .expect("test message body");
