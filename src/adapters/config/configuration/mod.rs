@@ -4,6 +4,7 @@
 mod document;
 mod edit;
 mod inspection;
+mod patch;
 mod projection;
 
 pub(super) use edit::{apply, preview};

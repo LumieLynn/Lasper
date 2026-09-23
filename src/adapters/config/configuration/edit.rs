@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use super::document::NspawnDocument;
 use super::inspection::{inspect, inspect_at};
+use super::patch::{apply_mutations, render_diff, SourceMutation};
 use super::projection::x11_scope;
 use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_begin_marker};
 use crate::adapters::error::Result;
@@ -20,7 +21,6 @@ use crate::domain::machine::MachineName;
 const MAX_X11_CHANGES: usize = 128;
 const MAX_CONFIG_PATH_BYTES: usize = 4096;
 const MAX_DIFF_BYTES: usize = 256 * 1024;
-const DIFF_CONTEXT_LINES: usize = 2;
 
 pub(crate) async fn preview(edit: ConfigurationEdit) -> Result<ConfigurationPreview> {
     let snapshot = inspect(edit.target.clone()).await?;
@@ -159,13 +159,7 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
             "The generated diff exceeds the {MAX_DIFF_BYTES}-byte preview limit; edit this declaration manually"
         ));
     }
-    let mut after = document.content().to_owned();
-    for mutation in mutations.iter().rev() {
-        after.replace_range(
-            mutation.start..mutation.end,
-            mutation.replacement.as_deref().unwrap_or_default(),
-        );
-    }
+    let after = apply_mutations(document.content(), &mutations);
     Preparation::Ready(PreparedChange {
         path: source.path.clone(),
         after,
@@ -173,22 +167,12 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
     })
 }
 
-#[derive(Debug)]
-struct Mutation {
-    line: usize,
-    start: usize,
-    end: usize,
-    old: Vec<String>,
-    new: Vec<String>,
-    replacement: Option<String>,
-}
-
 fn calculate_mutations(
     document: &NspawnDocument<'_>,
     declarations: &[X11BindingDeclaration],
     recommendation: &X11BindRecommendation,
     edit: &ConfigurationEdit,
-) -> std::result::Result<Vec<Mutation>, String> {
+) -> std::result::Result<Vec<SourceMutation>, String> {
     let lines = document.lines();
     let mut requested = BTreeMap::new();
     let mut additions = Vec::new();
@@ -280,7 +264,7 @@ fn calculate_mutations(
                 ))
             }
         };
-        mutations.push(Mutation {
+        mutations.push(SourceMutation {
             line: line.number(),
             start: line.start(),
             end: line.end(),
@@ -406,7 +390,7 @@ fn render_new_binding(source: &Path, idmapped: bool) -> String {
     format!("BindReadOnly={source}:{source}{suffix}")
 }
 
-fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> Mutation {
+fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> SourceMutation {
     let content = document.content();
     let lines = document.lines();
     let ending = document.preferred_line_ending();
@@ -466,7 +450,7 @@ fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> Mut
         .iter()
         .map(|line| line.body().to_string())
         .collect();
-    Mutation {
+    SourceMutation {
         line: before_line.max(1),
         start: offset,
         end: offset,
@@ -474,119 +458,6 @@ fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> Mut
         new,
         replacement: Some(replacement),
     }
-}
-
-fn render_diff(path: &Path, document: &NspawnDocument<'_>, mutations: &[Mutation]) -> String {
-    let lines = document.lines();
-    let mut diff = format!("--- {}\n+++ {}\n", path.display(), path.display());
-    if lines.is_empty() {
-        let inserted = mutations
-            .iter()
-            .flat_map(|mutation| mutation.new.iter())
-            .collect::<Vec<_>>();
-        diff.push_str(&format!("@@ -0,0 +1,{} @@\n", inserted.len()));
-        for line in inserted {
-            diff.push('+');
-            diff.push_str(line);
-            diff.push('\n');
-        }
-        return diff;
-    }
-
-    let mut ranges = Vec::<(usize, usize)>::new();
-    for mutation in mutations {
-        let (start, end) = if mutation.old.is_empty() {
-            let point = mutation.line.clamp(1, lines.len() + 1);
-            (
-                point.saturating_sub(DIFF_CONTEXT_LINES).max(1),
-                point
-                    .saturating_add(DIFF_CONTEXT_LINES.saturating_sub(1))
-                    .min(lines.len()),
-            )
-        } else {
-            (
-                mutation.line.saturating_sub(DIFF_CONTEXT_LINES).max(1),
-                mutation
-                    .line
-                    .saturating_add(DIFF_CONTEXT_LINES)
-                    .min(lines.len()),
-            )
-        };
-        match ranges.last_mut() {
-            Some((_, previous_end)) if start <= previous_end.saturating_add(1) => {
-                *previous_end = (*previous_end).max(end);
-            }
-            _ => ranges.push((start, end)),
-        }
-    }
-    let replacements = mutations
-        .iter()
-        .filter(|mutation| !mutation.old.is_empty())
-        .map(|mutation| (mutation.line, mutation))
-        .collect::<BTreeMap<_, _>>();
-    for (start, end) in ranges {
-        let delta_before = mutations
-            .iter()
-            .filter(|mutation| mutation.line < start)
-            .map(|mutation| mutation.new.len() as isize - mutation.old.len() as isize)
-            .sum::<isize>();
-        let old_count = end - start + 1;
-        let delta_here = mutations
-            .iter()
-            .filter(|mutation| {
-                if mutation.old.is_empty() {
-                    (start..=end.saturating_add(1)).contains(&mutation.line)
-                } else {
-                    (start..=end).contains(&mutation.line)
-                }
-            })
-            .map(|mutation| mutation.new.len() as isize - mutation.old.len() as isize)
-            .sum::<isize>();
-        let new_start = (start as isize + delta_before).max(0) as usize;
-        let new_count = (old_count as isize + delta_here).max(0) as usize;
-        diff.push_str(&format!(
-            "@@ -{start},{old_count} +{new_start},{new_count} @@\n"
-        ));
-        for line_number in start..=end {
-            for mutation in mutations
-                .iter()
-                .filter(|mutation| mutation.old.is_empty() && mutation.line == line_number)
-            {
-                for new in &mutation.new {
-                    diff.push('+');
-                    diff.push_str(new);
-                    diff.push('\n');
-                }
-            }
-            if let Some(mutation) = replacements.get(&line_number) {
-                for old in &mutation.old {
-                    diff.push('-');
-                    diff.push_str(old);
-                    diff.push('\n');
-                }
-                for new in &mutation.new {
-                    diff.push('+');
-                    diff.push_str(new);
-                    diff.push('\n');
-                }
-            } else if let Some(line) = lines.get(line_number - 1) {
-                diff.push(' ');
-                diff.push_str(line.body());
-                diff.push('\n');
-            }
-        }
-        for mutation in mutations
-            .iter()
-            .filter(|mutation| mutation.old.is_empty() && mutation.line == end + 1)
-        {
-            for new in &mutation.new {
-                diff.push('+');
-                diff.push_str(new);
-                diff.push('\n');
-            }
-        }
-    }
-    diff
 }
 
 #[cfg(test)]
