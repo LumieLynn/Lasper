@@ -11,6 +11,8 @@ use crate::application::configuration::{
     ConfigurationTarget, X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
 };
 
+use super::document::NspawnDocument;
+
 pub(super) fn project(
     target: ConfigurationTarget,
     config: Option<NspawnConfig>,
@@ -36,9 +38,10 @@ pub(super) fn project(
         diagnostics: Vec::new(),
     };
     if let Some(config) = config {
+        let document = NspawnDocument::new(&config.content);
         snapshot.x11_bind_recommendation =
-            x11_bind_recommendation(&config.content, &mut snapshot.diagnostics);
-        read_bind_declarations(&config.content, &mut snapshot);
+            x11_bind_recommendation(&document, &mut snapshot.diagnostics);
+        read_bind_declarations(&document, &mut snapshot);
         let origin = match config.path.parent() {
             Some(path) if path == Path::new("/etc/systemd/nspawn") => {
                 ConfigurationOrigin::Administrator
@@ -56,10 +59,13 @@ pub(super) fn project(
     snapshot
 }
 
-fn x11_bind_recommendation(content: &str, diagnostics: &mut Vec<String>) -> X11BindRecommendation {
+fn x11_bind_recommendation(
+    document: &NspawnDocument<'_>,
+    diagnostics: &mut Vec<String>,
+) -> X11BindRecommendation {
     let mut in_exec = false;
     let mut effective = None;
-    for_each_logical_line(content, |line, number| {
+    document.logical_lines(|line, number| {
         let line = line.trim();
         if line.starts_with('[') {
             in_exec = line == "[Exec]";
@@ -138,83 +144,11 @@ fn numeric_private_users(value: &str) -> bool {
     range > 0 && shift <= u32::MAX - range
 }
 
-fn read_bind_declarations(content: &str, snapshot: &mut ConfigurationSnapshot) {
+fn read_bind_declarations(document: &NspawnDocument<'_>, snapshot: &mut ConfigurationSnapshot) {
     let mut in_files = false;
-    for_each_logical_line(content, |line, number| {
+    document.logical_lines(|line, number| {
         read_logical_line(line, number, &mut in_files, snapshot);
     });
-}
-
-pub(super) fn bind_destinations(content: &str) -> Vec<(usize, std::path::PathBuf)> {
-    let mut in_files = false;
-    let mut destinations = Vec::new();
-    for_each_logical_line(content, |line, number| {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_files = line.eq_ignore_ascii_case("[Files]");
-            return;
-        }
-        if !in_files {
-            return;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            return;
-        };
-        if !matches!(key.trim(), "Bind" | "BindReadOnly") {
-            return;
-        }
-        let Some(fields) = parse_nspawn_bind_fields(value.trim()) else {
-            return;
-        };
-        if fields.is_empty() || fields.len() > 3 || fields[0].is_empty() {
-            return;
-        }
-        let destination = fields
-            .get(1)
-            .filter(|destination| !destination.is_empty())
-            .unwrap_or(&fields[0]);
-        destinations.push((number, destination.into()));
-    });
-    destinations
-}
-
-fn for_each_logical_line(content: &str, mut visit: impl FnMut(&str, usize)) {
-    let mut logical = String::new();
-    let mut first_line = 1;
-    // Match conf-parser.c: ignore comment lines even within a continuation;
-    // replace an unescaped final backslash with a space. Keep physical source
-    // locations without modifying the document that Raw displays.
-    for (index, line) in content
-        .strip_prefix('\u{feff}')
-        .unwrap_or(content)
-        .lines()
-        .enumerate()
-    {
-        if line.trim_start().starts_with(['#', ';']) {
-            continue;
-        }
-        if logical.is_empty() {
-            first_line = index + 1;
-        }
-        logical.push_str(line);
-        if logical
-            .bytes()
-            .rev()
-            .take_while(|byte| *byte == b'\\')
-            .count()
-            % 2
-            == 1
-        {
-            logical.pop();
-            logical.push(' ');
-            continue;
-        }
-        visit(&logical, first_line);
-        logical.clear();
-    }
-    if !logical.is_empty() {
-        visit(&logical, first_line);
-    }
 }
 
 fn read_logical_line(

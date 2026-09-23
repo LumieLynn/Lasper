@@ -1,6 +1,7 @@
 //! Configure capability adapter. The store selects direct/elevated execution;
 //! inspection and declaration projection stay inside the configuration adapter.
 
+mod document;
 mod edit;
 mod inspection;
 mod projection;

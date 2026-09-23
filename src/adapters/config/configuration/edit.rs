@@ -4,8 +4,9 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+use super::document::NspawnDocument;
 use super::inspection::{inspect, inspect_at};
-use super::projection::{bind_destinations, x11_scope};
+use super::projection::x11_scope;
 use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_begin_marker};
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
@@ -132,15 +133,16 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
             ),
             Err(error) => return Preparation::Blocked(error.to_string()),
         };
-    let document = context.document;
+    let source = context.document;
     if edit.x11_changes.len() > MAX_X11_CHANGES {
         return Preparation::Blocked(format!(
             "A single draft may change at most {MAX_X11_CHANGES} X11 declarations"
         ));
     }
 
+    let document = NspawnDocument::new(&source.content);
     let mutations = match calculate_mutations(
-        &document.content,
+        &document,
         &snapshot.x11_bindings,
         &snapshot.x11_bind_recommendation,
         edit,
@@ -149,15 +151,15 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
         Err(reason) => return Preparation::Blocked(reason),
     };
     if mutations.is_empty() {
-        return Preparation::Unchanged(document.path.clone());
+        return Preparation::Unchanged(source.path.clone());
     }
-    let diff = render_diff(&document.path, &document.content, &mutations);
+    let diff = render_diff(&source.path, &document, &mutations);
     if diff.len() > MAX_DIFF_BYTES {
         return Preparation::Blocked(format!(
             "The generated diff exceeds the {MAX_DIFF_BYTES}-byte preview limit; edit this declaration manually"
         ));
     }
-    let mut after = document.content.clone();
+    let mut after = document.content().to_owned();
     for mutation in mutations.iter().rev() {
         after.replace_range(
             mutation.start..mutation.end,
@@ -165,18 +167,10 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
         );
     }
     Preparation::Ready(PreparedChange {
-        path: document.path.clone(),
+        path: source.path.clone(),
         after,
         diff,
     })
-}
-
-struct PhysicalLine<'a> {
-    number: usize,
-    start: usize,
-    end: usize,
-    body: &'a str,
-    ending: &'a str,
 }
 
 #[derive(Debug)]
@@ -190,12 +184,12 @@ struct Mutation {
 }
 
 fn calculate_mutations(
-    content: &str,
+    document: &NspawnDocument<'_>,
     declarations: &[X11BindingDeclaration],
     recommendation: &X11BindRecommendation,
     edit: &ConfigurationEdit,
 ) -> std::result::Result<Vec<Mutation>, String> {
-    let lines = physical_lines(content);
+    let lines = document.lines();
     let mut requested = BTreeMap::new();
     let mut additions = Vec::new();
     for change in &edit.x11_changes {
@@ -213,7 +207,8 @@ fn calculate_mutations(
     }
 
     let mut mutations = Vec::with_capacity(requested.len());
-    let final_targets = bind_destinations(content)
+    let final_targets = document
+        .bind_destinations()
         .into_iter()
         .filter_map(|(line, target)| match requested.get(&line) {
             Some(X11BindingChange::Add { .. }) => {
@@ -238,7 +233,7 @@ fn calculate_mutations(
         let Some(line) = lines.get(line_number - 1) else {
             return Err(format!("Line {line_number} no longer exists"));
         };
-        if has_continuation(line.body) {
+        if line.has_continuation() {
             return Err(format!(
                 "Line {line_number} uses continuation syntax and must be edited manually"
             ));
@@ -276,8 +271,8 @@ fn calculate_mutations(
                     continue;
                 }
                 Some(render_binding(
-                    line.body,
-                    line.ending,
+                    line.body(),
+                    line.ending(),
                     declaration,
                     source,
                     guest_target,
@@ -286,15 +281,15 @@ fn calculate_mutations(
             }
         };
         mutations.push(Mutation {
-            line: line.number,
-            start: line.start,
-            end: line.end,
-            old: vec![line.body.to_string()],
+            line: line.number(),
+            start: line.start(),
+            end: line.end(),
+            old: vec![line.body().to_string()],
             new: new
                 .as_ref()
                 .map(|replacement| {
                     vec![replacement
-                        .strip_suffix(line.ending)
+                        .strip_suffix(line.ending())
                         .unwrap_or(replacement)
                         .to_string()]
                 })
@@ -333,39 +328,9 @@ fn calculate_mutations(
             occupied_targets.push(source.clone());
             rendered.push(render_new_binding(source, idmapped));
         }
-        mutations.push(insertion_mutation(content, &lines, &rendered));
+        mutations.push(insertion_mutation(document, &rendered));
     }
     Ok(mutations)
-}
-
-fn physical_lines(content: &str) -> Vec<PhysicalLine<'_>> {
-    let mut offset = 0;
-    content
-        .split_inclusive('\n')
-        .enumerate()
-        .map(|(index, raw)| {
-            let (body, ending) = if let Some(body) = raw.strip_suffix("\r\n") {
-                (body, "\r\n")
-            } else if let Some(body) = raw.strip_suffix('\n') {
-                (body, "\n")
-            } else {
-                (raw, "")
-            };
-            let line = PhysicalLine {
-                number: index + 1,
-                start: offset,
-                end: offset + raw.len(),
-                body,
-                ending,
-            };
-            offset += raw.len();
-            line
-        })
-        .collect()
-}
-
-fn has_continuation(line: &str) -> bool {
-    line.bytes().rev().take_while(|byte| *byte == b'\\').count() % 2 == 1
 }
 
 fn validate_source(path: &Path) -> std::result::Result<(), &'static str> {
@@ -441,33 +406,35 @@ fn render_new_binding(source: &Path, idmapped: bool) -> String {
     format!("BindReadOnly={source}:{source}{suffix}")
 }
 
-fn insertion_mutation(content: &str, lines: &[PhysicalLine<'_>], bindings: &[String]) -> Mutation {
-    let ending = preferred_line_ending(content);
+fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> Mutation {
+    let content = document.content();
+    let lines = document.lines();
+    let ending = document.preferred_line_ending();
     let mut in_files = false;
     let mut files_seen = false;
     let mut offset = content.len();
     let mut before_line = lines.len().saturating_add(1);
 
     for line in lines {
-        let trimmed = line.body.trim();
+        let trimmed = line.body().trim();
         if trimmed.starts_with('[') && trimmed.ends_with(']') {
             if trimmed.eq_ignore_ascii_case("[Files]") {
                 in_files = true;
                 files_seen = true;
-                offset = line.end;
-                before_line = line.number.saturating_add(1);
+                offset = line.end();
+                before_line = line.number().saturating_add(1);
             } else if in_files {
                 in_files = false;
-                offset = line.start;
-                before_line = line.number;
+                offset = line.start();
+                before_line = line.number();
             }
-        } else if in_files && is_nvidia_begin_marker(line.body) {
-            offset = line.start;
-            before_line = line.number;
+        } else if in_files && is_nvidia_begin_marker(line.body()) {
+            offset = line.start();
+            before_line = line.number();
             break;
         } else if in_files {
-            offset = line.end;
-            before_line = line.number.saturating_add(1);
+            offset = line.end();
+            before_line = line.number().saturating_add(1);
         }
     }
 
@@ -493,9 +460,11 @@ fn insertion_mutation(content: &str, lines: &[PhysicalLine<'_>], bindings: &[Str
         replacement.push_str(binding);
         replacement.push_str(ending);
     }
-    let new = physical_lines(&replacement)
-        .into_iter()
-        .map(|line| line.body.to_string())
+    let inserted = NspawnDocument::new(&replacement);
+    let new = inserted
+        .lines()
+        .iter()
+        .map(|line| line.body().to_string())
         .collect();
     Mutation {
         line: before_line.max(1),
@@ -507,15 +476,8 @@ fn insertion_mutation(content: &str, lines: &[PhysicalLine<'_>], bindings: &[Str
     }
 }
 
-fn preferred_line_ending(content: &str) -> &'static str {
-    match content.find('\n') {
-        Some(index) if content.as_bytes().get(index.wrapping_sub(1)) == Some(&b'\r') => "\r\n",
-        _ => "\n",
-    }
-}
-
-fn render_diff(path: &Path, content: &str, mutations: &[Mutation]) -> String {
-    let lines = physical_lines(content);
+fn render_diff(path: &Path, document: &NspawnDocument<'_>, mutations: &[Mutation]) -> String {
+    let lines = document.lines();
     let mut diff = format!("--- {}\n+++ {}\n", path.display(), path.display());
     if lines.is_empty() {
         let inserted = mutations
@@ -609,7 +571,7 @@ fn render_diff(path: &Path, content: &str, mutations: &[Mutation]) -> String {
                 }
             } else if let Some(line) = lines.get(line_number - 1) {
                 diff.push(' ');
-                diff.push_str(line.body);
+                diff.push_str(line.body());
                 diff.push('\n');
             }
         }
