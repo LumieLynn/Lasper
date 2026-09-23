@@ -6,6 +6,7 @@ mod edit;
 mod inspection;
 mod patch;
 mod projection;
+mod write;
 
 pub(super) use edit::{apply, preview};
 pub(super) use inspection::inspect;

@@ -6,34 +6,25 @@ use std::path::{Component, Path, PathBuf};
 
 use super::document::NspawnDocument;
 use super::inspection::{inspect, inspect_at};
-use super::patch::{apply_mutations, render_diff, SourceMutation};
+use super::patch::SourceMutation;
 use super::projection::x11_scope;
+use super::write::{prepare_patch, Preparation};
 use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_begin_marker};
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview,
-    ConfigurationSnapshot, ConfigurationWriteError, X11BindRecommendation, X11BindingChange,
-    X11BindingDeclaration, X11BindingScope,
+    ConfigurationSnapshot, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
+    X11BindingScope,
 };
 use crate::domain::machine::MachineName;
 
 const MAX_X11_CHANGES: usize = 128;
 const MAX_CONFIG_PATH_BYTES: usize = 4096;
-const MAX_DIFF_BYTES: usize = 256 * 1024;
 
 pub(crate) async fn preview(edit: ConfigurationEdit) -> Result<ConfigurationPreview> {
     let snapshot = inspect(edit.target.clone()).await?;
-    Ok(match prepare(&snapshot, &edit) {
-        Preparation::Ready(change) => ConfigurationPreview::Ready {
-            path: change.path,
-            diff: change.diff,
-            activation: ConfigurationActivation::NextMachineStart,
-        },
-        Preparation::Unchanged(path) => ConfigurationPreview::Unchanged { path },
-        Preparation::Blocked(reason) => ConfigurationPreview::Blocked { reason },
-        Preparation::Conflict(reason) => ConfigurationPreview::Conflict { reason },
-    })
+    Ok(prepare(&snapshot, &edit).into_preview())
 }
 
 pub(crate) async fn apply(edit: ConfigurationEdit) -> Result<ConfigurationApplyReport> {
@@ -99,71 +90,20 @@ async fn apply_with_sources(
     .await
 }
 
-enum Preparation {
-    Ready(PreparedChange),
-    Unchanged(PathBuf),
-    Blocked(String),
-    Conflict(String),
-}
-
-impl Preparation {
-    fn into_apply_report(self) -> ConfigurationApplyReport {
-        match self {
-            Self::Ready(_) => unreachable!("ready changes are written by the caller"),
-            Self::Unchanged(path) => ConfigurationApplyReport::Unchanged { path },
-            Self::Blocked(reason) => ConfigurationApplyReport::Blocked { reason },
-            Self::Conflict(reason) => ConfigurationApplyReport::Conflict { reason },
-        }
-    }
-}
-
-struct PreparedChange {
-    path: PathBuf,
-    after: String,
-    diff: String,
-}
-
 fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Preparation {
-    let context =
-        match snapshot.write_context(&edit.target, &edit.base_revision) {
-            Ok(context) => context,
-            Err(ConfigurationWriteError::RevisionChanged) => return Preparation::Conflict(
-                "The selected configuration source or file revision changed; refresh before saving"
-                    .into(),
-            ),
-            Err(error) => return Preparation::Blocked(error.to_string()),
-        };
-    let source = context.document;
     if edit.x11_changes.len() > MAX_X11_CHANGES {
         return Preparation::Blocked(format!(
             "A single draft may change at most {MAX_X11_CHANGES} X11 declarations"
         ));
     }
 
-    let document = NspawnDocument::new(&source.content);
-    let mutations = match calculate_mutations(
-        &document,
-        &snapshot.x11_bindings,
-        &snapshot.x11_bind_recommendation,
-        edit,
-    ) {
-        Ok(mutations) => mutations,
-        Err(reason) => return Preparation::Blocked(reason),
-    };
-    if mutations.is_empty() {
-        return Preparation::Unchanged(source.path.clone());
-    }
-    let diff = render_diff(&source.path, &document, &mutations);
-    if diff.len() > MAX_DIFF_BYTES {
-        return Preparation::Blocked(format!(
-            "The generated diff exceeds the {MAX_DIFF_BYTES}-byte preview limit; edit this declaration manually"
-        ));
-    }
-    let after = apply_mutations(document.content(), &mutations);
-    Preparation::Ready(PreparedChange {
-        path: source.path.clone(),
-        after,
-        diff,
+    prepare_patch(snapshot, &edit.target, &edit.base_revision, |document| {
+        calculate_mutations(
+            document,
+            &snapshot.x11_bindings,
+            &snapshot.x11_bind_recommendation,
+            edit,
+        )
     })
 }
 
