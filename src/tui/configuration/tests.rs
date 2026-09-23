@@ -229,6 +229,24 @@ fn wide_view_separates_navigation_declarations_and_runtime_access() {
 }
 
 #[test]
+fn configuration_footer_starts_at_column_zero_and_exposes_help() {
+    let mut view = loaded();
+    let screen = render(&mut view, 140, 28);
+    let footer = screen.lines().last().expect("configuration has a footer");
+    assert!(footer.starts_with('r'));
+    assert!(footer.contains("? Help"));
+}
+
+#[test]
+fn question_mark_requests_the_shared_help_overlay() {
+    let mut view = loaded();
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE)),
+        ConfigurationAction::Help
+    );
+}
+
+#[test]
 fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     let mut view = loaded();
     let selected = view.page.x11().selected_index();

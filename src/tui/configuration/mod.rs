@@ -57,6 +57,7 @@ impl PreviewTab {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigurationAction {
     None,
+    Help,
     Close,
     Refresh,
     Preview {
@@ -536,6 +537,7 @@ impl ConfigurationView {
             return self.handle_discard_key(key);
         }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('?'), _) => return ConfigurationAction::Help,
             (KeyCode::Esc, _) => {
                 return self.request_close_or_refresh(DiscardIntent::Close);
             }

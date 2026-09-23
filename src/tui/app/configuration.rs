@@ -28,6 +28,7 @@ impl App {
     pub(crate) fn handle_configuration_action(&mut self, action: ConfigurationAction) {
         match action {
             ConfigurationAction::Close => self.ui.configuration = None,
+            ConfigurationAction::Help => self.ui.show_help = true,
             ConfigurationAction::Refresh => self.refresh_configuration(),
             ConfigurationAction::Preview { generation, edit } => {
                 let Some(events) = self.ui.app_tx.clone() else {

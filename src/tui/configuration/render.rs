@@ -111,7 +111,6 @@ impl ConfigurationView {
             ))
         } else {
             Line::from(vec![
-                Span::raw(" "),
                 footer_key("r"),
                 footer_hint(" Refresh"),
                 footer_key("Esc"),
@@ -127,7 +126,9 @@ impl ConfigurationView {
                 footer_key("Ctrl+S"),
                 footer_hint(" Save"),
                 footer_key("[/]"),
-                footer_hint_last(" Tabs"),
+                footer_hint(" Tabs"),
+                footer_key("?"),
+                footer_hint_last(" Help"),
             ])
         };
         frame.render_widget(Paragraph::new(footer), rows[2]);
