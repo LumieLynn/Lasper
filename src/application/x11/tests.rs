@@ -109,7 +109,7 @@ fn record(phase: X11GrantRecordPhase, host_uid: u32) -> X11GrantRecordEvidence {
         source: projection.host_socket().source().to_path_buf(),
         canonical_source: projection.host_socket().canonical_path().to_path_buf(),
         socket_revision: projection.host_socket().revision(),
-        server_peer: projection.host_socket().peer_identity(),
+        server_peer: projection.host_socket().peer_identity().legacy_tuple(),
         server_peer_start_time: 77,
         acl_entry: X11AclEntry::from_wire(
             SERVER_INTERPRETED_FAMILY,
@@ -200,6 +200,39 @@ fn disabled_and_unknown_modes_are_not_reported_as_managed_access() {
         X11MappedUidAclStatus::UnknownMode {
             exact_numeric_entry_present: true,
         }
+    );
+}
+
+#[test]
+fn external_server_identity_cannot_be_managed_even_when_acl_is_enabled() {
+    let external_socket = HostX11Socket::from_verified_parts(
+        0,
+        false,
+        "/tmp/.X11-unix/X0".into(),
+        "/tmp/.X11-unix/X0".into(),
+        1000,
+        1000,
+        0o777,
+        0,
+        1000,
+        1000,
+        X11SocketRevision {
+            device: 1,
+            inode: 2,
+            ctime_seconds: 3,
+            ctime_nanoseconds: 4,
+        },
+    )
+    .unwrap();
+    let check = X11AccessCheck::from_observations(
+        target(),
+        projection_for_socket(external_socket, 1000),
+        X11AclSnapshot::from_wire(1, Vec::new()),
+    );
+    assert!(!check.server_identity_trackable());
+    assert_eq!(
+        check.mapped_uid_status(),
+        X11MappedUidAclStatus::ExactNumericEntryAbsent
     );
 }
 

@@ -18,6 +18,66 @@ pub enum X11ValidationError {
     BindTargetControlCharacter,
 }
 
+/// Identity returned by the Unix socket peer-credential query.
+///
+/// A zero PID is not a process identity.  Linux uses it when the peer lives
+/// outside the caller's PID namespace (for example, the WSLg X server), while
+/// the mapped UID/GID may still be available.  Keeping that case explicit
+/// prevents callers from treating `/proc/0` as a server-generation proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum X11PeerIdentity {
+    LocalProcess { pid: u32, uid: u32, gid: u32 },
+    External { uid: u32, gid: u32 },
+}
+
+impl X11PeerIdentity {
+    pub(crate) fn from_raw(pid: u32, uid: u32, gid: u32) -> Result<Self, X11ValidationError> {
+        if pid > i32::MAX as u32 {
+            return Err(X11ValidationError::InvalidPeerPid(pid));
+        }
+        Ok(if pid == 0 {
+            Self::External { uid, gid }
+        } else {
+            Self::LocalProcess { pid, uid, gid }
+        })
+    }
+
+    pub const fn pid(self) -> Option<u32> {
+        match self {
+            Self::LocalProcess { pid, .. } => Some(pid),
+            Self::External { .. } => None,
+        }
+    }
+
+    pub const fn uid(self) -> u32 {
+        match self {
+            Self::LocalProcess { uid, .. } | Self::External { uid, .. } => uid,
+        }
+    }
+
+    pub const fn gid(self) -> u32 {
+        match self {
+            Self::LocalProcess { gid, .. } | Self::External { gid, .. } => gid,
+        }
+    }
+
+    pub const fn is_local_process(self) -> bool {
+        matches!(self, Self::LocalProcess { .. })
+    }
+
+    /// Preserve the pre-existing three-field representation at internal
+    /// persistence boundaries.  External peers use the explicit zero-PID
+    /// sentinel only at that boundary; no process-oriented code should use it
+    /// as an actual PID.
+    pub(crate) const fn legacy_tuple(self) -> (u32, u32, u32) {
+        let pid = match self.pid() {
+            Some(pid) => pid,
+            None => 0,
+        };
+        (pid, self.uid(), self.gid())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct X11SocketRevision {
@@ -111,9 +171,7 @@ impl HostX11Socket {
         if !canonical_path.is_absolute() {
             return Err(X11ValidationError::CanonicalPathNotAbsolute(canonical_path));
         }
-        if peer_pid == 0 || peer_pid > i32::MAX as u32 {
-            return Err(X11ValidationError::InvalidPeerPid(peer_pid));
-        }
+        let _ = X11PeerIdentity::from_raw(peer_pid, peer_uid, peer_gid)?;
         Ok(Self {
             display,
             alternate,
@@ -157,8 +215,9 @@ impl HostX11Socket {
         self.mode
     }
 
-    pub fn peer_identity(&self) -> (u32, u32, u32) {
-        (self.peer_pid, self.peer_uid, self.peer_gid)
+    pub fn peer_identity(&self) -> X11PeerIdentity {
+        X11PeerIdentity::from_raw(self.peer_pid, self.peer_uid, self.peer_gid)
+            .expect("validated X11 socket stores a valid peer identity")
     }
 
     pub fn revision(&self) -> X11SocketRevision {
@@ -268,6 +327,50 @@ mod tests {
         let mut invalid = encoded;
         invalid["source"] = serde_json::json!("/run/user/1000/not-an-x11-socket");
         assert!(serde_json::from_value::<HostX11Socket>(invalid).is_err());
+    }
+
+    #[test]
+    fn zero_peer_pid_is_an_external_identity_not_a_local_process() {
+        let external = HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            "/tmp/.X11-unix/X0".into(),
+            1000,
+            1000,
+            0o777,
+            0,
+            1000,
+            1000,
+            X11SocketRevision {
+                device: 1,
+                inode: 2,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            external.peer_identity(),
+            X11PeerIdentity::External {
+                uid: 1000,
+                gid: 1000
+            }
+        );
+        assert!(!external.peer_identity().is_local_process());
+
+        let encoded = serde_json::to_value(&external).unwrap();
+        let decoded: HostX11Socket = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, external);
+    }
+
+    #[test]
+    fn peer_pid_above_linux_range_remains_invalid() {
+        let error = X11PeerIdentity::from_raw(i32::MAX as u32 + 1, 1000, 1000).unwrap_err();
+        assert_eq!(
+            error,
+            X11ValidationError::InvalidPeerPid(i32::MAX as u32 + 1)
+        );
     }
 
     #[test]

@@ -246,6 +246,17 @@ impl X11AccessCheck {
         self.mapped_uid_status
     }
 
+    /// Whether Lasper can bind ACL lifecycle evidence to a host X server
+    /// process in the current PID namespace.  External peers (such as WSLg)
+    /// may still be observed and used when access control is disabled, but
+    /// they cannot safely receive a managed ACL mutation.
+    pub fn server_identity_trackable(&self) -> bool {
+        self.projection
+            .host_socket()
+            .peer_identity()
+            .is_local_process()
+    }
+
     pub fn grant_assessment(&self) -> &X11GrantAssessment {
         &self.grant_assessment
     }
@@ -308,7 +319,8 @@ fn assess_grants(
                     if observation.host_boot_id.as_deref() != Some(record.boot_id.as_str())
                         || observation.server_peer_start_time
                             != Some(record.server_peer_start_time)
-                        || projection.host_socket().peer_identity() != record.server_peer
+                        || projection.host_socket().peer_identity().legacy_tuple()
+                            != record.server_peer
                     {
                         differences.push("X server continuity is not confirmed");
                     }

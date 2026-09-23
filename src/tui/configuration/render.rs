@@ -15,6 +15,7 @@ use super::{
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
 };
+use crate::domain::x11::X11PeerIdentity;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
 use crate::tui::{soft_wrap_text, theme};
@@ -281,9 +282,16 @@ impl ConfigurationView {
                 }
                 for socket in &snapshot.host_x11.sockets {
                     let revision = socket.revision();
-                    let (peer_pid, peer_uid, peer_gid) = socket.peer_identity();
+                    let peer = match socket.peer_identity() {
+                        X11PeerIdentity::LocalProcess { pid, uid, gid } => {
+                            format!("pid {pid} {uid}:{gid}")
+                        }
+                        X11PeerIdentity::External { uid, gid } => {
+                            format!("external {uid}:{gid} (PID unavailable)")
+                        }
+                    };
                     lines.push(format!(
-                        ":{}{} {} -> {} | owner {}:{} mode {:04o} | peer {peer_pid} {peer_uid}:{peer_gid} | dev {} ino {}",
+                        ":{}{} {} -> {} | owner {}:{} mode {:04o} | peer {peer} | dev {} ino {}",
                         socket.display(),
                         if socket.alternate() { " alternate" } else { "" },
                         socket.source().display(),

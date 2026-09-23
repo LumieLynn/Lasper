@@ -573,6 +573,7 @@ impl X11AccessDialog {
             &self.state,
             CheckState::Ready { check, assessment, .. }
                 if check.mapped_uid_status() == X11MappedUidAclStatus::ExactNumericEntryAbsent
+                    && check.server_identity_trackable()
                     && assessment.records_complete
         ) && self.pending_authorization.is_none()
     }
@@ -787,7 +788,11 @@ impl X11AccessDialog {
                     context.guest_mount().display(),
                     context.guest_client_path().display(),
                     pathname_access_summary(context.filesystem_access()),
-                    grant_status(assessment, identity.host_uid()),
+                    grant_status(
+                        assessment,
+                        identity.host_uid(),
+                        check.server_identity_trackable(),
+                    ),
                     action,
                     acl_summary(check.acl()),
                 )
@@ -944,9 +949,16 @@ fn pathname_access_summary(
     }
 }
 
-fn grant_status(assessment: &GrantAssessment, host_uid: u32) -> String {
+fn grant_status(
+    assessment: &GrantAssessment,
+    host_uid: u32,
+    server_identity_trackable: bool,
+) -> String {
     match &assessment.status {
         GrantStatus::AccessControlDisabled => "X server access control is disabled.".to_owned(),
+        _ if !server_identity_trackable => {
+            "X server peer is external to this PID namespace; Lasper will not manage ACL lifecycle for this display.".to_owned()
+        }
         GrantStatus::Managed { record_id } => format!(
             "Exact localuser:#{host_uid} entry is managed by Lasper record {}.",
             &record_id[..record_id.len().min(12)]

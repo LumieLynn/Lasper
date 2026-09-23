@@ -16,7 +16,7 @@ const MAX_UNIT_BYTES: usize = 16 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActivationBackend {
+pub(super) enum ActivationBackend {
     Dbus,
     SystemdTools,
 }
@@ -24,7 +24,7 @@ pub(crate) enum ActivationBackend {
 /// Install and start the user-manager path watcher for the invoking desktop
 /// user. The target machine scope remains system scope; the user manager is
 /// only an unprivileged lifecycle trigger.
-pub(crate) async fn ensure_system_machine_path_activation(
+pub(super) async fn ensure_system_machine_path_activation(
     backend: ActivationBackend,
 ) -> Result<(), String> {
     let units = tokio::task::spawn_blocking(prepare_units)
@@ -45,7 +45,7 @@ pub(crate) async fn ensure_system_machine_path_activation(
 
 /// Synchronize the watcher with the claim catalog. No active claim means
 /// there is no reason to leave a path unit loaded in the user manager.
-pub(crate) async fn synchronize_system_machine_path_activation(
+pub(super) async fn synchronize_system_machine_path_activation(
     backend: ActivationBackend,
     active_claims: bool,
 ) -> Result<(), String> {
