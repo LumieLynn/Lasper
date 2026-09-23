@@ -259,9 +259,13 @@ fn discover_sync(configured_sources: &[PathBuf]) -> X11EndpointCatalog {
             state: inspect_source(source, directory),
         });
     }
-    if let Err(reason) = validate_socket_directory(directory) {
-        catalog.diagnostics.push(reason);
-        return catalog;
+    match validate_socket_directory(directory) {
+        Ok(Some(warning)) => catalog.diagnostics.push(warning),
+        Ok(None) => {}
+        Err(reason) => {
+            catalog.diagnostics.push(reason);
+            return catalog;
+        }
     }
 
     let entries = match fs::read_dir(directory) {
@@ -403,20 +407,43 @@ fn parse_standard_socket_name(name: &str) -> Option<u16> {
     number.parse().ok()
 }
 
-fn validate_socket_directory(path: &Path) -> Result<(), String> {
+/// Validate the fixed X11 socket directory. A root-owned, non-sticky 0777
+/// directory is accepted as a compatibility layout used by WSLg, but callers
+/// receive a diagnostic because replacement races are less strongly bounded
+/// than with the standard sticky `/tmp/.X11-unix` directory.
+fn validate_socket_directory(path: &Path) -> Result<Option<String>, String> {
     let metadata = fs::metadata(path)
         .map_err(|error| format!("Cannot inspect {}: {error}", path.display()))?;
     let mode = metadata.permissions().mode();
-    if !metadata.is_dir() || metadata.uid() != 0 {
-        return Err(format!("{} is not a root-owned directory", path.display()));
-    }
-    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+    validate_socket_directory_metadata(path, metadata.is_dir(), metadata.uid(), mode)
+}
+
+fn validate_socket_directory_metadata(
+    path: &Path,
+    is_directory: bool,
+    owner_uid: u32,
+    mode: u32,
+) -> Result<Option<String>, String> {
+    let mode = mode & 0o7777;
+    if !is_directory {
         return Err(format!(
-            "{} is writable by other users without the sticky bit",
+            "{} is not a directory (uid={owner_uid} mode={mode:04o})",
             path.display()
         ));
     }
-    Ok(())
+    if owner_uid != 0 {
+        return Err(format!(
+            "{} is not root-owned (uid={owner_uid} mode={mode:04o})",
+            path.display()
+        ));
+    }
+    if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+        return Ok(Some(format!(
+            "{} is root-owned but writable by group/other without the sticky bit (mode={mode:04o}); accepting this compatibility layout with weaker replacement-race protection",
+            path.display()
+        )));
+    }
+    Ok(None)
 }
 
 fn inspect_endpoint(
@@ -1373,7 +1400,7 @@ fn observe_machine_claim(
         (
             MachineClaimPhase::Active,
             SystemMachineRegistration::Present {
-                leader_pid,
+                leader_pid: _,
                 instance: Some(instance),
             },
         ) if claim.matches_machine_instance(instance) => Some(MachineClaimObservation::Active),
@@ -1952,6 +1979,28 @@ fn desktop_observation(
 fn ensure_access_sync(
     request: &X11AuthorizationRequest,
 ) -> Result<X11DesktopAuthorization, String> {
+    let projection = request.projection();
+    let socket = projection.host_socket();
+    require_current_socket(socket, "before authorizing access")?;
+    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let before = read_acl(&connection, socket.display())?;
+    require_current_socket(socket, "before changing its ACL")?;
+
+    match before.mode() {
+        crate::application::x11::X11AccessControlMode::Disabled => {
+            return Ok(X11DesktopAuthorization::new(
+                desktop_observation(socket, before, None),
+                X11AuthorizationDisposition::AccessControlDisabled,
+            ));
+        }
+        crate::application::x11::X11AccessControlMode::Unknown(mode) => {
+            return Err(format!(
+                "X server returned unsupported access-control mode {mode}; no ACL change was attempted"
+            ));
+        }
+        crate::application::x11::X11AccessControlMode::Enabled => {}
+    }
+
     let state = X11RuntimeState::open()?;
     let _lock = state.lock()?;
     let existing_claims = state.load_claims();
@@ -1965,14 +2014,11 @@ fn ensure_access_sync(
             "X11 authorization was not attempted because Lasper cannot safely inspect its machine claims: {detail}"
         ));
     }
-    let projection = request.projection();
-    let socket = projection.host_socket();
-    require_current_socket(socket, "before authorizing access")?;
-    let server_peer_start_time = x11_peer_start_time(socket)?;
-    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    // Another Lasper process may have changed the ACL while the lock was
+    // being acquired. Re-observe it before deciding whether a mutation is
+    // needed; a concurrent switch to disabled access remains a read-only path.
     let before = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "before changing its ACL")?;
-
     match before.mode() {
         crate::application::x11::X11AccessControlMode::Disabled => {
             return Ok(X11DesktopAuthorization::new(
@@ -1987,6 +2033,7 @@ fn ensure_access_sync(
         }
         crate::application::x11::X11AccessControlMode::Enabled => {}
     }
+    let server_peer_start_time = x11_peer_start_time(socket)?;
 
     let host_uid = projection.identity().host_uid();
     if before.has_numeric_local_user(host_uid) {
@@ -2426,6 +2473,48 @@ fn authenticated_connection(
     source: &Path,
     display: u16,
 ) -> Result<AuthenticatedX11Connection, String> {
+    // The family/address used for Xauthority lookup is the same one that
+    // x11rb derives from a freshly connected Unix stream.
+    let stream = UnixStream::connect(source)
+        .map_err(|error| format!("connect to {}: {error}", source.display()))?;
+    let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
+        .map_err(|error| format!("prepare X11 authority lookup: {error}"))?;
+    drop(stream);
+    let authority = xauth::get_auth(family, &address, display)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+
+    match connect_x11(source, authority.0.clone(), authority.1.clone()) {
+        Ok(connection) => Ok(connection),
+        Err(with_authority_error) if !authority.0.is_empty() || !authority.1.is_empty() => {
+            // Some Xwayland environments expose a valid pathname socket but
+            // deliberately run without Xauthority. A stale local cookie must
+            // not hide that endpoint; retrying with empty credentials merely
+            // lets the X server apply its own no-auth/access-control policy.
+            match connect_x11(source, Vec::new(), Vec::new()) {
+                Ok(connection) => {
+                    log::debug!(
+                        "X11 endpoint {} accepted an unauthenticated setup after the configured Xauthority failed",
+                        source.display()
+                    );
+                    Ok(connection)
+                }
+                Err(without_authority_error) => Err(format!(
+                    "X11 setup through {} failed with configured Xauthority ({with_authority_error}); unauthenticated retry also failed ({without_authority_error})",
+                    source.display()
+                )),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn connect_x11(
+    source: &Path,
+    auth_name: Vec<u8>,
+    auth_data: Vec<u8>,
+) -> Result<AuthenticatedX11Connection, String> {
     let stream = UnixStream::connect(source)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
     stream
@@ -2435,14 +2524,10 @@ fn authenticated_connection(
         .set_write_timeout(Some(ENDPOINT_IO_TIMEOUT))
         .map_err(|error| format!("set X11 write deadline: {error}"))?;
     let peer = peer_credentials(&stream)?;
-    let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
+    let (stream, _) = DefaultStream::from_unix_stream(stream)
         .map_err(|error| format!("prepare X11 connection: {error}"))?;
-    let authority = xauth::get_auth(family, &address, display)
-        .ok()
-        .flatten()
-        .unwrap_or_default();
     let connection =
-        RustConnection::connect_to_stream_with_auth_info(stream, 0, authority.0, authority.1)
+        RustConnection::connect_to_stream_with_auth_info(stream, 0, auth_name, auth_data)
             .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
     Ok((connection, peer))
 }
@@ -2544,6 +2629,20 @@ mod tests {
         assert_eq!(parse_standard_socket_name("X12"), Some(12));
         assert_eq!(parse_standard_socket_name("X0_"), None);
         assert_eq!(parse_standard_socket_name("X"), None);
+    }
+
+    #[test]
+    fn socket_directory_policy_reports_wslg_compatibility_mode() {
+        let path = Path::new("/tmp/.X11-unix");
+        let warning = validate_socket_directory_metadata(path, true, 0, 0o777)
+            .unwrap()
+            .expect("non-sticky root-owned directories need a warning");
+        assert!(warning.contains("weaker replacement-race protection"));
+        assert!(validate_socket_directory_metadata(path, true, 1000, 0o1777).is_err());
+        assert!(validate_socket_directory_metadata(path, true, 0, 0o1777)
+            .unwrap()
+            .is_none());
+        assert!(validate_socket_directory_metadata(path, false, 0, 0o755).is_err());
     }
 
     #[test]
