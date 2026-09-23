@@ -11,8 +11,8 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::application::configuration::{
-    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
-    ConfigurationTarget,
+    ConfigurationApplyReport, ConfigurationDraft, ConfigurationEdit, ConfigurationPreview,
+    ConfigurationSnapshot, ConfigurationTarget,
 };
 use crate::application::inspection::ResourceInspectionError;
 use crate::application::x11::{X11AccessCheck, X11AccessError, X11Authorization};
@@ -163,6 +163,7 @@ pub(crate) struct ConfigurationView {
     saving: bool,
     apply_error: Option<String>,
     page: ConfigurationPageState,
+    draft: ConfigurationDraft,
     preview_scroll: usize,
     preview_max_scroll: usize,
     preview_width: u16,
@@ -189,6 +190,7 @@ impl ConfigurationView {
             saving: false,
             apply_error: None,
             page: ConfigurationPageState::default(),
+            draft: ConfigurationDraft::default(),
             preview_scroll: 0,
             preview_max_scroll: 0,
             preview_width: 0,
@@ -204,7 +206,7 @@ impl ConfigurationView {
         self.page.x11_mut().begin_query();
         self.query = query;
         self.cancel_preview();
-        self.page.x11_mut().clear_draft();
+        self.draft.clear();
         self.draft_preview = DraftPreviewState::Clean;
         self.discard = None;
         self.restart_confirmation = None;
@@ -300,10 +302,7 @@ impl ConfigurationView {
         target: &ConfigurationTarget,
         result: Result<ConfigurationPreview, ResourceInspectionError>,
     ) {
-        if generation != self.draft_generation
-            || target != &self.target
-            || self.page.x11().draft_is_empty()
-        {
+        if generation != self.draft_generation || target != &self.target || self.draft_is_empty() {
             return;
         }
         self.pending_preview.take();
@@ -333,7 +332,7 @@ impl ConfigurationView {
         self.saving = false;
         match result {
             Ok(ConfigurationApplyReport::Applied { .. }) => {
-                self.page.x11_mut().clear_draft();
+                self.draft.clear();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 self.restart_confirmation = match &self.target {
@@ -343,7 +342,7 @@ impl ConfigurationView {
                 Some("X11 configuration saved; it takes effect on the next machine start".into())
             }
             Ok(ConfigurationApplyReport::Unchanged { .. }) => {
-                self.page.x11_mut().clear_draft();
+                self.draft.clear();
                 self.draft_preview = DraftPreviewState::Clean;
                 self.apply_error = None;
                 Some("Configuration is already up to date".into())
@@ -375,19 +374,23 @@ impl ConfigurationView {
         let InspectionState::Ready(snapshot) = &self.state else {
             return None;
         };
-        Some(ConfigurationEdit {
-            target: self.target.clone(),
-            base_revision: snapshot.revision.clone()?,
-            x11_changes: self.page.x11().draft_changes(),
-        })
+        self.draft.edit(&self.target, snapshot)
+    }
+
+    fn draft_is_empty(&self) -> bool {
+        self.draft.is_empty()
     }
 
     fn toggle_selected_x11(&mut self) -> ConfigurationAction {
         if self.saving {
             return ConfigurationAction::None;
         }
-        if !self.page.x11_mut().toggle_selected() {
+        let Some(selected) = self.page.x11().selected_item() else {
             return ConfigurationAction::None;
+        };
+        match selected {
+            x11::X11DraftItem::Declaration(line) => self.draft.toggle_x11_declaration(line),
+            x11::X11DraftItem::Available(source) => self.draft.toggle_x11_source(&source),
         }
         self.draft_changed()
     }
@@ -401,7 +404,7 @@ impl ConfigurationView {
         self.apply_error = None;
         self.preview_scroll = 0;
         self.preview_cache = None;
-        if self.page.x11().draft_is_empty() {
+        if self.draft_is_empty() {
             self.draft_preview = DraftPreviewState::Clean;
             return ConfigurationAction::None;
         }
@@ -440,7 +443,7 @@ impl ConfigurationView {
             self.preview_cache = None;
             return ConfigurationAction::None;
         }
-        if !self.page.x11().draft_is_empty() {
+        if !self.draft_is_empty() {
             self.discard = Some(intent);
             return ConfigurationAction::None;
         }
@@ -454,7 +457,7 @@ impl ConfigurationView {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let intent = self.discard.take().expect("discard intent is visible");
-                self.page.x11_mut().clear_draft();
+                self.draft.clear();
                 match intent {
                     DiscardIntent::Close => ConfigurationAction::Close,
                     DiscardIntent::Refresh => ConfigurationAction::Refresh,

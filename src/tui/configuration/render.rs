@@ -36,7 +36,7 @@ impl ConfigurationView {
         };
         let state = if self.saving {
             "Saving"
-        } else if !self.page.x11().draft_is_empty() {
+        } else if !self.draft_is_empty() {
             "MOD"
         } else if matches!(&self.state, InspectionState::Ready(snapshot) if snapshot.document.is_some())
         {
@@ -96,6 +96,7 @@ impl ConfigurationView {
                         &self.state,
                         &self.target,
                         self.pane,
+                        &self.draft,
                     );
                 }
             }

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crossterm::event::KeyEvent;
@@ -10,8 +10,8 @@ use ratatui::Frame;
 
 use super::{ConfigurationAction, ConfigurationPane, ConfigurationTarget, InspectionState};
 use crate::application::configuration::{
-    ConfigurationSnapshot, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
-    X11BindingScope,
+    ConfigurationDraft, ConfigurationSnapshot, X11BindRecommendation, X11BindingChange,
+    X11BindingDeclaration, X11BindingScope,
 };
 use crate::application::x11::{X11AccessCheck, X11AccessError, X11Authorization};
 use crate::domain::x11::HostX11Socket;
@@ -25,14 +25,14 @@ pub(super) enum X11ContentFocus {
     RuntimeAccess,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum X11DraftKey {
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum X11ChecklistItem {
     Declaration(usize),
-    Addition(PathBuf),
+    Available(PathBuf),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum X11ChecklistItem {
+pub(super) enum X11DraftItem {
     Declaration(usize),
     Available(PathBuf),
 }
@@ -49,7 +49,6 @@ pub(super) struct X11PageState {
     access_dialog: Option<X11AccessDialog>,
     list: ListState,
     items: Vec<X11ChecklistItem>,
-    draft: BTreeMap<X11DraftKey, X11BindingChange>,
     expanded: BTreeSet<usize>,
 }
 
@@ -60,7 +59,6 @@ impl Default for X11PageState {
             access_dialog: None,
             list: ListState::default(),
             items: Vec::new(),
-            draft: BTreeMap::new(),
             expanded: BTreeSet::new(),
         }
     }
@@ -83,41 +81,16 @@ impl X11PageState {
         self.content_focus = X11ContentFocus::Bindings;
     }
 
-    pub(super) fn clear_draft(&mut self) {
-        self.draft.clear();
-    }
-
-    pub(super) fn draft_is_empty(&self) -> bool {
-        self.draft.is_empty()
-    }
-
-    pub(super) fn draft_changes(&self) -> Vec<X11BindingChange> {
-        self.draft.values().cloned().collect()
-    }
-
-    pub(super) fn toggle_selected(&mut self) -> bool {
-        let Some(item) = self
+    pub(super) fn selected_item(&self) -> Option<X11DraftItem> {
+        let item = self
             .list
             .selected()
             .and_then(|index| self.items.get(index))
-            .cloned()
-        else {
-            return false;
-        };
-        let (key, change) = match item {
-            X11ChecklistItem::Declaration(line) => (
-                X11DraftKey::Declaration(line),
-                X11BindingChange::Remove { line },
-            ),
-            X11ChecklistItem::Available(source) => (
-                X11DraftKey::Addition(source.clone()),
-                X11BindingChange::Add { source },
-            ),
-        };
-        if self.draft.remove(&key).is_none() {
-            self.draft.insert(key, change);
-        }
-        true
+            .cloned()?;
+        Some(match item {
+            X11ChecklistItem::Declaration(line) => X11DraftItem::Declaration(line),
+            X11ChecklistItem::Available(source) => X11DraftItem::Available(source),
+        })
     }
 
     pub(super) fn toggle_selected_details(&mut self) {
@@ -376,6 +349,7 @@ impl X11PageState {
         state: &InspectionState,
         target: &ConfigurationTarget,
         pane: ConfigurationPane,
+        draft: &ConfigurationDraft,
     ) -> X11HitAreas {
         let mut hits = X11HitAreas::default();
         let block = Block::default()
@@ -415,8 +389,8 @@ impl X11PageState {
                     x11_item_lines(
                         item,
                         snapshot,
-                        self.item_change(item),
-                        self.item_checked(item),
+                        self.item_change(item, draft),
+                        self.item_checked(item, draft),
                         self.is_expanded(index),
                         rows[0].width.saturating_sub(3),
                     )
@@ -513,22 +487,28 @@ impl X11PageState {
         );
     }
 
-    fn item_change(&self, item: &X11ChecklistItem) -> Option<&X11BindingChange> {
-        let key = match item {
-            X11ChecklistItem::Declaration(line) => X11DraftKey::Declaration(*line),
-            X11ChecklistItem::Available(source) => X11DraftKey::Addition(source.clone()),
-        };
-        self.draft.get(&key)
+    fn item_change<'a>(
+        &self,
+        item: &X11ChecklistItem,
+        draft: &'a ConfigurationDraft,
+    ) -> Option<&'a X11BindingChange> {
+        match item {
+            X11ChecklistItem::Declaration(line) => draft.x11_change_for_declaration(*line),
+            X11ChecklistItem::Available(source) => draft.x11_change_for_source(source),
+        }
     }
 
-    fn item_checked(&self, item: &X11ChecklistItem) -> bool {
+    fn item_checked(&self, item: &X11ChecklistItem, draft: &ConfigurationDraft) -> bool {
         match item {
             X11ChecklistItem::Declaration(_) => !matches!(
-                self.item_change(item),
+                self.item_change(item, draft),
                 Some(X11BindingChange::Remove { .. })
             ),
             X11ChecklistItem::Available(_) => {
-                matches!(self.item_change(item), Some(X11BindingChange::Add { .. }))
+                matches!(
+                    self.item_change(item, draft),
+                    Some(X11BindingChange::Add { .. })
+                )
             }
         }
     }

@@ -479,7 +479,7 @@ fn dirty_close_requires_confirmation_and_keeps_the_draft_when_cancelled() {
         view.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(!view.page.x11().draft_is_empty());
+    assert!(!view.draft_is_empty());
     view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(
         view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
@@ -526,7 +526,7 @@ fn only_current_ready_preview_can_be_saved_and_success_clears_the_draft() {
         }),
     );
     assert!(message.unwrap().contains("next machine start"));
-    assert!(view.page.x11().draft_is_empty());
+    assert!(view.draft_is_empty());
 }
 
 #[test]
@@ -583,7 +583,7 @@ fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
         assert_eq!(buffer[(x, y)].fg, color, "selected status lost its color");
         assert!(render(&mut view, 160, 28).contains("[x] > Socket directory"));
         assert!(
-            view.page.x11().draft_is_empty(),
+            view.draft_is_empty(),
             "observation must not remove a declaration"
         );
     }
@@ -626,7 +626,7 @@ fn available_endpoint_check_generates_add_and_checking_again_cancels_it() {
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(view.page.x11().draft_is_empty());
+    assert!(view.draft_is_empty());
 }
 
 #[test]

@@ -14,8 +14,10 @@ use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 
+mod draft;
 mod x11;
 
+pub use draft::ConfigurationDraft;
 pub use x11::{X11BindRecommendation, X11BindingChange, X11BindingDeclaration, X11BindingScope};
 
 /// A catalog resource to inspect, not an arbitrary path or a claim that an
