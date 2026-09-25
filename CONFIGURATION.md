@@ -11,6 +11,7 @@ The file is parsed once when Lasper starts. It can contain these top-level secti
 ```toml
 [settings]
 [theme]
+[nvidia]
 [bootstrap]
 ```
 
@@ -48,6 +49,26 @@ scrollback-lines = 2000
 The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -s` always enables the systemd tools path. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
 
 `-s/--systemd-tools` selects the same execution path previously named `-c/--cli-mode`; it does not select a command-line UI or change the authority of an operation. The old flags and `[settings] cli-mode` remain accepted as compatibility aliases. Use only one of `systemd-tools` and `cli-mode` in a configuration file; declaring both is a duplicate-setting error. The theme key `badge_systemd_tools` likewise accepts the old `badge_cli` name.
+
+## NVIDIA CDI Source
+
+Lasper can either ask `nvidia-ctk` for a current CDI document or consume an existing document maintained by the host:
+
+```toml
+[nvidia]
+cdi-source = "generate"
+```
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `cdi-source` | `generate` or `existing` | `generate` | `generate` runs `nvidia-ctk cdi generate --format=json`. `existing` reads a complete NVIDIA CDI document without invoking `nvidia-ctk`. |
+| `cdi-file` | absolute path | omitted | Select one existing YAML or JSON document explicitly. It is used only with `cdi-source = "existing"`. |
+
+When `existing` has no explicit file, Lasper looks for `nvidia.yaml`, `nvidia.yml`, or `nvidia.json` in `/etc/cdi` and `/var/run/cdi`. Discovery must find exactly one candidate; configure `cdi-file` when more than one exists. An explicit path must be absolute. CDI files are bounded to 8 MiB, must be regular files rather than symlinks, must be owned by root or the executing user, and must not be group- or world-writable. Consequently, an explicit user-owned file is accepted in a direct user process but is intentionally rejected by the elevated root daemon; use a root-owned host CDI file for elevated deployment.
+
+Both modes load the complete CDI document and then select the requested NVIDIA device in memory. Lasper retains its existing translation of NVIDIA CDI device nodes, mounts, `create-symlinks`, and `update-ldcache` edits into its nspawn projection. Before changing state, it also verifies that every projected host source still exists and is a supported file, directory, or device-node type.
+
+At each Lasper-managed machine start, NVIDIA reconciliation compares the fresh CDI-derived state with the persisted state payload and separately requires exact set equality between `state.binds` and the `Bind=`/`BindReadOnly=` entries inside the `X-Lasper-Nvidia-Begin` and `X-Lasper-Nvidia-End` block. Duplicate binds, malformed values, bind options, unknown directives, missing markers, and partial blocks force regeneration. Content outside that owned block is administrator configuration and is deliberately excluded from this equality check.
 
 ## Bootstrap Selection
 

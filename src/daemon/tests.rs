@@ -839,6 +839,7 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         },
         storage: DeploymentStorage::Directory,
         nvidia_profile: None,
+        nvidia_cdi_source: Default::default(),
         wayland: Vec::new(),
         allow_unsafe_remote_tar: false,
     })

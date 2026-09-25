@@ -1127,7 +1127,11 @@ mod tests {
             None,
         )
         .unwrap();
-        let services = crate::composition::compose_application_services(mode, false);
+        let services = crate::composition::compose_application_services(
+            mode,
+            false,
+            crate::domain::nvidia::NvidiaCdiSource::default(),
+        );
         App::new(
             permissions,
             false, // systemd_tools

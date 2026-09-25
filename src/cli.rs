@@ -307,6 +307,14 @@ fn help_text() -> String {
             .entry(
                 "[settings] scrollback-lines = N",
                 "Max history rows per embedded terminal (default 2000, 0 disables).",
+            )
+            .entry(
+                "[nvidia] cdi-source = \"existing\"",
+                "Read the host CDI document instead of invoking nvidia-ctk.",
+            )
+            .entry(
+                "[nvidia] cdi-file = /absolute/path",
+                "Select one existing NVIDIA CDI YAML or JSON document explicitly.",
             ),
     )
     .to_string()

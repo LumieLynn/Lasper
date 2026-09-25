@@ -59,6 +59,21 @@ pub struct NvidiaState {
 }
 
 impl NvidiaState {
+    /// Compare the persisted NVIDIA payload with a freshly assembled one.
+    /// Ownership is storage metadata and must not force a reconciliation by
+    /// itself; every other serialized field remains part of the comparison.
+    pub(crate) fn same_payload(&self, other: &Self) -> bool {
+        self.driver_version == other.driver_version
+            && self.binds == other.binds
+            && self.readonly_binds == other.readonly_binds
+            && self.device_binds == other.device_binds
+            && self.classified_entries == other.classified_entries
+            && self.symlinks == other.symlinks
+            && self.ldcache_folders == other.ldcache_folders
+            && self.env_vars == other.env_vars
+            && self.profile == other.profile
+    }
+
     /// Populate `binds` from legacy fields if binds is empty and legacy fields have data.
     /// Called after deserialization of old-format state files.
     pub fn migrate_from_legacy(&mut self) {
@@ -1018,6 +1033,25 @@ mod tests {
         let serialized = serde_json::to_string(&state).unwrap();
         let deserialized: NvidiaState = serde_json::from_str(&serialized).unwrap();
         assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn payload_comparison_ignores_only_the_ownership_marker() {
+        let state = NvidiaState {
+            driver_version: "550.1".into(),
+            binds: vec![PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let mut persisted = state.clone();
+        persisted.ownership_marker = Some(NVIDIA_STATE_MARKER.into());
+        assert!(persisted.same_payload(&state));
+
+        persisted.binds[0].container_path = "/dev/nvidia1".into();
+        assert!(!persisted.same_payload(&state));
     }
 
     #[test]

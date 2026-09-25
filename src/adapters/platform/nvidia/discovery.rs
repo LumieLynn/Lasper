@@ -1,15 +1,22 @@
-use super::cdi::{CdiDeviceNode, CdiMount, CdiSpec};
+use super::cdi::{
+    CdiDeviceNode, CdiDocument, CdiMount, CdiSpec, MAX_CDI_DOCUMENT_BYTES, NVIDIA_CDI_KIND,
+};
 use super::classify::{self, ClassifiedEntry};
 use super::resolve::{get_ldconfig_cache, resolve_so_aliases};
 use super::state::{NvidiaState, PassthroughBind};
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::new_command;
-use crate::domain::nvidia::{NvidiaPassthroughMode, NvidiaPassthroughProfile};
+use crate::domain::nvidia::{NvidiaCdiSource, NvidiaPassthroughMode, NvidiaPassthroughProfile};
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use tokio::io::AsyncReadExt;
+
+const STANDARD_CDI_DIRECTORIES: &[&str] = &["/etc/cdi", "/var/run/cdi"];
+const NVIDIA_CDI_FILENAMES: &[&str] = &["nvidia.yaml", "nvidia.yml", "nvidia.json"];
 
 /// Check whether `nvidia-ctk` is available on PATH.
-pub fn nvidia_ctk_available() -> bool {
+pub(crate) fn nvidia_ctk_available() -> bool {
     which::which("nvidia-ctk").is_ok()
 }
 
@@ -28,14 +35,18 @@ pub async fn get_host_driver_version() -> Result<String> {
     }
 }
 
-/// Refresh NVIDIA hardware from one current CDI snapshot.
-pub async fn discover_hardware() -> Result<(Vec<String>, NvidiaState)> {
+pub async fn discover_hardware_from(
+    source: &NvidiaCdiSource,
+) -> Result<(Vec<String>, NvidiaState)> {
     let driver_version = get_host_driver_version().await.unwrap_or_default();
-    let spec = generate_cdi_spec("all").await?;
+    let full_spec = load_cdi_spec(source).await?;
 
-    let devices = devices_from_spec(&spec);
+    let devices = devices_from_spec(&full_spec);
+    let spec = select_cdi_device(full_spec, "all")?;
+    validate_cdi_selection(&spec, "all")?;
     let state = build_nvidia_state(&spec, driver_version, None).await?;
     validate_authoritative_state(&state, "all")?;
+    validate_host_sources(&state).await?;
     Ok((devices, state))
 }
 
@@ -358,14 +369,89 @@ fn extract_classified_entries(binds: &[PassthroughBind]) -> Vec<ClassifiedEntry>
         .collect()
 }
 
-async fn generate_cdi_spec(gpu_device: &str) -> Result<CdiSpec> {
+pub(crate) async fn cdi_source_available(source: &NvidiaCdiSource) -> bool {
+    if source.validate().is_err() {
+        return false;
+    }
+    match source {
+        NvidiaCdiSource::Generate => nvidia_ctk_available(),
+        NvidiaCdiSource::Existing { path } => {
+            resolve_existing_cdi_path(path.as_deref()).await.is_ok()
+        }
+    }
+}
+
+async fn load_cdi_spec(source: &NvidiaCdiSource) -> Result<CdiSpec> {
+    source.validate().map_err(NspawnError::Validation)?;
+    let document = match source {
+        NvidiaCdiSource::Generate => generate_cdi_document().await?,
+        NvidiaCdiSource::Existing { path } => {
+            let path = resolve_existing_cdi_path(path.as_deref()).await?;
+            log::debug!("Using existing NVIDIA CDI document {}", path.display());
+            read_cdi_document(&path).await?
+        }
+    };
+    validate_cdi_document(&document)?;
+    Ok(document.into_spec())
+}
+
+async fn resolve_existing_cdi_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        let metadata = tokio::fs::symlink_metadata(path).await.map_err(|error| {
+            NspawnError::Runtime(format!(
+                "Cannot inspect NVIDIA CDI file {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !metadata.file_type().is_file() {
+            return Err(NspawnError::Validation(format!(
+                "NVIDIA CDI source is not a regular file: {}",
+                path.display()
+            )));
+        }
+        return Ok(path.to_path_buf());
+    }
+
+    let mut matches = Vec::new();
+    for directory in STANDARD_CDI_DIRECTORIES {
+        for filename in NVIDIA_CDI_FILENAMES {
+            let candidate = Path::new(directory).join(filename);
+            match tokio::fs::symlink_metadata(&candidate).await {
+                Ok(metadata) if metadata.file_type().is_file() => matches.push(candidate),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(NspawnError::Runtime(format!(
+                        "Cannot inspect NVIDIA CDI candidate {}: {error}",
+                        candidate.display()
+                    )))
+                }
+            }
+        }
+    }
+
+    match matches.as_slice() {
+        [] => Err(NspawnError::Runtime(format!(
+            "No existing NVIDIA CDI document was found in {}",
+            STANDARD_CDI_DIRECTORIES.join(" or ")
+        ))),
+        [path] => Ok(path.clone()),
+        _ => Err(NspawnError::Validation(format!(
+            "Multiple NVIDIA CDI documents were found ({}); set nvidia.cdi-file explicitly",
+            matches
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+async fn generate_cdi_document() -> Result<CdiDocument> {
     let mut cmd = new_command("nvidia-ctk");
     // Keep CDI hooks in the snapshot: the state builder translates their
     // symlink and ld-cache edits into nspawn bind configuration.
     cmd.args(["cdi", "generate", "--format=json"]);
-    if gpu_device != "all" {
-        cmd.args(["--device-id", gpu_device]);
-    }
 
     let out = cmd.output().await.map_err(|e| {
         NspawnError::Runtime(format!(
@@ -384,18 +470,19 @@ async fn generate_cdi_spec(gpu_device: &str) -> Result<CdiSpec> {
     }
 
     if !out.status.success() {
-        let device_arg = if gpu_device == "all" {
-            String::new()
-        } else {
-            format!(" --device-id={gpu_device}")
-        };
         return Err(NspawnError::cmd_failed(
             "NVIDIA CDI Discovery",
-            format!("nvidia-ctk cdi generate --format=json{device_arg}"),
+            "nvidia-ctk cdi generate --format=json",
             &out,
         ));
     }
 
+    if out.stdout.len() > MAX_CDI_DOCUMENT_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "nvidia-ctk CDI JSON exceeds {} bytes",
+            MAX_CDI_DOCUMENT_BYTES
+        )));
+    }
     if out.stdout.iter().all(|byte| byte.is_ascii_whitespace()) {
         return Err(NspawnError::Runtime(
             "nvidia-ctk generated empty CDI JSON; refusing to replace the current NVIDIA state"
@@ -403,23 +490,189 @@ async fn generate_cdi_spec(gpu_device: &str) -> Result<CdiSpec> {
         ));
     }
 
-    let spec = parse_generated_cdi_json(&out.stdout)?;
-    validate_cdi_selection(&spec, gpu_device)?;
-    Ok(spec)
+    parse_generated_cdi_json(&out.stdout)
 }
 
-fn parse_generated_cdi_json(content: &[u8]) -> Result<CdiSpec> {
-    let mut documents = serde_json::Deserializer::from_slice(content).into_iter::<CdiSpec>();
-    let first = documents
-        .next()
-        .transpose()
-        .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?
-        .ok_or_else(|| NspawnError::Runtime("nvidia-ctk generated empty CDI JSON".into()))?;
-    for document in documents {
-        document
-            .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?;
+async fn read_cdi_document(path: &Path) -> Result<CdiDocument> {
+    // Open with O_NOFOLLOW so the metadata check and read refer to the same
+    // inode. This matters for a root daemon consuming an explicitly supplied
+    // path that another process could otherwise retarget between checks.
+    let file = tokio::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .await
+        .map_err(|error| {
+            NspawnError::Runtime(format!(
+                "Cannot open NVIDIA CDI file {}: {error}",
+                path.display()
+            ))
+        })?;
+    let metadata = file.metadata().await.map_err(|error| {
+        NspawnError::Runtime(format!(
+            "Cannot inspect NVIDIA CDI file {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI source is not a regular file: {}",
+            path.display()
+        )));
     }
-    Ok(first)
+    if metadata.len() > MAX_CDI_DOCUMENT_BYTES as u64 {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI file {} exceeds {} bytes",
+            path.display(),
+            MAX_CDI_DOCUMENT_BYTES
+        )));
+    }
+
+    let uid = metadata.uid();
+    let mode = metadata.permissions().mode();
+    let effective_uid = uzers::get_effective_uid();
+    if uid != 0 && uid != effective_uid {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI file {} is owned by uid {}, not root or the effective user",
+            path.display(),
+            uid
+        )));
+    }
+    if mode & 0o022 != 0 {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI file {} is writable by group or other users",
+            path.display()
+        )));
+    }
+
+    let mut content = Vec::new();
+    file.take((MAX_CDI_DOCUMENT_BYTES as u64) + 1)
+        .read_to_end(&mut content)
+        .await
+        .map_err(|error| {
+            NspawnError::Runtime(format!(
+                "Cannot read NVIDIA CDI file {}: {error}",
+                path.display()
+            ))
+        })?;
+    if content.len() > MAX_CDI_DOCUMENT_BYTES {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI file {} exceeds {} bytes",
+            path.display(),
+            MAX_CDI_DOCUMENT_BYTES
+        )));
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        parse_generated_cdi_json(&content).map_err(|error| {
+            NspawnError::Runtime(format!(
+                "Failed to parse NVIDIA CDI file {}: {error}",
+                path.display()
+            ))
+        })
+    } else {
+        parse_cdi_yaml(&content).map_err(|error| {
+            NspawnError::Runtime(format!(
+                "Failed to parse NVIDIA CDI file {}: {error}",
+                path.display()
+            ))
+        })
+    }
+}
+
+fn parse_generated_cdi_json(content: &[u8]) -> Result<CdiDocument> {
+    let documents = if content
+        .iter()
+        .copied()
+        .find(|byte| !byte.is_ascii_whitespace())
+        == Some(b'[')
+    {
+        serde_json::from_slice::<Vec<CdiDocument>>(content)
+            .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?
+    } else {
+        serde_json::Deserializer::from_slice(content)
+            .into_iter::<CdiDocument>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| NspawnError::Runtime(format!("Failed to parse CDI JSON: {error}")))?
+    };
+    if documents.is_empty() {
+        return Err(NspawnError::Runtime(
+            "nvidia-ctk generated empty CDI JSON".into(),
+        ));
+    }
+
+    let mut nvidia = documents
+        .into_iter()
+        .filter(|document| document.kind.as_deref() == Some(NVIDIA_CDI_KIND));
+    let document = nvidia.next().ok_or_else(|| {
+        NspawnError::Validation("CDI JSON contains no nvidia.com/gpu document".into())
+    })?;
+    if nvidia.next().is_some() {
+        return Err(NspawnError::Validation(
+            "CDI JSON contains multiple nvidia.com/gpu documents".into(),
+        ));
+    }
+    Ok(document)
+}
+
+fn parse_cdi_yaml(content: &[u8]) -> std::result::Result<CdiDocument, serde_yml::Error> {
+    serde_yml::from_slice(content)
+}
+
+fn validate_cdi_document(document: &CdiDocument) -> Result<()> {
+    if document.kind.as_deref() != Some(NVIDIA_CDI_KIND) {
+        return Err(NspawnError::Validation(format!(
+            "NVIDIA CDI document has unsupported kind {:?}",
+            document.kind
+        )));
+    }
+    if document
+        .cdi_version
+        .as_deref()
+        .is_none_or(|version| version.trim().is_empty())
+    {
+        return Err(NspawnError::Validation(
+            "NVIDIA CDI document has no cdiVersion".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Project one named CDI device while preserving the document-level edits.
+/// The generated `all` entry is preferred for the all-device selector; a
+/// legacy document without it falls back to the complete device list.
+fn select_cdi_device(mut spec: CdiSpec, gpu_device: &str) -> Result<CdiSpec> {
+    let devices = spec.devices.take().unwrap_or_default();
+    if devices.is_empty() {
+        return Err(NspawnError::Runtime(
+            "NVIDIA CDI document contains no devices".into(),
+        ));
+    }
+
+    if gpu_device == "all" {
+        if let Some(all) = devices.iter().find(|device| device.name == "all") {
+            spec.devices = Some(vec![all.clone()]);
+        } else {
+            log::warn!(
+                "NVIDIA CDI document has no explicit 'all' device; using all device entries"
+            );
+            spec.devices = Some(devices);
+        }
+        return Ok(spec);
+    }
+
+    let selected = devices
+        .into_iter()
+        .find(|device| device.name == gpu_device)
+        .ok_or_else(|| {
+            NspawnError::Runtime(format!(
+                "NVIDIA CDI document does not contain requested device {gpu_device:?}"
+            ))
+        })?;
+    spec.devices = Some(vec![selected]);
+    Ok(spec)
 }
 
 fn validate_cdi_selection(spec: &CdiSpec, gpu_device: &str) -> Result<()> {
@@ -429,6 +682,13 @@ fn validate_cdi_selection(spec: &CdiSpec, gpu_device: &str) -> Result<()> {
             "NVIDIA CDI JSON contains no devices; refusing to replace the current NVIDIA state"
                 .into(),
         ));
+    }
+    // Older toolkit documents may list only concrete devices and omit the
+    // synthetic `all` entry. `select_cdi_device` intentionally projects that
+    // complete set for the all-device request, so non-empty is the correct
+    // post-selection invariant here.
+    if gpu_device == "all" {
+        return Ok(());
     }
     if !devices.iter().any(|device| device.name == gpu_device) {
         return Err(NspawnError::Runtime(format!(
@@ -447,15 +707,58 @@ fn validate_authoritative_state(state: &NvidiaState, gpu_device: &str) -> Result
     Ok(())
 }
 
-/// Perform a comprehensive scan of the host using the official NVIDIA CDI standard.
-pub async fn get_nvidia_state(profile: Option<&NvidiaPassthroughProfile>) -> Result<NvidiaState> {
+pub async fn get_nvidia_state_from(
+    profile: Option<&NvidiaPassthroughProfile>,
+    source: &NvidiaCdiSource,
+) -> Result<NvidiaState> {
     let driver_version = get_host_driver_version().await.unwrap_or_default();
     let gpu_device = profile.map(|p| p.gpu_device.as_str()).unwrap_or("all");
-    let spec = generate_cdi_spec(gpu_device).await?;
+    let full_spec = load_cdi_spec(source).await?;
+    let spec = select_cdi_device(full_spec, gpu_device)?;
+    validate_cdi_selection(&spec, gpu_device)?;
 
     let state = build_nvidia_state(&spec, driver_version, profile).await?;
     validate_authoritative_state(&state, gpu_device)?;
+    validate_host_sources(&state).await?;
     Ok(state)
+}
+
+async fn validate_host_sources(state: &NvidiaState) -> Result<()> {
+    let mut checked = HashSet::new();
+    for bind in &state.binds {
+        if !checked.insert(bind.host_path.clone()) {
+            continue;
+        }
+        let metadata = match tokio::fs::metadata(&bind.host_path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(NspawnError::Runtime(format!(
+                    "NVIDIA CDI host source does not exist: {}",
+                    bind.host_path
+                )))
+            }
+            Err(error) => {
+                return Err(NspawnError::Runtime(format!(
+                    "Cannot inspect NVIDIA CDI host source {}: {error}",
+                    bind.host_path
+                )))
+            }
+        };
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        if metadata.file_type().is_file()
+            || metadata.file_type().is_char_device()
+            || metadata.file_type().is_block_device()
+        {
+            continue;
+        }
+        return Err(NspawnError::Runtime(format!(
+            "NVIDIA CDI host source has unsupported type: {}",
+            bind.host_path
+        )));
+    }
+    Ok(())
 }
 
 async fn build_nvidia_state(
@@ -617,6 +920,23 @@ mod tests {
     }
 
     #[test]
+    fn all_device_selection_accepts_documents_without_a_synthetic_all_entry() {
+        let spec: CdiSpec =
+            serde_json::from_str(r#"{"devices":[{"name":"0"},{"name":"GPU-uuid"}]}"#).unwrap();
+        let selected = select_cdi_device(spec, "all").unwrap();
+        assert!(validate_cdi_selection(&selected, "all").is_ok());
+        assert_eq!(
+            selected
+                .devices
+                .unwrap()
+                .into_iter()
+                .map(|device| device.name)
+                .collect::<Vec<_>>(),
+            vec!["0", "GPU-uuid"]
+        );
+    }
+
+    #[test]
     fn authoritative_nvidia_state_requires_usable_binds() {
         let empty = NvidiaState::default();
         let error = validate_authoritative_state(&empty, "all").unwrap_err();
@@ -634,10 +954,26 @@ mod tests {
     }
 
     #[test]
-    fn generated_cdi_json_parser_accepts_multiple_specs_and_uses_the_full_spec() {
-        let content = br#"{"devices":[{"name":"all"}]} {"devices":[{"name":"stale"}]}"#;
-        let spec = parse_generated_cdi_json(content).unwrap();
-        assert_eq!(spec.devices.unwrap()[0].name, "all");
+    fn generated_cdi_json_parser_selects_the_nvidia_document() {
+        let content = br#"{"cdiVersion":"0.5.0","kind":"vendor.example/device","devices":[{"name":"ignored"}]} {"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"all"}]}"#;
+        let document = parse_generated_cdi_json(content).unwrap();
+        assert_eq!(document.devices.unwrap()[0].name, "all");
+    }
+
+    #[test]
+    fn generated_cdi_json_parser_accepts_an_array_document() {
+        let content =
+            br#"[{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"all"}]}]"#;
+        assert_eq!(
+            parse_generated_cdi_json(content).unwrap().devices.unwrap()[0].name,
+            "all"
+        );
+    }
+
+    #[test]
+    fn generated_cdi_json_parser_rejects_ambiguous_nvidia_documents() {
+        let content = br#"{"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"all"}]} {"cdiVersion":"0.5.0","kind":"nvidia.com/gpu","devices":[{"name":"stale"}]}"#;
+        assert!(parse_generated_cdi_json(content).is_err());
     }
 
     #[test]
@@ -645,6 +981,101 @@ mod tests {
         assert!(parse_generated_cdi_json(br"not-json").is_err());
         assert!(parse_generated_cdi_json(b" ").is_err());
         assert!(parse_generated_cdi_json(br#"{"devices":[]} trailing"#).is_err());
+    }
+
+    #[test]
+    fn reference_yaml_uses_the_same_projection_and_hook_translation() {
+        let content = include_bytes!("../../../../docs/reference-nvidia-ctk-cdi.yaml");
+        let document = parse_cdi_yaml(content).expect("reference CDI YAML should parse");
+        validate_cdi_document(&document).unwrap();
+        let full = document.into_spec();
+        assert_eq!(
+            devices_from_spec(&full),
+            vec![
+                "all".to_string(),
+                "0".to_string(),
+                "GPU-182ac723-33e8-575e-bc65-ed6ebd99ed52".to_string()
+            ]
+        );
+
+        let selected = select_cdi_device(full, "0").unwrap();
+        let (_, hooks, _) = collect_cdi_edits(&selected);
+        let symlinks = classify::parse_symlink_hooks(&hooks);
+        let ldcache = classify::parse_ldcache_folders(&hooks);
+        assert!(!symlinks.is_empty());
+        assert!(!ldcache.is_empty());
+        assert!(selected
+            .devices
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|device| device.name == "0"));
+    }
+
+    #[test]
+    fn selecting_all_prefers_the_explicit_all_entry() {
+        let spec: CdiSpec = serde_json::from_str(
+            r#"{
+                "containerEdits":{"deviceNodes":[{"path":"/dev/common"}]},
+                "devices":[
+                    {"name":"0","containerEdits":{"deviceNodes":[{"path":"/dev/zero-gpu"}]}},
+                    {"name":"all","containerEdits":{"deviceNodes":[{"path":"/dev/all-gpu"}]}}
+                ]
+            }"#,
+        )
+        .unwrap();
+        let projected = select_cdi_device(spec, "all").unwrap();
+        let (_, _, nodes) = collect_cdi_edits(&projected);
+        let paths = nodes.into_iter().map(|node| node.path).collect::<Vec<_>>();
+        assert!(paths.contains(&"/dev/common".to_string()));
+        assert!(paths.contains(&"/dev/all-gpu".to_string()));
+        assert!(!paths.contains(&"/dev/zero-gpu".to_string()));
+    }
+
+    #[tokio::test]
+    async fn existing_cdi_file_is_bounded_and_parsed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nvidia.yaml");
+        tokio::fs::write(
+            &path,
+            "cdiVersion: '0.7.0'\nkind: nvidia.com/gpu\ndevices:\n  - name: all\n    containerEdits:\n      deviceNodes:\n        - path: /dev/nvidia0\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let document = read_cdi_document(&path).await.unwrap();
+        validate_cdi_document(&document).unwrap();
+        assert_eq!(document.devices.unwrap()[0].name, "all");
+    }
+
+    #[tokio::test]
+    async fn existing_cdi_file_rejects_content_over_the_bound() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("nvidia.yaml");
+        tokio::fs::write(&path, vec![b'x'; MAX_CDI_DOCUMENT_BYTES + 1])
+            .await
+            .unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .unwrap();
+        let error = read_cdi_document(&path).await.unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[tokio::test]
+    async fn host_source_validation_rejects_missing_paths() {
+        let state = NvidiaState {
+            binds: vec![PassthroughBind {
+                host_path: "/definitely/missing/lasper-nvidia-source".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let error = validate_host_sources(&state).await.unwrap_err();
+        assert!(error.to_string().contains("does not exist"));
     }
 
     #[test]

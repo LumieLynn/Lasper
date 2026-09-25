@@ -542,7 +542,7 @@ pub struct PassthroughState {
     pub gpu_passthrough_all: bool,
     pub discovered_gpus: Vec<HostGpuDevice>,
     pub nvidia_gpu: bool,
-    pub nvidia_toolkit_installed: bool,
+    pub nvidia_cdi_available: bool,
     pub selected_gpu_nodes: Vec<String>,
     pub wayland_sockets: Vec<HostWaylandSocket>,
     pub x11_sockets: Vec<HostX11Socket>,
@@ -569,7 +569,7 @@ impl PassthroughState {
             private_users: self.private_users,
             graphics_acceleration: self.graphics_acceleration,
             gpu_passthrough_all: self.gpu_passthrough_all,
-            nvidia_gpu: self.nvidia_gpu && self.nvidia_toolkit_installed,
+            nvidia_gpu: self.nvidia_gpu && self.nvidia_cdi_available,
             nvidia_profile: if self.nvidia_gpu {
                 let manual_classifications: Vec<crate::domain::nvidia::ManualClassification> = self
                     .unclassified_files
@@ -613,6 +613,7 @@ pub struct WizardDraft {
     pub entries: Vec<MachineEntry>,
     pub images: Vec<ImageEntry>,
     pub host: ProvisioningHostSnapshot,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
 }
 
 impl WizardDraft {
@@ -626,6 +627,7 @@ impl WizardDraft {
         let discovered_gpus = vec![];
         let nvidia_available_devices = vec!["all".to_string()];
         let active_nvidia_categories = vec![];
+        let nvidia_cdi_source = config.nvidia.source();
         let (profiles, default_profiles, default_method, default_profile) =
             Self::configured_profiles(&config);
         let default_kind =
@@ -731,7 +733,7 @@ impl WizardDraft {
                 gpu_passthrough_all: false,
                 discovered_gpus,
                 nvidia_gpu: false,
-                nvidia_toolkit_installed: host.nvidia_toolkit_installed,
+                nvidia_cdi_available: host.nvidia_cdi_available,
                 selected_gpu_nodes: vec![],
                 wayland_sockets: host.wayland_sockets.clone(),
                 x11_sockets: vec![],
@@ -748,6 +750,7 @@ impl WizardDraft {
             entries,
             images,
             host,
+            nvidia_cdi_source,
         }
     }
 
@@ -796,6 +799,7 @@ impl WizardDraft {
                 source,
                 storage: DeploymentStorage::Directory,
                 nvidia_profile: None,
+                nvidia_cdi_source: self.nvidia_cdi_source.clone(),
                 wayland: Vec::new(),
                 allow_unsafe_remote_tar: false,
             };
@@ -861,6 +865,7 @@ impl WizardDraft {
             source,
             storage,
             nvidia_profile: passthrough.nvidia_profile,
+            nvidia_cdi_source: self.nvidia_cdi_source.clone(),
             wayland,
             allow_unsafe_remote_tar: self.source.unsafe_remote_tar_accepted(),
         }
@@ -1287,7 +1292,7 @@ mod tests {
             gpu_passthrough_all: true,
             discovered_gpus: vec![],
             nvidia_gpu: true,
-            nvidia_toolkit_installed: true,
+            nvidia_cdi_available: true,
             selected_gpu_nodes: vec![],
             wayland_sockets: vec![],
             x11_sockets: vec![],
@@ -1305,10 +1310,10 @@ mod tests {
         let cfg = state.extract_config();
         assert!(cfg.gpu_passthrough_all);
 
-        // Nvidia GPU only if toolkit installed
-        let mut state_no_toolkit = state.clone();
-        state_no_toolkit.nvidia_toolkit_installed = false;
-        let cfg = state_no_toolkit.extract_config();
+        // NVIDIA GPU is available only when the configured CDI source is present.
+        let mut state_no_cdi_source = state.clone();
+        state_no_cdi_source.nvidia_cdi_available = false;
+        let cfg = state_no_cdi_source.extract_config();
         assert!(!cfg.nvidia_gpu);
     }
 

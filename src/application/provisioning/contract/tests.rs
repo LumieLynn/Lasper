@@ -47,6 +47,7 @@ fn wayland_target_must_belong_to_the_deployment_user_set() {
         },
         storage: DeploymentStorage::Directory,
         nvidia_profile: None,
+        nvidia_cdi_source: Default::default(),
         wayland: vec![wayland_intent("bob")],
         allow_unsafe_remote_tar: false,
     };
@@ -74,6 +75,7 @@ fn wayland_target_must_request_the_host_session_uid() {
         },
         storage: DeploymentStorage::Directory,
         nvidia_profile: None,
+        nvidia_cdi_source: Default::default(),
         wayland: vec![wayland_intent("alice")],
         allow_unsafe_remote_tar: false,
     };
@@ -110,6 +112,7 @@ fn wayland_grant_rejects_sources_that_skip_rootfs_configuration() {
             source,
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            nvidia_cdi_source: Default::default(),
             wayland: vec![wayland_intent("alice")],
             allow_unsafe_remote_tar: false,
         };
@@ -139,6 +142,7 @@ fn request_debug_and_serializable_config_contain_no_passwords() {
         },
         storage: DeploymentStorage::Directory,
         nvidia_profile: None,
+        nvidia_cdi_source: Default::default(),
         wayland: Vec::new(),
         allow_unsafe_remote_tar: false,
     };
@@ -148,6 +152,66 @@ fn request_debug_and_serializable_config_contain_no_passwords() {
     assert!(!debug.contains("root-secret"));
     assert!(!debug.contains("user-secret"));
     assert!(!json.contains("password"));
+
+    let request_json = serde_json::to_value(&request).unwrap();
+    assert!(request_json.get("nvidia_cdi_source").is_none());
+    let decoded: DeploymentRequest = serde_json::from_value(request_json).unwrap();
+    assert_eq!(
+        decoded.nvidia_cdi_source,
+        crate::domain::nvidia::NvidiaCdiSource::Generate
+    );
+}
+
+#[test]
+fn request_rejects_a_relative_existing_cdi_path() {
+    let request = DeploymentRequest {
+        config: MachineProvisioningConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        source: DeploymentSource::Copy {
+            source_name: "base".into(),
+        },
+        storage: DeploymentStorage::Directory,
+        nvidia_profile: None,
+        nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource::existing(Some(
+            "relative/nvidia.yaml".into(),
+        )),
+        wayland: Vec::new(),
+        allow_unsafe_remote_tar: false,
+    };
+
+    assert!(request
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("must be absolute"));
+}
+
+#[test]
+fn request_serializes_an_explicit_existing_cdi_source_for_the_daemon() {
+    let request = DeploymentRequest {
+        config: MachineProvisioningConfig {
+            name: "test".into(),
+            ..Default::default()
+        },
+        source: DeploymentSource::Copy {
+            source_name: "base".into(),
+        },
+        storage: DeploymentStorage::Directory,
+        nvidia_profile: None,
+        nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource::existing(Some(
+            "/var/run/cdi/nvidia.yaml".into(),
+        )),
+        wayland: Vec::new(),
+        allow_unsafe_remote_tar: false,
+    };
+    let value = serde_json::to_value(&request).unwrap();
+    assert_eq!(value["nvidia_cdi_source"]["mode"], "existing");
+    assert_eq!(
+        value["nvidia_cdi_source"]["path"],
+        "/var/run/cdi/nvidia.yaml"
+    );
 }
 
 #[test]
@@ -166,6 +230,7 @@ fn submission_debug_redacts_all_secrets() {
         },
         storage: DeploymentStorage::Directory,
         nvidia_profile: None,
+        nvidia_cdi_source: Default::default(),
         wayland: Vec::new(),
         allow_unsafe_remote_tar: false,
     };
@@ -196,6 +261,7 @@ fn sources_without_rootfs_configuration_reject_account_secrets() {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            nvidia_cdi_source: Default::default(),
             wayland: Vec::new(),
             allow_unsafe_remote_tar: false,
         },

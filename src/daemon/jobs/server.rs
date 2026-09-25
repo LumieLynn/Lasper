@@ -1013,6 +1013,7 @@ mod tests {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            nvidia_cdi_source: Default::default(),
             wayland: Vec::new(),
             allow_unsafe_remote_tar: false,
         })

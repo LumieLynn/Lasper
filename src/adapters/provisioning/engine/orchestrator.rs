@@ -21,6 +21,7 @@ pub(crate) async fn run_deployment(
     name: String,
     cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,
     secrets: DeploymentSecrets,
@@ -33,6 +34,7 @@ pub(crate) async fn run_deployment(
         name.clone(),
         cfg,
         nvidia_profile,
+        nvidia_cdi_source,
         wayland_intents,
         host,
         secrets,
@@ -70,6 +72,7 @@ async fn run_deploy_internal(
     name: String,
     cfg: MachineProvisioningConfig,
     nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
     wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
     host: DirectProvisioningCapabilities,
     mut secrets: DeploymentSecrets,
@@ -348,8 +351,9 @@ async fn run_deploy_internal(
 
             // Run initial CDI discovery to seed the .nspawn config and state.
             // Remapping is applied inside get_nvidia_state after CDI + ldconfig collection.
-            let state = crate::adapters::platform::nvidia::get_nvidia_state(
+            let state = crate::adapters::platform::nvidia::get_nvidia_state_from(
                 nvidia_profile.as_ref(),
+                &nvidia_cdi_source,
             )
             .await
             .map_err(|error| {

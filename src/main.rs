@@ -201,8 +201,11 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     // 5. Compose and run the application. Terminal ownership stays inside
     // the TUI launcher so a future CLI entry point can bypass it entirely.
     let log_buffer_lines = app_settings.log_buffer_lines;
-    let services =
-        crate::composition::compose_application_services(composition_mode, want_systemd_tools);
+    let services = crate::composition::compose_application_services(
+        composition_mode,
+        want_systemd_tools,
+        app_config.nvidia.source(),
+    );
     match services.x11_access.reconcile().await {
         Ok(reports) => {
             for report in reports {

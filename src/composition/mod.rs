@@ -78,6 +78,7 @@ pub(crate) fn compose_process_shell_services(
 pub(crate) fn compose_application_services(
     mode: CompositionMode,
     systemd_tools: bool,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
 ) -> ApplicationServices {
     let level = mode.permission_level();
     let daemon = mode.daemon().cloned();
@@ -243,6 +244,7 @@ pub(crate) fn compose_application_services(
             nspawn: nspawn.clone(),
             systemd_unit: systemd_unit.clone(),
             nvidia_state: nvidia_state.clone(),
+            nvidia_cdi_source: nvidia_cdi_source.clone(),
             rootfs,
         },
     );
@@ -252,7 +254,7 @@ pub(crate) fn compose_application_services(
         Arc::clone(&runtime),
     );
     let provisioning_preparation =
-        crate::adapters::provisioning::compose_provisioning_preparation_service();
+        crate::adapters::provisioning::compose_provisioning_preparation_service(nvidia_cdi_source);
     let x11_endpoints = compose_x11_endpoint_discovery();
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
         Arc::new(crate::adapters::session::X11ProjectionAdapter::new(

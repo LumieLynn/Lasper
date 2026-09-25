@@ -1,6 +1,6 @@
 use crate::domain::bootstrap::BootstrapSpec;
 use crate::domain::machine::{GuestHostname, MachineName};
-use crate::domain::nvidia::NvidiaPassthroughProfile;
+use crate::domain::nvidia::{NvidiaCdiSource, NvidiaPassthroughProfile};
 use crate::domain::provisioning::OciNetworkMode;
 use crate::domain::source::ArtifactSpec;
 use crate::domain::storage::DiskImageConfig;
@@ -51,12 +51,17 @@ pub struct DeploymentRequest {
     pub source: DeploymentSource,
     pub storage: DeploymentStorage,
     pub nvidia_profile: Option<NvidiaPassthroughProfile>,
+    #[serde(default, skip_serializing_if = "NvidiaCdiSource::is_generate")]
+    pub nvidia_cdi_source: NvidiaCdiSource,
     pub wayland: Vec<WaylandGrantIntent>,
     pub allow_unsafe_remote_tar: bool,
 }
 
 impl DeploymentRequest {
     pub(crate) fn validate(&self) -> Result<(), super::job::DeploymentError> {
+        self.nvidia_cdi_source
+            .validate()
+            .map_err(super::job::DeploymentError::rejected)?;
         let machine = MachineName::new(self.config.name.clone())
             .map_err(|error| super::job::DeploymentError::rejected(error.to_string()))?;
         GuestHostname::resolve(&self.config.guest_hostname, &machine)

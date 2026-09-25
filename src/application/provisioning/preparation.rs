@@ -65,7 +65,7 @@ pub struct ProvisioningHostSnapshot {
     pub preferred_wayland_display: Option<WaylandDisplay>,
     pub x11_sockets: Vec<HostX11Socket>,
     pub preferred_x11_display: Option<u16>,
-    pub nvidia_toolkit_installed: bool,
+    pub nvidia_cdi_available: bool,
 }
 
 impl Default for ProvisioningHostSnapshot {
@@ -89,7 +89,7 @@ impl Default for ProvisioningHostSnapshot {
             preferred_wayland_display: None,
             x11_sockets: Vec::new(),
             preferred_x11_display: None,
-            nvidia_toolkit_installed: false,
+            nvidia_cdi_available: false,
         }
     }
 }

@@ -2,6 +2,60 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+/// How Lasper obtains the NVIDIA CDI document used for one operation.
+///
+/// This is carried in deployment requests so direct and elevated execution
+/// consume the same input policy. Existing state files deliberately store the
+/// resulting projection rather than treating this acquisition choice as part
+/// of the container's persistent NVIDIA profile.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NvidiaCdiSource {
+    #[default]
+    Generate,
+    Existing {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
+    },
+}
+
+impl NvidiaCdiSource {
+    pub fn existing(path: Option<PathBuf>) -> Self {
+        Self::Existing { path }
+    }
+
+    pub fn explicit_path(&self) -> Option<&Path> {
+        match self {
+            Self::Generate => None,
+            Self::Existing { path } => path.as_deref(),
+        }
+    }
+
+    pub fn is_generate(&self) -> bool {
+        matches!(self, Self::Generate)
+    }
+
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::Generate => "nvidia-ctk generated CDI",
+            Self::Existing { .. } => "existing NVIDIA CDI file",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(path) = self.explicit_path() {
+            if !path.is_absolute() {
+                return Err("the NVIDIA CDI file path must be absolute".into());
+            }
+            if path.as_os_str().is_empty() {
+                return Err("the NVIDIA CDI file path cannot be empty".into());
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum NvidiaFileCategory {

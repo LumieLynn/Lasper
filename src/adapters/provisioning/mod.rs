@@ -44,10 +44,11 @@ struct ProvisioningPorts {
 }
 
 pub(crate) fn compose_provisioning_preparation_service(
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
 ) -> Arc<crate::application::provisioning::ProvisioningPreparationService> {
     Arc::new(
         crate::application::provisioning::ProvisioningPreparationService::new(Arc::new(
-            preparation::NspawnProvisioningPreparation,
+            preparation::NspawnProvisioningPreparation::new(nvidia_cdi_source),
         )),
     )
 }

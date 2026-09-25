@@ -7,6 +7,6 @@ pub mod lifecycle;
 pub mod resolve;
 pub mod state;
 
-pub use discovery::{get_nvidia_state, nvidia_ctk_available};
+pub(crate) use discovery::get_nvidia_state_from;
 pub use lifecycle::ensure_gpu_passthrough;
 pub use state::{NvidiaState, NvidiaStateStore};

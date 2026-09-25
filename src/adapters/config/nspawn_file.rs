@@ -36,6 +36,7 @@ pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
     path.replace('\\', "\\\\").replace(':', "\\:")
 }
 
+#[cfg(test)]
 pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
     let fields = parse_nspawn_bind_fields(value)?;
     let source = fields.first()?.trim().to_string();
@@ -51,7 +52,7 @@ pub(crate) fn parse_nspawn_bind_paths(value: &str) -> Option<(String, String)> {
     Some((source, destination))
 }
 
-pub(super) fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
+pub(crate) fn parse_nspawn_bind_fields(value: &str) -> Option<Vec<String>> {
     let mut fields = vec![String::new()];
     let mut chars = value.chars().peekable();
     while let Some(character) = chars.next() {

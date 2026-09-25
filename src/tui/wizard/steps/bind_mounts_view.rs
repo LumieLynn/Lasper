@@ -50,7 +50,7 @@ pub struct BindMountsStepView {
     nvidia_unavailable: TextBlock,
     nvidia_enabled: bool,
     nvidia_mode: NvidiaPassthroughMode,
-    nvidia_toolkit_installed: bool,
+    nvidia_cdi_available: bool,
     focus: FocusTracker,
 }
 
@@ -58,9 +58,9 @@ impl BindMountsStepView {
     pub fn new(
         initial_data: &PassthroughConfig,
         unclassified_files: &[UnclassifiedFile],
-        nvidia_toolkit_installed: bool,
+        nvidia_cdi_available: bool,
     ) -> Self {
-        let nvidia_enabled = initial_data.nvidia_gpu && nvidia_toolkit_installed;
+        let nvidia_enabled = initial_data.nvidia_gpu && nvidia_cdi_available;
         let nvidia_mode = initial_data
             .nvidia_profile
             .as_ref()
@@ -113,14 +113,14 @@ impl BindMountsStepView {
             bind_list,
             unclassified_list,
             nvidia_toggle: Checkbox::new(NVIDIA_TOGGLE_LABEL, nvidia_enabled)
-                .with_enabled(nvidia_toolkit_installed),
+                .with_enabled(nvidia_cdi_available),
             nvidia_unavailable: TextBlock::new(
-                " NVIDIA TOOLKIT REQUIRED ",
-                "nvidia-container-toolkit is not installed on this host.",
+                " NVIDIA CDI SOURCE REQUIRED ",
+                "The configured NVIDIA CDI source is unavailable on this host.",
             ),
             nvidia_enabled,
             nvidia_mode,
-            nvidia_toolkit_installed,
+            nvidia_cdi_available,
             focus: FocusTracker::new(),
         };
 
@@ -146,7 +146,7 @@ impl Component for BindMountsStepView {
             .required_height(area.width.saturating_sub(2));
 
         let mut constraints = vec![Constraint::Length(3)]; // NVIDIA toggle
-        if !self.nvidia_toolkit_installed {
+        if !self.nvidia_cdi_available {
             constraints.push(Constraint::Length(unavailable_height));
         }
         if has_uc {
@@ -165,7 +165,7 @@ impl Component for BindMountsStepView {
         self.nvidia_toggle.render(f, chunks[0]);
 
         let mut next = 1;
-        if !self.nvidia_toolkit_installed {
+        if !self.nvidia_cdi_available {
             self.nvidia_unavailable.render(f, chunks[next]);
             next += 1;
         }
@@ -175,7 +175,7 @@ impl Component for BindMountsStepView {
         }
         self.bind_list.render(f, chunks[next]);
 
-        let footer = if self.nvidia_toolkit_installed {
+        let footer = if self.nvidia_cdi_available {
             " [Tab] switch focus, [Space] toggle NVIDIA, [A]dd/[E]dit/[D]elete, [Enter] next "
         } else {
             " [Tab] switch focus, [A]dd/[E]dit/[D]elete, [Enter] next "
@@ -266,7 +266,7 @@ impl StepComponent for BindMountsStepView {
                 self.nvidia_enabled = true;
                 self.nvidia_mode = result.mode.clone();
                 self.nvidia_toggle = Checkbox::new(NVIDIA_TOGGLE_LABEL, true)
-                    .with_enabled(self.nvidia_toolkit_installed);
+                    .with_enabled(self.nvidia_cdi_available);
                 if self.has_unclassified() {
                     self.focus.active_idx = 1;
                 }
@@ -281,7 +281,7 @@ impl StepComponent for BindMountsStepView {
             AppMessage::Wizard(WizardMessage::DialogCancel) => {
                 if !self.nvidia_enabled {
                     self.nvidia_toggle = Checkbox::new(NVIDIA_TOGGLE_LABEL, false)
-                        .with_enabled(self.nvidia_toolkit_installed);
+                        .with_enabled(self.nvidia_cdi_available);
                 }
                 StepAction::CloseDialog
             }
@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_nvidia_toolkit_disables_and_explains_passthrough() {
+    fn missing_nvidia_cdi_source_disables_and_explains_passthrough() {
         crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
         let mut view = BindMountsStepView::new(&passthrough_config(true), &[], false);
         assert!(!view.nvidia_enabled);
@@ -341,7 +341,7 @@ mod tests {
             .join("\n");
 
         assert!(rendered.contains("NVIDIA GPU Passthrough"));
-        assert!(rendered.contains("nvidia-container-toolkit is not installed"));
+        assert!(rendered.contains("NVIDIA CDI SOURCE"));
         assert!(!rendered.contains("toggle NVIDIA"));
     }
 }

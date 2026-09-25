@@ -31,6 +31,7 @@ pub(crate) struct MachineLifecycleAdapters {
     pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
     pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
     pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    pub(crate) nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
     pub(crate) rootfs: crate::adapters::rootfs::RootfsStore,
 }
 
@@ -55,6 +56,7 @@ pub(crate) fn compose_machine_lifecycle(
         nspawn,
         systemd_unit,
         nvidia_state,
+        nvidia_cdi_source,
         rootfs,
     } = adapters;
     let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
@@ -75,6 +77,7 @@ pub(crate) fn compose_machine_lifecycle(
         nspawn,
         systemd_unit,
         nvidia_state,
+        nvidia_cdi_source,
         rootfs,
         system_operations,
         runtime: runtime.clone(),
@@ -391,6 +394,7 @@ struct StoreStartPreparation {
     nspawn: crate::adapters::config::NspawnConfigStore,
     systemd_unit: crate::adapters::config::SystemdUnitStore,
     nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
     rootfs: crate::adapters::rootfs::RootfsStore,
     system_operations: SystemOperationStore,
     runtime: Arc<RuntimeCatalog>,
@@ -405,6 +409,7 @@ impl MachineStartPreparation for StoreStartPreparation {
             &self.systemd_unit,
             &self.nvidia_state,
             &self.rootfs,
+            &self.nvidia_cdi_source,
         )
         .await;
         self.runtime.invalidate();

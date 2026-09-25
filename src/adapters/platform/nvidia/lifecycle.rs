@@ -1,4 +1,4 @@
-use super::discovery::get_nvidia_state;
+use super::discovery::get_nvidia_state_from;
 use super::state::{calculate_death_list, calculate_removed_binds, NvidiaState};
 use crate::adapters::config::nspawn_file::NspawnConfig;
 use crate::adapters::error::Result;
@@ -60,18 +60,28 @@ fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
         if !inside {
             continue;
         }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
         if let Some(val) = trimmed.strip_prefix("BindReadOnly=") {
-            if let Some((host, container)) =
-                crate::adapters::config::nspawn_file::parse_nspawn_bind_paths(val)
-            {
-                file_binds.insert((host, container, true));
+            let Some((host, container)) = parse_managed_bind(val) else {
+                return false;
+            };
+            if !file_binds.insert((host, container, true)) {
+                return false;
             }
         } else if let Some(val) = trimmed.strip_prefix("Bind=") {
-            if let Some((host, container)) =
-                crate::adapters::config::nspawn_file::parse_nspawn_bind_paths(val)
-            {
-                file_binds.insert((host, container, false));
+            let Some((host, container)) = parse_managed_bind(val) else {
+                return false;
+            };
+            if !file_binds.insert((host, container, false)) {
+                return false;
             }
+        } else {
+            // The managed block is intentionally a typed projection.  An
+            // unknown directive here means the state cannot be compared
+            // safely and must be rebuilt rather than partially preserved.
+            return false;
         }
     }
 
@@ -81,7 +91,24 @@ fn marker_binds_match_state(content: &str, state: &NvidiaState) -> bool {
         .map(|b| (b.host_path.clone(), b.container_path.clone(), b.readonly))
         .collect();
 
-    complete && !inside && file_binds == state_binds
+    complete && !inside && state_binds.len() == state.binds.len() && file_binds == state_binds
+}
+
+fn parse_managed_bind(value: &str) -> Option<(String, String)> {
+    let fields = crate::adapters::config::nspawn_file::parse_nspawn_bind_fields(value.trim())?;
+    if fields.is_empty() || fields.len() > 2 {
+        return None;
+    }
+    let host = fields.first()?.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let container = fields
+        .get(1)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(host);
+    Some((host.to_string(), container.to_string()))
 }
 
 async fn inject_persistent_device_allow(
@@ -142,6 +169,7 @@ pub async fn ensure_gpu_passthrough(
     systemd_unit: &crate::adapters::config::SystemdUnitStore,
     state_store: &crate::adapters::platform::nvidia::NvidiaStateStore,
     rootfs: &crate::adapters::rootfs::RootfsStore,
+    cdi_source: &crate::domain::nvidia::NvidiaCdiSource,
 ) -> Result<()> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
     let config = match nspawn.read(name).await? {
@@ -161,12 +189,24 @@ pub async fn ensure_gpu_passthrough(
     // 2. Load old state and profile, then scan host
     log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
 
-    let external_cache = state_store.read(name).await?.unwrap_or_default();
+    let persisted_state = state_store.read(name).await?;
+    let external_cache = persisted_state.clone().unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
+
+    // Check the persisted projection independently of the fresh host scan.
+    // This keeps a hand-edited or partially-written `.nspawn` visible in the
+    // lifecycle log and ensures the later fast path can only accept an exact
+    // managed block, including duplicate/unknown entries checks.
+    if persisted_state.is_some() && !marker_binds_match_state(&config.content, &external_cache) {
+        log::info!(
+            "NVIDIA state and managed .nspawn projection differ for {}; scheduling reconciliation",
+            name
+        );
+    }
 
     // Discovery and snapshot validation are fail-closed. No rootfs, config,
     // unit, or state mutation may move above this boundary.
-    let host_state = get_nvidia_state(Some(&profile)).await?;
+    let host_state = get_nvidia_state_from(Some(&profile), cdi_source).await?;
 
     log_step!(
         name,
@@ -180,7 +220,7 @@ pub async fn ensure_gpu_passthrough(
     // 3. Compare old vs new state
     let old_state = external_cache.clone();
 
-    if old_state == host_state && !old_state.driver_version.is_empty() {
+    if old_state.same_payload(&host_state) && !old_state.driver_version.is_empty() {
         // State matches — verify .nspawn markers exist and have content.
         if config
             .content
@@ -300,6 +340,37 @@ X-Lasper-Nvidia-End=true
 ";
 
         assert!(marker_binds_match_state(content, &state));
+    }
+
+    #[test]
+    fn marker_match_rejects_unknown_directives_and_duplicate_binds() {
+        let state = NvidiaState {
+            binds: vec![crate::adapters::platform::nvidia::state::PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let unknown = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nTemporary=yes\nX-Lasper-Nvidia-End=true\n";
+        assert!(!marker_binds_match_state(unknown, &state));
+
+        let duplicate = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nBind=/dev/nvidia0\nX-Lasper-Nvidia-End=true\n";
+        assert!(!marker_binds_match_state(duplicate, &state));
+    }
+
+    #[test]
+    fn marker_match_rejects_bind_options_not_owned_by_the_projection() {
+        let state = NvidiaState {
+            binds: vec![crate::adapters::platform::nvidia::state::PassthroughBind {
+                host_path: "/dev/nvidia0".into(),
+                container_path: "/dev/nvidia0".into(),
+                readonly: false,
+            }],
+            ..Default::default()
+        };
+        let content = "[Files]\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0:/dev/nvidia0:idmap\nX-Lasper-Nvidia-End=true\n";
+        assert!(!marker_binds_match_state(content, &state));
     }
 
     #[test]

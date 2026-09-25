@@ -6,6 +6,7 @@
 use crate::domain::bootstrap::{
     DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
+use crate::domain::nvidia::NvidiaCdiSource;
 use crate::domain::source::{ArtifactSpec, BootstrapMethod};
 use crate::tui::theme::PartialTheme;
 use std::collections::BTreeMap;
@@ -49,7 +50,45 @@ pub struct AppConfig {
     /// `Some(PartialTheme::default())` when `[theme]` is present but empty.
     pub theme: Option<PartialTheme>,
     pub settings: AppSettings,
+    pub nvidia: NvidiaSettings,
     pub bootstrap: BootstrapSettings,
+}
+
+/// NVIDIA CDI acquisition policy used by discovery, deployment, and machine
+/// start reconciliation.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NvidiaSettings {
+    #[serde(rename = "cdi-source")]
+    pub cdi_source: NvidiaCdiSourceMode,
+    #[serde(rename = "cdi-file")]
+    pub cdi_file: Option<PathBuf>,
+}
+
+impl NvidiaSettings {
+    pub fn source(&self) -> NvidiaCdiSource {
+        match self.cdi_source {
+            NvidiaCdiSourceMode::Generate => NvidiaCdiSource::Generate,
+            NvidiaCdiSourceMode::Existing => NvidiaCdiSource::existing(self.cdi_file.clone()),
+        }
+    }
+}
+
+impl Default for NvidiaSettings {
+    fn default() -> Self {
+        Self {
+            cdi_source: NvidiaCdiSourceMode::Generate,
+            cdi_file: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NvidiaCdiSourceMode {
+    #[default]
+    Generate,
+    Existing,
 }
 
 /// Typed rootfs source methods and profiles used to preconfigure the wizard.
@@ -266,6 +305,27 @@ mod tests {
             }
         }
         assert!(!AppSettings::default().systemd_tools);
+    }
+
+    #[test]
+    fn nvidia_cdi_source_defaults_to_generation_and_accepts_existing_files() {
+        assert_eq!(
+            AppConfig::default().nvidia.source(),
+            NvidiaCdiSource::Generate
+        );
+
+        let config: AppConfig = toml::from_str(
+            r#"
+                [nvidia]
+                cdi-source = "existing"
+                cdi-file = "/var/run/cdi/nvidia.yaml"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.nvidia.source(),
+            NvidiaCdiSource::existing(Some("/var/run/cdi/nvidia.yaml".into()))
+        );
     }
 
     #[test]

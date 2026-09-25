@@ -15,7 +15,7 @@ Lasper provides a guided interface over native systemd resources. It organizes m
 - **Image provisioning**:
   - Pull OCI registry images through `importctl pull-oci` on systemd 260 or newer as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
   - Bootstrap native Debian, Ubuntu, or Arch systems with `debootstrap` or `pacstrap`.
-- **Host Integration**: Allocate NVIDIA GPU devices (requires `nvidia-container-toolkit`) and grant per-user Wayland access.
+- **Host Integration**: Allocate NVIDIA GPU devices from generated or existing CDI data and grant per-user Wayland access.
 - **Storage backends**: Directory, Btrfs subvolume, and raw sparse image support.
 
 ## Status
@@ -35,7 +35,7 @@ Optional:
 - systemd 260 or newer for OCI application images through `importctl pull-oci`.
 - `debootstrap` and/or `pacstrap` for native Debian, Ubuntu, or Arch image support.
 - GNU tar 1.35 or newer for tar rootfs imports. Older versions remain usable with a security warning.
-- `nvidia-container-toolkit` for NVIDIA GPU passthrough.
+- `nvidia-container-toolkit` for generated NVIDIA GPU discovery, or an existing host NVIDIA CDI document selected in `lasper.toml`.
 
 ## Security and caveats
 
@@ -75,6 +75,7 @@ The configuration is typed and can control:
 
 - startup and communication behavior, including `elevate`, `systemd-tools`, journal `log-buffer-lines`, and terminal `scrollback-lines` limits;
 - bootstrap defaults, named profiles, provider-specific policies, package inheritance, and local artifact paths for `debootstrap`, `pacstrap`, `dnf5`, and artifact imports;
+- NVIDIA CDI acquisition, including generated snapshots or an existing host `nvidia.yaml`/JSON document;
 - TUI colors and semantic status styling through the `[theme]` section.
 
 Command-line flags take precedence over the corresponding settings. Configuration does not add arbitrary executable paths or arbitrary root commands.

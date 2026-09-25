@@ -9,7 +9,15 @@ use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub(crate) struct NspawnProvisioningPreparation;
+pub(crate) struct NspawnProvisioningPreparation {
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
+}
+
+impl NspawnProvisioningPreparation {
+    pub(crate) fn new(nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource) -> Self {
+        Self { nvidia_cdi_source }
+    }
+}
 
 fn filesystem_tool(filesystem: DiskImageFilesystem) -> &'static str {
     match filesystem {
@@ -88,7 +96,11 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             preferred_wayland_display: wayland.preferred_display,
             x11_sockets: x11.sockets,
             preferred_x11_display: x11.preferred_display,
-            nvidia_toolkit_installed: crate::adapters::platform::nvidia::nvidia_ctk_available(),
+            nvidia_cdi_available:
+                crate::adapters::platform::nvidia::discovery::cdi_source_available(
+                    &self.nvidia_cdi_source,
+                )
+                .await,
         })
     }
 
@@ -102,13 +114,26 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 nodes: gpu.nodes,
             })
             .collect();
+        let cdi_available = crate::adapters::platform::nvidia::discovery::cdi_source_available(
+            &self.nvidia_cdi_source,
+        )
+        .await;
         let mut nvidia_devices = Vec::new();
         let mut active_nvidia_categories = Vec::new();
         let mut unclassified_nvidia_files = Vec::new();
         let mut warnings = Vec::new();
 
-        if crate::adapters::platform::nvidia::nvidia_ctk_available() {
-            match crate::adapters::platform::nvidia::discovery::discover_hardware().await {
+        if !cdi_available {
+            warnings.push(format!(
+                "{} is unavailable",
+                self.nvidia_cdi_source.description()
+            ));
+        } else {
+            match crate::adapters::platform::nvidia::discovery::discover_hardware_from(
+                &self.nvidia_cdi_source,
+            )
+            .await
+            {
                 Ok((devices, state)) => {
                     nvidia_devices = devices;
                     active_nvidia_categories =
@@ -367,6 +392,7 @@ mod tests {
             },
             storage: DeploymentStorage::Directory,
             nvidia_profile: None,
+            nvidia_cdi_source: Default::default(),
             wayland: vec![WaylandGrantIntent::new("lumie", vec![source.clone()]).unwrap()],
             allow_unsafe_remote_tar: false,
         }
@@ -374,7 +400,7 @@ mod tests {
 
     #[test]
     fn preview_uses_the_same_wayland_endpoint_and_bind_policy_as_apply() {
-        let adapter = NspawnProvisioningPreparation;
+        let adapter = NspawnProvisioningPreparation::new(Default::default());
         let idmapped = adapter.preview(&request(PrivateUsersMode::Pick));
         assert!(idmapped.contains("Wayland access: wayland-0 -> lumie"));
         assert!(idmapped
@@ -387,7 +413,8 @@ mod tests {
 
     #[test]
     fn preview_reports_unsupported_managed_wayland_policy() {
-        let preview = NspawnProvisioningPreparation.preview(&request(PrivateUsersMode::Managed));
+        let preview = NspawnProvisioningPreparation::new(Default::default())
+            .preview(&request(PrivateUsersMode::Managed));
         assert!(preview.contains("[ERROR:"));
         assert!(preview.contains("not supported with PrivateUsers=managed"));
         assert!(!preview.contains("/run/lasper/wayland/1001/wayland-0:idmap"));
@@ -400,7 +427,7 @@ mod tests {
             source_name: "source-machine".into(),
         };
 
-        let preview = NspawnProvisioningPreparation.preview(&request);
+        let preview = NspawnProvisioningPreparation::new(Default::default()).preview(&request);
 
         assert!(preview.contains("Exact clone"));
         assert!(preview.contains("machine-id"));

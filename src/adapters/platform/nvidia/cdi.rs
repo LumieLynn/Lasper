@@ -1,21 +1,48 @@
 use serde::Deserialize;
 
-// CDI Parsing Structs for industry-standard discovery (ISO/IEC 20248 compliant)
+pub(crate) const NVIDIA_CDI_KIND: &str = "nvidia.com/gpu";
+pub(crate) const MAX_CDI_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Metadata and payload of one CDI document.
+///
+/// CDI files are an external registry, so the metadata is kept separate from
+/// the projection-oriented `CdiSpec` used by the state builder.  This lets the
+/// generated JSON and an administrator-provided YAML document share exactly
+/// the same downstream representation.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CdiDocument {
+    pub(crate) cdi_version: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) container_edits: Option<CdiEdits>,
+    pub(crate) devices: Option<Vec<CdiDevice>>,
+}
+
+impl CdiDocument {
+    pub(crate) fn into_spec(self) -> CdiSpec {
+        CdiSpec {
+            container_edits: self.container_edits,
+            devices: self.devices,
+        }
+    }
+}
+
+// CDI Parsing Structs for industry-standard discovery (ISO/IEC 20248 compliant)
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiSpec {
     pub(crate) container_edits: Option<CdiEdits>,
     pub(crate) devices: Option<Vec<CdiDevice>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiDevice {
     pub(crate) name: String,
     pub(crate) container_edits: Option<CdiEdits>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CdiEdits {
     pub(crate) device_nodes: Option<Vec<CdiDeviceNode>>,

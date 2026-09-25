@@ -85,7 +85,7 @@ pub fn build_view(
         WizardStep::BindMounts => Box::new(bind_mounts_view::BindMountsStepView::new(
             &context.passthrough.extract_config(),
             &context.passthrough.unclassified_files,
-            context.passthrough.nvidia_toolkit_installed,
+            context.passthrough.nvidia_cdi_available,
         )),
 
         WizardStep::Review => Box::new(review_view::ReviewStepView::new(

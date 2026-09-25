@@ -187,6 +187,7 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
             source,
             storage,
             nvidia_profile,
+            nvidia_cdi_source,
             wayland,
             allow_unsafe_remote_tar,
         } = request;
@@ -212,6 +213,7 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
             name,
             config,
             nvidia_profile,
+            nvidia_cdi_source,
             wayland,
             self.host.clone(),
             secrets,
