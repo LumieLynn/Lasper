@@ -16,6 +16,8 @@ mod state;
 mod transport;
 
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
 mod tests;
 
 use std::path::{Path, PathBuf};
@@ -135,7 +137,7 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
     }
 
     async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
-        let has_active_claims = tokio::task::spawn_blocking(state::has_active_claims_sync)
+        let claims_need_activation = tokio::task::spawn_blocking(state::has_unresolved_claims_sync)
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!(
@@ -145,7 +147,7 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
             .map_err(X11DesktopAccessError::new)?;
         activation::synchronize_system_machine_path_activation(
             self.activation_backend,
-            has_active_claims,
+            claims_need_activation,
         )
         .await
         .map_err(X11DesktopAccessError::new)

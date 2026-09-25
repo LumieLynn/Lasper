@@ -109,10 +109,15 @@ pub(super) fn system_machine_registration(machine: &str) -> SystemMachineRegistr
 pub(super) enum MachineClaimObservation {
     Active,
     EndedCandidate,
-    CleanupPending { since_unix_millis: u64 },
+    CleanupPending {
+        since_unix_millis: u64,
+    },
     CleanupReady,
     NeedsReview(String),
-    Unknown(String),
+    /// A failed read in this pass, not an uncertain ACL mutation.
+    Unavailable(String),
+    /// A persisted ACL outcome whose ownership cannot be inferred by retrying.
+    Blocked(String),
 }
 
 pub(super) fn observe_machine_claim(
@@ -121,14 +126,18 @@ pub(super) fn observe_machine_claim(
     registration: SystemMachineRegistration,
     now_unix_millis: u64,
 ) -> Option<MachineClaimObservation> {
-    if !matches!(
-        &claim.phase,
-        MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. }
-    ) {
-        return None;
+    match &claim.phase {
+        MachineClaimPhase::Ended => return None,
+        MachineClaimPhase::NeedsReview { reason } => {
+            return Some(MachineClaimObservation::NeedsReview(reason.clone()));
+        }
+        MachineClaimPhase::Unknown { reason } if !legacy_observation_failure(reason) => {
+            return Some(MachineClaimObservation::Blocked(reason.clone()));
+        }
+        _ => {}
     }
     let Some(current_boot_id) = current_boot_id else {
-        return Some(MachineClaimObservation::Unknown(
+        return Some(MachineClaimObservation::Unavailable(
             "host boot identity is unavailable".into(),
         ));
     };
@@ -137,7 +146,14 @@ pub(super) fn observe_machine_claim(
             "claim belongs to an earlier host boot".into(),
         ));
     }
-    match (&claim.phase, registration) {
+    // Old versions persisted failed observations as Unknown. Re-observe those
+    // claims from the beginning; no absence/grace-period evidence survives an
+    // interrupted observation. Unknown ACL outcomes remain blocked above.
+    let phase = match &claim.phase {
+        MachineClaimPhase::Unknown { .. } => &MachineClaimPhase::Active,
+        phase => phase,
+    };
+    match (phase, registration) {
         (
             MachineClaimPhase::Active,
             SystemMachineRegistration::Present {
@@ -160,9 +176,13 @@ pub(super) fn observe_machine_claim(
                 leader_pid,
                 instance: None,
             },
-        ) if leader_pid == claim.machine_leader_pid => Some(MachineClaimObservation::Unknown(
-            "machine namespace identity is unavailable; cleanup is blocked".into(),
-        )),
+        ) if leader_pid == claim.machine_leader_pid => {
+            // The desktop worker may not read a system machine's namespaces.
+            // A registered name is sufficient to retain an existing claim:
+            // this neither proves instance equality nor authorizes new access.
+            // Cleanup still requires two absent observations with a grace period.
+            Some(MachineClaimObservation::Active)
+        }
         (
             MachineClaimPhase::Active,
             SystemMachineRegistration::Present {
@@ -176,7 +196,7 @@ pub(super) fn observe_machine_claim(
             Some(MachineClaimObservation::EndedCandidate)
         }
         (MachineClaimPhase::Active, SystemMachineRegistration::Unknown(reason)) => {
-            Some(MachineClaimObservation::Unknown(reason))
+            Some(MachineClaimObservation::Unavailable(reason))
         }
         (
             MachineClaimPhase::CleanupPending { .. },
@@ -213,28 +233,63 @@ pub(super) fn observe_machine_claim(
                 since_unix_millis: _,
             },
             SystemMachineRegistration::Unknown(reason),
-        ) => Some(MachineClaimObservation::Unknown(reason)),
+        ) => Some(MachineClaimObservation::Unavailable(reason)),
         _ => None,
     }
 }
 
-pub(super) fn proposed_claim_phase(
-    claim: &ManagedX11MachineClaim,
-    current_boot_id: Option<&str>,
-    registration: SystemMachineRegistration,
-    now_unix_millis: u64,
-) -> Option<MachineClaimPhase> {
-    match observe_machine_claim(claim, current_boot_id, registration, now_unix_millis)? {
-        MachineClaimObservation::Active
-        | MachineClaimObservation::CleanupPending { .. }
-        | MachineClaimObservation::CleanupReady => None,
-        MachineClaimObservation::EndedCandidate => Some(MachineClaimPhase::CleanupPending {
-            since_unix_millis: now_unix_millis,
-        }),
-        MachineClaimObservation::NeedsReview(reason) => {
-            Some(MachineClaimPhase::NeedsReview { reason })
+/// Compatibility for the observation errors that older versions wrote into
+/// Unknown claims. Only known machine-read diagnostics are retryable; arbitrary
+/// reasons, including all ACL mutation failures, must retain their old guard.
+fn legacy_observation_failure(reason: &str) -> bool {
+    matches!(
+        reason,
+        "host boot identity is unavailable"
+            | "machine namespace identity is unavailable; cleanup is blocked"
+    ) || [
+        "system machined runtime path is not a directory: ",
+        "cannot inspect system machined runtime directory ",
+        "system machine registration changed during leader inspection ",
+        "cannot inspect system machine leader ",
+        "cannot inspect system machine instance ",
+        "system machine registration is not a regular file: ",
+        "cannot inspect system machine registration ",
+    ]
+    .iter()
+    .any(|prefix| reason.starts_with(prefix))
+}
+
+impl MachineClaimObservation {
+    pub(super) fn next_phase(
+        &self,
+        claim: &ManagedX11MachineClaim,
+        now_unix_millis: u64,
+    ) -> Option<MachineClaimPhase> {
+        let next = match self {
+            Self::Active | Self::Unavailable(_) => MachineClaimPhase::Active,
+            Self::EndedCandidate => MachineClaimPhase::CleanupPending {
+                since_unix_millis: now_unix_millis,
+            },
+            Self::NeedsReview(reason) => MachineClaimPhase::NeedsReview {
+                reason: reason.clone(),
+            },
+            Self::CleanupPending { .. } | Self::CleanupReady | Self::Blocked(_) => return None,
+        };
+        // A transient read failure blocks this pass only. In particular, reset
+        // any pending timestamp so the next successful absence starts a full
+        // grace period. Never persist the observation as an ACL-outcome Unknown.
+        (next != claim.phase).then_some(next)
+    }
+
+    fn into_reconcile_status(self) -> ReconcileClaimStatus {
+        match self {
+            Self::Active => ReconcileClaimStatus::Active,
+            Self::EndedCandidate | Self::CleanupPending { .. } => ReconcileClaimStatus::Pending,
+            Self::CleanupReady => ReconcileClaimStatus::Ready,
+            Self::NeedsReview(reason) | Self::Unavailable(reason) | Self::Blocked(reason) => {
+                ReconcileClaimStatus::Blocked(reason)
+            }
         }
-        MachineClaimObservation::Unknown(reason) => Some(MachineClaimPhase::Unknown { reason }),
     }
 }
 
@@ -246,11 +301,11 @@ pub(super) fn machine_claim_diagnostics(
     let now = unix_millis().unwrap_or(0);
     for claim in &claims.claims {
         let registration = system_machine_registration(&claim.machine);
-        let proposed = proposed_claim_phase(claim, current_boot_id, registration.clone(), now);
         let Some(observation) = observe_machine_claim(claim, current_boot_id, registration, now)
         else {
             continue;
         };
+        let proposed = observation.next_phase(claim, now);
         let mut detail = match observation {
             MachineClaimObservation::Active => "system machine registration is present".to_owned(),
             MachineClaimObservation::EndedCandidate => {
@@ -264,14 +319,16 @@ pub(super) fn machine_claim_diagnostics(
                     .to_owned()
             }
             MachineClaimObservation::NeedsReview(reason)
-            | MachineClaimObservation::Unknown(reason) => reason,
+            | MachineClaimObservation::Unavailable(reason)
+            | MachineClaimObservation::Blocked(reason) => reason,
         };
         if let Some(phase) = proposed {
             detail.push_str(match phase {
                 MachineClaimPhase::CleanupPending { .. } => "; next state: cleanup pending",
                 MachineClaimPhase::NeedsReview { .. } => "; next state: needs review",
                 MachineClaimPhase::Unknown { .. } => "; next state: unknown",
-                MachineClaimPhase::Active | MachineClaimPhase::Ended => "",
+                MachineClaimPhase::Active => "; next state: active (observation will be retried)",
+                MachineClaimPhase::Ended => "",
             });
         }
         if diagnostics.len() < MAX_GRANT_DIAGNOSTICS {
@@ -284,7 +341,7 @@ pub(super) fn machine_claim_diagnostics(
     diagnostics
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ReconcileClaimStatus {
     Active,
     Pending,
@@ -366,6 +423,27 @@ pub(super) fn mark_claim_phase_sync(
     state.write_claim(&updated)
 }
 
+/// Use one transition path for normal passes, retries of old observations, and
+/// the last machine check before removing an ACL entry. Persistence failures
+/// always block mutation and leave the watcher responsible for the claim.
+pub(super) fn reconcile_claim(
+    state: &X11RuntimeState,
+    claim: &ManagedX11MachineClaim,
+    current_boot_id: &str,
+    registration: SystemMachineRegistration,
+    now: u64,
+) -> Option<ReconcileClaimStatus> {
+    let observation = observe_machine_claim(claim, Some(current_boot_id), registration, now)?;
+    if let Some(phase) = observation.next_phase(claim, now) {
+        if let Err(error) = mark_claim_phase_sync(state, claim, phase) {
+            return Some(ReconcileClaimStatus::Blocked(format!(
+                "could not persist machine claim transition: {error}"
+            )));
+        }
+    }
+    Some(observation.into_reconcile_status())
+}
+
 pub(super) fn mark_record_phase_sync(
     state: &X11RuntimeState,
     record_id: &str,
@@ -424,7 +502,7 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
             .cloned()
             .unwrap_or_else(|| "X11 grant record set is incomplete".into()));
     }
-    if claims.claims.is_empty() {
+    if !super::state::claims_need_activation(&claims, &records)? {
         return Ok(X11ReconcileReport::new(
             socket.display(),
             Vec::new(),
@@ -458,71 +536,42 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
     }
 
     let mut diagnostics = Vec::new();
+    for record in &records.records {
+        if matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded)
+            && claim_key_matches_socket(
+                &ManagedX11GrantKey::from_evidence(record),
+                socket,
+                server_peer_start_time,
+            )
+            && !claims.claims.iter().any(|claim| {
+                claim.grant_record_id == record.record_id && claim.phase.requires_reconcile()
+            })
+        {
+            push_reconcile_diagnostic(
+                &mut diagnostics,
+                format!(
+                    "confirmed grant {} has no unresolved machine claim; automatic cleanup cannot establish its lifecycle",
+                    record.record_id,
+                ),
+            );
+        }
+    }
     let mut groups = Vec::<ReconcileGroup>::new();
     for claim in claims.claims.iter() {
+        if !claim.phase.requires_reconcile() {
+            continue;
+        }
         if !claim_key_matches_socket(&claim.key, socket, server_peer_start_time) {
             continue;
         }
-        let status = match &claim.phase {
-            MachineClaimPhase::Ended => continue,
-            MachineClaimPhase::NeedsReview { reason } => {
-                ReconcileClaimStatus::Blocked(reason.clone())
-            }
-            MachineClaimPhase::Unknown { reason } => ReconcileClaimStatus::Blocked(reason.clone()),
-            MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. } => {
-                let registration = system_machine_registration(&claim.machine);
-                match observe_machine_claim(
-                    claim,
-                    Some(current_boot_id.as_str()),
-                    registration,
-                    now,
-                ) {
-                    Some(MachineClaimObservation::Active) => ReconcileClaimStatus::Active,
-                    Some(MachineClaimObservation::EndedCandidate) => {
-                        let phase = MachineClaimPhase::CleanupPending {
-                            since_unix_millis: now,
-                        };
-                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
-                            ReconcileClaimStatus::Blocked(format!(
-                                "could not persist cleanup-pending state: {error}"
-                            ))
-                        } else {
-                            ReconcileClaimStatus::Pending
-                        }
-                    }
-                    Some(MachineClaimObservation::CleanupPending { .. }) => {
-                        ReconcileClaimStatus::Pending
-                    }
-                    Some(MachineClaimObservation::CleanupReady) => ReconcileClaimStatus::Ready,
-                    Some(MachineClaimObservation::NeedsReview(reason)) => {
-                        let phase = MachineClaimPhase::NeedsReview {
-                            reason: reason.clone(),
-                        };
-                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
-                            ReconcileClaimStatus::Blocked(format!(
-                                "{reason}; could not persist review state: {error}"
-                            ))
-                        } else {
-                            ReconcileClaimStatus::Blocked(reason)
-                        }
-                    }
-                    Some(MachineClaimObservation::Unknown(reason)) => {
-                        let phase = MachineClaimPhase::Unknown {
-                            reason: reason.clone(),
-                        };
-                        if let Err(error) = mark_claim_phase_sync(&state, claim, phase) {
-                            ReconcileClaimStatus::Blocked(format!(
-                                "{reason}; could not persist unknown state: {error}"
-                            ))
-                        } else {
-                            ReconcileClaimStatus::Blocked(reason)
-                        }
-                    }
-                    None => ReconcileClaimStatus::Blocked(
-                        "machine claim lifecycle could not be observed".into(),
-                    ),
-                }
-            }
+        let Some(status) = reconcile_claim(
+            &state,
+            claim,
+            &current_boot_id,
+            system_machine_registration(&claim.machine),
+            now,
+        ) else {
+            continue;
         };
         let reconcile_claim = ReconcileClaim {
             claim_id: claim.claim_id.clone(),
@@ -585,6 +634,37 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         }
         if let Some(reason) = invalid_record {
             push_reconcile_diagnostic(&mut diagnostics, reason);
+            continue;
+        }
+
+        // An earlier group may have involved X11 I/O. Recheck every machine
+        // sharing this grant immediately before revoking it, so a registration
+        // that reappeared since the first pass still blocks this mutation.
+        let mut still_ready = true;
+        for member in &group.claims {
+            let claim = claims
+                .claims
+                .iter()
+                .find(|claim| claim.claim_id == member.claim_id)
+                .expect("reconcile claim came from catalog");
+            let status = reconcile_claim(
+                &state,
+                claim,
+                &current_boot_id,
+                system_machine_registration(&claim.machine),
+                unix_millis()?,
+            );
+            if status != Some(ReconcileClaimStatus::Ready) {
+                still_ready = false;
+                if let Some(ReconcileClaimStatus::Blocked(reason)) = status {
+                    push_reconcile_diagnostic(
+                        &mut diagnostics,
+                        format!("claim {} changed before cleanup: {reason}", claim.claim_id),
+                    );
+                }
+            }
+        }
+        if !still_ready {
             continue;
         }
 

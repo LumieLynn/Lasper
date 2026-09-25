@@ -138,6 +138,10 @@ impl X11ReconcileReport {
     pub(crate) fn diagnostics(&self) -> &[String] {
         &self.diagnostics
     }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.pending_record_ids.is_empty() && self.diagnostics.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

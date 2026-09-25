@@ -19,7 +19,7 @@ use super::common::MAX_GRANT_RECORD_BYTES;
 use super::lifecycle::machine_claim_diagnostics;
 use super::state::{
     load_existing_grant_records, load_existing_machine_claims, valid_record_id, GrantRecordPhase,
-    MachineClaimPhase, ManagedX11GrantRecord, ManagedX11MachineClaim, X11RuntimeState,
+    ManagedX11GrantRecord, ManagedX11MachineClaim, X11RuntimeState,
 };
 use super::transport::{
     authenticated_connection, authorization_was_confirmed, host_boot_id, insert_and_observe,
@@ -314,9 +314,8 @@ pub(super) fn revoke_access_sync(
             "X11 revocation was not attempted because Lasper cannot safely inspect its machine claims: {detail}"
         ));
     }
-    let claim_is_active = claims.claims.iter().any(|claim| {
-        claim.grant_record_id == request.record_id()
-            && matches!(&claim.phase, MachineClaimPhase::Active)
+    let claim_is_unresolved = claims.claims.iter().any(|claim| {
+        claim.grant_record_id == request.record_id() && claim.phase.requires_reconcile()
     });
 
     let record_id = request.record_id();
@@ -396,7 +395,7 @@ pub(super) fn revoke_access_sync(
                 "the exact ACL entry was already absent, but operation record {record_id} could not be finalized: {error}"
             )
         })?;
-        if claim_is_active {
+        if claim_is_unresolved {
             state.end_claim(record_id).map_err(|error| {
                 format!(
                     "the exact ACL entry was already absent and the grant record was finalized, but its machine claim could not be ended: {error}"
@@ -433,7 +432,7 @@ pub(super) fn revoke_access_sync(
                 "X11 access was revoked, but operation record {record_id} could not be finalized ({error}); the confirmed record was preserved"
             )
         })?;
-        if claim_is_active {
+        if claim_is_unresolved {
             state.end_claim(record_id).map_err(|error| {
                 format!(
                     "X11 access was revoked and the grant record was finalized, but its machine claim could not be ended: {error}"

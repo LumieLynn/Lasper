@@ -82,25 +82,47 @@ async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
     let mode =
         crate::composition::CompositionMode::new(crate::composition::PermissionLevel::User, None)?;
     let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
-    match services.x11_access.reconcile_after_machine_event().await {
-        Ok(reports) => {
-            for report in reports {
-                for diagnostic in report.diagnostics() {
-                    log::debug!(
-                        "X11 lifecycle reconcile :{}: {diagnostic}",
-                        report.display()
-                    );
+    let reconcile_result =
+        match services.x11_access.reconcile_after_machine_event().await {
+            Ok(reports) => {
+                let mut incomplete = Vec::new();
+                for report in reports {
+                    if !report.is_complete() {
+                        if !report.pending_record_ids().is_empty() {
+                            incomplete.push(format!(
+                                "display :{} still has {} pending grant(s)",
+                                report.display(),
+                                report.pending_record_ids().len()
+                            ));
+                        }
+                        incomplete.extend(report.diagnostics().iter().map(|diagnostic| {
+                            format!("display :{}: {diagnostic}", report.display())
+                        }));
+                    }
+                }
+                if !incomplete.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "X11 lifecycle reconcile incomplete: {}",
+                        incomplete.join("; ")
+                    ))
+                } else {
+                    Ok(())
                 }
             }
-        }
-        Err(crate::application::x11::X11AccessError::Selection(_)) => {}
-        Err(error) => return Err(anyhow::anyhow!(error.to_string())),
+            Err(crate::application::x11::X11AccessError::Selection(error)) => Err(anyhow::anyhow!(
+                "X11 lifecycle reconcile could not discover a live endpoint: {error}"
+            )),
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        };
+    let activation_result = services.x11_access.synchronize_reconcile_activation().await;
+    match (reconcile_result, activation_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(reconcile), Ok(())) => Err(reconcile),
+        (Ok(()), Err(activation)) => Err(anyhow::anyhow!(activation.to_string())),
+        (Err(reconcile), Err(activation)) => Err(anyhow::anyhow!(
+            "{reconcile}; X11 lifecycle activation sync failed: {activation}"
+        )),
     }
-    services
-        .x11_access
-        .synchronize_reconcile_activation()
-        .await?;
-    Ok(())
 }
 
 async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {

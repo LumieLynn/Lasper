@@ -141,8 +141,7 @@ fn an_observed_entry_is_not_claimed_when_change_hosts_failed() {
     ));
 }
 
-#[test]
-fn grant_records_are_versioned_and_reject_unknown_fields() {
+pub(super) fn grant_request() -> X11AuthorizationRequest {
     let namespace = ObservedNamespaceIdentity::new(1, 2);
     let identity = MappedGuestIdentity::verified(
         ObservedGuestIdentity::new(1000, 1000),
@@ -176,13 +175,18 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
         crate::application::sessions::X11FilesystemAccess::observed(true, true),
         identity,
     );
-    let request = X11AuthorizationRequest::new(
+    X11AuthorizationRequest::new(
         ShellTarget::new(
             crate::domain::machine::MachineName::new("archlinux").unwrap(),
             ValidatedGuestUserName::new("alice").unwrap(),
         ),
         projection,
-    );
+    )
+}
+
+#[test]
+fn grant_records_are_versioned_and_reject_unknown_fields() {
+    let request = grant_request();
     let record_id = "0123456789abcdef0123456789abcdef";
     let record = ManagedX11GrantRecord::pending(&request, record_id.into(), 77).unwrap();
     let value = serde_json::to_value(&record).unwrap();
@@ -226,12 +230,14 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
         Some(MachineClaimObservation::EndedCandidate)
     );
     assert_eq!(
-        proposed_claim_phase(
+        observe_machine_claim(
             &claim,
             Some(claim.boot_id.as_str()),
             SystemMachineRegistration::Absent,
             123,
-        ),
+        )
+        .unwrap()
+        .next_phase(&claim, 123),
         Some(MachineClaimPhase::CleanupPending {
             since_unix_millis: 123
         })
@@ -282,7 +288,7 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
             },
             1,
         ),
-        Some(MachineClaimObservation::Unknown(_))
+        Some(MachineClaimObservation::Unavailable(_))
     ));
     let replacement_instance = ObservedMachineInstance::new(
         claim.machine_leader_pid.saturating_add(1),

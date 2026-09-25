@@ -43,13 +43,13 @@ pub(super) async fn ensure_system_machine_path_activation(
     })
 }
 
-/// Synchronize the watcher with the claim catalog. No active claim means
+/// Synchronize the watcher with the claim catalog. Once every claim is ended,
 /// there is no reason to leave a path unit loaded in the user manager.
 pub(super) async fn synchronize_system_machine_path_activation(
     backend: ActivationBackend,
-    active_claims: bool,
+    claims_need_activation: bool,
 ) -> Result<(), String> {
-    if active_claims {
+    if claims_need_activation {
         ensure_system_machine_path_activation(backend).await
     } else {
         remove_system_machine_path_activation(backend).await
@@ -139,11 +139,23 @@ async fn remove_system_machine_path_activation(backend: ActivationBackend) -> Re
         return Ok(());
     };
     let validation_units = units.clone();
-    tokio::task::spawn_blocking(move || validate_owned_units(&validation_units))
+    let owned_units = tokio::task::spawn_blocking(move || validate_owned_units(&validation_units))
         .await
         .map_err(|error| format!("X11 activation ownership check failed: {error}"))??;
 
-    stop_path_unit(backend).await?;
+    // A missing runtime unit is an ordinary result of an interrupted or
+    // already-completed cleanup.  Only stop the manager unit when at least
+    // one of our files is still present; an empty directory does not prove
+    // that an external unit with the same name is ours to stop.
+    if !owned_units.any() {
+        return Ok(());
+    }
+
+    // The companion service alone does not establish ownership of a loaded
+    // path unit whose runtime file is absent.
+    if owned_units.path {
+        stop_path_unit(backend).await?;
+    }
     tokio::task::spawn_blocking(move || {
         units
             .with_exclusive_lock("x11-activation", || {
@@ -177,13 +189,29 @@ fn open_existing_unit_directory() -> Result<Option<TrustedDirectory>, String> {
     Ok(units)
 }
 
-fn validate_owned_units(units: &TrustedDirectory) -> Result<(), String> {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct OwnedUnits {
+    path: bool,
+    service: bool,
+}
+
+impl OwnedUnits {
+    fn any(self) -> bool {
+        self.path || self.service
+    }
+}
+
+fn validate_owned_units(units: &TrustedDirectory) -> Result<OwnedUnits, String> {
+    let mut owned = OwnedUnits::default();
     for name in [PATH_UNIT, SERVICE_UNIT] {
         let Some(file) = units
             .read_bounded(name, MAX_UNIT_BYTES)
             .map_err(|error| format!("read X11 runtime unit {name}: {error}"))?
         else {
-            return Err(format!("X11 runtime unit {name} is missing"));
+            // Runtime units may be removed by systemd/user-session cleanup or
+            // by a previous Lasper process.  Absence is not an ownership
+            // violation and must not block ACL reconciliation.
+            continue;
         };
         if file.uid != units.expected_uid() || file.mode & 0o077 != 0 {
             return Err(format!(
@@ -195,8 +223,13 @@ fn validate_owned_units(units: &TrustedDirectory) -> Result<(), String> {
                 "refusing to remove an external user runtime unit: {name}"
             ));
         }
+        match name {
+            PATH_UNIT => owned.path = true,
+            SERVICE_UNIT => owned.service = true,
+            _ => unreachable!("validated only the two Lasper X11 units"),
+        }
     }
-    Ok(())
+    Ok(owned)
 }
 
 fn runtime_directory(uid: u32) -> Result<PathBuf, String> {
@@ -281,7 +314,7 @@ async fn stop_path_unit(backend: ActivationBackend) -> Result<(), String> {
         ActivationBackend::Dbus => {
             let connection = connect_user_bus().await?;
             let proxy = manager_proxy(&connection).await?;
-            tokio::time::timeout(
+            let result = tokio::time::timeout(
                 COMMAND_TIMEOUT,
                 proxy.call::<_, _, zbus::zvariant::OwnedObjectPath>(
                     "StopUnit",
@@ -289,9 +322,16 @@ async fn stop_path_unit(backend: ActivationBackend) -> Result<(), String> {
                 ),
             )
             .await
-            .map_err(|_| "stop X11 path unit timed out".to_owned())?
-            .map_err(|error| format!("stop X11 path unit: {error}"))?;
-            Ok(())
+            .map_err(|_| "stop X11 path unit timed out".to_owned())?;
+            match result {
+                Ok(_) => Ok(()),
+                Err(zbus::Error::MethodError(name, _, _))
+                    if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(format!("stop X11 path unit: {error}")),
+            }
         }
         ActivationBackend::SystemdTools => {
             let output = DefaultCommandRunner
@@ -307,13 +347,18 @@ async fn stop_path_unit(backend: ActivationBackend) -> Result<(), String> {
                 )
                 .await
                 .map_err(|error| format!("run systemctl --user stop: {error}"))?;
-            if output.status.success() {
+            if output.status.success() || is_missing_unit_diagnostic(&command_diagnostic(&output)) {
                 Ok(())
             } else {
                 Err(command_diagnostic(&output))
             }
         }
     }
+}
+
+fn is_missing_unit_diagnostic(diagnostic: &str) -> bool {
+    diagnostic.contains(&format!("Unit {PATH_UNIT} not loaded."))
+        || diagnostic.contains(&format!("Unit {PATH_UNIT} not found."))
 }
 
 async fn reload_manager(backend: ActivationBackend) -> Result<(), String> {
@@ -418,5 +463,67 @@ mod tests {
         assert!(!executable_metadata_is_safe(true, 2000, 0o755, 1000));
         assert!(!executable_metadata_is_safe(true, 0, 0o775, 1000));
         assert!(!executable_metadata_is_safe(true, 0, 0o644, 1000));
+    }
+
+    #[test]
+    fn missing_unit_diagnostics_are_idempotent_but_other_failures_are_not() {
+        assert!(is_missing_unit_diagnostic(
+            "Unit lasper-x11-machine.path not loaded."
+        ));
+        assert!(is_missing_unit_diagnostic(
+            "Unit lasper-x11-machine.path not found."
+        ));
+        assert!(!is_missing_unit_diagnostic(
+            "Access denied while stopping unit"
+        ));
+        assert!(!is_missing_unit_diagnostic(
+            "Connection to user manager timed out"
+        ));
+        assert!(!is_missing_unit_diagnostic("User bus not found"));
+        assert!(!is_missing_unit_diagnostic("Unit other.path not loaded."));
+    }
+
+    #[test]
+    fn absent_and_partially_removed_units_can_be_cleaned_up() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let units =
+            TrustedDirectory::open_existing(temporary.path(), uzers::get_effective_uid()).unwrap();
+        assert!(!validate_owned_units(&units).unwrap().any());
+        let service = reconcile_service_contents("'/opt/lasper/bin/lasper'");
+        ensure_unit(&units, SERVICE_UNIT, service.as_bytes()).unwrap();
+        assert_eq!(
+            validate_owned_units(&units).unwrap(),
+            OwnedUnits {
+                path: false,
+                service: true
+            }
+        );
+        ensure_unit(&units, PATH_UNIT, UNIT_MARKER.as_bytes()).unwrap();
+        assert_eq!(
+            validate_owned_units(&units).unwrap(),
+            OwnedUnits {
+                path: true,
+                service: true
+            }
+        );
+    }
+
+    #[test]
+    fn missing_unit_does_not_allow_removing_an_external_or_unsafe_companion() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let units =
+            TrustedDirectory::open_existing(temporary.path(), uzers::get_effective_uid()).unwrap();
+        units
+            .write_atomic(SERVICE_UNIT, b"[Service]\nExecStart=/bin/true\n", 0o600)
+            .unwrap();
+        assert!(validate_owned_units(&units)
+            .unwrap_err()
+            .contains("external"));
+        units
+            .write_atomic(SERVICE_UNIT, UNIT_MARKER.as_bytes(), 0o644)
+            .unwrap();
+        assert!(validate_owned_units(&units).unwrap_err().contains("unsafe"));
     }
 }

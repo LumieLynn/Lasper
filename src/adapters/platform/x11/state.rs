@@ -282,10 +282,25 @@ impl ManagedX11GrantKey {
 #[serde(rename_all = "snake_case", tag = "state", deny_unknown_fields)]
 pub(super) enum MachineClaimPhase {
     Active,
-    CleanupPending { since_unix_millis: u64 },
+    CleanupPending {
+        since_unix_millis: u64,
+    },
     Ended,
-    NeedsReview { reason: String },
-    Unknown { reason: String },
+    NeedsReview {
+        reason: String,
+    },
+    /// An uncertain ACL mutation must not be retried automatically. Older
+    /// versions also stored observation errors here; lifecycle recognizes only
+    /// those known errors when recovering existing claims.
+    Unknown {
+        reason: String,
+    },
+}
+
+impl MachineClaimPhase {
+    pub(super) fn requires_reconcile(&self) -> bool {
+        !matches!(self, Self::Ended)
+    }
 }
 
 /// A lifecycle claim is deliberately separate from the grant operation
@@ -557,11 +572,20 @@ impl X11RuntimeState {
     }
 }
 
-pub(super) fn has_active_claims_sync() -> Result<bool, String> {
+pub(super) fn has_unresolved_claims_sync() -> Result<bool, String> {
     let Some(state) = X11RuntimeState::open_existing()? else {
         return Ok(false);
     };
-    let claims = state.load_claims();
+    let _lock = state.lock()?;
+    claims_need_activation(&state.load_claims(), &state.load_records())
+}
+
+/// Keep the lifecycle wake-up while any claim or confirmed grant remains.
+/// Observation/review failures are unresolved work, not evidence of cleanup.
+pub(super) fn claims_need_activation(
+    claims: &MachineClaimCatalog,
+    records: &X11GrantRecordCatalog,
+) -> Result<bool, String> {
     if !claims.complete {
         return Err(claims
             .diagnostics
@@ -569,12 +593,21 @@ pub(super) fn has_active_claims_sync() -> Result<bool, String> {
             .cloned()
             .unwrap_or_else(|| "X11 machine claim set is incomplete".into()));
     }
-    Ok(claims.claims.iter().any(|claim| {
-        matches!(
-            &claim.phase,
-            MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. }
-        )
-    }))
+    if !records.complete {
+        return Err(records
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 grant record set is incomplete".into()));
+    }
+    Ok(claims
+        .claims
+        .iter()
+        .any(|claim| claim.phase.requires_reconcile())
+        || records
+            .records
+            .iter()
+            .any(|record| matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded)))
 }
 
 pub(super) fn load_existing_grant_records() -> X11GrantRecordCatalog {

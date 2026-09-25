@@ -482,6 +482,27 @@ mod tests {
         assert!(leader_pid_at(&path, "test-machine").is_err());
     }
 
+    #[test]
+    fn machine_instance_does_not_require_pidfd_registration_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test-machine");
+        std::fs::write(
+            &path,
+            format!("NAME=test-machine\nLEADER={}\n", std::process::id()),
+        )
+        .unwrap();
+        let instance = machine_instance_at(&path, "test-machine").unwrap();
+        assert_eq!(instance.leader_pid(), std::process::id());
+        assert_eq!(
+            instance.pid_namespace(),
+            namespace_identity(Path::new("/proc/self/ns/pid")).unwrap(),
+        );
+        assert_eq!(
+            instance.user_namespace(),
+            namespace_identity(Path::new("/proc/self/ns/user")).unwrap(),
+        );
+    }
+
     #[tokio::test]
     async fn runtime_enumeration_uses_regular_valid_registration_files_only() {
         let dir = tempfile::tempdir().unwrap();
