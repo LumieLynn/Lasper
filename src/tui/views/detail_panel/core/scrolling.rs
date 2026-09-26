@@ -1,13 +1,10 @@
-use ratatui::{
-    layout::Rect,
-    widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState},
-    Frame,
-};
+use ratatui::{layout::Rect, widgets::ScrollbarState, Frame};
 
 use super::super::DetailPane;
 use super::super::DetailPanel;
 use super::properties::summary_properties;
 use crate::tui::app::AppData;
+use crate::tui::widgets::display::scrollbar::vertical_scrollbar;
 
 /// Presentation cache for the log pane: pre-computed wrapped-line offsets
 /// so scrolling is O(log N) binary search instead of O(N) counting.
@@ -303,11 +300,6 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
         .position(position)
         .viewport_content_length(usize::from(panel.pane_height));
 
-    let scrollbar = Scrollbar::default()
-        .orientation(ScrollbarOrientation::VerticalRight)
-        .begin_symbol(Some("▲"))
-        .end_symbol(Some("▼"));
-
     let scrollbar_area = Rect {
         x: area.x,
         y: area.y + 1,
@@ -315,5 +307,5 @@ pub fn render_scrollbar(panel: &DetailPanel, f: &mut Frame, area: Rect) {
         height: area.height.saturating_sub(2),
     };
 
-    f.render_stateful_widget(scrollbar, scrollbar_area, &mut state);
+    f.render_stateful_widget(vertical_scrollbar(), scrollbar_area, &mut state);
 }

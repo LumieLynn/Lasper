@@ -4,7 +4,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, ScrollbarState, Wrap},
     Frame,
 };
 
@@ -18,6 +18,7 @@ use crate::application::configuration::{
 use crate::domain::x11::X11PeerIdentity;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
+use crate::tui::widgets::display::scrollbar::vertical_scrollbar;
 use crate::tui::{soft_wrap_text, theme};
 use unicode_width::UnicodeWidthStr;
 
@@ -369,6 +370,16 @@ impl ConfigurationView {
             ),
             inner,
         );
+        if self.preview_max_scroll > 0 && inner.width > 0 && inner.height > 0 {
+            let mut state = ScrollbarState::new(self.preview_max_scroll + 1)
+                .position(self.preview_scroll)
+                .viewport_content_length(usize::from(inner.height));
+            frame.render_stateful_widget(
+                vertical_scrollbar(),
+                Rect::new(inner.x + inner.width, inner.y, 1, inner.height),
+                &mut state,
+            );
+        }
     }
 
     fn render_discard_confirmation(&self, frame: &mut Frame, area: Rect) {

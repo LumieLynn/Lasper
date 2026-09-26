@@ -306,16 +306,12 @@ impl Component for NvidiaConfigDialog {
             }
 
             if max_scroll > 0 {
-                use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+                use ratatui::widgets::ScrollbarState;
                 let mut state = ScrollbarState::new(usize::from(max_scroll) + 1)
                     .position(self.scroll_offset as usize)
                     .viewport_content_length(usize::from(dest_area.height));
-                let scrollbar = Scrollbar::default()
-                    .orientation(ScrollbarOrientation::VerticalRight)
-                    .begin_symbol(Some("▲"))
-                    .end_symbol(Some("▼"));
                 f.render_stateful_widget(
-                    scrollbar,
+                    crate::tui::widgets::display::scrollbar::vertical_scrollbar(),
                     Rect {
                         x: dest_area.x + dest_area.width - 1,
                         y: dest_area.y,

@@ -526,6 +526,21 @@ impl ConfigurationView {
         }
     }
 
+    fn scroll_preview_page(&mut self, down: bool) {
+        if self.pane != ConfigurationPane::Preview {
+            return;
+        }
+        let viewport = usize::from(self.hits.preview.height.saturating_sub(2));
+        let step = viewport.saturating_sub(1).max(1);
+        self.preview_scroll = if down {
+            self.preview_scroll
+                .saturating_add(step)
+                .min(self.preview_max_scroll)
+        } else {
+            self.preview_scroll.saturating_sub(step)
+        };
+    }
+
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> ConfigurationAction {
         if let Some(action) = self.page.x11_mut().handle_access_key(key) {
             return action;
@@ -571,6 +586,8 @@ impl ConfigurationView {
             }
             (KeyCode::Down | KeyCode::Char('j'), KeyModifiers::NONE) => self.scroll(true),
             (KeyCode::Up | KeyCode::Char('k'), KeyModifiers::NONE) => self.scroll(false),
+            (KeyCode::PageDown, KeyModifiers::NONE) => self.scroll_preview_page(true),
+            (KeyCode::PageUp, KeyModifiers::NONE) => self.scroll_preview_page(false),
             (KeyCode::Char('[') | KeyCode::Char(']'), KeyModifiers::NONE)
                 if self.pane == ConfigurationPane::Preview =>
             {

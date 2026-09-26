@@ -2,6 +2,7 @@ use crate::application::provisioning::HostGpuDevice;
 use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
 use crate::domain::x11::HostX11Socket;
 use crate::tui::core::{Component, EventResult, FocusTracker};
+use crate::tui::widgets::display::scrollbar::vertical_scrollbar;
 use crate::tui::widgets::display::text_block::TextBlock;
 use crate::tui::widgets::lists::checklist::Checklist;
 use crate::tui::widgets::selectors::checkbox::Checkbox;
@@ -417,15 +418,9 @@ impl Component for HostIntegrationStepView {
 
         // Scrollbar
         if total_height > area.height {
-            use ratatui::widgets::{Scrollbar, ScrollbarOrientation};
             let mut state = scrollbar_state(self.scroll_offset, max_scroll, area.height);
-            let scrollbar = Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"));
-
             f.render_stateful_widget(
-                scrollbar,
+                vertical_scrollbar(),
                 Rect {
                     x: area.x + area.width - 1,
                     y: area.y,
@@ -529,36 +524,31 @@ impl StepComponent for HostIntegrationStepView {
 mod tests {
     use super::*;
     use crate::domain::x11::X11SocketRevision;
-    use ratatui::{
-        backend::TestBackend,
-        buffer::Buffer,
-        widgets::{Scrollbar, ScrollbarOrientation, StatefulWidget},
-        Terminal,
-    };
+    use ratatui::{backend::TestBackend, buffer::Buffer, widgets::StatefulWidget, Terminal};
 
     #[test]
     fn scrollbar_thumb_uses_the_bounded_scroll_range() {
         let area = Rect::new(0, 0, 1, 8);
-        let scrollbar = || {
-            Scrollbar::default()
-                .orientation(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("▲"))
-                .end_symbol(Some("▼"))
-        };
-
         let mut top_buffer = Buffer::empty(area);
         let mut top_state = scrollbar_state(0, 8, area.height);
-        StatefulWidget::render(scrollbar(), area, &mut top_buffer, &mut top_state);
-        assert_eq!(top_buffer[(0, 1)].symbol(), "█");
-        assert_eq!(top_buffer[(0, 3)].symbol(), "█");
-        assert_eq!(top_buffer[(0, 4)].symbol(), "║");
+        StatefulWidget::render(vertical_scrollbar(), area, &mut top_buffer, &mut top_state);
+        assert_eq!(top_buffer[(0, 0)].symbol(), "↑");
+        assert_eq!(top_buffer[(0, 1)].symbol(), "▐");
+        assert_eq!(top_buffer[(0, 3)].symbol(), "▐");
+        assert_eq!(top_buffer[(0, 4)].symbol(), "│");
 
         let mut bottom_buffer = Buffer::empty(area);
         let mut bottom_state = scrollbar_state(8, 8, area.height);
-        StatefulWidget::render(scrollbar(), area, &mut bottom_buffer, &mut bottom_state);
-        assert_eq!(bottom_buffer[(0, 3)].symbol(), "║");
-        assert_eq!(bottom_buffer[(0, 4)].symbol(), "█");
-        assert_eq!(bottom_buffer[(0, 6)].symbol(), "█");
+        StatefulWidget::render(
+            vertical_scrollbar(),
+            area,
+            &mut bottom_buffer,
+            &mut bottom_state,
+        );
+        assert_eq!(bottom_buffer[(0, 3)].symbol(), "│");
+        assert_eq!(bottom_buffer[(0, 4)].symbol(), "▐");
+        assert_eq!(bottom_buffer[(0, 6)].symbol(), "▐");
+        assert_eq!(bottom_buffer[(0, 7)].symbol(), "↓");
     }
 
     #[test]

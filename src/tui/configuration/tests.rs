@@ -325,6 +325,33 @@ fn refresh_failure_remains_visible_and_raw_scroll_is_bounded() {
 }
 
 #[test]
+fn preview_scrollbar_and_page_keys_follow_the_visible_viewport() {
+    let mut view = loaded();
+    if let InspectionState::Ready(snapshot) = &mut view.state {
+        snapshot.document.as_mut().unwrap().content = "a line of configuration\n".repeat(40);
+    }
+    view.select_tab(PreviewTab::Raw);
+    let buffer = render_buffer(&mut view, 40, 10);
+    assert!(view.preview_max_scroll > 0);
+    let scrollbar_x = view.hits.preview.right() - 1;
+    assert_eq!(buffer[(scrollbar_x, view.hits.preview.y + 1)].symbol(), "↑");
+    assert_eq!(
+        buffer[(scrollbar_x, view.hits.preview.bottom() - 2)].symbol(),
+        "↓"
+    );
+
+    let step = usize::from(view.hits.preview.height - 3);
+    view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(view.preview_scroll, step);
+    view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+    assert_eq!(view.preview_scroll, 0);
+
+    view.pane = ConfigurationPane::Content;
+    view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+    assert_eq!(view.preview_scroll, 0);
+}
+
+#[test]
 fn tiny_terminal_sizes_keep_rendering_and_escape_safe() {
     let mut view = loaded();
     for (width, height) in [(0, 0), (1, 1), (8, 3), (30, 6)] {
