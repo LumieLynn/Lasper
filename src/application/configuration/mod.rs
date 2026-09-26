@@ -48,6 +48,11 @@ impl ConfigurationTarget {
     }
 
     pub fn for_image(image: &ImageEntry) -> Result<Self, ResourceInspectionError> {
+        if image.is_hidden() {
+            return Err(ResourceInspectionError::unsupported(
+                "Configure is unavailable for internal images",
+            ));
+        }
         ImageName::new(&image.name)
             .map(Self::Image)
             .map_err(ResourceInspectionError::backend)

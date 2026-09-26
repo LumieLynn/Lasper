@@ -194,6 +194,10 @@ mod tests {
                 image: "ubuntu".into()
             })
         );
+
+        // Hidden images may still have image actions, but no Configure row.
+        let internal = ResourceActionMenu::for_image(&image(".internal"), false, false);
+        assert_eq!(internal.item_count, 4);
     }
 
     #[test]

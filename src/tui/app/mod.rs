@@ -1204,6 +1204,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_leader_does_not_open_for_internal_images() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for focus in [WorkspaceFocus::Images, WorkspaceFocus::ImageInspector] {
+            let mut app = make_app();
+            app.data.internal_images = vec![make_internal_image(".internal")];
+            app.ui.focus = focus;
+            app.data.detail_target = DetailTarget::Image {
+                name: ".internal".into(),
+                internal: true,
+            };
+            app.ui.image_list.handle_key(
+                KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+                app.data.internal_images.len(),
+            );
+
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+                .await;
+            app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+                .await;
+
+            assert!(app.ui.configuration.is_none());
+            assert!(app.ui.leader.is_none());
+        }
+    }
+
+    #[tokio::test]
     async fn configure_menu_keeps_its_original_target_after_catalog_selection_changes() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut app = make_app();
