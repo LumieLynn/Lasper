@@ -4,9 +4,8 @@ pub mod panes;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 use ratatui::{
-    layout::{Alignment, Rect},
+    layout::Rect,
     style::{Modifier, Style},
-    text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
@@ -14,10 +13,7 @@ use ratatui::{
 use crate::handle_nav;
 use crate::tui::app::AppData;
 use crate::tui::core::{AppMessage, ContainerMessage, EventResult};
-use crate::tui::views::title_tabs::{
-    bordered_title_tab_hitboxes, clicked_title_tab, TitleTabHitbox,
-};
-use unicode_width::UnicodeWidthStr;
+use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox, TitleTabViewport};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum DetailTarget {
@@ -147,6 +143,7 @@ pub struct DetailPanel {
     pub(crate) log_cache: core::scrolling::LogRenderCache,
     scroll_area: Rect,
     tab_hitboxes: Vec<TitleTabHitbox<DetailPane>>,
+    tab_viewport: TitleTabViewport,
 }
 
 impl DetailPanel {
@@ -174,6 +171,7 @@ impl DetailPanel {
             log_cache: core::scrolling::LogRenderCache::new(),
             scroll_area: Rect::default(),
             tab_hitboxes: Vec::new(),
+            tab_viewport: TitleTabViewport::default(),
         }
     }
 
@@ -199,13 +197,40 @@ impl DetailPanel {
         let labels = Self::tab_labels(data);
         let tabs = DetailPane::tabs_for(&data.detail_target);
         debug_assert_eq!(tabs.len(), labels.len());
-        let tab_widths = tabs
+        let active = tabs
+            .iter()
+            .position(|pane| pane == &self.active_pane)
+            .unwrap_or(0);
+        let t = crate::tui::theme::theme();
+        let tab_specs = tabs
             .iter()
             .copied()
-            .zip(labels.iter().map(|label| label.width()))
+            .zip(labels)
+            .enumerate()
+            .map(|(index, (pane, label))| {
+                let style = if index == active {
+                    Style::default()
+                        .fg(if self.focused {
+                            t.tab_active_focused
+                        } else {
+                            t.tab_active_unfocused
+                        })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.tab_inactive)
+                };
+                (pane, label.to_owned(), style)
+            })
             .collect::<Vec<_>>();
-        self.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
-        let tabs_line = self.get_tabs_line(data, &labels);
+        let tab_layout = self.tab_viewport.layout(
+            area,
+            &tab_specs,
+            "-",
+            active,
+            Style::default().fg(t.tab_inactive),
+        );
+        self.tab_hitboxes = tab_layout.hitboxes;
+        let tabs_line = tab_layout.line;
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -276,36 +301,6 @@ impl DetailPanel {
                 " Metrics ",
             ]
         }
-    }
-
-    fn get_tabs_line(&self, data: &AppData, labels: &[&'static str]) -> Line<'static> {
-        let tabs = DetailPane::tabs_for(&data.detail_target);
-        let selected = tabs
-            .iter()
-            .position(|pane| pane == &self.active_pane)
-            .unwrap_or(0);
-
-        let mut spans = Vec::new();
-
-        let t = crate::tui::theme::theme();
-        for (i, label) in labels.iter().enumerate() {
-            let mut style = Style::default().fg(t.tab_inactive);
-            if i == selected {
-                style = style
-                    .fg(if self.focused {
-                        t.tab_active_focused
-                    } else {
-                        t.tab_active_unfocused
-                    })
-                    .add_modifier(Modifier::BOLD);
-            }
-            spans.push(Span::styled((*label).to_string(), style));
-
-            if i < labels.len() - 1 {
-                spans.push(Span::raw("-"));
-            }
-        }
-        Line::from(spans)
     }
 
     pub fn ensure_pane_for_target(&mut self, target: &DetailTarget) {

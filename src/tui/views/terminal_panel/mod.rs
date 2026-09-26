@@ -1,7 +1,6 @@
 pub mod manager;
 mod osc52;
 mod shell_prompt;
-use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 pub use manager::{TerminalInputStatus, TerminalKeyOutcome, TerminalManager, TextSelection};
 use ratatui::{
     layout::{Alignment, Rect},
@@ -10,8 +9,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear},
     Frame,
 };
-use unicode_width::UnicodeWidthStr;
-
 pub struct TerminalPanel;
 
 impl TerminalPanel {
@@ -30,35 +27,41 @@ impl TerminalPanel {
         }
         let active_idx = manager.active_idx;
 
-        let tab_widths = manager
+        let tab_labels = manager
             .sessions
             .iter()
             .enumerate()
-            .map(|(index, _)| (index, manager.tab_label(index).width().saturating_add(2)))
+            .map(|(index, _)| manager.tab_label(index))
             .collect::<Vec<_>>();
-        manager.tab_hitboxes = bordered_title_tab_hitboxes(area, Alignment::Left, &tab_widths, 1);
-
         // Collect tab labels and session metadata before any mutable borrow.
         let t = crate::tui::theme::theme();
-        let mut tab_spans = Vec::new();
-        let session_count = manager.sessions.len();
-        for (i, _session) in manager.sessions.iter().enumerate() {
-            let mut style = Style::default().fg(t.tab_inactive);
-            if i == active_idx {
-                style = style
-                    .fg(if is_focused {
-                        t.tab_active_focused
-                    } else {
-                        t.tab_active_unfocused
-                    })
-                    .add_modifier(Modifier::BOLD);
-            }
-            tab_spans.push(Span::styled(format!(" {} ", manager.tab_label(i)), style));
-            if i < session_count - 1 {
-                tab_spans.push(Span::raw("-"));
-            }
-        }
-        let tabs_line = Line::from(tab_spans);
+        let tab_specs = tab_labels
+            .into_iter()
+            .enumerate()
+            .map(|(index, label)| {
+                let style = if index == active_idx {
+                    Style::default()
+                        .fg(if is_focused {
+                            t.tab_active_focused
+                        } else {
+                            t.tab_active_unfocused
+                        })
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(t.tab_inactive)
+                };
+                (index, format!(" {label} "), style)
+            })
+            .collect::<Vec<_>>();
+        let tab_layout = manager.tab_viewport.layout(
+            area,
+            &tab_specs,
+            "-",
+            active_idx,
+            Style::default().fg(t.tab_inactive),
+        );
+        manager.tab_hitboxes = tab_layout.hitboxes;
+        let tabs_line = tab_layout.line;
 
         let session = &mut manager.sessions[active_idx];
         // Clone the Arc before locking so the guard does not hold an

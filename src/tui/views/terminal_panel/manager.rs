@@ -10,7 +10,7 @@ use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::tui::events::AppEvent;
-use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox};
+use crate::tui::views::title_tabs::{clicked_title_tab, TitleTabHitbox, TitleTabViewport};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,6 +120,7 @@ pub struct TerminalManager {
     pub term_area: Rect,
     /// Last rendered title-tab areas, used before terminal mouse forwarding.
     pub(super) tab_hitboxes: Vec<TitleTabHitbox<usize>>,
+    pub(super) tab_viewport: TitleTabViewport,
     session_service: Arc<SessionService>,
     redraw_gate: RedrawGate,
     scrollback_lines: usize,
@@ -141,6 +142,7 @@ impl TerminalManager {
             maximized: false,
             term_area: Rect::default(),
             tab_hitboxes: Vec::new(),
+            tab_viewport: TitleTabViewport::default(),
             session_service,
             redraw_gate: RedrawGate::new(),
             scrollback_lines,
@@ -913,9 +915,10 @@ mod tests {
     use crate::domain::machine::MachineName;
     use crate::domain::runtime::{MachineEntry, MachineState};
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
+    use crate::tui::views::terminal_panel::TerminalPanel;
     use crate::tui::views::title_tabs::TitleTabHitbox;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-    use ratatui::layout::Rect;
+    use ratatui::{backend::TestBackend, layout::Rect, Terminal};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1209,6 +1212,71 @@ mod tests {
 
         assert_eq!(manager.tab_label(0), "demo #1");
         assert_eq!(manager.tab_label(1), "demo #2");
+    }
+
+    #[tokio::test]
+    async fn terminal_tabs_follow_the_active_session_and_reset_after_widening() {
+        crate::tui::theme::init_theme(crate::tui::theme::Theme::dark());
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))));
+        let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
+        let mut endpoints = Vec::new();
+        for (id, name) in ["alpha", "bravo", "charlie", "delta"]
+            .into_iter()
+            .enumerate()
+        {
+            let (session, endpoint) = test_session(id as u64 + 1, name);
+            manager.sessions.push(session);
+            endpoints.push(endpoint);
+        }
+        let panel = TerminalPanel;
+
+        let mut narrow = Terminal::new(TestBackend::new(18, 6)).unwrap();
+        narrow
+            .draw(|frame| panel.render(frame, frame.area(), &mut manager, true, false))
+            .unwrap();
+        let first_title = (0..18)
+            .map(|column| narrow.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(!first_title.contains('←'));
+        assert!(first_title.contains('→'));
+        assert!(manager.tab_hitboxes.iter().any(|tab| tab.value == 0));
+        assert!(!manager.tab_hitboxes.iter().any(|tab| tab.value == 3));
+
+        manager.active_idx = 3;
+        narrow
+            .draw(|frame| panel.render(frame, frame.area(), &mut manager, true, false))
+            .unwrap();
+        let last_title = (0..18)
+            .map(|column| narrow.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(last_title.contains('←'));
+        assert!(!last_title.contains('→'));
+        assert!(last_title.contains("rlie"));
+        assert!(!manager.tab_hitboxes.iter().any(|tab| tab.value == 0));
+        assert!(manager.tab_hitboxes.iter().any(|tab| tab.value == 3));
+
+        let mut wide = Terminal::new(TestBackend::new(80, 6)).unwrap();
+        wide.draw(|frame| panel.render(frame, frame.area(), &mut manager, true, false))
+            .unwrap();
+        let wide_title = (0..80)
+            .map(|column| wide.backend().buffer()[(column, 0)].symbol())
+            .collect::<String>();
+        assert!(!wide_title.contains('←'));
+        assert!(!wide_title.contains('→'));
+        assert_eq!(
+            manager
+                .tab_hitboxes
+                .iter()
+                .map(|tab| tab.value)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+
+        drop(endpoints);
     }
 
     #[tokio::test]

@@ -270,8 +270,8 @@ impl X11AccessDialog {
             Constraint::Length(3),
             Constraint::Min(7),
             Constraint::Length(4),
-            Constraint::Length(3),
             Constraint::Length(1),
+            Constraint::Length(3),
         ])
         .split(inner);
         self.sockets.render(frame, rows[0]);
@@ -279,22 +279,23 @@ impl X11AccessDialog {
         self.render_status(frame, rows[2]);
         self.render_history(frame, rows[3]);
 
+        frame.render_widget(
+            Paragraph::new(" Tab/Shift+Tab focus, j/k select display, c check, a authorize, d revoke, Esc close ")
+                .style(Style::default().fg(theme::theme().hint_fg)),
+            rows[4],
+        );
+
         let buttons = Layout::horizontal([
             Constraint::Percentage(25),
             Constraint::Percentage(25),
             Constraint::Percentage(25),
             Constraint::Percentage(25),
         ])
-        .split(rows[4]);
+        .split(rows[5]);
         self.check.render(frame, buttons[0]);
         self.authorize.render(frame, buttons[1]);
         self.revoke.render(frame, buttons[2]);
         self.close.render(frame, buttons[3]);
-        frame.render_widget(
-            Paragraph::new(" Tab/Shift+Tab focus, j/k select display, c check, a authorize, d revoke, Esc close ")
-                .style(Style::default().fg(theme::theme().hint_fg)),
-            rows[5],
-        );
 
         if self.authorization_confirmation.is_some() {
             self.render_authorization_confirmation(frame, area);
