@@ -22,13 +22,18 @@ use zbus::zvariant::{self, OwnedObjectPath};
 use zbus::{proxy, Connection};
 
 type EnableUnitFilesBody<'a> = (Vec<&'a str>, bool, bool);
+type DisableUnitFilesBody<'a> = (Vec<&'a str>, bool);
 
 const DBUS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DBUS_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 const DBUS_MUTATION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn enable_unit_files_body(unit: &str) -> EnableUnitFilesBody<'_> {
-    (vec![unit], false, false)
+    (vec!["machines.target", unit], false, false)
+}
+
+fn disable_unit_files_body(unit: &str) -> DisableUnitFilesBody<'_> {
+    (vec![unit], false)
 }
 
 fn machine_shell_process(request: &MachineShellRequest) -> (&str, Vec<String>) {
@@ -522,15 +527,21 @@ impl DbusBackend {
             "EnableUnitFiles",
             &enable_unit_files_body(&unit),
         )
-        .await
+        .await?;
+        // machinectl reloads systemd after changing the unit-file graph. Keep
+        // the D-Bus route behaviorally aligned with that native command.
+        self.reload_daemon().await
     }
 
     pub(crate) async fn disable(&self, name: &str) -> Result<()> {
         let name = parse_machine_name(name)?;
         let unit = name.systemd_nspawn_unit();
-        let files: Vec<&str> = vec![&unit];
-        self.call_systemd1::<_, Vec<(String, String, String)>>("DisableUnitFiles", &(files, false))
-            .await
+        self.call_systemd1::<_, Vec<(String, String, String)>>(
+            "DisableUnitFiles",
+            &disable_unit_files_body(&unit),
+        )
+        .await?;
+        self.reload_daemon().await
     }
 
     pub(crate) async fn kill(&self, name: &str, signal: AllowedSignal) -> Result<()> {
@@ -938,9 +949,22 @@ mod tests {
             .unwrap();
 
         assert_eq!(message.body().signature().to_string_no_parens(), "asbb");
-        assert_eq!(body.0, ["systemd-nspawn@test.service"]);
+        assert_eq!(body.0, ["machines.target", "systemd-nspawn@test.service"]);
         assert!(!body.1, "runtime must remain disabled");
         assert!(!body.2, "force must remain disabled");
+    }
+
+    #[test]
+    fn disable_unit_files_uses_systemd_manager_signature() {
+        let body = disable_unit_files_body("systemd-nspawn@test.service");
+        let message = zbus::Message::method_call("/org/freedesktop/systemd1", "DisableUnitFiles")
+            .unwrap()
+            .build(&body)
+            .unwrap();
+
+        assert_eq!(message.body().signature().to_string_no_parens(), "asb");
+        assert_eq!(body.0, ["systemd-nspawn@test.service"]);
+        assert!(!body.1, "runtime must remain disabled");
     }
 
     #[test]
