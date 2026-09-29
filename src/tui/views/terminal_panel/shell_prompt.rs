@@ -1,9 +1,9 @@
 //! Embedded selected-user shell prompt and terminal bridge.
 
 use crate::application::sessions::{
-    InteractiveShellEnvironment, SessionService, ShellOpenError, ShellOpenIntent, ShellTarget,
-    TerminalCommand, TerminalSessionEndpoint, TerminalSessionHandle, ValidatedGuestUserName,
-    WaylandShellRequest, X11SessionContext,
+    InteractiveShellEnvironment, SessionService, ShellOpenIntent, ShellTarget, TerminalCommand,
+    TerminalSessionEndpoint, TerminalSessionHandle, ValidatedGuestUserName, WaylandShellRequest,
+    X11SessionContext,
 };
 use crate::application::x11::{
     X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
@@ -273,39 +273,20 @@ async fn open_shell(
     x11: Option<X11SessionContext>,
     size: SessionSize,
 ) -> Result<(TerminalSessionHandle, bool), String> {
-    let (wayland, selection_failure) = match service.automatic_wayland(target.machine()).await {
-        Ok(wayland) => (wayland, None),
-        Err(error) => (WaylandShellRequest::Disabled, Some(error)),
-    };
     let mut intent = ShellOpenIntent::new(
         target,
-        wayland.clone(),
+        WaylandShellRequest::Automatic,
         InteractiveShellEnvironment::embedded(),
         size,
     );
     if let Some(x11) = x11 {
         intent = intent.with_x11(x11);
     }
-    match service.open_shell(intent.clone()).await {
-        Ok(handle) => Ok((handle, selection_failure.is_some())),
-        Err(ShellOpenError::WaylandPreparation(error)) if wayland.host_socket().is_some() => {
-            service
-                .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
-                .await
-                .map(|handle| (handle, true))
-                .map_err(|fallback| {
-                    format!(
-                    "Wayland validation failed: {error}; terminal-only fallback failed: {fallback}"
-                )
-                })
-        }
-        Err(error) => match selection_failure {
-            Some(selection) => Err(format!(
-                "Wayland selection failed: {selection}; terminal-only fallback failed: {error}"
-            )),
-            None => Err(error.to_string()),
-        },
-    }
+    service
+        .open_shell_with_fallback(intent, true)
+        .await
+        .map(|(handle, fallback)| (handle, fallback.is_some()))
+        .map_err(|error| error.to_string())
 }
 
 enum BridgeResult {

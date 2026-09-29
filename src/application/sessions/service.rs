@@ -1,7 +1,7 @@
 use super::{
     JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenError,
     ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionRequest,
-    TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
+    TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext,
     X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
@@ -42,20 +42,28 @@ impl SessionService {
         self.port.discover_host_wayland_sockets().await
     }
 
-    pub async fn automatic_wayland(
+    pub(super) async fn automatic_wayland(
         &self,
         machine: &MachineName,
-    ) -> Result<WaylandShellRequest, SessionError> {
-        self.port.automatic_wayland(machine).await.map(|socket| {
-            socket
-                .map(WaylandShellRequest::SelectedHostDisplay)
-                .unwrap_or(WaylandShellRequest::Disabled)
-        })
+    ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+        self.port.automatic_wayland(machine).await
     }
 
     pub async fn open_shell(
         &self,
         intent: ShellOpenIntent,
+    ) -> Result<TerminalSessionHandle, ShellOpenError> {
+        let socket = self
+            .resolve_shell_wayland(intent.target(), intent.wayland())
+            .await
+            .map_err(ShellOpenError::WaylandSelection)?;
+        self.open_prepared_shell(&intent, socket).await
+    }
+
+    pub(super) async fn open_prepared_shell(
+        &self,
+        intent: &ShellOpenIntent,
+        socket: Option<crate::domain::wayland::HostWaylandSocket>,
     ) -> Result<TerminalSessionHandle, ShellOpenError> {
         if intent
             .x11()
@@ -67,13 +75,11 @@ impl SessionService {
         }
         let terminal_environment = intent.terminal_environment().clone();
         let command = intent.command().cloned();
-        let mut environment = match intent.wayland() {
-            WaylandShellRequest::Disabled => {
-                TypedSessionEnvironment::terminal(terminal_environment)
-            }
-            WaylandShellRequest::SelectedHostDisplay(socket) => TypedSessionEnvironment::wayland(
+        let mut environment = match socket {
+            None => TypedSessionEnvironment::terminal(terminal_environment),
+            Some(socket) => TypedSessionEnvironment::wayland(
                 terminal_environment,
-                self.prepare_wayland(intent.target().clone(), socket.clone())
+                self.prepare_wayland(intent.target().clone(), socket)
                     .await
                     .map_err(ShellOpenError::WaylandPreparation)?,
             ),
@@ -159,6 +165,7 @@ mod tests {
     use crate::application::sessions::{
         journal_session_channel, terminal_session_channel, JournalSessionRequest, SessionPort,
         TerminalLaunch, TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
+        WaylandShellRequest,
     };
     use crate::domain::session::TerminalAttachmentKind;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};

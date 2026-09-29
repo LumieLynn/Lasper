@@ -8,8 +8,8 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::application::sessions::{
-    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellOpenError,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, ValidatedGuestUserName,
+    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellAttemptError,
+    ShellOpenError, ShellOpenIntent, ShellTarget, ValidatedGuestUserName, WaylandFallbackCause,
     WaylandShellRequest,
 };
 use crate::application::x11::{
@@ -17,7 +17,7 @@ use crate::application::x11::{
     X11SessionSelection,
 };
 use crate::domain::machine::MachineName;
-use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
+use crate::domain::wayland::WaylandDisplay;
 
 const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
 
@@ -47,7 +47,7 @@ pub(crate) enum ShellIoMode {
 pub(crate) struct ShellCommand {
     io_mode: ShellIoMode,
     target: ShellTarget,
-    wayland: ShellWaylandSelection,
+    wayland: WaylandShellRequest,
     x11: ShellX11Selection,
     command: Option<GuestCommand>,
     allow_wayland_fallback: bool,
@@ -88,13 +88,6 @@ impl ShellCommand {
     pub(crate) const fn requests_x11(&self) -> bool {
         !matches!(self.x11, ShellX11Selection::Disabled)
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ShellWaylandSelection {
-    Automatic,
-    Display(WaylandDisplay),
-    Disabled,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -382,22 +375,6 @@ pub(crate) async fn run_shell(
         x11,
         ..
     } = command;
-    let (wayland, discovery_fallback) =
-        match resolve_wayland_request(sessions, &target, wayland).await {
-            Ok(wayland) => (wayland, None),
-            Err(error) if allow_wayland_fallback => (
-                WaylandShellRequest::Disabled,
-                Some(WaylandFallbackCause::SocketSelection(error)),
-            ),
-            Err(error) => {
-                report_shell_error("Wayland socket selection failed", &error);
-                eprintln!(
-                    "lasper: hint: choose another display with --wayland=DISPLAY, or use \
-                 --no-wayland for a terminal-only session"
-                );
-                return 1;
-            }
-        };
     let uses_wayland = !matches!(&wayland, WaylandShellRequest::Disabled);
     let size = match io_mode {
         ShellIoMode::Interactive => {
@@ -453,25 +430,23 @@ pub(crate) async fn run_shell(
     if let Some(preparation) = x11 {
         intent = intent.with_x11(preparation.into_context());
     }
-    let (handle, probe_fallback) = match open_shell_with_wayland_fallback(
-        sessions,
-        intent,
-        allow_wayland_fallback && uses_wayland,
-    )
-    .await
+    let (handle, fallback) = match sessions
+        .open_shell_with_fallback(intent, allow_wayland_fallback)
+        .await
     {
-        Ok(handle) => handle,
+        Ok(opened) => opened,
         Err(ShellAttemptError::Initial(error)) => {
-            if let Some(cause) = &discovery_fallback {
-                report_wayland_fallback_failure(cause, &error);
+            let context = if matches!(&error, ShellOpenError::WaylandSelection(_)) {
+                "Wayland socket selection failed"
             } else {
-                report_shell_error("failed to open selected-user shell", error.session_error());
-                if uses_wayland && !allow_wayland_fallback {
-                    eprintln!(
-                        "lasper: hint: choose another display with --wayland=DISPLAY, or use \
-                         --no-wayland for a terminal-only session"
-                    );
-                }
+                "failed to open selected-user shell"
+            };
+            report_shell_error(context, error.session_error());
+            if uses_wayland && !allow_wayland_fallback {
+                eprintln!(
+                    "lasper: hint: choose another display with --wayland=DISPLAY, or use \
+                     --no-wayland for a terminal-only session"
+                );
             }
             return 1;
         }
@@ -480,11 +455,7 @@ pub(crate) async fn run_shell(
             return 1;
         }
     };
-
-    if let Some(notice) = wayland_fallback_notice(
-        quiet,
-        discovery_fallback.is_some() || probe_fallback.is_some(),
-    ) {
+    if let Some(notice) = wayland_fallback_notice(quiet, fallback.is_some()) {
         eprintln!("{notice}");
     }
 
@@ -540,101 +511,6 @@ fn report_x11_preparation(preparation: &X11SessionPreparation) {
     }
 }
 
-#[derive(Debug)]
-enum ShellAttemptError {
-    Initial(ShellOpenError),
-    Fallback {
-        cause: WaylandFallbackCause,
-        error: ShellOpenError,
-    },
-}
-
-#[derive(Debug)]
-enum WaylandFallbackCause {
-    SocketSelection(SessionError),
-    Validation(SessionError),
-}
-
-impl WaylandFallbackCause {
-    fn context(&self) -> &'static str {
-        match self {
-            Self::SocketSelection(_) => "Wayland socket selection failed",
-            Self::Validation(_) => "Wayland validation failed",
-        }
-    }
-
-    fn error(&self) -> &SessionError {
-        match self {
-            Self::SocketSelection(error) | Self::Validation(error) => error,
-        }
-    }
-}
-
-async fn open_shell_with_wayland_fallback(
-    sessions: &SessionService,
-    intent: ShellOpenIntent,
-    allow_fallback: bool,
-) -> Result<(TerminalSessionHandle, Option<WaylandFallbackCause>), ShellAttemptError> {
-    match sessions.open_shell(intent.clone()).await {
-        Ok(handle) => Ok((handle, None)),
-        Err(ShellOpenError::WaylandPreparation(error)) if allow_fallback => {
-            let cause = WaylandFallbackCause::Validation(error);
-            match sessions
-                .open_shell(intent.with_wayland(WaylandShellRequest::Disabled))
-                .await
-            {
-                Ok(handle) => Ok((handle, Some(cause))),
-                Err(error) => Err(ShellAttemptError::Fallback { cause, error }),
-            }
-        }
-        Err(error) => Err(ShellAttemptError::Initial(error)),
-    }
-}
-
-async fn resolve_wayland_request(
-    sessions: &SessionService,
-    target: &ShellTarget,
-    selection: ShellWaylandSelection,
-) -> Result<WaylandShellRequest, SessionError> {
-    if selection == ShellWaylandSelection::Disabled {
-        return Ok(WaylandShellRequest::Disabled);
-    }
-    if selection == ShellWaylandSelection::Automatic {
-        return sessions.automatic_wayland(target.machine()).await;
-    }
-
-    let sockets = sessions.discover_host_wayland_sockets().await;
-    let ShellWaylandSelection::Display(display) = selection else {
-        unreachable!("disabled and automatic Wayland selections returned before discovery")
-    };
-    let socket = select_wayland_socket(sockets, &display).map_err(SessionError::new)?;
-    Ok(WaylandShellRequest::SelectedHostDisplay(socket))
-}
-
-fn select_wayland_socket(
-    mut sockets: Vec<HostWaylandSocket>,
-    display: &WaylandDisplay,
-) -> Result<HostWaylandSocket, String> {
-    if sockets.is_empty() {
-        return Err("no usable host Wayland socket was discovered".into());
-    }
-
-    let Some(index) = sockets
-        .iter()
-        .position(|socket| socket.display() == display)
-    else {
-        let available = sockets
-            .iter()
-            .map(|socket| socket.display().as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(format!(
-            "Wayland display {display} was not discovered (available: {available})"
-        ));
-    };
-    Ok(sockets.remove(index))
-}
-
 fn report_shell_error(context: &str, error: &SessionError) {
     eprintln!("lasper: {context}: {error}");
     if let Some(hint) = error.hint() {
@@ -674,7 +550,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         ShellIoMode::Launcher => "launch",
     };
     let mut target = None;
-    let mut wayland = ShellWaylandSelection::Automatic;
+    let mut wayland = WaylandShellRequest::Automatic;
     let mut selection_was_explicit = false;
     let mut x11 = ShellX11Selection::Disabled;
     let mut x11_was_explicit = false;
@@ -695,17 +571,17 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         }
 
         let requested_wayland = if argument == "--wayland" {
-            Some(ShellWaylandSelection::Automatic)
+            Some(WaylandShellRequest::Automatic)
         } else if let Some(display) = argument.strip_prefix("--wayland=") {
             if display.is_empty() {
                 return Err("--wayland= requires a display name".into());
             }
-            Some(ShellWaylandSelection::Display(
+            Some(WaylandShellRequest::Display(
                 WaylandDisplay::new(display.to_string())
                     .map_err(|error| format!("invalid --wayland display: {error}"))?,
             ))
         } else if argument == "--no-wayland" {
-            Some(ShellWaylandSelection::Disabled)
+            Some(WaylandShellRequest::Disabled)
         } else {
             None
         };
@@ -808,7 +684,7 @@ fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCom
         return Err("launch requires a guest executable".into());
     }
     let allow_wayland_fallback =
-        io_mode == ShellIoMode::Interactive && wayland == ShellWaylandSelection::Automatic;
+        io_mode == ShellIoMode::Interactive && wayland == WaylandShellRequest::Automatic;
     Ok(ShellCommand {
         io_mode,
         target,
@@ -917,18 +793,6 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::sessions::{
-        journal_session_channel, terminal_session_channel, JournalSessionHandle,
-        JournalSessionRequest, SessionPort, TerminalLaunch, TerminalSessionHandle,
-        TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
-    };
-    use crate::domain::session::TerminalAttachmentKind;
-    use crate::domain::wayland::SocketRevision;
-    use async_trait::async_trait;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
-
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
     }
@@ -939,161 +803,6 @@ mod tests {
 
     fn parse_launcher(args: &[String]) -> Result<ShellCommand, String> {
         parse_shell_command(ShellIoMode::Launcher, args)
-    }
-
-    fn socket(display: &str, inode: u64) -> HostWaylandSocket {
-        HostWaylandSocket::from_verified_parts(
-            WaylandDisplay::new(display).unwrap(),
-            PathBuf::from("/run/user/1000"),
-            PathBuf::from(format!("/run/user/1000/{display}")),
-            1000,
-            1000,
-            1000,
-            0o700,
-            SocketRevision {
-                device: 1,
-                inode,
-                ctime_seconds: 1,
-                ctime_nanoseconds: 0,
-            },
-        )
-        .unwrap()
-    }
-
-    #[derive(Default)]
-    struct CountingSessionPort {
-        automatic_calls: AtomicUsize,
-        discovery_calls: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl SessionPort for CountingSessionPort {
-        async fn automatic_wayland(
-            &self,
-            _machine: &MachineName,
-        ) -> Result<Option<HostWaylandSocket>, SessionError> {
-            self.automatic_calls.fetch_add(1, Ordering::Relaxed);
-            Ok(None)
-        }
-
-        async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket> {
-            self.discovery_calls.fetch_add(1, Ordering::Relaxed);
-            Vec::new()
-        }
-
-        async fn open_terminal(
-            &self,
-            _request: TerminalSessionRequest,
-        ) -> Result<TerminalSessionHandle, SessionError> {
-            panic!("CLI preparation must not open a terminal")
-        }
-
-        async fn prepare_wayland(
-            &self,
-            _request: WaylandPreparationRequest,
-        ) -> Result<WaylandSessionContext, SessionError> {
-            panic!("disabled Wayland must not run a probe")
-        }
-
-        async fn probe_x11_projection(
-            &self,
-            _request: crate::application::sessions::X11ProjectionProbeRequest,
-        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
-            panic!("CLI preparation must not run an X11 probe")
-        }
-
-        async fn open_journal(
-            &self,
-            _request: JournalSessionRequest,
-        ) -> Result<JournalSessionHandle, SessionError> {
-            panic!("CLI preparation must not open a journal")
-        }
-    }
-
-    struct FallbackSessionPort {
-        prepare_calls: AtomicUsize,
-        open_calls: AtomicUsize,
-        open_wayland: parking_lot::Mutex<Vec<bool>>,
-        fail_fallback: bool,
-    }
-
-    impl FallbackSessionPort {
-        fn new(fail_fallback: bool) -> Self {
-            Self {
-                prepare_calls: AtomicUsize::new(0),
-                open_calls: AtomicUsize::new(0),
-                open_wayland: parking_lot::Mutex::new(Vec::new()),
-                fail_fallback,
-            }
-        }
-    }
-
-    #[async_trait]
-    impl SessionPort for FallbackSessionPort {
-        async fn automatic_wayland(
-            &self,
-            _machine: &MachineName,
-        ) -> Result<Option<HostWaylandSocket>, SessionError> {
-            Ok(Some(socket("wayland-0", 1)))
-        }
-
-        async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket> {
-            vec![socket("wayland-0", 1)]
-        }
-
-        async fn open_terminal(
-            &self,
-            request: TerminalSessionRequest,
-        ) -> Result<TerminalSessionHandle, SessionError> {
-            self.open_calls.fetch_add(1, Ordering::Relaxed);
-            let has_wayland = matches!(
-                &request.launch,
-                TerminalLaunch::SelectedUserShell { environment, .. }
-                    if environment.wayland_context().is_some()
-            );
-            self.open_wayland.lock().push(has_wayland);
-            if self.fail_fallback && !has_wayland {
-                return Err(SessionError::new("simulated terminal open failure"));
-            }
-            Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
-        }
-
-        async fn prepare_wayland(
-            &self,
-            _request: WaylandPreparationRequest,
-        ) -> Result<WaylandSessionContext, SessionError> {
-            self.prepare_calls.fetch_add(1, Ordering::Relaxed);
-            Err(SessionError::with_hint(
-                "simulated Wayland probe failure",
-                "simulated probe hint",
-            ))
-        }
-
-        async fn probe_x11_projection(
-            &self,
-            _request: crate::application::sessions::X11ProjectionProbeRequest,
-        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
-            panic!("Wayland fallback tests must not run an X11 probe")
-        }
-
-        async fn open_journal(
-            &self,
-            request: JournalSessionRequest,
-        ) -> Result<JournalSessionHandle, SessionError> {
-            Ok(journal_session_channel(request.id).0)
-        }
-    }
-
-    fn selected_wayland_intent() -> ShellOpenIntent {
-        ShellOpenIntent::new(
-            ShellTarget::new(
-                MachineName::new("demo").unwrap(),
-                ValidatedGuestUserName::new("alice").unwrap(),
-            ),
-            WaylandShellRequest::SelectedHostDisplay(socket("wayland-0", 1)),
-            InteractiveShellEnvironment::default(),
-            crate::domain::session::SessionSize::new(80, 24).unwrap(),
-        )
     }
 
     #[test]
@@ -1183,7 +892,7 @@ mod tests {
         assert!(command.permits_elevation());
         assert_eq!(command.target.user().as_str(), "alice");
         assert_eq!(command.target.machine().as_str(), "demo");
-        assert_eq!(command.wayland, ShellWaylandSelection::Automatic);
+        assert_eq!(command.wayland, WaylandShellRequest::Automatic);
         assert_eq!(command.x11, ShellX11Selection::Disabled);
         assert!(command.allows_wayland_fallback());
         assert!(command.command().is_none());
@@ -1217,11 +926,11 @@ mod tests {
             parse_interactive(&arguments(&["--wayland=wayland-1", "alice@demo"])).unwrap();
         assert_eq!(
             selected.wayland,
-            ShellWaylandSelection::Display(WaylandDisplay::new("wayland-1").unwrap())
+            WaylandShellRequest::Display(WaylandDisplay::new("wayland-1").unwrap())
         );
 
         let disabled = parse_interactive(&arguments(&["alice@demo", "--no-wayland"])).unwrap();
-        assert_eq!(disabled.wayland, ShellWaylandSelection::Disabled);
+        assert_eq!(disabled.wayland, WaylandShellRequest::Disabled);
         assert!(!disabled.allows_wayland_fallback());
 
         let automatic = parse_interactive(&arguments(&["--wayland", "alice@demo"])).unwrap();
@@ -1332,70 +1041,6 @@ mod tests {
         assert!(parse_launcher(&arguments(&["alice@demo"])).is_err());
     }
 
-    #[tokio::test]
-    async fn interactive_wayland_probe_retries_once_without_wayland() {
-        let port = Arc::new(FallbackSessionPort::new(false));
-        let service = SessionService::new(port.clone());
-        let (mut handle, used_fallback) =
-            open_shell_with_wayland_fallback(&service, selected_wayland_intent(), true)
-                .await
-                .unwrap();
-
-        assert!(matches!(
-            used_fallback,
-            Some(WaylandFallbackCause::Validation(_))
-        ));
-        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(*port.open_wayland.lock(), [false]);
-        handle.close();
-    }
-
-    #[tokio::test]
-    async fn explicit_wayland_failure_does_not_retry() {
-        let port = Arc::new(FallbackSessionPort::new(false));
-        let service = SessionService::new(port.clone());
-        let error = match open_shell_with_wayland_fallback(
-            &service,
-            selected_wayland_intent(),
-            false,
-        )
-        .await
-        {
-            Err(error) => error,
-            Ok(_) => panic!("explicit Wayland failure unexpectedly opened a shell"),
-        };
-
-        assert!(matches!(
-            error,
-            ShellAttemptError::Initial(ShellOpenError::WaylandPreparation(_))
-        ));
-        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(port.open_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn wayland_fallback_failure_is_reported_as_fallback_error() {
-        let port = Arc::new(FallbackSessionPort::new(true));
-        let service = SessionService::new(port.clone());
-        let error =
-            match open_shell_with_wayland_fallback(&service, selected_wayland_intent(), true).await
-            {
-                Err(error) => error,
-                Ok(_) => panic!("Wayland fallback unexpectedly succeeded"),
-            };
-
-        assert!(matches!(
-            error,
-            ShellAttemptError::Fallback {
-                cause: WaylandFallbackCause::Validation(_),
-                error: ShellOpenError::Terminal(_),
-            }
-        ));
-        assert_eq!(port.prepare_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(port.open_calls.load(Ordering::Relaxed), 1);
-    }
-
     #[test]
     fn quiet_suppresses_the_successful_wayland_fallback_notice() {
         assert_eq!(
@@ -1445,57 +1090,5 @@ mod tests {
             let error = parse_shell_command(mode, &command_args).unwrap_err();
             assert!(error.contains("does not support --quiet"), "{error}");
         }
-    }
-
-    #[test]
-    fn exact_display_selection_uses_all_discovered_sockets() {
-        let selected = select_wayland_socket(
-            vec![socket("wayland-0", 1), socket("wayland-1", 2)],
-            &WaylandDisplay::new("wayland-1").unwrap(),
-        )
-        .unwrap();
-
-        assert_eq!(selected.display().as_str(), "wayland-1");
-        assert!(select_wayland_socket(
-            vec![socket("wayland-0", 1)],
-            &WaylandDisplay::new("wayland-2").unwrap(),
-        )
-        .unwrap_err()
-        .contains("available: wayland-0"));
-    }
-
-    #[tokio::test]
-    async fn disabled_wayland_skips_discovery_and_probe() {
-        let port = Arc::new(CountingSessionPort::default());
-        let sessions = SessionService::new(port.clone());
-        let target = ShellTarget::new(
-            MachineName::new("demo").unwrap(),
-            ValidatedGuestUserName::new("alice").unwrap(),
-        );
-        let request = resolve_wayland_request(&sessions, &target, ShellWaylandSelection::Disabled)
-            .await
-            .unwrap();
-
-        assert!(matches!(request, WaylandShellRequest::Disabled));
-        assert_eq!(port.automatic_calls.load(Ordering::Relaxed), 0);
-        assert_eq!(port.discovery_calls.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn automatic_wayland_uses_machine_aware_selection_only() {
-        let port = Arc::new(CountingSessionPort::default());
-        let sessions = SessionService::new(port.clone());
-        let target = ShellTarget::new(
-            MachineName::new("demo").unwrap(),
-            ValidatedGuestUserName::new("alice").unwrap(),
-        );
-
-        let request = resolve_wayland_request(&sessions, &target, ShellWaylandSelection::Automatic)
-            .await
-            .unwrap();
-
-        assert!(matches!(request, WaylandShellRequest::Disabled));
-        assert_eq!(port.automatic_calls.load(Ordering::Relaxed), 1);
-        assert_eq!(port.discovery_calls.load(Ordering::Relaxed), 0);
     }
 }

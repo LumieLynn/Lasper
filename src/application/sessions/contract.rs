@@ -1,6 +1,6 @@
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
-use crate::domain::wayland::HostWaylandSocket;
+use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::domain::x11::HostX11Socket;
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -347,22 +347,14 @@ impl ShellTarget {
 
 /// Optional Wayland context requested for one selected-user shell.
 ///
-/// The host socket is produced by the local discovery adapter. The UI never
-/// submits an arbitrary path, and the session adapter must revalidate this
-/// evidence against the static `.nspawn` projection before opening the PTY.
+/// Automatic and named selections are resolved by the session service. A
+/// preselected socket still needs validation against the static projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WaylandShellRequest {
+    Automatic,
+    Display(WaylandDisplay),
     Disabled,
     SelectedHostDisplay(HostWaylandSocket),
-}
-
-impl WaylandShellRequest {
-    pub fn host_socket(&self) -> Option<&HostWaylandSocket> {
-        match self {
-            Self::Disabled => None,
-            Self::SelectedHostDisplay(socket) => Some(socket),
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -395,11 +387,6 @@ impl ShellOpenIntent {
     /// Attach a command to the selected-user shell request.
     pub fn with_command(mut self, command: GuestCommand) -> Self {
         self.command = Some(command);
-        self
-    }
-
-    pub(crate) fn with_wayland(mut self, wayland: WaylandShellRequest) -> Self {
-        self.wayland = wayland;
         self
     }
 
@@ -856,6 +843,8 @@ impl From<std::io::Error> for SessionError {
 #[derive(Debug, thiserror::Error)]
 pub enum ShellOpenError {
     #[error("{0}")]
+    WaylandSelection(#[source] SessionError),
+    #[error("{0}")]
     X11Context(#[source] SessionError),
     #[error("{0}")]
     WaylandPreparation(#[source] SessionError),
@@ -866,9 +855,10 @@ pub enum ShellOpenError {
 impl ShellOpenError {
     pub fn session_error(&self) -> &SessionError {
         match self {
-            Self::X11Context(error) | Self::WaylandPreparation(error) | Self::Terminal(error) => {
-                error
-            }
+            Self::WaylandSelection(error)
+            | Self::X11Context(error)
+            | Self::WaylandPreparation(error)
+            | Self::Terminal(error) => error,
         }
     }
 }

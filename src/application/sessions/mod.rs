@@ -1,5 +1,6 @@
 mod contract;
 mod service;
+mod shell;
 
 #[allow(unused_imports)]
 pub use contract::{
@@ -12,6 +13,7 @@ pub use contract::{
     X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
 };
 pub use service::SessionService;
+pub use shell::{ShellAttemptError, WaylandFallbackCause};
 
 pub(crate) use contract::{
     journal_session_channel, terminal_session_channel, TerminalCommand, TerminalLaunch,
