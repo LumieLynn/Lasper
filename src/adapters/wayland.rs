@@ -5,7 +5,7 @@ use crate::domain::wayland::{
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-pub(crate) const CONTAINER_WAYLAND_ROOT: &str = "/run/lasper/wayland";
+pub(crate) const CONTAINER_WAYLAND_ROOT: &str = crate::domain::wayland::CONTAINER_WAYLAND_ROOT;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WaylandBind {
@@ -42,9 +42,7 @@ impl WaylandBind {
 }
 
 pub(crate) fn container_socket_path(uid: u32, display: &WaylandDisplay) -> PathBuf {
-    Path::new(CONTAINER_WAYLAND_ROOT)
-        .join(uid.to_string())
-        .join(display.as_str())
+    crate::domain::wayland::container_socket_path(uid, display)
 }
 
 /// Re-observe a previously captured host socket and require an exact metadata

@@ -1,4 +1,4 @@
-//! Finite X11 bind edits for Configure. Preview and apply share the same
+//! Finite display-bind edits for Configure. Preview and apply share the same
 //! policy checks and byte-preserving patch calculation.
 
 use std::collections::BTreeMap;
@@ -9,17 +9,22 @@ use super::inspection::{inspect, inspect_at};
 use super::patch::SourceMutation;
 use super::projection::x11_scope;
 use super::write::{prepare_patch, Preparation};
-use crate::adapters::config::nspawn_file::{escape_nspawn_bind_path, is_nvidia_begin_marker};
+use crate::adapters::config::nspawn_file::{
+    encode_nspawn_bind_value, is_nvidia_begin_marker, nspawn_bind_key,
+};
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview,
-    ConfigurationSnapshot, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
-    X11BindingScope,
+    ConfigurationSnapshot, DisplayBindRecommendation, WaylandBindingChange,
+    WaylandBindingDeclaration, X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
 use crate::domain::machine::MachineName;
+use crate::domain::wayland::WaylandDisplay;
+use crate::domain::x11::X11_SOCKET_BIND_READ_ONLY;
 
 const MAX_X11_CHANGES: usize = 128;
+const MAX_WAYLAND_CHANGES: usize = 128;
 const MAX_CONFIG_PATH_BYTES: usize = 4096;
 
 pub(crate) async fn preview(edit: ConfigurationEdit) -> Result<ConfigurationPreview> {
@@ -38,8 +43,8 @@ pub(crate) async fn apply(edit: ConfigurationEdit) -> Result<ConfigurationApplyR
     apply_with_sources(
         edit,
         initial,
-        PathBuf::from("/etc/systemd/nspawn"),
-        PathBuf::from("/run/systemd/nspawn"),
+        crate::paths::nspawn_config_dir(),
+        crate::paths::nspawn_runtime_config_dir(),
         crate::paths::machines_dir(),
     )
     .await
@@ -96,23 +101,44 @@ fn prepare(snapshot: &ConfigurationSnapshot, edit: &ConfigurationEdit) -> Prepar
             "A single draft may change at most {MAX_X11_CHANGES} X11 declarations"
         ));
     }
+    if edit.wayland_changes.len() > MAX_WAYLAND_CHANGES {
+        return Preparation::Blocked(format!(
+            "A single draft may change at most {MAX_WAYLAND_CHANGES} Wayland declarations"
+        ));
+    }
 
     prepare_patch(snapshot, &edit.target, &edit.base_revision, |document| {
-        calculate_mutations(
+        plan_display_mutations(
             document,
             &snapshot.x11_bindings,
             &snapshot.x11_bind_recommendation,
+            &snapshot.wayland_bindings,
+            &snapshot.wayland_bind_recommendation,
             edit,
         )
     })
 }
 
-fn calculate_mutations(
+fn plan_display_mutations(
     document: &NspawnDocument<'_>,
-    declarations: &[X11BindingDeclaration],
-    recommendation: &X11BindRecommendation,
+    x11_declarations: &[X11BindingDeclaration],
+    x11_recommendation: &DisplayBindRecommendation,
+    wayland_declarations: &[WaylandBindingDeclaration],
+    wayland_recommendation: &DisplayBindRecommendation,
     edit: &ConfigurationEdit,
 ) -> std::result::Result<Vec<SourceMutation>, String> {
+    enum Requested<'a> {
+        X11(&'a X11BindingChange),
+        Wayland(&'a WaylandBindingChange),
+    }
+    enum Addition<'a> {
+        X11(&'a Path),
+        Wayland {
+            source: &'a Path,
+            guest_target: &'a Path,
+        },
+    }
+
     let lines = document.lines();
     let mut requested = BTreeMap::new();
     let mut additions = Vec::new();
@@ -120,40 +146,57 @@ fn calculate_mutations(
         match change.declaration_line() {
             Some(0) => return Err("Declaration line numbers start at one".into()),
             Some(line) => {
-                if requested.insert(line, change).is_some() {
+                if requested.insert(line, Requested::X11(change)).is_some() {
                     return Err(format!(
                         "Line {line} is changed more than once in this draft"
                     ));
                 }
             }
-            None => additions.push(change),
+            None => match change {
+                X11BindingChange::Add { source } => additions.push(Addition::X11(source)),
+                _ => unreachable!("X11 changes without declaration lines are additions"),
+            },
+        }
+    }
+    for change in &edit.wayland_changes {
+        match change.declaration_line() {
+            Some(0) => return Err("Declaration line numbers start at one".into()),
+            Some(line) => {
+                if requested.insert(line, Requested::Wayland(change)).is_some() {
+                    return Err(format!(
+                        "Line {line} is changed more than once in this draft"
+                    ));
+                }
+            }
+            None => match change {
+                WaylandBindingChange::Add {
+                    source,
+                    guest_target,
+                } => additions.push(Addition::Wayland {
+                    source,
+                    guest_target,
+                }),
+                _ => unreachable!("Wayland changes without declaration lines are additions"),
+            },
         }
     }
 
     let mut mutations = Vec::with_capacity(requested.len());
-    let final_targets = document
+    let mut occupied_targets = document
         .bind_destinations()
         .into_iter()
         .filter_map(|(line, target)| match requested.get(&line) {
-            Some(X11BindingChange::Add { .. }) => {
-                unreachable!("additions are not indexed by declaration line")
-            }
-            Some(X11BindingChange::Remove { .. }) => None,
-            Some(X11BindingChange::Update { guest_target, .. }) => {
+            Some(Requested::X11(X11BindingChange::Remove { .. }))
+            | Some(Requested::Wayland(WaylandBindingChange::Remove { .. })) => None,
+            Some(Requested::X11(X11BindingChange::Update { guest_target, .. }))
+            | Some(Requested::Wayland(WaylandBindingChange::Update { guest_target, .. })) => {
                 Some((line, guest_target.clone()))
             }
+            Some(_) => unreachable!("additions are not indexed by declaration line"),
             None => Some((line, target)),
         })
         .collect::<Vec<_>>();
     for (line_number, change) in requested {
-        let Some(declaration) = declarations
-            .iter()
-            .find(|declaration| declaration.line == line_number)
-        else {
-            return Err(format!(
-                "Line {line_number} is not a recognized X11 bind in this revision"
-            ));
-        };
         let Some(line) = lines.get(line_number - 1) else {
             return Err(format!("Line {line_number} no longer exists"));
         };
@@ -164,46 +207,27 @@ fn calculate_mutations(
         }
 
         let new = match change {
-            X11BindingChange::Add { .. } => {
-                unreachable!("additions are not indexed by declaration line")
-            }
-            X11BindingChange::Remove { .. } => None,
-            X11BindingChange::Update {
-                source,
-                guest_target,
-                readonly,
-                ..
-            } => {
-                validate_source(source)
-                    .map_err(|reason| format!("Line {line_number}: {reason}"))?;
-                validate_guest_target(guest_target)
-                    .map_err(|reason| format!("Line {line_number}: {reason}"))?;
-                if guest_target != &declaration.guest_target
-                    && final_targets.iter().any(|(other_line, target)| {
-                        *other_line != line_number && target == guest_target
-                    })
-                {
-                    return Err(format!(
-                        "Line {line_number}: guest target {} is already used by another bind",
-                        guest_target.display()
-                    ));
-                }
-                if source == &declaration.source
-                    && guest_target == &declaration.guest_target
-                    && readonly == &declaration.readonly
-                {
-                    continue;
-                }
-                Some(render_binding(
-                    line.body(),
-                    line.ending(),
-                    declaration,
-                    source,
-                    guest_target,
-                    *readonly,
-                ))
-            }
+            Requested::X11(change) => calculate_x11_replacement(
+                line_number,
+                line.body(),
+                line.ending(),
+                x11_declarations,
+                &occupied_targets,
+                change,
+            )?,
+            Requested::Wayland(change) => calculate_wayland_replacement(
+                line_number,
+                line.body(),
+                line.ending(),
+                wayland_declarations,
+                &occupied_targets,
+                change,
+            )?,
         };
+        let unchanged = format!("{}{}", line.body(), line.ending());
+        if new.as_ref() == Some(&unchanged) {
+            continue;
+        }
         mutations.push(SourceMutation {
             line: line.number(),
             start: line.start(),
@@ -222,46 +246,196 @@ fn calculate_mutations(
         });
     }
 
-    if !additions.is_empty() {
-        let idmapped = match recommendation {
-            X11BindRecommendation::Ready { idmapped, .. } => *idmapped,
-            X11BindRecommendation::Unsupported { reason, .. } => return Err(reason.clone()),
+    let mut encoded_additions = Vec::with_capacity(additions.len());
+    for addition in additions {
+        let (target, binding) = match addition {
+            Addition::X11(source) => {
+                let idmapped = recommendation_idmap(x11_recommendation, "X11")?;
+                validate_x11_source(source).map_err(|reason| format!("New X11 bind: {reason}"))?;
+                if !matches!(x11_scope(source), Some(X11BindingScope::Socket { .. })) {
+                    return Err(format!(
+                        "New X11 bind: {} is not an individual X11 socket endpoint",
+                        source.display()
+                    ));
+                }
+                (
+                    source.to_path_buf(),
+                    encode_new_x11_directive(source, idmapped),
+                )
+            }
+            Addition::Wayland {
+                source,
+                guest_target,
+            } => {
+                let idmapped = recommendation_idmap(wayland_recommendation, "Wayland")?;
+                validate_wayland_source(source)
+                    .map_err(|reason| format!("New Wayland bind: {reason}"))?;
+                validate_guest_target(guest_target)
+                    .map_err(|reason| format!("New Wayland bind: {reason}"))?;
+                (
+                    guest_target.to_path_buf(),
+                    encode_new_wayland_directive(source, guest_target, idmapped),
+                )
+            }
         };
-        let mut rendered = Vec::with_capacity(additions.len());
-        let mut occupied_targets = final_targets
-            .into_iter()
-            .map(|(_, target)| target)
-            .collect::<Vec<_>>();
-        for change in additions {
-            let X11BindingChange::Add { source } = change else {
-                unreachable!("changes without declaration lines are additions")
-            };
-            validate_source(source).map_err(|reason| format!("New X11 bind: {reason}"))?;
-            if !matches!(x11_scope(source), Some(X11BindingScope::Socket { .. })) {
-                return Err(format!(
-                    "New X11 bind: {} is not an individual X11 socket endpoint",
-                    source.display()
-                ));
-            }
-            if occupied_targets.iter().any(|target| target == source) {
-                return Err(format!(
-                    "New X11 bind: guest target {} is already used by another bind",
-                    source.display()
-                ));
-            }
-            occupied_targets.push(source.clone());
-            rendered.push(render_new_binding(source, idmapped));
+        if occupied_targets
+            .iter()
+            .any(|(_, occupied)| occupied == &target)
+        {
+            return Err(format!(
+                "New display bind: guest target {} is already used by another bind",
+                target.display()
+            ));
         }
-        mutations.push(insertion_mutation(document, &rendered));
+        occupied_targets.push((0, target));
+        encoded_additions.push(binding);
+    }
+    if !encoded_additions.is_empty() {
+        mutations.push(insertion_mutation(document, &encoded_additions));
     }
     Ok(mutations)
 }
 
-fn validate_source(path: &Path) -> std::result::Result<(), &'static str> {
+fn recommendation_idmap(
+    recommendation: &DisplayBindRecommendation,
+    label: &str,
+) -> std::result::Result<bool, String> {
+    match recommendation {
+        DisplayBindRecommendation::Ready { idmapped, .. } => Ok(*idmapped),
+        DisplayBindRecommendation::Unsupported { reason, .. } => {
+            Err(format!("New {label} bind: {reason}"))
+        }
+    }
+}
+
+fn calculate_x11_replacement(
+    line_number: usize,
+    old_body: &str,
+    ending: &str,
+    declarations: &[X11BindingDeclaration],
+    occupied_targets: &[(usize, PathBuf)],
+    change: &X11BindingChange,
+) -> std::result::Result<Option<String>, String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.line == line_number)
+        .ok_or_else(|| {
+            format!("Line {line_number} is not a recognized X11 bind in this revision")
+        })?;
+    match change {
+        X11BindingChange::Add { .. } => {
+            unreachable!("additions are not indexed by declaration line")
+        }
+        X11BindingChange::Remove { .. } => Ok(None),
+        X11BindingChange::Update {
+            source,
+            guest_target,
+            readonly,
+            ..
+        } => {
+            validate_x11_source(source)
+                .map_err(|reason| format!("Line {line_number}: {reason}"))?;
+            validate_guest_target(guest_target)
+                .map_err(|reason| format!("Line {line_number}: {reason}"))?;
+            reject_occupied_target(line_number, guest_target, occupied_targets)?;
+            if source == &declaration.source
+                && guest_target == &declaration.guest_target
+                && readonly == &declaration.readonly
+            {
+                return Ok(Some(format!("{old_body}{ending}")));
+            }
+            Ok(Some(encode_x11_replacement(
+                old_body,
+                ending,
+                declaration,
+                source,
+                guest_target,
+                *readonly,
+            )))
+        }
+    }
+}
+
+fn calculate_wayland_replacement(
+    line_number: usize,
+    old_body: &str,
+    ending: &str,
+    declarations: &[WaylandBindingDeclaration],
+    occupied_targets: &[(usize, PathBuf)],
+    change: &WaylandBindingChange,
+) -> std::result::Result<Option<String>, String> {
+    let declaration = declarations
+        .iter()
+        .find(|declaration| declaration.line == line_number)
+        .ok_or_else(|| {
+            format!("Line {line_number} is not a recognized Wayland bind in this revision")
+        })?;
+    match change {
+        WaylandBindingChange::Add { .. } => {
+            unreachable!("additions are not indexed by declaration line")
+        }
+        WaylandBindingChange::Remove { .. } => Ok(None),
+        WaylandBindingChange::Update {
+            source,
+            guest_target,
+            readonly,
+            ..
+        } => {
+            validate_wayland_source(source)
+                .map_err(|reason| format!("Line {line_number}: {reason}"))?;
+            validate_guest_target(guest_target)
+                .map_err(|reason| format!("Line {line_number}: {reason}"))?;
+            reject_occupied_target(line_number, guest_target, occupied_targets)?;
+            if source == &declaration.source
+                && guest_target == &declaration.guest_target
+                && readonly == &declaration.readonly
+            {
+                return Ok(Some(format!("{old_body}{ending}")));
+            }
+            Ok(Some(encode_wayland_replacement(
+                old_body,
+                ending,
+                declaration,
+                source,
+                guest_target,
+                *readonly,
+            )))
+        }
+    }
+}
+
+fn reject_occupied_target(
+    line_number: usize,
+    guest_target: &Path,
+    occupied_targets: &[(usize, PathBuf)],
+) -> std::result::Result<(), String> {
+    if occupied_targets
+        .iter()
+        .any(|(other_line, target)| *other_line != line_number && target == guest_target)
+    {
+        return Err(format!(
+            "Line {line_number}: guest target {} is already used by another bind",
+            guest_target.display()
+        ));
+    }
+    Ok(())
+}
+
+fn validate_x11_source(path: &Path) -> std::result::Result<(), &'static str> {
     validate_plain_absolute_path(path, "X11 source")?;
     if x11_scope(path).is_none() {
         return Err("source must be /tmp/.X11-unix or one of its X<number> endpoints");
     }
+    Ok(())
+}
+
+fn validate_wayland_source(path: &Path) -> std::result::Result<(), &'static str> {
+    validate_plain_absolute_path(path, "Wayland source")?;
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return Err("Wayland source has no display name");
+    };
+    WaylandDisplay::new(name.to_owned())
+        .map_err(|_| "Wayland source has an invalid display name")?;
     Ok(())
 }
 
@@ -286,6 +460,7 @@ fn validate_plain_absolute_path(
     if !path.is_absolute() {
         return Err(match label {
             "X11 source" => "X11 source must be absolute",
+            "Wayland source" => "Wayland source must be absolute",
             _ => "guest target must be absolute",
         });
     }
@@ -301,7 +476,7 @@ fn validate_plain_absolute_path(
     Ok(())
 }
 
-fn render_binding(
+fn encode_x11_replacement(
     old_body: &str,
     ending: &str,
     declaration: &X11BindingDeclaration,
@@ -309,25 +484,69 @@ fn render_binding(
     guest_target: &Path,
     readonly: bool,
 ) -> String {
-    let indent_len = old_body.len() - old_body.trim_start().len();
-    let indent = &old_body[..indent_len];
-    let key = if readonly { "BindReadOnly" } else { "Bind" };
-    let source = escape_nspawn_bind_path(source.to_str().expect("validated UTF-8 path"));
-    let target =
-        escape_nspawn_bind_path(guest_target.to_str().expect("validated UTF-8 guest target"));
-    let mut rendered = format!("{indent}{key}={source}:{target}");
-    if !declaration.options.is_empty() {
-        rendered.push(':');
-        rendered.push_str(&declaration.options.join(","));
-    }
-    rendered.push_str(ending);
-    rendered
+    encode_display_replacement(
+        old_body,
+        ending,
+        source,
+        guest_target,
+        readonly,
+        &declaration.options,
+    )
 }
 
-fn render_new_binding(source: &Path, idmapped: bool) -> String {
-    let source = escape_nspawn_bind_path(source.to_str().expect("validated UTF-8 path"));
-    let suffix = if idmapped { ":idmap" } else { "" };
-    format!("BindReadOnly={source}:{source}{suffix}")
+fn encode_wayland_replacement(
+    old_body: &str,
+    ending: &str,
+    declaration: &WaylandBindingDeclaration,
+    source: &Path,
+    guest_target: &Path,
+    readonly: bool,
+) -> String {
+    encode_display_replacement(
+        old_body,
+        ending,
+        source,
+        guest_target,
+        readonly,
+        &declaration.options,
+    )
+}
+
+fn encode_display_replacement(
+    old_body: &str,
+    ending: &str,
+    source: &Path,
+    guest_target: &Path,
+    readonly: bool,
+    options: &[String],
+) -> String {
+    let indent_len = old_body.len() - old_body.trim_start().len();
+    let indent = &old_body[..indent_len];
+    let options = (!options.is_empty()).then(|| options.join(","));
+    format!(
+        "{indent}{}={}{}",
+        nspawn_bind_key(readonly),
+        encode_nspawn_bind_value(source, Some(guest_target), options.as_deref()),
+        ending
+    )
+}
+
+fn encode_new_x11_directive(source: &Path, idmapped: bool) -> String {
+    let suffix = idmapped.then_some("idmap");
+    format!(
+        "{}={}",
+        nspawn_bind_key(X11_SOCKET_BIND_READ_ONLY),
+        encode_nspawn_bind_value(source, Some(source), suffix)
+    )
+}
+
+fn encode_new_wayland_directive(source: &Path, target: &Path, idmapped: bool) -> String {
+    let suffix = idmapped.then_some("idmap");
+    format!(
+        "{}={}",
+        nspawn_bind_key(false),
+        encode_nspawn_bind_value(source, Some(target), suffix)
+    )
 }
 
 fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> SourceMutation {
@@ -436,6 +655,7 @@ mod tests {
             target: ConfigurationTarget::Machine(MachineName::new("arch").unwrap()),
             base_revision: revision,
             x11_changes: changes,
+            wayland_changes: vec![],
         }
     }
 
@@ -647,6 +867,42 @@ mod tests {
     }
 
     #[test]
+    fn x11_and_wayland_additions_share_one_ordered_insertion() {
+        let source = "[Files]\nBind=/dev/dri\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nX-Lasper-Nvidia-End=true\n";
+        let (snapshot, revision) = fixture(source);
+        let mut request = edit(
+            revision,
+            vec![X11BindingChange::Add {
+                source: "/tmp/.X11-unix/X0".into(),
+            }],
+        );
+        request.wayland_changes = vec![WaylandBindingChange::Add {
+            source: "/run/user/1000/wayland-1".into(),
+            guest_target: "/run/lasper/wayland/1000/wayland-1".into(),
+        }];
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(
+            change.after,
+            "[Files]\nBind=/dev/dri\nBindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap\nBind=/run/user/1000/wayland-1:/run/lasper/wayland/1000/wayland-1:idmap\nX-Lasper-Nvidia-Begin=managed-by-lasper\nBind=/dev/nvidia0\nX-Lasper-Nvidia-End=true\n"
+        );
+    }
+
+    #[test]
+    fn removes_a_custom_target_wayland_declaration_by_source_line() {
+        let source =
+            "[Files]\nBind=/run/user/1000/wayland-1:/mnt/wayland-socket:idmap\nBind=/dev/dri\n";
+        let (snapshot, revision) = fixture(source);
+        let mut request = edit(revision, vec![]);
+        request.wayland_changes = vec![WaylandBindingChange::Remove { line: 2 }];
+        let Preparation::Ready(change) = prepare(&snapshot, &request) else {
+            panic!("expected a ready change");
+        };
+        assert_eq!(change.after, "[Files]\nBind=/dev/dri\n");
+    }
+
+    #[test]
     fn additions_reject_directory_wide_or_non_x11_sources() {
         for source in ["/tmp/.X11-unix", "/tmp/not-x11/X0"] {
             let (snapshot, revision) = fixture("[Files]\n");
@@ -787,6 +1043,7 @@ mod tests {
                 guest_target: "/tmp/.X11-unix/X0".into(),
                 readonly: true,
             }],
+            wayland_changes: vec![],
         };
 
         let report = apply_with_sources(request, snapshot, admin, runtime, images)
@@ -814,6 +1071,7 @@ mod tests {
             target,
             base_revision: snapshot.revision.clone().unwrap(),
             x11_changes: vec![X11BindingChange::Remove { line: 2 }],
+            wayland_changes: vec![],
         };
         std::fs::write(&path, "# external edit\n[Files]\nBind=/tmp/.X11-unix\n").unwrap();
 

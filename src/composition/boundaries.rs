@@ -204,6 +204,30 @@ fn tui_production_does_not_hold_host_transport_or_composition_mode() {
 }
 
 #[test]
+fn configuration_pages_do_not_depend_on_the_app_coordinator() {
+    let sources = rust_sources("src/tui/configuration")
+        .into_iter()
+        .map(|(path, source)| (path, production_source(&source)))
+        .collect::<Vec<_>>();
+
+    assert_absent(
+        "configuration workspace/app coordinator",
+        &sources,
+        &["crate::tui::app::", "super::App", "impl App"],
+    );
+
+    let sources = rust_sources("src/tui/app/configuration")
+        .into_iter()
+        .map(|(path, source)| (path, production_source(&source)))
+        .collect::<Vec<_>>();
+    assert_absent(
+        "app/configuration concrete page dispatch",
+        &sources,
+        &["X11Page", "WaylandPage", "ConfigurationPageAction::"],
+    );
+}
+
+#[test]
 fn provisioning_contract_does_not_depend_on_nspawn_models() {
     let sources = rust_sources("src/application/provisioning");
 

@@ -51,7 +51,6 @@ impl Component for HelpOverlay {
             spacer_row(),
             category_row(" Terminal ", header_style),
             key_row("t", "Open selected-user shell", key_style, desc_style),
-            key_row("Ctrl+t", "Open shell options", key_style, desc_style),
             key_row(
                 "Space, then t/l",
                 "Shell or login terminal",

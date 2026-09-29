@@ -6,34 +6,18 @@ pub enum AppMessage {
     Wizard(WizardMessage),
     Container(ContainerMessage),
     List(ListMessage),
-    Session(SessionMessage),
     Configuration(ConfigurationMessage),
 }
 
 #[derive(Debug, PartialEq)]
 pub enum ConfigurationMessage {
+    CheckWayland,
+    EnterWaylandShell,
+    CloseWaylandSession,
     CheckX11,
     AuthorizeX11,
     RevokeX11,
-    CloseX11Access,
-}
-
-#[derive(Debug, PartialEq)]
-pub enum SessionMessage {
-    OpenShell {
-        machine: crate::domain::machine::MachineName,
-        user: crate::application::sessions::ValidatedGuestUserName,
-        wayland: crate::application::sessions::WaylandShellRequest,
-    },
-    TestWayland {
-        machine: crate::domain::machine::MachineName,
-        user: crate::application::sessions::ValidatedGuestUserName,
-        host_socket: crate::domain::wayland::HostWaylandSocket,
-        available_sockets: Vec<crate::domain::wayland::HostWaylandSocket>,
-    },
-    DialogSubmit,
-    DialogTestWayland,
-    DialogCancel,
+    CloseX11Authorization,
 }
 
 #[derive(Debug, PartialEq)]

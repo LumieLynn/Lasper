@@ -95,12 +95,12 @@ impl Component for Button {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::core::SessionMessage;
+    use crate::tui::core::ConfigurationMessage;
 
     #[test]
     fn disabled_button_is_not_focusable_and_emits_no_message() {
         let mut button = Button::new("Disabled", || {
-            AppMessage::Session(SessionMessage::DialogSubmit)
+            AppMessage::Configuration(ConfigurationMessage::CloseX11Authorization)
         })
         .with_enabled(false);
 

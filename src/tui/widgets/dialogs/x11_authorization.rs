@@ -34,7 +34,7 @@ macro_rules! active_components {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum X11AccessDialogAction {
+pub(crate) enum X11AuthorizationDialogAction {
     None,
     Close,
     Check {
@@ -190,7 +190,7 @@ struct PendingRevocation {
     host_uid: u32,
 }
 
-pub(crate) struct X11AccessDialog {
+pub(crate) struct X11AuthorizationDialog {
     machine: MachineName,
     sockets: SelectableList<HostX11Socket>,
     guest_user: TextBox,
@@ -208,7 +208,7 @@ pub(crate) struct X11AccessDialog {
     pending_revocation: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl X11AccessDialog {
+impl X11AuthorizationDialog {
     pub(crate) fn new(
         machine: MachineName,
         sockets: Vec<HostX11Socket>,
@@ -237,7 +237,7 @@ impl X11AccessDialog {
             })
             .with_enabled(false),
             close: Button::new("Close", || {
-                AppMessage::Configuration(ConfigurationMessage::CloseX11Access)
+                AppMessage::Configuration(ConfigurationMessage::CloseX11Authorization)
             }),
             focus: FocusTracker::new(),
             generation: 0,
@@ -258,7 +258,7 @@ impl X11AccessDialog {
         let dialog = crate::tui::centered_rect(88, 92, area);
         frame.render_widget(Clear, dialog);
         let block = Block::default()
-            .title(format!(" X11 runtime access: {} ", self.machine))
+            .title(format!(" X11 authorization: {} ", self.machine))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme::theme().dialog_border));
@@ -304,7 +304,7 @@ impl X11AccessDialog {
         }
     }
 
-    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> X11AccessDialogAction {
+    pub(crate) fn handle_key(&mut self, key: KeyEvent) -> X11AuthorizationDialogAction {
         if self.authorization_confirmation.is_some() {
             return self.handle_authorization_confirmation(key);
         }
@@ -315,17 +315,17 @@ impl X11AccessDialog {
             self.state,
             CheckState::Authorizing { .. } | CheckState::Revoking { .. }
         ) {
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         }
         match key.code {
-            KeyCode::Esc => return X11AccessDialogAction::Close,
+            KeyCode::Esc => return X11AuthorizationDialogAction::Close,
             KeyCode::Tab => {
                 self.next_focus();
-                return X11AccessDialogAction::None;
+                return X11AuthorizationDialogAction::None;
             }
             KeyCode::BackTab => {
                 self.previous_focus();
-                return X11AccessDialogAction::None;
+                return X11AuthorizationDialogAction::None;
             }
             KeyCode::Char('c') if !self.guest_user.is_focused() => return self.request_check(),
             KeyCode::Char('a') if !self.guest_user.is_focused() => {
@@ -355,7 +355,7 @@ impl X11AccessDialog {
             }
             _ => {}
         }
-        X11AccessDialogAction::None
+        X11AuthorizationDialogAction::None
     }
 
     pub(crate) fn track_check(&mut self, task: tokio::task::JoinHandle<()>) {
@@ -529,25 +529,26 @@ impl X11AccessDialog {
         Ok(ShellTarget::new(self.machine.clone(), user))
     }
 
-    fn handle_message(&mut self, message: ConfigurationMessage) -> X11AccessDialogAction {
+    fn handle_message(&mut self, message: ConfigurationMessage) -> X11AuthorizationDialogAction {
         match message {
             ConfigurationMessage::CheckX11 => self.request_check(),
             ConfigurationMessage::AuthorizeX11 => self.request_authorization_confirmation(),
             ConfigurationMessage::RevokeX11 => self.request_revocation_confirmation(),
-            ConfigurationMessage::CloseX11Access => X11AccessDialogAction::Close,
+            ConfigurationMessage::CloseX11Authorization => X11AuthorizationDialogAction::Close,
+            _ => X11AuthorizationDialogAction::None,
         }
     }
 
-    fn request_check(&mut self) -> X11AccessDialogAction {
+    fn request_check(&mut self) -> X11AuthorizationDialogAction {
         let Some(host_socket) = self.selected_socket() else {
             self.set_check_error("No local X11 display is available");
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         };
         let target = match self.target() {
             Ok(target) => target,
             Err(error) => {
                 self.set_check_error(error);
-                return X11AccessDialogAction::None;
+                return X11AuthorizationDialogAction::None;
             }
         };
         if let Some(previous) = self.pending_check.take() {
@@ -562,7 +563,7 @@ impl X11AccessDialog {
             generation,
             user: target.user().clone(),
         };
-        X11AccessDialogAction::Check {
+        X11AuthorizationDialogAction::Check {
             generation,
             target,
             host_socket,
@@ -587,37 +588,37 @@ impl X11AccessDialog {
         ) && self.pending_revocation.is_none()
     }
 
-    fn request_authorization_confirmation(&mut self) -> X11AccessDialogAction {
+    fn request_authorization_confirmation(&mut self) -> X11AuthorizationDialogAction {
         if !self.can_authorize() {
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         }
         let target = match self.target() {
             Ok(target) => target,
             Err(error) => {
                 self.set_check_error(error);
-                return X11AccessDialogAction::None;
+                return X11AuthorizationDialogAction::None;
             }
         };
         let CheckState::Ready { check, .. } = &self.state else {
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         };
         self.authorization_confirmation = Some(PendingAuthorization {
             target,
             host_socket: check.projection().host_socket().clone(),
             host_uid: check.projection().identity().host_uid(),
         });
-        X11AccessDialogAction::None
+        X11AuthorizationDialogAction::None
     }
 
-    fn request_revocation_confirmation(&mut self) -> X11AccessDialogAction {
+    fn request_revocation_confirmation(&mut self) -> X11AuthorizationDialogAction {
         if !self.can_revoke() {
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         }
         let target = match self.target() {
             Ok(target) => target,
             Err(error) => {
                 self.set_check_error(error);
-                return X11AccessDialogAction::None;
+                return X11AuthorizationDialogAction::None;
             }
         };
         let CheckState::Ready {
@@ -630,7 +631,7 @@ impl X11AccessDialog {
             ..
         } = &self.state
         else {
-            return X11AccessDialogAction::None;
+            return X11AuthorizationDialogAction::None;
         };
         self.revocation_confirmation = Some(PendingRevocation {
             target,
@@ -638,10 +639,10 @@ impl X11AccessDialog {
             record_id: record_id.clone(),
             host_uid: check.projection().identity().host_uid(),
         });
-        X11AccessDialogAction::None
+        X11AuthorizationDialogAction::None
     }
 
-    fn handle_authorization_confirmation(&mut self, key: KeyEvent) -> X11AccessDialogAction {
+    fn handle_authorization_confirmation(&mut self, key: KeyEvent) -> X11AuthorizationDialogAction {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let intent = self
@@ -658,7 +659,7 @@ impl X11AccessDialog {
                     user: intent.target.user().clone(),
                     host_uid: intent.host_uid,
                 };
-                X11AccessDialogAction::Authorize {
+                X11AuthorizationDialogAction::Authorize {
                     generation,
                     target: intent.target,
                     host_socket: intent.host_socket,
@@ -666,13 +667,13 @@ impl X11AccessDialog {
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.authorization_confirmation = None;
-                X11AccessDialogAction::None
+                X11AuthorizationDialogAction::None
             }
-            _ => X11AccessDialogAction::None,
+            _ => X11AuthorizationDialogAction::None,
         }
     }
 
-    fn handle_revocation_confirmation(&mut self, key: KeyEvent) -> X11AccessDialogAction {
+    fn handle_revocation_confirmation(&mut self, key: KeyEvent) -> X11AuthorizationDialogAction {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let intent = self
@@ -689,7 +690,7 @@ impl X11AccessDialog {
                     user: intent.target.user().clone(),
                     record_id: intent.record_id.clone(),
                 };
-                X11AccessDialogAction::Revoke {
+                X11AuthorizationDialogAction::Revoke {
                     generation,
                     target: intent.target,
                     host_socket: intent.host_socket,
@@ -698,9 +699,9 @@ impl X11AccessDialog {
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
                 self.revocation_confirmation = None;
-                X11AccessDialogAction::None
+                X11AuthorizationDialogAction::None
             }
-            _ => X11AccessDialogAction::None,
+            _ => X11AuthorizationDialogAction::None,
         }
     }
 
@@ -892,7 +893,7 @@ impl X11AccessDialog {
     }
 }
 
-impl Drop for X11AccessDialog {
+impl Drop for X11AuthorizationDialog {
     fn drop(&mut self) {
         if let Some(task) = self.pending_check.take() {
             task.abort();

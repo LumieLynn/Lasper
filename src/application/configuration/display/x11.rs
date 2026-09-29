@@ -1,11 +1,13 @@
-//! X11-specific configuration page contracts.
+//! X11-specific persistent configuration contracts.
 //!
-//! Persistent declarations and edits live here; runtime ACL authorization is
-//! intentionally kept in the sibling application X11 service.
+//! Runtime ACL authorization is intentionally kept in the application X11
+//! service rather than in this configuration subdomain.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub type X11BindRecommendation = super::DisplayBindRecommendation;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -24,21 +26,6 @@ pub struct X11BindingDeclaration {
     pub readonly: bool,
     pub options: Vec<String>,
     pub scope: X11BindingScope,
-}
-
-/// Policy for a newly selected X11 endpoint. This is derived from the
-/// inspected startup configuration; callers cannot choose a mount suffix.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum X11BindRecommendation {
-    Ready {
-        private_users: String,
-        idmapped: bool,
-    },
-    Unsupported {
-        private_users: String,
-        reason: String,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -256,6 +256,11 @@ pub(crate) fn compose_application_services(
     let provisioning_preparation =
         crate::adapters::provisioning::compose_provisioning_preparation_service(nvidia_cdi_source);
     let x11_endpoints = compose_x11_endpoint_discovery();
+    let wayland_endpoints = Arc::new(
+        crate::application::configuration::WaylandEndpointDiscoveryService::new(Arc::new(
+            crate::adapters::platform::wayland::HostWaylandEndpointDiscovery,
+        )),
+    );
     let x11_access = Arc::new(crate::application::x11::X11AccessService::new(
         Arc::new(crate::adapters::session::X11ProjectionAdapter::new(
             Arc::clone(&session),
@@ -271,6 +276,7 @@ pub(crate) fn compose_application_services(
                 crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
             ),
             Arc::clone(&x11_endpoints),
+            wayland_endpoints,
             Arc::clone(&operations),
         ),
     );

@@ -45,28 +45,7 @@ pub enum AppEvent {
             crate::application::inspection::ResourceInspectionError,
         >,
     },
-    ConfigurationX11Checked {
-        generation: u64,
-        target: crate::application::configuration::ConfigurationTarget,
-        result: Result<
-            crate::application::x11::X11AccessCheck,
-            crate::application::x11::X11AccessError,
-        >,
-    },
-    ConfigurationX11Authorized {
-        generation: u64,
-        target: crate::application::configuration::ConfigurationTarget,
-        result: Result<
-            crate::application::x11::X11Authorization,
-            crate::application::x11::X11AccessError,
-        >,
-    },
-    ConfigurationX11Revoked {
-        generation: u64,
-        target: crate::application::configuration::ConfigurationTarget,
-        result:
-            Result<crate::application::x11::X11Revocation, crate::application::x11::X11AccessError>,
-    },
+    ConfigurationPage(crate::tui::configuration::ConfigurationPageEvent),
     WizardHardwareDiscoveryFinished {
         wizard_id: crate::tui::wizard::WizardInstanceId,
         result: Result<
@@ -114,9 +93,7 @@ impl AppEvent {
             Self::ConfigurationInspected { .. } => "configuration-inspected",
             Self::ConfigurationPreviewed { .. } => "configuration-previewed",
             Self::ConfigurationApplied { .. } => "configuration-applied",
-            Self::ConfigurationX11Checked { .. } => "configuration-x11-checked",
-            Self::ConfigurationX11Authorized { .. } => "configuration-x11-authorized",
-            Self::ConfigurationX11Revoked { .. } => "configuration-x11-revoked",
+            Self::ConfigurationPage(event) => event.label(),
             Self::WizardHardwareDiscoveryFinished { .. } => "wizard-hardware-discovery",
             Self::WizardInterfaceValidationFinished { .. } => "wizard-interface-validation",
             Self::DeploymentPreflightFinished { .. } => "deployment-preflight",

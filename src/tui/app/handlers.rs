@@ -137,7 +137,7 @@ impl App {
 
 impl App {
     pub async fn handle_mouse(&mut self, mouse: MouseEvent) {
-        if self.handle_modal_mouse(mouse) {
+        if self.handle_modal_mouse(mouse).await {
             return;
         }
         // Hit-test: which panel is the mouse over?
@@ -253,7 +253,7 @@ impl App {
             Some(ModalLayer::Configuration) => {
                 if let Some(view) = &mut self.ui.configuration {
                     let action = view.handle_key(key);
-                    self.handle_configuration_action(action);
+                    self.handle_configuration_action(action).await;
                 }
                 true
             }
@@ -548,11 +548,7 @@ impl App {
                 };
                 true
             }
-            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.show_shell_dialog().await;
-                true
-            }
-            KeyCode::Char('t') => {
+            KeyCode::Char('t') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.spawn_shell_prompt().await;
                 true
             }
@@ -1000,89 +996,6 @@ impl App {
         let mut dialog = self.ui.active_dialog.take().unwrap();
         let result = dialog.handle_key(key);
         match result {
-            EventResult::Message(AppMessage::Session(
-                crate::tui::core::SessionMessage::OpenShell {
-                    machine,
-                    user,
-                    wayland,
-                },
-            )) => {
-                if !self.spawn_terminal_as_user(machine, user, wayland).await {
-                    self.ui.active_dialog = Some(dialog);
-                }
-                true
-            }
-            EventResult::Message(AppMessage::Session(
-                crate::tui::core::SessionMessage::TestWayland {
-                    machine,
-                    user,
-                    host_socket,
-                    available_sockets,
-                },
-            )) => {
-                let result = self
-                    .data
-                    .session_service
-                    .test_wayland(
-                        crate::application::sessions::ShellTarget::new(
-                            machine.clone(),
-                            user.clone(),
-                        ),
-                        host_socket.clone(),
-                    )
-                    .await;
-                let (probe_result, message, level) = match result {
-                    Ok(context) => (
-                        Ok(context.clone()),
-                        format!(
-                            "Wayland projection for {}@{} is ready at {}.",
-                            user,
-                            machine,
-                            context.guest_socket().display()
-                        ),
-                        crate::tui::StatusLevel::Info,
-                    ),
-                    Err(error) => {
-                        let error = error
-                            .to_string()
-                            .chars()
-                            .take(160)
-                            .map(|character| {
-                                if character.is_control() {
-                                    ' '
-                                } else {
-                                    character
-                                }
-                            })
-                            .collect::<String>();
-                        (
-                            Err(error.clone()),
-                            format!("Wayland validation failed: {error}"),
-                            crate::tui::StatusLevel::Error,
-                        )
-                    }
-                };
-                self.set_status(message, level);
-                self.ui.active_dialog = Some(Box::new(
-                    crate::tui::widgets::dialogs::shell::ShellDialog::new(
-                        machine,
-                        user.to_string(),
-                        available_sockets,
-                    )
-                    .with_selected_wayland_socket(&host_socket)
-                    .with_probe_result(probe_result),
-                ));
-                true
-            }
-            EventResult::Message(AppMessage::Session(
-                crate::tui::core::SessionMessage::DialogCancel,
-            )) => true,
-            EventResult::Message(AppMessage::Session(
-                crate::tui::core::SessionMessage::DialogSubmit,
-            )) => {
-                self.ui.active_dialog = Some(dialog);
-                true
-            }
             EventResult::Message(msg) => {
                 if let Some(action) = self
                     .ui
@@ -1102,7 +1015,7 @@ impl App {
         }
     }
 
-    fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
+    async fn handle_modal_mouse(&mut self, mouse: MouseEvent) -> bool {
         // A visible modal always consumes the event even if its component has
         // no mouse behavior.  The priority comes from AppUi::modal_layer(),
         // shared with key dispatch.
@@ -1110,7 +1023,7 @@ impl App {
             Some(ModalLayer::Configuration) => {
                 if let Some(view) = &mut self.ui.configuration {
                     let action = view.handle_mouse(mouse);
-                    self.handle_configuration_action(action);
+                    self.handle_configuration_action(action).await;
                 }
                 true
             }

@@ -81,8 +81,7 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             };
 
         let x11 = crate::adapters::platform::x11::discover_host_x11_sockets().await;
-        let wayland =
-            crate::adapters::platform::capabilities::discover_wayland_socket_catalog().await;
+        let wayland = crate::adapters::platform::wayland::discover_wayland_socket_catalog().await;
 
         Ok(ProvisioningHostSnapshot {
             storage_backends,

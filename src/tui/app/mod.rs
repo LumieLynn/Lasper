@@ -219,6 +219,7 @@ impl AppUi {
 
 pub struct AppData {
     pub configuration: std::sync::Arc<crate::application::configuration::ConfigurationService>,
+    pub configuration_executor: crate::tui::configuration::ConfigurationPageExecutor,
     pub x11_access: std::sync::Arc<crate::application::x11::X11AccessService>,
     /// Running systemd-machined instances plus optimistic `Starting` rows.
     /// Persistent images live in `images`.
@@ -291,6 +292,10 @@ impl App {
             resource_inspection,
             host_operations,
         } = services;
+        let configuration_executor = crate::tui::configuration::ConfigurationPageExecutor::new(
+            session_service.clone(),
+            x11_access.clone(),
+        );
         let scrollback_lines = config.settings.scrollback_lines;
         Self {
             permissions,
@@ -298,6 +303,7 @@ impl App {
             should_quit: false,
             data: AppData {
                 configuration,
+                configuration_executor,
                 x11_access,
                 entries: Vec::new(),
                 images: Vec::new(),
@@ -641,67 +647,8 @@ impl App {
                     }
                 }
             }
-            AppEvent::ConfigurationX11Checked {
-                generation,
-                target,
-                result,
-            } => {
-                if let Some(view) = &mut self.ui.configuration {
-                    view.finish_x11_check(generation, &target, result);
-                }
-            }
-            AppEvent::ConfigurationX11Authorized {
-                generation,
-                target,
-                result,
-            } => {
-                if let Some(view) = &mut self.ui.configuration {
-                    view.finish_x11_authorization(generation, &target, result);
-                } else {
-                    let (message, level) = match result {
-                        Ok(authorization) => {
-                            let message = match authorization.disposition() {
-                                crate::application::x11::X11AuthorizationDisposition::Added {
-                                    ..
-                                } => "X11 access authorized; the operation record was saved",
-                                crate::application::x11::X11AuthorizationDisposition::PreExisting => {
-                                    "X11 access was already present; no Lasper ownership was recorded"
-                                }
-                                crate::application::x11::X11AuthorizationDisposition::AccessControlDisabled => {
-                                    "X11 access control is disabled; no ACL entry was added"
-                                }
-                            };
-                            (message.to_owned(), crate::tui::StatusLevel::Success)
-                        }
-                        Err(error) => (error.to_string(), crate::tui::StatusLevel::Error),
-                    };
-                    self.set_status(message, level);
-                }
-            }
-            AppEvent::ConfigurationX11Revoked {
-                generation,
-                target,
-                result,
-            } => {
-                if let Some(view) = &mut self.ui.configuration {
-                    view.finish_x11_revocation(generation, &target, result);
-                } else {
-                    let (message, level) = match result {
-                        Ok(revocation) => {
-                            let message = match revocation.disposition() {
-                                crate::application::x11::X11RevocationDisposition::Revoked {
-                                    ..
-                                } => "X11 access revoked; the operation record was retained",
-                                crate::application::x11::X11RevocationDisposition::AlreadyAbsent {
-                                    ..
-                                } => "X11 access was already absent; the operation record was finalized",
-                            };
-                            (message.to_owned(), crate::tui::StatusLevel::Success)
-                        }
-                        Err(error) => (error.to_string(), crate::tui::StatusLevel::Error),
-                    };
-                    self.set_status(message, level);
-                }
+            AppEvent::ConfigurationPage(event) => {
+                self.handle_configuration_page_event(event);
             }
             AppEvent::WizardHardwareDiscoveryFinished { wizard_id, result } => {
                 if self.ui.wizard.as_ref().map(Wizard::id) != Some(wizard_id) {

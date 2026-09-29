@@ -1,7 +1,7 @@
 use super::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::wayland::WaylandBind;
-use crate::domain::provisioning::{IdmapSuffix, PrivateUsersMode};
+use crate::domain::provisioning::PrivateUsersMode;
 use crate::domain::wayland::WaylandBindPolicy;
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
@@ -34,6 +34,43 @@ pub(crate) fn is_nvidia_end_marker(line: &str) -> bool {
 
 pub(crate) fn escape_nspawn_bind_path(path: &str) -> String {
     path.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// Return the nspawn directive name for a bind declaration.
+///
+/// Keeping this decision next to the bind-value encoder prevents provisioning
+/// and configuration editing from silently acquiring different output rules.
+pub(crate) const fn nspawn_bind_key(readonly: bool) -> &'static str {
+    if readonly {
+        "BindReadOnly"
+    } else {
+        "Bind"
+    }
+}
+
+/// Encode the value portion of an nspawn bind declaration.
+///
+/// `options` is the optional third colon-delimited field (for example,
+/// `idmap`). Callers pass already validated option text; paths are escaped at
+/// this single boundary.
+pub(crate) fn encode_nspawn_bind_value(
+    source: &Path,
+    target: Option<&Path>,
+    options: Option<&str>,
+) -> String {
+    let source = escape_nspawn_bind_path(source.to_str().expect("validated UTF-8 bind path"));
+    let mut value = source;
+    if let Some(target) = target {
+        value.push(':');
+        value.push_str(&escape_nspawn_bind_path(
+            target.to_str().expect("validated UTF-8 bind target"),
+        ));
+    }
+    if let Some(options) = options.filter(|options| !options.is_empty()) {
+        value.push(':');
+        value.push_str(options);
+    }
+    value
 }
 
 #[cfg(test)]
@@ -151,7 +188,7 @@ fn validate_machine_name(name: &str) -> Result<()> {
 
 impl NspawnConfig {
     pub fn default_path(name: &str) -> PathBuf {
-        PathBuf::from(format!("/etc/systemd/nspawn/{}.nspawn", name))
+        crate::paths::nspawn_config(name)
     }
 
     /// Find declared targets for this exact host socket, including source
@@ -626,26 +663,28 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
 
         for wayland_bind in wayland_binds {
             let suffix = match wayland_bind.policy() {
-                WaylandBindPolicy::Idmap => ":idmap",
-                WaylandBindPolicy::NoIdmap => ":noidmap",
+                WaylandBindPolicy::Idmap => "idmap",
+                WaylandBindPolicy::NoIdmap => "noidmap",
             };
             let source = validated_nspawn_path("Wayland socket path", wayland_bind.source())?;
             let target = validated_nspawn_path("Wayland container path", wayland_bind.target())?;
-            let source = escape_nspawn_bind_path(source);
-            let target = escape_nspawn_bind_path(target);
-            files.append("Bind", format!("{source}:{target}{suffix}"));
+            files.append(
+                nspawn_bind_key(false),
+                encode_nspawn_bind_value(Path::new(source), Some(Path::new(target)), Some(suffix)),
+            );
         }
 
         for x11_bind in &spec.x11_binds {
             let suffix = match spec.private_users {
-                Some(PrivateUsersMode::No) => IdmapSuffix::Noidmap,
-                _ => IdmapSuffix::Idmap,
+                Some(PrivateUsersMode::No) => "noidmap",
+                _ => "idmap",
             };
             let source = validated_nspawn_path("X11 socket path", x11_bind.socket().source())?;
             let target = validated_nspawn_path("X11 container path", x11_bind.target())?;
-            let source = escape_nspawn_bind_path(source);
-            let target = escape_nspawn_bind_path(target);
-            files.append("Bind", format!("{source}:{target}{suffix}"));
+            files.append(
+                nspawn_bind_key(x11_bind.readonly()),
+                encode_nspawn_bind_value(Path::new(source), Some(Path::new(target)), Some(suffix)),
+            );
         }
 
         // Individual device binds are populated in cfg.device_binds. The
@@ -1269,7 +1308,8 @@ mod tests {
             ..Default::default()
         };
         let content = nspawn_config_content(&idmapped).unwrap();
-        assert!(content.contains("Bind=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap"));
+        assert!(content.contains("BindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap"));
+        assert!(!content.contains("\nBind=/tmp/.X11-unix/X0:"));
 
         let noidmap = MachineProvisioningConfig {
             name: "noidmap".into(),
@@ -1278,7 +1318,8 @@ mod tests {
             ..Default::default()
         };
         let content = nspawn_config_content(&noidmap).unwrap();
-        assert!(content.contains("Bind=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:noidmap"));
+        assert!(content.contains("BindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:noidmap"));
+        assert!(!content.contains("\nBind=/tmp/.X11-unix/X0:"));
     }
 
     #[test]

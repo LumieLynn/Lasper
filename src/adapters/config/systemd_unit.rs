@@ -515,10 +515,8 @@ fn parse_machine_name(name: &str) -> Result<MachineName> {
 }
 
 fn service_override_dir(machine: &MachineName) -> PathBuf {
-    PathBuf::from(format!(
-        "/etc/systemd/system/systemd-nspawn@{}.service.d",
-        machine.as_str()
-    ))
+    crate::paths::systemd_system_unit_dir()
+        .join(format!("systemd-nspawn@{}.service.d", machine.as_str()))
 }
 
 fn service_override_path(machine: &MachineName) -> PathBuf {
@@ -526,10 +524,8 @@ fn service_override_path(machine: &MachineName) -> PathBuf {
 }
 
 fn transient_service_override_dir(machine: &MachineName) -> PathBuf {
-    PathBuf::from(format!(
-        "/run/systemd/system/systemd-nspawn@{}.service.d",
-        machine.as_str()
-    ))
+    crate::paths::systemd_runtime_unit_dir()
+        .join(format!("systemd-nspawn@{}.service.d", machine.as_str()))
 }
 
 fn persistent_nvidia_override_path(machine: &MachineName) -> PathBuf {

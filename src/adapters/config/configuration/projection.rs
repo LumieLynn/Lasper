@@ -1,5 +1,5 @@
-//! Read-only X11 declaration projection. Preserve the original document and
-//! leave unsupported bind syntax visible as diagnostics instead of guessing.
+//! Read-only display declaration projection. Preserve the original document
+//! and leave unsupported bind syntax visible as diagnostics instead of guessing.
 
 use std::path::Path;
 
@@ -8,8 +8,11 @@ use sha2::{Digest, Sha256};
 use crate::adapters::config::nspawn_file::{parse_nspawn_bind_fields, NspawnConfig};
 use crate::application::configuration::{
     ConfigurationDiscovery, ConfigurationDocument, ConfigurationOrigin, ConfigurationSnapshot,
-    ConfigurationTarget, X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
+    ConfigurationTarget, DisplayBindRecommendation, WaylandBindingDeclaration,
+    X11BindRecommendation, X11BindingDeclaration, X11BindingScope,
 };
+use crate::domain::wayland::{WaylandDisplay, CONTAINER_WAYLAND_ROOT};
+use crate::domain::x11::X11_SOCKET_DIRECTORY;
 
 use super::document::NspawnDocument;
 
@@ -34,19 +37,26 @@ pub(super) fn project(
             idmapped: true,
         },
         host_x11: Default::default(),
+        wayland_bindings: Vec::new(),
+        wayland_bind_recommendation: DisplayBindRecommendation::Ready {
+            private_users: "default (systemd-nspawn@ -U)".into(),
+            idmapped: true,
+        },
+        host_wayland: Default::default(),
         other_bind_count: 0,
         diagnostics: Vec::new(),
     };
     if let Some(config) = config {
         let document = NspawnDocument::new(&config.content);
-        snapshot.x11_bind_recommendation =
-            x11_bind_recommendation(&document, &mut snapshot.diagnostics);
+        let display_policy = display_bind_recommendation(&document, &mut snapshot.diagnostics);
+        snapshot.x11_bind_recommendation = display_policy.clone();
+        snapshot.wayland_bind_recommendation = display_policy;
         read_bind_declarations(&document, &mut snapshot);
+        let admin = crate::paths::nspawn_config_dir();
+        let runtime = crate::paths::nspawn_runtime_config_dir();
         let origin = match config.path.parent() {
-            Some(path) if path == Path::new("/etc/systemd/nspawn") => {
-                ConfigurationOrigin::Administrator
-            }
-            Some(path) if path == Path::new("/run/systemd/nspawn") => ConfigurationOrigin::Runtime,
+            Some(path) if path == admin => ConfigurationOrigin::Administrator,
+            Some(path) if path == runtime => ConfigurationOrigin::Runtime,
             _ => ConfigurationOrigin::ImageAdjacent,
         };
         snapshot.document = Some(ConfigurationDocument {
@@ -59,10 +69,10 @@ pub(super) fn project(
     snapshot
 }
 
-fn x11_bind_recommendation(
+fn display_bind_recommendation(
     document: &NspawnDocument<'_>,
     diagnostics: &mut Vec<String>,
-) -> X11BindRecommendation {
+) -> DisplayBindRecommendation {
     let mut in_exec = false;
     let mut effective = None;
     document.logical_lines(|line, number| {
@@ -88,27 +98,27 @@ fn x11_bind_recommendation(
             )),
         }
     });
-    effective.unwrap_or_else(|| X11BindRecommendation::Ready {
+    effective.unwrap_or_else(|| DisplayBindRecommendation::Ready {
         private_users: "default (systemd-nspawn@ -U)".into(),
         idmapped: true,
     })
 }
 
-fn parse_private_users(value: &str) -> Option<X11BindRecommendation> {
+fn parse_private_users(value: &str) -> Option<DisplayBindRecommendation> {
     if matches_ignore_ascii_case(value, &["no", "false", "off", "0", "n"]) {
-        return Some(X11BindRecommendation::Ready {
+        return Some(DisplayBindRecommendation::Ready {
             private_users: "no".into(),
             idmapped: false,
         });
     }
     if matches_ignore_ascii_case(value, &["yes", "true", "on", "1", "y"]) {
-        return Some(X11BindRecommendation::Ready {
+        return Some(DisplayBindRecommendation::Ready {
             private_users: "yes".into(),
             idmapped: true,
         });
     }
     if value.eq_ignore_ascii_case("pick") {
-        return Some(X11BindRecommendation::Ready {
+        return Some(DisplayBindRecommendation::Ready {
             private_users: "pick".into(),
             idmapped: true,
         });
@@ -124,7 +134,7 @@ fn parse_private_users(value: &str) -> Option<X11BindRecommendation> {
         }
         _ => return None,
     };
-    Some(X11BindRecommendation::Unsupported {
+    Some(DisplayBindRecommendation::Unsupported {
         private_users: normalized,
         reason: reason.into(),
     })
@@ -192,25 +202,50 @@ fn read_logical_line(
         ));
         return;
     }
-    let Some(scope) = x11_scope(Path::new(source)) else {
+    let source = Path::new(source);
+    let destination = Path::new(destination);
+    let options = fields
+        .get(2)
+        .map(|value| value.split(',').map(str::to_owned).collect())
+        .unwrap_or_default();
+    if let Some(scope) = x11_scope(source) {
+        snapshot.x11_bindings.push(X11BindingDeclaration {
+            line: number,
+            source: source.into(),
+            guest_target: destination.into(),
+            readonly,
+            options,
+            scope,
+        });
+    } else if let Some(display) = wayland_display_for_binding(source, destination) {
+        snapshot.wayland_bindings.push(WaylandBindingDeclaration {
+            line: number,
+            display,
+            source: source.into(),
+            guest_target: destination.into(),
+            readonly,
+            options,
+        });
+    } else {
         snapshot.other_bind_count += 1;
-        return;
-    };
-    snapshot.x11_bindings.push(X11BindingDeclaration {
-        line: number,
-        source: source.into(),
-        guest_target: destination.into(),
-        readonly,
-        options: fields
-            .get(2)
-            .map(|value| value.split(',').map(str::to_owned).collect())
-            .unwrap_or_default(),
-        scope,
-    });
+    }
+}
+
+fn wayland_display_for_binding(source: &Path, destination: &Path) -> Option<WaylandDisplay> {
+    let source_name = source.file_name()?.to_str()?;
+    let recommended_target = destination.starts_with(CONTAINER_WAYLAND_ROOT);
+    if !source_name.starts_with("wayland-") && !recommended_target {
+        return None;
+    }
+    let display = WaylandDisplay::new(source_name.to_owned()).ok()?;
+    if source_name.starts_with("wayland-") {
+        return Some(display);
+    }
+    (destination.file_name()?.to_str()? == display.as_str()).then_some(display)
 }
 
 pub(super) fn x11_scope(source: &Path) -> Option<X11BindingScope> {
-    let directory = Path::new("/tmp/.X11-unix");
+    let directory = Path::new(X11_SOCKET_DIRECTORY);
     if source == directory {
         return Some(X11BindingScope::Directory);
     }
@@ -288,6 +323,28 @@ mod tests {
         );
         assert_eq!(result.other_bind_count, 1);
         assert_eq!(result.diagnostics.len(), 2);
+    }
+
+    #[test]
+    fn wayland_declarations_keep_custom_targets_and_share_private_users_policy() {
+        let result = snapshot(
+            "[Exec]\nPrivateUsers=pick\n[Files]\nBind=/run/user/1000/wayland-1:/mnt/wayland-socket:idmap\nBindReadOnly=/dev/dri\n",
+        );
+        assert_eq!(result.wayland_bindings.len(), 1);
+        let binding = &result.wayland_bindings[0];
+        assert_eq!(binding.display.as_str(), "wayland-1");
+        assert_eq!(binding.source, Path::new("/run/user/1000/wayland-1"));
+        assert_eq!(binding.guest_target, Path::new("/mnt/wayland-socket"));
+        assert!(!binding.readonly);
+        assert_eq!(binding.options, ["idmap"]);
+        assert_eq!(result.other_bind_count, 1);
+        assert_eq!(
+            result.wayland_bind_recommendation,
+            crate::application::configuration::WaylandBindRecommendation::Ready {
+                private_users: "pick".into(),
+                idmapped: true,
+            }
+        );
     }
 
     #[test]

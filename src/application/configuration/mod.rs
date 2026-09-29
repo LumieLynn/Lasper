@@ -14,11 +14,17 @@ use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 
+mod display;
 mod draft;
-mod x11;
 
-pub use draft::ConfigurationDraft;
-pub use x11::{X11BindRecommendation, X11BindingChange, X11BindingDeclaration, X11BindingScope};
+pub use display::{
+    recommended_wayland_target, DisplayBindRecommendation, WaylandBindRecommendation,
+    WaylandBindingChange, WaylandBindingDeclaration, WaylandEndpointCatalog,
+    WaylandSourceObservation, WaylandSourceState, X11BindRecommendation, X11BindingChange,
+    X11BindingDeclaration, X11BindingScope,
+};
+pub(crate) use display::{WaylandEndpointDiscoveryPort, WaylandEndpointDiscoveryService};
+pub use draft::{ConfigurationDraft, ConfigurationDraftRequest};
 
 /// A catalog resource to inspect, not an arbitrary path or a claim that an
 /// image and a running machine with the same name share a launch source.
@@ -163,6 +169,9 @@ pub struct ConfigurationSnapshot {
     pub x11_bindings: Vec<X11BindingDeclaration>,
     pub x11_bind_recommendation: X11BindRecommendation,
     pub host_x11: X11EndpointCatalog,
+    pub wayland_bindings: Vec<WaylandBindingDeclaration>,
+    pub wayland_bind_recommendation: WaylandBindRecommendation,
+    pub host_wayland: WaylandEndpointCatalog,
     pub other_bind_count: usize,
     pub diagnostics: Vec<String>,
 }
@@ -236,6 +245,8 @@ pub struct ConfigurationEdit {
     pub target: ConfigurationTarget,
     pub base_revision: ConfigurationRevision,
     pub x11_changes: Vec<X11BindingChange>,
+    #[serde(default)]
+    pub wayland_changes: Vec<WaylandBindingChange>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +302,7 @@ impl fmt::Debug for ConfigurationSnapshot {
             .field("discovery", &self.discovery)
             .field("document_present", &self.document.is_some())
             .field("x11_binding_count", &self.x11_bindings.len())
+            .field("wayland_binding_count", &self.wayland_bindings.len())
             .finish_non_exhaustive()
     }
 }
@@ -316,6 +328,7 @@ pub(crate) trait ConfigurationPort: Send + Sync {
 pub struct ConfigurationService {
     port: Arc<dyn ConfigurationPort>,
     x11_endpoints: Arc<X11EndpointDiscoveryService>,
+    wayland_endpoints: Arc<WaylandEndpointDiscoveryService>,
     operations: Arc<OperationRegistry>,
 }
 
@@ -323,11 +336,13 @@ impl ConfigurationService {
     pub(crate) fn new(
         port: Arc<dyn ConfigurationPort>,
         x11_endpoints: Arc<X11EndpointDiscoveryService>,
+        wayland_endpoints: Arc<WaylandEndpointDiscoveryService>,
         operations: Arc<OperationRegistry>,
     ) -> Self {
         Self {
             port,
             x11_endpoints,
+            wayland_endpoints,
             operations,
         }
     }
@@ -343,6 +358,12 @@ impl ConfigurationService {
             .map(|binding| binding.source.clone())
             .collect::<Vec<_>>();
         snapshot.host_x11 = self.x11_endpoints.discover(&sources).await;
+        let sources = snapshot
+            .wayland_bindings
+            .iter()
+            .map(|binding| binding.source.clone())
+            .collect::<Vec<_>>();
+        snapshot.host_wayland = self.wayland_endpoints.discover(&sources).await;
         Ok(snapshot)
     }
 
@@ -385,6 +406,15 @@ mod tests {
     impl X11EndpointDiscoveryPort for EmptyX11Endpoints {
         async fn discover(&self, _configured_sources: &[PathBuf]) -> X11EndpointCatalog {
             X11EndpointCatalog::default()
+        }
+    }
+
+    struct EmptyWaylandEndpoints;
+
+    #[async_trait::async_trait]
+    impl WaylandEndpointDiscoveryPort for EmptyWaylandEndpoints {
+        async fn discover(&self, _configured_sources: &[PathBuf]) -> WaylandEndpointCatalog {
+            WaylandEndpointCatalog::default()
         }
     }
 
@@ -431,6 +461,7 @@ mod tests {
                 write_target: Some("target".into()),
             },
             x11_changes: vec![X11BindingChange::Remove { line: 2 }],
+            wayland_changes: vec![],
         }
     }
 
@@ -444,6 +475,9 @@ mod tests {
             port.clone(),
             Arc::new(X11EndpointDiscoveryService::new(Arc::new(
                 EmptyX11Endpoints,
+            ))),
+            Arc::new(WaylandEndpointDiscoveryService::new(Arc::new(
+                EmptyWaylandEndpoints,
             ))),
             OperationRegistry::new(),
         ));

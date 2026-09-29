@@ -27,12 +27,9 @@ pub(crate) async fn inspect(target: ConfigurationTarget) -> Result<Configuration
 }
 
 pub(super) fn inspect_now(target: ConfigurationTarget) -> ConfigurationSnapshot {
-    inspect_at(
-        target,
-        Path::new("/etc/systemd/nspawn"),
-        Path::new("/run/systemd/nspawn"),
-        &crate::paths::machines_dir(),
-    )
+    let admin = crate::paths::nspawn_config_dir();
+    let runtime = crate::paths::nspawn_runtime_config_dir();
+    inspect_at(target, &admin, &runtime, &crate::paths::machines_dir())
 }
 
 pub(super) fn inspect_at(

@@ -413,12 +413,14 @@ pub(crate) async fn execute_nspawn_config_operation(
             })
         }
         NspawnConfigOperation::PromoteOci(request) => {
+            let admin = crate::paths::nspawn_config_dir();
+            let runtime = crate::paths::nspawn_runtime_config_dir();
             let apply = promote_new_oci_config(
                 &request.machine,
                 request.network,
                 &crate::paths::machines_dir(),
-                Path::new("/etc/systemd/nspawn"),
-                Path::new("/run/systemd/nspawn"),
+                &admin,
+                &runtime,
             )
             .await?;
             Ok(NspawnConfigResult {
@@ -427,12 +429,9 @@ pub(crate) async fn execute_nspawn_config_operation(
             })
         }
         NspawnConfigOperation::PrepareOciPromotion(request) => {
-            validate_oci_promotion_target(
-                &request.machine,
-                Path::new("/etc/systemd/nspawn"),
-                Path::new("/run/systemd/nspawn"),
-            )
-            .await?;
+            let admin = crate::paths::nspawn_config_dir();
+            let runtime = crate::paths::nspawn_runtime_config_dir();
+            validate_oci_promotion_target(&request.machine, &admin, &runtime).await?;
             Ok(NspawnConfigResult::default())
         }
         NspawnConfigOperation::UpdateGpu(request) => {
@@ -500,8 +499,8 @@ async fn probe_nspawn_config_at(path: &Path) -> Result<NspawnConfigPresence> {
 fn discovered_nspawn_paths(image: &ImageName) -> [PathBuf; 3] {
     let filename = format!("{}.nspawn", image.as_str());
     [
-        PathBuf::from("/etc/systemd/nspawn").join(&filename),
-        PathBuf::from("/run/systemd/nspawn").join(&filename),
+        crate::paths::nspawn_config_dir().join(&filename),
+        crate::paths::nspawn_runtime_config_dir().join(&filename),
         crate::paths::machines_dir().join(filename),
     ]
 }
@@ -1095,7 +1094,7 @@ fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGran
 }
 
 fn invoking_uid() -> u32 {
-    crate::adapters::platform::capabilities::invoking_uid()
+    crate::adapters::platform::invoking_uid()
 }
 
 #[cfg(test)]
@@ -1198,6 +1197,39 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!json.contains("root_password"));
         assert!(value["params"]["spec"].get("users").is_none());
+    }
+
+    #[test]
+    fn configuration_edit_wire_keeps_wayland_intents() {
+        let operation = NspawnConfigOperation::PreviewConfiguration(Box::new(ConfigurationEdit {
+            target: ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap()),
+            base_revision: crate::application::configuration::ConfigurationRevision {
+                discovery: "machine-name".into(),
+                read_source: Some("administrator".into()),
+                write_target: Some("administrator".into()),
+            },
+            x11_changes: Vec::new(),
+            wayland_changes: vec![
+                crate::application::configuration::WaylandBindingChange::Add {
+                    source: "/run/user/1000/wayland-1".into(),
+                    guest_target: "/run/lasper/wayland/1000/wayland-1".into(),
+                },
+            ],
+        }));
+
+        let wire = serde_json::to_vec(&operation).unwrap();
+        let decoded: NspawnConfigOperation = serde_json::from_slice(&wire).unwrap();
+        let NspawnConfigOperation::PreviewConfiguration(edit) = decoded else {
+            panic!("configuration operation changed while crossing the RPC wire");
+        };
+        assert!(matches!(
+            edit.wayland_changes.as_slice(),
+            [crate::application::configuration::WaylandBindingChange::Add {
+                source,
+                guest_target,
+            }] if source == Path::new("/run/user/1000/wayland-1")
+                && guest_target == Path::new("/run/lasper/wayland/1000/wayland-1")
+        ));
     }
 
     #[test]

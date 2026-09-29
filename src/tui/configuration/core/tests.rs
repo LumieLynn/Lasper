@@ -5,9 +5,17 @@ use crate::application::configuration::{
     ConfigurationWriteTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
     X11BindingScope,
 };
+use crate::application::inspection::ResourceInspectionError;
+use crate::application::x11::X11AccessCheck;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::ImageName;
+use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
+use crate::tui::configuration::{
+    ConfigurationPageAction, ConfigurationPageEvent, WaylandPageAction, WaylandPageEvent,
+    X11PageAction, X11PageEvent,
+};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{backend::TestBackend, Terminal};
 use std::path::PathBuf;
 
@@ -30,6 +38,22 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
         X11SocketRevision {
             device: 1,
             inode: 2,
+            ctime_seconds: 3,
+            ctime_nanoseconds: 4,
+        },
+    )
+    .unwrap();
+    let wayland_socket = HostWaylandSocket::from_verified_parts(
+        WaylandDisplay::new("wayland-1").unwrap(),
+        "/run/user/1000".into(),
+        "/run/user/1000/wayland-1".into(),
+        1000,
+        1000,
+        1000,
+        0o755,
+        SocketRevision {
+            device: 1,
+            inode: 8,
             ctime_seconds: 3,
             ctime_nanoseconds: 4,
         },
@@ -68,6 +92,18 @@ fn snapshot(name: &str) -> ConfigurationSnapshot {
             preferred_display: Some(0),
             diagnostics: vec![],
         },
+        wayland_bindings: vec![],
+        wayland_bind_recommendation:
+            crate::application::configuration::WaylandBindRecommendation::Ready {
+                private_users: "pick".into(),
+                idmapped: true,
+            },
+        host_wayland: crate::application::configuration::WaylandEndpointCatalog {
+            sockets: vec![wayland_socket],
+            sources: vec![],
+            preferred_display: Some(WaylandDisplay::new("wayland-1").unwrap()),
+            diagnostics: vec![],
+        },
         other_bind_count: 0, diagnostics: vec![],
     }
 }
@@ -76,6 +112,7 @@ fn loaded() -> ConfigurationView {
     let mut view = ConfigurationView::new(target("archlinux"));
     view.begin_query(3);
     view.finish_query(3, &target("archlinux"), Ok(snapshot("archlinux")));
+    select_x11_page(&mut view);
     view
 }
 
@@ -87,7 +124,47 @@ fn loaded_machine() -> ConfigurationView {
     let mut view = ConfigurationView::new(target.clone());
     view.begin_query(3);
     view.finish_query(3, &target, Ok(snapshot));
+    select_x11_page(&mut view);
     view
+}
+
+fn select_x11_page(view: &mut ConfigurationView) {
+    if view.navigation.current_page() != super::super::pages::x11::PAGE_ID {
+        view.pane = ConfigurationPane::Navigation;
+        view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    }
+    assert_eq!(
+        view.navigation.current_page(),
+        super::super::pages::x11::PAGE_ID
+    );
+    view.pane = ConfigurationPane::Content;
+}
+
+fn select_wayland_page(view: &mut ConfigurationView) {
+    view.pane = ConfigurationPane::Navigation;
+    view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+    assert_eq!(
+        view.navigation.current_page(),
+        super::super::pages::wayland::PAGE_ID
+    );
+    view.pane = ConfigurationPane::Content;
+}
+
+fn x11_state(view: &ConfigurationView) -> super::page::PageTestState {
+    view.pages.test_state(super::super::pages::x11::PAGE_ID)
+}
+
+fn wayland_state(view: &ConfigurationView) -> super::page::PageTestState {
+    view.pages.test_state(super::super::pages::wayland::PAGE_ID)
+}
+
+#[test]
+fn navigation_starts_on_the_first_registered_page() {
+    let view = ConfigurationView::new(target("archlinux"));
+    assert_eq!(
+        view.navigation.current_page(),
+        super::super::pages::wayland::PAGE_ID
+    );
 }
 
 fn x11_check(host_socket: HostX11Socket, entries: &[&[u8]]) -> X11AccessCheck {
@@ -178,17 +255,17 @@ fn begin_x11_access_check(
         view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(view.page.x11().access_dialog_is_open());
+    assert!(x11_state(view).modal_open);
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     for character in guest_user.chars() {
         view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let ConfigurationAction::CheckX11 {
+    let ConfigurationAction::Page(ConfigurationPageAction::X11(X11PageAction::Check {
         generation,
         target,
         host_socket,
-    } = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    })) = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     else {
         panic!("X11 access dialog should emit the runtime check request");
     };
@@ -249,7 +326,7 @@ fn question_mark_requests_the_shared_help_overlay() {
 #[test]
 fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     let mut view = loaded();
-    let selected = view.page.x11().selected_index();
+    let selected = x11_state(&view).selected;
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Preview);
     render(&mut view, 60, 15);
@@ -264,8 +341,8 @@ fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     let screen = render(&mut view, 60, 15);
     assert!(screen.contains("PRIVATE_VALUE=secret"));
     assert!(screen.contains("Esc Close"));
-    assert_eq!(view.page.x11().selected_index(), selected);
-    assert!(view.page.x11().is_expanded(0));
+    assert_eq!(x11_state(&view).selected, selected);
+    assert!(x11_state(&view).expanded.contains(&0));
     let close = view.hits.close;
     assert_eq!(view.handle_mouse(click(close)), ConfigurationAction::Close);
 }
@@ -279,20 +356,20 @@ fn mouse_and_keyboard_select_the_same_panes_and_binding() {
     assert_eq!(view.pane, ConfigurationPane::Navigation);
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Content);
-    let binding = view.hits.x11.bindings[0].0;
+    let binding = x11_state(&view).bindings[0].0;
     view.handle_mouse(click(binding));
-    assert!(view.page.x11().is_expanded(0));
+    assert!(x11_state(&view).expanded.contains(&0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!view.page.x11().is_expanded(0));
+    assert!(!x11_state(&view).expanded.contains(&0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(view.page.x11().is_expanded(0));
+    assert!(x11_state(&view).expanded.contains(&0));
 }
 
 #[test]
 fn clicking_the_checkbox_uses_the_same_desired_state_transition_as_space() {
     let mut view = loaded();
     render(&mut view, 140, 28);
-    let checkbox = view.hits.x11.checkboxes[0].0;
+    let checkbox = x11_state(&view).checkboxes[0].0;
     let ConfigurationAction::Preview { edit, .. } = view.handle_mouse(click(checkbox)) else {
         panic!("clicking a checked declaration should request its removal preview");
     };
@@ -389,7 +466,7 @@ async fn closing_view_cancels_its_pending_inspection() {
 }
 
 #[test]
-fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed() {
+fn tree_navigation_switches_pages_immediately_and_keeps_the_current_page_when_collapsed() {
     let mut view = loaded();
     view.pane = ConfigurationPane::Navigation;
     let screen = render(&mut view, 140, 28);
@@ -405,11 +482,15 @@ fn tree_navigation_has_depth_pointers_and_keeps_the_active_page_when_collapsed()
     assert_eq!(view.pane, ConfigurationPane::Navigation);
     view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains(">> Wayland"));
+    assert!(screen.contains("/run/lasper/wayland/1000/wayland-1"));
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     assert!(render(&mut view, 140, 28).contains(">> X11"));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(view.pane, ConfigurationPane::Content);
-    assert_eq!(view.page.x11().selected_index(), Some(0));
-    assert!(view.page.x11().is_expanded(0));
+    assert_eq!(x11_state(&view).selected, Some(0));
+    assert!(x11_state(&view).expanded.contains(&0));
 }
 
 #[test]
@@ -422,13 +503,195 @@ fn tree_rows_are_clickable_and_binding_disclosure_is_separate_from_selection() {
     assert!(render(&mut view, 140, 28).contains("> [+] Host Integration"));
     view.handle_mouse(click(parent));
     render(&mut view, 140, 28);
-    view.handle_mouse(click(Rect::new(parent.x, parent.y + 1, 1, 1)));
+    view.handle_mouse(click(Rect::new(parent.x, parent.y + 2, 1, 1)));
     assert!(render(&mut view, 140, 28).contains(">> X11"));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
     assert!(render(&mut view, 140, 28).contains(">> [x] > Socket directory"));
     view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
     assert!(render(&mut view, 140, 28).contains(">> [x] ∨ Socket directory"));
+}
+
+#[test]
+fn wayland_page_marks_the_current_display_and_builds_a_typed_addition() {
+    let mut view = loaded();
+    select_wayland_page(&mut view);
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains("wayland-1 (current WAYLAND_DISPLAY) [available]"));
+    assert!(screen.contains("/run/lasper/wayland/1000/wayland-1"));
+
+    let ConfigurationAction::Preview { edit, .. } =
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+    else {
+        panic!("selecting a Wayland socket should request a preview");
+    };
+    assert_eq!(
+        edit.wayland_changes,
+        [
+            crate::application::configuration::WaylandBindingChange::Add {
+                source: "/run/user/1000/wayland-1".into(),
+                guest_target: "/run/lasper/wayland/1000/wayland-1".into(),
+            }
+        ]
+    );
+    assert!(edit.x11_changes.is_empty());
+}
+
+#[test]
+fn wayland_page_accumulates_multiple_socket_selections_in_one_draft() {
+    let mut inspected = snapshot("archlinux");
+    inspected.host_wayland.sockets.push(
+        HostWaylandSocket::from_verified_parts(
+            WaylandDisplay::new("wayland-2").unwrap(),
+            "/run/user/1000".into(),
+            "/run/user/1000/wayland-2".into(),
+            1000,
+            1000,
+            1000,
+            0o755,
+            SocketRevision {
+                device: 1,
+                inode: 9,
+                ctime_seconds: 3,
+                ctime_nanoseconds: 4,
+            },
+        )
+        .unwrap(),
+    );
+    let configuration_target = target("archlinux");
+    let mut view = ConfigurationView::new(configuration_target.clone());
+    view.begin_query(3);
+    view.finish_query(3, &configuration_target, Ok(inspected));
+    select_wayland_page(&mut view);
+
+    assert!(matches!(
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        ConfigurationAction::Preview { .. }
+    ));
+    view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    let ConfigurationAction::Preview { edit, .. } =
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+    else {
+        panic!("selecting a second Wayland socket should preserve the first selection");
+    };
+
+    assert_eq!(edit.wayland_changes.len(), 2);
+    assert!(edit.wayland_changes.iter().any(|change| matches!(
+        change,
+        crate::application::configuration::WaylandBindingChange::Add { source, .. }
+            if source == std::path::Path::new("/run/user/1000/wayland-1")
+    )));
+    assert!(edit.wayland_changes.iter().any(|change| matches!(
+        change,
+        crate::application::configuration::WaylandBindingChange::Add { source, .. }
+            if source == std::path::Path::new("/run/user/1000/wayland-2")
+    )));
+}
+
+#[test]
+fn observed_wayland_source_alias_is_not_duplicated_as_an_available_socket() {
+    let mut inspected = snapshot("archlinux");
+    inspected.wayland_bindings.push(
+        crate::application::configuration::WaylandBindingDeclaration {
+            line: 5,
+            display: WaylandDisplay::new("wayland-1").unwrap(),
+            source: "/run/user/1000/wayland-current".into(),
+            guest_target: "/mnt/wayland-socket".into(),
+            readonly: false,
+            options: vec!["idmap".into()],
+        },
+    );
+    inspected.host_wayland.sources.push(
+        crate::application::configuration::WaylandSourceObservation {
+            source: "/run/user/1000/wayland-current".into(),
+            state: crate::application::configuration::WaylandSourceState::Observed,
+        },
+    );
+    let configuration_target = target("archlinux");
+    let mut view = ConfigurationView::new(configuration_target.clone());
+    view.begin_query(3);
+    view.finish_query(3, &configuration_target, Ok(inspected));
+    select_wayland_page(&mut view);
+
+    let screen = render(&mut view, 140, 28);
+    assert!(screen.contains("wayland-1 (current WAYLAND_DISPLAY) [line 5]"));
+    assert!(!screen.contains("wayland-1 (current WAYLAND_DISPLAY) [available]"));
+}
+
+#[test]
+fn wayland_session_dialog_checks_and_enters_through_typed_session_actions() {
+    let mut view = loaded_machine();
+    select_wayland_page(&mut view);
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(wayland_state(&view).modal_open);
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for character in "alice".chars() {
+        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let ConfigurationAction::Page(ConfigurationPageAction::Wayland(WaylandPageAction::Check {
+        generation,
+        target,
+        host_socket,
+    })) = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("Wayland access dialog should emit a typed check");
+    };
+    assert_eq!(target.user().as_str(), "alice");
+    assert_eq!(host_socket.display().as_str(), "wayland-1");
+    let context = crate::application::sessions::WaylandSessionContext::verified(
+        host_socket.clone(),
+        "/run/lasper/wayland/1000/wayland-1".into(),
+        crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
+    );
+    let configuration_target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
+    view.finish_page_event(ConfigurationPageEvent::Wayland(Box::new(
+        WaylandPageEvent::Checked {
+            generation,
+            target: configuration_target,
+            result: Ok(context),
+        },
+    )))
+    .unwrap();
+    assert!(render(&mut view, 140, 30).contains("READY"));
+
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let ConfigurationAction::Page(ConfigurationPageAction::Wayland(
+        WaylandPageAction::EnterShell {
+            target,
+            host_socket: selected,
+        },
+    )) = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    else {
+        panic!("Enter shell should preserve the selected target and host evidence");
+    };
+    assert_eq!(target.user().as_str(), "alice");
+    assert_eq!(selected, host_socket);
+}
+
+#[test]
+fn unsaved_wayland_draft_blocks_enter_shell_instead_of_being_discarded() {
+    let mut view = loaded_machine();
+    select_wayland_page(&mut view);
+    assert!(matches!(
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        ConfigurationAction::Preview { .. }
+    ));
+    view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for character in "alice".chars() {
+        view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
+    }
+    view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    assert!(render(&mut view, 140, 30).contains("Save or discard pending configuration changes"));
+    assert!(!view.draft_is_empty());
 }
 
 #[test]
@@ -581,9 +844,9 @@ fn space_changes_the_check_state_while_enter_only_folds() {
         view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
         ConfigurationAction::Preview { .. }
     ));
-    assert!(view.page.x11().is_expanded(0));
+    assert!(x11_state(&view).expanded.contains(&0));
     view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    assert!(!view.page.x11().is_expanded(0));
+    assert!(!x11_state(&view).expanded.contains(&0));
 }
 
 #[test]
@@ -613,7 +876,8 @@ fn unavailable_source_is_visible_when_folded_and_keeps_its_binding() {
         let mut view = ConfigurationView::new(target("archlinux"));
         view.begin_query(3);
         view.finish_query(3, &target("archlinux"), Ok(inspected));
-        view.page.x11_mut().clear_expanded();
+        select_x11_page(&mut view);
+        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let buffer = render_buffer(&mut view, 160, 28);
         let (x, y) = (0..28)
             .flat_map(|y| (0..160).map(move |x| (x, y)))
@@ -641,7 +905,8 @@ fn an_unobserved_source_is_not_claimed_to_be_missing() {
     let mut view = ConfigurationView::new(target("archlinux"));
     view.begin_query(3);
     view.finish_query(3, &target("archlinux"), Ok(inspected));
-    view.page.x11_mut().clear_expanded();
+    select_x11_page(&mut view);
+    view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     let screen = render(&mut view, 160, 28);
     assert!(screen.contains("[! Not observed]"));
     assert!(!screen.contains("[! Missing]"));
@@ -712,7 +977,7 @@ fn machine_apply_prompts_for_restart_and_returns_the_exact_target() {
 }
 
 #[test]
-fn machine_x11_access_dialog_checks_guest_projection_and_reports_acl_state() {
+fn machine_x11_authorization_dialog_checks_guest_projection_and_reports_acl_state() {
     let mut view = loaded_machine();
     let (generation, target, host_socket) = begin_x11_access_check(&mut view, "alice");
     assert_eq!(target.machine().as_str(), "archlinux");
@@ -721,7 +986,14 @@ fn machine_x11_access_dialog_checks_guest_projection_and_reports_acl_state() {
 
     let configuration_target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
     let check = x11_check(host_socket, &[b"localuser\0#1437402088"]);
-    view.finish_x11_check(generation, &configuration_target, Ok(check));
+    view.finish_page_event(ConfigurationPageEvent::X11(Box::new(
+        X11PageEvent::Checked {
+            generation,
+            target: configuration_target,
+            result: Ok(check),
+        },
+    )))
+    .unwrap();
     let screen = render(&mut view, 140, 30);
     assert!(screen.contains("guest uid 1000"));
     assert!(screen.contains("1437402088"));
@@ -731,7 +1003,7 @@ fn machine_x11_access_dialog_checks_guest_projection_and_reports_acl_state() {
 }
 
 #[test]
-fn x11_access_dialog_selects_each_display_from_the_keyboard() {
+fn x11_authorization_dialog_selects_each_display_from_the_keyboard() {
     let second = HostX11Socket::from_verified_parts(
         1,
         false,
@@ -760,6 +1032,7 @@ fn x11_access_dialog_selects_each_display_from_the_keyboard() {
     let mut view = ConfigurationView::new(target.clone());
     view.begin_query(3);
     view.finish_query(3, &target, Ok(inspected));
+    select_x11_page(&mut view);
 
     view.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
     view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
@@ -768,8 +1041,10 @@ fn x11_access_dialog_selects_each_display_from_the_keyboard() {
         view.handle_key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE));
     }
     view.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let ConfigurationAction::CheckX11 { host_socket, .. } =
-        view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    let ConfigurationAction::Page(ConfigurationPageAction::X11(X11PageAction::Check {
+        host_socket,
+        ..
+    })) = view.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     else {
         panic!("selected display should be checked");
     };
@@ -780,12 +1055,12 @@ fn x11_access_dialog_selects_each_display_from_the_keyboard() {
 fn runtime_access_entry_opens_a_nested_dialog_and_escape_only_closes_it() {
     let mut view = loaded_machine();
     render(&mut view, 140, 30);
-    let access_entry = view.hits.x11.access;
+    let access_entry = x11_state(&view).access;
     assert_eq!(
         view.handle_mouse(click(access_entry)),
         ConfigurationAction::None
     );
-    assert!(view.page.x11().access_dialog_is_open());
+    assert!(x11_state(&view).modal_open);
 
     for (width, height) in [(60, 15), (30, 8), (1, 1)] {
         render(&mut view, width, height);
@@ -794,7 +1069,7 @@ fn runtime_access_entry_opens_a_nested_dialog_and_escape_only_closes_it() {
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ConfigurationAction::None
     );
-    assert!(!view.page.x11().access_dialog_is_open());
+    assert!(!x11_state(&view).modal_open);
     assert_eq!(
         view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
         ConfigurationAction::Close
@@ -806,11 +1081,14 @@ fn pathname_permission_failure_is_visible_without_blocking_authorization() {
     let mut view = loaded_machine();
     let (generation, _, host_socket) = begin_x11_access_check(&mut view, "alice");
     let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    view.finish_x11_check(
-        generation,
-        &target,
-        Ok(x11_check_with_access(host_socket, &[], false, false)),
-    );
+    view.finish_page_event(ConfigurationPageEvent::X11(Box::new(
+        X11PageEvent::Checked {
+            generation,
+            target,
+            result: Ok(x11_check_with_access(host_socket, &[], false, false)),
+        },
+    )))
+    .unwrap();
 
     let screen = render(&mut view, 160, 30);
     assert!(screen.contains("Pathname: denied at both guest paths; abstract route not tested."));
@@ -823,11 +1101,14 @@ fn missing_exact_x11_entry_requires_scope_confirmation_before_authorization() {
     let mut view = loaded_machine();
     let (check_generation, _, host_socket) = begin_x11_access_check(&mut view, "alice");
     let target = ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap());
-    view.finish_x11_check(
-        check_generation,
-        &target,
-        Ok(x11_check(host_socket.clone(), &[])),
-    );
+    view.finish_page_event(ConfigurationPageEvent::X11(Box::new(
+        X11PageEvent::Checked {
+            generation: check_generation,
+            target,
+            result: Ok(x11_check(host_socket.clone(), &[])),
+        },
+    )))
+    .unwrap();
 
     let screen = render(&mut view, 140, 30);
     assert!(screen.contains(" Authorize "));
@@ -840,11 +1121,11 @@ fn missing_exact_x11_entry_requires_scope_confirmation_before_authorization() {
     assert!(confirmation.contains("every host process with that UID"));
     assert!(confirmation.contains("Closing Lasper does not revoke it"));
 
-    let ConfigurationAction::AuthorizeX11 {
+    let ConfigurationAction::Page(ConfigurationPageAction::X11(X11PageAction::Authorize {
         generation,
         target: shell_target,
         host_socket: selected_socket,
-    } = view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+    })) = view.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
     else {
         panic!("confirmation should emit one typed authorization request");
     };

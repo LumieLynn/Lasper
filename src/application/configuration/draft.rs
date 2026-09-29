@@ -8,10 +8,34 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{ConfigurationEdit, ConfigurationSnapshot, ConfigurationTarget, X11BindingChange};
+use super::{
+    ConfigurationEdit, ConfigurationSnapshot, ConfigurationTarget, WaylandBindingChange,
+    X11BindingChange,
+};
+
+/// A page-owned edit intent submitted to the shared configuration draft.
+///
+/// Keeping this request at the application boundary prevents presentation
+/// controllers from reaching into another page's accumulated state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfigurationDraftRequest {
+    ToggleX11Declaration(usize),
+    ToggleX11Source(PathBuf),
+    ToggleWaylandDeclaration(usize),
+    ToggleWaylandSource {
+        source: PathBuf,
+        guest_target: PathBuf,
+    },
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum X11IntentKey {
+    Declaration(usize),
+    Addition(PathBuf),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum WaylandIntentKey {
     Declaration(usize),
     Addition(PathBuf),
 }
@@ -21,15 +45,37 @@ enum X11IntentKey {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfigurationDraft {
     x11: BTreeMap<X11IntentKey, X11BindingChange>,
+    wayland: BTreeMap<WaylandIntentKey, WaylandBindingChange>,
 }
 
 impl ConfigurationDraft {
+    pub fn apply(&mut self, request: ConfigurationDraftRequest) {
+        match request {
+            ConfigurationDraftRequest::ToggleX11Declaration(line) => {
+                self.toggle_x11_declaration(line);
+            }
+            ConfigurationDraftRequest::ToggleX11Source(source) => {
+                self.toggle_x11_source(&source);
+            }
+            ConfigurationDraftRequest::ToggleWaylandDeclaration(line) => {
+                self.toggle_wayland_declaration(line);
+            }
+            ConfigurationDraftRequest::ToggleWaylandSource {
+                source,
+                guest_target,
+            } => {
+                self.toggle_wayland_source(&source, &guest_target);
+            }
+        }
+    }
+
     pub fn clear(&mut self) {
         self.x11.clear();
+        self.wayland.clear();
     }
 
     pub fn is_empty(&self) -> bool {
-        self.x11.is_empty()
+        self.x11.is_empty() && self.wayland.is_empty()
     }
 
     pub fn toggle_x11_declaration(&mut self, line: usize) {
@@ -68,6 +114,42 @@ impl ConfigurationDraft {
         self.x11.get(&X11IntentKey::Addition(source.to_path_buf()))
     }
 
+    pub fn toggle_wayland_declaration(&mut self, line: usize) {
+        let key = WaylandIntentKey::Declaration(line);
+        if self.wayland.remove(&key).is_none() {
+            self.set_wayland_change(WaylandBindingChange::Remove { line });
+        }
+    }
+
+    pub fn set_wayland_change(&mut self, change: WaylandBindingChange) {
+        let key = match &change {
+            WaylandBindingChange::Add { source, .. } => WaylandIntentKey::Addition(source.clone()),
+            WaylandBindingChange::Update { line, .. } | WaylandBindingChange::Remove { line } => {
+                WaylandIntentKey::Declaration(*line)
+            }
+        };
+        self.wayland.insert(key, change);
+    }
+
+    pub fn toggle_wayland_source(&mut self, source: &Path, guest_target: &Path) {
+        let key = WaylandIntentKey::Addition(source.to_path_buf());
+        if self.wayland.remove(&key).is_none() {
+            self.set_wayland_change(WaylandBindingChange::Add {
+                source: source.to_path_buf(),
+                guest_target: guest_target.to_path_buf(),
+            });
+        }
+    }
+
+    pub fn wayland_change_for_declaration(&self, line: usize) -> Option<&WaylandBindingChange> {
+        self.wayland.get(&WaylandIntentKey::Declaration(line))
+    }
+
+    pub fn wayland_change_for_source(&self, source: &Path) -> Option<&WaylandBindingChange> {
+        self.wayland
+            .get(&WaylandIntentKey::Addition(source.to_path_buf()))
+    }
+
     /// Build the single application edit submitted for preview or apply.
     /// The snapshot revision binds all accumulated page intents to one
     /// inspected resource.
@@ -80,6 +162,7 @@ impl ConfigurationDraft {
             target: target.clone(),
             base_revision: snapshot.revision.clone()?,
             x11_changes: self.x11.values().cloned().collect(),
+            wayland_changes: self.wayland.values().cloned().collect(),
         })
     }
 }
@@ -116,5 +199,24 @@ mod tests {
         ));
         draft.clear();
         assert!(draft.is_empty());
+    }
+
+    #[test]
+    fn wayland_intents_share_the_revision_bound_draft() {
+        let mut draft = ConfigurationDraft::default();
+        draft.toggle_wayland_source(
+            Path::new("/run/user/1000/wayland-1"),
+            Path::new("/run/lasper/wayland/1000/wayland-1"),
+        );
+        assert!(matches!(
+            draft.wayland_change_for_source(Path::new("/run/user/1000/wayland-1")),
+            Some(WaylandBindingChange::Add { guest_target, .. })
+                if guest_target == Path::new("/run/lasper/wayland/1000/wayland-1")
+        ));
+        draft.toggle_wayland_declaration(9);
+        assert!(matches!(
+            draft.wayland_change_for_declaration(9),
+            Some(WaylandBindingChange::Remove { line: 9 })
+        ));
     }
 }

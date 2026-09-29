@@ -1,4 +1,10 @@
+//! Host Wayland endpoint discovery and revalidation.
+
 use crate::adapters::error::{NspawnError, Result};
+use crate::application::configuration::{
+    WaylandEndpointCatalog, WaylandEndpointDiscoveryPort, WaylandSourceObservation,
+    WaylandSourceState,
+};
 use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -7,6 +13,64 @@ use std::path::{Path, PathBuf};
 pub(crate) struct WaylandSocketCatalog {
     pub sockets: Vec<HostWaylandSocket>,
     pub preferred_display: Option<WaylandDisplay>,
+}
+
+pub(crate) struct HostWaylandEndpointDiscovery;
+
+#[async_trait::async_trait]
+impl WaylandEndpointDiscoveryPort for HostWaylandEndpointDiscovery {
+    async fn discover(&self, configured_sources: &[PathBuf]) -> WaylandEndpointCatalog {
+        let discovered = discover_wayland_socket_catalog().await;
+        let mut sources = Vec::new();
+        for source in configured_sources {
+            if sources
+                .iter()
+                .any(|observation: &WaylandSourceObservation| observation.source == *source)
+            {
+                continue;
+            }
+            sources.push(WaylandSourceObservation {
+                source: source.clone(),
+                state: observe_configured_wayland_source(source, &discovered.sockets).await,
+            });
+        }
+        WaylandEndpointCatalog {
+            sockets: discovered.sockets,
+            preferred_display: discovered.preferred_display,
+            sources,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+async fn observe_configured_wayland_source(
+    source: &Path,
+    sockets: &[HostWaylandSocket],
+) -> WaylandSourceState {
+    let canonical = match tokio::fs::canonicalize(source).await {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return WaylandSourceState::Missing
+        }
+        Err(error) => return WaylandSourceState::Unverified(error.to_string()),
+    };
+    let metadata = match tokio::fs::metadata(&canonical).await {
+        Ok(metadata) => metadata,
+        Err(error) => return WaylandSourceState::Unverified(error.to_string()),
+    };
+    if !metadata.file_type().is_socket() {
+        return WaylandSourceState::Invalid("Configured source is not a Unix socket".into());
+    }
+    if sockets
+        .iter()
+        .any(|socket| socket.canonical_path() == canonical)
+    {
+        WaylandSourceState::Observed
+    } else {
+        WaylandSourceState::Unverified(
+            "Socket was not authenticated as part of the current desktop session".into(),
+        )
+    }
 }
 
 /// Returns runtime-directory candidates in discovery priority order.
@@ -40,7 +104,7 @@ pub async fn discover_wayland_sockets() -> Vec<HostWaylandSocket> {
 /// desktop environment, when that display is present in the verified catalog.
 pub(crate) async fn discover_wayland_socket_catalog() -> WaylandSocketCatalog {
     discover_wayland_socket_catalog_from(
-        invoking_uid(),
+        super::invoking_uid(),
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var_os("WAYLAND_DISPLAY"),
     )
@@ -51,7 +115,7 @@ pub(crate) async fn discover_wayland_socket_catalog() -> WaylandSocketCatalog {
 /// discover other displays independently.
 pub(crate) async fn current_wayland_socket() -> Result<Option<HostWaylandSocket>> {
     current_wayland_socket_from(
-        invoking_uid(),
+        super::invoking_uid(),
         std::env::var_os("XDG_RUNTIME_DIR"),
         std::env::var_os("WAYLAND_DISPLAY"),
     )
@@ -319,17 +383,6 @@ async fn validate_wayland_directory(
         )));
     }
     Ok(canonical)
-}
-
-pub(crate) fn invoking_uid() -> u32 {
-    if uzers::get_current_uid() == 0 {
-        if let Ok(uid) = std::env::var("SUDO_UID") {
-            if let Ok(uid) = uid.parse() {
-                return uid;
-            }
-        }
-    }
-    uzers::get_current_uid()
 }
 
 #[cfg(test)]

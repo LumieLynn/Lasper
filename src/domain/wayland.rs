@@ -2,6 +2,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+pub const CONTAINER_WAYLAND_ROOT: &str = "/run/lasper/wayland";
+
 /// Structured failures for Wayland display, discovery evidence, and grant invariants.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum WaylandValidationError {
@@ -57,6 +59,16 @@ impl fmt::Display for WaylandDisplay {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Stable guest-side location used by Lasper-managed Wayland projections.
+///
+/// Both provisioning and the bounded configuration editor consume this
+/// policy; neither adapter owns the path convention independently.
+pub fn container_socket_path(uid: u32, display: &WaylandDisplay) -> PathBuf {
+    PathBuf::from(CONTAINER_WAYLAND_ROOT)
+        .join(uid.to_string())
+        .join(display.as_str())
 }
 
 impl<'de> Deserialize<'de> for WaylandDisplay {

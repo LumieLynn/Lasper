@@ -20,11 +20,7 @@ pub(crate) struct WaylandSessionResolver {
 
 impl WaylandSessionResolver {
     pub(crate) fn new(machine: MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
-        Self::for_authorized_uid(
-            machine,
-            nspawn,
-            crate::adapters::platform::capabilities::invoking_uid(),
-        )
+        Self::for_authorized_uid(machine, nspawn, crate::adapters::platform::invoking_uid())
     }
 
     pub(crate) fn for_authorized_uid(
@@ -107,7 +103,7 @@ pub(super) async fn automatic_wayland(
     nspawn: &NspawnConfigStore,
     machine: &MachineName,
 ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
-    let Some(socket) = crate::adapters::platform::capabilities::current_wayland_socket()
+    let Some(socket) = crate::adapters::platform::wayland::current_wayland_socket()
         .await
         .map_err(|error| SessionError::new(format!("resolve current Wayland display: {error}")))?
     else {

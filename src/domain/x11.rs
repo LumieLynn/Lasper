@@ -2,6 +2,12 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Standard filesystem namespace used by local X11 servers.
+pub const X11_SOCKET_DIRECTORY: &str = "/tmp/.X11-unix";
+
+/// X11 socket projections are communication endpoints, not guest-owned files.
+pub const X11_SOCKET_BIND_READ_ONLY: bool = true;
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum X11ValidationError {
     #[error("X11 endpoint source is not the standard path for display :{display}")]
@@ -163,7 +169,7 @@ impl HostX11Socket {
         revision: X11SocketRevision,
     ) -> Result<Self, X11ValidationError> {
         let expected = format!("X{display}{}", if alternate { "_" } else { "" });
-        if source.parent() != Some(Path::new("/tmp/.X11-unix"))
+        if source.parent() != Some(Path::new(X11_SOCKET_DIRECTORY))
             || source.file_name().and_then(|name| name.to_str()) != Some(expected.as_str())
         {
             return Err(X11ValidationError::InvalidSource { display });
@@ -269,6 +275,12 @@ impl X11BindIntent {
 
     pub fn target(&self) -> &Path {
         &self.target
+    }
+
+    /// X11 socket projections are communication endpoints, not guest-owned
+    /// files. Keep their nspawn mount read-only in every producer.
+    pub const fn readonly(&self) -> bool {
+        X11_SOCKET_BIND_READ_ONLY
     }
 }
 

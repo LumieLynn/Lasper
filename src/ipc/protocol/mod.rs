@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 21;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 22;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.

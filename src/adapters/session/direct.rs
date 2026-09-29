@@ -50,7 +50,7 @@ impl SessionPort for DirectSessionAdapter {
     async fn discover_host_wayland_sockets(
         &self,
     ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
-        crate::adapters::platform::capabilities::discover_wayland_sockets().await
+        crate::adapters::platform::wayland::discover_wayland_sockets().await
     }
 
     async fn open_terminal(

@@ -8,14 +8,13 @@ use ratatui::{
     Frame,
 };
 
-use super::navigation::ConfigurationPage;
+use super::page::PageRenderContext;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
 };
 use crate::application::configuration::{
-    ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget, X11BindRecommendation,
+    ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget,
 };
-use crate::domain::x11::X11PeerIdentity;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
 use crate::tui::widgets::display::scrollbar::vertical_scrollbar;
@@ -90,18 +89,17 @@ impl ConfigurationView {
             );
         }
         if self.hits.content.width > 0 {
-            match self.navigation.active_page() {
-                ConfigurationPage::X11 => {
-                    self.hits.x11 = self.page.x11_mut().render_content(
-                        frame,
-                        self.hits.content,
-                        &self.state,
-                        &self.target,
-                        self.pane,
-                        &self.draft,
-                    );
-                }
-            }
+            self.pages.render(
+                self.navigation.current_page(),
+                frame,
+                self.hits.content,
+                PageRenderContext {
+                    state: &self.state,
+                    target: &self.target,
+                    pane: self.pane,
+                    draft: &self.draft,
+                },
+            );
         }
         if self.hits.preview.width > 0 {
             self.render_preview(frame);
@@ -146,7 +144,8 @@ impl ConfigurationView {
         } else if self.discard.is_some() {
             self.render_discard_confirmation(frame, area);
         }
-        self.page.x11_mut().render_access_dialog(frame, area);
+        self.pages
+            .render_overlay(self.navigation.current_page(), frame, area);
     }
 
     fn block(&self, title: &'static str, pane: ConfigurationPane) -> Block<'static> {
@@ -171,7 +170,7 @@ impl ConfigurationView {
                 if self.preview_tab == PreviewTab::Diff {
                     let mut text = match &self.draft_preview {
                         DraftPreviewState::Clean => {
-                            "No unsaved changes. Check or uncheck an X11 endpoint to generate a diff."
+                            "No unsaved changes. Check or uncheck a display endpoint to generate a diff."
                                 .to_owned()
                         }
                         DraftPreviewState::Loading(generation) => {
@@ -257,54 +256,18 @@ impl ConfigurationView {
                         lines.push("The selected source differs from this target. Copying it requires a separate trust and replacement decision.".into());
                     }
                 }
+                let page_report = self.pages.inspection_report(snapshot);
                 lines.push(String::new());
-                lines.extend([format!("{} recognized X11 bind declaration(s)", snapshot.x11_bindings.len()),
-                    format!("{} live X11 filesystem endpoint(s)", snapshot.host_x11.sockets.len()),
-                    format!("{} other bind declaration(s) in Raw", snapshot.other_bind_count), String::new(),
+                lines.extend(page_report.summary);
+                lines.extend([
+                    format!("{} other bind declaration(s) in Raw", snapshot.other_bind_count),
+                    String::new(),
                     "Declarations are shown without a live socket, mount, guest path or authorization check.".into(),
                     "Alternate endpoint names do not prove display ownership. Directory binds may expose multiple displays.".into(),
-                    "Inspecting configuration does not save files, create guest links, or change X11 access.".into()]);
-                lines.push(String::new());
-                match &snapshot.x11_bind_recommendation {
-                    X11BindRecommendation::Ready {
-                        private_users,
-                        idmapped,
-                    } => lines.push(format!(
-                        "New endpoint policy: PrivateUsers={private_users}; {}",
-                        if *idmapped {
-                            "read-only original-path bind with idmap"
-                        } else {
-                            "read-only original-path bind without idmap"
-                        }
-                    )),
-                    X11BindRecommendation::Unsupported { reason, .. } => {
-                        lines.push(format!("New endpoint policy unavailable: {reason}"));
-                    }
-                }
-                for socket in &snapshot.host_x11.sockets {
-                    let revision = socket.revision();
-                    let peer = match socket.peer_identity() {
-                        X11PeerIdentity::LocalProcess { pid, uid, gid } => {
-                            format!("pid {pid} {uid}:{gid}")
-                        }
-                        X11PeerIdentity::External { uid, gid } => {
-                            format!("external {uid}:{gid} (PID unavailable)")
-                        }
-                    };
-                    lines.push(format!(
-                        ":{}{} {} -> {} | owner {}:{} mode {:04o} | peer {peer} | dev {} ino {}",
-                        socket.display(),
-                        if socket.alternate() { " alternate" } else { "" },
-                        socket.source().display(),
-                        socket.canonical_path().display(),
-                        socket.owner_uid(),
-                        socket.owner_gid(),
-                        socket.mode(),
-                        revision.device,
-                        revision.inode,
-                    ));
-                }
-                lines.extend(snapshot.host_x11.diagnostics.iter().cloned());
+                    "Inspecting configuration does not save files, create guest links, or change runtime access.".into(),
+                    String::new(),
+                ]);
+                lines.extend(page_report.details);
                 lines.extend(snapshot.diagnostics.iter().cloned());
                 Cow::Owned(lines.join("\n"))
             }
@@ -394,7 +357,7 @@ impl ConfigurationView {
         frame.render_widget(Clear, dialog);
         frame.render_widget(
             Paragraph::new(
-                "Discard the unsaved X11 configuration draft?\n\n[y] Discard    [n/Esc] Keep editing",
+                "Discard the unsaved configuration draft?\n\n[y] Discard    [n/Esc] Keep editing",
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false })
@@ -424,7 +387,7 @@ impl ConfigurationView {
         frame.render_widget(Clear, dialog);
         frame.render_widget(
             Paragraph::new(format!(
-                "Restart {machine} now to activate the saved X11 bind changes?\n\n[y] Restart now    [n/Esc] Later"
+                "Restart {machine} now to activate the saved display bind changes?\n\n[y] Restart now    [n/Esc] Later"
             ))
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: false })

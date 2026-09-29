@@ -2,7 +2,7 @@ use crate::domain::provisioning::{validate_login_shell, validate_login_username}
 use crate::domain::secret::validate_chpasswd_secret;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::tui::core::{AppMessage, Component, EventResult, FocusTracker, WizardMessage};
-use crate::tui::widgets::dialogs::wayland_access::WaylandAccessDialog;
+use crate::tui::widgets::dialogs::wayland_bindings::WaylandBindingsDialog;
 use crate::tui::widgets::inputs::button::Button;
 use crate::tui::widgets::inputs::password_box::PasswordBox;
 use crate::tui::widgets::inputs::text_box::TextBox;
@@ -40,7 +40,7 @@ pub struct UserEditor {
     wayland_sockets: Vec<HostWaylandSocket>,
     preferred_wayland_display: Option<WaylandDisplay>,
     wayland: Option<WaylandAccessDraft>,
-    wayland_dialog: Option<WaylandAccessDialog>,
+    wayland_dialog: Option<WaylandBindingsDialog>,
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
@@ -126,7 +126,7 @@ impl UserEditor {
     }
 
     fn open_wayland_dialog(&mut self) {
-        let mut dialog = WaylandAccessDialog::new(
+        let mut dialog = WaylandBindingsDialog::new(
             self.wayland_sockets.clone(),
             self.preferred_wayland_display.clone(),
             self.wayland.as_ref(),

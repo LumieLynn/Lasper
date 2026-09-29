@@ -17,51 +17,6 @@ enum PreparedDetailRefresh {
 }
 
 impl App {
-    pub(crate) async fn show_shell_dialog(&mut self) {
-        let entry = if let Some(image) = self.focused_image_resource() {
-            self.data
-                .entries
-                .iter()
-                .find(|entry| entry.name == image.name)
-                .cloned()
-        } else {
-            self.data.entries.get(self.data.selected).cloned()
-        };
-        let Some(entry) = entry else {
-            self.set_status(
-                "Select a running machine before opening a shell.".into(),
-                crate::tui::StatusLevel::Info,
-            );
-            return;
-        };
-        if entry.state != MachineState::Running {
-            self.set_status(
-                format!("{} is not running.", entry.name),
-                crate::tui::StatusLevel::Info,
-            );
-            return;
-        }
-        let Ok(machine) = MachineName::new(&entry.name) else {
-            self.set_status(
-                format!("{} is not a valid nspawn machine name.", entry.name),
-                crate::tui::StatusLevel::Error,
-            );
-            return;
-        };
-        let wayland_sockets = self
-            .data
-            .session_service
-            .discover_host_wayland_sockets()
-            .await;
-        self.ui.active_dialog = Some(Box::new(
-            crate::tui::widgets::dialogs::shell::ShellDialog::new(
-                machine,
-                String::new(),
-                wayland_sockets,
-            ),
-        ));
-    }
-
     pub(crate) async fn spawn_terminal_as_user(
         &mut self,
         machine: MachineName,

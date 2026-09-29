@@ -19,14 +19,14 @@ macro_rules! active_comps {
     }};
 }
 
-pub struct WaylandAccessDialog {
+pub struct WaylandBindingsDialog {
     sockets: Checklist<HostWaylandSocket>,
     btn_ok: Button,
     btn_cancel: Button,
     focus: FocusTracker,
 }
 
-impl WaylandAccessDialog {
+impl WaylandBindingsDialog {
     pub fn new(
         available: Vec<HostWaylandSocket>,
         preferred_display: Option<WaylandDisplay>,
@@ -102,14 +102,14 @@ fn socket_label(socket: &HostWaylandSocket, preferred_display: Option<&WaylandDi
     )
 }
 
-impl Component for WaylandAccessDialog {
+impl Component for WaylandBindingsDialog {
     fn render(&mut self, frame: &mut Frame, area: Rect) {
         let dialog_area = crate::tui::centered_rect(65, 70, area);
         frame.render_widget(Clear, dialog_area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .title(" Wayland Access ")
+            .title(" Wayland Bindings ")
             .border_style(Style::default().fg(crate::tui::theme::theme().dialog_border));
         let inner = block.inner(dialog_area);
         frame.render_widget(block, dialog_area);
@@ -227,7 +227,7 @@ mod tests {
         let first = socket("wayland-0", 1);
         let second = socket("wayland-1", 2);
         let initial = WaylandAccessDraft::new(vec![first.clone(), second.clone()]).unwrap();
-        let dialog = WaylandAccessDialog::new(
+        let dialog = WaylandBindingsDialog::new(
             vec![first, second],
             Some(WaylandDisplay::new("wayland-0").unwrap()),
             Some(&initial),

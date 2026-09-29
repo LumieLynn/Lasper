@@ -133,6 +133,13 @@ mod tests {
                     idmapped: false,
                 },
             host_x11: Default::default(),
+            wayland_bindings: Vec::new(),
+            wayland_bind_recommendation:
+                crate::application::configuration::WaylandBindRecommendation::Ready {
+                    private_users: "no".into(),
+                    idmapped: false,
+                },
+            host_wayland: Default::default(),
             other_bind_count: 0,
             diagnostics: Vec::new(),
         };
