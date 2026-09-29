@@ -33,6 +33,7 @@ pub(crate) trait DaemonRuntimeQueries: Send + Sync {
         include_nspawn_unit: bool,
     ) -> RuntimeResult<MachineProperties>;
     async fn is_available(&self) -> bool;
+    async fn get_unit_properties(&self, machine: &MachineName) -> RuntimeResult<MachineProperties>;
 }
 
 /// Host mutation surface exposed to command handlers.
@@ -90,6 +91,12 @@ pub(crate) trait DaemonSystemExecutor: Send + Sync {
 
 #[async_trait::async_trait]
 impl DaemonRuntimeQueries for crate::adapters::runtime::dbus::DbusBackend {
+    async fn get_unit_properties(&self, machine: &MachineName) -> RuntimeResult<MachineProperties> {
+        RuntimeSource::get_unit_properties(self, machine)
+            .await
+            .map_err(crate::adapters::runtime::map_runtime_error)
+    }
+
     async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
         RuntimeSource::list_machines(self)
             .await

@@ -1,5 +1,6 @@
 use crate::adapters::error::Result;
 use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
 
 /// Read-only runtime discovery, inspection, and observation.
@@ -21,4 +22,5 @@ pub trait RuntimeSource: Send + Sync + 'static {
         include_nspawn_unit: bool,
     ) -> Result<MachineProperties>;
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
+    async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties>;
 }

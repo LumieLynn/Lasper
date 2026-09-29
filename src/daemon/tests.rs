@@ -38,6 +38,15 @@ struct SlowRemoveDbus {
 
 #[async_trait::async_trait]
 impl DaemonRuntimeQueries for SlowRemoveDbus {
+    async fn get_unit_properties(
+        &self,
+        _: &crate::domain::machine::MachineName,
+    ) -> crate::application::runtime::RuntimeResult<MachineProperties> {
+        Err(crate::application::runtime::RuntimeError::failed(
+            "test backend does not inspect units",
+        ))
+    }
+
     async fn list_machines(&self) -> crate::application::runtime::RuntimeResult<Vec<MachineEntry>> {
         Err(crate::application::runtime::RuntimeError::failed(
             "slow test backend does not list machines",

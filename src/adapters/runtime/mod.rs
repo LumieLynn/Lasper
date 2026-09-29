@@ -131,6 +131,14 @@ impl RuntimePort for SourceRuntimePort {
         }
     }
 
+    async fn inspect_unit(&self, machine: &MachineName) -> RuntimeResult<MachineProperties> {
+        match &self.inspector {
+            RuntimeInspector::Source => self.source.get_unit_properties(machine).await,
+            RuntimeInspector::Store(store) => store.inspect_unit(machine).await,
+        }
+        .map_err(map_runtime_error)
+    }
+
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> RuntimeResult<()> {
         self.source
             .watch_events(tx)

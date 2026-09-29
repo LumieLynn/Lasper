@@ -1,28 +1,28 @@
 //! Host-backed resource detail inspection.
 
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
-use crate::adapters::process::CommandRunner;
 use crate::application::inspection::{
     ImageUnitInspection, NspawnConfigInspection, ResourceInspectionError, ResourceInspectionPort,
     SystemdDropInInspection, SystemdUnitInspection,
 };
+use crate::application::runtime::RuntimeCatalog;
 use crate::domain::runtime::MachineEntry;
 use std::sync::Arc;
 
 pub(crate) struct StoreResourceInspection {
-    local_cmd: Arc<dyn CommandRunner>,
+    runtime: Arc<RuntimeCatalog>,
     nspawn: NspawnConfigStore,
     systemd_unit: SystemdUnitStore,
 }
 
 impl StoreResourceInspection {
     pub(crate) fn new(
-        local_cmd: Arc<dyn CommandRunner>,
+        runtime: Arc<RuntimeCatalog>,
         nspawn: NspawnConfigStore,
         systemd_unit: SystemdUnitStore,
     ) -> Self {
         Self {
-            local_cmd,
+            runtime,
             nspawn,
             systemd_unit,
         }
@@ -70,12 +70,11 @@ impl ResourceInspectionPort for StoreResourceInspection {
     }
 
     async fn inspect_image_unit(&self, name: &str) -> ImageUnitInspection {
-        let properties =
-            crate::adapters::runtime::systemd_tools::get_image_unit_properties_with_runner(
-                name,
-                self.local_cmd.as_ref(),
-            )
+        let properties = self
+            .runtime
+            .inspect_image_unit(name)
             .await
+            .map(|query| query.map(|query| query.value))
             .map_err(ResourceInspectionError::backend);
         let unit = if matches!(properties, Ok(None)) {
             None
@@ -107,10 +106,19 @@ mod tests {
     use super::*;
     use crate::domain::runtime::{MachineState, ReadOnlyReason};
 
+    fn runtime() -> Arc<RuntimeCatalog> {
+        Arc::new(RuntimeCatalog::new(
+            None,
+            Arc::new(crate::application::runtime::MockRuntimePort::new()),
+            vec![],
+            None,
+        ))
+    }
+
     #[tokio::test]
     async fn non_machine_image_names_do_not_probe_systemd_unit_drop_ins() {
         let inspection = StoreResourceInspection::new(
-            Arc::new(crate::adapters::process::DefaultCommandRunner),
+            runtime(),
             NspawnConfigStore::direct(),
             SystemdUnitStore::direct(),
         );
@@ -124,7 +132,7 @@ mod tests {
     #[tokio::test]
     async fn foreign_machine_cannot_enter_the_nspawn_config_reader() {
         let inspection = StoreResourceInspection::new(
-            Arc::new(crate::adapters::process::DefaultCommandRunner),
+            runtime(),
             NspawnConfigStore::direct(),
             SystemdUnitStore::direct(),
         );

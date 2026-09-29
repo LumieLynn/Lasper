@@ -281,7 +281,11 @@ pub(crate) fn compose_application_services(
         ),
     );
     let resource_inspection = Arc::new(ResourceInspectionService::new(Arc::new(
-        crate::adapters::inspection::StoreResourceInspection::new(local_cmd, nspawn, systemd_unit),
+        crate::adapters::inspection::StoreResourceInspection::new(
+            Arc::clone(&runtime),
+            nspawn,
+            systemd_unit,
+        ),
     )));
 
     ApplicationServices {

@@ -735,6 +735,33 @@ impl RuntimeSource for DbusBackend {
         }
     }
 
+    async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties> {
+        let (generation, conn) = self
+            .connection_lease()
+            .await
+            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
+        let values = self
+            .query_with_deadline(
+                generation,
+                "image unit properties",
+                get_systemd1_properties(&conn, machine),
+            )
+            .await
+            .map_err(NspawnError::Dbus)?;
+        let mut properties = MachineProperties::from_inspection(
+            InspectionSource::Dbus,
+            InspectionCompleteness::Full,
+        );
+        for (key, value) in values {
+            crate::adapters::runtime::formatting::insert_systemd_property(
+                &mut properties,
+                key,
+                value,
+            );
+        }
+        Ok(properties)
+    }
+
     async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
         use futures_util::StreamExt;
         let (generation, proxy) = self

@@ -44,6 +44,7 @@ pub(crate) trait RuntimePort: Send + Sync + 'static {
         entry: &MachineEntry,
     ) -> RuntimeResult<MachineProperties>;
     async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> RuntimeResult<()>;
+    async fn inspect_unit(&self, machine: &MachineName) -> RuntimeResult<MachineProperties>;
 }
 
 pub struct RuntimeCatalog {
@@ -183,6 +184,52 @@ impl RuntimeCatalog {
 
         enrich_properties(&mut query.value, entry);
         Ok(query)
+    }
+
+    /// An image can have a unit without being registered as a running machine.
+    /// Filesystem-valid image names outside the machine namespace have no unit.
+    pub async fn inspect_image_unit(
+        &self,
+        name: &str,
+    ) -> RuntimeResult<Option<RuntimeQuery<MachineProperties>>> {
+        let Ok(machine) = MachineName::new(name) else {
+            return Ok(None);
+        };
+        let mut fallback = None;
+        if let Some(primary) = &self.primary {
+            let result = if primary.is_available().await {
+                primary.inspect_unit(&machine).await
+            } else {
+                Err(RuntimeError::unavailable("D-Bus not available"))
+            };
+            match result {
+                Ok(value) => {
+                    return Ok(Some(RuntimeQuery {
+                        value,
+                        route: primary.inspection_route(),
+                        fallback: None,
+                    }))
+                }
+                Err(error) => {
+                    let from = primary.inspection_route();
+                    let to = self.fallback.inspection_route();
+                    let reason = fallback_reason(&error);
+                    log::warn!(
+                        "{} unit inspection failed for {} ({}), using {}",
+                        from.label(),
+                        machine,
+                        reason,
+                        to.label()
+                    );
+                    fallback = Some(RouteFallback { from, to, reason });
+                }
+            }
+        }
+        Ok(Some(RuntimeQuery {
+            value: self.fallback.inspect_unit(&machine).await?,
+            route: self.fallback.inspection_route(),
+            fallback,
+        }))
     }
 
     pub async fn watch(self: &Arc<Self>, tx: tokio::sync::mpsc::Sender<RuntimeUpdate>) {
@@ -529,6 +576,73 @@ mod tests {
 
         assert_eq!(query.route, ExecutionRoute::LocalSystemdTools);
         assert!(query.fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_unit_uses_selected_dbus_route_without_machine_queries() {
+        for route in [ExecutionRoute::DirectDbus, ExecutionRoute::ElevatedDbus] {
+            let mut primary = port(route);
+            primary.expect_is_available().once().returning(|| true);
+            primary
+                .expect_inspect_unit()
+                .once()
+                .withf(|machine| machine.as_str() == "test-image")
+                .returning(|_| Ok(MachineProperties::default()));
+            let catalog = RuntimeCatalog::new(
+                Some(Arc::new(primary)),
+                Arc::new(port(ExecutionRoute::LocalSystemdTools)),
+                vec![],
+                None,
+            );
+            let query = catalog
+                .inspect_image_unit("test-image")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(query.route, route);
+            assert!(query.fallback.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn image_unit_preserves_elevated_tools_route() {
+        let mut fallback = port(ExecutionRoute::ElevatedSystemdTools);
+        fallback
+            .expect_inspect_unit()
+            .once()
+            .returning(|_| Ok(MachineProperties::default()));
+        let catalog = RuntimeCatalog::new(None, Arc::new(fallback), vec![], None);
+        let query = catalog
+            .inspect_image_unit("test-image")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(query.route, ExecutionRoute::ElevatedSystemdTools);
+        assert!(query.fallback.is_none());
+    }
+
+    #[tokio::test]
+    async fn image_unit_query_falls_back_after_primary_failure() {
+        let mut primary = port(ExecutionRoute::DirectDbus);
+        primary.expect_is_available().returning(|| true);
+        primary
+            .expect_inspect_unit()
+            .once()
+            .returning(|_| Err(RuntimeError::failed("query failed")));
+        let mut fallback = port(ExecutionRoute::LocalSystemdTools);
+        fallback
+            .expect_inspect_unit()
+            .once()
+            .returning(|_| Ok(MachineProperties::default()));
+        let catalog =
+            RuntimeCatalog::new(Some(Arc::new(primary)), Arc::new(fallback), vec![], None);
+        let query = catalog
+            .inspect_image_unit("test-image")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(query.route, ExecutionRoute::LocalSystemdTools);
+        assert_eq!(query.fallback.unwrap().from, ExecutionRoute::DirectDbus);
     }
 
     #[tokio::test]

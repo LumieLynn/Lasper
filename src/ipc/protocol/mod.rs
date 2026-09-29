@@ -13,7 +13,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 22;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 23;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -107,6 +107,7 @@ rpc_methods! {
     AssessTarRuntime => ("assess_tar_runtime", Query),
     SystemOperation => ("system_operation", Command),
     SystemdToolsInspectMachine => ("systemd_tools_inspect_machine", Query),
+    SystemdToolsInspectUnit => ("systemd_tools_inspect_unit", Query),
     DbusListMachines => ("dbus_list_machines", Query),
     DbusListImages => ("dbus_list_images", Query),
     NspawnLaunch => ("nspawn_launch", Command),
@@ -114,6 +115,7 @@ rpc_methods! {
     NspawnUnitControl => ("nspawn_unit_control", Command),
     ImageRemove => ("image_remove", Command),
     DbusGetProperties => ("dbus_get_properties", Query),
+    DbusGetUnitProperties => ("dbus_get_unit_properties", Query),
     DbusIsAvailable => ("dbus_is_available", Query),
 }
 

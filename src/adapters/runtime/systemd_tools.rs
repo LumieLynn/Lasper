@@ -186,6 +186,10 @@ fn x11_projection_probe(
 
 #[async_trait::async_trait]
 impl RuntimeSource for SystemdToolsBackend {
+    async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties> {
+        get_unit_properties_with_runner(machine, self.cmd_runner.as_ref()).await
+    }
+
     async fn is_available(&self) -> bool {
         which::which("machinectl").is_ok()
     }
@@ -366,22 +370,18 @@ pub(crate) async fn get_properties_with_runner(
 
 /// Inspect only the systemd-nspawn unit associated with an image.
 ///
-/// Image names follow filesystem component rules and are broader than machine
-/// names. `None` means the image cannot have a corresponding nspawn machine
-/// unit; command or systemd failures remain errors.
-pub(crate) async fn get_image_unit_properties_with_runner(
-    name: &str,
+/// The catalog validates image names before reaching this backend; query
+/// failures (including an absent unit) remain errors.
+pub(crate) async fn get_unit_properties_with_runner(
+    name: &MachineName,
     cmd_runner: &dyn CommandRunner,
-) -> Result<Option<MachineProperties>> {
-    let Ok(name) = MachineName::new(name) else {
-        return Ok(None);
-    };
+) -> Result<MachineProperties> {
     let mut props = MachineProperties::from_inspection(
         InspectionSource::SystemdTools,
         InspectionCompleteness::Full,
     );
-    match append_systemd_unit_properties(&name, cmd_runner, &mut props).await? {
-        UnitInspection::Present => Ok(Some(props)),
+    match append_systemd_unit_properties(name, cmd_runner, &mut props).await? {
+        UnitInspection::Present => Ok(props),
         UnitInspection::NotFound(diagnostic) => {
             let unit = name.systemd_nspawn_unit();
             Err(NspawnError::CommandFailed(
@@ -1120,10 +1120,10 @@ mod tests {
                 ))
             });
 
-        let properties = get_image_unit_properties_with_runner("test-image", &runner)
-            .await
-            .unwrap()
-            .expect("valid machine name has a unit");
+        let properties =
+            get_unit_properties_with_runner(&MachineName::new("test-image").unwrap(), &runner)
+                .await
+                .unwrap();
 
         let systemd = properties.get_group("Systemd").unwrap();
         assert_eq!(
@@ -1148,10 +1148,11 @@ mod tests {
                 ))
             });
 
-        let error = get_image_unit_properties_with_runner("test-image", &runner)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error =
+            get_unit_properties_with_runner(&MachineName::new("test-image").unwrap(), &runner)
+                .await
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("LoadState=not-found"));
         assert!(error.contains("org.freedesktop.systemd1.NoSuchUnit"));
@@ -1166,23 +1167,12 @@ mod tests {
             .times(1)
             .returning(|_, _, _| Ok(mock_output(false, "inactive\n", "")));
 
-        let error = get_image_unit_properties_with_runner("test-image", &runner)
-            .await
-            .unwrap_err()
-            .to_string();
+        let error =
+            get_unit_properties_with_runner(&MachineName::new("test-image").unwrap(), &runner)
+                .await
+                .unwrap_err()
+                .to_string();
 
         assert!(error.contains("inactive"));
-    }
-
-    #[tokio::test]
-    async fn image_unit_inspection_skips_non_machine_image_names() {
-        let mut runner = MockCommandRunner::new();
-        runner.expect_run().never();
-
-        let properties = get_image_unit_properties_with_runner("Ubuntu Resolute 镜像", &runner)
-            .await
-            .unwrap();
-
-        assert!(properties.is_none());
     }
 }

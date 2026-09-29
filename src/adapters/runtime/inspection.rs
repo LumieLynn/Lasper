@@ -4,6 +4,7 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::application::operations::ExecutionRoute;
 use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,6 +36,10 @@ impl MachineInspectionStore {
     pub(crate) fn route(&self) -> ExecutionRoute {
         self.executor.route()
     }
+
+    pub(crate) async fn inspect_unit(&self, machine: &MachineName) -> Result<MachineProperties> {
+        self.executor.inspect_unit(machine).await
+    }
 }
 
 impl std::fmt::Debug for MachineInspectionStore {
@@ -50,12 +55,21 @@ trait MachineInspectionExecutor: Send + Sync + 'static {
     fn route(&self) -> ExecutionRoute;
 
     async fn inspect(&self, name: &str, entry: &MachineEntry) -> Result<MachineProperties>;
+    async fn inspect_unit(&self, machine: &MachineName) -> Result<MachineProperties>;
 }
 
 struct DirectMachineInspectionExecutor;
 
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for DirectMachineInspectionExecutor {
+    async fn inspect_unit(&self, machine: &MachineName) -> Result<MachineProperties> {
+        crate::adapters::runtime::systemd_tools::get_unit_properties_with_runner(
+            machine,
+            &crate::adapters::process::DefaultCommandRunner,
+        )
+        .await
+    }
+
     fn route(&self) -> ExecutionRoute {
         ExecutionRoute::LocalSystemdTools
     }
@@ -71,6 +85,13 @@ struct ElevatedMachineInspectionExecutor {
 
 #[async_trait::async_trait]
 impl MachineInspectionExecutor for ElevatedMachineInspectionExecutor {
+    async fn inspect_unit(&self, machine: &MachineName) -> Result<MachineProperties> {
+        self.daemon
+            .systemd_tools_inspect_unit(machine)
+            .await
+            .map_err(|error| NspawnError::Io(PathBuf::from("elevated unit inspection"), error))
+    }
+
     fn route(&self) -> ExecutionRoute {
         ExecutionRoute::ElevatedSystemdTools
     }
@@ -97,6 +118,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MachineInspectionExecutor for RecordingInspector {
+        async fn inspect_unit(&self, _: &MachineName) -> Result<MachineProperties> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(MachineProperties::default())
+        }
+
         fn route(&self) -> ExecutionRoute {
             ExecutionRoute::LocalSystemdTools
         }

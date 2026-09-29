@@ -9,6 +9,7 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, MachineEntry, StatusUpdate};
 use std::sync::Arc;
 
@@ -32,6 +33,13 @@ impl DaemonBackend {
 
 #[async_trait::async_trait]
 impl RuntimeSource for DaemonBackend {
+    async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties> {
+        let json = self
+            .call("dbus_get_unit_properties", serde_json::json!(machine))
+            .await?;
+        Ok(serde_json::from_value(json)?)
+    }
+
     async fn is_available(&self) -> bool {
         self.call("dbus_is_available", serde_json::json!({}))
             .await

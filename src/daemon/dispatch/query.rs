@@ -92,6 +92,37 @@ pub(super) async fn handle<B: DaemonRuntimeQueries>(
             HandleOutcome::Spawned
         }
 
+        RpcMethod::DbusGetUnitProperties | RpcMethod::SystemdToolsInspectUnit => {
+            let machine: crate::domain::machine::MachineName = match serde_json::from_value(params)
+            {
+                Ok(machine) => machine,
+                Err(error) => {
+                    return HandleOutcome::Sync(Err(format!(
+                        "invalid unit inspection request: {error}"
+                    )))
+                }
+            };
+            let result = if method == RpcMethod::DbusGetUnitProperties {
+                match dbus.as_ref() {
+                    Some(dbus) => dbus
+                        .get_unit_properties(&machine)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    None => Err("DBus not available".into()),
+                }
+            } else {
+                crate::adapters::runtime::systemd_tools::get_unit_properties_with_runner(
+                    &machine,
+                    &crate::adapters::process::DefaultCommandRunner,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            };
+            HandleOutcome::Sync(result.and_then(|properties| {
+                serde_json::to_value(properties).map_err(|error| error.to_string())
+            }))
+        }
+
         RpcMethod::DbusListMachines => {
             let dbus = match dbus.as_ref() {
                 Some(dbus) => dbus,
@@ -168,6 +199,8 @@ mod tests {
                     RpcMethod::Ping
                         | RpcMethod::AssessTarRuntime
                         | RpcMethod::SystemdToolsInspectMachine
+                        | RpcMethod::SystemdToolsInspectUnit
+                        | RpcMethod::DbusGetUnitProperties
                         | RpcMethod::DbusListMachines
                         | RpcMethod::DbusListImages
                         | RpcMethod::DbusGetProperties
