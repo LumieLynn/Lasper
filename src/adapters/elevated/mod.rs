@@ -1,5 +1,6 @@
 //! Authenticated daemon client facade, RPC multiplexer, and typed proxies.
 
+mod configuration;
 mod session;
 
 use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
@@ -468,10 +469,7 @@ impl ElevatedDaemon {
                 );
             })?;
         if let Some(err) = response.error {
-            return Err(std::io::Error::other(format!(
-                "daemon error (code={}): {}",
-                err.code, err.message
-            )));
+            return Err(std::io::Error::other(err));
         }
         Ok(response.result.unwrap_or(serde_json::Value::Null))
     }

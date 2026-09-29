@@ -6,7 +6,6 @@ pub(crate) mod query;
 
 use self::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use super::server::DaemonServerState;
-use crate::adapters::config::store::NspawnConfigOperation;
 use crate::adapters::system_operation::SystemOperation;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::image_lifecycle::ImageRemoveRequest;
@@ -231,14 +230,21 @@ pub(super) fn daemon_resource_claims(
                 ResourceClaim::shared(ResourceKey::SystemdManager),
             ]
         }
-        RpcMethod::NspawnConfig => {
-            let operation: NspawnConfigOperation =
+        RpcMethod::Configuration => {
+            let operation: crate::ipc::protocol::configuration::ConfigurationOperation =
                 serde_json::from_value(request.params.clone())
-                    .map_err(|error| format!("invalid nspawn_config request: {error}"))?;
-            operation
-                .configuration_apply_machine()
-                .map(|machine| vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))])
-                .unwrap_or_default()
+                    .map_err(|error| format!("invalid configuration request: {error}"))?;
+            match operation {
+                crate::ipc::protocol::configuration::ConfigurationOperation::Apply(edit) => {
+                    use crate::application::configuration::ConfigurationTarget;
+                    let key = match edit.target {
+                        ConfigurationTarget::Machine(machine) => ResourceKey::for_machine(&machine),
+                        ConfigurationTarget::Image(image) => ResourceKey::for_image(&image),
+                    };
+                    vec![ResourceClaim::exclusive(key)]
+                }
+                _ => vec![],
+            }
         }
         RpcMethod::SystemOperation => {
             let wire_operation: crate::ipc::protocol::system::SystemOperation =

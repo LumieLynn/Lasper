@@ -1,6 +1,6 @@
 use super::nspawn_source::{NspawnConfigSource, NspawnConfigSourceKind, NspawnConfigSources};
 use super::nspawn_spec::NspawnConfigSpec;
-use super::{editor, settings_lock, MAX_NSPAWN_CONTENT_BYTES};
+use super::{settings_lock, MAX_NSPAWN_CONTENT_BYTES};
 use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
@@ -8,10 +8,6 @@ use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
-use crate::application::configuration::{
-    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
-    ConfigurationTarget,
-};
 use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
@@ -73,38 +69,6 @@ impl NspawnConfigStore {
             }))
             .await?;
         Ok(result.content.map(NspawnConfig::from))
-    }
-
-    pub(crate) async fn configuration_snapshot(
-        &self,
-        target: ConfigurationTarget,
-    ) -> Result<ConfigurationSnapshot> {
-        self.execute(NspawnConfigOperation::Snapshot(target))
-            .await?
-            .snapshot
-            .ok_or_else(|| {
-                NspawnError::Runtime("configuration inspection returned no snapshot".into())
-            })
-    }
-
-    pub(crate) async fn preview_configuration(
-        &self,
-        edit: ConfigurationEdit,
-    ) -> Result<ConfigurationPreview> {
-        self.execute(NspawnConfigOperation::PreviewConfiguration(Box::new(edit)))
-            .await?
-            .preview
-            .ok_or_else(|| NspawnError::Runtime("configuration preview returned no result".into()))
-    }
-
-    pub(crate) async fn apply_configuration(
-        &self,
-        edit: ConfigurationEdit,
-    ) -> Result<ConfigurationApplyReport> {
-        self.execute(NspawnConfigOperation::ApplyConfiguration(Box::new(edit)))
-            .await?
-            .configuration_apply
-            .ok_or_else(|| NspawnError::Runtime("configuration apply returned no result".into()))
     }
 
     pub async fn write_generated(
@@ -246,9 +210,6 @@ impl NspawnConfigExecutor for ElevatedNspawnConfigExecutor {
 pub(crate) enum NspawnConfigOperation {
     Read(ReadNspawnConfig),
     Inspect(InspectNspawnConfig),
-    Snapshot(ConfigurationTarget),
-    PreviewConfiguration(Box<ConfigurationEdit>),
-    ApplyConfiguration(Box<ConfigurationEdit>),
     Write(Box<WriteNspawnConfig>),
     PrepareOciPromotion(PrepareOciPromotion),
     PromoteOci(PromoteOciConfig),
@@ -262,22 +223,12 @@ impl NspawnConfigOperation {
         match self {
             Self::Read(_)
             | Self::Inspect(_)
-            | Self::Snapshot(_)
-            | Self::PreviewConfiguration(_)
             | Self::PrepareOciPromotion(_)
             | Self::CleanupSidecarLocks(_) => None,
             Self::Write(request) => Some(request.spec.machine.clone()),
-            Self::ApplyConfiguration(edit) => MachineName::new(edit.target.name()).ok(),
             Self::PromoteOci(request) => Some(request.machine.clone()),
             Self::UpdateGpu(request) => Some(request.machine.clone()),
             Self::Remove(request) => Some(request.machine.clone()),
-        }
-    }
-
-    pub(crate) fn configuration_apply_machine(&self) -> Option<MachineName> {
-        match self {
-            Self::ApplyConfiguration(edit) => MachineName::new(edit.target.name()).ok(),
-            _ => None,
         }
     }
 }
@@ -331,12 +282,6 @@ pub(crate) struct NspawnConfigResult {
     apply: Option<ResourceApplyStatus>,
     #[serde(default)]
     sidecars_cleaned: Option<bool>,
-    #[serde(default)]
-    snapshot: Option<ConfigurationSnapshot>,
-    #[serde(default)]
-    preview: Option<ConfigurationPreview>,
-    #[serde(default)]
-    configuration_apply: Option<ConfigurationApplyReport>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -376,18 +321,6 @@ pub(crate) async fn execute_nspawn_config_operation(
         None => None,
     };
     match operation {
-        NspawnConfigOperation::Snapshot(target) => Ok(NspawnConfigResult {
-            snapshot: Some(editor::inspect(target).await?),
-            ..Default::default()
-        }),
-        NspawnConfigOperation::PreviewConfiguration(edit) => Ok(NspawnConfigResult {
-            preview: Some(editor::preview(*edit).await?),
-            ..Default::default()
-        }),
-        NspawnConfigOperation::ApplyConfiguration(edit) => Ok(NspawnConfigResult {
-            configuration_apply: Some(editor::apply(*edit).await?),
-            ..Default::default()
-        }),
         NspawnConfigOperation::Read(request) => {
             let path = nspawn_path(&request.machine);
             Ok(NspawnConfigResult {
@@ -1199,39 +1132,6 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(!json.contains("root_password"));
         assert!(value["params"]["spec"].get("users").is_none());
-    }
-
-    #[test]
-    fn configuration_edit_wire_keeps_wayland_intents() {
-        let operation = NspawnConfigOperation::PreviewConfiguration(Box::new(ConfigurationEdit {
-            target: ConfigurationTarget::Machine(MachineName::new("archlinux").unwrap()),
-            base_revision: crate::application::configuration::ConfigurationRevision {
-                discovery: "machine-name".into(),
-                read_source: Some("administrator".into()),
-                write_target: Some("administrator".into()),
-            },
-            x11_changes: Vec::new(),
-            wayland_changes: vec![
-                crate::application::configuration::WaylandBindingChange::Add {
-                    source: "/run/user/1000/wayland-1".into(),
-                    guest_target: "/run/lasper/wayland/1000/wayland-1".into(),
-                },
-            ],
-        }));
-
-        let wire = serde_json::to_vec(&operation).unwrap();
-        let decoded: NspawnConfigOperation = serde_json::from_slice(&wire).unwrap();
-        let NspawnConfigOperation::PreviewConfiguration(edit) = decoded else {
-            panic!("configuration operation changed while crossing the RPC wire");
-        };
-        assert!(matches!(
-            edit.wayland_changes.as_slice(),
-            [crate::application::configuration::WaylandBindingChange::Add {
-                source,
-                guest_target,
-            }] if source == Path::new("/run/user/1000/wayland-1")
-                && guest_target == Path::new("/run/lasper/wayland/1000/wayland-1")
-        ));
     }
 
     #[test]

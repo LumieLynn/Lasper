@@ -2,10 +2,9 @@
 
 use super::{ConfigurationView, DraftPreviewState, InspectionState};
 use crate::application::configuration::{
-    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
-    ConfigurationTarget,
+    ConfigurationApplyReport, ConfigurationEdit, ConfigurationError, ConfigurationPreview,
+    ConfigurationSnapshot, ConfigurationTarget,
 };
-use crate::application::inspection::ResourceInspectionError;
 use crate::tui::configuration::page::ConfigurationPageId;
 use crate::tui::configuration::pages::{ConfigurationPageEvent, ConfigurationPageUpdate};
 
@@ -22,6 +21,7 @@ impl ConfigurationView {
         self.discard = None;
         self.restart_confirmation = None;
         self.apply_error = None;
+        self.apply_requires_refresh = false;
         self.state = InspectionState::Loading;
         self.preview_cache = None;
     }
@@ -67,7 +67,7 @@ impl ConfigurationView {
         &mut self,
         query: u64,
         target: &ConfigurationTarget,
-        result: Result<ConfigurationSnapshot, ResourceInspectionError>,
+        result: Result<ConfigurationSnapshot, ConfigurationError>,
     ) {
         if self.query != query || &self.target != target {
             return;
@@ -89,7 +89,7 @@ impl ConfigurationView {
         &mut self,
         generation: u64,
         target: &ConfigurationTarget,
-        result: Result<ConfigurationPreview, ResourceInspectionError>,
+        result: Result<ConfigurationPreview, ConfigurationError>,
     ) {
         if generation != self.draft_generation || target != &self.target || self.draft_is_empty() {
             return;
@@ -112,7 +112,7 @@ impl ConfigurationView {
         &mut self,
         generation: u64,
         target: &ConfigurationTarget,
-        result: Result<ConfigurationApplyReport, ResourceInspectionError>,
+        result: Result<ConfigurationApplyReport, ConfigurationError>,
     ) -> Option<String> {
         if generation != self.draft_generation || target != &self.target || !self.saving {
             return None;
@@ -146,6 +146,7 @@ impl ConfigurationView {
                 None
             }
             Err(error) => {
+                self.apply_requires_refresh = error.is_outcome_unknown();
                 self.apply_error = Some(error.to_string());
                 self.preview_cache = None;
                 None

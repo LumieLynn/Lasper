@@ -90,6 +90,7 @@ pub(crate) fn compose_application_services(
         system_operations,
         machine_inspection,
         nspawn,
+        configuration_adapter,
         systemd_unit,
         rootfs,
         nvidia_state,
@@ -101,6 +102,7 @@ pub(crate) fn compose_application_services(
                 daemon,
             )),
             crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(daemon)),
+            crate::adapters::config::editor::ConfigurationAdapter::elevated(Arc::clone(daemon)),
             crate::adapters::config::SystemdUnitStore::elevated(Arc::clone(daemon)),
             crate::adapters::rootfs::RootfsStore::elevated(Arc::clone(daemon)),
             crate::adapters::platform::nvidia::NvidiaStateStore::elevated(Arc::clone(daemon)),
@@ -112,6 +114,7 @@ pub(crate) fn compose_application_services(
                 crate::adapters::system_operation::SystemOperationStore::direct(local_cmd.clone()),
                 crate::adapters::runtime::inspection::MachineInspectionStore::direct(),
                 crate::adapters::config::NspawnConfigStore::direct(),
+                crate::adapters::config::editor::ConfigurationAdapter::direct(),
                 crate::adapters::config::SystemdUnitStore::direct(),
                 crate::adapters::rootfs::RootfsStore::direct(),
                 crate::adapters::platform::nvidia::NvidiaStateStore::direct(
@@ -272,9 +275,7 @@ pub(crate) fn compose_application_services(
     ));
     let configuration = Arc::new(
         crate::application::configuration::ConfigurationService::new(
-            Arc::new(crate::adapters::config::editor::StoreConfiguration::new(
-                nspawn.clone(),
-            )),
+            Arc::new(configuration_adapter),
             Arc::clone(&x11_endpoints),
             wayland_endpoints,
             Arc::clone(&operations),

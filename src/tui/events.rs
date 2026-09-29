@@ -26,7 +26,7 @@ pub enum AppEvent {
         target: crate::application::configuration::ConfigurationTarget,
         result: Result<
             crate::application::configuration::ConfigurationSnapshot,
-            crate::application::inspection::ResourceInspectionError,
+            crate::application::configuration::ConfigurationError,
         >,
     },
     ConfigurationPreviewed {
@@ -34,7 +34,7 @@ pub enum AppEvent {
         target: crate::application::configuration::ConfigurationTarget,
         result: Result<
             crate::application::configuration::ConfigurationPreview,
-            crate::application::inspection::ResourceInspectionError,
+            crate::application::configuration::ConfigurationError,
         >,
     },
     ConfigurationApplied {
@@ -42,7 +42,7 @@ pub enum AppEvent {
         target: crate::application::configuration::ConfigurationTarget,
         result: Result<
             crate::application::configuration::ConfigurationApplyReport,
-            crate::application::inspection::ResourceInspectionError,
+            crate::application::configuration::ConfigurationError,
         >,
     },
     ConfigurationPage(crate::tui::configuration::ConfigurationPageEvent),

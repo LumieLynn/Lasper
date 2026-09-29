@@ -265,17 +265,17 @@ fn configuration_apply_claims_nspawn_but_preview_remains_read_only() {
     let request = |operation| RpcRequest {
         jsonrpc: "2.0".into(),
         id: 1,
-        method: "nspawn_config".into(),
+        method: "configuration".into(),
         params: serde_json::json!({"operation": operation, "params": edit.clone()}),
     };
 
     assert_eq!(
-        daemon_resource_claims(&request("apply_configuration")).unwrap(),
+        daemon_resource_claims(&request("apply")).unwrap(),
         vec![crate::application::ResourceClaim::exclusive(
             crate::application::ResourceKey::Nspawn("test-machine".into())
         )]
     );
-    assert!(daemon_resource_claims(&request("preview_configuration"))
+    assert!(daemon_resource_claims(&request("preview"))
         .unwrap()
         .is_empty());
 }

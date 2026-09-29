@@ -4,6 +4,7 @@ use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretBytes;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod configuration;
 pub(crate) mod deployment;
 pub(crate) mod rootfs;
 pub(crate) mod session;
@@ -13,7 +14,7 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 23;
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 24;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -92,6 +93,7 @@ rpc_methods! {
     PrepareWayland => ("prepare_wayland", Session),
     ProbeX11Projection => ("probe_x11_projection", Session),
     NspawnConfig => ("nspawn_config", Command),
+    Configuration => ("configuration", Command),
     SystemdUnit => ("systemd_unit", Command),
     NvidiaState => ("nvidia_state", Command),
     DeploymentState => ("deployment_state", Command),
@@ -210,7 +212,8 @@ pub(crate) struct RpcResponse {
     pub error: Option<RpcError>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("daemon error (code={code}): {message}")]
 pub(crate) struct RpcError {
     pub code: i32,
     pub message: String,

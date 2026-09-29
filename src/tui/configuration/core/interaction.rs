@@ -35,7 +35,9 @@ impl ConfigurationView {
     ) -> ConfigurationAction {
         match request {
             PageRequest::None => ConfigurationAction::None,
-            PageRequest::Draft(_) if self.saving => ConfigurationAction::None,
+            PageRequest::Draft(_) if self.saving || self.apply_requires_refresh => {
+                ConfigurationAction::None
+            }
             PageRequest::Draft(request) => {
                 self.draft.apply(request);
                 self.draft_changed()
@@ -203,7 +205,7 @@ impl ConfigurationView {
                 return self.request_close_or_refresh(DiscardIntent::Close);
             }
             (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.saving {
+                if self.saving || self.apply_requires_refresh {
                     return ConfigurationAction::None;
                 }
                 let ready = matches!(

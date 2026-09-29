@@ -1,11 +1,10 @@
 use super::*;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationDiscovery,
-    ConfigurationDocument, ConfigurationOrigin, ConfigurationPreview, ConfigurationRevision,
-    ConfigurationSnapshot, ConfigurationWriteTarget, X11BindRecommendation, X11BindingChange,
-    X11BindingDeclaration, X11BindingScope,
+    ConfigurationDocument, ConfigurationError, ConfigurationOrigin, ConfigurationPreview,
+    ConfigurationRevision, ConfigurationSnapshot, ConfigurationWriteTarget, X11BindRecommendation,
+    X11BindingChange, X11BindingDeclaration, X11BindingScope,
 };
-use crate::application::inspection::ResourceInspectionError;
 use crate::application::x11::X11AccessCheck;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::ImageName;
@@ -280,7 +279,7 @@ fn stale_query_and_wrong_target_results_cannot_replace_current_snapshot() {
     view.finish_query(
         2,
         &target("archlinux"),
-        Err(ResourceInspectionError::backend("stale")),
+        Err(ConfigurationError::failed("stale")),
     );
     view.finish_query(3, &target("other-image"), Ok(snapshot("other-image")));
     assert!(
@@ -392,7 +391,7 @@ fn refresh_failure_remains_visible_and_raw_scroll_is_bounded() {
     view.finish_query(
         4,
         &target("archlinux"),
-        Err(ResourceInspectionError::backend("Permission denied")),
+        Err(ConfigurationError::failed("Permission denied")),
     );
     let screen = render(&mut view, 40, 7);
     assert!(screen.contains("Permission denied"));
@@ -836,6 +835,48 @@ fn only_current_ready_preview_can_be_saved_and_success_clears_the_draft() {
         }),
     );
     assert!(message.unwrap().contains("next machine start"));
+    assert!(view.draft_is_empty());
+}
+
+#[test]
+fn unknown_save_keeps_the_draft_but_blocks_replay_until_refresh() {
+    let mut view = loaded();
+    let ConfigurationAction::Preview { generation, edit } =
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+    else {
+        panic!("expected preview");
+    };
+    view.finish_preview(
+        generation,
+        &edit.target,
+        Ok(ConfigurationPreview::Ready {
+            path: "/etc/systemd/nspawn/archlinux.nspawn".into(),
+            diff: "pending change".into(),
+            activation: ConfigurationActivation::NextMachineStart,
+        }),
+    );
+    assert!(matches!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        ConfigurationAction::Apply { .. }
+    ));
+    view.finish_apply(
+        generation,
+        &edit.target,
+        Err(ConfigurationError::outcome_unknown("connection lost")),
+    );
+    assert!(view.apply_requires_refresh);
+    assert!(!view.draft_is_empty());
+    assert!(render(&mut view, 140, 28).contains("outcome is unknown"));
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        ConfigurationAction::None
+    );
+    assert_eq!(
+        view.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE)),
+        ConfigurationAction::None
+    );
+    view.begin_query(5);
+    assert!(!view.apply_requires_refresh);
     assert!(view.draft_is_empty());
 }
 

@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 
+use crate::application::configuration::ConfigurationError;
 use crate::application::configuration::{
     ConfigurationEdit, ConfigurationService, ConfigurationTarget,
 };
-use crate::application::inspection::ResourceInspectionError;
 use crate::tui::events::AppEvent;
 
 pub(crate) fn inspect(
@@ -24,10 +24,10 @@ pub(crate) fn inspect(
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ResourceInspectionError::backend(
+            Ok(Err(_)) => Err(ConfigurationError::failed(
                 "Configuration inspection stopped unexpectedly",
             )),
-            Err(_) => Err(ResourceInspectionError::backend(
+            Err(_) => Err(ConfigurationError::failed(
                 "Configuration inspection timed out",
             )),
         };
@@ -56,10 +56,10 @@ pub(crate) fn preview(
         .await
         {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(ResourceInspectionError::backend(
+            Ok(Err(_)) => Err(ConfigurationError::failed(
                 "Configuration preview stopped unexpectedly",
             )),
-            Err(_) => Err(ResourceInspectionError::backend(
+            Err(_) => Err(ConfigurationError::failed(
                 "Configuration preview timed out",
             )),
         };
@@ -85,7 +85,7 @@ pub(crate) fn apply(
         // definite semantic outcome, especially after RPC dispatch.
         let result = match AssertUnwindSafe(service.apply(&edit)).catch_unwind().await {
             Ok(result) => result,
-            Err(_) => Err(ResourceInspectionError::backend(
+            Err(_) => Err(ConfigurationError::outcome_unknown(
                 "Configuration save stopped unexpectedly; refresh before retrying",
             )),
         };

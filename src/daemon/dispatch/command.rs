@@ -62,6 +62,16 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
     debug_assert_eq!(method.family(), RpcFamily::Command);
 
     match method {
+        RpcMethod::Configuration => {
+            let result = match serde_json::from_value(params) {
+                Ok(operation) => crate::adapters::config::editor::execute(operation).await,
+                Err(error) => {
+                    Err(crate::application::configuration::ConfigurationError::invalid_input(error))
+                }
+            };
+            HandleOutcome::Sync(serde_json::to_value(result).map_err(|error| error.to_string()))
+        }
+
         RpcMethod::NspawnConfig => {
             let operation: NspawnConfigOperation = match serde_json::from_value(params) {
                 Ok(operation) => operation,

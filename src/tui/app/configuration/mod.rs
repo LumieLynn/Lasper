@@ -1,8 +1,8 @@
 //! Configuration workspace integration with the application event loop.
 
 use super::App;
+use crate::application::configuration::ConfigurationError;
 use crate::application::configuration::ConfigurationTarget;
-use crate::application::inspection::ResourceInspectionError;
 use crate::tui::configuration::{
     ConfigurationAction, ConfigurationPageEffect, ConfigurationPageEvent, ConfigurationView,
 };
@@ -81,7 +81,7 @@ impl App {
                         view.finish_preview(
                             generation,
                             &edit.target,
-                            Err(ResourceInspectionError::backend(
+                            Err(ConfigurationError::failed(
                                 "Application event channel is unavailable",
                             )),
                         );
@@ -104,7 +104,7 @@ impl App {
                         view.finish_apply(
                             generation,
                             &edit.target,
-                            Err(ResourceInspectionError::backend(
+                            Err(ConfigurationError::failed(
                                 "Application event channel is unavailable",
                             )),
                         );
@@ -160,7 +160,7 @@ impl App {
             view.finish_query(
                 query,
                 &target,
-                Err(ResourceInspectionError::backend(
+                Err(ConfigurationError::failed(
                     "Application event channel is unavailable",
                 )),
             );

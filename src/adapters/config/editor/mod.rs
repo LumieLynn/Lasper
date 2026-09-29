@@ -1,63 +1,99 @@
-//! Configuration editing adapter: inspect, preview, and apply nspawn changes.
-//! The store selects direct/elevated execution. This module owns source
-//! inspection and mutation planning, not configuration-page presentation.
+//! Configuration inspection and editing over one composition-selected route.
 
 mod document;
 mod edit;
+mod execution;
 mod inspection;
 mod patch;
 mod projection;
 mod write;
 
-pub(super) use edit::{apply, preview};
-pub(super) use inspection::inspect;
+pub(crate) use execution::execute;
 
-use super::NspawnConfigStore;
+use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::configuration::{
-    ConfigurationApplyReport, ConfigurationEdit, ConfigurationPort, ConfigurationPreview,
-    ConfigurationSnapshot, ConfigurationTarget,
+    ConfigurationApplyReport, ConfigurationEdit, ConfigurationError, ConfigurationPort,
+    ConfigurationPreview, ConfigurationSnapshot, ConfigurationTarget,
 };
-use crate::application::inspection::ResourceInspectionError;
+use crate::ipc::protocol::configuration::{
+    ConfigurationOperation, ConfigurationResult, ConfigurationValue,
+};
+use std::sync::Arc;
 
-pub(crate) struct StoreConfiguration {
-    store: NspawnConfigStore,
+pub(crate) struct ConfigurationAdapter {
+    route: ConfigurationRoute,
 }
 
-impl StoreConfiguration {
-    pub(crate) fn new(store: NspawnConfigStore) -> Self {
-        Self { store }
+enum ConfigurationRoute {
+    Direct,
+    Elevated(Arc<ElevatedDaemon>),
+}
+
+impl ConfigurationAdapter {
+    pub(crate) fn direct() -> Self {
+        Self {
+            route: ConfigurationRoute::Direct,
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            route: ConfigurationRoute::Elevated(daemon),
+        }
+    }
+
+    async fn execute(&self, operation: ConfigurationOperation) -> ConfigurationResult {
+        match &self.route {
+            ConfigurationRoute::Direct => execute(operation).await,
+            ConfigurationRoute::Elevated(daemon) => daemon.configuration(operation).await,
+        }
     }
 }
 
 #[async_trait::async_trait]
-impl ConfigurationPort for StoreConfiguration {
+impl ConfigurationPort for ConfigurationAdapter {
     async fn inspect(
         &self,
         target: &ConfigurationTarget,
-    ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
-        self.store
-            .configuration_snapshot(target.clone())
-            .await
-            .map_err(ResourceInspectionError::backend)
+    ) -> Result<ConfigurationSnapshot, ConfigurationError> {
+        match self
+            .execute(ConfigurationOperation::Inspect(target.clone()))
+            .await?
+        {
+            ConfigurationValue::Inspection(snapshot) => Ok(*snapshot),
+            _ => Err(ConfigurationError::failed(
+                "Configuration inspection returned an unexpected response",
+            )),
+        }
     }
 
     async fn preview(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationPreview, ResourceInspectionError> {
-        self.store
-            .preview_configuration(edit.clone())
-            .await
-            .map_err(ResourceInspectionError::backend)
+    ) -> Result<ConfigurationPreview, ConfigurationError> {
+        match self
+            .execute(ConfigurationOperation::Preview(Box::new(edit.clone())))
+            .await?
+        {
+            ConfigurationValue::Preview(preview) => Ok(preview),
+            _ => Err(ConfigurationError::failed(
+                "Configuration preview returned an unexpected response",
+            )),
+        }
     }
 
     async fn apply(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
-        self.store
-            .apply_configuration(edit.clone())
-            .await
-            .map_err(ResourceInspectionError::backend)
+    ) -> Result<ConfigurationApplyReport, ConfigurationError> {
+        match self
+            .execute(ConfigurationOperation::Apply(Box::new(edit.clone())))
+            .await?
+        {
+            ConfigurationValue::Apply(report) => Ok(report),
+            _ => Err(ConfigurationError::outcome_unknown(
+                "Configuration save returned an unexpected response",
+            )),
+        }
     }
 }

@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::application::inspection::ResourceInspectionError;
 use crate::application::operations::ResourceConflict;
 use crate::application::x11::{X11EndpointCatalog, X11EndpointDiscoveryService};
 use crate::application::{OperationRegistry, ResourceClaim, ResourceKey};
@@ -16,6 +15,8 @@ use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 
 mod display;
 mod draft;
+mod error;
+pub use error::ConfigurationError;
 
 pub use display::{
     recommended_wayland_target, DisplayBindRecommendation, WaylandBindRecommendation,
@@ -41,27 +42,27 @@ pub enum ConfigurationTarget {
 }
 
 impl ConfigurationTarget {
-    pub fn for_machine(machine: &MachineEntry) -> Result<Self, ResourceInspectionError> {
+    pub fn for_machine(machine: &MachineEntry) -> Result<Self, ConfigurationError> {
         if !machine.access().is_nspawn() {
-            return Err(ResourceInspectionError::unsupported(
+            return Err(ConfigurationError::unsupported(
                 "Configure requires a systemd-nspawn machine",
             ));
         }
         machine
             .validated_name()
             .map(Self::Machine)
-            .map_err(ResourceInspectionError::backend)
+            .map_err(ConfigurationError::invalid_input)
     }
 
-    pub fn for_image(image: &ImageEntry) -> Result<Self, ResourceInspectionError> {
+    pub fn for_image(image: &ImageEntry) -> Result<Self, ConfigurationError> {
         if image.is_hidden() {
-            return Err(ResourceInspectionError::unsupported(
+            return Err(ConfigurationError::unsupported(
                 "Configure is unavailable for internal images",
             ));
         }
         ImageName::new(&image.name)
             .map(Self::Image)
-            .map_err(ResourceInspectionError::backend)
+            .map_err(ConfigurationError::invalid_input)
     }
 
     pub fn name(&self) -> &str {
@@ -312,17 +313,17 @@ pub(crate) trait ConfigurationPort: Send + Sync {
     async fn inspect(
         &self,
         target: &ConfigurationTarget,
-    ) -> Result<ConfigurationSnapshot, ResourceInspectionError>;
+    ) -> Result<ConfigurationSnapshot, ConfigurationError>;
 
     async fn preview(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationPreview, ResourceInspectionError>;
+    ) -> Result<ConfigurationPreview, ConfigurationError>;
 
     async fn apply(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationApplyReport, ResourceInspectionError>;
+    ) -> Result<ConfigurationApplyReport, ConfigurationError>;
 }
 
 pub struct ConfigurationService {
@@ -350,7 +351,7 @@ impl ConfigurationService {
     pub async fn inspect(
         &self,
         target: &ConfigurationTarget,
-    ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
+    ) -> Result<ConfigurationSnapshot, ConfigurationError> {
         let mut snapshot = self.port.inspect(target).await?;
         let sources = snapshot
             .x11_bindings
@@ -370,14 +371,14 @@ impl ConfigurationService {
     pub async fn preview(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationPreview, ResourceInspectionError> {
+    ) -> Result<ConfigurationPreview, ConfigurationError> {
         self.port.preview(edit).await
     }
 
     pub async fn apply(
         &self,
         edit: &ConfigurationEdit,
-    ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
+    ) -> Result<ConfigurationApplyReport, ConfigurationError> {
         let key = match &edit.target {
             ConfigurationTarget::Machine(machine) => ResourceKey::for_machine(machine),
             ConfigurationTarget::Image(image) => ResourceKey::for_image(image),
@@ -428,21 +429,21 @@ mod tests {
         async fn inspect(
             &self,
             _target: &ConfigurationTarget,
-        ) -> Result<ConfigurationSnapshot, ResourceInspectionError> {
+        ) -> Result<ConfigurationSnapshot, ConfigurationError> {
             unreachable!("this test only exercises apply coordination")
         }
 
         async fn preview(
             &self,
             _edit: &ConfigurationEdit,
-        ) -> Result<ConfigurationPreview, ResourceInspectionError> {
+        ) -> Result<ConfigurationPreview, ConfigurationError> {
             unreachable!("this test only exercises apply coordination")
         }
 
         async fn apply(
             &self,
             _edit: &ConfigurationEdit,
-        ) -> Result<ConfigurationApplyReport, ResourceInspectionError> {
+        ) -> Result<ConfigurationApplyReport, ConfigurationError> {
             self.entered.notify_one();
             self.release.notified().await;
             Ok(ConfigurationApplyReport::Applied {
