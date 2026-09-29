@@ -6,10 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use super::super::core::utils::empty_block;
-use super::super::DetailPanel;
 use crate::tui::app::AppData;
 use crate::tui::theme;
+use crate::tui::views::detail_panel::core::utils::empty_block;
+use crate::tui::views::detail_panel::DetailPanel;
 
 pub fn render(f: &mut Frame, data: &AppData, panel: &DetailPanel, area: Rect) {
     if data.entries.is_empty() {

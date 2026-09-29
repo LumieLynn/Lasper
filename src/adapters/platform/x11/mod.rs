@@ -28,6 +28,7 @@ use crate::application::x11::{
     X11ReconcileReport, X11RevokeRequest,
 };
 use crate::domain::x11::HostX11Socket;
+use crate::domain::x11::X11_SOCKET_DIRECTORY;
 
 pub(crate) struct HostX11EndpointDiscovery;
 
@@ -200,7 +201,7 @@ pub(crate) async fn projection_socket_identities(
             let standard = transport::inspect_endpoint_peer_only(
                 socket.display(),
                 false,
-                Path::new(common::X11_SOCKET_DIRECTORY).join(format!("X{}", socket.display())),
+                Path::new(X11_SOCKET_DIRECTORY).join(format!("X{}", socket.display())),
             )?;
             if standard.peer_identity() != socket.peer_identity() {
                 return Err(format!(

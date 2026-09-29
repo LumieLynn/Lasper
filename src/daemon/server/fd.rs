@@ -3,10 +3,10 @@
 //! Authentication and socket setup remain in `server`; this module only
 //! routes an authenticated typed operation to the subsystem that owns it.
 
-use super::super::jobs;
-use super::super::sessions;
 use super::DaemonServerState;
 use crate::adapters::trusted_state::TrustedStateRoot;
+use crate::daemon::jobs;
+use crate::daemon::sessions;
 use crate::ipc::protocol::FdOperation;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;

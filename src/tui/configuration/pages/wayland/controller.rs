@@ -4,25 +4,17 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Position, Rect};
 use ratatui::Frame;
 
+use super::request::{WaylandPageAction, WaylandPageUpdate};
 use super::runtime::WaylandRuntimeRequest;
-use super::{presentation, WaylandDraftItem, WaylandPageAction, WaylandPageState};
+use super::{presentation, WaylandDraftItem, WaylandPageState, PAGE_ID};
 use crate::application::configuration::{
     ConfigurationDraftRequest, ConfigurationSnapshot, ConfigurationTarget,
 };
-use crate::application::sessions::{SessionError, WaylandSessionContext};
-use crate::tui::configuration::core::page::{
-    ConfigurationPageController, ConfigurationPageDescriptor, ConfigurationSectionId, PageInput,
-    PageInspectionReport, PageInteractionContext, PageRenderContext, PageRequest,
+use crate::tui::configuration::page::{ConfigurationPageController, PageRequest};
+use crate::tui::configuration::page::{
+    ConfigurationPageDescriptor, PageInput, PageInspectionReport, PageInteractionContext,
+    PageRenderContext,
 };
-use crate::tui::configuration::pages::ConfigurationPageAction;
-
-pub(crate) enum WaylandPageUpdate {
-    TrackCheck(tokio::task::JoinHandle<()>),
-    Checked {
-        generation: u64,
-        result: Result<WaylandSessionContext, SessionError>,
-    },
-}
 
 impl WaylandPageState {
     fn draft_request(&self, snapshot: &ConfigurationSnapshot) -> Option<ConfigurationDraftRequest> {
@@ -44,21 +36,19 @@ impl WaylandPageState {
         &mut self,
         key: KeyEvent,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest {
+    ) -> PageRequest<WaylandPageAction> {
         if let Some(request) = self.handle_access_key(key) {
             return match request {
                 WaylandRuntimeRequest::None => PageRequest::None,
                 WaylandRuntimeRequest::Action(action @ WaylandPageAction::EnterShell { .. }) => {
                     PageRequest::CleanDraftAction {
-                        action: ConfigurationPageAction::Wayland(action),
+                        action: action,
                         blocked_message:
                             "Save or discard pending configuration changes before entering a shell"
                                 .into(),
                     }
                 }
-                WaylandRuntimeRequest::Action(action) => {
-                    PageRequest::Action(ConfigurationPageAction::Wayland(action))
-                }
+                WaylandRuntimeRequest::Action(action) => PageRequest::Action(action),
             };
         }
         if key.modifiers != KeyModifiers::NONE {
@@ -97,7 +87,7 @@ impl WaylandPageState {
         &mut self,
         position: Position,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest {
+    ) -> PageRequest<WaylandPageAction> {
         let Some(snapshot) = context.snapshot else {
             return PageRequest::None;
         };
@@ -136,12 +126,13 @@ impl WaylandPageState {
 }
 
 impl ConfigurationPageController for WaylandPageState {
+    type Action = WaylandPageAction;
     type Update = WaylandPageUpdate;
 
     fn descriptor(&self) -> ConfigurationPageDescriptor {
         ConfigurationPageDescriptor {
-            id: super::PAGE_ID,
-            section: ConfigurationSectionId::HostIntegration,
+            id: PAGE_ID,
+            section: crate::tui::configuration::pages::HOST_INTEGRATION,
             label: "Wayland",
         }
     }
@@ -186,7 +177,7 @@ impl ConfigurationPageController for WaylandPageState {
         &mut self,
         input: PageInput,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest {
+    ) -> PageRequest<WaylandPageAction> {
         match input {
             PageInput::Key(key) => self.handle_page_key(key, context),
             PageInput::Click(position) => self.handle_page_click(position, context),
@@ -210,10 +201,14 @@ impl ConfigurationPageController for WaylandPageState {
             }
         }
     }
+}
 
-    #[cfg(test)]
-    fn test_state(&self) -> crate::tui::configuration::core::page::PageTestState {
-        crate::tui::configuration::core::page::PageTestState {
+#[cfg(test)]
+impl WaylandPageState {
+    pub(in crate::tui::configuration) fn test_state(
+        &self,
+    ) -> crate::tui::configuration::pages::ChecklistTestState {
+        crate::tui::configuration::pages::ChecklistTestState {
             selected: self.checklist.selected(),
             expanded: self.checklist.expanded.clone(),
             modal_open: self.access_dialog_is_open(),

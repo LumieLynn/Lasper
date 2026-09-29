@@ -1,5 +1,6 @@
+use super::nspawn_source::{NspawnConfigSource, NspawnConfigSourceKind, NspawnConfigSources};
 use super::nspawn_spec::NspawnConfigSpec;
-use super::{configuration, settings_lock, MAX_NSPAWN_CONTENT_BYTES};
+use super::{editor, settings_lock, MAX_NSPAWN_CONTENT_BYTES};
 use crate::adapters::config::nspawn_file::{
     nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
 };
@@ -376,15 +377,15 @@ pub(crate) async fn execute_nspawn_config_operation(
     };
     match operation {
         NspawnConfigOperation::Snapshot(target) => Ok(NspawnConfigResult {
-            snapshot: Some(configuration::inspect(target).await?),
+            snapshot: Some(editor::inspect(target).await?),
             ..Default::default()
         }),
         NspawnConfigOperation::PreviewConfiguration(edit) => Ok(NspawnConfigResult {
-            preview: Some(configuration::preview(*edit).await?),
+            preview: Some(editor::preview(*edit).await?),
             ..Default::default()
         }),
         NspawnConfigOperation::ApplyConfiguration(edit) => Ok(NspawnConfigResult {
-            configuration_apply: Some(configuration::apply(*edit).await?),
+            configuration_apply: Some(editor::apply(*edit).await?),
             ..Default::default()
         }),
         NspawnConfigOperation::Read(request) => {
@@ -469,7 +470,7 @@ fn parse_image_name(name: &str) -> Result<ImageName> {
 }
 
 fn nspawn_path(machine: &MachineName) -> PathBuf {
-    NspawnConfig::default_path(machine.as_str())
+    crate::paths::nspawn_config(machine.as_str())
 }
 
 pub(crate) async fn probe_exact_nspawn_config(
@@ -496,25 +497,26 @@ async fn probe_nspawn_config_at(path: &Path) -> Result<NspawnConfigPresence> {
     )
 }
 
-fn discovered_nspawn_paths(image: &ImageName) -> [PathBuf; 3] {
-    let filename = format!("{}.nspawn", image.as_str());
-    [
-        crate::paths::nspawn_config_dir().join(&filename),
-        crate::paths::nspawn_runtime_config_dir().join(&filename),
-        crate::paths::machines_dir().join(filename),
-    ]
+fn discovered_nspawn_paths(image: &ImageName) -> Vec<PathBuf> {
+    NspawnConfigSources::for_image(image)
+        .paths()
+        .map(Path::to_path_buf)
+        .collect()
 }
 
 async fn read_discovered_config(image: &ImageName) -> Result<Option<NspawnConfigInspection>> {
-    read_discovered_config_from(&discovered_nspawn_paths(image)).await
+    read_discovered_config_from(NspawnConfigSources::for_image(image).candidates()).await
 }
 
-async fn read_discovered_config_from(paths: &[PathBuf]) -> Result<Option<NspawnConfigInspection>> {
-    for (index, path) in paths.iter().enumerate() {
+async fn read_discovered_config_from(
+    sources: &[NspawnConfigSource],
+) -> Result<Option<NspawnConfigInspection>> {
+    for source in sources {
+        let path = source.path();
         match read_bounded_utf8(path).await {
             Ok(content) => {
                 return Ok(Some(NspawnConfigInspection {
-                    path: path.clone(),
+                    path: path.to_path_buf(),
                     content,
                 }));
             }
@@ -523,7 +525,7 @@ async fn read_discovered_config_from(paths: &[PathBuf]) -> Result<Option<NspawnC
             // unprivileged UI process. It is an optional inspection source,
             // so an inaccessible adjacent file does not hide trusted config.
             Err(error)
-                if index == paths.len().saturating_sub(1)
+                if source.kind() == NspawnConfigSourceKind::ImageAdjacent
                     && error.kind() == std::io::ErrorKind::PermissionDenied =>
             {
                 log::debug!(
@@ -531,7 +533,7 @@ async fn read_discovered_config_from(paths: &[PathBuf]) -> Result<Option<NspawnC
                     path.display()
                 );
             }
-            Err(error) => return Err(NspawnError::Io(path.clone(), error)),
+            Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
         }
     }
     Ok(None)
@@ -1609,18 +1611,24 @@ Unknown=preserve-me\n";
             .unwrap();
         tokio::fs::write(&image, "[Exec]\nBoot=no\n").await.unwrap();
 
-        let discovered =
-            read_discovered_config_from(&[admin.clone(), runtime.clone(), image.clone()])
-                .await
-                .unwrap()
-                .unwrap();
+        let sources = NspawnConfigSources::from_test_roots(
+            "test",
+            true,
+            admin.parent().unwrap(),
+            runtime.parent().unwrap(),
+            image.parent().unwrap(),
+        );
+        let discovered = read_discovered_config_from(sources.candidates())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(discovered.path, runtime);
         assert!(discovered.content.contains("Boot=yes"));
 
         tokio::fs::write(&admin, "[Exec]\nPrivateUsers=managed\n")
             .await
             .unwrap();
-        let discovered = read_discovered_config_from(&[admin.clone(), runtime, image])
+        let discovered = read_discovered_config_from(sources.candidates())
             .await
             .unwrap()
             .unwrap();

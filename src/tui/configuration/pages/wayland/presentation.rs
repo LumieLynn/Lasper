@@ -10,8 +10,7 @@ use crate::application::configuration::{
     DisplayBindRecommendation, WaylandBindingChange, WaylandBindingDeclaration, WaylandSourceState,
 };
 use crate::domain::wayland::HostWaylandSocket;
-use crate::tui::configuration::core::page::PageInspectionReport;
-use crate::tui::configuration::core::{ConfigurationPane, InspectionState};
+use crate::tui::configuration::page::{ConfigurationPane, InspectionState, PageInspectionReport};
 use crate::tui::configuration::pages::checklist::{
     render_endpoint_checklist, ChecklistBody, ChecklistHitAreas,
 };

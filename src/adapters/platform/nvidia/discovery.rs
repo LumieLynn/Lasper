@@ -845,8 +845,8 @@ async fn build_nvidia_state(
 
 #[cfg(test)]
 mod tests {
-    use super::super::cdi::{CdiDeviceNode, CdiHook};
     use super::*;
+    use crate::adapters::platform::nvidia::cdi::{CdiDeviceNode, CdiEdits, CdiHook};
     use crate::domain::nvidia::NvidiaFileCategory;
 
     #[test]
@@ -1167,7 +1167,7 @@ mod tests {
     #[test]
     fn test_cdi_raw_binds_device_nodes() {
         let spec = CdiSpec {
-            container_edits: Some(super::super::cdi::CdiEdits {
+            container_edits: Some(CdiEdits {
                 device_nodes: Some(vec![CdiDeviceNode {
                     path: "/dev/nvidia0".into(),
                     host_path: None,
@@ -1193,7 +1193,7 @@ mod tests {
     #[test]
     fn cdi_mount_binds_preserve_ro_and_rw_options() {
         let spec = CdiSpec {
-            container_edits: Some(super::super::cdi::CdiEdits {
+            container_edits: Some(CdiEdits {
                 device_nodes: None,
                 mounts: Some(vec![
                     CdiMount {
@@ -1225,7 +1225,7 @@ mod tests {
     #[test]
     fn test_cdi_device_symlink_keeps_writable_binding() {
         let spec = CdiSpec {
-            container_edits: Some(super::super::cdi::CdiEdits {
+            container_edits: Some(CdiEdits {
                 device_nodes: Some(vec![CdiDeviceNode {
                     path: "/dev/dri/card0".into(),
                     host_path: None,
@@ -1279,7 +1279,7 @@ mod tests {
         };
 
         let spec = CdiSpec {
-            container_edits: Some(super::super::cdi::CdiEdits {
+            container_edits: Some(CdiEdits {
                 device_nodes: None,
                 mounts: Some(vec![mount]),
                 hooks: Some(vec![hook]),

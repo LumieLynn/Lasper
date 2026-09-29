@@ -2,12 +2,14 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::page::{PageInput, PageInteractionContext, PageRequest};
 use super::{
     ConfigurationAction, ConfigurationPane, ConfigurationView, DiscardIntent, DraftPreviewState,
     InspectionState, PreviewTab,
 };
 use crate::application::configuration::ConfigurationPreview;
+use crate::tui::configuration::page::PageRequest;
+use crate::tui::configuration::page::{PageInput, PageInteractionContext};
+use crate::tui::configuration::pages::ConfigurationPageAction;
 use crate::tui::views::title_tabs::clicked_title_tab;
 
 impl ConfigurationView {
@@ -27,10 +29,13 @@ impl ConfigurationView {
         self.resolve_page_request(request)
     }
 
-    fn resolve_page_request(&mut self, request: PageRequest) -> ConfigurationAction {
+    fn resolve_page_request(
+        &mut self,
+        request: PageRequest<ConfigurationPageAction>,
+    ) -> ConfigurationAction {
         match request {
             PageRequest::None => ConfigurationAction::None,
-            PageRequest::Draft(request) if self.saving => ConfigurationAction::None,
+            PageRequest::Draft(_) if self.saving => ConfigurationAction::None,
             PageRequest::Draft(request) => {
                 self.draft.apply(request);
                 self.draft_changed()

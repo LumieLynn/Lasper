@@ -11,12 +11,14 @@ use ratatui::{
     Frame,
 };
 
-use super::page::{ConfigurationPageDescriptor, ConfigurationPageId, ConfigurationSectionId};
+use crate::tui::configuration::page::{
+    ConfigurationPageDescriptor, ConfigurationPageId, ConfigurationSection,
+};
 use crate::tui::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum NavigationNodeId {
-    Section(ConfigurationSectionId),
+    Section(ConfigurationSection),
     Page(ConfigurationPageId),
 }
 
@@ -30,7 +32,7 @@ pub(super) struct ConfigurationNavigation {
     pages: Vec<ConfigurationPageDescriptor>,
     selected: NavigationNodeId,
     current_page: ConfigurationPageId,
-    expanded: BTreeSet<ConfigurationSectionId>,
+    expanded: BTreeSet<ConfigurationSection>,
     list: ListState,
     hits: Vec<(Rect, NavigationNodeId)>,
 }
@@ -55,7 +57,7 @@ impl ConfigurationNavigation {
         self.current_page
     }
 
-    fn sections(&self) -> Vec<ConfigurationSectionId> {
+    fn sections(&self) -> Vec<ConfigurationSection> {
         let mut sections = Vec::new();
         for page in &self.pages {
             if !sections.contains(&page.section) {
@@ -100,7 +102,7 @@ impl ConfigurationNavigation {
 
     fn children(
         &self,
-        section: ConfigurationSectionId,
+        section: ConfigurationSection,
     ) -> impl Iterator<Item = ConfigurationPageId> + '_ {
         self.pages
             .iter()
@@ -110,9 +112,7 @@ impl ConfigurationNavigation {
 
     fn label(&self, id: NavigationNodeId) -> &'static str {
         match id {
-            NavigationNodeId::Section(ConfigurationSectionId::HostIntegration) => {
-                "Host Integration"
-            }
+            NavigationNodeId::Section(section) => section.label,
             NavigationNodeId::Page(page) => self
                 .pages
                 .iter()
@@ -175,7 +175,7 @@ impl ConfigurationNavigation {
         false
     }
 
-    fn toggle_section(&mut self, section: ConfigurationSectionId) {
+    fn toggle_section(&mut self, section: ConfigurationSection) {
         if !self.expanded.remove(&section) {
             self.expanded.insert(section);
         }
@@ -196,7 +196,7 @@ impl ConfigurationNavigation {
         }
     }
 
-    fn is_current_section(&self, section: ConfigurationSectionId) -> bool {
+    fn is_current_section(&self, section: ConfigurationSection) -> bool {
         self.pages
             .iter()
             .any(|page| page.id == self.current_page && page.section == section)
@@ -268,5 +268,58 @@ impl ConfigurationNavigation {
                 item.id,
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn navigation_accepts_page_owned_ids_and_new_sections_without_display_branches() {
+        let host = ConfigurationSection {
+            key: "host",
+            label: "Host Integration",
+        };
+        let network = ConfigurationSection {
+            key: "network",
+            label: "Networking",
+        };
+        let first = ConfigurationPageId::new("first");
+        let second = ConfigurationPageId::new("second");
+        let additional = ConfigurationPageId::new("veth");
+        let mut navigation = ConfigurationNavigation::new(&[
+            ConfigurationPageDescriptor {
+                id: first,
+                section: host,
+                label: "First",
+            },
+            ConfigurationPageDescriptor {
+                id: second,
+                section: host,
+                label: "Second",
+            },
+            ConfigurationPageDescriptor {
+                id: additional,
+                section: network,
+                label: "Veth",
+            },
+        ]);
+        assert_eq!(navigation.current_page(), first);
+        navigation.move_selection(true);
+        assert_eq!(navigation.current_page(), second);
+        navigation.move_selection(true);
+        assert_eq!(navigation.selected, NavigationNodeId::Section(network));
+        assert_eq!(navigation.label(navigation.selected), "Networking");
+        navigation.handle_key(KeyCode::Right);
+        navigation.move_selection(true);
+        assert_eq!(navigation.current_page(), additional);
+        navigation.handle_key(KeyCode::Left);
+        navigation.handle_key(KeyCode::Char(' '));
+        assert_eq!(navigation.current_page(), additional);
+        assert!(!navigation
+            .visible_items()
+            .iter()
+            .any(|node| node.id == NavigationNodeId::Page(additional)));
     }
 }

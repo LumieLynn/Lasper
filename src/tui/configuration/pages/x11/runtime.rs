@@ -4,6 +4,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use super::request::X11PageAction;
 use super::{X11ChecklistItem, X11PageState};
 use crate::application::configuration::{
     ConfigurationSnapshot, ConfigurationTarget, X11BindingScope,
@@ -12,26 +13,6 @@ use crate::domain::x11::HostX11Socket;
 use crate::tui::widgets::dialogs::x11_authorization::{
     X11AuthorizationDialog, X11AuthorizationDialogAction,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum X11PageAction {
-    Check {
-        generation: u64,
-        target: crate::application::sessions::ShellTarget,
-        host_socket: HostX11Socket,
-    },
-    Authorize {
-        generation: u64,
-        target: crate::application::sessions::ShellTarget,
-        host_socket: HostX11Socket,
-    },
-    Revoke {
-        generation: u64,
-        target: crate::application::sessions::ShellTarget,
-        host_socket: HostX11Socket,
-        record_id: String,
-    },
-}
 
 pub(super) enum X11RuntimeRequest {
     None,

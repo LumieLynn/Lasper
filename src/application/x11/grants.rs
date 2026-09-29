@@ -5,8 +5,7 @@ use std::path::PathBuf;
 use crate::application::sessions::{MappedGuestIdentity, ShellTarget, X11ProjectionContext};
 use crate::domain::x11::X11SocketRevision;
 
-use super::acl::SERVER_INTERPRETED_FAMILY;
-use super::{X11AccessControlMode, X11AclEntry, X11AclSnapshot};
+use super::acl::{X11AccessControlMode, X11AclEntry, X11AclSnapshot, SERVER_INTERPRETED_FAMILY};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum X11GrantRecordPhase {

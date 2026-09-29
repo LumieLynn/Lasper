@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 
 use super::projection::project;
 use crate::adapters::config::nspawn_file::NspawnConfig;
+use crate::adapters::config::nspawn_source::{NspawnConfigSourceKind, NspawnConfigSources};
 use crate::adapters::config::MAX_NSPAWN_CONTENT_BYTES;
 use crate::adapters::error::{NspawnError, Result};
 use crate::application::configuration::{
@@ -27,59 +28,63 @@ pub(crate) async fn inspect(target: ConfigurationTarget) -> Result<Configuration
 }
 
 pub(super) fn inspect_now(target: ConfigurationTarget) -> ConfigurationSnapshot {
-    let admin = crate::paths::nspawn_config_dir();
-    let runtime = crate::paths::nspawn_runtime_config_dir();
-    inspect_at(target, &admin, &runtime, &crate::paths::machines_dir())
+    let sources = sources_for_target(&target);
+    inspect_at(target, &sources)
+}
+
+/// Adapt the editor target to the shared nspawn lookup policy.
+pub(super) fn sources_for_target(target: &ConfigurationTarget) -> NspawnConfigSources {
+    match target {
+        ConfigurationTarget::Machine(machine) => NspawnConfigSources::for_machine(machine),
+        ConfigurationTarget::Image(image) => NspawnConfigSources::for_image(image),
+    }
 }
 
 pub(super) fn inspect_at(
     target: ConfigurationTarget,
-    admin: &Path,
-    runtime: &Path,
-    images: &Path,
+    sources: &NspawnConfigSources,
 ) -> ConfigurationSnapshot {
-    let filename = format!("{}.nspawn", target.name());
-    let mut locations = vec![
-        (admin.join(&filename), ConfigurationOrigin::Administrator),
-        (runtime.join(&filename), ConfigurationOrigin::Runtime),
-    ];
-    if matches!(target, ConfigurationTarget::Image(_)) {
-        locations.push((images.join(&filename), ConfigurationOrigin::ImageAdjacent));
-    }
     let writable_name = MachineName::new(target.name()).is_ok();
-    let mut candidates = Vec::with_capacity(locations.len());
+    let mut candidates = Vec::with_capacity(sources.candidates().len());
     let mut read_source = None;
     let mut write_target_revision = None;
     let mut write_target = None;
     let mut selected = None;
-    let mut selected_origin = None;
     let mut failure = None;
-    for (index, (path, origin)) in locations.into_iter().enumerate() {
+    for source in sources.candidates() {
+        let path = source.path();
+        let origin = match source.kind() {
+            NspawnConfigSourceKind::Administrator => ConfigurationOrigin::Administrator,
+            NspawnConfigSourceKind::Runtime => ConfigurationOrigin::Runtime,
+            NspawnConfigSourceKind::ImageAdjacent => ConfigurationOrigin::ImageAdjacent,
+        };
         let state = if selected.is_some() || failure.is_some() {
             ConfigurationCandidateState::NotConsulted
         } else {
-            match read_file(&path) {
+            match read_file(path) {
                 Ok(Some(file)) => {
-                    if index == 0 && writable_name {
+                    if source.kind() == NspawnConfigSourceKind::Administrator && writable_name {
                         write_target_revision = Some(file.revision.clone());
                         write_target = Some(ConfigurationWriteTarget {
-                            path: path.clone(),
+                            path: path.to_path_buf(),
                             exists: true,
                         });
                     }
                     read_source = Some(file.revision);
-                    selected = Some(NspawnConfig {
-                        path: path.clone(),
-                        content: file.content,
-                    });
-                    selected_origin = Some(origin);
+                    selected = Some((
+                        NspawnConfig {
+                            path: path.to_path_buf(),
+                            content: file.content,
+                        },
+                        origin,
+                    ));
                     ConfigurationCandidateState::Selected
                 }
                 Ok(None) => {
-                    if index == 0 && writable_name {
-                        write_target_revision = Some(absence_revision(&path));
+                    if source.kind() == NspawnConfigSourceKind::Administrator && writable_name {
+                        write_target_revision = Some(absence_revision(path));
                         write_target = Some(ConfigurationWriteTarget {
-                            path: path.clone(),
+                            path: path.to_path_buf(),
                             exists: false,
                         });
                     }
@@ -93,15 +98,12 @@ pub(super) fn inspect_at(
             }
         };
         candidates.push(ConfigurationCandidate {
-            path,
+            path: path.to_path_buf(),
             origin,
             state,
         });
     }
     let mut snapshot = project(target, selected);
-    if let Some(document) = &mut snapshot.document {
-        document.origin = selected_origin.expect("selected file has a source origin");
-    }
     snapshot.write_target = write_target;
     if let Some(failure) = failure {
         snapshot.diagnostics.push(failure);
@@ -262,12 +264,14 @@ mod tests {
         }
 
         fn inspect(&self, target: ConfigurationTarget) -> ConfigurationSnapshot {
-            inspect_at(
-                target,
+            let sources = NspawnConfigSources::from_test_roots(
+                target.name(),
+                matches!(target, ConfigurationTarget::Image(_)),
                 &self.root.path().join("admin"),
                 &self.root.path().join("runtime"),
                 &self.root.path().join("images"),
-            )
+            );
+            inspect_at(target, &sources)
         }
 
         fn image(&self, name: &str) -> ConfigurationSnapshot {

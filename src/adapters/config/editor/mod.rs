@@ -1,5 +1,6 @@
-//! Configure capability adapter. The store selects direct/elevated execution;
-//! inspection and declaration projection stay inside the configuration adapter.
+//! Configuration editing adapter: inspect, preview, and apply nspawn changes.
+//! The store selects direct/elevated execution. This module owns source
+//! inspection and mutation planning, not configuration-page presentation.
 
 mod document;
 mod edit;

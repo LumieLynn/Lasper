@@ -1,13 +1,9 @@
-//! Typed effect requests emitted by registered configuration pages.
+//! Typed routing envelopes for registered pages. Concrete messages belong to each page.
 
-use super::wayland::WaylandPageAction;
-use super::wayland::WaylandPageEvent;
-use super::wayland::WaylandPageUpdate;
-use super::x11::X11PageAction;
-use super::x11::X11PageEvent;
-use super::x11::X11PageUpdate;
+use super::wayland::{self, WaylandPageAction, WaylandPageEvent, WaylandPageUpdate};
+use super::x11::{self, X11PageAction, X11PageEvent, X11PageUpdate};
 use crate::application::configuration::ConfigurationTarget;
-use crate::tui::configuration::core::page::ConfigurationPageId;
+use crate::tui::configuration::page::ConfigurationPageId;
 use crate::tui::StatusLevel;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -17,7 +13,7 @@ pub(crate) enum ConfigurationPageAction {
 }
 
 #[derive(Debug)]
-pub enum ConfigurationPageEvent {
+pub(crate) enum ConfigurationPageEvent {
     Wayland(Box<WaylandPageEvent>),
     X11(Box<X11PageEvent>),
 }
@@ -28,10 +24,10 @@ pub(crate) enum ConfigurationPageUpdate {
 }
 
 impl ConfigurationPageUpdate {
-    pub fn page_id(&self) -> ConfigurationPageId {
+    pub(crate) fn page_id(&self) -> ConfigurationPageId {
         match self {
-            Self::Wayland(_) => ConfigurationPageId::Wayland,
-            Self::X11(_) => ConfigurationPageId::X11,
+            Self::Wayland(_) => wayland::PAGE_ID,
+            Self::X11(_) => x11::PAGE_ID,
         }
     }
 }
@@ -60,8 +56,44 @@ impl ConfigurationPageEvent {
 
     pub(crate) fn detached_status(self) -> Option<(String, StatusLevel)> {
         match self {
-            Self::Wayland(event) => (*event).detached_status(),
-            Self::X11(event) => (*event).detached_status(),
+            Self::Wayland(event) => event.detached_status(),
+            Self::X11(event) => event.detached_status(),
+        }
+    }
+}
+
+impl ConfigurationPageAction {
+    pub(in crate::tui::configuration) fn start(
+        self,
+        session: &std::sync::Arc<crate::application::sessions::SessionService>,
+        x11_access: &std::sync::Arc<crate::application::x11::X11AccessService>,
+        events: Option<tokio::sync::mpsc::Sender<crate::tui::events::AppEvent>>,
+    ) -> crate::tui::configuration::executor::ConfigurationPageEffect {
+        use crate::tui::configuration::executor::PageEventSender;
+        use crate::tui::events::AppEvent;
+        use std::sync::Arc;
+
+        match self {
+            Self::Wayland(action) => {
+                let events = events.map(|sender| {
+                    PageEventSender::new(sender, |event| {
+                        AppEvent::ConfigurationPage(ConfigurationPageEvent::Wayland(Box::new(
+                            event,
+                        )))
+                    })
+                });
+                wayland::start_action(Arc::clone(session), action, events)
+                    .map_update(ConfigurationPageUpdate::Wayland)
+            }
+            Self::X11(action) => {
+                let events = events.map(|sender| {
+                    PageEventSender::new(sender, |event| {
+                        AppEvent::ConfigurationPage(ConfigurationPageEvent::X11(Box::new(event)))
+                    })
+                });
+                x11::start_action(Arc::clone(x11_access), action, events)
+                    .map_update(|update| ConfigurationPageUpdate::X11(Box::new(update)))
+            }
         }
     }
 }

@@ -1,9 +1,9 @@
 use ratatui::{layout::Rect, widgets::ScrollbarState, Frame};
 
-use super::super::DetailPane;
-use super::super::DetailPanel;
 use super::properties::summary_properties;
 use crate::tui::app::AppData;
+use crate::tui::views::detail_panel::DetailPane;
+use crate::tui::views::detail_panel::DetailPanel;
 use crate::tui::widgets::display::scrollbar::vertical_scrollbar;
 
 /// Presentation cache for the log pane: pre-computed wrapped-line offsets

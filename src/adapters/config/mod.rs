@@ -1,5 +1,6 @@
-pub(crate) mod configuration;
+pub(crate) mod editor;
 pub mod nspawn_file;
+pub(crate) mod nspawn_source;
 pub(crate) mod nspawn_spec;
 mod settings_lock;
 pub mod store;

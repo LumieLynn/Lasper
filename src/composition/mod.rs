@@ -272,9 +272,9 @@ pub(crate) fn compose_application_services(
     ));
     let configuration = Arc::new(
         crate::application::configuration::ConfigurationService::new(
-            Arc::new(
-                crate::adapters::config::configuration::StoreConfiguration::new(nspawn.clone()),
-            ),
+            Arc::new(crate::adapters::config::editor::StoreConfiguration::new(
+                nspawn.clone(),
+            )),
             Arc::clone(&x11_endpoints),
             wayland_endpoints,
             Arc::clone(&operations),

@@ -419,6 +419,7 @@ fn spawn_direct_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::session::MachinePty;
     use portable_pty::CommandBuilder;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::Duration;
@@ -454,7 +455,7 @@ mod tests {
         removed: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
     ) -> TerminalSessionHandle {
         spawn_machine_terminal(
-            super::super::MachinePty {
+            MachinePty {
                 master,
                 machine_removed: removed,
             },

@@ -5,7 +5,6 @@
 //! domain dependencies so that the module boundaries remain visible at the
 //! import site.
 
-pub(super) use crate::domain::x11::X11_SOCKET_DIRECTORY;
 pub(super) const ENDPOINT_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 pub(super) const MAX_DISCOVERED_DISPLAYS: usize = 16;
 pub(super) const MAX_INSPECTED_SOURCES: usize = 64;

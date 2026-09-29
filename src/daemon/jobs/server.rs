@@ -1,6 +1,5 @@
 //! Daemon-owned provisioning job registry and dedicated event stream.
 
-use super::super::server::DaemonServerState;
 use crate::adapters::provisioning::direct::DirectProvisioningExecutor;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::operations::ResourceReservation;
@@ -10,6 +9,7 @@ use crate::application::provisioning::{
     DeploymentSubmission, PlanFingerprint,
 };
 use crate::application::{OperationRegistry, ResourceClaim};
+use crate::daemon::server::DaemonServerState;
 use crate::ipc::protocol::deployment::{
     DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame,
     DeploymentSubmissionSnapshot, DeploymentSubmissionStatus, SubmitDeploymentParams,

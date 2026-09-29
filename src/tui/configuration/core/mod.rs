@@ -5,27 +5,18 @@
 mod interaction;
 mod lifecycle;
 mod navigation;
-pub(super) mod page;
 mod render;
 
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use super::pages::ConfigurationPageAction;
-use super::pages::ConfigurationPages;
+use super::pages::{ConfigurationPageAction, ConfigurationPages};
 use crate::application::configuration::{
-    ConfigurationDraft, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
-    ConfigurationTarget,
+    ConfigurationDraft, ConfigurationEdit, ConfigurationPreview, ConfigurationTarget,
 };
+use crate::tui::configuration::page::{ConfigurationPane, InspectionState};
 use crate::tui::views::title_tabs::TitleTabHitbox;
 use navigation::ConfigurationNavigation;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ConfigurationPane {
-    Navigation,
-    Content,
-    Preview,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PreviewTab {
@@ -70,12 +61,6 @@ pub(crate) enum ConfigurationAction {
     },
     Page(ConfigurationPageAction),
     Restart(crate::domain::machine::MachineName),
-}
-
-pub(super) enum InspectionState {
-    Loading,
-    Ready(Box<ConfigurationSnapshot>),
-    Failed(String),
 }
 
 enum DraftPreviewState {

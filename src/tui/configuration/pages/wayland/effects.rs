@@ -5,56 +5,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::FutureExt;
-use tokio::sync::mpsc;
 
-use super::{WaylandPageAction, WaylandPageUpdate, PAGE_ID};
+use super::request::{WaylandPageAction, WaylandPageEvent, WaylandPageUpdate};
+use super::PAGE_ID;
 use crate::application::configuration::ConfigurationTarget;
-use crate::application::sessions::{SessionError, WaylandSessionContext, WaylandShellRequest};
-use crate::tui::configuration::pages::{ConfigurationPageEvent, ConfigurationPageUpdate};
-use crate::tui::configuration::{ConfigurationPageEffect, ConfigurationTerminalRequest};
-use crate::tui::events::AppEvent;
-use crate::tui::StatusLevel;
-
-#[derive(Debug)]
-pub(crate) enum WaylandPageEvent {
-    Checked {
-        generation: u64,
-        target: ConfigurationTarget,
-        result: Result<WaylandSessionContext, SessionError>,
-    },
-}
-
-impl WaylandPageEvent {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Checked { .. } => "configuration-wayland-checked",
-        }
-    }
-
-    pub(crate) fn target(&self) -> &ConfigurationTarget {
-        match self {
-            Self::Checked { target, .. } => target,
-        }
-    }
-
-    pub(crate) fn into_update(self) -> WaylandPageUpdate {
-        match self {
-            Self::Checked {
-                generation, result, ..
-            } => WaylandPageUpdate::Checked { generation, result },
-        }
-    }
-
-    pub(crate) fn detached_status(self) -> Option<(String, StatusLevel)> {
-        None
-    }
-}
+use crate::application::sessions::{SessionError, WaylandShellRequest};
+use crate::tui::configuration::executor::{
+    ConfigurationTerminalRequest, PageEffect, PageEventSender,
+};
 
 pub(in crate::tui::configuration) fn start_action(
     service: Arc<crate::application::sessions::SessionService>,
     action: WaylandPageAction,
-    events: Option<mpsc::Sender<AppEvent>>,
-) -> ConfigurationPageEffect {
+    events: Option<PageEventSender<WaylandPageEvent>>,
+) -> PageEffect<WaylandPageUpdate> {
     match action {
         WaylandPageAction::Check {
             generation,
@@ -77,12 +41,12 @@ pub(in crate::tui::configuration) fn start_action(
                     )),
                 },
             };
-            ConfigurationPageEffect::Update(ConfigurationPageUpdate::Wayland(update))
+            PageEffect::Update(update)
         }
         WaylandPageAction::EnterShell {
             target,
             host_socket,
-        } => ConfigurationPageEffect::OpenTerminal(ConfigurationTerminalRequest::new(
+        } => PageEffect::OpenTerminal(ConfigurationTerminalRequest::new(
             PAGE_ID,
             target,
             WaylandShellRequest::SelectedHostDisplay(host_socket),
@@ -96,7 +60,7 @@ fn spawn_check(
     target: crate::application::sessions::ShellTarget,
     host_socket: crate::domain::wayland::HostWaylandSocket,
     generation: u64,
-    events: mpsc::Sender<AppEvent>,
+    events: PageEventSender<WaylandPageEvent>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let result = match tokio::time::timeout(
@@ -111,14 +75,12 @@ fn spawn_check(
             )),
             Err(_) => Err(SessionError::new("Wayland access check timed out")),
         };
-        let _ = events
-            .send(AppEvent::ConfigurationPage(
-                ConfigurationPageEvent::Wayland(Box::new(WaylandPageEvent::Checked {
-                    generation,
-                    target: configuration_target,
-                    result,
-                })),
-            ))
+        events
+            .send(WaylandPageEvent::Checked {
+                generation,
+                target: configuration_target,
+                result,
+            })
             .await;
     })
 }

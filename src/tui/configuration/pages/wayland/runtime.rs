@@ -4,25 +4,13 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::Frame;
 
+use super::request::WaylandPageAction;
 use super::{WaylandChecklistItem, WaylandPageState};
 use crate::application::configuration::{ConfigurationSnapshot, ConfigurationTarget};
 use crate::domain::wayland::HostWaylandSocket;
 use crate::tui::widgets::dialogs::wayland_session::{
     WaylandSessionDialog, WaylandSessionDialogAction,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum WaylandPageAction {
-    Check {
-        generation: u64,
-        target: crate::application::sessions::ShellTarget,
-        host_socket: HostWaylandSocket,
-    },
-    EnterShell {
-        target: crate::application::sessions::ShellTarget,
-        host_socket: HostWaylandSocket,
-    },
-}
 
 pub(super) enum WaylandRuntimeRequest {
     None,

@@ -8,13 +8,13 @@ use ratatui::{
     Frame,
 };
 
-use super::page::PageRenderContext;
 use super::{
     ConfigurationPane, ConfigurationView, DraftPreviewState, HitAreas, InspectionState, PreviewTab,
 };
 use crate::application::configuration::{
     ConfigurationCandidateState, ConfigurationPreview, ConfigurationTarget,
 };
+use crate::tui::configuration::page::PageRenderContext;
 use crate::tui::views::title_tabs::bordered_title_tab_hitboxes;
 use crate::tui::widgets::display::config_text;
 use crate::tui::widgets::display::scrollbar::vertical_scrollbar;

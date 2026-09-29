@@ -1,7 +1,7 @@
 //! Simple directory-based storage backend.
 
-use super::super::{ManagedStorageStore, StorageBackend, StorageType};
 use crate::adapters::error::Result;
+use crate::adapters::storage::{ManagedStorageStore, StorageBackend, StorageType};
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]

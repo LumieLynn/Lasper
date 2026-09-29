@@ -4,7 +4,6 @@
 //! perform external I/O in a spawned task, but they do not expose accepted
 //! job state; long-running stateful work belongs to `jobs::server`.
 
-use super::super::server::DaemonServerState;
 use super::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
 use crate::adapters::config::store::{execute_nspawn_config_operation, NspawnConfigOperation};
 use crate::adapters::config::systemd_unit::{execute_systemd_unit_operation, SystemdUnitOperation};
@@ -27,6 +26,8 @@ use crate::application::machine_lifecycle::{
     validate_nspawn_runtime_entry, MachineControlOutcome, MachineControlTransport,
     MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
 };
+use crate::daemon::server::shutdown_daemon_resources;
+use crate::daemon::server::DaemonServerState;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use crate::ipc::protocol::rootfs as rootfs_wire;
@@ -344,7 +345,7 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
         }
 
         RpcMethod::Exit => {
-            super::super::server::shutdown_daemon_resources(&server_state).await;
+            shutdown_daemon_resources(&server_state).await;
             std::process::exit(0);
         }
 

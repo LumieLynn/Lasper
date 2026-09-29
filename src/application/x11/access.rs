@@ -3,7 +3,7 @@
 use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionContext};
 use crate::domain::x11::HostX11Socket;
 
-use super::{X11AccessCheck, X11DesktopObservation};
+use super::grants::{X11AccessCheck, X11DesktopObservation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11AuthorizationRequest {

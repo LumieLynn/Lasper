@@ -6,9 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::super::core::utils::empty_block;
 use crate::domain::runtime::ImageEntry;
 use crate::tui::app::AppData;
+use crate::tui::views::detail_panel::core::utils::empty_block;
 
 fn selected_image(data: &AppData) -> Option<&ImageEntry> {
     data.detail_target.name().and_then(|name| {

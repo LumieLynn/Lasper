@@ -16,16 +16,15 @@ use crate::tui::widgets::dialogs::x11_authorization::X11AuthorizationDialog;
 mod controller;
 mod effects;
 mod presentation;
+mod request;
 mod runtime;
 
-pub(crate) use controller::X11PageUpdate;
 pub(in crate::tui::configuration) use effects::start_action;
-pub(crate) use effects::X11PageEvent;
-pub(crate) use runtime::X11PageAction;
+pub(crate) use request::{X11PageAction, X11PageEvent, X11PageUpdate};
 
 pub(in crate::tui::configuration) const PAGE_ID:
-    crate::tui::configuration::core::page::ConfigurationPageId =
-    crate::tui::configuration::core::page::ConfigurationPageId::X11;
+    crate::tui::configuration::page::ConfigurationPageId =
+    crate::tui::configuration::page::ConfigurationPageId::new("x11");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum X11ChecklistItem {

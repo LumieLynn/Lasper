@@ -11,8 +11,7 @@ use crate::application::configuration::{
 };
 use crate::domain::x11::HostX11Socket;
 use crate::domain::x11::X11PeerIdentity;
-use crate::tui::configuration::core::page::PageInspectionReport;
-use crate::tui::configuration::core::{ConfigurationPane, InspectionState};
+use crate::tui::configuration::page::{ConfigurationPane, InspectionState, PageInspectionReport};
 use crate::tui::configuration::pages::checklist::{
     render_endpoint_checklist, ChecklistBody, ChecklistHitAreas,
 };

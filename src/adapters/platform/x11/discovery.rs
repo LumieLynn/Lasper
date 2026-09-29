@@ -13,9 +13,10 @@ use x11rb::connection::Connection;
 use x11rb::reexports::x11rb_protocol::parse_display;
 
 use crate::application::x11::{X11EndpointCatalog, X11SourceObservation, X11SourceState};
+use crate::domain::x11::X11_SOCKET_DIRECTORY;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
-use super::common::{MAX_DISCOVERED_DISPLAYS, MAX_INSPECTED_SOURCES, X11_SOCKET_DIRECTORY};
+use super::common::{MAX_DISCOVERED_DISPLAYS, MAX_INSPECTED_SOURCES};
 use super::transport::authenticated_connection;
 
 pub(super) fn discover_sync(configured_sources: &[PathBuf]) -> X11EndpointCatalog {

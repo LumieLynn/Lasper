@@ -355,6 +355,10 @@ mod tests {
     use super::*;
     use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
+        DeploymentClaimControl, DeploymentId, MemoryDeploymentClaimControl,
+        MemoryDeploymentRecoveryProbe, MemoryDeploymentStatePort,
+    };
+    use crate::application::provisioning::{
         DeploymentEvent, DeploymentJobContext, DeploymentSecrets, DeploymentSource,
         DeploymentStorage,
     };
@@ -378,7 +382,7 @@ mod tests {
     struct FailingClaimControl;
 
     struct RevisingClaimControl {
-        state: Arc<super::super::MemoryDeploymentStatePort>,
+        state: Arc<MemoryDeploymentStatePort>,
         calls: AtomicUsize,
     }
 
@@ -386,7 +390,7 @@ mod tests {
     impl DeploymentClaimControl for RevisingClaimControl {
         async fn release_unresolved(
             &self,
-            deployment_id: super::super::DeploymentId,
+            deployment_id: DeploymentId,
             confirmed: bool,
         ) -> Result<(), DeploymentError> {
             assert!(confirmed);
@@ -451,10 +455,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl super::super::DeploymentClaimControl for FailingClaimControl {
+    impl DeploymentClaimControl for FailingClaimControl {
         async fn release_unresolved(
             &self,
-            _deployment_id: super::super::DeploymentId,
+            _deployment_id: DeploymentId,
             _confirmed: bool,
         ) -> Result<(), DeploymentError> {
             Err(DeploymentError::reconciliation_required(
@@ -489,12 +493,12 @@ mod tests {
         })
     }
 
-    fn recovery() -> Arc<super::super::MemoryDeploymentRecoveryProbe> {
-        Arc::new(super::super::MemoryDeploymentRecoveryProbe)
+    fn recovery() -> Arc<MemoryDeploymentRecoveryProbe> {
+        Arc::new(MemoryDeploymentRecoveryProbe)
     }
 
-    fn claim_control() -> Arc<super::super::MemoryDeploymentClaimControl> {
-        Arc::new(super::super::MemoryDeploymentClaimControl)
+    fn claim_control() -> Arc<MemoryDeploymentClaimControl> {
+        Arc::new(MemoryDeploymentClaimControl)
     }
 
     async fn wait_until_finished(handle: &DeploymentJobHandle) {
@@ -516,7 +520,7 @@ mod tests {
         let service = ProvisioningService::new(
             preflight.clone(),
             executor(Ok(())),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             OperationRegistry::new(),
@@ -539,7 +543,7 @@ mod tests {
         let service = ProvisioningService::new(
             preflight.clone(),
             executor(Ok(())),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             OperationRegistry::new(),
@@ -573,7 +577,7 @@ mod tests {
         let service = ProvisioningService::new(
             preflight,
             executor(Ok(())),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             OperationRegistry::new(),
@@ -598,7 +602,7 @@ mod tests {
         let service = ProvisioningService::new(
             preflight,
             executor(Err(DeploymentError::cancelled("cancelled"))),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             OperationRegistry::new(),
@@ -622,7 +626,7 @@ mod tests {
                 safety: RemoteTarSafety::Compatible,
             }),
             Arc::new(CancellationExecutor),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             Arc::clone(&registry),
@@ -654,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn executor_panic_is_reconciliation_required_and_retains_its_claim() {
         let registry = OperationRegistry::new();
-        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
+        let state = Arc::new(MemoryDeploymentStatePort::default());
         let service = ProvisioningService::new(
             Arc::new(RecordingPreflight {
                 calls: AtomicUsize::new(0),
@@ -720,7 +724,7 @@ mod tests {
     #[tokio::test]
     async fn manifest_discard_can_retry_without_releasing_an_acknowledged_daemon_job_again() {
         let registry = OperationRegistry::new();
-        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
+        let state = Arc::new(MemoryDeploymentStatePort::default());
         let control = Arc::new(RevisingClaimControl {
             state: state.clone(),
             calls: AtomicUsize::new(0),
@@ -775,7 +779,7 @@ mod tests {
                 safety: RemoteTarSafety::Compatible,
             }),
             Arc::new(PanicExecutor),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             Arc::new(FailingClaimControl),
             Arc::clone(&registry),
@@ -816,7 +820,7 @@ mod tests {
             executor(Err(DeploymentError::reconciled_unknown(
                 "historical outcome is unknown",
             ))),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             Arc::clone(&registry),
@@ -841,7 +845,7 @@ mod tests {
     #[tokio::test]
     async fn startup_recovery_tracks_manifest_claims_without_mutating_them() {
         let registry = OperationRegistry::new();
-        let state = Arc::new(super::super::MemoryDeploymentStatePort::default());
+        let state = Arc::new(MemoryDeploymentStatePort::default());
         let (request, _) = submission().into_parts();
         let plan = DeploymentPlan::build(request).unwrap();
         let manifest = DeploymentCrashManifest::prepared(
@@ -895,7 +899,7 @@ mod tests {
         let service = ProvisioningService::new(
             preflight,
             executor(Ok(())),
-            Arc::new(super::super::MemoryDeploymentStatePort::default()),
+            Arc::new(MemoryDeploymentStatePort::default()),
             recovery(),
             claim_control(),
             OperationRegistry::new(),

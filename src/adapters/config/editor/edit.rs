@@ -5,13 +5,14 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use super::document::NspawnDocument;
-use super::inspection::{inspect, inspect_at};
+use super::inspection::{inspect, inspect_at, sources_for_target};
 use super::patch::SourceMutation;
 use super::projection::x11_scope;
 use super::write::{prepare_patch, Preparation};
 use crate::adapters::config::nspawn_file::{
     encode_nspawn_bind_value, is_nvidia_begin_marker, nspawn_bind_key,
 };
+use crate::adapters::config::nspawn_source::NspawnConfigSources;
 use crate::adapters::error::Result;
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::configuration::{
@@ -40,22 +41,14 @@ pub(crate) async fn apply(edit: ConfigurationEdit) -> Result<ConfigurationApplyR
     }
 
     let initial = inspect(edit.target.clone()).await?;
-    apply_with_sources(
-        edit,
-        initial,
-        crate::paths::nspawn_config_dir(),
-        crate::paths::nspawn_runtime_config_dir(),
-        crate::paths::machines_dir(),
-    )
-    .await
+    let sources = sources_for_target(&edit.target);
+    apply_with_sources(edit, initial, sources).await
 }
 
 async fn apply_with_sources(
     edit: ConfigurationEdit,
     initial: ConfigurationSnapshot,
-    admin: PathBuf,
-    runtime: PathBuf,
-    images: PathBuf,
+    sources: NspawnConfigSources,
 ) -> Result<ConfigurationApplyReport> {
     let path = match prepare(&initial, &edit) {
         Preparation::Ready(change) => change.path,
@@ -66,7 +59,7 @@ async fn apply_with_sources(
         // The stable machine lock is held by the operation executor and this
         // closure runs under the target's sidecar lock. Re-discover every
         // source here so the preview revision is an actual apply condition.
-        let current = inspect_at(edit.target.clone(), &admin, &runtime, &images);
+        let current = inspect_at(edit.target.clone(), &sources);
         let prepared = prepare(&current, &edit);
         match prepared {
             Preparation::Ready(change) => {
@@ -622,7 +615,7 @@ fn insertion_mutation(document: &NspawnDocument<'_>, bindings: &[String]) -> Sou
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::config::configuration::projection::project;
+    use crate::adapters::config::editor::projection::project;
     use crate::adapters::config::nspawn_file::NspawnConfig;
     use crate::application::configuration::ConfigurationOrigin;
     use crate::application::configuration::{
@@ -635,10 +628,13 @@ mod tests {
         let path = PathBuf::from("/etc/systemd/nspawn/arch.nspawn");
         let mut snapshot = project(
             target,
-            Some(NspawnConfig {
-                path: path.clone(),
-                content: content.into(),
-            }),
+            Some((
+                NspawnConfig {
+                    path: path.clone(),
+                    content: content.into(),
+                },
+                ConfigurationOrigin::Administrator,
+            )),
         );
         let revision = ConfigurationRevision {
             discovery: "discovery".into(),
@@ -1033,7 +1029,9 @@ mod tests {
         )
         .unwrap();
         let target = ConfigurationTarget::Machine(MachineName::new("arch").unwrap());
-        let snapshot = inspect_at(target.clone(), &admin, &runtime, &images);
+        let sources =
+            NspawnConfigSources::from_test_roots(target.name(), false, &admin, &runtime, &images);
+        let snapshot = inspect_at(target.clone(), &sources);
         let request = ConfigurationEdit {
             target,
             base_revision: snapshot.revision.clone().unwrap(),
@@ -1046,7 +1044,7 @@ mod tests {
             wayland_changes: vec![],
         };
 
-        let report = apply_with_sources(request, snapshot, admin, runtime, images)
+        let report = apply_with_sources(request, snapshot, sources)
             .await
             .unwrap();
         assert!(matches!(report, ConfigurationApplyReport::Applied { .. }));
@@ -1066,7 +1064,9 @@ mod tests {
         let path = admin.join("arch.nspawn");
         std::fs::write(&path, "[Files]\nBind=/tmp/.X11-unix\n").unwrap();
         let target = ConfigurationTarget::Machine(MachineName::new("arch").unwrap());
-        let snapshot = inspect_at(target.clone(), &admin, &runtime, &images);
+        let sources =
+            NspawnConfigSources::from_test_roots(target.name(), false, &admin, &runtime, &images);
+        let snapshot = inspect_at(target.clone(), &sources);
         let request = ConfigurationEdit {
             target,
             base_revision: snapshot.revision.clone().unwrap(),
@@ -1075,7 +1075,7 @@ mod tests {
         };
         std::fs::write(&path, "# external edit\n[Files]\nBind=/tmp/.X11-unix\n").unwrap();
 
-        let report = apply_with_sources(request, snapshot, admin, runtime, images)
+        let report = apply_with_sources(request, snapshot, sources)
             .await
             .unwrap();
         assert!(matches!(report, ConfigurationApplyReport::Conflict { .. }));

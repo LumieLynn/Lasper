@@ -8,8 +8,8 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::super::core::ConfigurationPane;
 use crate::application::configuration::ConfigurationTarget;
+use crate::tui::configuration::page::ConfigurationPane;
 use crate::tui::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,4 +256,15 @@ fn render_runtime_access<T>(
             ),
         area,
     );
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(in crate::tui::configuration) struct ChecklistTestState {
+    pub selected: Option<usize>,
+    pub expanded: std::collections::BTreeSet<usize>,
+    pub modal_open: bool,
+    pub bindings: Vec<(Rect, usize)>,
+    pub checkboxes: Vec<(Rect, usize)>,
+    pub access: Rect,
 }

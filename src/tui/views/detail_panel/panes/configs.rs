@@ -6,9 +6,9 @@ use ratatui::{
     Frame,
 };
 
-use super::super::core::utils::empty_block;
 use crate::tui::app::AppData;
 use crate::tui::theme;
+use crate::tui::views::detail_panel::core::utils::empty_block;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.detail_target.name().is_none() {

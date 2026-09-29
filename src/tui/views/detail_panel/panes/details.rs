@@ -6,11 +6,11 @@ use ratatui::{
     Frame,
 };
 
-use super::super::core::properties::group_display_priority;
-use super::super::core::style::property_style;
-use super::super::core::utils::empty_block;
 use crate::render_column_layout;
 use crate::tui::app::AppData;
+use crate::tui::views::detail_panel::core::properties::group_display_priority;
+use crate::tui::views::detail_panel::core::style::property_style;
+use crate::tui::views::detail_panel::core::utils::empty_block;
 
 pub fn render(f: &mut Frame, data: &AppData, area: Rect, scroll: u16) {
     if data.entries.is_empty() {

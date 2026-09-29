@@ -2,26 +2,37 @@
 //!
 //! This module is deliberately a registry, not an interaction coordinator.
 //! Each controller owns its controls, hit testing, modal state, and runtime
-//! result handling. The workspace talks to every page through `core::page`.
+//! result handling. The workspace talks to every page through the sibling
+//! configuration protocol.
 
 mod checklist;
+#[cfg(test)]
+pub(in crate::tui::configuration) use checklist::ChecklistTestState;
 mod request;
 pub(in crate::tui::configuration) mod wayland;
 pub(in crate::tui::configuration) mod x11;
 
+use ratatui::{layout::Rect, Frame};
+
+use crate::application::configuration::ConfigurationSnapshot;
+use crate::tui::configuration::page::{
+    ConfigurationPageController, ConfigurationSection, PageRequest,
+};
+use crate::tui::configuration::page::{
+    ConfigurationPageDescriptor, ConfigurationPageId, PageInput, PageInspectionReport,
+    PageInteractionContext, PageRenderContext,
+};
+use wayland::WaylandPageState;
+use x11::X11PageState;
+
 pub(crate) use request::{
     ConfigurationPageAction, ConfigurationPageEvent, ConfigurationPageUpdate,
 };
-
-use ratatui::{layout::Rect, Frame};
-
-use super::core::page::{
-    ConfigurationPageController, ConfigurationPageDescriptor, ConfigurationPageId, PageInput,
-    PageInspectionReport, PageInteractionContext, PageRenderContext, PageRequest,
-};
-use crate::application::configuration::ConfigurationSnapshot;
-use wayland::WaylandPageState;
-use x11::X11PageState;
+pub(in crate::tui::configuration) const HOST_INTEGRATION: ConfigurationSection =
+    ConfigurationSection {
+        key: "host-integration",
+        label: "Host Integration",
+    };
 
 pub(super) struct ConfigurationPages {
     controllers: Vec<RegisteredPage>,
@@ -87,10 +98,14 @@ impl RegisteredPage {
         &mut self,
         input: PageInput,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest {
+    ) -> PageRequest<ConfigurationPageAction> {
         match self {
-            Self::Wayland(page) => page.handle_input(input, context),
-            Self::X11(page) => page.handle_input(input, context),
+            Self::Wayland(page) => page
+                .handle_input(input, context)
+                .map_action(ConfigurationPageAction::Wayland),
+            Self::X11(page) => page
+                .handle_input(input, context)
+                .map_action(ConfigurationPageAction::X11),
         }
     }
 
@@ -110,7 +125,7 @@ impl RegisteredPage {
     }
 
     #[cfg(test)]
-    fn test_state(&self) -> super::core::page::PageTestState {
+    fn test_state(&self) -> ChecklistTestState {
         match self {
             Self::Wayland(page) => page.test_state(),
             Self::X11(page) => page.test_state(),
@@ -205,7 +220,7 @@ impl ConfigurationPages {
         page: ConfigurationPageId,
         input: PageInput,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest {
+    ) -> PageRequest<ConfigurationPageAction> {
         self.controller_mut(page).handle_input(input, context)
     }
 
@@ -219,7 +234,7 @@ impl ConfigurationPages {
     }
 
     #[cfg(test)]
-    pub(super) fn test_state(&self, page: ConfigurationPageId) -> super::core::page::PageTestState {
+    pub(super) fn test_state(&self, page: ConfigurationPageId) -> ChecklistTestState {
         self.controller(page).test_state()
     }
 }

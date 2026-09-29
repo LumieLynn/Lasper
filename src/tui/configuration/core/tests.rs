@@ -2,8 +2,8 @@ use super::*;
 use crate::application::configuration::{
     ConfigurationActivation, ConfigurationApplyReport, ConfigurationDiscovery,
     ConfigurationDocument, ConfigurationOrigin, ConfigurationPreview, ConfigurationRevision,
-    ConfigurationWriteTarget, X11BindRecommendation, X11BindingChange, X11BindingDeclaration,
-    X11BindingScope,
+    ConfigurationSnapshot, ConfigurationWriteTarget, X11BindRecommendation, X11BindingChange,
+    X11BindingDeclaration, X11BindingScope,
 };
 use crate::application::inspection::ResourceInspectionError;
 use crate::application::x11::X11AccessCheck;
@@ -129,13 +129,13 @@ fn loaded_machine() -> ConfigurationView {
 }
 
 fn select_x11_page(view: &mut ConfigurationView) {
-    if view.navigation.current_page() != super::super::pages::x11::PAGE_ID {
+    if view.navigation.current_page() != crate::tui::configuration::pages::x11::PAGE_ID {
         view.pane = ConfigurationPane::Navigation;
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
     assert_eq!(
         view.navigation.current_page(),
-        super::super::pages::x11::PAGE_ID
+        crate::tui::configuration::pages::x11::PAGE_ID
     );
     view.pane = ConfigurationPane::Content;
 }
@@ -145,17 +145,19 @@ fn select_wayland_page(view: &mut ConfigurationView) {
     view.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
     assert_eq!(
         view.navigation.current_page(),
-        super::super::pages::wayland::PAGE_ID
+        crate::tui::configuration::pages::wayland::PAGE_ID
     );
     view.pane = ConfigurationPane::Content;
 }
 
-fn x11_state(view: &ConfigurationView) -> super::page::PageTestState {
-    view.pages.test_state(super::super::pages::x11::PAGE_ID)
+fn x11_state(view: &ConfigurationView) -> crate::tui::configuration::pages::ChecklistTestState {
+    view.pages
+        .test_state(crate::tui::configuration::pages::x11::PAGE_ID)
 }
 
-fn wayland_state(view: &ConfigurationView) -> super::page::PageTestState {
-    view.pages.test_state(super::super::pages::wayland::PAGE_ID)
+fn wayland_state(view: &ConfigurationView) -> crate::tui::configuration::pages::ChecklistTestState {
+    view.pages
+        .test_state(crate::tui::configuration::pages::wayland::PAGE_ID)
 }
 
 #[test]
@@ -163,7 +165,7 @@ fn navigation_starts_on_the_first_registered_page() {
     let view = ConfigurationView::new(target("archlinux"));
     assert_eq!(
         view.navigation.current_page(),
-        super::super::pages::wayland::PAGE_ID
+        crate::tui::configuration::pages::wayland::PAGE_ID
     );
 }
 

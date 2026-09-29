@@ -11,16 +11,15 @@ use crate::tui::widgets::dialogs::wayland_session::WaylandSessionDialog;
 mod controller;
 mod effects;
 mod presentation;
+mod request;
 mod runtime;
 
-pub(crate) use controller::WaylandPageUpdate;
 pub(in crate::tui::configuration) use effects::start_action;
-pub(crate) use effects::WaylandPageEvent;
-pub(crate) use runtime::WaylandPageAction;
+pub(crate) use request::{WaylandPageAction, WaylandPageEvent, WaylandPageUpdate};
 
 pub(in crate::tui::configuration) const PAGE_ID:
-    crate::tui::configuration::core::page::ConfigurationPageId =
-    crate::tui::configuration::core::page::ConfigurationPageId::Wayland;
+    crate::tui::configuration::page::ConfigurationPageId =
+    crate::tui::configuration::page::ConfigurationPageId::new("wayland");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum WaylandChecklistItem {

@@ -97,7 +97,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::config::configuration::patch::SourceMutation;
+    use crate::adapters::config::editor::patch::SourceMutation;
 
     #[test]
     fn patch_preparation_keeps_a_bounded_mutation_result() {

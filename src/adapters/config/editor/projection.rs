@@ -18,7 +18,7 @@ use super::document::NspawnDocument;
 
 pub(super) fn project(
     target: ConfigurationTarget,
-    config: Option<NspawnConfig>,
+    config: Option<(NspawnConfig, ConfigurationOrigin)>,
 ) -> ConfigurationSnapshot {
     let discovery = match &target {
         ConfigurationTarget::Machine(_) => ConfigurationDiscovery::MachineNameCandidates,
@@ -46,19 +46,12 @@ pub(super) fn project(
         other_bind_count: 0,
         diagnostics: Vec::new(),
     };
-    if let Some(config) = config {
+    if let Some((config, origin)) = config {
         let document = NspawnDocument::new(&config.content);
         let display_policy = display_bind_recommendation(&document, &mut snapshot.diagnostics);
         snapshot.x11_bind_recommendation = display_policy.clone();
         snapshot.wayland_bind_recommendation = display_policy;
         read_bind_declarations(&document, &mut snapshot);
-        let admin = crate::paths::nspawn_config_dir();
-        let runtime = crate::paths::nspawn_runtime_config_dir();
-        let origin = match config.path.parent() {
-            Some(path) if path == admin => ConfigurationOrigin::Administrator,
-            Some(path) if path == runtime => ConfigurationOrigin::Runtime,
-            _ => ConfigurationOrigin::ImageAdjacent,
-        };
         snapshot.document = Some(ConfigurationDocument {
             content_sha256: format!("{:x}", Sha256::digest(config.content.as_bytes())),
             path: config.path,
@@ -272,11 +265,32 @@ mod tests {
     fn snapshot(content: &str) -> ConfigurationSnapshot {
         project(
             ConfigurationTarget::Image(ImageName::new("arch-image").unwrap()),
-            Some(NspawnConfig {
-                path: "/etc/systemd/nspawn/arch-image.nspawn".into(),
-                content: content.into(),
-            }),
+            Some((
+                NspawnConfig {
+                    path: "/etc/systemd/nspawn/arch-image.nspawn".into(),
+                    content: content.into(),
+                },
+                ConfigurationOrigin::Administrator,
+            )),
         )
+    }
+
+    #[test]
+    fn projection_uses_observed_origin_instead_of_guessing_from_the_path() {
+        let snapshot = project(
+            ConfigurationTarget::Image(ImageName::new("arch-image").unwrap()),
+            Some((
+                NspawnConfig {
+                    path: "/etc/systemd/nspawn/arch-image.nspawn".into(),
+                    content: "[Exec]\nBoot=yes\n".into(),
+                },
+                ConfigurationOrigin::Runtime,
+            )),
+        );
+        assert_eq!(
+            snapshot.document.unwrap().origin,
+            ConfigurationOrigin::Runtime
+        );
     }
 
     #[test]

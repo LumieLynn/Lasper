@@ -187,10 +187,6 @@ fn validate_machine_name(name: &str) -> Result<()> {
 }
 
 impl NspawnConfig {
-    pub fn default_path(name: &str) -> PathBuf {
-        crate::paths::nspawn_config(name)
-    }
-
     /// Find declared targets for this exact host socket, including source
     /// aliases. Guest paths are configuration data, not provisioning policy.
     pub(crate) async fn wayland_targets(&self, source: &Path) -> Result<Vec<PathBuf>> {

@@ -333,6 +333,7 @@ async fn validate_tar_target(target: &RootfsTarget) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::DeploymentCancellation;
     use std::io::{Seek, SeekFrom};
 
     #[test]
@@ -474,13 +475,9 @@ mod tests {
         archive.seek(SeekFrom::Start(0)).unwrap();
 
         let (archive, _) = prepare_tar_import(archive, TarSourceOrigin::Local, false).unwrap();
-        extract_tar_at(
-            target.path(),
-            archive,
-            &super::super::DeploymentCancellation::default(),
-        )
-        .await
-        .unwrap();
+        extract_tar_at(target.path(), archive, &DeploymentCancellation::default())
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read(target.path().join("etc/os-release")).unwrap(),
             b"NAME=Lasper test\n"
@@ -491,7 +488,7 @@ mod tests {
     async fn tar_extraction_stops_when_deployment_is_cancelled() {
         let mut command = crate::adapters::process::new_command("sh");
         command.args(["-c", "sleep 30"]);
-        let cancellation = super::super::DeploymentCancellation::default();
+        let cancellation = DeploymentCancellation::default();
         let request = cancellation.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;

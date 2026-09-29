@@ -1,29 +1,46 @@
-//! Contract between the configuration workspace and independently owned pages.
+//! Page-independent configuration workspace contracts.
+//! Concrete actions, completion messages, and access policy belong to each page.
 
 use crossterm::event::KeyEvent;
-use ratatui::{layout::Position, layout::Rect, Frame};
+use ratatui::layout::Rect;
+use ratatui::{layout::Position, Frame};
 
-use super::super::pages::ConfigurationPageAction;
-use super::{ConfigurationPane, InspectionState};
 use crate::application::configuration::{
     ConfigurationDraft, ConfigurationDraftRequest, ConfigurationSnapshot, ConfigurationTarget,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ConfigurationPageId {
-    Wayland,
-    X11,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConfigurationPane {
+    Navigation,
+    Content,
+    Preview,
+}
+
+pub(crate) enum InspectionState {
+    Loading,
+    Ready(Box<ConfigurationSnapshot>),
+    Failed(String),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(in crate::tui::configuration) enum ConfigurationSectionId {
-    HostIntegration,
+pub(crate) struct ConfigurationPageId(&'static str);
+
+impl ConfigurationPageId {
+    pub(in crate::tui::configuration) const fn new(id: &'static str) -> Self {
+        Self(id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::tui::configuration) struct ConfigurationSection {
+    pub key: &'static str,
+    pub label: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::tui::configuration) struct ConfigurationPageDescriptor {
     pub id: ConfigurationPageId,
-    pub section: ConfigurationSectionId,
+    pub section: ConfigurationSection,
     pub label: &'static str,
 }
 
@@ -57,24 +74,22 @@ impl PageInspectionReport {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::tui::configuration) enum PageInput {
     Key(KeyEvent),
     Click(Position),
     Scroll(bool),
 }
 
-pub(in crate::tui::configuration) enum PageRequest {
+pub(in crate::tui::configuration) enum PageRequest<A> {
     None,
     Draft(ConfigurationDraftRequest),
-    Action(ConfigurationPageAction),
-    CleanDraftAction {
-        action: ConfigurationPageAction,
-        blocked_message: String,
-    },
+    Action(A),
+    CleanDraftAction { action: A, blocked_message: String },
 }
 
 pub(in crate::tui::configuration) trait ConfigurationPageController {
+    type Action;
     type Update;
 
     fn descriptor(&self) -> ConfigurationPageDescriptor;
@@ -88,21 +103,24 @@ pub(in crate::tui::configuration) trait ConfigurationPageController {
         &mut self,
         input: PageInput,
         context: PageInteractionContext<'_>,
-    ) -> PageRequest;
+    ) -> PageRequest<Self::Action>;
     fn reject_action(&mut self, _message: String) {}
     fn update(&mut self, update: Self::Update);
-
-    #[cfg(test)]
-    fn test_state(&self) -> PageTestState;
 }
 
-#[cfg(test)]
-#[derive(Clone, Debug, Default)]
-pub(in crate::tui::configuration) struct PageTestState {
-    pub selected: Option<usize>,
-    pub expanded: std::collections::BTreeSet<usize>,
-    pub modal_open: bool,
-    pub bindings: Vec<(Rect, usize)>,
-    pub checkboxes: Vec<(Rect, usize)>,
-    pub access: Rect,
+impl<A> PageRequest<A> {
+    pub fn map_action<B>(self, map: impl FnOnce(A) -> B) -> PageRequest<B> {
+        match self {
+            Self::None => PageRequest::None,
+            Self::Draft(request) => PageRequest::Draft(request),
+            Self::Action(action) => PageRequest::Action(map(action)),
+            Self::CleanDraftAction {
+                action,
+                blocked_message,
+            } => PageRequest::CleanDraftAction {
+                action: map(action),
+                blocked_message,
+            },
+        }
+    }
 }

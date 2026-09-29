@@ -1,12 +1,12 @@
 //! Inspection, preview, and apply lifecycle for the configuration workspace.
 
-use super::page::ConfigurationPageId;
 use super::{ConfigurationView, DraftPreviewState, InspectionState};
 use crate::application::configuration::{
     ConfigurationApplyReport, ConfigurationEdit, ConfigurationPreview, ConfigurationSnapshot,
     ConfigurationTarget,
 };
 use crate::application::inspection::ResourceInspectionError;
+use crate::tui::configuration::page::ConfigurationPageId;
 use crate::tui::configuration::pages::{ConfigurationPageEvent, ConfigurationPageUpdate};
 
 impl ConfigurationView {

@@ -528,8 +528,8 @@ impl DeploymentStateSession {
 
 #[cfg(test)]
 mod tests {
-    use super::super::MachineProvisioningConfig;
     use super::*;
+    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{DeploymentSource, DeploymentStorage};
 
     fn request() -> DeploymentRequest {

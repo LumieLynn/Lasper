@@ -18,11 +18,11 @@ use crate::application::x11::{
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::X11SocketRevision;
+use crate::domain::x11::X11_SOCKET_DIRECTORY;
 
 use super::common::{
     GRANT_RECORD_VERSION, MACHINE_CLAIM_VERSION, MAX_GRANT_DIAGNOSTICS, MAX_GRANT_REASON_BYTES,
     MAX_GRANT_RECORDS, MAX_GRANT_RECORD_BYTES, MAX_MACHINE_CLAIMS, MAX_MACHINE_CLAIM_BYTES,
-    X11_SOCKET_DIRECTORY,
 };
 use super::transport::{
     host_boot_id, numeric_local_user_address, unix_millis, user_runtime_directory,

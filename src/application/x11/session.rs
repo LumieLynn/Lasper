@@ -7,7 +7,9 @@
 use crate::application::sessions::X11SessionContext;
 use crate::domain::x11::HostX11Socket;
 
-use super::{X11AccessCheck, X11AuthorizationDisposition, X11EndpointCatalog};
+use super::access::X11AuthorizationDisposition;
+use super::catalog::X11EndpointCatalog;
+use super::grants::X11AccessCheck;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum X11SessionSelection {

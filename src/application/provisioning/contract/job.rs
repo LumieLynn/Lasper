@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 
-use super::super::state::DeploymentStateSession;
 use super::identity::DeploymentId;
 use super::secrets::DeploymentSecrets;
+use crate::application::provisioning::state::{DeploymentPlan, DeploymentStateSession};
 
 pub(crate) const DEPLOYMENT_EVENT_CAPACITY: usize = 256;
 
@@ -323,7 +323,7 @@ pub trait SourcePreflight: Send + Sync + 'static {
 pub trait DeploymentExecutor: Send + Sync + 'static {
     async fn run(
         &self,
-        plan: super::super::state::DeploymentPlan,
+        plan: DeploymentPlan,
         secrets: DeploymentSecrets,
         context: DeploymentJobContext,
     ) -> Result<(), DeploymentError>;

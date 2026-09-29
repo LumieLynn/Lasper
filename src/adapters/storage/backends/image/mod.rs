@@ -3,10 +3,10 @@
 pub mod create;
 pub mod mount;
 
-use super::super::{
+use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::storage::{
     ImageMountSource, ManagedImageKind, ManagedStorageStore, StorageBackend, StorageType,
 };
-use crate::adapters::error::{NspawnError, Result};
 use crate::domain::storage::DiskImageConfig;
 use std::path::PathBuf;
 

@@ -7,13 +7,13 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
-use super::core::page::ConfigurationPageId;
-use super::pages::{self, ConfigurationPageAction, ConfigurationPageUpdate};
+use super::pages::{ConfigurationPageAction, ConfigurationPageUpdate};
 use crate::application::sessions::{
     SessionService, ShellTarget, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::application::x11::X11AccessService;
 use crate::domain::machine::MachineName;
+use crate::tui::configuration::page::ConfigurationPageId;
 use crate::tui::events::AppEvent;
 
 pub(crate) struct ConfigurationPageExecutor {
@@ -34,19 +34,14 @@ impl ConfigurationPageExecutor {
         action: ConfigurationPageAction,
         events: Option<mpsc::Sender<AppEvent>>,
     ) -> ConfigurationPageEffect {
-        match action {
-            ConfigurationPageAction::Wayland(action) => {
-                pages::wayland::start_action(Arc::clone(&self.session), action, events)
-            }
-            ConfigurationPageAction::X11(action) => {
-                pages::x11::start_action(Arc::clone(&self.x11_access), action, events)
-            }
-        }
+        action.start(&self.session, &self.x11_access, events)
     }
 }
 
-pub(crate) enum ConfigurationPageEffect {
-    Update(ConfigurationPageUpdate),
+pub(crate) type ConfigurationPageEffect = PageEffect<ConfigurationPageUpdate>;
+
+pub(crate) enum PageEffect<U> {
+    Update(U),
     OpenTerminal(ConfigurationTerminalRequest),
 }
 
@@ -83,5 +78,33 @@ impl ConfigurationTerminalRequest {
             self.target.user().clone(),
             self.access,
         )
+    }
+}
+
+impl<U> PageEffect<U> {
+    pub(in crate::tui::configuration) fn map_update<V>(
+        self,
+        map: impl FnOnce(U) -> V,
+    ) -> PageEffect<V> {
+        match self {
+            Self::Update(update) => PageEffect::Update(map(update)),
+            Self::OpenTerminal(request) => PageEffect::OpenTerminal(request),
+        }
+    }
+}
+
+/// The registry supplies the event conversion; a page only sends its own messages.
+pub(in crate::tui::configuration) struct PageEventSender<E> {
+    sender: mpsc::Sender<AppEvent>,
+    wrap: fn(E) -> AppEvent,
+}
+
+impl<E> PageEventSender<E> {
+    pub fn new(sender: mpsc::Sender<AppEvent>, wrap: fn(E) -> AppEvent) -> Self {
+        Self { sender, wrap }
+    }
+
+    pub async fn send(&self, event: E) {
+        let _ = self.sender.send((self.wrap)(event)).await;
     }
 }
