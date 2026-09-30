@@ -1,9 +1,9 @@
 //! Embedded selected-user shell prompt and terminal bridge.
 
 use crate::application::sessions::{
-    InteractiveShellEnvironment, SessionService, ShellOpenIntent, ShellTarget, TerminalCommand,
-    TerminalSessionEndpoint, TerminalSessionHandle, ValidatedGuestUserName, WaylandShellRequest,
-    X11SessionContext,
+    InteractiveShellEnvironment, SessionService, ShellLaunchError, ShellLaunchRequest, ShellTarget,
+    TerminalCommand, TerminalSessionEndpoint, TerminalSessionHandle, ValidatedGuestUserName,
+    WaylandShellRequest,
 };
 use crate::application::x11::{
     X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
@@ -184,51 +184,61 @@ async fn enter_shell(
     bridge: ShellBridge<'_>,
 ) -> ShellEntryResult {
     let ShellEntryRequest { target, size } = request;
-    let x11 = match mode.x11_access() {
-        Some(access) => match access
-            .prepare_session(target.clone(), X11SessionSelection::Current)
-            .await
-        {
-            Ok(preparation) => {
+    let mut request = ShellLaunchRequest::new(
+        target,
+        WaylandShellRequest::Automatic,
+        InteractiveShellEnvironment::embedded(),
+        size,
+    )
+    .with_wayland_fallback(true);
+    if mode.x11_access().is_some() {
+        request = request.with_x11(X11SessionSelection::Current);
+    }
+    let mut remote = match service.launch_shell(request, mode.x11_access()).await {
+        Ok(opened) => {
+            if let Some(preparation) = opened.x11.as_ref() {
                 let _ = send_output(
                     bridge.output,
-                    x11_preparation_notice(&preparation).into_bytes(),
+                    x11_preparation_notice(preparation).into_bytes(),
                 )
                 .await;
-                Some(preparation.into_context())
             }
-            Err(error) => {
-                return ShellEntryResult::Finished(x11_error_message(
-                    "failed to prepare Host X11 session",
-                    &error,
-                ));
-            }
-        },
-        None => None,
-    };
-
-    match open_shell(service, target, x11, size).await {
-        Ok((mut remote, fallback)) => {
-            if fallback {
+            if opened.wayland_fallback.is_some() {
                 let _ = send_output(
                     bridge.output,
                     format!("{WAYLAND_FALLBACK_NOTICE}\r\n").into_bytes(),
                 )
                 .await;
             }
-            match bridge_shell(bridge.commands, bridge.close, bridge.output, &mut remote).await {
-                BridgeResult::Closed => ShellEntryResult::Closed,
-                BridgeResult::Finished(state) => {
-                    let message = match state {
-                        SessionLifecycle::Exited { .. } | SessionLifecycle::Closed => "\r\n".into(),
-                        SessionLifecycle::Failed(error) => format!("\r\nlasper: {error}\r\n"),
-                        SessionLifecycle::Running => String::new(),
-                    };
-                    ShellEntryResult::Finished(message)
-                }
-            }
+            opened.handle
         }
-        Err(error) => ShellEntryResult::Finished(format!("lasper: {error}\r\n")),
+        Err(ShellLaunchError::X11(error)) => {
+            return ShellEntryResult::Finished(x11_error_message(
+                "failed to prepare Host X11 session",
+                &error,
+            ));
+        }
+        Err(ShellLaunchError::Open { error, x11 }) => {
+            if let Some(preparation) = x11.as_ref() {
+                let _ = send_output(
+                    bridge.output,
+                    x11_preparation_notice(preparation).into_bytes(),
+                )
+                .await;
+            }
+            return ShellEntryResult::Finished(format!("lasper: {error}\r\n"));
+        }
+    };
+    match bridge_shell(bridge.commands, bridge.close, bridge.output, &mut remote).await {
+        BridgeResult::Closed => ShellEntryResult::Closed,
+        BridgeResult::Finished(state) => {
+            let message = match state {
+                SessionLifecycle::Exited { .. } | SessionLifecycle::Closed => "\r\n".into(),
+                SessionLifecycle::Failed(error) => format!("\r\nlasper: {error}\r\n"),
+                SessionLifecycle::Running => String::new(),
+            };
+            ShellEntryResult::Finished(message)
+        }
     }
 }
 
@@ -265,28 +275,6 @@ fn x11_preparation_notice(preparation: &X11SessionPreparation) -> String {
         ));
     }
     message
-}
-
-async fn open_shell(
-    service: &SessionService,
-    target: ShellTarget,
-    x11: Option<X11SessionContext>,
-    size: SessionSize,
-) -> Result<(TerminalSessionHandle, bool), String> {
-    let mut intent = ShellOpenIntent::new(
-        target,
-        WaylandShellRequest::Automatic,
-        InteractiveShellEnvironment::embedded(),
-        size,
-    );
-    if let Some(x11) = x11 {
-        intent = intent.with_x11(x11);
-    }
-    service
-        .open_shell_with_fallback(intent, true)
-        .await
-        .map(|(handle, fallback)| (handle, fallback.is_some()))
-        .map_err(|error| error.to_string())
 }
 
 enum BridgeResult {

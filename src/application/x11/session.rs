@@ -36,10 +36,6 @@ impl X11SessionPreparation {
     pub fn disposition(&self) -> &X11AuthorizationDisposition {
         &self.disposition
     }
-
-    pub fn into_context(self) -> X11SessionContext {
-        self.context
-    }
 }
 
 pub(super) fn select_session_endpoints(

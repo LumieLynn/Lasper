@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use crate::application::sessions::{
     GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellAttemptError,
-    ShellOpenError, ShellOpenIntent, ShellTarget, ValidatedGuestUserName, WaylandFallbackCause,
-    WaylandShellRequest,
+    ShellLaunchError, ShellLaunchRequest, ShellOpenError, ShellTarget, ValidatedGuestUserName,
+    WaylandFallbackCause, WaylandShellRequest,
 };
 use crate::application::x11::{
     X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
@@ -390,75 +390,64 @@ pub(crate) async fn run_shell(
     };
     let x11 = match x11 {
         ShellX11Selection::Disabled => None,
-        ShellX11Selection::Current => {
-            match x11_access
-                .prepare_session(target.clone(), X11SessionSelection::Current)
-                .await
-            {
-                Ok(preparation) => Some(preparation),
-                Err(error) => {
-                    report_x11_error(&error);
-                    return 1;
-                }
-            }
-        }
-        ShellX11Selection::Display(display) => {
-            match x11_access
-                .prepare_session(target.clone(), X11SessionSelection::Display(display))
-                .await
-            {
-                Ok(preparation) => Some(preparation),
-                Err(error) => {
-                    report_x11_error(&error);
-                    return 1;
-                }
-            }
-        }
+        ShellX11Selection::Current => Some(X11SessionSelection::Current),
+        ShellX11Selection::Display(display) => Some(X11SessionSelection::Display(display)),
     };
-    if let Some(preparation) = &x11 {
-        report_x11_preparation(preparation);
-    }
-    let mut intent = ShellOpenIntent::new(
+    let mut request = ShellLaunchRequest::new(
         target,
         wayland,
         InteractiveShellEnvironment::capture(),
         size,
-    );
+    )
+    .with_wayland_fallback(allow_wayland_fallback);
     if let Some(command) = requested_command {
-        intent = intent.with_command(command);
+        request = request.with_command(command);
     }
-    if let Some(preparation) = x11 {
-        intent = intent.with_x11(preparation.into_context());
+    if let Some(selection) = x11 {
+        request = request.with_x11(selection);
     }
-    let (handle, fallback) = match sessions
-        .open_shell_with_fallback(intent, allow_wayland_fallback)
-        .await
-    {
-        Ok(opened) => opened,
-        Err(ShellAttemptError::Initial(error)) => {
-            let context = if matches!(&error, ShellOpenError::WaylandSelection(_)) {
-                "Wayland socket selection failed"
-            } else {
-                "failed to open selected-user shell"
-            };
-            report_shell_error(context, error.session_error());
-            if uses_wayland && !allow_wayland_fallback {
-                eprintln!(
-                    "lasper: hint: choose another display with --wayland=DISPLAY, or use \
-                     --no-wayland for a terminal-only session"
-                );
+    let handle = match sessions.launch_shell(request, Some(x11_access)).await {
+        Ok(opened) => {
+            if let Some(preparation) = opened.x11.as_ref() {
+                report_x11_preparation(preparation);
             }
+            if let Some(notice) = wayland_fallback_notice(quiet, opened.wayland_fallback.is_some())
+            {
+                eprintln!("{notice}");
+            }
+            opened.handle
+        }
+        Err(ShellLaunchError::X11(error)) => {
+            report_x11_error(&error);
             return 1;
         }
-        Err(ShellAttemptError::Fallback { cause, error }) => {
-            report_wayland_fallback_failure(&cause, &error);
-            return 1;
+        Err(ShellLaunchError::Open { error, x11 }) => {
+            if let Some(preparation) = &x11 {
+                report_x11_preparation(preparation);
+            }
+            match error {
+                ShellAttemptError::Initial(error) => {
+                    let context = if matches!(&error, ShellOpenError::WaylandSelection(_)) {
+                        "Wayland socket selection failed"
+                    } else {
+                        "failed to open selected-user shell"
+                    };
+                    report_shell_error(context, error.session_error());
+                    if uses_wayland && !allow_wayland_fallback {
+                        eprintln!(
+                            "lasper: hint: choose another display with --wayland=DISPLAY, or use \
+                             --no-wayland for a terminal-only session"
+                        );
+                    }
+                    return 1;
+                }
+                ShellAttemptError::Fallback { cause, error } => {
+                    report_wayland_fallback_failure(&cause, &error);
+                    return 1;
+                }
+            }
         }
     };
-    if let Some(notice) = wayland_fallback_notice(quiet, fallback.is_some()) {
-        eprintln!("{notice}");
-    }
-
     let result = match io_mode {
         ShellIoMode::Interactive => {
             crate::adapters::session::terminal_io::run_inherited_terminal(handle, !quiet).await

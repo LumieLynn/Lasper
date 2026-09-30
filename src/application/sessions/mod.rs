@@ -13,7 +13,11 @@ pub use contract::{
     X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
 };
 pub use service::SessionService;
-pub use shell::{ShellAttemptError, WaylandFallbackCause};
+#[allow(unused_imports)]
+pub use shell::{
+    ShellAttemptError, ShellLaunchError, ShellLaunchRequest, ShellLaunchResult,
+    WaylandFallbackCause,
+};
 
 pub(crate) use contract::{
     journal_session_channel, terminal_session_channel, TerminalCommand, TerminalLaunch,

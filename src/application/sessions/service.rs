@@ -1,8 +1,7 @@
 use super::{
-    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellOpenError,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionRequest,
-    TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext,
-    X11ProjectionContext, X11ProjectionProbeRequest,
+    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellTarget,
+    TerminalSessionHandle, TerminalSessionRequest, WaylandPreparationRequest,
+    WaylandSessionContext, X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -10,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct SessionService {
-    port: Arc<dyn SessionPort>,
+    pub(super) port: Arc<dyn SessionPort>,
     next_id: AtomicU64,
 }
 
@@ -47,58 +46,6 @@ impl SessionService {
         machine: &MachineName,
     ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
         self.port.automatic_wayland(machine).await
-    }
-
-    pub async fn open_shell(
-        &self,
-        intent: ShellOpenIntent,
-    ) -> Result<TerminalSessionHandle, ShellOpenError> {
-        let socket = self
-            .resolve_shell_wayland(intent.target(), intent.wayland())
-            .await
-            .map_err(ShellOpenError::WaylandSelection)?;
-        self.open_prepared_shell(&intent, socket).await
-    }
-
-    pub(super) async fn open_prepared_shell(
-        &self,
-        intent: &ShellOpenIntent,
-        socket: Option<crate::domain::wayland::HostWaylandSocket>,
-    ) -> Result<TerminalSessionHandle, ShellOpenError> {
-        if intent
-            .x11()
-            .is_some_and(|context| context.target() != intent.target())
-        {
-            return Err(ShellOpenError::X11Context(SessionError::new(
-                "prepared X11 access belongs to a different shell target",
-            )));
-        }
-        let terminal_environment = intent.terminal_environment().clone();
-        let command = intent.command().cloned();
-        let mut environment = match socket {
-            None => TypedSessionEnvironment::terminal(terminal_environment),
-            Some(socket) => TypedSessionEnvironment::wayland(
-                terminal_environment,
-                self.prepare_wayland(intent.target().clone(), socket)
-                    .await
-                    .map_err(ShellOpenError::WaylandPreparation)?,
-            ),
-        };
-        if let Some(context) = intent.x11().cloned() {
-            environment = environment.with_x11(context);
-        }
-        let target = intent.target();
-        self.port
-            .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
-                self.allocate_id(),
-                target.machine().clone(),
-                target.user().clone(),
-                environment,
-                command,
-                intent.size(),
-            ))
-            .await
-            .map_err(ShellOpenError::Terminal)
     }
 
     pub async fn test_wayland(
@@ -164,8 +111,8 @@ mod tests {
     use super::*;
     use crate::application::sessions::{
         journal_session_channel, terminal_session_channel, JournalSessionRequest, SessionPort,
-        TerminalLaunch, TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
-        WaylandShellRequest,
+        ShellOpenError, ShellOpenIntent, TerminalLaunch, TerminalSessionRequest,
+        WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
     };
     use crate::domain::session::TerminalAttachmentKind;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
