@@ -1,15 +1,15 @@
 //! Selected-user shell preparation and opening shared by CLI and embedded terminals.
 
 use crate::application::x11::{
-    X11AccessError, X11AccessService, X11SessionPreparation, X11SessionSelection,
+    X11AccessError, X11SessionPreparation, X11SessionPreparationPort, X11SessionSelection,
 };
 use crate::domain::session::SessionSize;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 
 use super::{
     GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellOpenError,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionRequest,
-    TypedSessionEnvironment, WaylandShellRequest,
+    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TypedSessionEnvironment,
+    WaylandShellRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -72,7 +72,7 @@ impl SessionService {
     pub async fn launch_shell(
         &self,
         request: ShellLaunchRequest,
-        x11_access: Option<&X11AccessService>,
+        x11_access: Option<&dyn X11SessionPreparationPort>,
     ) -> Result<ShellLaunchResult, ShellLaunchError> {
         let x11 = match request.x11 {
             Some(selection) => {
@@ -117,18 +117,6 @@ impl SessionService {
         })
     }
 
-    /// Open an intent without automatic X11 authorization or Wayland fallback.
-    pub async fn open_shell(
-        &self,
-        intent: ShellOpenIntent,
-    ) -> Result<TerminalSessionHandle, ShellOpenError> {
-        let socket = self
-            .resolve_shell_wayland(intent.target(), intent.wayland())
-            .await
-            .map_err(ShellOpenError::WaylandSelection)?;
-        self.open_prepared_shell(&intent, socket).await
-    }
-
     async fn open_prepared_shell(
         &self,
         intent: &ShellOpenIntent,
@@ -156,16 +144,7 @@ impl SessionService {
         if let Some(context) = intent.x11().cloned() {
             environment = environment.with_x11(context);
         }
-        let target = intent.target();
-        self.port
-            .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
-                self.allocate_id(),
-                target.machine().clone(),
-                target.user().clone(),
-                environment,
-                command,
-                intent.size(),
-            ))
+        self.open_selected_user_terminal(intent.target(), environment, command, intent.size())
             .await
             .map_err(ShellOpenError::Terminal)
     }

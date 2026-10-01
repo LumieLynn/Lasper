@@ -3,9 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::application::sessions::{
-    SessionError, ShellTarget, X11ProjectionContext, X11SessionContext,
-};
+use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionContext};
 use crate::domain::x11::HostX11Socket;
 
 use super::access::{
@@ -14,7 +12,9 @@ use super::access::{
 };
 use super::catalog::X11EndpointDiscoveryService;
 use super::grants::X11AccessCheck;
-use super::session::{select_session_endpoints, X11SessionPreparation, X11SessionSelection};
+use super::session::{
+    select_session_endpoints, X11SessionPreparation, X11SessionPreparationPort, X11SessionSelection,
+};
 
 pub(super) const MACHINE_LIFECYCLE_RETRY_DELAY: Duration = Duration::from_millis(2_100);
 const MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS: usize = 3;
@@ -38,6 +38,17 @@ pub struct X11AccessService {
     projection: Arc<dyn X11ProjectionPort>,
     endpoints: Arc<X11EndpointDiscoveryService>,
     desktop: Arc<dyn X11DesktopAccessPort>,
+}
+
+#[async_trait::async_trait]
+impl X11SessionPreparationPort for X11AccessService {
+    async fn prepare_session(
+        &self,
+        target: ShellTarget,
+        selection: X11SessionSelection,
+    ) -> Result<X11SessionPreparation, X11AccessError> {
+        X11AccessService::prepare_session(self, target, selection).await
+    }
 }
 
 impl X11AccessService {
@@ -137,11 +148,11 @@ impl X11AccessService {
                 "external-stop X11 reconcile is unavailable: {error}"
             ));
         }
-        Ok(X11SessionPreparation {
-            context: X11SessionContext::prepared(target, projection),
+        Ok(X11SessionPreparation::new(
+            target,
             check,
-            disposition: desktop.disposition,
-        })
+            desktop.disposition,
+        ))
     }
 
     async fn resolve_session_projection(

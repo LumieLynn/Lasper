@@ -7,7 +7,7 @@ use crate::application::sessions::{
 };
 use crate::application::x11::{
     X11AccessError, X11AccessService, X11AuthorizationDisposition, X11SessionPreparation,
-    X11SessionSelection,
+    X11SessionPreparationPort, X11SessionSelection,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionLifecycle, SessionSize};
@@ -22,10 +22,10 @@ pub(super) enum BuiltinShellMode {
 }
 
 impl BuiltinShellMode {
-    fn x11_access(&self) -> Option<&X11AccessService> {
+    fn x11_access(&self) -> Option<&dyn X11SessionPreparationPort> {
         match self {
             Self::Standard => None,
-            Self::HostX11(access) => Some(access),
+            Self::HostX11(access) => Some(access.as_ref()),
         }
     }
 }

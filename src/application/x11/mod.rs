@@ -26,6 +26,7 @@ pub(crate) use grants::{
 pub use grants::{X11GrantAssessment, X11GrantHistoryEntry};
 pub use service::X11AccessService;
 pub(crate) use service::X11ProjectionPort;
+pub(crate) use session::X11SessionPreparationPort;
 pub use session::{X11SessionPreparation, X11SessionSelection};
 
 #[cfg(test)]

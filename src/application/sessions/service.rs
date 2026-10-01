@@ -1,7 +1,8 @@
 use super::{
-    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, ShellTarget,
-    TerminalSessionHandle, TerminalSessionRequest, WaylandPreparationRequest,
-    WaylandSessionContext, X11ProjectionContext, X11ProjectionProbeRequest,
+    GuestCommand, JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort,
+    ShellTarget, TerminalSessionHandle, TerminalSessionRequest, TypedSessionEnvironment,
+    WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
+    X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -9,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub struct SessionService {
-    pub(super) port: Arc<dyn SessionPort>,
+    port: Arc<dyn SessionPort>,
     next_id: AtomicU64,
 }
 
@@ -82,6 +83,25 @@ impl SessionService {
             .await
     }
 
+    pub(super) async fn open_selected_user_terminal(
+        &self,
+        target: &ShellTarget,
+        environment: TypedSessionEnvironment,
+        command: Option<GuestCommand>,
+        size: SessionSize,
+    ) -> Result<TerminalSessionHandle, SessionError> {
+        self.port
+            .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
+                self.allocate_id(),
+                target.machine().clone(),
+                target.user().clone(),
+                environment,
+                command,
+                size,
+            ))
+            .await
+    }
+
     pub(crate) fn allocate_id(&self) -> SessionId {
         loop {
             let value = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -109,24 +129,13 @@ impl SessionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::sessions::{
-        journal_session_channel, terminal_session_channel, JournalSessionRequest, SessionPort,
-        ShellOpenError, ShellOpenIntent, TerminalLaunch, TerminalSessionRequest,
-        WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
-    };
+    use crate::application::sessions::{journal_session_channel, terminal_session_channel};
     use crate::domain::session::TerminalAttachmentKind;
-    use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
-    use crate::domain::x11::{HostX11Socket, X11SocketRevision};
     use parking_lot::Mutex;
-    use std::path::PathBuf;
 
     #[derive(Default)]
     struct RecordingPort {
         ids: Mutex<Vec<SessionId>>,
-        terminal_wayland_contexts: Mutex<Vec<bool>>,
-        terminal_x11_contexts: Mutex<Vec<bool>>,
-        terminal_terms: Mutex<Vec<String>>,
-        terminal_commands: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -134,7 +143,7 @@ mod tests {
         async fn automatic_wayland(
             &self,
             _machine: &MachineName,
-        ) -> Result<Option<HostWaylandSocket>, SessionError> {
+        ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
             Ok(None)
         }
 
@@ -149,48 +158,21 @@ mod tests {
             request: TerminalSessionRequest,
         ) -> Result<TerminalSessionHandle, SessionError> {
             self.ids.lock().push(request.id);
-            self.terminal_wayland_contexts.lock().push(matches!(
-                &request.launch,
-                TerminalLaunch::SelectedUserShell { environment, .. }
-                    if environment.wayland_context().is_some()
-            ));
-            self.terminal_x11_contexts.lock().push(matches!(
-                &request.launch,
-                TerminalLaunch::SelectedUserShell { environment, .. }
-                    if environment.x11_context().is_some()
-            ));
-            if let TerminalLaunch::SelectedUserShell { environment, .. } = &request.launch {
-                self.terminal_terms
-                    .lock()
-                    .push(environment.terminal_environment().term().to_string());
-            }
-            if let TerminalLaunch::SelectedUserShell { command, .. } = &request.launch {
-                self.terminal_commands.lock().push(
-                    command
-                        .as_ref()
-                        .map(|command| command.program().to_string()),
-                );
-            }
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
         }
 
         async fn prepare_wayland(
             &self,
-            request: WaylandPreparationRequest,
+            _request: WaylandPreparationRequest,
         ) -> Result<WaylandSessionContext, SessionError> {
-            self.ids.lock().push(request.probe_id);
-            Ok(WaylandSessionContext::verified(
-                request.host_socket,
-                PathBuf::from("/run/lasper/wayland/1000/wayland-0"),
-                crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
-            ))
+            panic!("session allocation must not prepare Wayland")
         }
 
         async fn probe_x11_projection(
             &self,
             _request: X11ProjectionProbeRequest,
         ) -> Result<X11ProjectionContext, SessionError> {
-            panic!("unrequested X11 projection probe")
+            panic!("session allocation must not probe X11")
         }
 
         async fn open_journal(
@@ -200,51 +182,6 @@ mod tests {
             self.ids.lock().push(request.id);
             Ok(journal_session_channel(request.id).0)
         }
-    }
-
-    fn shell_target(machine: &str) -> ShellTarget {
-        ShellTarget::new(
-            MachineName::new(machine).unwrap(),
-            crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
-        )
-    }
-
-    fn prepared_x11(target: ShellTarget) -> crate::application::sessions::X11SessionContext {
-        let namespace = crate::application::sessions::ObservedNamespaceIdentity::new(1, 2);
-        let socket = HostX11Socket::from_verified_parts(
-            0,
-            false,
-            "/tmp/.X11-unix/X0".into(),
-            "/tmp/.X11-unix/X0".into(),
-            1000,
-            1000,
-            0o755,
-            42,
-            1000,
-            1000,
-            X11SocketRevision {
-                device: 1,
-                inode: 2,
-                ctime_seconds: 3,
-                ctime_nanoseconds: 4,
-            },
-        )
-        .unwrap();
-        let projection = X11ProjectionContext::verified(
-            socket,
-            "/mnt/host-x11/X0".into(),
-            "/tmp/.X11-unix/X0".into(),
-            crate::application::sessions::X11FilesystemAccess::observed(true, true),
-            crate::application::sessions::MappedGuestIdentity::verified(
-                crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
-                1_437_402_088,
-                1_437_402_088,
-                crate::application::sessions::ObservedMachineInstance::new(
-                    42, namespace, namespace,
-                ),
-            ),
-        );
-        crate::application::sessions::X11SessionContext::prepared(target, projection)
     }
 
     #[tokio::test]
@@ -261,106 +198,5 @@ mod tests {
         let ids = port.ids.lock();
         assert_eq!(ids.len(), 2);
         assert_ne!(ids[0], ids[1]);
-    }
-
-    #[tokio::test]
-    async fn wayland_shell_prepares_before_opening_with_verified_context() {
-        let port = Arc::new(RecordingPort::default());
-        let service = SessionService::new(port.clone());
-        let socket = HostWaylandSocket::from_verified_parts(
-            WaylandDisplay::new("wayland-0").unwrap(),
-            PathBuf::from("/run/user/1000"),
-            PathBuf::from("/run/user/1000/wayland-0"),
-            1000,
-            1000,
-            1000,
-            0o700,
-            SocketRevision {
-                device: 1,
-                inode: 2,
-                ctime_seconds: 3,
-                ctime_nanoseconds: 4,
-            },
-        )
-        .unwrap();
-
-        let _terminal = service
-            .open_shell(ShellOpenIntent::new(
-                ShellTarget::new(
-                    MachineName::new("test").unwrap(),
-                    crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
-                ),
-                WaylandShellRequest::SelectedHostDisplay(socket),
-                crate::application::sessions::InteractiveShellEnvironment::default(),
-                SessionSize::new(80, 24).unwrap(),
-            ))
-            .await
-            .unwrap();
-
-        let ids = port.ids.lock();
-        assert_eq!(ids.iter().map(|id| id.get()).collect::<Vec<_>>(), [1, 2]);
-        assert_eq!(*port.terminal_wayland_contexts.lock(), [true]);
-        assert_eq!(*port.terminal_terms.lock(), ["dumb"]);
-    }
-
-    #[tokio::test]
-    async fn shell_command_is_carried_after_wayland_preparation() {
-        let port = Arc::new(RecordingPort::default());
-        let service = SessionService::new(port.clone());
-        let command = crate::application::sessions::GuestCommand::new(
-            "/usr/bin/kitty",
-            vec!["--single-instance".into()],
-        )
-        .unwrap();
-        let _terminal = service
-            .open_shell(
-                ShellOpenIntent::new(
-                    ShellTarget::new(
-                        MachineName::new("test").unwrap(),
-                        crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
-                    ),
-                    WaylandShellRequest::Disabled,
-                    crate::application::sessions::InteractiveShellEnvironment::default(),
-                    SessionSize::new(80, 24).unwrap(),
-                )
-                .with_command(command),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            *port.terminal_commands.lock(),
-            [Some("/usr/bin/kitty".into())]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepared_x11_context_is_target_bound_and_carried_without_reprobing() {
-        let port = Arc::new(RecordingPort::default());
-        let service = SessionService::new(port.clone());
-        let target = shell_target("test");
-        let intent = ShellOpenIntent::new(
-            target.clone(),
-            WaylandShellRequest::Disabled,
-            crate::application::sessions::InteractiveShellEnvironment::default(),
-            SessionSize::new(80, 24).unwrap(),
-        )
-        .with_x11(prepared_x11(target));
-
-        let _terminal = service.open_shell(intent).await.unwrap();
-        assert_eq!(*port.terminal_x11_contexts.lock(), [true]);
-
-        let mismatched = ShellOpenIntent::new(
-            shell_target("other"),
-            WaylandShellRequest::Disabled,
-            crate::application::sessions::InteractiveShellEnvironment::default(),
-            SessionSize::new(80, 24).unwrap(),
-        )
-        .with_x11(prepared_x11(shell_target("test")));
-        assert!(matches!(
-            service.open_shell(mismatched).await,
-            Err(ShellOpenError::X11Context(_))
-        ));
-        assert_eq!(*port.terminal_x11_contexts.lock(), [true]);
     }
 }

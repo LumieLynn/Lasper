@@ -2,7 +2,7 @@
 
 use crate::application::sessions::{
     terminal_session_channel, InteractiveShellEnvironment, SessionSendStatus, SessionService,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
+    ShellLaunchRequest, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
     ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::application::x11::X11AccessService;
@@ -358,15 +358,16 @@ impl TerminalManager {
             .map_err(|error| format!("Invalid terminal size: {error}"))?;
         let mut handle = match user.clone() {
             Some(user) => {
-                let intent = ShellOpenIntent::new(
+                let request = ShellLaunchRequest::new(
                     ShellTarget::new(machine, user),
                     wayland,
                     InteractiveShellEnvironment::embedded(),
                     size,
                 );
                 self.session_service
-                    .open_shell(intent)
+                    .launch_shell(request, None)
                     .await
+                    .map(|opened| opened.handle)
                     .map_err(|error| error.to_string())
             }
             None => self
