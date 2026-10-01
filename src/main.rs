@@ -170,6 +170,7 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
         let launch = crate::composition::compose_process_launch_services(
             systemd_tools,
             loaded_config.config.nvidia.source(),
+            pm.level(),
         );
         crate::cli::run_launch(
             command,

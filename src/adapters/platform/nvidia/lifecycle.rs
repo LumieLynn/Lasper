@@ -1,7 +1,7 @@
 use super::discovery::get_nvidia_state_from;
 use super::state::{calculate_death_list, calculate_removed_binds, NvidiaState};
 use crate::adapters::config::nspawn_file::NspawnConfig;
-use crate::adapters::error::Result;
+use crate::adapters::error::{NspawnError, Result};
 use crate::domain::nvidia::NvidiaPassthroughMode;
 
 macro_rules! log_step {
@@ -111,6 +111,16 @@ fn parse_managed_bind(value: &str) -> Option<(String, String)> {
     Some((host.to_string(), container.to_string()))
 }
 
+fn is_permission_denied(error: &NspawnError) -> bool {
+    match error {
+        NspawnError::PermissionDenied => true,
+        NspawnError::GenericIo(source) | NspawnError::Io(_, source) => {
+            source.kind() == std::io::ErrorKind::PermissionDenied
+        }
+        _ => error.is_polkit_rejection(),
+    }
+}
+
 async fn inject_persistent_device_allow(
     name: &str,
     state: &NvidiaState,
@@ -189,7 +199,11 @@ pub async fn ensure_gpu_passthrough(
     // 2. Load old state and profile, then scan host
     log_step!(name, "Detection", "Scanning host for NVIDIA CDI devices...");
 
-    let persisted_state = state_store.read(name).await?;
+    let persisted_state = match state_store.read(name).await {
+        Ok(state) => state,
+        Err(error) if is_permission_denied(&error) => return Err(NspawnError::PermissionDenied),
+        Err(error) => return Err(error),
+    };
     let external_cache = persisted_state.clone().unwrap_or_default();
     let profile = external_cache.profile.clone().unwrap_or_default();
 

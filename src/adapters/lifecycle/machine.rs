@@ -33,6 +33,7 @@ pub(crate) struct MachineLifecycleAdapters {
     pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
     pub(crate) nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
     pub(crate) rootfs: crate::adapters::rootfs::RootfsStore,
+    pub(crate) skip_nvidia_permission_denied: bool,
 }
 
 pub(crate) enum MachineLifecycleRoute {
@@ -58,6 +59,7 @@ pub(crate) fn compose_machine_lifecycle(
         nvidia_state,
         nvidia_cdi_source,
         rootfs,
+        skip_nvidia_permission_denied,
     } = adapters;
     let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
         route: match route {
@@ -81,6 +83,7 @@ pub(crate) fn compose_machine_lifecycle(
         rootfs,
         system_operations,
         runtime: runtime.clone(),
+        skip_nvidia_permission_denied,
     });
     let observation: Arc<dyn MachineObservation> = Arc::new(CatalogMachineObservation {
         runtime: runtime.clone(),
@@ -398,6 +401,7 @@ struct StoreStartPreparation {
     rootfs: crate::adapters::rootfs::RootfsStore,
     system_operations: SystemOperationStore,
     runtime: Arc<RuntimeCatalog>,
+    skip_nvidia_permission_denied: bool,
 }
 
 #[async_trait::async_trait]
@@ -413,7 +417,17 @@ impl MachineStartPreparation for StoreStartPreparation {
         )
         .await;
         self.runtime.invalidate();
-        result.map_err(map_machine_preparation_error)?;
+        match result {
+            Ok(()) => {}
+            Err(NspawnError::PermissionDenied) if self.skip_nvidia_permission_denied => {
+                log::warn!(
+                    "skipping NVIDIA pre-start synchronization for {}: NVIDIA state could not be read without elevated privileges",
+                    machine,
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(map_machine_preparation_error(error)),
+        }
         if let Err(error) = self.system_operations.reload_daemon().await {
             log::warn!(
                 "systemd daemon reload after pre-start reconciliation failed for {}: {}",
@@ -426,8 +440,9 @@ impl MachineStartPreparation for StoreStartPreparation {
 }
 
 fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError {
-    let permission_denied =
-        error.is_polkit_rejection() || matches!(&error, NspawnError::PermissionDenied);
+    let permission_denied = error.is_polkit_rejection()
+        || matches!(&error, NspawnError::PermissionDenied)
+        || matches!(&error, NspawnError::GenericIo(source) | NspawnError::Io(_, source) if source.kind() == std::io::ErrorKind::PermissionDenied);
     let invalid_configuration = matches!(
         &error,
         NspawnError::Validation(_) | NspawnError::InvalidConfig(_)

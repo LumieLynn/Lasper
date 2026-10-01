@@ -46,6 +46,7 @@ pub(crate) struct ProcessLaunchServices {
 pub(crate) fn compose_process_launch_services(
     systemd_tools: bool,
     nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
+    permission_level: PermissionLevel,
 ) -> ProcessLaunchServices {
     let local_cmd: Arc<dyn crate::adapters::process::CommandRunner> =
         Arc::new(crate::adapters::process::DefaultCommandRunner);
@@ -81,6 +82,7 @@ pub(crate) fn compose_process_launch_services(
             ),
             nvidia_cdi_source,
             rootfs: crate::adapters::rootfs::RootfsStore::direct(),
+            skip_nvidia_permission_denied: permission_level == PermissionLevel::User,
         },
     );
     ProcessLaunchServices {
@@ -302,6 +304,7 @@ pub(crate) fn compose_application_services(
             nvidia_state: nvidia_state.clone(),
             nvidia_cdi_source: nvidia_cdi_source.clone(),
             rootfs,
+            skip_nvidia_permission_denied: level == PermissionLevel::User,
         },
     );
     let provisioning = crate::adapters::provisioning::compose_provisioning_service(
