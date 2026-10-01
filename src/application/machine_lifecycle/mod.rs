@@ -1,8 +1,10 @@
 //! Application-owned machine lifecycle workflow and transition projection.
 
 mod error;
+mod readiness;
 
 pub use error::MachinePreparationError;
+pub use readiness::MachineReadyError;
 
 use super::operations::{ExecutionRoute, RouteFallback};
 use super::operations::{

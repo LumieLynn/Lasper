@@ -1,5 +1,6 @@
 pub mod gpu;
 pub mod network;
+pub(crate) mod notifications;
 pub mod nvidia;
 pub mod wayland;
 pub mod x11;

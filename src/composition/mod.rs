@@ -36,6 +36,59 @@ pub(crate) struct ProcessShellServices {
     pub x11_access: Arc<crate::application::x11::X11AccessService>,
 }
 
+pub(crate) struct ProcessLaunchServices {
+    pub runtime: Arc<RuntimeCatalog>,
+    pub machine_lifecycle: Arc<MachineLifecycleService>,
+}
+
+/// Only desktop launches need machine discovery and startup. No runtime
+/// observers or TUI services are started in this process route.
+pub(crate) fn compose_process_launch_services(
+    systemd_tools: bool,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
+) -> ProcessLaunchServices {
+    let local_cmd: Arc<dyn crate::adapters::process::CommandRunner> =
+        Arc::new(crate::adapters::process::DefaultCommandRunner);
+    let dbus = crate::adapters::runtime::dbus::DbusBackend::new();
+    let primary = if systemd_tools {
+        crate::adapters::runtime::PrimaryRuntimeRoute::Disabled
+    } else {
+        crate::adapters::runtime::PrimaryRuntimeRoute::DirectDbus(dbus.clone())
+    };
+    let runtime = crate::adapters::runtime::compose_runtime_catalog(
+        Arc::clone(&local_cmd),
+        systemd_tools.then(crate::adapters::runtime::inspection::MachineInspectionStore::direct),
+        primary,
+    );
+    let route = if systemd_tools {
+        crate::adapters::lifecycle::machine::MachineLifecycleRoute::LocalSystemdTools
+    } else {
+        crate::adapters::lifecycle::machine::MachineLifecycleRoute::DirectDbus(dbus)
+    };
+    let machine_lifecycle = crate::adapters::lifecycle::machine::compose_machine_lifecycle(
+        Arc::clone(&runtime),
+        OperationRegistry::new(),
+        route,
+        crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
+            system_operations: crate::adapters::system_operation::SystemOperationStore::direct(
+                Arc::clone(&local_cmd),
+            ),
+            local_cmd,
+            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
+            systemd_unit: crate::adapters::config::SystemdUnitStore::direct(),
+            nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore::direct(
+                crate::adapters::trusted_state::TrustedStateRoot::production(),
+            ),
+            nvidia_cdi_source,
+            rootfs: crate::adapters::rootfs::RootfsStore::direct(),
+        },
+    );
+    ProcessLaunchServices {
+        runtime,
+        machine_lifecycle,
+    }
+}
+
 /// Compose the process-level shell through the same authority and transport
 /// matrix as the TUI session service.
 pub(crate) fn compose_process_shell_services(

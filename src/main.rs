@@ -126,6 +126,8 @@ async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
 }
 
 async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
+    let launch_target = (command.io_mode() == crate::cli::ShellIoMode::Launcher)
+        .then(|| format!("{}@{}", command.target().user(), command.target().machine()));
     let loaded_config = crate::config::load_config();
     if let Some(diagnostic) = loaded_config.diagnostic {
         eprintln!("lasper: {}", diagnostic.summary);
@@ -164,9 +166,46 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
             log::debug!("X11 lifecycle reconcile unavailable before shell: {error}");
         }
     }
-    let code = crate::cli::run_shell(command, &services.session, &services.x11_access).await;
+    let result = if launch_target.is_some() {
+        let launch = crate::composition::compose_process_launch_services(
+            systemd_tools,
+            loaded_config.config.nvidia.source(),
+        );
+        crate::cli::run_launch(
+            command,
+            &services.session,
+            services.x11_access.as_ref(),
+            &launch.machine_lifecycle,
+            &launch.runtime,
+        )
+        .await
+    } else {
+        crate::cli::run_shell(command, &services.session, services.x11_access.as_ref()).await
+    };
     if let Some(daemon) = daemon {
         daemon.exit().await;
+    }
+    let (code, failure) = match result {
+        Ok(0) => (0, None),
+        Ok(code) => {
+            let failure = launch_target.as_ref().map(|_| {
+                let failure = format!("The guest command exited with status {code}.");
+                eprintln!("lasper: {failure}");
+                failure
+            });
+            (code, failure)
+        }
+        Err(error) => {
+            crate::cli::report_command_error(&error);
+            (1, Some(error.to_string()))
+        }
+    };
+    if let (Some(target), Some(failure)) = (launch_target, failure) {
+        if let Err(error) =
+            crate::adapters::platform::notifications::notify_launch_failure(&target, &failure).await
+        {
+            eprintln!("lasper: desktop notification unavailable: {error}");
+        }
     }
     code
 }
