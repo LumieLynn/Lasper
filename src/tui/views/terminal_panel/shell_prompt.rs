@@ -264,6 +264,10 @@ fn x11_preparation_notice(preparation: &X11SessionPreparation) -> String {
             "🪐 Reusing existing Host X11 access on :{display} for mapped uid #{}.\r\n",
             projection.identity().host_uid()
         ),
+        X11AuthorizationDisposition::ReusedManaged { .. } => format!(
+            "🪐 Reusing Lasper-managed Host X11 access on :{display} for mapped uid #{}; this machine's lifecycle is tracked.\r\n",
+            projection.identity().host_uid()
+        ),
         X11AuthorizationDisposition::AccessControlDisabled => format!(
             "lasper: warning: X11 access control is disabled on :{display}; no per-user ACL entry was added.\r\n"
         ),

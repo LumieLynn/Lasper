@@ -88,6 +88,7 @@ enum CheckState {
 enum AuthorizationPresentation {
     AccessControlDisabled,
     PreExisting,
+    ReusedManaged { record_id: String },
     Added { record_id: String },
 }
 
@@ -416,6 +417,11 @@ impl X11AuthorizationDialog {
                     crate::application::x11::X11AuthorizationDisposition::PreExisting => {
                         AuthorizationPresentation::PreExisting
                     }
+                    crate::application::x11::X11AuthorizationDisposition::ReusedManaged {
+                        record_id,
+                    } => AuthorizationPresentation::ReusedManaged {
+                        record_id: record_id.clone(),
+                    },
                     crate::application::x11::X11AuthorizationDisposition::Added { record_id } => {
                         AuthorizationPresentation::Added {
                             record_id: record_id.clone(),
@@ -777,6 +783,10 @@ impl X11AuthorizationDialog {
                     (Some(AuthorizationPresentation::PreExisting), _) => {
                         " Last action reused the existing entry without claiming it.".to_owned()
                     }
+                    (Some(AuthorizationPresentation::ReusedManaged { record_id }), _) => format!(
+                        " Last action registered this machine's claim on grant {}.",
+                        &record_id[..record_id.len().min(12)]
+                    ),
                     (Some(AuthorizationPresentation::AccessControlDisabled), _) => {
                         " No entry was added.".to_owned()
                     }

@@ -607,7 +607,9 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                     ),
                 );
             }
-            if matches!(&claim.status, ReconcileClaimStatus::Pending) {
+            if matches!(&claim.status, ReconcileClaimStatus::Pending)
+                && !pending_record_ids.contains(&claim.record_id)
+            {
                 pending_record_ids.push(claim.record_id.clone());
             }
         }
@@ -635,7 +637,9 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                 ));
                 break;
             };
-            matching_records.push(record);
+            if !matching_records.contains(&record) {
+                matching_records.push(record);
+            }
         }
         if let Some(reason) = invalid_record {
             push_reconcile_diagnostic(&mut diagnostics, reason);

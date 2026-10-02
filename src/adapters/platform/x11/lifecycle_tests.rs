@@ -1,6 +1,7 @@
 //! Exercise persisted claims across multiple worker invocations. These tests
 //! never modify the desktop ACL or install units in the real user manager.
 
+use super::access::reuse_managed_grant_sync;
 use super::common::CLAIM_RECONCILE_GRACE_MILLIS;
 use super::lifecycle::*;
 use super::state::*;
@@ -198,7 +199,7 @@ fn unprivileged_observation_then_stop_reaches_cleanup_across_worker_restarts() {
     )
     .unwrap();
     assert!(fixture.watcher_needed()); // Claim finalization must also finish.
-    fixture.state.end_claim(&fixture.record.record_id).unwrap();
+    fixture.state.end_claims(&fixture.record.record_id).unwrap();
     assert!(!fixture.watcher_needed());
 }
 
@@ -365,6 +366,192 @@ fn shared_grant_waits_for_every_machine_and_all_observation_failures() {
 }
 
 #[test]
+fn reusing_a_managed_acl_persists_each_machine_without_duplicate_mutation_records() {
+    let first =
+        ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(77).unwrap(), None);
+    let second =
+        ObservedMachineInstance::from_process(43, std::num::NonZeroU64::new(88).unwrap(), None);
+    let fixture = Fixture::with_request(grant_request_for_instance(first));
+    let request = grant_request_for_instance(second);
+    let request = crate::application::x11::X11AuthorizationRequest::for_explicit_session(
+        crate::application::sessions::ShellTarget::new(
+            crate::domain::machine::MachineName::new("fedora").unwrap(),
+            request.target().user().clone(),
+        ),
+        request.projection().clone(),
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            reuse_managed_grant_sync(
+                &fixture.state,
+                &fixture.state.load_records(),
+                &fixture.state.load_claims(),
+                &request,
+                77,
+                &fixture.record.boot_id,
+            )
+            .unwrap(),
+            Some(fixture.record.record_id.clone()),
+        );
+        assert_eq!(fixture.state.load_claims().claims.len(), 2);
+        assert_eq!(fixture.state.load_records().records.len(), 1);
+    }
+    let claims = fixture.state.load_claims();
+    assert!(claims.complete);
+    let original = claims
+        .claims
+        .iter()
+        .find(|claim| claim.machine == "archlinux")
+        .unwrap();
+    let reused = claims
+        .claims
+        .iter()
+        .find(|claim| claim.machine == "fedora")
+        .unwrap();
+    assert_ne!(original.claim_id, reused.claim_id);
+    assert_eq!(original.grant_record_id, reused.grant_record_id);
+    assert_eq!(original.key, reused.key);
+    assert_eq!(reused.compare_machine_instance(second), Some(true));
+    assert_eq!(reused.compare_machine_instance(first), Some(false));
+
+    let now = 100;
+    let mut group = ReconcileGroup::new(ReconcileClaim {
+        claim_id: original.claim_id.clone(),
+        record_id: original.grant_record_id.clone(),
+        key: original.key.clone(),
+        status: ReconcileClaimStatus::Ready,
+    });
+    group.add(ReconcileClaim {
+        claim_id: reused.claim_id.clone(),
+        record_id: reused.grant_record_id.clone(),
+        key: reused.key.clone(),
+        status: reconcile_claim(
+            &fixture.state,
+            reused,
+            &fixture.record.boot_id,
+            SystemMachineRegistration::Present {
+                leader_pid: 43,
+                instance: Some(second),
+            },
+            now,
+        )
+        .unwrap(),
+    });
+    assert!(
+        !group.ready(),
+        "the second machine must keep the shared ACL alive"
+    );
+    assert_eq!(
+        reconcile_claim(
+            &fixture.state,
+            reused,
+            &fixture.record.boot_id,
+            SystemMachineRegistration::Absent,
+            now
+        ),
+        Some(ReconcileClaimStatus::Pending),
+    );
+    let pending = fixture
+        .state
+        .load_claims()
+        .claims
+        .into_iter()
+        .find(|claim| claim.claim_id == reused.claim_id)
+        .unwrap();
+    group.claims[1].status = reconcile_claim(
+        &fixture.state,
+        &pending,
+        &fixture.record.boot_id,
+        SystemMachineRegistration::Absent,
+        now + CLAIM_RECONCILE_GRACE_MILLIS,
+    )
+    .unwrap();
+    assert!(group.ready());
+
+    fixture.state.end_claims(&fixture.record.record_id).unwrap();
+    assert!(fixture
+        .state
+        .load_claims()
+        .claims
+        .iter()
+        .all(|claim| matches!(claim.phase, MachineClaimPhase::Ended)));
+}
+
+#[test]
+fn external_historical_or_other_generation_acls_are_not_claimed_on_reuse() {
+    let fixture = Fixture::new();
+    let request = grant_request();
+    let original = fixture.state.load_records();
+    let mut catalogs = vec![crate::application::x11::X11GrantRecordCatalog::empty()];
+    for phase in [
+        crate::application::x11::X11GrantRecordPhase::Pending,
+        crate::application::x11::X11GrantRecordPhase::Revoked,
+        crate::application::x11::X11GrantRecordPhase::OutcomeUnknown {
+            reason: "uncertain".into(),
+        },
+    ] {
+        let mut catalog = original.clone();
+        catalog.records[0].phase = phase;
+        catalogs.push(catalog);
+    }
+    let mut replaced = original.clone();
+    replaced.records[0].socket_revision.inode += 1;
+    catalogs.push(replaced);
+    let mut other_boot = original.clone();
+    other_boot.records[0].boot_id = "22222222-2222-4222-8222-222222222222".into();
+    catalogs.push(other_boot);
+    for records in catalogs {
+        assert_eq!(
+            reuse_managed_grant_sync(
+                &fixture.state,
+                &records,
+                &fixture.state.load_claims(),
+                &request,
+                77,
+                &fixture.record.boot_id,
+            )
+            .unwrap(),
+            None
+        );
+    }
+    assert_eq!(
+        reuse_managed_grant_sync(
+            &fixture.state,
+            &original,
+            &fixture.state.load_claims(),
+            &request,
+            78,
+            &fixture.record.boot_id,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(fixture.state.load_claims().claims.len(), 1);
+}
+
+#[test]
+fn a_managed_acl_is_not_reused_when_the_new_machine_claim_cannot_be_saved() {
+    let mut fixture = Fixture::new();
+    let request = grant_request_for_instance(ObservedMachineInstance::from_process(
+        43,
+        std::num::NonZeroU64::new(88).unwrap(),
+        None,
+    ));
+    fixture.state.claims = None;
+    let error = reuse_managed_grant_sync(
+        &fixture.state,
+        &fixture.state.load_records(),
+        &fixture.state.load_claims(),
+        &request,
+        77,
+        &fixture.record.boot_id,
+    )
+    .unwrap_err();
+    assert!(error.contains("machine claim could not be saved"));
+    assert_eq!(fixture.state.load_records().records.len(), 1);
+}
+
+#[test]
 fn watcher_survives_unresolved_claims_and_missing_or_incomplete_records() {
     let fixture = Fixture::new();
     mark_record_phase_sync(
@@ -388,7 +575,7 @@ fn watcher_survives_unresolved_claims_and_missing_or_incomplete_records() {
         fixture.phase(phase);
         assert!(fixture.watcher_needed());
     }
-    fixture.state.end_claim(&fixture.record.record_id).unwrap();
+    fixture.state.end_claims(&fixture.record.record_id).unwrap();
     assert!(!fixture.watcher_needed());
 
     mark_record_phase_sync(

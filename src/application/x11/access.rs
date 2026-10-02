@@ -88,6 +88,7 @@ impl X11AuthorizationRequest {
 pub enum X11AuthorizationDisposition {
     AccessControlDisabled,
     PreExisting,
+    ReusedManaged { record_id: String },
     Added { record_id: String },
 }
 

@@ -19,7 +19,8 @@ use super::common::MAX_GRANT_RECORD_BYTES;
 use super::lifecycle::machine_claim_diagnostics;
 use super::state::{
     load_existing_grant_records, load_existing_machine_claims, valid_record_id, GrantRecordPhase,
-    ManagedX11GrantRecord, ManagedX11MachineClaim, X11RuntimeState,
+    MachineClaimCatalog, ManagedX11GrantKey, ManagedX11GrantRecord, ManagedX11MachineClaim,
+    X11RuntimeState,
 };
 use super::transport::{
     authenticated_connection, authorization_was_confirmed, host_boot_id, insert_and_observe,
@@ -142,14 +143,6 @@ pub(super) fn ensure_access_sync(
     }
     let server_peer_start_time = x11_peer_start_time(socket)?;
 
-    let host_uid = projection.identity().host_uid();
-    if before.has_numeric_local_user(host_uid) {
-        return Ok(X11DesktopAuthorization::new(
-            desktop_observation(socket, before, Some(&state)),
-            X11AuthorizationDisposition::PreExisting,
-        ));
-    }
-
     let existing_records = state.load_records();
     if !existing_records.complete {
         let detail = existing_records
@@ -161,13 +154,29 @@ pub(super) fn ensure_access_sync(
             "X11 authorization was not attempted because Lasper cannot safely inspect its existing grant records: {detail}"
         ));
     }
-    if request.purpose() == X11AuthorizationPurpose::ExplicitSession {
-        if let Some(record) = current_generation_record(
+    let boot_id = host_boot_id()?;
+    let host_uid = projection.identity().host_uid();
+    if before.has_numeric_local_user(host_uid) {
+        let disposition = match reuse_managed_grant_sync(
+            &state,
             &existing_records,
+            &existing_claims,
             request,
             server_peer_start_time,
-            &host_boot_id()?,
-        ) {
+            &boot_id,
+        )? {
+            Some(record_id) => X11AuthorizationDisposition::ReusedManaged { record_id },
+            None => X11AuthorizationDisposition::PreExisting,
+        };
+        return Ok(X11DesktopAuthorization::new(
+            desktop_observation(socket, before, Some(&state)),
+            disposition,
+        ));
+    }
+    if request.purpose() == X11AuthorizationPurpose::ExplicitSession {
+        if let Some(record) =
+            current_generation_record(&existing_records, request, server_peer_start_time, &boot_id)
+        {
             let phase = match &record.phase {
                 X11GrantRecordPhase::Pending => "pending",
                 X11GrantRecordPhase::ConfirmedAdded => "confirmed but now absent",
@@ -260,6 +269,45 @@ pub(super) fn ensure_access_sync(
             "X11 authorization outcome is unknown: {reason}; additionally, the pending operation record could not be updated: {record_error}"
         ),
     })
+}
+
+pub(super) fn reuse_managed_grant_sync(
+    state: &X11RuntimeState,
+    records: &X11GrantRecordCatalog,
+    claims: &MachineClaimCatalog,
+    request: &X11AuthorizationRequest,
+    server_peer_start_time: u64,
+    boot_id: &str,
+) -> Result<Option<String>, String> {
+    let key = ManagedX11GrantKey::from_projection(request.projection(), server_peer_start_time);
+    let Some(record) = records.records.iter().find(|record| {
+        record.caller_uid == uzers::get_effective_uid()
+            && record.boot_id == boot_id
+            && matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded)
+            && ManagedX11GrantKey::from_evidence(record) == key
+    }) else {
+        return Ok(None);
+    };
+    let already_claimed = claims.claims.iter().any(|claim| {
+        claim.grant_record_id == record.record_id
+            && claim.boot_id == boot_id
+            && claim.key == key
+            && claim.machine == request.target().machine().as_str()
+            && claim.guest_user == request.target().user().as_str()
+            && claim.compare_machine_instance(request.projection().identity().instance())
+                == Some(true)
+            && claim.phase.requires_reconcile()
+    });
+    if !already_claimed {
+        // Reuse adds a lifecycle consumer, not a second ACL mutation record.
+        let claim = ManagedX11MachineClaim::active_for_grant(request, record)?;
+        state.write_claim(&claim).map_err(|error| {
+            format!(
+                "X11 access was not reused because its machine claim could not be saved: {error}"
+            )
+        })?;
+    }
+    Ok(Some(record.record_id.clone()))
 }
 
 pub(super) fn current_generation_record<'a>(
@@ -396,7 +444,7 @@ pub(super) fn revoke_access_sync(
             )
         })?;
         if claim_is_unresolved {
-            state.end_claim(record_id).map_err(|error| {
+            state.end_claims(record_id).map_err(|error| {
                 format!(
                     "the exact ACL entry was already absent and the grant record was finalized, but its machine claim could not be ended: {error}"
                 )
@@ -407,6 +455,17 @@ pub(super) fn revoke_access_sync(
             X11RevocationDisposition::AlreadyAbsent {
                 record_id: record_id.to_owned(),
             },
+        ));
+    }
+
+    let shared_claims = claims
+        .claims
+        .iter()
+        .filter(|claim| claim.grant_record_id == record_id && claim.phase.requires_reconcile())
+        .count();
+    if shared_claims > 1 {
+        return Err(format!(
+            "X11 grant record {record_id} is shared by {shared_claims} unresolved machine claims; stop the machines and let lifecycle cleanup revoke the shared entry"
         ));
     }
 
@@ -433,7 +492,7 @@ pub(super) fn revoke_access_sync(
             )
         })?;
         if claim_is_unresolved {
-            state.end_claim(record_id).map_err(|error| {
+            state.end_claims(record_id).map_err(|error| {
                 format!(
                     "X11 access was revoked and the grant record was finalized, but its machine claim could not be ended: {error}"
                 )

@@ -544,6 +544,7 @@ fn report_x11_preparation(preparation: &X11SessionPreparation) {
             "lasper: warning: X11 access control is disabled on :{display}; no per-user ACL entry was added"
         ),
         X11AuthorizationDisposition::PreExisting => {}
+        X11AuthorizationDisposition::ReusedManaged { .. } => {}
     }
     if !projection.filesystem_access().client_writable() {
         eprintln!(

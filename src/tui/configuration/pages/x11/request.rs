@@ -106,6 +106,9 @@ impl X11PageEvent {
                         X11AuthorizationDisposition::Added { .. } => {
                             "X11 access authorized; the operation record was saved"
                         }
+                        X11AuthorizationDisposition::ReusedManaged { .. } => {
+                            "Lasper-managed X11 access reused; this machine's lifecycle claim was saved"
+                        }
                         X11AuthorizationDisposition::PreExisting => {
                             "X11 access was already present; no Lasper ownership was recorded"
                         }

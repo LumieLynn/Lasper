@@ -10,7 +10,7 @@ use x11rb::protocol::xproto::Family;
 
 use crate::application::sessions::{
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
-    ShellTarget, ValidatedGuestUserName,
+    ShellTarget, ValidatedGuestUserName, X11ProjectionContext,
 };
 use crate::application::x11::{
     X11AclEntry, X11AuthorizationRequest, X11GrantRecordCatalog, X11GrantRecordEvidence,
@@ -210,6 +210,26 @@ pub(super) struct ManagedX11GrantKey {
 }
 
 impl ManagedX11GrantKey {
+    pub(super) fn from_projection(
+        projection: &X11ProjectionContext,
+        server_peer_start_time: u64,
+    ) -> Self {
+        let socket = projection.host_socket();
+        let host_uid = projection.identity().host_uid();
+        Self {
+            host_uid,
+            display: socket.display(),
+            alternate_endpoint: socket.alternate(),
+            source: socket.source().to_path_buf(),
+            canonical_source: socket.canonical_path().to_path_buf(),
+            socket_revision: socket.revision(),
+            server_peer: socket.peer_identity().legacy_tuple(),
+            server_peer_start_time,
+            acl_family: Family::SERVER_INTERPRETED.into(),
+            acl_address: numeric_local_user_address(host_uid),
+        }
+    }
+
     pub(super) fn from_record(record: &ManagedX11GrantRecord) -> Self {
         Self {
             host_uid: record.host_uid,
@@ -299,6 +319,7 @@ impl MachineClaimPhase {
 /// answers “which currently-running system-scope machine instance may keep
 /// that exact ACL key alive”.  Keeping the two records separate lets future
 /// reconciliation end a claim without rewriting operation history.
+/// Multiple machine instances may reference the same grant record.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ManagedX11MachineClaim {
@@ -324,6 +345,33 @@ pub(super) struct ManagedX11MachineClaim {
 }
 
 impl ManagedX11MachineClaim {
+    pub(super) fn active_for_grant(
+        request: &X11AuthorizationRequest,
+        record: &X11GrantRecordEvidence,
+    ) -> Result<Self, String> {
+        let identity = request.projection().identity();
+        let instance = identity.instance();
+        let namespaces = instance.namespaces();
+        Ok(Self {
+            version: MACHINE_CLAIM_VERSION,
+            claim_id: uuid::Uuid::new_v4().simple().to_string(),
+            grant_record_id: record.record_id.clone(),
+            phase: MachineClaimPhase::Active,
+            created_unix_millis: unix_millis()?,
+            boot_id: record.boot_id.clone(),
+            machine: request.target().machine().as_str().to_owned(),
+            guest_user: request.target().user().as_str().to_owned(),
+            guest_uid: identity.guest().uid(),
+            guest_gid: identity.guest().gid(),
+            host_gid: identity.host_gid(),
+            machine_leader_pid: instance.leader_pid(),
+            machine_leader_start_time: instance.leader_start_time(),
+            machine_pid_namespace: namespaces.map(|(pid, _)| (pid.device(), pid.inode())),
+            machine_user_namespace: namespaces.map(|(_, user)| (user.device(), user.inode())),
+            key: ManagedX11GrantKey::from_evidence(record),
+        })
+    }
+
     pub(super) fn active_from_record(record: &ManagedX11GrantRecord) -> Self {
         Self {
             version: MACHINE_CLAIM_VERSION,
@@ -353,11 +401,10 @@ impl ManagedX11MachineClaim {
             ));
         }
         if !valid_record_id(&self.claim_id)
-            || self.claim_id != self.grant_record_id
             || file_name != format!("claim-{}.json", self.claim_id)
             || !valid_record_id(&self.grant_record_id)
         {
-            return Err("machine claim ID does not match its filename or grant record".into());
+            return Err("machine claim IDs are invalid or its filename does not match".into());
         }
         uuid::Uuid::parse_str(&self.boot_id)
             .map_err(|error| format!("invalid machine claim host boot identity: {error}"))?;
@@ -552,32 +599,21 @@ impl X11RuntimeState {
             .map_err(|error| format!("persist X11 machine claim: {error}"))
     }
 
-    /// End the claim associated with one grant record. Older runtime state
+    /// End all claims associated with one grant record. Older runtime state
     /// has no claim directory; that is an ordinary compatibility case and is
     /// intentionally treated as a no-op.
-    pub(super) fn end_claim(&self, grant_record_id: &str) -> Result<(), String> {
-        let Some(claims) = self.claims.as_ref() else {
-            return Ok(());
-        };
-        let file_name = format!("claim-{grant_record_id}.json");
-        let Some(file) = claims
-            .read_bounded(&file_name, MAX_MACHINE_CLAIM_BYTES)
-            .map_err(|error| format!("read X11 machine claim {grant_record_id}: {error}"))?
-        else {
-            return Ok(());
-        };
-        if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
-            return Err(format!(
-                "X11 machine claim {grant_record_id} is not owned by the invoking user"
-            ));
+    pub(super) fn end_claims(&self, grant_record_id: &str) -> Result<(), String> {
+        let claims = self.load_claims();
+        if !claims.complete {
+            return Err("cannot end X11 grant claims because their catalog is incomplete".into());
         }
-        let mut claim: ManagedX11MachineClaim = serde_json::from_slice(&file.bytes)
-            .map_err(|error| format!("invalid X11 machine claim {grant_record_id}: {error}"))?;
-        claim
-            .validate(&file_name)
-            .map_err(|error| format!("invalid X11 machine claim {grant_record_id}: {error}"))?;
-        claim.phase = MachineClaimPhase::Ended;
-        self.write_claim(&claim)
+        for mut claim in claims.claims {
+            if claim.grant_record_id == grant_record_id && claim.phase.requires_reconcile() {
+                claim.phase = MachineClaimPhase::Ended;
+                self.write_claim(&claim)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn load_records(&self) -> X11GrantRecordCatalog {
