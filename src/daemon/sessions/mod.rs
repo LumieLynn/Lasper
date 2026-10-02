@@ -10,7 +10,7 @@ use super::dispatch::handler::HandleOutcome;
 use super::server::DaemonServerState;
 use crate::ipc::protocol::session::{
     CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, ProbeX11ProjectionParams,
-    ProbeX11ProjectionResponse,
+    ProbeX11ProjectionResponse, WireMachineNamespaces,
 };
 use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use serde_json::Value;
@@ -116,8 +116,6 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     let identity = context.identity();
                     let guest = identity.guest();
                     let instance = identity.instance();
-                    let pid_namespace = instance.pid_namespace();
-                    let user_namespace = instance.user_namespace();
                     ProbeX11ProjectionResponse::Ready {
                         guest_mount: context.guest_mount().to_path_buf(),
                         guest_client_path: context.guest_client_path().to_path_buf(),
@@ -128,10 +126,15 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                         host_uid: identity.host_uid(),
                         host_gid: identity.host_gid(),
                         leader_pid: instance.leader_pid(),
-                        pid_namespace_device: pid_namespace.device(),
-                        pid_namespace_inode: pid_namespace.inode(),
-                        user_namespace_device: user_namespace.device(),
-                        user_namespace_inode: user_namespace.inode(),
+                        leader_start_time: instance
+                            .leader_start_time()
+                            .expect("X11 projection observes the leader start time"),
+                        namespaces: instance.namespaces().map(|(pid, user)| {
+                            WireMachineNamespaces {
+                                pid: (pid.device(), pid.inode()),
+                                user: (user.device(), user.inode()),
+                            }
+                        }),
                     }
                 }
                 Err(error) => ProbeX11ProjectionResponse::Failed {

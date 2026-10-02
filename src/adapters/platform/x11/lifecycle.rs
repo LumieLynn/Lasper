@@ -160,7 +160,12 @@ pub(super) fn observe_machine_claim(
                 leader_pid: _,
                 instance: Some(instance),
             },
-        ) if claim.matches_machine_instance(instance) => Some(MachineClaimObservation::Active),
+        ) if claim.compare_machine_instance(instance) != Some(false) => {
+            // Legacy namespace-only records may have no evidence in common
+            // with an unprivileged process-only observation. Retain them, but
+            // never use that uncertainty to authorize or clean up a grant.
+            Some(MachineClaimObservation::Active)
+        }
         (
             MachineClaimPhase::Active,
             SystemMachineRegistration::Present {
@@ -206,7 +211,7 @@ pub(super) fn observe_machine_claim(
             },
         ) => {
             let reason = if instance
-                .is_some_and(|instance| claim.matches_machine_instance(instance))
+                .is_some_and(|instance| claim.compare_machine_instance(instance) == Some(true))
             {
                 "machine registration reappeared before cleanup; explicit preparation is required"
             } else if leader_pid == claim.machine_leader_pid && instance.is_none() {

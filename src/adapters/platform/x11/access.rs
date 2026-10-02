@@ -279,7 +279,7 @@ pub(super) fn current_generation_record<'a>(
             && record.display == projection.host_socket().display()
             && record.caller_uid == caller_uid
             && record.boot_id == boot_id
-            && record.identity == projection.identity()
+            && record.identity.matches(projection.identity())
             && record.server_peer == projection.host_socket().peer_identity().legacy_tuple()
             && record.server_peer_start_time == server_peer_start_time
             && record.acl_entry == desired_entry
@@ -352,7 +352,7 @@ pub(super) fn revoke_access_sync(
         return Err("X11 grant record belongs to another invoking user".to_owned());
     }
     if evidence.target != *request.target()
-        || evidence.identity != projection.identity()
+        || !evidence.identity.matches(projection.identity())
         || evidence.display != socket.display()
         || evidence.alternate_endpoint != socket.alternate()
         || evidence.source != socket.source()

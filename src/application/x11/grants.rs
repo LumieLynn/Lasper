@@ -323,7 +323,7 @@ fn assess_grants(
                     {
                         differences.push("X server continuity is not confirmed");
                     }
-                    if record.identity != projection.identity() {
+                    if !record.identity.matches(projection.identity()) {
                         differences.push("machine instance or mapped identity changed");
                     }
                     if endpoint_changed {

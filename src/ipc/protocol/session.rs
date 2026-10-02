@@ -151,6 +151,13 @@ pub(crate) struct ProbeX11ProjectionParams {
     pub host_socket: HostX11Socket,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireMachineNamespaces {
+    pub pid: (u64, u64),
+    pub user: (u64, u64),
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ProbeX11ProjectionResponse {
@@ -164,10 +171,8 @@ pub(crate) enum ProbeX11ProjectionResponse {
         host_uid: u32,
         host_gid: u32,
         leader_pid: u32,
-        pid_namespace_device: u64,
-        pid_namespace_inode: u64,
-        user_namespace_device: u64,
-        user_namespace_inode: u64,
+        leader_start_time: NonZeroU64,
+        namespaces: Option<WireMachineNamespaces>,
     },
     Failed {
         message: String,
@@ -316,6 +321,43 @@ mod tests {
     fn wire_session_id_rejects_zero() {
         assert!(serde_json::from_str::<WireSessionId>("0").is_err());
         assert_eq!(serde_json::from_str::<WireSessionId>("1").unwrap().get(), 1);
+    }
+
+    #[test]
+    fn x11_projection_wire_preserves_process_only_and_namespace_evidence() {
+        let response = ProbeX11ProjectionResponse::Ready {
+            guest_mount: "/tmp/.X11-unix/X0".into(),
+            guest_client_path: "/tmp/.X11-unix/X0".into(),
+            mount_writable: true,
+            client_writable: true,
+            guest_uid: 1000,
+            guest_gid: 1000,
+            host_uid: 101000,
+            host_gid: 101000,
+            leader_pid: 42,
+            leader_start_time: NonZeroU64::new(77).unwrap(),
+            namespaces: None,
+        };
+        let value = serde_json::to_value(&response).unwrap();
+        for namespaces in [
+            serde_json::Value::Null,
+            serde_json::json!({"pid": [1, 2], "user": [1, 3]}),
+        ] {
+            let mut candidate = value.clone();
+            candidate["namespaces"] = namespaces;
+            let decoded: ProbeX11ProjectionResponse =
+                serde_json::from_value(candidate.clone()).unwrap();
+            assert_eq!(serde_json::to_value(decoded).unwrap(), candidate);
+        }
+        let mut zero_generation = value.clone();
+        zero_generation["leader_start_time"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<ProbeX11ProjectionResponse>(zero_generation).is_err());
+        let mut missing_generation = value;
+        missing_generation
+            .as_object_mut()
+            .unwrap()
+            .remove("leader_start_time");
+        assert!(serde_json::from_value::<ProbeX11ProjectionResponse>(missing_generation).is_err());
     }
 
     #[test]

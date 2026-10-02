@@ -53,8 +53,12 @@ pub(super) struct ManagedX11GrantRecord {
     pub(super) host_uid: u32,
     pub(super) host_gid: u32,
     pub(super) machine_leader_pid: u32,
-    pub(super) machine_pid_namespace: (u64, u64),
-    pub(super) machine_user_namespace: (u64, u64),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_leader_start_time: Option<std::num::NonZeroU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_pid_namespace: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_user_namespace: Option<(u64, u64)>,
     pub(super) display: u16,
     pub(super) alternate_endpoint: bool,
     pub(super) source: PathBuf,
@@ -75,8 +79,7 @@ impl ManagedX11GrantRecord {
         let projection = request.projection();
         let identity = projection.identity();
         let instance = identity.instance();
-        let pid_namespace = instance.pid_namespace();
-        let user_namespace = instance.user_namespace();
+        let namespaces = instance.namespaces();
         let host_uid = identity.host_uid();
         Ok(Self {
             version: GRANT_RECORD_VERSION,
@@ -92,8 +95,9 @@ impl ManagedX11GrantRecord {
             host_uid,
             host_gid: identity.host_gid(),
             machine_leader_pid: instance.leader_pid(),
-            machine_pid_namespace: (pid_namespace.device(), pid_namespace.inode()),
-            machine_user_namespace: (user_namespace.device(), user_namespace.inode()),
+            machine_leader_start_time: instance.leader_start_time(),
+            machine_pid_namespace: namespaces.map(|(pid, _)| (pid.device(), pid.inode())),
+            machine_user_namespace: namespaces.map(|(_, user)| (user.device(), user.inode())),
             display: projection.host_socket().display(),
             alternate_endpoint: projection.host_socket().alternate(),
             source: projection.host_socket().source().to_path_buf(),
@@ -121,13 +125,12 @@ impl ManagedX11GrantRecord {
             .map_err(|error| format!("invalid machine name: {error}"))?;
         let guest_user = ValidatedGuestUserName::new(self.guest_user)
             .map_err(|error| format!("invalid guest user: {error}"))?;
-        if self.machine_leader_pid == 0
-            || self.machine_leader_pid > i32::MAX as u32
-            || self.machine_pid_namespace.1 == 0
-            || self.machine_user_namespace.1 == 0
-        {
-            return Err("recorded machine instance is invalid".into());
-        }
+        let instance = machine_instance_from_record(
+            self.machine_leader_pid,
+            self.machine_leader_start_time,
+            self.machine_pid_namespace,
+            self.machine_user_namespace,
+        )?;
         if self.server_peer.0 == 0 || self.server_peer.0 > i32::MAX as u32 {
             return Err("recorded X server PID is invalid".into());
         }
@@ -162,14 +165,6 @@ impl ManagedX11GrantRecord {
                 X11GrantRecordPhase::OutcomeUnknown { reason }
             }
         };
-        let pid_namespace = ObservedNamespaceIdentity::new(
-            self.machine_pid_namespace.0,
-            self.machine_pid_namespace.1,
-        );
-        let user_namespace = ObservedNamespaceIdentity::new(
-            self.machine_user_namespace.0,
-            self.machine_user_namespace.1,
-        );
         Ok(X11GrantRecordEvidence {
             record_id: self.record_id,
             phase,
@@ -181,11 +176,7 @@ impl ManagedX11GrantRecord {
                 ObservedGuestIdentity::new(self.guest_uid, self.guest_gid),
                 self.host_uid,
                 self.host_gid,
-                ObservedMachineInstance::new(
-                    self.machine_leader_pid,
-                    pid_namespace,
-                    user_namespace,
-                ),
+                instance,
             ),
             display: self.display,
             alternate_endpoint: self.alternate_endpoint,
@@ -323,8 +314,12 @@ pub(super) struct ManagedX11MachineClaim {
     pub(super) guest_gid: u32,
     pub(super) host_gid: u32,
     pub(super) machine_leader_pid: u32,
-    pub(super) machine_pid_namespace: (u64, u64),
-    pub(super) machine_user_namespace: (u64, u64),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_leader_start_time: Option<std::num::NonZeroU64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_pid_namespace: Option<(u64, u64)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) machine_user_namespace: Option<(u64, u64)>,
     pub(super) key: ManagedX11GrantKey,
 }
 
@@ -343,6 +338,7 @@ impl ManagedX11MachineClaim {
             guest_gid: record.guest_gid,
             host_gid: record.host_gid,
             machine_leader_pid: record.machine_leader_pid,
+            machine_leader_start_time: record.machine_leader_start_time,
             machine_pid_namespace: record.machine_pid_namespace,
             machine_user_namespace: record.machine_user_namespace,
             key: ManagedX11GrantKey::from_record(record),
@@ -369,13 +365,7 @@ impl ManagedX11MachineClaim {
             .map_err(|error| format!("invalid machine claim machine name: {error}"))?;
         ValidatedGuestUserName::new(self.guest_user.clone())
             .map_err(|error| format!("invalid machine claim guest user: {error}"))?;
-        if self.machine_leader_pid == 0
-            || self.machine_leader_pid > i32::MAX as u32
-            || self.machine_pid_namespace.1 == 0
-            || self.machine_user_namespace.1 == 0
-        {
-            return Err("machine claim contains an invalid machine instance".into());
-        }
+        self.machine_instance()?;
         self.key.validate()?;
         if let MachineClaimPhase::NeedsReview { reason } | MachineClaimPhase::Unknown { reason } =
             &self.phase
@@ -395,18 +385,48 @@ impl ManagedX11MachineClaim {
         Ok(())
     }
 
-    pub(super) fn matches_machine_instance(&self, instance: ObservedMachineInstance) -> bool {
-        self.machine_leader_pid == instance.leader_pid()
-            && self.machine_pid_namespace
-                == (
-                    instance.pid_namespace().device(),
-                    instance.pid_namespace().inode(),
-                )
-            && self.machine_user_namespace
-                == (
-                    instance.user_namespace().device(),
-                    instance.user_namespace().inode(),
-                )
+    pub(super) fn machine_instance(&self) -> Result<ObservedMachineInstance, String> {
+        machine_instance_from_record(
+            self.machine_leader_pid,
+            self.machine_leader_start_time,
+            self.machine_pid_namespace,
+            self.machine_user_namespace,
+        )
+    }
+
+    pub(super) fn compare_machine_instance(
+        &self,
+        instance: ObservedMachineInstance,
+    ) -> Option<bool> {
+        self.machine_instance().ok()?.compare(instance)
+    }
+}
+
+fn machine_instance_from_record(
+    leader_pid: u32,
+    start_time: Option<std::num::NonZeroU64>,
+    pid_namespace: Option<(u64, u64)>,
+    user_namespace: Option<(u64, u64)>,
+) -> Result<ObservedMachineInstance, String> {
+    if leader_pid == 0 || leader_pid > i32::MAX as u32 {
+        return Err("recorded machine leader PID is invalid".into());
+    }
+    let namespaces = match (pid_namespace, user_namespace) {
+        (Some(pid), Some(user)) if pid.1 != 0 && user.1 != 0 => Some((
+            ObservedNamespaceIdentity::new(pid.0, pid.1),
+            ObservedNamespaceIdentity::new(user.0, user.1),
+        )),
+        (None, None) => None,
+        _ => return Err("recorded machine namespaces are incomplete or invalid".into()),
+    };
+    match (start_time, namespaces) {
+        (Some(start_time), namespaces) => Ok(ObservedMachineInstance::from_process(
+            leader_pid, start_time, namespaces,
+        )),
+        // Existing grants remain readable, but namespace-only evidence cannot
+        // prove equality against a process-only observation.
+        (None, Some((pid, user))) => Ok(ObservedMachineInstance::new(leader_pid, pid, user)),
+        (None, None) => Err("recorded machine instance has no generation evidence".into()),
     }
 }
 

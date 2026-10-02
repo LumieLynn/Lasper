@@ -283,16 +283,7 @@ pub(super) fn x11_peer_start_time(socket: &HostX11Socket) -> Result<u64, String>
                 .into(),
         );
     };
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
-        .map_err(|error| format!("read X server process identity for pid {pid}: {error}"))?;
-    let fields = stat
-        .rsplit_once(')')
-        .map(|(_, fields)| fields)
-        .ok_or_else(|| format!("X server process {pid} stat has no command terminator"))?;
-    fields
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| format!("X server process {pid} stat has no start time"))?
-        .parse()
-        .map_err(|error| format!("X server process {pid} start time is invalid: {error}"))
+    crate::adapters::process_identity::process_start_time(Path::new(&format!("/proc/{pid}")))
+        .map(std::num::NonZeroU64::get)
+        .map_err(|error| format!("read X server process identity for pid {pid}: {error}"))
 }

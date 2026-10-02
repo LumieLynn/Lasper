@@ -4,7 +4,7 @@
 use super::common::CLAIM_RECONCILE_GRACE_MILLIS;
 use super::lifecycle::*;
 use super::state::*;
-use super::tests::grant_request;
+use super::tests::{grant_request, grant_request_for_instance};
 use crate::adapters::trusted_state::TrustedDirectory;
 use crate::application::sessions::{ObservedMachineInstance, ObservedNamespaceIdentity};
 use std::os::unix::fs::PermissionsExt;
@@ -17,6 +17,10 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_request(grant_request())
+    }
+
+    fn with_request(request: crate::application::x11::X11AuthorizationRequest) -> Self {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let access =
@@ -26,12 +30,9 @@ impl Fixture {
             claims: Some(access.open_or_create_child("claims", 0o700).unwrap()),
             access,
         };
-        let mut record = ManagedX11GrantRecord::pending(
-            &grant_request(),
-            "0123456789abcdef0123456789abcdef".into(),
-            77,
-        )
-        .unwrap();
+        let mut record =
+            ManagedX11GrantRecord::pending(&request, "0123456789abcdef0123456789abcdef".into(), 77)
+                .unwrap();
         record.phase = GrantRecordPhase::ConfirmedAdded;
         state
             .write(&format!("grant-{}.json", record.record_id), &record)
@@ -82,6 +83,77 @@ impl Fixture {
     }
 }
 
+#[test]
+fn process_only_claims_survive_reconcile_then_stop_without_namespace_access() {
+    let instance =
+        ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(77).unwrap(), None);
+    let fixture = Fixture::with_request(grant_request_for_instance(instance));
+    assert_eq!(
+        fixture.step(
+            SystemMachineRegistration::Present {
+                leader_pid: 42,
+                instance: Some(instance)
+            },
+            1,
+        ),
+        ReconcileClaimStatus::Active,
+    );
+    assert_eq!(
+        fixture.step(SystemMachineRegistration::Absent, 100),
+        ReconcileClaimStatus::Pending
+    );
+    assert_eq!(
+        fixture.step(
+            SystemMachineRegistration::Absent,
+            100 + CLAIM_RECONCILE_GRACE_MILLIS
+        ),
+        ReconcileClaimStatus::Ready,
+    );
+}
+
+#[test]
+fn same_pid_with_a_new_start_time_requires_review_even_without_namespaces() {
+    let instance =
+        ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(77).unwrap(), None);
+    let fixture = Fixture::with_request(grant_request_for_instance(instance));
+    let replacement =
+        ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(78).unwrap(), None);
+    assert!(matches!(
+        fixture.step(
+            SystemMachineRegistration::Present {
+                leader_pid: 42,
+                instance: Some(replacement)
+            },
+            1
+        ),
+        ReconcileClaimStatus::Blocked(_),
+    ));
+    assert!(matches!(
+        fixture.claim().phase,
+        MachineClaimPhase::NeedsReview { .. }
+    ));
+}
+
+#[test]
+fn legacy_namespace_only_claim_is_retained_when_current_evidence_is_process_only() {
+    let fixture = Fixture::new();
+    let current = ObservedMachineInstance::from_process(
+        fixture.record.machine_leader_pid,
+        std::num::NonZeroU64::new(77).unwrap(),
+        None,
+    );
+    assert_eq!(
+        fixture.step(
+            SystemMachineRegistration::Present {
+                leader_pid: current.leader_pid(),
+                instance: Some(current)
+            },
+            1
+        ),
+        ReconcileClaimStatus::Active,
+    );
+    assert!(fixture.watcher_needed());
+}
 #[test]
 fn unprivileged_observation_then_stop_reaches_cleanup_across_worker_restarts() {
     let fixture = Fixture::new();

@@ -45,14 +45,15 @@ impl NamespaceSnapshot {
         Ok(Self {
             leader,
             process: process.to_path_buf(),
-            start_time: process_start_time(process)?,
+            start_time: crate::adapters::process_identity::process_start_time(process)?.get(),
             namespaces,
             root: file_identity(&process.join("root"))?,
         })
     }
 
     fn verify(&self) -> io::Result<()> {
-        let current_start_time = process_start_time(&self.process)?;
+        let current_start_time =
+            crate::adapters::process_identity::process_start_time(&self.process)?.get();
         if current_start_time != self.start_time {
             return Err(snapshot_changed(self.leader, "process start time"));
         }
@@ -303,35 +304,6 @@ fn file_identity(path: &Path) -> io::Result<FileIdentity> {
         device: metadata.dev(),
         inode: metadata.ino(),
     })
-}
-
-fn process_start_time(process: &Path) -> io::Result<u64> {
-    let stat = std::fs::read_to_string(process.join("stat"))?;
-    let fields = stat
-        .rsplit_once(')')
-        .map(|(_, fields)| fields)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "container leader stat has no command terminator",
-            )
-        })?;
-    fields
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "container leader stat has no start time",
-            )
-        })?
-        .parse()
-        .map_err(|error| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("container leader start time is invalid: {error}"),
-            )
-        })
 }
 
 fn snapshot_changed(leader: u32, part: &str) -> io::Error {

@@ -180,15 +180,18 @@ impl ElevatedDaemon {
                 host_uid,
                 host_gid,
                 leader_pid,
-                pid_namespace_device,
-                pid_namespace_inode,
-                user_namespace_device,
-                user_namespace_inode,
+                leader_start_time,
+                namespaces,
             } => {
-                let instance = ObservedMachineInstance::new(
+                let instance = ObservedMachineInstance::from_process(
                     leader_pid,
-                    ObservedNamespaceIdentity::new(pid_namespace_device, pid_namespace_inode),
-                    ObservedNamespaceIdentity::new(user_namespace_device, user_namespace_inode),
+                    leader_start_time,
+                    namespaces.map(|namespaces| {
+                        (
+                            ObservedNamespaceIdentity::new(namespaces.pid.0, namespaces.pid.1),
+                            ObservedNamespaceIdentity::new(namespaces.user.0, namespaces.user.1),
+                        )
+                    }),
                 );
                 Ok(X11ProjectionContext::verified(
                     host_socket,

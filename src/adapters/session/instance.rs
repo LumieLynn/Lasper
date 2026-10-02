@@ -11,7 +11,6 @@ use crate::application::sessions::{
 use crate::domain::machine::MachineName;
 use std::fs::File;
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::MachineSessionTransport;
@@ -61,7 +60,11 @@ impl MachineInstanceSnapshot {
         guest: ObservedGuestIdentity,
         probe_user_namespace: ObservedNamespaceIdentity,
     ) -> Result<MappedGuestIdentity, SessionError> {
-        if probe_user_namespace != self.revision.user_namespace() {
+        if self
+            .revision
+            .namespaces()
+            .is_some_and(|(_, user)| probe_user_namespace != user)
+        {
             return Err(SessionError::new(
                 "guest identity probe ran in a different user namespace than the machine leader",
             ));
@@ -89,38 +92,23 @@ impl MachineInstanceSnapshot {
 
 fn read_instance(leader: u32) -> std::io::Result<MachineInstanceSnapshot> {
     let proc = PathBuf::from(format!("/proc/{leader}"));
-    let before = namespace_pair(&proc)?;
+    let before = crate::adapters::runtime::state::observe_machine_instance(leader)?;
     let uid_map = read_id_map(&proc.join("uid_map"))?;
     let gid_map = read_id_map(&proc.join("gid_map"))?;
-    let after = namespace_pair(&proc)?;
-    if before != after {
+    let current_uid_map = read_id_map(&proc.join("uid_map"))?;
+    let current_gid_map = read_id_map(&proc.join("gid_map"))?;
+    let after = crate::adapters::runtime::state::observe_machine_instance(leader)?;
+    if before != after || uid_map != current_uid_map || gid_map != current_gid_map {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "machine namespaces changed during inspection",
+            "machine process identity or mapping changed during inspection",
         ));
     }
     Ok(MachineInstanceSnapshot {
-        revision: ObservedMachineInstance::new(leader, before.0, before.1),
+        revision: before,
         uid_map,
         gid_map,
     })
-}
-
-fn namespace_pair(
-    proc: &Path,
-) -> std::io::Result<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)> {
-    Ok((
-        namespace_identity(&proc.join("ns/pid"))?,
-        namespace_identity(&proc.join("ns/user"))?,
-    ))
-}
-
-fn namespace_identity(path: &Path) -> std::io::Result<ObservedNamespaceIdentity> {
-    let metadata = std::fs::metadata(path)?;
-    Ok(ObservedNamespaceIdentity::new(
-        metadata.dev(),
-        metadata.ino(),
-    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,7 +120,10 @@ struct IdMapExtent {
 
 fn read_id_map(path: &Path) -> std::io::Result<Vec<IdMapExtent>> {
     let mut bytes = Vec::new();
-    File::open(path)?
+    File::open(path)
+        .map_err(|error| {
+            std::io::Error::new(error.kind(), format!("open {}: {error}", path.display()))
+        })?
         .take(MAX_ID_MAP_BYTES + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_ID_MAP_BYTES {
@@ -209,6 +200,53 @@ fn invalid_data(message: &'static str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_only_observation_maps_guest_ids_using_host_extents() {
+        let snapshot = MachineInstanceSnapshot {
+            revision: ObservedMachineInstance::from_process(
+                42,
+                std::num::NonZeroU64::new(77).unwrap(),
+                None,
+            ),
+            uid_map: parse_id_map("0 1437401088 65536\n").unwrap(),
+            gid_map: parse_id_map("0 200000 65536\n").unwrap(),
+        };
+        let identity = snapshot
+            .mapped_identity(
+                ObservedGuestIdentity::new(1000, 1001),
+                ObservedNamespaceIdentity::new(1, 2),
+            )
+            .unwrap();
+        assert_eq!(identity.host_uid(), 1_437_402_088);
+        assert_eq!(identity.host_gid(), 201_001);
+        assert!(snapshot
+            .mapped_identity(
+                ObservedGuestIdentity::new(70000, 1000),
+                ObservedNamespaceIdentity::new(1, 2),
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn readable_host_namespace_evidence_still_rejects_a_different_probe_namespace() {
+        let namespace = ObservedNamespaceIdentity::new(1, 2);
+        let snapshot = MachineInstanceSnapshot {
+            revision: ObservedMachineInstance::from_process(
+                42,
+                std::num::NonZeroU64::new(77).unwrap(),
+                Some((namespace, namespace)),
+            ),
+            uid_map: parse_id_map("0 100000 65536\n").unwrap(),
+            gid_map: parse_id_map("0 100000 65536\n").unwrap(),
+        };
+        assert!(snapshot
+            .mapped_identity(
+                ObservedGuestIdentity::new(1000, 1000),
+                ObservedNamespaceIdentity::new(1, 3),
+            )
+            .is_err());
+    }
 
     #[test]
     fn maps_multi_extent_guest_ids_without_assuming_one_shift() {

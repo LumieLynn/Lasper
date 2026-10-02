@@ -143,11 +143,17 @@ fn an_observed_entry_is_not_claimed_when_change_hosts_failed() {
 
 pub(super) fn grant_request() -> X11AuthorizationRequest {
     let namespace = ObservedNamespaceIdentity::new(1, 2);
+    grant_request_for_instance(ObservedMachineInstance::new(42, namespace, namespace))
+}
+
+pub(super) fn grant_request_for_instance(
+    instance: ObservedMachineInstance,
+) -> X11AuthorizationRequest {
     let identity = MappedGuestIdentity::verified(
         ObservedGuestIdentity::new(1000, 1000),
         1_437_402_088,
         1_437_402_088,
-        ObservedMachineInstance::new(42, namespace, namespace),
+        instance,
     );
     let socket = HostX11Socket::from_verified_parts(
         0,
@@ -185,6 +191,46 @@ pub(super) fn grant_request() -> X11AuthorizationRequest {
 }
 
 #[test]
+fn process_only_grant_and_claim_records_preserve_generation_evidence() {
+    let start = std::num::NonZeroU64::new(77).unwrap();
+    let instance = ObservedMachineInstance::from_process(42, start, None);
+    let request = grant_request_for_instance(instance);
+    let record_id = "0123456789abcdef0123456789abcdef";
+    let record = ManagedX11GrantRecord::pending(&request, record_id.into(), 99).unwrap();
+    let value = serde_json::to_value(&record).unwrap();
+    assert_eq!(value["machine_leader_start_time"], 77);
+    assert!(value.get("machine_pid_namespace").is_none());
+    assert!(value.get("machine_user_namespace").is_none());
+    let decoded: ManagedX11GrantRecord = serde_json::from_value(value.clone()).unwrap();
+    let claim = ManagedX11MachineClaim::active_from_record(&decoded);
+    let claim_value = serde_json::to_value(&claim).unwrap();
+    let claim: ManagedX11MachineClaim = serde_json::from_value(claim_value).unwrap();
+    claim.validate(&format!("claim-{record_id}.json")).unwrap();
+    assert_eq!(claim.compare_machine_instance(instance), Some(true));
+    assert_eq!(
+        decoded
+            .into_evidence(&format!("grant-{record_id}.json"))
+            .unwrap()
+            .identity
+            .instance(),
+        instance,
+    );
+
+    let mut missing_generation = value.clone();
+    missing_generation
+        .as_object_mut()
+        .unwrap()
+        .remove("machine_leader_start_time");
+    let missing: ManagedX11GrantRecord = serde_json::from_value(missing_generation).unwrap();
+    assert!(missing
+        .into_evidence(&format!("grant-{record_id}.json"))
+        .is_err());
+    let mut zero_generation = value;
+    zero_generation["machine_leader_start_time"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<ManagedX11GrantRecord>(zero_generation).is_err());
+}
+
+#[test]
 fn grant_records_are_versioned_and_reject_unknown_fields() {
     let request = grant_request();
     let record_id = "0123456789abcdef0123456789abcdef";
@@ -197,17 +243,7 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
 
     let claim = ManagedX11MachineClaim::active_from_record(&decoded);
     claim.validate(&format!("claim-{record_id}.json")).unwrap();
-    let claim_instance = ObservedMachineInstance::new(
-        claim.machine_leader_pid,
-        ObservedNamespaceIdentity::new(
-            claim.machine_pid_namespace.0,
-            claim.machine_pid_namespace.1,
-        ),
-        ObservedNamespaceIdentity::new(
-            claim.machine_user_namespace.0,
-            claim.machine_user_namespace.1,
-        ),
-    );
+    let claim_instance = claim.machine_instance().unwrap();
     assert_eq!(
         observe_machine_claim(
             &claim,
@@ -293,12 +329,12 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
     let replacement_instance = ObservedMachineInstance::new(
         claim.machine_leader_pid.saturating_add(1),
         ObservedNamespaceIdentity::new(
-            claim.machine_pid_namespace.0,
-            claim.machine_pid_namespace.1.saturating_add(1),
+            claim.machine_pid_namespace.unwrap().0,
+            claim.machine_pid_namespace.unwrap().1.saturating_add(1),
         ),
         ObservedNamespaceIdentity::new(
-            claim.machine_user_namespace.0,
-            claim.machine_user_namespace.1.saturating_add(1),
+            claim.machine_user_namespace.unwrap().0,
+            claim.machine_user_namespace.unwrap().1.saturating_add(1),
         ),
     );
     assert!(matches!(

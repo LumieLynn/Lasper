@@ -732,8 +732,8 @@ impl ObservedNamespaceIdentity {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedMachineInstance {
     leader_pid: u32,
-    pid_namespace: ObservedNamespaceIdentity,
-    user_namespace: ObservedNamespaceIdentity,
+    leader_start_time: Option<std::num::NonZeroU64>,
+    namespaces: Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)>,
 }
 
 impl ObservedMachineInstance {
@@ -744,8 +744,20 @@ impl ObservedMachineInstance {
     ) -> Self {
         Self {
             leader_pid,
-            pid_namespace,
-            user_namespace,
+            leader_start_time: None,
+            namespaces: Some((pid_namespace, user_namespace)),
+        }
+    }
+
+    pub(crate) const fn from_process(
+        leader_pid: u32,
+        leader_start_time: std::num::NonZeroU64,
+        namespaces: Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)>,
+    ) -> Self {
+        Self {
+            leader_pid,
+            leader_start_time: Some(leader_start_time),
+            namespaces,
         }
     }
 
@@ -753,12 +765,35 @@ impl ObservedMachineInstance {
         self.leader_pid
     }
 
-    pub const fn pid_namespace(self) -> ObservedNamespaceIdentity {
-        self.pid_namespace
+    pub const fn leader_start_time(self) -> Option<std::num::NonZeroU64> {
+        self.leader_start_time
     }
 
-    pub const fn user_namespace(self) -> ObservedNamespaceIdentity {
-        self.user_namespace
+    pub const fn namespaces(
+        self,
+    ) -> Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)> {
+        self.namespaces
+    }
+
+    /// None means that the observations have no comparable generation evidence.
+    /// It must not be treated as proof of a matching or replaced instance.
+    pub fn compare(self, other: Self) -> Option<bool> {
+        if self.leader_pid != other.leader_pid {
+            return Some(false);
+        }
+        if let (Some(left), Some(right)) = (self.leader_start_time, other.leader_start_time) {
+            if left != right {
+                return Some(false);
+            }
+            return Some(match (self.namespaces, other.namespaces) {
+                (Some(left), Some(right)) => left == right,
+                _ => true,
+            });
+        }
+        match (self.namespaces, other.namespaces) {
+            (Some(left), Some(right)) => Some(left == right),
+            _ => None,
+        }
     }
 }
 
@@ -801,6 +836,13 @@ impl MappedGuestIdentity {
 
     pub const fn instance(self) -> ObservedMachineInstance {
         self.instance
+    }
+
+    pub fn matches(self, other: Self) -> bool {
+        self.guest == other.guest
+            && self.host_uid == other.host_uid
+            && self.host_gid == other.host_gid
+            && self.instance.compare(other.instance) == Some(true)
     }
 }
 
@@ -1109,6 +1151,29 @@ pub(crate) fn journal_session_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_generation_matches_across_authority_without_reusing_a_pid() {
+        let namespace = ObservedNamespaceIdentity::new(1, 2);
+        let start = std::num::NonZeroU64::new(77).unwrap();
+        let privileged =
+            ObservedMachineInstance::from_process(42, start, Some((namespace, namespace)));
+        let unprivileged = ObservedMachineInstance::from_process(42, start, None);
+        assert_eq!(privileged.compare(unprivileged), Some(true));
+        let replacement =
+            ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(78).unwrap(), None);
+        assert_eq!(unprivileged.compare(replacement), Some(false));
+        assert_eq!(privileged.compare(replacement), Some(false));
+        let legacy = ObservedMachineInstance::new(42, namespace, namespace);
+        assert_eq!(legacy.compare(privileged), Some(true));
+        assert_eq!(legacy.compare(unprivileged), None);
+        let changed_namespaces = ObservedMachineInstance::from_process(
+            42,
+            start,
+            Some((namespace, ObservedNamespaceIdentity::new(1, 3))),
+        );
+        assert_eq!(privileged.compare(changed_namespaces), Some(false));
+    }
 
     #[test]
     fn guest_command_keeps_argv_boundaries_and_requires_absolute_program() {

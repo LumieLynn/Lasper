@@ -35,20 +35,18 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
 }
 
 /// Read the kernel identity of the machine currently registered under a name.
-/// The registration file supplies the leader PID; procfs supplies namespace
-/// identities so a rapid same-name restart cannot be mistaken for the old
-/// machine instance.
+/// The registration supplies the leader PID; procfs supplies its start time
+/// and, when permitted, namespace identities. A PID alone is not a revision.
 pub(crate) fn machine_instance_at(
     path: &Path,
     expected_name: &str,
 ) -> std::io::Result<ObservedMachineInstance> {
     let fields = read_runtime_state(path, expected_name)?;
     let leader = parse_leader_pid(&fields)?;
-    let proc = PathBuf::from(format!("/proc/{leader}"));
-    let before = namespace_pair(&proc)?;
+    let before = observe_machine_instance(leader)?;
 
     // Read the registration again after procfs inspection. A replacement can
-    // reuse a PID, so the namespace identity and the registration leader must
+    // reuse a PID, so the process identity and the registration leader must
     // both remain stable across the observation.
     let current_fields = read_runtime_state(path, expected_name)?;
     if parse_leader_pid(&current_fields)? != leader {
@@ -57,15 +55,43 @@ pub(crate) fn machine_instance_at(
             "machine leader changed during registration inspection",
         ));
     }
-    let after = namespace_pair(&proc)?;
+    let after = observe_machine_instance(leader)?;
     if before != after {
         return Err(std::io::Error::new(
             ErrorKind::NotFound,
-            "machine namespaces changed during registration inspection",
+            "machine process identity changed during registration inspection",
         ));
     }
 
-    Ok(ObservedMachineInstance::new(leader, before.0, before.1))
+    Ok(before)
+}
+
+/// Namespace symlinks require ptrace access; process start time does not.
+/// Always pin the observation to host procfs evidence, never to guest output.
+pub(crate) fn observe_machine_instance(leader: u32) -> std::io::Result<ObservedMachineInstance> {
+    observe_machine_instance_at(leader, &PathBuf::from(format!("/proc/{leader}")))
+}
+
+fn observe_machine_instance_at(
+    leader: u32,
+    proc: &Path,
+) -> std::io::Result<ObservedMachineInstance> {
+    let before = crate::adapters::process_identity::process_start_time(proc)?;
+    let namespaces = match namespace_pair(proc) {
+        Ok(namespaces) => Some(namespaces),
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => None,
+        Err(error) => return Err(error),
+    };
+    let after = crate::adapters::process_identity::process_start_time(proc)?;
+    if before != after {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            "machine leader changed during process inspection",
+        ));
+    }
+    Ok(ObservedMachineInstance::from_process(
+        leader, before, namespaces,
+    ))
 }
 
 fn parse_leader_pid(fields: &HashMap<String, String>) -> std::io::Result<u32> {
@@ -493,13 +519,43 @@ mod tests {
         .unwrap();
         let instance = machine_instance_at(&path, "test-machine").unwrap();
         assert_eq!(instance.leader_pid(), std::process::id());
+        assert!(instance.leader_start_time().is_some());
         assert_eq!(
-            instance.pid_namespace(),
-            namespace_identity(Path::new("/proc/self/ns/pid")).unwrap(),
+            instance.namespaces(),
+            Some(namespace_pair(Path::new("/proc/self")).unwrap())
         );
+    }
+
+    #[test]
+    fn process_generation_remains_observable_without_ptrace_access_to_namespaces() {
+        let proc = Path::new("/proc/1");
+        let expected_namespaces = match namespace_pair(proc) {
+            Ok(namespaces) => Some(namespaces),
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("unexpected namespace observation failure: {error}"),
+        };
+        let instance = observe_machine_instance(1).unwrap();
+        assert_eq!(instance.namespaces(), expected_namespaces);
         assert_eq!(
-            instance.user_namespace(),
-            namespace_identity(Path::new("/proc/self/ns/user")).unwrap(),
+            instance.leader_start_time(),
+            Some(crate::adapters::process_identity::process_start_time(proc).unwrap()),
+        );
+    }
+
+    #[test]
+    fn missing_namespaces_are_not_treated_as_a_permission_limited_observation() {
+        let proc = tempfile::tempdir().unwrap();
+        let fields = std::iter::repeat_n("0", 18).collect::<Vec<_>>().join(" ");
+        std::fs::write(
+            proc.path().join("stat"),
+            format!("42 (machine) S {fields} 77 0\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            observe_machine_instance_at(42, proc.path())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound,
         );
     }
 
