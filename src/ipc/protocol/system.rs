@@ -4,9 +4,17 @@
 //! names, argument construction, and host policy remain in the system
 //! operation adapter.
 
+use crate::application::machine_lifecycle::MachineControlTransport;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::ImageName;
 use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SystemOperationRequest {
+    pub(crate) operation: SystemOperation,
+    pub(crate) transport: MachineControlTransport,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
@@ -46,6 +54,29 @@ pub(crate) enum SystemOperation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_operation_requests_preserve_the_selected_transport() {
+        for transport in [
+            MachineControlTransport::Dbus,
+            MachineControlTransport::SystemdTools,
+        ] {
+            let request = SystemOperationRequest {
+                operation: SystemOperation::ReloadDaemon,
+                transport,
+            };
+            let value = serde_json::to_value(&request).unwrap();
+            assert_eq!(
+                value["operation"],
+                serde_json::json!({"operation": "reload_daemon"})
+            );
+            let parsed: SystemOperationRequest = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(parsed, request);
+            let mut unknown = value;
+            unknown["program"] = serde_json::json!("sh");
+            assert!(serde_json::from_value::<SystemOperationRequest>(unknown).is_err());
+        }
+    }
 
     #[test]
     fn wire_operations_have_a_closed_and_stable_shape() {

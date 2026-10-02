@@ -71,9 +71,6 @@ pub(crate) fn compose_process_launch_services(
         OperationRegistry::new(),
         route,
         crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
-            system_operations: crate::adapters::system_operation::SystemOperationStore::direct(
-                Arc::clone(&local_cmd),
-            ),
             local_cmd,
             nspawn: crate::adapters::config::NspawnConfigStore::direct(),
             systemd_unit: crate::adapters::config::SystemdUnitStore::direct(),
@@ -298,7 +295,6 @@ pub(crate) fn compose_application_services(
         machine_route,
         crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
             local_cmd: local_cmd.clone(),
-            system_operations: system_operations.clone(),
             nspawn: nspawn.clone(),
             systemd_unit: systemd_unit.clone(),
             nvidia_state: nvidia_state.clone(),

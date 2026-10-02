@@ -173,21 +173,27 @@ fn nvidia_rootfs_config(state: &NvidiaState) -> (Vec<String>, Vec<(String, Strin
     (folders, environment, write_environment)
 }
 
-pub async fn ensure_gpu_passthrough(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NvidiaPreparationOutcome {
+    NotConfigured,
+    Synchronized,
+}
+
+pub(crate) async fn ensure_gpu_passthrough(
     name: &str,
     nspawn: &crate::adapters::config::NspawnConfigStore,
     systemd_unit: &crate::adapters::config::SystemdUnitStore,
     state_store: &crate::adapters::platform::nvidia::NvidiaStateStore,
     rootfs: &crate::adapters::rootfs::RootfsStore,
     cdi_source: &crate::domain::nvidia::NvidiaCdiSource,
-) -> Result<()> {
+) -> Result<NvidiaPreparationOutcome> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
     let config = match nspawn.read(name).await? {
         Some(c) => c,
-        None => return Ok(()),
+        None => return Ok(NvidiaPreparationOutcome::NotConfigured),
     };
     if !config.is_gpu_enabled()? {
-        return Ok(());
+        return Ok(NvidiaPreparationOutcome::NotConfigured);
     }
 
     log_step!(
@@ -246,7 +252,7 @@ pub async fn ensure_gpu_passthrough(
                 name
             );
             inject_persistent_device_allow(name, &host_state, systemd_unit).await?;
-            return Ok(());
+            return Ok(NvidiaPreparationOutcome::Synchronized);
         }
         log::info!(
             "GPU state matches but managed .nspawn markers are missing or stale for {}; rebuilding configuration.",
@@ -308,14 +314,8 @@ pub async fn ensure_gpu_passthrough(
     state_store.write(name, &host_state).await?;
     inject_persistent_device_allow(name, &host_state, systemd_unit).await?;
 
-    // 7. Reload daemon
-    log_step!(
-        name,
-        "Lifecycle",
-        "Reloading systemd daemon to commit changes."
-    );
-    log_step!(name, "Lifecycle", "GPU surgery successful.");
-    Ok(())
+    log_step!(name, "Lifecycle", "NVIDIA configuration synchronized.");
+    Ok(NvidiaPreparationOutcome::Synchronized)
 }
 
 #[cfg(test)]

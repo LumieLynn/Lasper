@@ -500,10 +500,15 @@ impl ElevatedDaemon {
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub(super) async fn system_operation(&self, operation: SystemOperation) -> std::io::Result<()> {
-        let params = serde_json::to_value(crate::ipc::protocol::system::SystemOperation::from(
-            operation,
-        ))
+    pub(super) async fn system_operation(
+        &self,
+        operation: SystemOperation,
+        transport: crate::application::machine_lifecycle::MachineControlTransport,
+    ) -> std::io::Result<()> {
+        let params = serde_json::to_value(crate::ipc::protocol::system::SystemOperationRequest {
+            operation: operation.into(),
+            transport,
+        })
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.rpc_call("system_operation", params).await?;
         Ok(())

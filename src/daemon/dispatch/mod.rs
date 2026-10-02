@@ -247,10 +247,10 @@ pub(super) fn daemon_resource_claims(
             }
         }
         RpcMethod::SystemOperation => {
-            let wire_operation: crate::ipc::protocol::system::SystemOperation =
+            let wire_request: crate::ipc::protocol::system::SystemOperationRequest =
                 serde_json::from_value(request.params.clone())
                     .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
-            let operation = SystemOperation::from(wire_operation);
+            let operation = SystemOperation::from(wire_request.operation);
             system_operation_claims(operation)
         }
         _ => Vec::new(),

@@ -3,6 +3,9 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
+use crate::adapters::runtime::dbus::DbusBackend;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::application::machine_lifecycle::MachineControlTransport;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName};
 use std::path::PathBuf;
@@ -207,13 +210,32 @@ pub struct SystemOperationStore {
 impl SystemOperationStore {
     pub(crate) fn direct(local_runner: Arc<dyn CommandRunner>) -> Self {
         Self {
-            executor: Arc::new(DirectSystemOperationExecutor { local_runner }),
+            executor: Arc::new(DirectSystemOperationExecutor {
+                local_runner,
+                dbus: None,
+            }),
+        }
+    }
+
+    pub(crate) fn dbus(dbus: DbusBackend, local_runner: Arc<dyn CommandRunner>) -> Self {
+        Self {
+            executor: Arc::new(DirectSystemOperationExecutor {
+                local_runner,
+                dbus: Some(dbus),
+            }),
         }
     }
 
     pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self::elevated_with_transport(daemon, MachineControlTransport::SystemdTools)
+    }
+
+    pub(crate) fn elevated_with_transport(
+        daemon: Arc<ElevatedDaemon>,
+        transport: MachineControlTransport,
+    ) -> Self {
         Self {
-            executor: Arc::new(ElevatedSystemOperationExecutor { daemon }),
+            executor: Arc::new(ElevatedSystemOperationExecutor { daemon, transport }),
         }
     }
 
@@ -289,21 +311,32 @@ trait SystemOperationExecutor: Send + Sync + 'static {
 
 struct DirectSystemOperationExecutor {
     local_runner: Arc<dyn CommandRunner>,
+    dbus: Option<DbusBackend>,
 }
 
 #[async_trait::async_trait]
 impl SystemOperationExecutor for DirectSystemOperationExecutor {
     fn route(&self) -> &'static str {
-        "direct"
+        if self.dbus.is_some() {
+            "direct_dbus"
+        } else {
+            "systemd_tools"
+        }
     }
 
     async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
+        if let Some(dbus) = &self.dbus {
+            if RuntimeSource::is_available(dbus).await {
+                return execute_dbus_system_operation(dbus, operation).await;
+            }
+        }
         execute_system_operation_with_runner(operation, self.local_runner.as_ref()).await
     }
 }
 
 struct ElevatedSystemOperationExecutor {
     daemon: Arc<ElevatedDaemon>,
+    transport: MachineControlTransport,
 }
 
 #[async_trait::async_trait]
@@ -314,7 +347,7 @@ impl SystemOperationExecutor for ElevatedSystemOperationExecutor {
 
     async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
         self.daemon
-            .system_operation(operation)
+            .system_operation(operation, self.transport)
             .await
             .map_err(|source| SystemOperationError::Io {
                 path: PathBuf::from("system operation"),

@@ -3,6 +3,7 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::NspawnError;
 use crate::adapters::lifecycle::error::map_system_operation_machine_error;
+use crate::adapters::platform::nvidia::NvidiaPreparationOutcome;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
@@ -27,7 +28,6 @@ use std::sync::Arc;
 
 pub(crate) struct MachineLifecycleAdapters {
     pub(crate) local_cmd: Arc<dyn CommandRunner>,
-    pub(crate) system_operations: SystemOperationStore,
     pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
     pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
     pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
@@ -53,7 +53,6 @@ pub(crate) fn compose_machine_lifecycle(
 ) -> Arc<MachineLifecycleService> {
     let MachineLifecycleAdapters {
         local_cmd,
-        system_operations,
         nspawn,
         systemd_unit,
         nvidia_state,
@@ -61,19 +60,30 @@ pub(crate) fn compose_machine_lifecycle(
         rootfs,
         skip_nvidia_permission_denied,
     } = adapters;
-    let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
-        route: match route {
-            MachineLifecycleRoute::DirectDbus(dbus) => MachineControlRoute::DirectDbus {
-                dbus,
+    let (control_route, system_operations) = match route {
+        MachineLifecycleRoute::DirectDbus(dbus) => (
+            MachineControlRoute::DirectDbus {
+                dbus: dbus.clone(),
                 fallback_runner: local_cmd.clone(),
             },
-            MachineLifecycleRoute::LocalSystemdTools => MachineControlRoute::LocalSystemdTools {
+            SystemOperationStore::dbus(dbus, local_cmd.clone()),
+        ),
+        MachineLifecycleRoute::LocalSystemdTools => (
+            MachineControlRoute::LocalSystemdTools {
                 runner: local_cmd.clone(),
             },
-            MachineLifecycleRoute::Elevated { daemon, transport } => {
-                MachineControlRoute::Daemon { daemon, transport }
-            }
-        },
+            SystemOperationStore::direct(local_cmd.clone()),
+        ),
+        MachineLifecycleRoute::Elevated { daemon, transport } => (
+            MachineControlRoute::Daemon {
+                daemon: daemon.clone(),
+                transport,
+            },
+            SystemOperationStore::elevated_with_transport(daemon, transport),
+        ),
+    };
+    let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
+        route: control_route,
     });
     let preparation: Arc<dyn MachineStartPreparation> = Arc::new(StoreStartPreparation {
         nspawn,
@@ -417,25 +427,36 @@ impl MachineStartPreparation for StoreStartPreparation {
         )
         .await;
         self.runtime.invalidate();
-        match result {
-            Ok(()) => {}
-            Err(NspawnError::PermissionDenied) if self.skip_nvidia_permission_denied => {
-                log::warn!(
-                    "skipping NVIDIA pre-start synchronization for {}: NVIDIA state could not be read without elevated privileges",
-                    machine,
-                );
-                return Ok(());
-            }
-            Err(error) => return Err(map_machine_preparation_error(error)),
-        }
-        if let Err(error) = self.system_operations.reload_daemon().await {
+        reload_after_nvidia_preparation(
+            result,
+            machine,
+            &self.system_operations,
+            self.skip_nvidia_permission_denied,
+        )
+        .await
+    }
+}
+
+async fn reload_after_nvidia_preparation(
+    result: crate::adapters::error::Result<NvidiaPreparationOutcome>,
+    machine: &MachineName,
+    system_operations: &SystemOperationStore,
+    skip_permission_denied: bool,
+) -> Result<(), MachinePreparationError> {
+    match result {
+        Ok(NvidiaPreparationOutcome::NotConfigured) => Ok(()),
+        Ok(NvidiaPreparationOutcome::Synchronized) => system_operations
+            .reload_daemon()
+            .await
+            .map_err(map_machine_preparation_error),
+        Err(NspawnError::PermissionDenied) if skip_permission_denied => {
             log::warn!(
-                "systemd daemon reload after pre-start reconciliation failed for {}: {}",
+                "skipping NVIDIA pre-start synchronization for {}: NVIDIA state could not be read without elevated privileges",
                 machine,
-                error
             );
+            Ok(())
         }
-        Ok(())
+        Err(error) => Err(map_machine_preparation_error(error)),
     }
 }
 
@@ -567,6 +588,78 @@ mod tests {
             stdout: vec![],
             stderr: vec![],
         }
+    }
+
+    #[tokio::test]
+    async fn startup_without_nvidia_does_not_reload_the_manager() {
+        let runner = MockCommandRunner::new();
+        let store = SystemOperationStore::direct(Arc::new(runner));
+        reload_after_nvidia_preparation(
+            Ok(NvidiaPreparationOutcome::NotConfigured),
+            &MachineName::new("test").unwrap(),
+            &store,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn nvidia_synchronization_requires_a_successful_reload_on_every_attempt() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(2)
+            .withf(|program, args, _| {
+                program == "systemctl"
+                    && args.iter().map(String::as_str).eq(["--", "daemon-reload"])
+            })
+            .returning(|_, _, _| {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: vec![],
+                    stderr: b"Reload failed".to_vec(),
+                })
+            });
+        let store = SystemOperationStore::direct(Arc::new(runner));
+        for _ in 0..2 {
+            let error = reload_after_nvidia_preparation(
+                Ok(NvidiaPreparationOutcome::Synchronized),
+                &MachineName::new("test").unwrap(),
+                &store,
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Reload failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_normal_nvidia_read_preflight_can_skip_permission_denial() {
+        let store = SystemOperationStore::direct(Arc::new(MockCommandRunner::new()));
+        let machine = MachineName::new("test").unwrap();
+        reload_after_nvidia_preparation(Err(NspawnError::PermissionDenied), &machine, &store, true)
+            .await
+            .unwrap();
+        let error = reload_after_nvidia_preparation(
+            Err(NspawnError::PermissionDenied),
+            &machine,
+            &store,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_permission_denied());
+        let error = reload_after_nvidia_preparation(
+            Err(NspawnError::InvalidConfig("invalid NVIDIA markers".into())),
+            &machine,
+            &store,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_invalid_configuration());
     }
 
     #[tokio::test]

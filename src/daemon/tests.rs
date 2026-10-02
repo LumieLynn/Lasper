@@ -81,6 +81,9 @@ impl DaemonSystemExecutor for SlowRemoveDbus {
         operation: SystemOperation,
     ) -> crate::adapters::system_operation::SystemOperationResult<()> {
         match operation {
+            SystemOperation::ReloadDaemon => Err(SystemOperationError::OutcomeUnknown(
+                "test reload response was lost".into(),
+            )),
             SystemOperation::RemoveImage { .. } => {
                 self.started.notify_one();
                 self.release.notified().await;
@@ -291,7 +294,11 @@ fn generic_system_mutations_claim_every_affected_resource() {
         jsonrpc: "2.0".into(),
         id: 1,
         method: "system_operation".into(),
-        params: serde_json::to_value(operation).unwrap(),
+        params: serde_json::to_value(crate::ipc::protocol::system::SystemOperationRequest {
+            operation,
+            transport: crate::application::machine_lifecycle::MachineControlTransport::SystemdTools,
+        })
+        .unwrap(),
     };
 
     for operation in [
@@ -436,6 +443,48 @@ async fn systemd_tools_skips_daemon_dbus_initialization() {
 #[tokio::test]
 async fn daemon_keeps_dbus_capability_when_the_bus_is_late() {
     assert!(initialize_dbus_backend(true).await.is_some());
+}
+
+#[tokio::test]
+async fn dbus_reload_failure_is_returned_without_running_systemd_tools() {
+    let dbus = Some(SlowRemoveDbus {
+        started: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let (out_tx, _) = tokio::sync::mpsc::channel(4);
+    let directory = tempfile::tempdir().unwrap();
+    let request = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "system_operation".into(),
+        params: serde_json::to_value(crate::ipc::protocol::system::SystemOperationRequest {
+            operation: crate::ipc::protocol::system::SystemOperation::ReloadDaemon,
+            transport: MachineControlTransport::Dbus,
+        })
+        .unwrap(),
+    };
+    assert_eq!(
+        daemon_resource_claims(&request).unwrap(),
+        vec![crate::application::ResourceClaim::exclusive(
+            crate::application::ResourceKey::SystemdManager
+        ),]
+    );
+    match handle_request(
+        request,
+        &dbus,
+        &out_tx,
+        uzers::get_current_uid(),
+        Arc::new(DaemonServerState::default()),
+        crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().to_path_buf()),
+        systemd_tools_sessions(),
+    )
+    .await
+    {
+        HandleOutcome::Sync(Err(error)) => {
+            assert!(error.contains("test reload response was lost"), "{error}")
+        }
+        _ => panic!("failed reload must return its original error"),
+    }
 }
 
 #[tokio::test]
