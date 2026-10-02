@@ -66,8 +66,14 @@ Native systemd-compatible symlinks may work for advanced users, but custom stora
 
 Not as privileged root hooks. General-purpose privileged hooks conflict with the daemon security model. Future setup customization should be represented as typed provisioning operations with validated arguments and clear audit output.
 
-## Why does Wayland work but X11 does not?
+## How do Wayland and X11 display access work?
 
-Wayland and X11 have different authorization models. Lasper can bind display sockets into the container, but UID mapping, `PrivateUsers`, and host compositor policy still matter.
+Wayland and X11 are explicit host integrations, not runtime socket forwarding. Their source sockets must be declared in the machine's startup `.nspawn` configuration, and the machine must be restarted after a bind is added or changed.
 
-Disabling `PrivateUsers` may make X11 access easier, but it weakens isolation. Prefer nested Wayland or carefully reviewed display passthrough when possible.
+### Wayland
+
+Lasper automatically probes the current `WAYLAND_DISPLAY` only when the exact host socket is declared as a bind. `--wayland=DISPLAY` selects one display strictly; `--no-wayland` disables the probe. Interactive `lasper shell` can fall back to a terminal-only session when an automatic probe fails, but an explicit selection and `lasper launch` remain strict. Lasper injects the selected guest socket path into the session and does not write a persistent `.wayland-env` file.
+
+### X11
+
+X11 is opt-in through `--with-x11[=:N]` or the TUI configuration flow. The selected local display must have a supported pathname socket bind. When the X server has access control enabled, Lasper can add a recorded numeric `localuser` ACL entry for the projected guest identity; when access control is disabled, no ACL mutation is needed. Lasper only revokes entries it created and can identify exactly, and it does not manage pre-existing entries. X11 access is broad and compositor-dependent, so use it only with trusted guests and prefer Wayland when possible.

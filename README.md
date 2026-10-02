@@ -15,12 +15,12 @@ Lasper provides a guided interface over native systemd resources. It organizes m
 - **Image provisioning**:
   - Pull OCI registry images through `importctl pull-oci` on systemd 260 or newer as an experimental application-container provider. systemd stores these as `.mstack` images under `/var/lib/machines`.
   - Bootstrap native Debian, Ubuntu, or Arch systems with `debootstrap` or `pacstrap`.
-- **Host Integration**: Allocate NVIDIA GPU devices from generated or existing CDI data and grant per-user Wayland access.
+- **Host Integration**: Allocate NVIDIA GPU devices from generated or existing CDI data, configure per-user Wayland binds, and explicitly manage X11 socket access when the host X server permits it.
 - **Storage backends**: Directory, Btrfs subvolume, and raw sparse image support.
 
 ## Status
 
-Lasper is in an early functional stage. The current workflow focuses on container creation and lifecycle operations, while configuration management is still evolving.
+Lasper is in an early functional stage. The current workflow focuses on container creation, lifecycle operations, and selected display integrations; broader nspawn configuration management is still evolving.
 
 ## Prerequisites
 
@@ -80,6 +80,8 @@ The configuration is typed and can control:
 
 Command-line flags take precedence over the corresponding settings. Configuration does not add arbitrary executable paths or arbitrary root commands.
 
+The TUI's per-machine configuration editor separately manages Wayland and X11 display binds. Those binds belong to the machine's `.nspawn` configuration rather than to the global TOML file.
+
 ## Usage
 
 Start the UI in the recommended elevated-daemon mode:
@@ -103,10 +105,14 @@ Lasper also provides process-level selected-user shell commands that follow `mac
 lasper shell user@machine
 lasper shell --quiet user@machine
 lasper shell user@machine -- /usr/bin/kitty --single-instance
+lasper shell --with-x11 user@machine
 lasper launch user@machine -- /usr/bin/kitty --single-instance
+lasper launch --with-x11=:0 user@machine -- /usr/bin/kitty --single-instance
 ```
 
 The executable is an absolute guest path and the remaining values are passed as its argv. Automatic Wayland selection uses the current `WAYLAND_DISPLAY` only when its host socket is declared as a bind source in the machine's effective `.nspawn` configuration. Otherwise the shell opens without a Wayland probe or fallback notice. If validation of an automatically selected socket fails, an interactive `lasper shell` retries once without Wayland and prints `🪐 Continuing without Wayland...` when that fallback succeeds. Detailed diagnostics are shown only if the fallback also fails. An exact `--wayland=DISPLAY` selection remains strict, and `lasper launch` never silently falls back after a validation failure. Use `--no-wayland` to request a terminal-only session directly.
+
+X11 access is always explicit. `--with-x11` selects the current local `DISPLAY`; `--with-x11=:N` selects a particular local display. The corresponding X11 socket must already be declared in the machine's startup configuration, and the machine must be started or restarted after that bind changes. Lasper validates the projected endpoint and, when X11 access control is enabled, can add a narrowly recorded ACL entry for the mapped guest identity. It does not silently fall back from an X11 failure, and it does not add an ACL entry when the server has disabled access control. X11 grants the guest broad access to the selected X server, so use it only for trusted guests.
 
 `lasper shell` owns an interactive PTY and may use the configured elevated daemon. It forwards `TERM`, `COLORTERM`, and `NO_COLOR`, and prints a single detach hint for every transport; press `Ctrl+]` three times within one second to leave a session whose guest processes keep the PTY open. Pass `--quiet` after `shell` to suppress this hint and the successful Wayland fallback notice; errors and guest output remain visible. `lasper launch` is intended for `Terminal=false` desktop entries. It always uses the invoking user's authority so machine1 can authenticate through the desktop polkit agent, while `--systemd-tools` remains available as the systemd transport. Lasper forwards the guest PTY to its inherited stdout and waits for the command's reported lifecycle to finish. After completion, both commands allow up to two seconds for remaining output to drain so an inherited PTY descriptor cannot hold the launcher open indefinitely.
 

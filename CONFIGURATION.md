@@ -70,6 +70,12 @@ Both modes load the complete CDI document and then select the requested NVIDIA d
 
 At each Lasper-managed machine start, NVIDIA reconciliation compares the fresh CDI-derived state with the persisted state payload and separately requires exact set equality between `state.binds` and the `Bind=`/`BindReadOnly=` entries inside the `X-Lasper-Nvidia-Begin` and `X-Lasper-Nvidia-End` block. Duplicate binds, malformed values, bind options, unknown directives, missing markers, and partial blocks force regeneration. Content outside that owned block is administrator configuration and is deliberately excluded from this equality check.
 
+## Display Integration
+
+Wayland and X11 bind declarations are stored in the machine's effective `.nspawn` configuration and are applied at machine startup. The configuration editor can manage multiple display sockets and keeps the source and guest destination explicit; changing a bind requires restarting the machine. A display bind is not a persistent environment-file export.
+
+Wayland sessions can probe the current `WAYLAND_DISPLAY` when its exact host source is configured. X11 sessions require an explicit `--with-x11` selection or the corresponding TUI action. X11 ACL authorization is a separate runtime operation: Lasper records and later revokes only ACL entries that it created for the selected display and machine instance. It is not stored as a durable trust-list setting in `lasper.toml`.
+
 ## Bootstrap Selection
 
 `default-method` controls the source selected when the creation wizard opens. If it is absent, the wizard starts with copy/clone selected.
