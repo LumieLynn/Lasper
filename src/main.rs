@@ -1,0 +1,391 @@
+use anyhow::Result;
+
+mod adapters;
+mod application;
+mod cli;
+mod composition;
+mod config;
+mod daemon;
+mod domain;
+mod ipc;
+mod logging;
+mod paths;
+mod tui;
+
+// Shell sessions spend most of their lifetime forwarding terminal I/O. A
+// current-thread runtime keeps the idle path to one scheduler thread; PTY
+// adapters still obtain blocking workers on demand when a direct attachment
+// needs them.
+const SHELL_MAX_BLOCKING_THREADS: usize = 4;
+const DAEMON_MAX_BLOCKING_THREADS: usize = 8;
+const TUI_WORKER_THREADS: usize = 2;
+const TUI_MAX_BLOCKING_THREADS: usize = 8;
+
+fn build_current_thread_runtime(max_blocking_threads: usize) -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(max_blocking_threads)
+        .build()?)
+}
+
+fn build_tui_runtime() -> Result<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(TUI_WORKER_THREADS)
+        .max_blocking_threads(TUI_MAX_BLOCKING_THREADS)
+        .enable_all()
+        .build()?)
+}
+
+fn main() -> Result<()> {
+    // 1. Parse CLI flags — all early exits happen here, before terminal
+    //    takeover, so raw-mode / alternate-screen restoration is never needed.
+    //    The runtime is created only after dispatch so the daemon can use a
+    //    smaller current-thread executor than the interactive TUI.
+    let dispatch = match crate::cli::dispatch() {
+        Ok(dispatch) => dispatch,
+        Err(code) => std::process::exit(code),
+    };
+
+    match dispatch {
+        crate::cli::CliDispatch::Shell(command) => {
+            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
+            let code = runtime.block_on(run_shell_command(command));
+            std::process::exit(code);
+        }
+        // 1b. Internal daemon mode — run as root child process with its
+        //     dedicated current-thread runtime.
+        crate::cli::CliDispatch::Application(options) if options.is_daemon => {
+            let runtime = build_current_thread_runtime(DAEMON_MAX_BLOCKING_THREADS)?;
+            runtime.block_on(crate::daemon::daemon_main(
+                options.fd_sock,
+                options.rpc_sock,
+                options.daemon_uid,
+                options.daemon_pid,
+            ));
+        }
+        crate::cli::CliDispatch::Application(options) if options.internal_x11_reconcile => {
+            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
+            runtime.block_on(run_x11_reconcile(options.want_systemd_tools))?;
+        }
+        crate::cli::CliDispatch::Application(options) => {
+            let runtime = build_tui_runtime()?;
+            runtime.block_on(run_application(options))?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
+    let loaded_config = crate::config::load_config();
+    let systemd_tools = systemd_tools || loaded_config.config.settings.systemd_tools;
+    let mode =
+        crate::composition::CompositionMode::new(crate::composition::PermissionLevel::User, None)?;
+    let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
+    let reconcile_result =
+        match services.x11_access.reconcile_after_machine_event().await {
+            Ok(reports) => {
+                let mut incomplete = Vec::new();
+                for report in reports {
+                    if !report.is_complete() {
+                        if !report.pending_record_ids().is_empty() {
+                            incomplete.push(format!(
+                                "display :{} still has {} pending grant(s)",
+                                report.display(),
+                                report.pending_record_ids().len()
+                            ));
+                        }
+                        incomplete.extend(report.diagnostics().iter().map(|diagnostic| {
+                            format!("display :{}: {diagnostic}", report.display())
+                        }));
+                    }
+                }
+                if !incomplete.is_empty() {
+                    Err(anyhow::anyhow!(
+                        "X11 lifecycle reconcile incomplete: {}",
+                        incomplete.join("; ")
+                    ))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(crate::application::x11::X11AccessError::Selection(error)) => Err(anyhow::anyhow!(
+                "X11 lifecycle reconcile could not discover a live endpoint: {error}"
+            )),
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        };
+    let activation_result = services.x11_access.synchronize_reconcile_activation().await;
+    match (reconcile_result, activation_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(reconcile), Ok(())) => Err(reconcile),
+        (Ok(()), Err(activation)) => Err(anyhow::anyhow!(activation.to_string())),
+        (Err(reconcile), Err(activation)) => Err(anyhow::anyhow!(
+            "{reconcile}; X11 lifecycle activation sync failed: {activation}"
+        )),
+    }
+}
+
+async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
+    let launch_target = (command.io_mode() == crate::cli::ShellIoMode::Launcher)
+        .then(|| format!("{}@{}", command.target().user(), command.target().machine()));
+    let loaded_config = crate::config::load_config();
+    if let Some(diagnostic) = loaded_config.diagnostic {
+        eprintln!("lasper: {}", diagnostic.summary);
+    }
+    let systemd_tools =
+        command.wants_systemd_tools() || loaded_config.config.settings.systemd_tools;
+    let use_sudo = command.permits_elevation()
+        && crate::composition::DefaultPermissionManager::wants_elevation(
+            command.wants_elevation(),
+            &loaded_config.config.settings,
+        );
+    let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
+        crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
+    );
+    let daemon = if pm.level() == crate::composition::PermissionLevel::Elevated {
+        match crate::adapters::elevated::ElevatedDaemon::spawn(!systemd_tools).await {
+            Ok(daemon) => Some(std::sync::Arc::new(daemon)),
+            Err(error) => {
+                eprintln!("lasper: failed to start elevated daemon: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+    let mode = match crate::composition::CompositionMode::new(pm.level(), daemon.clone()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("lasper: failed to compose shell services: {error}");
+            std::process::exit(1);
+        }
+    };
+    let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
+    if command.requests_x11() {
+        if let Err(error) = services.x11_access.reconcile().await {
+            log::debug!("X11 lifecycle reconcile unavailable before shell: {error}");
+        }
+    }
+    let result = if launch_target.is_some() {
+        let launch = crate::composition::compose_process_launch_services(
+            systemd_tools,
+            loaded_config.config.nvidia.source(),
+            pm.level(),
+        );
+        crate::cli::run_launch(
+            command,
+            &services.session,
+            services.x11_access.as_ref(),
+            &launch.machine_lifecycle,
+            &launch.runtime,
+        )
+        .await
+    } else {
+        crate::cli::run_shell(command, &services.session, services.x11_access.as_ref()).await
+    };
+    if let Some(daemon) = daemon {
+        daemon.exit().await;
+    }
+    let (code, failure) = match result {
+        Ok(0) => (0, None),
+        Ok(code) => {
+            let failure = launch_target.as_ref().map(|_| {
+                let failure = format!("The guest command exited with status {code}.");
+                eprintln!("lasper: {failure}");
+                failure
+            });
+            (code, failure)
+        }
+        Err(error) => {
+            crate::cli::report_command_error(&error);
+            (1, Some(error.to_string()))
+        }
+    };
+    if let (Some(target), Some(failure)) = (launch_target, failure) {
+        if let Err(error) =
+            crate::adapters::platform::notifications::notify_launch_failure(&target, &failure).await
+        {
+            eprintln!("lasper: desktop notification unavailable: {error}");
+        }
+    }
+    code
+}
+
+async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
+    let want_elevation = options.want_elevation;
+    let mut want_systemd_tools = options.want_systemd_tools;
+
+    // 2. Parse configuration once for settings, theme, and bootstrap profiles.
+    let loaded_config = crate::config::load_config();
+    let config_diagnostic = loaded_config.diagnostic;
+    let app_config = std::sync::Arc::new(loaded_config.config);
+    let app_settings = &app_config.settings;
+    if !want_systemd_tools {
+        want_systemd_tools = app_settings.systemd_tools;
+    }
+
+    // 3. Permission manager — no full-process elevation.
+    //    `-e` / `elevate = true` routes privileged work through a sudo daemon.
+    let use_sudo =
+        crate::composition::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
+    let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
+        crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
+    );
+
+    // 3b. Spawn elevated daemon before terminal takeover so the sudo
+    //     password prompt (if any) appears on the clean terminal.
+    let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> =
+        if pm.level() == crate::composition::PermissionLevel::Elevated {
+            match crate::adapters::elevated::ElevatedDaemon::spawn(!want_systemd_tools).await {
+                Ok(d) => Some(std::sync::Arc::new(d)),
+                Err(e) => {
+                    eprintln!("Failed to start elevated daemon: {}", e);
+                    eprintln!(
+                        "For sudo errors, run `sudo -v`; otherwise inspect the reported \
+                         path or permission details."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
+
+    // 3c. Validate the authority/daemon pairing before composing host adapters.
+    let composition_mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
+
+    // 4. Setup logging — always owned by the current user.
+    let (log_dir, _log_guard) = crate::logging::init()?;
+
+    log::info!("Lasper starting (log dir: {})", log_dir.display());
+    log::info!("Elevation mode: {}", use_sudo);
+
+    // 5. Compose and run the application. Terminal ownership stays inside
+    // the TUI launcher so a future CLI entry point can bypass it entirely.
+    let log_buffer_lines = app_settings.log_buffer_lines;
+    let services = crate::composition::compose_application_services(
+        composition_mode,
+        want_systemd_tools,
+        app_config.nvidia.source(),
+    );
+    match services.x11_access.reconcile().await {
+        Ok(reports) => {
+            for report in reports {
+                if !report.revoked_record_ids().is_empty()
+                    || !report.pending_record_ids().is_empty()
+                    || !report.diagnostics().is_empty()
+                {
+                    log::debug!(
+                        "X11 lifecycle reconcile for :{}: revoked={}, pending={}, diagnostics={}",
+                        report.display(),
+                        report.revoked_record_ids().len(),
+                        report.pending_record_ids().len(),
+                        report.diagnostics().len(),
+                    );
+                    for diagnostic in report.diagnostics() {
+                        log::debug!(
+                            "X11 lifecycle reconcile :{}: {diagnostic}",
+                            report.display()
+                        );
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            // Reconcile is deliberately best-effort at startup.  A missing
+            // local X server or an unavailable machine observation must not
+            // prevent the TUI from managing machines; the next activation or
+            // explicit X11 operation can retry the bounded pass.
+            log::debug!("X11 lifecycle reconcile unavailable at startup: {error}");
+        }
+    }
+    if let Err(error) = services.x11_access.synchronize_reconcile_activation().await {
+        log::debug!("X11 lifecycle activation unavailable at startup: {error}");
+    }
+    let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
+        None
+    } else {
+        match services.provisioning.unfinished_deployments().await {
+            Ok(reports) if reports.is_empty() => None,
+            Ok(reports) => {
+                log::warn!(
+                    "Found {} unfinished deployment crash manifest(s); automatic replay and rollback are disabled",
+                    reports.len()
+                );
+                for report in &reports {
+                    log::warn!(
+                        "Unfinished deployment {} targets {} at revision {} ({:?})",
+                        report.manifest.deployment_id,
+                        report.manifest.target,
+                        report.manifest.revision,
+                        report.manifest.state,
+                    );
+                    if let Some(error) = &report.probe_error {
+                        log::warn!(
+                            "Deployment {} host evidence could not be collected: {error}",
+                            report.manifest.deployment_id
+                        );
+                    }
+                    for observation in &report.observations {
+                        log::info!(
+                            "Deployment {} recovery evidence: {} = {:?} (recorded={:?}, applying={})",
+                            report.manifest.deployment_id,
+                            observation.subject.resource.label(),
+                            observation.evidence,
+                            observation.subject.recorded_disposition,
+                            observation.subject.applying_when_interrupted,
+                        );
+                    }
+                }
+                Some((
+                    format!(
+                        "{} previous deployment(s) may be incomplete; inspect before cleanup.",
+                        reports.len()
+                    ),
+                    crate::tui::foundation::status::StatusLevel::Warn,
+                ))
+            }
+            Err(error) => {
+                log::error!("Could not inspect deployment recovery state: {error}");
+                Some((
+                    format!("Could not inspect deployment recovery state: {error}"),
+                    crate::tui::foundation::status::StatusLevel::Error,
+                ))
+            }
+        }
+    };
+    let mut app = tui::app::App::new(
+        pm,
+        want_systemd_tools,
+        log_buffer_lines,
+        services,
+        app_config,
+    );
+    if let Some(diagnostic) = config_diagnostic {
+        log::warn!("{}", diagnostic.detail);
+        app.set_status_for(
+            diagnostic.summary,
+            crate::tui::foundation::status::StatusLevel::Warn,
+            std::time::Duration::from_secs(12),
+        );
+    }
+    if let Some((message, level)) = deployment_recovery {
+        app.set_status_for(message, level, std::time::Duration::from_secs(20));
+    }
+    let result = crate::tui::run(&mut app).await;
+
+    if let Err(ref e) = result {
+        log::error!("Application error: {:#}", e);
+        eprintln!("Error: {:#}", e);
+    }
+
+    log::info!("[lasper] calling daemon.exit()...");
+    if let Some(daemon) = daemon {
+        daemon.exit().await;
+    }
+    log::info!("[lasper] daemon.exit() completed");
+
+    log::info!("[lasper] main() returning");
+    let code = if result.is_ok() { 0 } else { 1 };
+    std::process::exit(code);
+}

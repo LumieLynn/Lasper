@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --locked
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit dependencies
+        run: cargo audit
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --version 0.9.2 --features cli
+
+      - name: Check dependency licenses
+        run: |
+          cargo about generate --locked --fail about.hbs --output-file /tmp/lasper-dependency-notices.md
+          cmp THIRD_PARTY_NOTICES.md /tmp/lasper-dependency-notices.md
+
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+            zig: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-22.04-arm
+            zig: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            zig: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Setup zig
+        if: ${{ matrix.zig }}
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        if: ${{ matrix.zig }}
+        run: cargo install cargo-zigbuild
+
+      - name: Build (glibc)
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked
+
+      - name: Install target
+        if: ${{ matrix.zig }}
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build (musl)
+        if: ${{ matrix.zig }}
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          if [ "${{ matrix.zig }}" = "true" ]; then
+            cp "target/${{ matrix.target }}/release/lasper" "lasper-${{ matrix.target }}"
+          else
+            cp target/release/lasper "lasper-${{ matrix.target }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lasper-${{ matrix.target }}
+          path: lasper-${{ matrix.target }}
+          if-no-files-found: error

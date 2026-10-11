@@ -1,0 +1,26 @@
+use crate::adapters::error::Result;
+use crate::domain::inspection::MachineProperties;
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
+
+/// Read-only runtime discovery, inspection, and observation.
+///
+/// Application services depend on this port without gaining mutation methods.
+#[cfg_attr(test, mockall::automock)]
+#[async_trait::async_trait]
+pub trait RuntimeSource: Send + Sync + 'static {
+    async fn is_available(&self) -> bool;
+    async fn list_machines(&self) -> Result<Vec<MachineEntry>>;
+    async fn list_images(&self) -> Result<Vec<ImageEntry>>;
+    async fn snapshot(&self) -> Result<RuntimeSnapshot> {
+        let (machines, images) = tokio::try_join!(self.list_machines(), self.list_images())?;
+        Ok(RuntimeSnapshot::new(machines, images))
+    }
+    async fn get_properties(
+        &self,
+        name: &str,
+        include_nspawn_unit: bool,
+    ) -> Result<MachineProperties>;
+    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
+    async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties>;
+}

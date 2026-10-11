@@ -1,0 +1,67 @@
+# Preferred license choices for dependencies of the shipped Linux builds.
+accepted = [
+    "MIT",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "Apache-2.0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "GPL-3.0-or-later",
+]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
+ignore-dev-dependencies = true
+ignore-build-dependencies = false
+
+# These Rio crates omit their workspace license from the published package.
+# Pin the upstream text and preserve the additional source-level notices.
+[rio-vt.clarify]
+license = "MIT AND Apache-2.0"
+
+[[rio-vt.clarify.git]]
+path = "LICENSE"
+license = "MIT"
+checksum = "3e963e8031b64dfbb1c3559c87f8fab3d7a8a8331308f7cdeb8ad4478c43e654"
+
+[[rio-vt.clarify.files]]
+path = "src/crosswords/grid/mod.rs"
+license = "Apache-2.0"
+checksum = "f4a94b315377f1f8ab6c4ee0c815002e46166ee4f09fc96f7e8e381386b4a569"
+end = "\n\n"
+
+[rio-graphics.clarify]
+license = "MIT"
+
+[[rio-graphics.clarify.git]]
+path = "LICENSE"
+checksum = "3e963e8031b64dfbb1c3559c87f8fab3d7a8a8331308f7cdeb8ad4478c43e654"
+
+[rio-unicode.clarify]
+license = "MIT OR Apache-2.0"
+
+[[rio-unicode.clarify.git]]
+path = "LICENSE"
+license = "MIT"
+checksum = "3e963e8031b64dfbb1c3559c87f8fab3d7a8a8331308f7cdeb8ad4478c43e654"
+
+[[rio-unicode.clarify.files]]
+path = "src/tables.rs"
+license = "MIT"
+checksum = "a2b5f4b6522a31e52191e0414ea7926c414ff6500777f5ea5fd2f062c8ceac9a"
+end = "\n\n"
+
+[ryu.clarify]
+license = "Apache-2.0 OR BSL-1.0"
+
+[[ryu.clarify.files]]
+path = "LICENSE-APACHE"
+license = "Apache-2.0"
+checksum = "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"

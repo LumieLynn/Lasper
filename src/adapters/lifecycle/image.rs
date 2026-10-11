@@ -1,0 +1,323 @@
+//! Runtime composition for the image lifecycle vertical slice.
+
+use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::lifecycle::error::map_system_operation_image_error;
+use crate::adapters::process::CommandRunner;
+use crate::adapters::runtime::dbus::DbusBackend;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::system_operation::{SystemOperationError, SystemOperationStore};
+use crate::application::image_lifecycle::{
+    ArtifactCleanupReport, ArtifactOwnership, ImageControl, ImageControlOutcome,
+    ImageLifecycleService, ImageRemoveRequest, ImageRemoveTransport, ImageRuntime,
+    ManagedArtifactCleanup, UnitDisableReport,
+};
+use crate::application::machine_lifecycle::{
+    MachineControlOutcome, MachineControlTransport, NspawnUnitAction, NspawnUnitControlRequest,
+};
+use crate::application::runtime::RuntimeResult;
+use crate::application::{OperationRegistry, RuntimeCatalog};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
+use std::sync::Arc;
+
+pub(crate) struct ImageLifecycleAdapters {
+    pub(crate) local_cmd: Arc<dyn CommandRunner>,
+    pub(crate) system_operations: SystemOperationStore,
+    pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
+    pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
+    pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+}
+
+pub(crate) enum ImageLifecycleRoute {
+    DirectDbus(DbusBackend),
+    LocalSystemdTools,
+    Elevated {
+        daemon: Arc<ElevatedDaemon>,
+        transport: ImageRemoveTransport,
+    },
+}
+
+pub(crate) fn compose_image_lifecycle(
+    runtime_catalog: Arc<RuntimeCatalog>,
+    registry: Arc<OperationRegistry>,
+    route: ImageLifecycleRoute,
+    adapters: ImageLifecycleAdapters,
+) -> ImageLifecycleService {
+    let ImageLifecycleAdapters {
+        local_cmd,
+        system_operations,
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+    } = adapters;
+    let runtime: Arc<dyn ImageRuntime> = Arc::new(CatalogImageRuntime(runtime_catalog));
+    let route = match route {
+        ImageLifecycleRoute::Elevated { daemon, transport } => ImageControlRoute::Daemon {
+            daemon,
+            system_operations: system_operations.clone(),
+            transport,
+        },
+        ImageLifecycleRoute::LocalSystemdTools => ImageControlRoute::LocalSystemdTools {
+            runner: local_cmd.clone(),
+            system_operations: system_operations.clone(),
+        },
+        ImageLifecycleRoute::DirectDbus(dbus) => ImageControlRoute::DirectDbus {
+            dbus,
+            fallback_runner: local_cmd,
+            fallback_operations: system_operations.clone(),
+        },
+    };
+    let control: Arc<dyn ImageControl> = Arc::new(RoutedImageControl { route, nspawn });
+    let cleanup: Arc<dyn ManagedArtifactCleanup> = Arc::new(StoreArtifactCleanup {
+        systemd_unit,
+        nvidia_state,
+        system_operations,
+    });
+    ImageLifecycleService::new(runtime, control, cleanup, registry)
+}
+
+fn direct_remove_may_fallback(outcome: &ImageControlOutcome) -> bool {
+    matches!(outcome, ImageControlOutcome::NotAttempted { .. })
+}
+
+struct CatalogImageRuntime(Arc<RuntimeCatalog>);
+
+#[async_trait::async_trait]
+impl ImageRuntime for CatalogImageRuntime {
+    async fn list_machines(&self) -> RuntimeResult<Vec<MachineEntry>> {
+        self.0.machines().await.map(|query| query.value)
+    }
+}
+
+enum ImageControlRoute {
+    DirectDbus {
+        dbus: DbusBackend,
+        fallback_runner: Arc<dyn CommandRunner>,
+        fallback_operations: SystemOperationStore,
+    },
+    LocalSystemdTools {
+        runner: Arc<dyn CommandRunner>,
+        system_operations: SystemOperationStore,
+    },
+    Daemon {
+        daemon: Arc<ElevatedDaemon>,
+        system_operations: SystemOperationStore,
+        transport: ImageRemoveTransport,
+    },
+}
+
+struct RoutedImageControl {
+    route: ImageControlRoute,
+    nspawn: crate::adapters::config::NspawnConfigStore,
+}
+
+#[async_trait::async_trait]
+impl ImageControl for RoutedImageControl {
+    async fn disable_unit(&self, machine: &MachineName) -> UnitDisableReport {
+        let result = match &self.route {
+            ImageControlRoute::DirectDbus {
+                dbus,
+                fallback_operations,
+                ..
+            } => {
+                if RuntimeSource::is_available(dbus).await {
+                    dbus.disable(machine.as_str()).await
+                } else {
+                    fallback_operations.disable(machine.as_str()).await
+                }
+            }
+            ImageControlRoute::LocalSystemdTools {
+                system_operations, ..
+            } => system_operations.disable(machine.as_str()).await,
+            ImageControlRoute::Daemon {
+                daemon,
+                system_operations,
+                transport,
+                ..
+            } => match transport {
+                ImageRemoveTransport::Dbus => disable_unit_via_daemon(daemon, machine).await,
+                ImageRemoveTransport::SystemdTools => {
+                    system_operations.disable(machine.as_str()).await
+                }
+            },
+        };
+        match result {
+            Ok(()) => UnitDisableReport::Disabled,
+            Err(error) => UnitDisableReport::Failed(error.to_string()),
+        }
+    }
+
+    async fn remove_image(&self, image: &ImageName) -> ImageControlOutcome {
+        let outcome = match &self.route {
+            ImageControlRoute::DirectDbus {
+                dbus,
+                fallback_runner,
+                ..
+            } => match dbus.remove_image_outcome(image).await {
+                outcome if direct_remove_may_fallback(&outcome) => map_systemd_tools_image_remove(
+                    crate::adapters::system_operation::execute_systemd_tools_image_remove_with_runner(
+                        image.clone(),
+                        fallback_runner.as_ref(),
+                    )
+                    .await,
+                ),
+                outcome => outcome,
+            },
+            ImageControlRoute::LocalSystemdTools { runner, .. } => map_systemd_tools_image_remove(
+                crate::adapters::system_operation::execute_systemd_tools_image_remove_with_runner(
+                    image.clone(),
+                    runner.as_ref(),
+                )
+                .await,
+            ),
+            ImageControlRoute::Daemon {
+                daemon, transport, ..
+            } => {
+                let request = ImageRemoveRequest {
+                    image: image.clone(),
+                    transport: *transport,
+                };
+                match daemon.image_remove(request).await {
+                    Ok(outcome) => outcome,
+                    Err(error) => ImageControlOutcome::OutcomeUnknown {
+                        reason: format!("daemon response was lost: {error}"),
+                    },
+                }
+            }
+        };
+
+        if matches!(&outcome, ImageControlOutcome::Removed) {
+            match self.nspawn.cleanup_sidecar_locks(image.as_str()).await {
+                Ok(true) => log::debug!(
+                    "Removed stale nspawn sidecar locks for image {}",
+                    image.as_str()
+                ),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "Image {} was removed, but its nspawn sidecar locks could not be cleaned: {}",
+                    image.as_str(),
+                    error
+                ),
+            }
+        }
+
+        outcome
+    }
+}
+
+fn map_systemd_tools_image_remove(result: Result<(), SystemOperationError>) -> ImageControlOutcome {
+    match result {
+        Ok(()) => ImageControlOutcome::Removed,
+        Err(error) => map_system_operation_image_error(error),
+    }
+}
+
+async fn disable_unit_via_daemon(
+    daemon: &ElevatedDaemon,
+    machine: &MachineName,
+) -> crate::adapters::error::Result<()> {
+    let outcome = daemon
+        .nspawn_unit_control(NspawnUnitControlRequest {
+            machine: machine.clone(),
+            action: NspawnUnitAction::Disable,
+            transport: MachineControlTransport::Dbus,
+        })
+        .await
+        .map_err(|error| crate::adapters::error::NspawnError::Runtime(error.to_string()))?;
+    match outcome {
+        MachineControlOutcome::Succeeded => Ok(()),
+        other => Err(crate::adapters::error::NspawnError::Runtime(format!(
+            "disable unit was not completed: {other:?}"
+        ))),
+    }
+}
+
+struct StoreArtifactCleanup {
+    systemd_unit: crate::adapters::config::SystemdUnitStore,
+    nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    system_operations: SystemOperationStore,
+}
+
+#[async_trait::async_trait]
+impl ManagedArtifactCleanup for StoreArtifactCleanup {
+    async fn cleanup(&self, machine: &MachineName) -> ArtifactCleanupReport {
+        let mut removed = Vec::new();
+        let mut ambiguous = Vec::new();
+        let mut failed = Vec::new();
+        let mut unit_drop_ins_removed = false;
+        match self
+            .systemd_unit
+            .remove_owned_overrides(machine.as_str())
+            .await
+        {
+            Ok(ownership) if ownership.contains(&ArtifactOwnership::ProvenOwned) => {
+                unit_drop_ins_removed = true;
+                removed.push("systemd unit drop-ins".to_string());
+                if ownership.contains(&ArtifactOwnership::AmbiguousLegacy) {
+                    ambiguous.push("ambiguous legacy systemd unit drop-ins were preserved".into());
+                }
+            }
+            Ok(ownership) if ownership.contains(&ArtifactOwnership::AmbiguousLegacy) => {
+                ambiguous.push("ambiguous legacy systemd unit drop-ins were preserved".into());
+            }
+            Ok(_) => {}
+            Err(error) => failed.push(format!("systemd unit drop-ins: {error}")),
+        }
+        match self.nvidia_state.remove_owned(machine.as_str()).await {
+            Ok(ArtifactOwnership::ProvenOwned) => removed.push("NVIDIA state".to_string()),
+            Ok(ArtifactOwnership::AmbiguousLegacy) => {
+                ambiguous.push("ambiguous legacy NVIDIA state was preserved".into());
+            }
+            Ok(ArtifactOwnership::NotPresent) => {}
+            Err(error) => failed.push(format!("NVIDIA state: {error}")),
+        }
+        if unit_drop_ins_removed {
+            if let Err(error) = self.system_operations.reload_daemon().await {
+                failed.push(format!("systemd daemon reload: {error}"));
+            }
+        }
+        match (removed.is_empty(), failed.is_empty(), ambiguous.is_empty()) {
+            (true, true, true) => ArtifactCleanupReport::NotApplicable,
+            (true, true, false) => ArtifactCleanupReport::PreservedAmbiguous(ambiguous),
+            (false, true, true) => ArtifactCleanupReport::Removed,
+            (false, _, _) => {
+                failed.extend(ambiguous);
+                ArtifactCleanupReport::PartiallyRemoved(failed)
+            }
+            (true, false, _) => {
+                failed.extend(ambiguous);
+                ArtifactCleanupReport::Failed(failed)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::image_lifecycle::ImageRemovalRejection;
+
+    #[test]
+    fn direct_remove_falls_back_only_when_no_attempt_was_made() {
+        assert!(direct_remove_may_fallback(
+            &ImageControlOutcome::NotAttempted {
+                reason: "D-Bus unavailable".into(),
+            }
+        ));
+        for outcome in [
+            ImageControlOutcome::Removed,
+            ImageControlOutcome::Rejected {
+                rejection: ImageRemovalRejection::Busy,
+                reason: "busy".into(),
+            },
+            ImageControlOutcome::Failed {
+                reason: "failed".into(),
+            },
+            ImageControlOutcome::OutcomeUnknown {
+                reason: "response lost".into(),
+            },
+        ] {
+            assert!(!direct_remove_may_fallback(&outcome));
+        }
+    }
+}

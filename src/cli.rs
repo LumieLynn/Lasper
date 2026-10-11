@@ -1,0 +1,1309 @@
+//! Process-level command-line parsing.
+//!
+//! This module selects the process route and coordinates process-level shell
+//! requests through the application session service. It does not construct
+//! concrete host adapters.
+
+use std::fmt;
+use std::path::PathBuf;
+
+use crate::application::machine_lifecycle::{MachineLifecycleService, MachineReadyError};
+use crate::application::runtime::RuntimeCatalog;
+use crate::application::sessions::{
+    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellAttemptError,
+    ShellLaunchError, ShellLaunchRequest, ShellOpenError, ShellTarget, ValidatedGuestUserName,
+    WaylandFallbackCause, WaylandShellRequest,
+};
+use crate::application::x11::{
+    X11AccessError, X11AuthorizationDisposition, X11SessionPreparation, X11SessionPreparationPort,
+    X11SessionSelection,
+};
+use crate::domain::machine::MachineName;
+use crate::domain::wayland::WaylandDisplay;
+
+const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
+
+pub(crate) struct CliOptions {
+    pub(crate) want_elevation: bool,
+    pub(crate) want_systemd_tools: bool,
+    pub(crate) internal_x11_reconcile: bool,
+    pub(crate) is_daemon: bool,
+    pub(crate) fd_sock: Option<PathBuf>,
+    pub(crate) rpc_sock: Option<PathBuf>,
+    pub(crate) daemon_uid: u32,
+    pub(crate) daemon_pid: u32,
+}
+
+pub(crate) enum CliDispatch {
+    Application(CliOptions),
+    Shell(ShellCommand),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ShellIoMode {
+    Interactive,
+    Launcher,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ShellCommand {
+    io_mode: ShellIoMode,
+    target: ShellTarget,
+    wayland: WaylandShellRequest,
+    x11: ShellX11Selection,
+    command: Option<GuestCommand>,
+    allow_wayland_fallback: bool,
+    want_elevation: bool,
+    want_systemd_tools: bool,
+    quiet: bool,
+}
+
+impl ShellCommand {
+    pub(crate) fn target(&self) -> &ShellTarget {
+        &self.target
+    }
+
+    pub(crate) const fn io_mode(&self) -> ShellIoMode {
+        self.io_mode
+    }
+
+    pub(crate) const fn permits_elevation(&self) -> bool {
+        matches!(self.io_mode, ShellIoMode::Interactive)
+    }
+
+    pub(crate) const fn wants_elevation(&self) -> bool {
+        self.want_elevation
+    }
+
+    pub(crate) const fn wants_systemd_tools(&self) -> bool {
+        self.want_systemd_tools
+    }
+
+    pub(crate) fn command(&self) -> Option<&GuestCommand> {
+        self.command.as_ref()
+    }
+
+    pub(crate) const fn allows_wayland_fallback(&self) -> bool {
+        self.allow_wayland_fallback
+    }
+
+    pub(crate) const fn is_quiet(&self) -> bool {
+        self.quiet
+    }
+
+    pub(crate) const fn requests_x11(&self) -> bool {
+        !matches!(self.x11, ShellX11Selection::Disabled)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellX11Selection {
+    Disabled,
+    Current,
+    Display(u16),
+}
+
+struct HelpPage<'a> {
+    heading: String,
+    usage: Vec<&'a str>,
+    sections: Vec<HelpSection<'a>>,
+}
+
+impl<'a> HelpPage<'a> {
+    fn new(heading: String) -> Self {
+        Self {
+            heading,
+            usage: Vec::new(),
+            sections: Vec::new(),
+        }
+    }
+
+    fn usage(mut self, syntax: &'a str) -> Self {
+        self.usage.push(syntax);
+        self
+    }
+
+    fn section(mut self, section: HelpSection<'a>) -> Self {
+        self.sections.push(section);
+        self
+    }
+}
+
+impl fmt::Display for HelpPage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "{}", self.heading)?;
+        writeln!(formatter)?;
+        writeln!(formatter, "USAGE:")?;
+        for syntax in &self.usage {
+            writeln!(formatter, "    {syntax}")?;
+        }
+        for section in &self.sections {
+            writeln!(formatter)?;
+            section.fmt(formatter)?;
+        }
+        Ok(())
+    }
+}
+
+struct HelpSection<'a> {
+    heading: &'a str,
+    items: Vec<HelpItem<'a>>,
+}
+
+enum HelpItem<'a> {
+    Entry(&'a str, &'a str),
+    Paragraph(&'a str),
+}
+
+impl<'a> HelpSection<'a> {
+    fn new(heading: &'a str) -> Self {
+        Self {
+            heading,
+            items: Vec::new(),
+        }
+    }
+
+    fn entry(mut self, syntax: &'a str, description: &'a str) -> Self {
+        self.items.push(HelpItem::Entry(syntax, description));
+        self
+    }
+
+    fn paragraph(mut self, text: &'a str) -> Self {
+        self.items.push(HelpItem::Paragraph(text));
+        self
+    }
+}
+
+impl fmt::Display for HelpSection<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(formatter, "{}:", self.heading)?;
+        let syntax_width = self
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                HelpItem::Entry(syntax, _) => Some(syntax.len()),
+                HelpItem::Paragraph(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                HelpItem::Entry(syntax, description) => writeln!(
+                    formatter,
+                    "    {syntax:<syntax_width$}  {description}",
+                    syntax_width = syntax_width
+                )?,
+                HelpItem::Paragraph(paragraph) => {
+                    if index > 0 {
+                        writeln!(formatter)?;
+                    }
+                    write_wrapped(formatter, paragraph, 4, 80)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn write_wrapped(
+    formatter: &mut fmt::Formatter<'_>,
+    text: &str,
+    indentation: usize,
+    width: usize,
+) -> fmt::Result {
+    let prefix = " ".repeat(indentation);
+    let line_width = width.saturating_sub(indentation).max(1);
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let separator = usize::from(!line.is_empty());
+        if !line.is_empty() && line.len() + separator + word.len() > line_width {
+            writeln!(formatter, "{prefix}{line}")?;
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        writeln!(formatter, "{prefix}{line}")?;
+    }
+    Ok(())
+}
+
+fn help_text() -> String {
+    HelpPage::new(format!(
+        "lasper {} - A TUI for managing systemd-nspawn containers.",
+        env!("CARGO_PKG_VERSION")
+    ))
+    .usage("lasper [FLAGS]")
+    .usage(
+        "lasper [--elevate] [--systemd-tools] shell [--quiet] [--wayland[=DISPLAY] | --no-wayland] [--with-x11[=:N]] USER@MACHINE [--] [COMMAND [ARGUMENT...]]",
+    )
+    .usage(
+        "lasper [--systemd-tools] launch [--wayland[=DISPLAY] | --no-wayland] [--with-x11[=:N]] USER@MACHINE [--] COMMAND [ARGUMENT...]",
+    )
+    .section(
+        HelpSection::new("FLAGS")
+            .entry("-v, --version", "Print version")
+            .entry("-h, --help", "Print this message")
+            .entry(
+                "-e, --elevate",
+                "Use an isolated sudo daemon for privileged operations",
+            )
+            .entry(
+                "-s, --systemd-tools",
+                "Use runtime-state and systemd command backends",
+            ),
+    )
+    .section(
+        HelpSection::new("SESSION OPTIONS")
+            .entry(
+                "--wayland[=DISPLAY]",
+                "Auto-detect a configured current display; optionally select one explicitly",
+            )
+            .entry(
+                "--no-wayland",
+                "Open without Wayland validation or environment",
+            )
+            .entry(
+                "--with-x11[=:N]",
+                "Explicitly prepare Host X11 access for the current or selected display",
+            )
+            .entry(
+                "--quiet",
+                "Suppress Wayland fallback and detach notices",
+            )
+            .entry(
+                "COMMAND [ARGUMENT...]",
+                "Execute an absolute guest executable with argv values",
+            )
+            .paragraph(
+                "`shell` owns an interactive terminal and may use elevation. Press Ctrl+] three times within one second to detach. Its automatic Wayland selection falls back to a terminal-only shell when validation fails. An exact --wayland=DISPLAY selection does not fall back.",
+            )
+            .paragraph(
+                "`launch` is for Terminal=false desktop entries, always uses the caller's authority, starts a stopped machine before running the guest command, and forwards its output. Failures also produce a desktop notification when available.",
+            )
+            .paragraph(
+                "Host X11 is never enabled implicitly. --with-x11 uses the current local DISPLAY; --with-x11=:N selects one server exactly. A failed X11 preparation is a hard error and never falls back.",
+            ),
+    )
+    .section(
+        HelpSection::new("CONFIGURATION")
+            .paragraph("Settings are read from ~/.config/lasper/lasper.toml")
+            .entry(
+                "[settings] elevate = true",
+                "Use the isolated sudo daemon.",
+            )
+            .entry(
+                "[settings] systemd-tools = true",
+                "Use systemd tools instead of Lasper's D-Bus client.",
+            )
+            .entry(
+                "[settings] log-buffer-lines = N",
+                "Max log lines per container (default 5000).",
+            )
+            .entry(
+                "[settings] scrollback-lines = N",
+                "Max history rows per embedded terminal (default 2000, 0 disables).",
+            )
+            .entry(
+                "[nvidia] cdi-source = \"existing\"",
+                "Read the host CDI document instead of invoking nvidia-ctk.",
+            )
+            .entry(
+                "[nvidia] cdi-file = /absolute/path",
+                "Select one existing NVIDIA CDI YAML or JSON document explicitly.",
+            ),
+    )
+    .to_string()
+}
+
+fn print_help() {
+    print!("{}", help_text());
+}
+
+/// Dispatch process-level commands before the TUI owns the terminal.
+pub(crate) fn dispatch() -> std::result::Result<CliDispatch, i32> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some((io_mode, shell_args)) = shell_command_arguments(&args) {
+        return parse_shell_command(io_mode, &shell_args)
+            .map(CliDispatch::Shell)
+            .map_err(|error| {
+                eprintln!("lasper: {error}");
+                1
+            });
+    }
+    parse_flags(&args).map(CliDispatch::Application)
+}
+
+fn shell_command_arguments(args: &[String]) -> Option<(ShellIoMode, Vec<String>)> {
+    let (shell_index, io_mode) = args.iter().enumerate().find_map(|(index, argument)| {
+        let io_mode = match argument.as_str() {
+            "shell" => ShellIoMode::Interactive,
+            "launch" => ShellIoMode::Launcher,
+            _ => return None,
+        };
+        Some((index, io_mode))
+    })?;
+    args[..shell_index]
+        .iter()
+        .all(|argument| {
+            matches!(
+                argument.as_str(),
+                "--elevate" | "-e" | "--systemd-tools" | "-s" | "--cli-mode" | "-c"
+            )
+        })
+        .then(|| {
+            (
+                io_mode,
+                args[..shell_index]
+                    .iter()
+                    .chain(&args[shell_index + 1..])
+                    .cloned()
+                    .collect(),
+            )
+        })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ShellCommandError {
+    #[error("cannot prepare machine for guest launch: {0}")]
+    Machine(#[from] MachineReadyError),
+    #[error("{error}")]
+    Open {
+        #[source]
+        error: Box<ShellLaunchError>,
+        uses_wayland: bool,
+        allow_wayland_fallback: bool,
+    },
+    #[error("{context}: {error}")]
+    Terminal {
+        context: &'static str,
+        #[source]
+        error: SessionError,
+    },
+}
+
+pub(crate) async fn run_launch(
+    command: ShellCommand,
+    sessions: &SessionService,
+    x11_access: &dyn X11SessionPreparationPort,
+    lifecycle: &std::sync::Arc<MachineLifecycleService>,
+    runtime: &RuntimeCatalog,
+) -> Result<i32, ShellCommandError> {
+    lifecycle
+        .ensure_running(runtime, command.target().machine())
+        .await?;
+    run_shell(command, sessions, x11_access).await
+}
+
+pub(crate) async fn run_shell(
+    command: ShellCommand,
+    sessions: &SessionService,
+    x11_access: &dyn X11SessionPreparationPort,
+) -> Result<i32, ShellCommandError> {
+    let io_mode = command.io_mode();
+    let requested_command = command.command().cloned();
+    let allow_wayland_fallback = command.allows_wayland_fallback();
+    let quiet = command.is_quiet();
+    let ShellCommand {
+        target,
+        wayland,
+        x11,
+        ..
+    } = command;
+    let uses_wayland = !matches!(&wayland, WaylandShellRequest::Disabled);
+    let size = match io_mode {
+        ShellIoMode::Interactive => {
+            match crate::adapters::session::terminal_io::inherited_terminal_size() {
+                Ok(size) => size,
+                Err(error) => {
+                    return Err(ShellCommandError::Terminal {
+                        context: "cannot attach the interactive terminal",
+                        error,
+                    })
+                }
+            }
+        }
+        ShellIoMode::Launcher => crate::adapters::session::terminal_io::launcher_terminal_size(),
+    };
+    let x11 = match x11 {
+        ShellX11Selection::Disabled => None,
+        ShellX11Selection::Current => Some(X11SessionSelection::Current),
+        ShellX11Selection::Display(display) => Some(X11SessionSelection::Display(display)),
+    };
+    let mut request = ShellLaunchRequest::new(
+        target,
+        wayland,
+        InteractiveShellEnvironment::capture(),
+        size,
+    )
+    .with_wayland_fallback(allow_wayland_fallback);
+    if let Some(command) = requested_command {
+        request = request.with_command(command);
+    }
+    if let Some(selection) = x11 {
+        request = request.with_x11(selection);
+    }
+    let handle = match sessions.launch_shell(request, Some(x11_access)).await {
+        Ok(opened) => {
+            if let Some(preparation) = opened.x11.as_ref() {
+                report_x11_preparation(preparation);
+            }
+            if let Some(notice) = wayland_fallback_notice(quiet, opened.wayland_fallback.is_some())
+            {
+                eprintln!("{notice}");
+            }
+            opened.handle
+        }
+        Err(error) => {
+            return Err(ShellCommandError::Open {
+                error: Box::new(error),
+                uses_wayland,
+                allow_wayland_fallback,
+            })
+        }
+    };
+    let result = match io_mode {
+        ShellIoMode::Interactive => {
+            crate::adapters::session::terminal_io::run_inherited_terminal(handle, !quiet).await
+        }
+        ShellIoMode::Launcher => {
+            crate::adapters::session::terminal_io::run_launcher_terminal(handle).await
+        }
+    };
+    result.map_err(|error| ShellCommandError::Terminal {
+        context: match io_mode {
+            ShellIoMode::Interactive => "interactive shell failed",
+            ShellIoMode::Launcher => "guest launch failed",
+        },
+        error,
+    })
+}
+
+pub(crate) fn report_command_error(error: &ShellCommandError) {
+    match error {
+        ShellCommandError::Machine(error) => {
+            eprintln!("lasper: cannot prepare machine for guest launch: {error}");
+        }
+        ShellCommandError::Terminal { context, error } => report_shell_error(context, error),
+        ShellCommandError::Open {
+            error,
+            uses_wayland,
+            allow_wayland_fallback,
+        } => match error.as_ref() {
+            ShellLaunchError::X11(error) => report_x11_error(error),
+            ShellLaunchError::Open { error, x11 } => {
+                if let Some(preparation) = x11 {
+                    report_x11_preparation(preparation);
+                }
+                match error {
+                    ShellAttemptError::Initial(error) => {
+                        let context = if matches!(error, ShellOpenError::WaylandSelection(_)) {
+                            "Wayland socket selection failed"
+                        } else {
+                            "failed to open selected-user shell"
+                        };
+                        report_shell_error(context, error.session_error());
+                        if *uses_wayland && !*allow_wayland_fallback {
+                            eprintln!(
+                                "lasper: hint: choose another display with --wayland=DISPLAY, or use \
+                                 --no-wayland for a terminal-only session"
+                            );
+                        }
+                    }
+                    ShellAttemptError::Fallback { cause, error } => {
+                        report_wayland_fallback_failure(cause, error);
+                    }
+                }
+            }
+        },
+    }
+}
+
+fn report_x11_error(error: &X11AccessError) {
+    eprintln!("lasper: failed to prepare Host X11 session: {error}");
+    if let X11AccessError::Projection(error) = error {
+        if let Some(hint) = error.hint() {
+            eprintln!("lasper: hint: {hint}");
+        }
+    }
+}
+
+fn report_x11_preparation(preparation: &X11SessionPreparation) {
+    let context = preparation.context();
+    let display = context.display();
+    let projection = preparation.check().projection();
+    match preparation.disposition() {
+        X11AuthorizationDisposition::Added { .. } => eprintln!(
+            "🪐 Authorized Host X11 :{display} for mapped uid #{}; this X-server ACL entry outlives the shell, so revoke it from Configure when no longer needed (an external ACL change or X-server reset may also remove it).",
+            projection.identity().host_uid()
+        ),
+        X11AuthorizationDisposition::AccessControlDisabled => eprintln!(
+            "lasper: warning: X11 access control is disabled on :{display}; no per-user ACL entry was added"
+        ),
+        X11AuthorizationDisposition::PreExisting => {}
+        X11AuthorizationDisposition::ReusedManaged { .. } => {}
+    }
+    if !projection.filesystem_access().client_writable() {
+        eprintln!(
+            "lasper: warning: {} is not writable by the selected guest user; compatible clients may still use the Linux abstract X11 transport",
+            projection.guest_client_path().display()
+        );
+    }
+}
+
+fn report_shell_error(context: &str, error: &SessionError) {
+    eprintln!("lasper: {context}: {error}");
+    if let Some(hint) = error.hint() {
+        eprintln!("lasper: hint: {hint}");
+    }
+}
+
+fn report_wayland_fallback_failure(cause: &WaylandFallbackCause, error: &ShellOpenError) {
+    report_shell_error(cause.context(), cause.error());
+    report_shell_error(
+        "failed to open selected-user shell without Wayland",
+        error.session_error(),
+    );
+}
+
+fn wayland_fallback_notice(quiet: bool, fallback_used: bool) -> Option<&'static str> {
+    (!quiet && fallback_used).then_some(WAYLAND_FALLBACK_NOTICE)
+}
+
+fn parse_shell_target(target: &str) -> Result<ShellTarget, String> {
+    let Some((user, machine)) = target.split_once('@') else {
+        return Err("session target must be USER@MACHINE".into());
+    };
+    if machine.is_empty() || machine.contains('@') || user.contains('@') {
+        return Err("session target must be USER@MACHINE".into());
+    }
+    let machine = MachineName::new(machine)
+        .map_err(|error| format!("invalid machine in session target: {error}"))?;
+    let user = ValidatedGuestUserName::new(user)
+        .map_err(|error| format!("invalid user in session target: {error}"))?;
+    Ok(ShellTarget::new(machine, user))
+}
+
+fn parse_shell_command(io_mode: ShellIoMode, args: &[String]) -> Result<ShellCommand, String> {
+    let command_name = match io_mode {
+        ShellIoMode::Interactive => "shell",
+        ShellIoMode::Launcher => "launch",
+    };
+    let mut target = None;
+    let mut wayland = WaylandShellRequest::Automatic;
+    let mut selection_was_explicit = false;
+    let mut x11 = ShellX11Selection::Disabled;
+    let mut x11_was_explicit = false;
+    let mut command_program = None;
+    let mut command_args = Vec::new();
+    let mut command_started = false;
+    let mut want_elevation = false;
+    let mut want_systemd_tools = false;
+    let mut quiet = false;
+
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if command_started {
+            command_args.push(argument.clone());
+            index += 1;
+            continue;
+        }
+
+        let requested_wayland = if argument == "--wayland" {
+            Some(WaylandShellRequest::Automatic)
+        } else if let Some(display) = argument.strip_prefix("--wayland=") {
+            if display.is_empty() {
+                return Err("--wayland= requires a display name".into());
+            }
+            Some(WaylandShellRequest::Display(
+                WaylandDisplay::new(display.to_string())
+                    .map_err(|error| format!("invalid --wayland display: {error}"))?,
+            ))
+        } else if argument == "--no-wayland" {
+            Some(WaylandShellRequest::Disabled)
+        } else {
+            None
+        };
+
+        if let Some(requested_wayland) = requested_wayland {
+            if selection_was_explicit {
+                return Err(format!(
+                    "{command_name} accepts only one Wayland selection option"
+                ));
+            }
+            wayland = requested_wayland;
+            selection_was_explicit = true;
+            index += 1;
+            continue;
+        }
+
+        let requested_x11 = if argument == "--with-x11" {
+            Some(ShellX11Selection::Current)
+        } else if let Some(display) = argument.strip_prefix("--with-x11=") {
+            Some(ShellX11Selection::Display(parse_x11_display(display)?))
+        } else {
+            None
+        };
+        if let Some(requested_x11) = requested_x11 {
+            if x11_was_explicit {
+                return Err(format!(
+                    "{command_name} accepts only one Host X11 selection option"
+                ));
+            }
+            x11 = requested_x11;
+            x11_was_explicit = true;
+            index += 1;
+            continue;
+        }
+
+        match argument.as_str() {
+            "--elevate" | "-e" => {
+                want_elevation = true;
+                index += 1;
+                continue;
+            }
+            "--systemd-tools" | "-s" | "--cli-mode" | "-c" => {
+                want_systemd_tools = true;
+                index += 1;
+                continue;
+            }
+            "--quiet" => {
+                quiet = true;
+                index += 1;
+                continue;
+            }
+            "--" if target.is_none() => {
+                return Err(format!(
+                    "{command_name} command separator must follow USER@MACHINE"
+                ));
+            }
+            "--" => {
+                command_started = true;
+                index += 1;
+                if index == args.len() {
+                    return Err(format!(
+                        "{command_name} command separator requires an executable"
+                    ));
+                }
+                command_program = Some(args[index].clone());
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        if target.is_none() {
+            if argument.starts_with('-') {
+                return Err(format!("unknown {command_name} option: {argument}"));
+            }
+            target = Some(parse_shell_target(argument)?);
+            index += 1;
+            continue;
+        }
+
+        // Once the target is consumed, the first remaining value is the
+        // executable and every subsequent value belongs to its argv.
+        command_started = true;
+        command_program = Some(argument.clone());
+        index += 1;
+    }
+
+    let target = target.ok_or_else(|| format!("{command_name} requires USER@MACHINE"))?;
+    let command = command_program
+        .map(|program| GuestCommand::new(program, command_args))
+        .transpose()
+        .map_err(|error| format!("invalid guest command: {error}"))?;
+    if io_mode == ShellIoMode::Launcher && want_elevation {
+        return Err("launch does not support --elevate; desktop authorization uses polkit".into());
+    }
+    if io_mode == ShellIoMode::Launcher && quiet {
+        return Err("launch does not support --quiet; it emits no shell notices".into());
+    }
+    if io_mode == ShellIoMode::Launcher && command.is_none() {
+        return Err("launch requires a guest executable".into());
+    }
+    let allow_wayland_fallback =
+        io_mode == ShellIoMode::Interactive && wayland == WaylandShellRequest::Automatic;
+    Ok(ShellCommand {
+        io_mode,
+        target,
+        wayland,
+        x11,
+        command,
+        allow_wayland_fallback,
+        want_elevation,
+        want_systemd_tools,
+        quiet,
+    })
+}
+
+fn parse_x11_display(value: &str) -> Result<u16, String> {
+    let Some(number) = value.strip_prefix(':') else {
+        return Err("--with-x11= requires a local display in :N form".into());
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("--with-x11= requires a local display in :N form".into());
+    }
+    number
+        .parse()
+        .map_err(|_| "--with-x11 display number is outside the u16 range".into())
+}
+
+fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
+    let mut options = CliOptions {
+        want_elevation: false,
+        want_systemd_tools: false,
+        internal_x11_reconcile: false,
+        is_daemon: false,
+        fd_sock: None,
+        rpc_sock: None,
+        daemon_uid: 0,
+        daemon_pid: 0,
+    };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--version" | "-v" => {
+                println!("lasper {}", env!("CARGO_PKG_VERSION"));
+                return Err(0);
+            }
+            "--help" | "-h" => {
+                print_help();
+                return Err(0);
+            }
+            "--elevate" | "-e" => options.want_elevation = true,
+            "--systemd-tools" | "-s" | "--cli-mode" | "-c" => options.want_systemd_tools = true,
+            "--internal-x11-reconcile" => options.internal_x11_reconcile = true,
+            "--daemon" => options.is_daemon = true,
+            "--fd-sock" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --fd-sock requires a path argument");
+                    return Err(1);
+                }
+                options.fd_sock = Some(PathBuf::from(&args[i]));
+            }
+            "--rpc-sock" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --rpc-sock requires a path argument");
+                    return Err(1);
+                }
+                options.rpc_sock = Some(PathBuf::from(&args[i]));
+            }
+            "--daemon-uid" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --daemon-uid requires a uid argument");
+                    return Err(1);
+                }
+                options.daemon_uid = match args[i].parse::<u32>() {
+                    Ok(uid) => uid,
+                    Err(_) => {
+                        eprintln!("lasper: --daemon-uid must be a positive integer");
+                        return Err(1);
+                    }
+                };
+            }
+            "--daemon-pid" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("lasper: --daemon-pid requires a pid argument");
+                    return Err(1);
+                }
+                options.daemon_pid = match args[i].parse::<u32>() {
+                    Ok(pid) if pid > 0 => pid,
+                    _ => {
+                        eprintln!("lasper: --daemon-pid must be a positive integer");
+                        return Err(1);
+                    }
+                };
+            }
+            other => {
+                eprintln!("lasper: unknown flag: {}", other);
+                return Err(1);
+            }
+        }
+        i += 1;
+    }
+    Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn arguments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    fn parse_interactive(args: &[String]) -> Result<ShellCommand, String> {
+        parse_shell_command(ShellIoMode::Interactive, args)
+    }
+
+    fn parse_launcher(args: &[String]) -> Result<ShellCommand, String> {
+        parse_shell_command(ShellIoMode::Launcher, args)
+    }
+
+    #[test]
+    fn systemd_tools_flags_and_legacy_aliases_select_the_same_route() {
+        for flag in ["-s", "--systemd-tools", "-c", "--cli-mode"] {
+            let options = parse_flags(&arguments(&[flag])).unwrap();
+            assert!(options.want_systemd_tools, "{flag}");
+            assert!(!options.want_elevation, "{flag}");
+
+            for verb in ["shell", "launch"] {
+                for args in [
+                    arguments(&[flag, verb, "alice@demo", "/bin/echo"]),
+                    arguments(&[verb, flag, "alice@demo", "/bin/echo"]),
+                    arguments(&[verb, "alice@demo", flag, "/bin/echo"]),
+                ] {
+                    let (mode, args) = shell_command_arguments(&args).unwrap();
+                    let command = parse_shell_command(mode, &args).unwrap();
+                    assert!(command.wants_systemd_tools());
+                    assert!(!command.wants_elevation());
+                }
+            }
+        }
+        assert!(!parse_flags(&[]).unwrap().want_systemd_tools);
+    }
+
+    #[test]
+    fn internal_x11_reconcile_flag_is_hidden_from_public_routes() {
+        let options = parse_flags(&arguments(&["--internal-x11-reconcile"])).unwrap();
+        assert!(options.internal_x11_reconcile);
+        assert!(!options.want_elevation);
+        assert!(!options.want_systemd_tools);
+    }
+
+    #[test]
+    fn transport_flags_after_the_executable_belong_to_the_guest() {
+        for verb in ["shell", "launch"] {
+            for separator in [false, true] {
+                let mut args = arguments(&[verb, "alice@demo"]);
+                if separator {
+                    args.push("--".into());
+                }
+                args.extend(arguments(&[
+                    "/bin/echo",
+                    "-s",
+                    "--systemd-tools",
+                    "-c",
+                    "--cli-mode",
+                ]));
+                let (mode, args) = shell_command_arguments(&args).unwrap();
+                let command = parse_shell_command(mode, &args).unwrap();
+                assert!(!command.wants_systemd_tools());
+                assert_eq!(
+                    command.command().unwrap().args(),
+                    ["-s", "--systemd-tools", "-c", "--cli-mode"]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_uses_only_the_canonical_transport_name() {
+        let help = help_text();
+        assert!(help.contains("-s, --systemd-tools"));
+        assert!(help.contains("[settings] systemd-tools = true"));
+        assert!(!help.contains("--cli-mode"));
+    }
+
+    #[test]
+    fn shell_target_parses_one_validated_user_and_machine() {
+        let target = parse_shell_target("1000@demo").unwrap();
+        assert_eq!(target.user().as_str(), "1000");
+        assert_eq!(target.machine().as_str(), "demo");
+    }
+
+    #[test]
+    fn shell_target_rejects_extra_delimiters_and_option_shaped_users() {
+        for target in ["demo", "@demo", "alice@", "alice@demo@other", "-root@demo"] {
+            assert!(parse_shell_target(target).is_err(), "{target:?}");
+        }
+    }
+
+    #[test]
+    fn shell_defaults_to_automatic_wayland() {
+        let command = parse_interactive(&arguments(&["alice@demo"])).unwrap();
+
+        assert_eq!(command.io_mode(), ShellIoMode::Interactive);
+        assert!(command.permits_elevation());
+        assert_eq!(command.target.user().as_str(), "alice");
+        assert_eq!(command.target.machine().as_str(), "demo");
+        assert_eq!(command.wayland, WaylandShellRequest::Automatic);
+        assert_eq!(command.x11, ShellX11Selection::Disabled);
+        assert!(command.allows_wayland_fallback());
+        assert!(command.command().is_none());
+        assert!(!command.wants_elevation());
+        assert!(!command.wants_systemd_tools());
+        assert!(!command.is_quiet());
+    }
+
+    #[test]
+    fn host_x11_requires_explicit_current_or_exact_selection() {
+        let current = parse_interactive(&arguments(&["--with-x11", "alice@demo"])).unwrap();
+        assert_eq!(current.x11, ShellX11Selection::Current);
+
+        let exact = parse_interactive(&arguments(&["alice@demo", "--with-x11=:12"])).unwrap();
+        assert_eq!(exact.x11, ShellX11Selection::Display(12));
+
+        for args in [
+            arguments(&["--with-x11=", "alice@demo"]),
+            arguments(&["--with-x11=12", "alice@demo"]),
+            arguments(&["--with-x11=:1.0", "alice@demo"]),
+            arguments(&["--with-x11=:65536", "alice@demo"]),
+            arguments(&["--with-x11", "--with-x11=:1", "alice@demo"]),
+        ] {
+            assert!(parse_interactive(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn shell_accepts_an_exact_display_or_explicitly_disables_wayland() {
+        let selected =
+            parse_interactive(&arguments(&["--wayland=wayland-1", "alice@demo"])).unwrap();
+        assert_eq!(
+            selected.wayland,
+            WaylandShellRequest::Display(WaylandDisplay::new("wayland-1").unwrap())
+        );
+
+        let disabled = parse_interactive(&arguments(&["alice@demo", "--no-wayland"])).unwrap();
+        assert_eq!(disabled.wayland, WaylandShellRequest::Disabled);
+        assert!(!disabled.allows_wayland_fallback());
+
+        let automatic = parse_interactive(&arguments(&["--wayland", "alice@demo"])).unwrap();
+        assert!(automatic.allows_wayland_fallback());
+
+        assert!(!selected.allows_wayland_fallback());
+    }
+
+    #[test]
+    fn shell_accepts_the_shared_authority_and_transport_flags() {
+        let command =
+            parse_interactive(&arguments(&["--elevate", "alice@demo", "--cli-mode"])).unwrap();
+
+        assert!(command.wants_elevation());
+        assert!(command.wants_systemd_tools());
+    }
+
+    #[test]
+    fn shell_forwards_a_guest_command_with_or_without_separator() {
+        let direct = parse_interactive(&arguments(&[
+            "alice@demo",
+            "/usr/bin/kitty",
+            "--single-instance",
+        ]))
+        .unwrap();
+        let separated = parse_interactive(&arguments(&[
+            "alice@demo",
+            "--",
+            "/usr/bin/kitty",
+            "--single-instance",
+        ]))
+        .unwrap();
+
+        assert_eq!(direct.command(), separated.command());
+        let command = direct.command().expect("guest command");
+        assert_eq!(command.program(), "/usr/bin/kitty");
+        assert_eq!(command.args(), ["--single-instance"]);
+    }
+
+    #[test]
+    fn shell_route_flags_work_before_or_after_the_subcommand() {
+        let (before_mode, before) = shell_command_arguments(&arguments(&[
+            "--elevate",
+            "--cli-mode",
+            "shell",
+            "alice@demo",
+        ]))
+        .unwrap();
+        let (after_mode, after) = shell_command_arguments(&arguments(&[
+            "shell",
+            "--elevate",
+            "--cli-mode",
+            "alice@demo",
+        ]))
+        .unwrap();
+
+        assert_eq!(
+            parse_shell_command(before_mode, &before).unwrap(),
+            parse_shell_command(after_mode, &after).unwrap()
+        );
+        assert!(
+            shell_command_arguments(&arguments(&["--unknown", "shell", "alice@demo"])).is_none()
+        );
+    }
+
+    #[test]
+    fn quiet_is_a_right_side_shell_option() {
+        assert!(shell_command_arguments(&arguments(&["--quiet", "shell", "alice@demo"])).is_none());
+
+        for args in [
+            arguments(&["shell", "--quiet", "alice@demo"]),
+            arguments(&["shell", "alice@demo", "--quiet"]),
+        ] {
+            let (mode, command_args) = shell_command_arguments(&args).unwrap();
+            assert!(parse_shell_command(mode, &command_args).unwrap().is_quiet());
+        }
+    }
+
+    #[test]
+    fn shell_rejects_conflicting_options_and_invalid_commands() {
+        for args in [
+            arguments(&["--wayland", "--no-wayland", "alice@demo"]),
+            arguments(&["--wayland=", "alice@demo"]),
+            arguments(&["alice@demo", "extra"]),
+            arguments(&["alice@demo", "--"]),
+            arguments(&["--unknown", "alice@demo"]),
+        ] {
+            assert!(parse_interactive(&args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn launch_requires_a_command_and_uses_launcher_io() {
+        let command = parse_launcher(&arguments(&[
+            "--cli-mode",
+            "alice@demo",
+            "--",
+            "/usr/bin/kitty",
+            "--single-instance",
+        ]))
+        .unwrap();
+
+        assert_eq!(command.io_mode(), ShellIoMode::Launcher);
+        assert!(!command.permits_elevation());
+        assert!(command.wants_systemd_tools());
+        assert_eq!(command.command().unwrap().program(), "/usr/bin/kitty");
+        assert_eq!(command.command().unwrap().args(), ["--single-instance"]);
+        assert!(parse_launcher(&arguments(&["alice@demo"])).is_err());
+    }
+
+    #[test]
+    fn quiet_suppresses_the_successful_wayland_fallback_notice() {
+        assert_eq!(
+            wayland_fallback_notice(false, true),
+            Some(WAYLAND_FALLBACK_NOTICE)
+        );
+        assert_eq!(wayland_fallback_notice(true, true), None);
+        assert_eq!(wayland_fallback_notice(false, false), None);
+    }
+
+    #[test]
+    fn help_is_composed_from_sections() {
+        let help = help_text();
+        assert!(help.contains("USAGE:\n"));
+        assert!(help.contains("FLAGS:\n"));
+        assert!(help.contains("SESSION OPTIONS:\n"));
+        assert!(help.contains("CONFIGURATION:\n"));
+        let normalized = help.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("Press Ctrl+] three times within one second to detach."));
+        assert!(normalized.contains("Wayland selection falls back"));
+        assert!(normalized.contains("--quiet Suppress Wayland fallback and detach notices"));
+        assert!(normalized.contains("--with-x11[=:N] Explicitly prepare Host X11 access"));
+        assert!(normalized.contains("Host X11 is never enabled implicitly."));
+        assert_eq!(WAYLAND_FALLBACK_NOTICE, "🪐 Continuing without Wayland...");
+    }
+
+    #[test]
+    fn launch_rejects_elevation_before_or_after_the_subcommand() {
+        for args in [
+            arguments(&["--elevate", "launch", "alice@demo", "/bin/true"]),
+            arguments(&["--elevate", "launch", "alice@demo"]),
+            arguments(&["launch", "--elevate", "alice@demo", "/bin/true"]),
+        ] {
+            let (mode, command_args) = shell_command_arguments(&args).unwrap();
+            let error = parse_shell_command(mode, &command_args).unwrap_err();
+            assert!(error.contains("does not support --elevate"), "{error}");
+        }
+    }
+
+    #[test]
+    fn launch_rejects_the_shell_only_quiet_option() {
+        for args in [
+            arguments(&["launch", "--quiet", "alice@demo", "/bin/true"]),
+            arguments(&["launch", "alice@demo", "--quiet", "/bin/true"]),
+        ] {
+            let (mode, command_args) = shell_command_arguments(&args).unwrap();
+            let error = parse_shell_command(mode, &command_args).unwrap_err();
+            assert!(error.contains("does not support --quiet"), "{error}");
+        }
+    }
+
+    #[derive(Default)]
+    struct LauncherSession {
+        commands: parking_lot::Mutex<Vec<GuestCommand>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::application::sessions::SessionPort for LauncherSession {
+        async fn discover_host_wayland_sockets(
+            &self,
+        ) -> Vec<crate::domain::wayland::HostWaylandSocket> {
+            panic!("launch must not discover displays before machine readiness")
+        }
+
+        async fn automatic_wayland(
+            &self,
+            _machine: &MachineName,
+        ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
+            panic!("launch must not select Wayland before machine readiness")
+        }
+
+        async fn prepare_wayland(
+            &self,
+            _request: crate::application::sessions::WaylandPreparationRequest,
+        ) -> Result<crate::application::sessions::WaylandSessionContext, SessionError> {
+            panic!("launch must not probe Wayland before machine readiness")
+        }
+
+        async fn probe_x11_projection(
+            &self,
+            _request: crate::application::sessions::X11ProjectionProbeRequest,
+        ) -> Result<crate::application::sessions::X11ProjectionContext, SessionError> {
+            panic!("launch must not probe X11 before machine readiness")
+        }
+
+        async fn open_terminal(
+            &self,
+            request: crate::application::sessions::TerminalSessionRequest,
+        ) -> Result<crate::application::sessions::TerminalSessionHandle, SessionError> {
+            use crate::application::sessions::{terminal_session_channel, TerminalLaunch};
+            use crate::domain::session::{SessionLifecycle, TerminalAttachmentKind};
+
+            assert_eq!(request.machine.as_str(), "demo");
+            let TerminalLaunch::SelectedUserShell { user, command, .. } = request.launch else {
+                panic!("launch requires a selected-user command");
+            };
+            assert_eq!(user.as_str(), "alice");
+            self.commands.lock().push(command.unwrap());
+            let (handle, endpoint) =
+                terminal_session_channel(request.id, TerminalAttachmentKind::Login);
+            endpoint
+                .lifecycle
+                .send(SessionLifecycle::Exited {
+                    success: false,
+                    code: Some(37),
+                })
+                .unwrap();
+            Ok(handle)
+        }
+
+        async fn open_journal(
+            &self,
+            _request: crate::application::sessions::JournalSessionRequest,
+        ) -> Result<crate::application::sessions::JournalSessionHandle, SessionError> {
+            panic!("launch must not open a journal")
+        }
+    }
+
+    struct UnusedX11Preparation;
+
+    #[async_trait::async_trait]
+    impl X11SessionPreparationPort for UnusedX11Preparation {
+        async fn prepare_session(
+            &self,
+            _target: ShellTarget,
+            _selection: X11SessionSelection,
+        ) -> Result<X11SessionPreparation, X11AccessError> {
+            panic!("launch must not authorize X11 before machine readiness")
+        }
+    }
+
+    fn observed_launch_machine(
+        state: crate::domain::runtime::MachineState,
+    ) -> (RuntimeCatalog, std::sync::Arc<MachineLifecycleService>) {
+        use crate::application::machine_lifecycle::{
+            MockMachineControl, MockMachineObservation, MockMachineStartDiagnostics,
+            MockMachineStartPreparation,
+        };
+        use crate::application::operations::{ExecutionRoute, OperationRegistry};
+        use crate::application::runtime::MockRuntimePort;
+        use crate::domain::runtime::MachineEntry;
+        use std::sync::Arc;
+
+        let mut port = MockRuntimePort::new();
+        port.expect_list_machines()
+            .once()
+            .returning(move || Ok(vec![MachineEntry::optimistic_nspawn("demo", state.clone())]));
+        port.expect_snapshot_route()
+            .return_const(ExecutionRoute::LocalSystemdTools);
+        let runtime = RuntimeCatalog::new(None, Arc::new(port), vec![], None);
+        let lifecycle = Arc::new(MachineLifecycleService::new(
+            Arc::new(MockMachineControl::new()),
+            Arc::new(MockMachineStartPreparation::new()),
+            Arc::new(MockMachineObservation::new()),
+            Arc::new(MockMachineStartDiagnostics::new()),
+            OperationRegistry::new(),
+        ));
+        (runtime, lifecycle)
+    }
+
+    #[tokio::test]
+    async fn launch_readiness_failure_does_not_enter_display_preparation_or_terminal() {
+        use crate::domain::runtime::MachineState;
+        use std::sync::Arc;
+
+        let command = parse_launcher(&arguments(&[
+            "--with-x11",
+            "--wayland=wayland-1",
+            "alice@demo",
+            "/usr/bin/kitty",
+        ]))
+        .unwrap();
+        let port = Arc::new(LauncherSession::default());
+        let sessions = SessionService::new(port.clone());
+        let (runtime, lifecycle) = observed_launch_machine(MachineState::Exiting);
+        let result = run_launch(
+            command,
+            &sessions,
+            &UnusedX11Preparation,
+            &lifecycle,
+            &runtime,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(ShellCommandError::Machine(
+                MachineReadyError::Unavailable { .. }
+            ))
+        ));
+        assert!(port.commands.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_preserves_guest_command_arguments_and_exit_status() {
+        use crate::domain::runtime::MachineState;
+        use std::sync::Arc;
+
+        let command = parse_launcher(&arguments(&[
+            "--no-wayland",
+            "alice@demo",
+            "/usr/bin/kitty",
+            "--title",
+            "a b",
+            "",
+        ]))
+        .unwrap();
+        let expected = command.command().unwrap().clone();
+        let port = Arc::new(LauncherSession::default());
+        let sessions = SessionService::new(port.clone());
+        let (runtime, lifecycle) = observed_launch_machine(MachineState::Running);
+        let code = run_launch(
+            command,
+            &sessions,
+            &UnusedX11Preparation,
+            &lifecycle,
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 37);
+        assert_eq!(port.commands.lock().as_slice(), &[expected]);
+    }
+}

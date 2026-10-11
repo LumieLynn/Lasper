@@ -1,0 +1,81 @@
+[package]
+name = "lasper"
+version = "0.3.3"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
+
+[[bin]]
+name = "lasper"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = { version = "0.30", default-features = false, features = [
+    "all-widgets",
+    "crossterm",
+    "layout-cache",
+    "macros",
+    "underline-color",
+    "unstable-rendered-line-info",
+] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+tokio = { version = "1", features = [
+    "fs",
+    "io-std",
+    "io-util",
+    "macros",
+    "net",
+    "process",
+    "rt-multi-thread",
+    "signal",
+    "sync",
+    "time",
+] }
+tokio-stream = "0.1"
+anyhow = "1.0.103"
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+log = "0.4"
+dirs = "7"
+libc = "0.2"
+linux-raw-sys = { version = "0.12", features = ["general"] }
+uzers = "0.12"
+pciid-parser = "0.8"
+async-trait = "0.1"
+thiserror = "2"
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+rust-ini = "0.21.3"
+which = "8.0"
+serde_json = "1.0.149"
+serde_yaml_ng = "0.10.0"
+sha2 = "0.11"
+hex = "0.4"
+tui-input = { version = "0.15", default-features = false, features = [
+    "ratatui-crossterm",
+] }
+notify = "8.2.0"
+uuid = { version = "1.23.0", features = ["v4"] }
+url = "2.5"
+fs2 = "0.4"
+tempfile = "3"
+parking_lot = "0.12.5"
+portable-pty = "0.9.0"
+rio-vt = { version = "0.5.28", default-features = false }
+sendfd = { version = "0.4", features = ["tokio"] }
+unicode-width = "0.2"
+compact_str = "0.10"
+zeroize = "1.8"
+x11rb = { version = "0.14", default-features = false }
+
+[dev-dependencies]
+mockall = "0.15"
+tokio = { version = "1", features = ["test-util"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1

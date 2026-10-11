@@ -1,0 +1,758 @@
+//! Runtime composition for the machine lifecycle vertical slice.
+
+use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::NspawnError;
+use crate::adapters::lifecycle::error::map_system_operation_machine_error;
+use crate::adapters::platform::nvidia::NvidiaPreparationOutcome;
+use crate::adapters::process::CommandRunner;
+use crate::adapters::runtime::dbus::DbusBackend;
+use crate::adapters::runtime::source::RuntimeSource;
+use crate::adapters::system_operation::{
+    execute_dbus_system_operation_with_runner, execute_system_operation_with_runner,
+    SystemOperation, SystemOperationError, SystemOperationStore,
+};
+use crate::application::machine_lifecycle::{
+    MachineControl, MachineControlOutcome, MachineControlTransport, MachineLifecycleService,
+    MachineObservation, MachinePreparationError, MachineRuntimeAction,
+    MachineRuntimeControlRequest, MachineStartDiagnostics, MachineStartPreparation,
+    NspawnLaunchRequest, NspawnUnitAction, NspawnUnitControlRequest, RoutedMachineControlOutcome,
+    StartFailureEvidence,
+};
+use crate::application::operations::{ExecutionRoute, RouteFallback};
+use crate::application::runtime::RuntimeResult;
+use crate::application::{OperationRegistry, RuntimeCatalog};
+use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
+use crate::domain::machine::MachineName;
+use crate::domain::runtime::{ImageName, MachineEntry};
+use std::sync::Arc;
+
+pub(crate) struct MachineLifecycleAdapters {
+    pub(crate) local_cmd: Arc<dyn CommandRunner>,
+    pub(crate) nspawn: crate::adapters::config::NspawnConfigStore,
+    pub(crate) systemd_unit: crate::adapters::config::SystemdUnitStore,
+    pub(crate) nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    pub(crate) nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
+    pub(crate) rootfs: crate::adapters::rootfs::RootfsStore,
+    pub(crate) skip_nvidia_permission_denied: bool,
+}
+
+pub(crate) enum MachineLifecycleRoute {
+    DirectDbus(DbusBackend),
+    LocalSystemdTools,
+    Elevated {
+        daemon: Arc<ElevatedDaemon>,
+        transport: MachineControlTransport,
+    },
+}
+
+pub(crate) fn compose_machine_lifecycle(
+    runtime: Arc<RuntimeCatalog>,
+    registry: Arc<OperationRegistry>,
+    route: MachineLifecycleRoute,
+    adapters: MachineLifecycleAdapters,
+) -> Arc<MachineLifecycleService> {
+    let MachineLifecycleAdapters {
+        local_cmd,
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+        nvidia_cdi_source,
+        rootfs,
+        skip_nvidia_permission_denied,
+    } = adapters;
+    let (control_route, system_operations) = match route {
+        MachineLifecycleRoute::DirectDbus(dbus) => (
+            MachineControlRoute::DirectDbus {
+                dbus: dbus.clone(),
+                local_runner: local_cmd.clone(),
+            },
+            SystemOperationStore::dbus(dbus, local_cmd.clone()),
+        ),
+        MachineLifecycleRoute::LocalSystemdTools => (
+            MachineControlRoute::LocalSystemdTools {
+                runner: local_cmd.clone(),
+            },
+            SystemOperationStore::direct(local_cmd.clone()),
+        ),
+        MachineLifecycleRoute::Elevated { daemon, transport } => (
+            MachineControlRoute::Daemon {
+                daemon: daemon.clone(),
+                transport,
+            },
+            SystemOperationStore::elevated_with_transport(daemon, transport),
+        ),
+    };
+    let control: Arc<dyn MachineControl> = Arc::new(RoutedMachineControl {
+        route: control_route,
+    });
+    let preparation: Arc<dyn MachineStartPreparation> = Arc::new(StoreStartPreparation {
+        nspawn,
+        systemd_unit,
+        nvidia_state,
+        nvidia_cdi_source,
+        rootfs,
+        system_operations,
+        runtime: runtime.clone(),
+        skip_nvidia_permission_denied,
+    });
+    let observation: Arc<dyn MachineObservation> = Arc::new(CatalogMachineObservation {
+        runtime: runtime.clone(),
+        systemd_tools: local_cmd.clone(),
+    });
+    let diagnostics: Arc<dyn MachineStartDiagnostics> =
+        Arc::new(LocalStartDiagnostics { runner: local_cmd });
+    Arc::new(MachineLifecycleService::new(
+        control,
+        preparation,
+        observation,
+        diagnostics,
+        registry,
+    ))
+}
+
+enum MachineControlRoute {
+    DirectDbus {
+        dbus: DbusBackend,
+        local_runner: Arc<dyn CommandRunner>,
+    },
+    LocalSystemdTools {
+        runner: Arc<dyn CommandRunner>,
+    },
+    Daemon {
+        daemon: Arc<ElevatedDaemon>,
+        transport: MachineControlTransport,
+    },
+}
+
+struct RoutedMachineControl {
+    route: MachineControlRoute,
+}
+
+#[derive(Clone, Debug)]
+enum MachineControlIntent {
+    Launch { image: ImageName },
+    Runtime(MachineRuntimeAction),
+    Unit(NspawnUnitAction),
+}
+
+#[async_trait::async_trait]
+impl MachineControl for RoutedMachineControl {
+    async fn launch(
+        &self,
+        image: &ImageName,
+        machine: &MachineName,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(
+            machine,
+            MachineControlIntent::Launch {
+                image: image.clone(),
+            },
+        )
+        .await
+    }
+
+    async fn execute_runtime(
+        &self,
+        machine: &MachineName,
+        action: MachineRuntimeAction,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(machine, MachineControlIntent::Runtime(action))
+            .await
+    }
+
+    async fn execute_unit(
+        &self,
+        machine: &MachineName,
+        action: NspawnUnitAction,
+    ) -> RoutedMachineControlOutcome {
+        self.execute(machine, MachineControlIntent::Unit(action))
+            .await
+    }
+}
+
+impl RoutedMachineControl {
+    async fn execute(
+        &self,
+        machine: &MachineName,
+        intent: MachineControlIntent,
+    ) -> RoutedMachineControlOutcome {
+        match &self.route {
+            MachineControlRoute::DirectDbus { dbus, local_runner } => {
+                let dbus_outcome = if RuntimeSource::is_available(dbus).await {
+                    execute_dbus_machine_control(
+                        dbus,
+                        machine.clone(),
+                        intent.clone(),
+                        local_runner.as_ref(),
+                    )
+                    .await
+                } else {
+                    MachineControlOutcome::NotAttempted {
+                        reason: "D-Bus backend is unavailable".into(),
+                    }
+                };
+                match dbus_outcome {
+                    MachineControlOutcome::NotAttempted { reason } => {
+                        let outcome = execute_systemd_tools_machine_control_with_runner(
+                            machine.clone(),
+                            intent,
+                            local_runner.as_ref(),
+                        )
+                        .await;
+                        RoutedMachineControlOutcome {
+                            outcome,
+                            route: ExecutionRoute::LocalSystemdTools,
+                            fallback: Some(RouteFallback {
+                                from: ExecutionRoute::DirectDbus,
+                                to: ExecutionRoute::LocalSystemdTools,
+                                reason,
+                            }),
+                        }
+                    }
+                    outcome => RoutedMachineControlOutcome {
+                        outcome,
+                        route: ExecutionRoute::DirectDbus,
+                        fallback: None,
+                    },
+                }
+            }
+            MachineControlRoute::LocalSystemdTools { runner } => RoutedMachineControlOutcome {
+                outcome: execute_systemd_tools_machine_control_with_runner(
+                    machine.clone(),
+                    intent,
+                    runner.as_ref(),
+                )
+                .await,
+                route: ExecutionRoute::LocalSystemdTools,
+                fallback: None,
+            },
+            MachineControlRoute::Daemon { daemon, transport } => {
+                let outcome = match execute_daemon_machine_control(
+                    daemon,
+                    machine.clone(),
+                    intent.clone(),
+                    *transport,
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) => MachineControlOutcome::OutcomeUnknown {
+                        reason: format!("daemon response was lost: {error}"),
+                    },
+                };
+                if *transport == MachineControlTransport::Dbus {
+                    if let MachineControlOutcome::NotAttempted { reason } = outcome {
+                        let fallback_outcome = match execute_daemon_machine_control(
+                            daemon,
+                            machine.clone(),
+                            intent,
+                            MachineControlTransport::SystemdTools,
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(error) => MachineControlOutcome::OutcomeUnknown {
+                                reason: format!("daemon response was lost: {error}"),
+                            },
+                        };
+                        return RoutedMachineControlOutcome {
+                            outcome: fallback_outcome,
+                            route: ExecutionRoute::ElevatedSystemdTools,
+                            fallback: Some(RouteFallback {
+                                from: ExecutionRoute::ElevatedDbus,
+                                to: ExecutionRoute::ElevatedSystemdTools,
+                                reason,
+                            }),
+                        };
+                    }
+                }
+                RoutedMachineControlOutcome {
+                    outcome,
+                    route: match transport {
+                        MachineControlTransport::Dbus => ExecutionRoute::ElevatedDbus,
+                        MachineControlTransport::SystemdTools => {
+                            ExecutionRoute::ElevatedSystemdTools
+                        }
+                    },
+                    fallback: None,
+                }
+            }
+        }
+    }
+}
+
+async fn execute_daemon_machine_control(
+    daemon: &ElevatedDaemon,
+    machine: MachineName,
+    intent: MachineControlIntent,
+    transport: MachineControlTransport,
+) -> std::io::Result<MachineControlOutcome> {
+    match intent {
+        MachineControlIntent::Launch { image } => {
+            daemon
+                .nspawn_launch(NspawnLaunchRequest {
+                    image,
+                    machine,
+                    transport,
+                })
+                .await
+        }
+        MachineControlIntent::Runtime(action) => {
+            daemon
+                .machine_runtime_control(MachineRuntimeControlRequest {
+                    machine,
+                    action,
+                    transport,
+                })
+                .await
+        }
+        MachineControlIntent::Unit(action) => {
+            daemon
+                .nspawn_unit_control(NspawnUnitControlRequest {
+                    machine,
+                    action,
+                    transport,
+                })
+                .await
+        }
+    }
+}
+
+async fn execute_dbus_machine_control(
+    dbus: &DbusBackend,
+    machine: MachineName,
+    intent: MachineControlIntent,
+    runner: &dyn CommandRunner,
+) -> MachineControlOutcome {
+    match execute_dbus_system_operation_with_runner(dbus, system_operation(machine, intent), runner)
+        .await
+    {
+        Ok(()) => MachineControlOutcome::Succeeded,
+        Err(error) => map_system_operation_machine_error(error),
+    }
+}
+
+async fn execute_systemd_tools_machine_control(
+    machine: MachineName,
+    intent: MachineControlIntent,
+) -> MachineControlOutcome {
+    execute_systemd_tools_machine_control_with_runner(
+        machine,
+        intent,
+        &crate::adapters::process::DefaultCommandRunner,
+    )
+    .await
+}
+
+pub(crate) async fn execute_systemd_tools_nspawn_launch(
+    image: ImageName,
+    machine: MachineName,
+) -> MachineControlOutcome {
+    if image.as_str() != machine.as_str() {
+        return MachineControlOutcome::Rejected {
+            rejection: crate::application::machine_lifecycle::MachineRejection::InvalidTarget,
+            reason: "nspawn launch currently requires matching image and machine names".into(),
+        };
+    }
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Launch { image }).await
+}
+
+pub(crate) async fn execute_systemd_tools_machine_runtime(
+    machine: MachineName,
+    action: MachineRuntimeAction,
+) -> MachineControlOutcome {
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Runtime(action)).await
+}
+
+pub(crate) async fn execute_systemd_tools_nspawn_unit(
+    machine: MachineName,
+    action: NspawnUnitAction,
+) -> MachineControlOutcome {
+    execute_systemd_tools_machine_control(machine, MachineControlIntent::Unit(action)).await
+}
+
+async fn execute_systemd_tools_machine_control_with_runner(
+    machine: MachineName,
+    intent: MachineControlIntent,
+    runner: &dyn CommandRunner,
+) -> MachineControlOutcome {
+    match execute_system_operation_with_runner(system_operation(machine, intent), runner).await {
+        Ok(()) => MachineControlOutcome::Succeeded,
+        Err(SystemOperationError::Io { source: error, .. }) => {
+            MachineControlOutcome::NotAttempted {
+                reason: format!("failed to launch machine control command: {error}"),
+            }
+        }
+        Err(error) => map_system_operation_machine_error(error),
+    }
+}
+
+fn system_operation(machine: MachineName, intent: MachineControlIntent) -> SystemOperation {
+    match intent {
+        MachineControlIntent::Launch { .. } => SystemOperation::Start { machine },
+        MachineControlIntent::Runtime(MachineRuntimeAction::Terminate) => {
+            SystemOperation::Terminate { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff) => {
+            SystemOperation::Poweroff { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Reboot) => {
+            SystemOperation::Reboot { machine }
+        }
+        MachineControlIntent::Runtime(MachineRuntimeAction::Kill { signal }) => {
+            SystemOperation::Kill { machine, signal }
+        }
+        MachineControlIntent::Unit(NspawnUnitAction::Enable) => SystemOperation::Enable { machine },
+        MachineControlIntent::Unit(NspawnUnitAction::Disable) => {
+            SystemOperation::Disable { machine }
+        }
+    }
+}
+
+struct StoreStartPreparation {
+    nspawn: crate::adapters::config::NspawnConfigStore,
+    systemd_unit: crate::adapters::config::SystemdUnitStore,
+    nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore,
+    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
+    rootfs: crate::adapters::rootfs::RootfsStore,
+    system_operations: SystemOperationStore,
+    runtime: Arc<RuntimeCatalog>,
+    skip_nvidia_permission_denied: bool,
+}
+
+#[async_trait::async_trait]
+impl MachineStartPreparation for StoreStartPreparation {
+    async fn prepare(&self, machine: &MachineName) -> Result<(), MachinePreparationError> {
+        let result = crate::adapters::platform::nvidia::ensure_gpu_passthrough(
+            machine.as_str(),
+            &self.nspawn,
+            &self.systemd_unit,
+            &self.nvidia_state,
+            &self.rootfs,
+            &self.nvidia_cdi_source,
+        )
+        .await;
+        self.runtime.invalidate();
+        reload_after_nvidia_preparation(
+            result,
+            machine,
+            &self.system_operations,
+            self.skip_nvidia_permission_denied,
+        )
+        .await
+    }
+}
+
+async fn reload_after_nvidia_preparation(
+    result: crate::adapters::error::Result<NvidiaPreparationOutcome>,
+    machine: &MachineName,
+    system_operations: &SystemOperationStore,
+    skip_permission_denied: bool,
+) -> Result<(), MachinePreparationError> {
+    match result {
+        Ok(NvidiaPreparationOutcome::NotConfigured) => Ok(()),
+        Ok(NvidiaPreparationOutcome::Synchronized) => system_operations
+            .reload_daemon()
+            .await
+            .map_err(map_machine_preparation_error),
+        Err(NspawnError::PermissionDenied) if skip_permission_denied => {
+            log::warn!(
+                "skipping NVIDIA pre-start synchronization for {}: NVIDIA state could not be read without elevated privileges",
+                machine,
+            );
+            Ok(())
+        }
+        Err(error) => Err(map_machine_preparation_error(error)),
+    }
+}
+
+fn map_machine_preparation_error(error: NspawnError) -> MachinePreparationError {
+    let permission_denied = error.is_polkit_rejection()
+        || matches!(&error, NspawnError::PermissionDenied)
+        || matches!(&error, NspawnError::GenericIo(source) | NspawnError::Io(_, source) if source.kind() == std::io::ErrorKind::PermissionDenied);
+    let invalid_configuration = matches!(
+        &error,
+        NspawnError::Validation(_) | NspawnError::InvalidConfig(_)
+    );
+    let message = error.to_string();
+    if permission_denied {
+        MachinePreparationError::permission_denied(message)
+    } else if invalid_configuration {
+        MachinePreparationError::invalid_configuration(message)
+    } else {
+        MachinePreparationError::failed(message)
+    }
+}
+
+struct CatalogMachineObservation {
+    runtime: Arc<RuntimeCatalog>,
+    systemd_tools: Arc<dyn CommandRunner>,
+}
+
+#[async_trait::async_trait]
+impl MachineObservation for CatalogMachineObservation {
+    async fn inspect(
+        &self,
+        machine: &MachineName,
+        entry: &MachineEntry,
+    ) -> RuntimeResult<MachineProperties> {
+        let query = self.runtime.inspect(machine.as_str(), entry).await?;
+        if query.value.completeness == InspectionCompleteness::RuntimeOnly {
+            let mut properties = query.value;
+            match crate::adapters::runtime::systemd_tools::append_nspawn_unit_properties_with_runner(
+                machine,
+                self.systemd_tools.as_ref(),
+                &mut properties,
+            )
+            .await
+            {
+                Ok(true) => {
+                    properties.source = InspectionSource::SystemdTools;
+                    properties.completeness = InspectionCompleteness::Full;
+                }
+                Ok(false) => {}
+                Err(error) => log::debug!(
+                    "systemd-tools lifecycle inspection for {} is not ready: {}",
+                    machine,
+                    error
+                ),
+            }
+            return Ok(properties);
+        }
+        Ok(query.value)
+    }
+
+    fn invalidate(&self) {
+        self.runtime.invalidate();
+    }
+}
+
+struct LocalStartDiagnostics {
+    runner: Arc<dyn CommandRunner>,
+}
+
+#[async_trait::async_trait]
+impl MachineStartDiagnostics for LocalStartDiagnostics {
+    async fn collect(
+        &self,
+        machine: &MachineName,
+        invocation_id: Option<String>,
+        started_epoch: u64,
+    ) -> StartFailureEvidence {
+        let unit = machine.systemd_nspawn_unit();
+        let (mut args, selector_display) = if let Some(invocation_id) = invocation_id.as_deref() {
+            (
+                vec![format!("_SYSTEMD_INVOCATION_ID={invocation_id}")],
+                format!("_SYSTEMD_INVOCATION_ID={invocation_id}"),
+            )
+        } else {
+            (
+                vec![
+                    "-u".into(),
+                    unit,
+                    "--since".into(),
+                    format!("@{started_epoch}"),
+                ],
+                format!(
+                    "-u {} --since @{started_epoch}",
+                    machine.systemd_nspawn_unit()
+                ),
+            )
+        };
+        args.extend([
+            "-n".into(),
+            "40".into(),
+            "--no-pager".into(),
+            "--quiet".into(),
+            "--output=short".into(),
+        ]);
+        let journal = self
+            .runner
+            .run_bounded("journalctl", args, std::time::Duration::from_secs(5))
+            .await
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .filter(|output| !output.is_empty());
+        StartFailureEvidence {
+            journal_command: format!("journalctl {selector_display} --no-pager"),
+            journal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::process::MockCommandRunner;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Output;
+
+    fn success() -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: vec![],
+            stderr: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_without_nvidia_does_not_reload_the_manager() {
+        let runner = MockCommandRunner::new();
+        let store = SystemOperationStore::direct(Arc::new(runner));
+        reload_after_nvidia_preparation(
+            Ok(NvidiaPreparationOutcome::NotConfigured),
+            &MachineName::new("test").unwrap(),
+            &store,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn nvidia_synchronization_requires_a_successful_reload_on_every_attempt() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .times(2)
+            .withf(|program, args, _| {
+                program == "systemctl"
+                    && args.iter().map(String::as_str).eq(["--", "daemon-reload"])
+            })
+            .returning(|_, _, _| {
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: vec![],
+                    stderr: b"Reload failed".to_vec(),
+                })
+            });
+        let store = SystemOperationStore::direct(Arc::new(runner));
+        for _ in 0..2 {
+            let error = reload_after_nvidia_preparation(
+                Ok(NvidiaPreparationOutcome::Synchronized),
+                &MachineName::new("test").unwrap(),
+                &store,
+                true,
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains("Reload failed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn only_the_normal_nvidia_read_preflight_can_skip_permission_denial() {
+        let store = SystemOperationStore::direct(Arc::new(MockCommandRunner::new()));
+        let machine = MachineName::new("test").unwrap();
+        reload_after_nvidia_preparation(Err(NspawnError::PermissionDenied), &machine, &store, true)
+            .await
+            .unwrap();
+        let error = reload_after_nvidia_preparation(
+            Err(NspawnError::PermissionDenied),
+            &machine,
+            &store,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_permission_denied());
+        let error = reload_after_nvidia_preparation(
+            Err(NspawnError::InvalidConfig("invalid NVIDIA markers".into())),
+            &machine,
+            &store,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.is_invalid_configuration());
+    }
+
+    #[tokio::test]
+    async fn systemd_tools_control_uses_fixed_typed_command() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
+                program == "machinectl"
+                    && args.iter().map(String::as_str).eq(["--", "start", "test"])
+                    && *timeout == std::time::Duration::from_secs(60)
+            })
+            .returning(|_, _, _| Ok(success()));
+
+        let outcome = execute_systemd_tools_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Launch {
+                image: ImageName::new("test").unwrap(),
+            },
+            &runner,
+        )
+        .await;
+
+        assert_eq!(outcome, MachineControlOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn systemd_tools_launch_failure_is_explicitly_not_attempted() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run_bounded().returning(|_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "machinectl missing",
+            ))
+        });
+
+        let outcome = execute_systemd_tools_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Launch {
+                image: ImageName::new("test").unwrap(),
+            },
+            &runner,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            MachineControlOutcome::NotAttempted { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn systemd_tools_mutation_timeout_has_unknown_outcome() {
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run_bounded().returning(|_, _, _| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "deadline exceeded",
+            ))
+        });
+
+        let outcome = execute_systemd_tools_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff),
+            &runner,
+        )
+        .await;
+
+        assert!(matches!(
+            outcome,
+            MachineControlOutcome::OutcomeUnknown { .. }
+        ));
+    }
+
+    #[test]
+    fn preparation_errors_keep_host_semantics_at_the_adapter_boundary() {
+        let permission = map_machine_preparation_error(NspawnError::PermissionDenied);
+        assert!(permission.is_permission_denied());
+        assert!(!permission.is_invalid_configuration());
+
+        let invalid = map_machine_preparation_error(NspawnError::InvalidConfig("bad unit".into()));
+        assert!(invalid.is_invalid_configuration());
+        assert!(!invalid.is_permission_denied());
+
+        let failed = map_machine_preparation_error(NspawnError::Runtime("probe failed".into()));
+        assert!(!failed.is_invalid_configuration());
+        assert!(!failed.is_permission_denied());
+        assert_eq!(failed.to_string(), "Runtime error: probe failed");
+    }
+}

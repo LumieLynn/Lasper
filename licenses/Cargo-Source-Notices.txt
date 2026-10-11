@@ -1,0 +1,805 @@
+Copyright and license headers retained from dependency source files.
+
+======================================================================
+bitflags 2.13.2
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+find-msvc-tools 0.1.14
+Files: src/find_tools.rs, src/registry.rs
+======================================================================
+
+// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+flate2 1.1.10
+Files: src/bufreader.rs
+======================================================================
+
+// Copyright 2013 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// <https://github.com/rust-lang/rust/blob/HEAD/COPYRIGHT>.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+form_urlencoded 1.2.2
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2013-2016 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+gethostname 1.1.0
+Files: src/lib.rs
+======================================================================
+
+// Copyright Sebastian Wiesner <sebastian@swsnr.de>
+
+// Licensed under the Apache License, Version 2.0 (the "License"); you may not
+// use this file except in compliance with the License. You may obtain a copy of
+// the License at
+
+// 	http://www.apache.org/licenses/LICENSE-2.0
+
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// License for the specific language governing permissions and limitations under
+// the License.
+
+======================================================================
+hex 0.4.3
+Files: src/lib.rs
+======================================================================
+
+// Copyright (c) 2013-2014 The Rust Project Developers.
+// Copyright (c) 2015-2020 The rust-hex Developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+ident_case 1.0.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2017 Serde Developers
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+idna 1.1.0
+Files: src/deprecated.rs, tests/deprecated.rs, tests/uts46.rs
+======================================================================
+
+// Copyright 2013-2014 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+idna 1.1.0
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2016 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+idna 1.1.0
+Files: src/punycode.rs, tests/punycode.rs
+======================================================================
+
+// Copyright 2013 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+lazy_static 1.5.1
+Files: src/core_lazy.rs, src/inline_lazy.rs
+======================================================================
+
+// Copyright 2016 lazy-static.rs Developers
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+lazy_static 1.5.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2016 lazy-static.rs Developers
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// https://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+lock_api 0.4.14
+Files: src/lib.rs, src/mutex.rs, src/remutex.rs
+======================================================================
+
+// Copyright 2018 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+lock_api 0.4.14
+Files: src/rwlock.rs
+======================================================================
+
+// Copyright 2016 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+log 0.4.34
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+log 0.4.34
+Files: src/macros.rs
+======================================================================
+
+// Copyright 2014-2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+lru 0.18.5
+Files: src/lib.rs
+======================================================================
+
+// MIT License
+
+// Copyright (c) 2016 Jerome Froelich
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+======================================================================
+nix 0.28.0
+Files: src/sys/signal.rs
+======================================================================
+
+// Portions of this file are Copyright 2014 The Rust Project Developers.
+// See https://www.rust-lang.org/policies/licenses.
+
+======================================================================
+parking_lot 0.12.5
+Files: src/condvar.rs, src/elision.rs, src/fair_mutex.rs, src/lib.rs, src/mutex.rs, src/once.rs, src/raw_fair_mutex.rs, src/raw_mutex.rs, src/raw_rwlock.rs, src/remutex.rs, src/rwlock.rs, src/util.rs
+======================================================================
+
+// Copyright 2016 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+parking_lot_core 0.9.12
+Files: src/lib.rs, src/parking_lot.rs, src/spinwait.rs, src/thread_parker/generic.rs, src/thread_parker/linux.rs, src/thread_parker/redox.rs, src/thread_parker/sgx.rs, src/thread_parker/unix.rs, src/thread_parker/wasm.rs, src/thread_parker/wasm_atomic.rs, src/thread_parker/windows/keyed_event.rs, src/thread_parker/windows/mod.rs, src/thread_parker/windows/waitaddress.rs, src/word_lock.rs
+======================================================================
+
+// Copyright 2016 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+parking_lot_core 0.9.12
+Files: src/util.rs
+======================================================================
+
+// Copyright 2016 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+// Option::unchecked_unwrap
+
+======================================================================
+percent-encoding 2.3.2
+Files: src/ascii_set.rs, src/lib.rs
+======================================================================
+
+// Copyright 2013-2016 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+rio-grapheme-width 0.5.28
+Files: src/emoji.rs
+======================================================================
+
+// Forked verbatim (modulo module paths) from
+// https://github.com/wezterm/wezterm/blob/main/wezterm-char-props/src/emoji.rs
+// (MIT, Copyright (c) 2018-Present Wez Furlong).
+
+======================================================================
+rio-graphics 0.5.28
+Files: src/glyph/mod.rs, src/lib.rs
+======================================================================
+
+// Copyright (c) 2023-present, Raphael Amorim.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+======================================================================
+rio-unicode 0.5.28
+Files: src/lib.rs, src/tests.rs
+======================================================================
+
+// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+rio-unicode 0.5.28
+Files: src/tables.rs
+======================================================================
+
+// Copyright 2012-2022 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+// NOTE: The following code was generated by "scripts/unicode.py", do not edit directly
+
+======================================================================
+rio-vt 0.5.28
+Files: src/config/mod.rs, src/crosswords/formatter.rs, src/lib.rs
+======================================================================
+
+// Copyright (c) 2023-present, Raphael Amorim.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+
+======================================================================
+rio-vt 0.5.28
+Files: src/crosswords/square.rs
+======================================================================
+
+// Copyright (c) 2023-present, Raphael Amorim.
+//
+// This source code is licensed under the MIT license found in the
+// LICENSE file in the root directory of this source tree.
+//
+// In rio it has been rewritten as a packed `u64`. The previous design held
+// `c`, `fg`, `bg`, `flags`, and an `Option<Arc<CellExtra>>` inline (24 bytes
+// per cell + per-cell heap allocations for "extras"). All variable-sized
+// data now lives in per-grid side tables (`StyleSet`, `ExtrasTable`); the
+// cell itself is 8 bytes.
+
+======================================================================
+rust-ini 0.21.3
+Files: src/lib.rs
+======================================================================
+
+// The MIT License (MIT)
+
+// Copyright (c) 2014 Y. T. CHUNG
+
+// Permission is hereby granted, free of charge, to any person obtaining a copy of
+// this software and associated documentation files (the "Software"), to deal in
+// the Software without restriction, including without limitation the rights to
+// use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+// the Software, and to permit persons to whom the Software is furnished to do so,
+// subject to the following conditions:
+
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+// FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+// COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+// IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+// CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+======================================================================
+rustc_version 0.4.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2016 rustc-version-rs developers
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+ryu 1.0.23
+Files: src/common.rs
+======================================================================
+
+// Translated from C to Rust. The original C code can be found at
+// https://github.com/ulfjack/ryu and carries the following license:
+//
+// Copyright 2018 Ulf Adams
+//
+// The contents of this file may be used under the terms of the Apache License,
+// Version 2.0.
+//
+//    (See accompanying file LICENSE-Apache or copy at
+//     http://www.apache.org/licenses/LICENSE-2.0)
+//
+// Alternatively, the contents of this file may be used under the terms of
+// the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE-Boost or copy at
+//     https://www.boost.org/LICENSE_1_0.txt)
+//
+// Unless required by applicable law or agreed to in writing, this software
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.
+
+// Returns the number of decimal digits in v, which must not contain more than 9
+// digits.
+
+======================================================================
+ryu 1.0.23
+Files: src/d2s.rs, src/d2s_full_table.rs, src/d2s_intrinsics.rs, src/d2s_small_table.rs, src/f2s.rs, src/f2s_intrinsics.rs, tests/common_test.rs, tests/d2s_intrinsics_test.rs, tests/d2s_table_test.rs, tests/d2s_test.rs, tests/f2s_test.rs, tests/s2d_test.rs, tests/s2f_test.rs
+======================================================================
+
+// Translated from C to Rust. The original C code can be found at
+// https://github.com/ulfjack/ryu and carries the following license:
+//
+// Copyright 2018 Ulf Adams
+//
+// The contents of this file may be used under the terms of the Apache License,
+// Version 2.0.
+//
+//    (See accompanying file LICENSE-Apache or copy at
+//     http://www.apache.org/licenses/LICENSE-2.0)
+//
+// Alternatively, the contents of this file may be used under the terms of
+// the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE-Boost or copy at
+//     https://www.boost.org/LICENSE_1_0.txt)
+//
+// Unless required by applicable law or agreed to in writing, this software
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.
+
+======================================================================
+ryu 1.0.23
+Files: src/digit_table.rs
+======================================================================
+
+// Translated from C to Rust. The original C code can be found at
+// https://github.com/ulfjack/ryu and carries the following license:
+//
+// Copyright 2018 Ulf Adams
+//
+// The contents of this file may be used under the terms of the Apache License,
+// Version 2.0.
+//
+//    (See accompanying file LICENSE-Apache or copy at
+//     http://www.apache.org/licenses/LICENSE-2.0)
+//
+// Alternatively, the contents of this file may be used under the terms of
+// the Boost Software License, Version 1.0.
+//    (See accompanying file LICENSE-Boost or copy at
+//     https://www.boost.org/LICENSE_1_0.txt)
+//
+// Unless required by applicable law or agreed to in writing, this software
+// is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.
+
+// A table of all two-digit numbers. This is used to speed up decimal digit
+// generation by copying pairs of digits into the final output.
+
+======================================================================
+shell-words 1.1.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2018 Tomasz Miąsko
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE>
+// or the MIT license <LICENSE-MIT>, at your option.
+//
+
+======================================================================
+shlex 2.0.1
+Files: src/bytes.rs, src/lib.rs
+======================================================================
+
+// Copyright 2015 Nicholas Allegra (comex).
+// Licensed under the Apache License, Version 2.0 <https://www.apache.org/licenses/LICENSE-2.0> or
+// the MIT license <https://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+siphasher 1.0.4
+Files: src/sip.rs, src/sip128.rs
+======================================================================
+
+// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+siphasher 1.0.4
+Files: src/tests.rs, src/tests128.rs
+======================================================================
+
+// Copyright 2014 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+socket2 0.6.5
+Files: src/lib.rs, src/socket.rs, src/sys/unix.rs, src/sys/windows.rs
+======================================================================
+
+// Copyright 2015 The Rust Project Developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// https://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or https://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+stable_deref_trait 1.2.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2017 Robert Grosse
+
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+tempfile 3.27.0
+Files: src/dir/mod.rs
+======================================================================
+
+// Copyright 2015 The Rust Project Developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+tempfile 3.27.0
+Files: tests/tempdir.rs
+======================================================================
+
+// Copyright 2013-2014 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+thread_local 1.1.10
+Files: src/lib.rs, src/thread_id.rs
+======================================================================
+
+// Copyright 2017 Amanieu d'Antras
+//
+// Licensed under the Apache License, Version 2.0, <LICENSE-APACHE or
+// http://apache.org/licenses/LICENSE-2.0> or the MIT license <LICENSE-MIT or
+// http://opensource.org/licenses/MIT>, at your option. This file may not be
+// copied, modified, or distributed except according to those terms.
+
+======================================================================
+toml 1.1.6+spec-1.1.0
+Files: src/map.rs
+======================================================================
+
+// Copyright 2017 Serde Developers
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+unicode-segmentation 1.13.3
+Files: src/grapheme.rs, src/sentence.rs, src/word.rs
+======================================================================
+
+// Copyright 2012-2014 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+unicode-segmentation 1.13.3
+Files: src/lib.rs, tests/test.rs
+======================================================================
+
+// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+unicode-segmentation 1.13.3
+Files: src/tables.rs, tests/testdata/mod.rs
+======================================================================
+
+// Copyright 2012-2018 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+// NOTE: The following code was generated by "scripts/unicode.py", do not edit directly
+
+======================================================================
+unicode-truncate 2.0.1
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2019 Aetf <aetf at unlimitedcodeworks dot xyz>.
+// See the COPYRIGHT file at the top-level directory of this distribution.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+unicode-width 0.2.2
+Files: benches/benches.rs, src/lib.rs, tests/tests.rs
+======================================================================
+
+// Copyright 2012-2025 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+unicode-width 0.2.2
+Files: src/tables.rs
+======================================================================
+
+// Copyright 2012-2025 The Rust Project Developers. See the COPYRIGHT
+// file at the top-level directory of this distribution and at
+// http://rust-lang.org/COPYRIGHT.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+// NOTE: The following code was generated by "scripts/unicode.py", do not edit directly
+
+======================================================================
+url 2.5.8
+Files: src/host.rs, src/parser.rs
+======================================================================
+
+// Copyright 2013-2016 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+url 2.5.8
+Files: src/lib.rs
+======================================================================
+
+// Copyright 2013-2015 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+url 2.5.8
+Files: src/origin.rs, src/path_segments.rs, src/quirks.rs, src/slicing.rs
+======================================================================
+
+// Copyright 2016 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+url 2.5.8
+Files: tests/unit.rs, tests/wpt.rs
+======================================================================
+
+// Copyright 2013-2014 The rust-url developers.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+uuid 1.27.0
+Files: src/builder.rs, src/external/serde_support.rs, src/external/slog_support.rs, src/fmt.rs, src/lib.rs, src/parser.rs
+======================================================================
+
+// Copyright 2013-2014 The Rust Project Developers.
+// Copyright 2018 The Uuid Project Developers.
+//
+// See the COPYRIGHT file at the top-level directory of this distribution.
+//
+// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
+// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
+// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
+// option. This file may not be copied, modified, or distributed
+// except according to those terms.
+
+======================================================================
+x11rb 0.14.0
+Files: examples/hypnomoire.rs
+======================================================================
+
+// This is a (rough) port of hypnomoire from the xcb-demo repository.
+// The original file has Copyright (C) 2001-2002 Bart Massey and Jamey Sharp and is licensed under
+// a MIT license.

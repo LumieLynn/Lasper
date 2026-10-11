@@ -1,0 +1,1979 @@
+use super::nspawn_source::{NspawnConfigSource, NspawnConfigSourceKind, NspawnConfigSources};
+use super::nspawn_spec::NspawnConfigSpec;
+use super::{settings_lock, MAX_NSPAWN_CONTENT_BYTES};
+use crate::adapters::config::nspawn_file::{
+    nspawn_config_content_from_spec_with_wayland_binds, NspawnConfig,
+};
+use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::filesystem::AsyncLockedWriter;
+use crate::adapters::platform::nvidia::NvidiaState;
+use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
+use crate::domain::machine::MachineName;
+use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
+use crate::domain::runtime::ImageName;
+use crate::domain::wayland::{WaylandBindPolicy, WaylandGrant};
+use crate::domain::x11::X11BindIntent;
+use serde::{Deserialize, Serialize};
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+
+const MAX_NVIDIA_BINDS: usize = 16384;
+const LASPER_OCI_CONFIG_MARKER: &str =
+    "# Managed by Lasper: promoted systemd OCI runtime configuration";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NspawnConfigPresence {
+    Absent,
+    Regular,
+    Unsafe,
+}
+
+/// Typed read/write access to `.nspawn` configuration files.
+#[derive(Clone)]
+pub struct NspawnConfigStore {
+    executor: Arc<dyn NspawnConfigExecutor>,
+}
+
+impl NspawnConfigStore {
+    pub(crate) fn direct() -> Self {
+        Self {
+            executor: Arc::new(DirectNspawnConfigExecutor),
+        }
+    }
+
+    pub(crate) fn elevated(daemon: Arc<ElevatedDaemon>) -> Self {
+        Self {
+            executor: Arc::new(ElevatedNspawnConfigExecutor { daemon }),
+        }
+    }
+
+    pub async fn read(&self, name: &str) -> Result<Option<NspawnConfig>> {
+        let machine = parse_machine_name(name)?;
+        let result = self
+            .execute(NspawnConfigOperation::Read(ReadNspawnConfig { machine }))
+            .await?;
+        Ok(result.content.map(NspawnConfig::from))
+    }
+
+    /// Inspect the effective `.nspawn` file using systemd's discovery order.
+    pub async fn inspect(&self, name: &str) -> Result<Option<NspawnConfig>> {
+        let image = parse_image_name(name)?;
+        let result = self
+            .execute(NspawnConfigOperation::Inspect(InspectNspawnConfig {
+                image,
+            }))
+            .await?;
+        Ok(result.content.map(NspawnConfig::from))
+    }
+
+    pub async fn write_generated(
+        &self,
+        config: &MachineProvisioningConfig,
+        wayland: &[WaylandGrant],
+        nvidia_state: Option<&NvidiaState>,
+    ) -> Result<ResourceApplyStatus> {
+        let spec = NspawnConfigSpec::try_from(config)?;
+        let result = self
+            .execute(NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
+                spec,
+                wayland: wayland.to_vec(),
+                nvidia_state: nvidia_state.cloned(),
+            })))
+            .await?;
+        result
+            .apply
+            .ok_or_else(|| NspawnError::Runtime("nspawn write returned no apply status".into()))
+    }
+
+    pub async fn promote_oci(
+        &self,
+        name: &str,
+        network: OciNetworkMode,
+    ) -> Result<ResourceApplyStatus> {
+        let result = self
+            .execute(NspawnConfigOperation::PromoteOci(PromoteOciConfig {
+                machine: parse_machine_name(name)?,
+                network,
+            }))
+            .await?;
+        result
+            .apply
+            .ok_or_else(|| NspawnError::Runtime("OCI promotion returned no apply status".into()))
+    }
+
+    pub async fn prepare_oci_promotion(&self, name: &str) -> Result<()> {
+        self.execute(NspawnConfigOperation::PrepareOciPromotion(
+            PrepareOciPromotion {
+                machine: parse_machine_name(name)?,
+            },
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_gpu(
+        &self,
+        name: &str,
+        state: &NvidiaState,
+        removed_binds: &[crate::adapters::platform::nvidia::state::PassthroughBind],
+    ) -> Result<()> {
+        self.execute(NspawnConfigOperation::UpdateGpu(Box::new(
+            UpdateNspawnGpu {
+                machine: parse_machine_name(name)?,
+                state: state.clone(),
+                removed_binds: removed_binds.to_vec(),
+            },
+        )))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove(&self, name: &str) -> Result<()> {
+        self.execute(NspawnConfigOperation::Remove(RemoveNspawnConfig {
+            machine: parse_machine_name(name)?,
+        }))
+        .await?;
+        Ok(())
+    }
+
+    /// Reclaim sidecar locks after systemd removes an image's administrator
+    /// `.nspawn` file. The configuration itself is never removed here.
+    pub async fn cleanup_sidecar_locks(&self, name: &str) -> Result<bool> {
+        let result = self
+            .execute(NspawnConfigOperation::CleanupSidecarLocks(
+                CleanupNspawnSidecarLocks {
+                    image: parse_image_name(name)?,
+                },
+            ))
+            .await?;
+        Ok(result.sidecars_cleaned.unwrap_or(false))
+    }
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+        self.executor.execute(operation).await
+    }
+}
+
+impl std::fmt::Debug for NspawnConfigStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NspawnConfigStore")
+            .field("route", &self.executor.route())
+            .finish()
+    }
+}
+
+#[async_trait::async_trait]
+trait NspawnConfigExecutor: Send + Sync + 'static {
+    fn route(&self) -> &'static str;
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult>;
+}
+
+struct DirectNspawnConfigExecutor;
+
+#[async_trait::async_trait]
+impl NspawnConfigExecutor for DirectNspawnConfigExecutor {
+    fn route(&self) -> &'static str {
+        "direct"
+    }
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+        execute_nspawn_config_operation(operation, invoking_uid()).await
+    }
+}
+
+struct ElevatedNspawnConfigExecutor {
+    daemon: Arc<ElevatedDaemon>,
+}
+
+#[async_trait::async_trait]
+impl NspawnConfigExecutor for ElevatedNspawnConfigExecutor {
+    fn route(&self) -> &'static str {
+        "elevated_rpc"
+    }
+
+    async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+        self.daemon
+            .nspawn_config(operation)
+            .await
+            .map_err(|error| NspawnError::Runtime(error.to_string()))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", content = "params", rename_all = "snake_case")]
+pub(crate) enum NspawnConfigOperation {
+    Read(ReadNspawnConfig),
+    Inspect(InspectNspawnConfig),
+    Write(Box<WriteNspawnConfig>),
+    PrepareOciPromotion(PrepareOciPromotion),
+    PromoteOci(PromoteOciConfig),
+    UpdateGpu(Box<UpdateNspawnGpu>),
+    Remove(RemoveNspawnConfig),
+    CleanupSidecarLocks(CleanupNspawnSidecarLocks),
+}
+
+impl NspawnConfigOperation {
+    fn settings_machine(&self) -> Option<MachineName> {
+        match self {
+            Self::Read(_)
+            | Self::Inspect(_)
+            | Self::PrepareOciPromotion(_)
+            | Self::CleanupSidecarLocks(_) => None,
+            Self::Write(request) => Some(request.spec.machine.clone()),
+            Self::PromoteOci(request) => Some(request.machine.clone()),
+            Self::UpdateGpu(request) => Some(request.machine.clone()),
+            Self::Remove(request) => Some(request.machine.clone()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ReadNspawnConfig {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InspectNspawnConfig {
+    image: ImageName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WriteNspawnConfig {
+    spec: NspawnConfigSpec,
+    wayland: Vec<WaylandGrant>,
+    nvidia_state: Option<NvidiaState>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PromoteOciConfig {
+    machine: MachineName,
+    network: OciNetworkMode,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PrepareOciPromotion {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateNspawnGpu {
+    machine: MachineName,
+    state: NvidiaState,
+    removed_binds: Vec<crate::adapters::platform::nvidia::state::PassthroughBind>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NspawnConfigResult {
+    content: Option<NspawnConfigInspection>,
+    #[serde(default)]
+    apply: Option<ResourceApplyStatus>,
+    #[serde(default)]
+    sidecars_cleaned: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct NspawnConfigInspection {
+    path: PathBuf,
+    content: String,
+}
+
+impl From<NspawnConfigInspection> for NspawnConfig {
+    fn from(inspection: NspawnConfigInspection) -> Self {
+        Self {
+            path: inspection.path,
+            content: inspection.content,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RemoveNspawnConfig {
+    machine: MachineName,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CleanupNspawnSidecarLocks {
+    image: ImageName,
+}
+
+pub(crate) async fn execute_nspawn_config_operation(
+    operation: NspawnConfigOperation,
+    invoking_uid: u32,
+) -> Result<NspawnConfigResult> {
+    let _settings_lock = match operation.settings_machine() {
+        Some(machine) => Some(settings_lock::acquire(machine).await?),
+        None => None,
+    };
+    match operation {
+        NspawnConfigOperation::Read(request) => {
+            let path = nspawn_path(&request.machine);
+            Ok(NspawnConfigResult {
+                content: read_config_at(&path).await?,
+                ..Default::default()
+            })
+        }
+        NspawnConfigOperation::Inspect(request) => Ok(NspawnConfigResult {
+            content: read_discovered_config(&request.image).await?,
+            ..Default::default()
+        }),
+        NspawnConfigOperation::Write(request) => {
+            let apply = write_generated_at(
+                &nspawn_path(&request.spec.machine),
+                &request.spec,
+                &request.wayland,
+                request.nvidia_state.as_ref(),
+                invoking_uid,
+            )
+            .await?;
+            Ok(NspawnConfigResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
+        }
+        NspawnConfigOperation::PromoteOci(request) => {
+            let admin = crate::paths::nspawn_config_dir();
+            let runtime = crate::paths::nspawn_runtime_config_dir();
+            let apply = promote_new_oci_config(
+                &request.machine,
+                request.network,
+                &crate::paths::machines_dir(),
+                &admin,
+                &runtime,
+            )
+            .await?;
+            Ok(NspawnConfigResult {
+                apply: Some(apply),
+                ..Default::default()
+            })
+        }
+        NspawnConfigOperation::PrepareOciPromotion(request) => {
+            let admin = crate::paths::nspawn_config_dir();
+            let runtime = crate::paths::nspawn_runtime_config_dir();
+            validate_oci_promotion_target(&request.machine, &admin, &runtime).await?;
+            Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::UpdateGpu(request) => {
+            update_gpu_at(
+                &nspawn_path(&request.machine),
+                request.machine,
+                request.state,
+                request.removed_binds,
+            )
+            .await?;
+            Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::Remove(request) => {
+            let path = nspawn_path(&request.machine);
+            remove_config_at(&path).await?;
+            Ok(NspawnConfigResult::default())
+        }
+        NspawnConfigOperation::CleanupSidecarLocks(request) => {
+            let paths = discovered_nspawn_paths(&request.image);
+            let cleaned = cleanup_sidecar_locks_at(&paths).await?;
+            Ok(NspawnConfigResult {
+                sidecars_cleaned: Some(cleaned),
+                ..Default::default()
+            })
+        }
+    }
+}
+
+fn parse_machine_name(name: &str) -> Result<MachineName> {
+    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn parse_image_name(name: &str) -> Result<ImageName> {
+    ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+}
+
+fn nspawn_path(machine: &MachineName) -> PathBuf {
+    crate::paths::nspawn_config(machine.as_str())
+}
+
+pub(crate) async fn probe_exact_nspawn_config(
+    machine: &MachineName,
+) -> Result<NspawnConfigPresence> {
+    probe_nspawn_config_at(&nspawn_path(machine)).await
+}
+
+async fn probe_nspawn_config_at(path: &Path) -> Result<NspawnConfigPresence> {
+    let path = path.to_path_buf();
+    let metadata = match tokio::fs::symlink_metadata(&path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(NspawnConfigPresence::Absent)
+        }
+        Err(error) => return Err(NspawnError::Io(path, error)),
+    };
+    Ok(
+        if metadata.file_type().is_file() && metadata.len() <= MAX_NSPAWN_CONTENT_BYTES as u64 {
+            NspawnConfigPresence::Regular
+        } else {
+            NspawnConfigPresence::Unsafe
+        },
+    )
+}
+
+fn discovered_nspawn_paths(image: &ImageName) -> Vec<PathBuf> {
+    NspawnConfigSources::for_image(image)
+        .paths()
+        .map(Path::to_path_buf)
+        .collect()
+}
+
+async fn read_discovered_config(image: &ImageName) -> Result<Option<NspawnConfigInspection>> {
+    read_discovered_config_from(NspawnConfigSources::for_image(image).candidates()).await
+}
+
+async fn read_discovered_config_from(
+    sources: &[NspawnConfigSource],
+) -> Result<Option<NspawnConfigInspection>> {
+    for source in sources {
+        let path = source.path();
+        match read_bounded_utf8(path).await {
+            Ok(content) => {
+                return Ok(Some(NspawnConfigInspection {
+                    path: path.to_path_buf(),
+                    content,
+                }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // `/var/lib/machines` is often deliberately inaccessible to the
+            // unprivileged UI process. It is an optional inspection source,
+            // so an inaccessible adjacent file does not hide trusted config.
+            Err(error)
+                if source.kind() == NspawnConfigSourceKind::ImageAdjacent
+                    && error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                log::debug!(
+                    "Skipping inaccessible image-adjacent nspawn config {}",
+                    path.display()
+                );
+            }
+            Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+        }
+    }
+    Ok(None)
+}
+
+async fn read_config_at(path: &Path) -> Result<Option<NspawnConfigInspection>> {
+    let Some(content) = read_optional(path).await? else {
+        return Ok(None);
+    };
+    validate_content_size(&content)?;
+    Ok(Some(NspawnConfigInspection {
+        path: path.to_path_buf(),
+        content,
+    }))
+}
+
+async fn read_optional(path: &Path) -> Result<Option<String>> {
+    match read_bounded_utf8(path).await {
+        Ok(content) => Ok(Some(content)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn read_bounded_utf8(path: &Path) -> std::io::Result<String> {
+    let file = tokio::fs::File::open(path).await?;
+    let metadata = file.metadata().await?;
+    if metadata.len() > MAX_NSPAWN_CONTENT_BYTES as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(".nspawn content exceeds {} bytes", MAX_NSPAWN_CONTENT_BYTES),
+        ));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take((MAX_NSPAWN_CONTENT_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.len() > MAX_NSPAWN_CONTENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(".nspawn content exceeds {} bytes", MAX_NSPAWN_CONTENT_BYTES),
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+async fn remove_optional_file(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn remove_config_at(path: &Path) -> Result<()> {
+    remove_optional_file(path).await?;
+    remove_optional_file(&crate::adapters::filesystem::lock_path_for(path)).await?;
+    remove_optional_file(&path.with_extension("lock")).await?;
+    Ok(())
+}
+
+async fn cleanup_sidecar_locks_at(paths: &[PathBuf]) -> Result<bool> {
+    let mut cleaned = false;
+    for path in paths {
+        match tokio::fs::symlink_metadata(path).await {
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(NspawnError::Io(path.to_path_buf(), error)),
+        }
+
+        let lock_path = crate::adapters::filesystem::lock_path_for(path);
+        let legacy_lock_path = path.with_extension("lock");
+        cleaned |= AsyncLockedWriter::remove_lock_if_target_absent(path, &lock_path).await?;
+        cleaned |= AsyncLockedWriter::remove_lock_if_target_absent(path, &legacy_lock_path).await?;
+    }
+    Ok(cleaned)
+}
+
+async fn apply_new_content_at(
+    path: &Path,
+    content: String,
+    mode: Option<u32>,
+) -> Result<ResourceApplyStatus> {
+    let apply = move |existing: Option<String>| {
+        Ok(match existing {
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
+        })
+    };
+    match mode {
+        Some(mode) => AsyncLockedWriter::apply_locked_with_mode(path, mode, apply).await,
+        None => AsyncLockedWriter::apply_locked(path, apply).await,
+    }
+}
+
+#[cfg(test)]
+async fn promote_oci_config(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<ResourceApplyStatus> {
+    promote_oci_config_inner(machine, network, machines_dir, admin_dir, runtime_dir, true).await
+}
+
+async fn promote_new_oci_config(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<ResourceApplyStatus> {
+    promote_oci_config_inner(
+        machine,
+        network,
+        machines_dir,
+        admin_dir,
+        runtime_dir,
+        false,
+    )
+    .await
+}
+
+async fn promote_oci_config_inner(
+    machine: &MachineName,
+    network: OciNetworkMode,
+    machines_dir: &Path,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+    replace_owned: bool,
+) -> Result<ResourceApplyStatus> {
+    validate_oci_promotion_target(machine, admin_dir, runtime_dir).await?;
+    let filename = format!("{}.nspawn", machine.as_str());
+    let source = machines_dir.join(&filename);
+    let destination = admin_dir.join(filename);
+    let source_content = read_trusted_oci_config(&source).await?;
+
+    let content = promote_oci_content(&source_content, network)?;
+    validate_content_size(&content)?;
+    AsyncLockedWriter::apply_locked_with_mode(&destination, 0o640, move |existing| {
+        Ok(match existing {
+            None => (Some(content), ResourceApplyStatus::Created),
+            Some(existing) if existing == content => (None, ResourceApplyStatus::Unchanged),
+            Some(existing)
+                if replace_owned && existing.lines().next() == Some(LASPER_OCI_CONFIG_MARKER) =>
+            {
+                (Some(content), ResourceApplyStatus::ReplacedOwned)
+            }
+            Some(_) => (None, ResourceApplyStatus::ConflictUnknownOwner),
+        })
+    })
+    .await
+}
+
+async fn validate_oci_promotion_target(
+    machine: &MachineName,
+    admin_dir: &Path,
+    runtime_dir: &Path,
+) -> Result<()> {
+    let filename = format!("{}.nspawn", machine.as_str());
+    let admin = admin_dir.join(&filename);
+    if let Some(metadata) = optional_symlink_metadata(&admin).await? {
+        if !metadata.file_type().is_file() {
+            return Err(NspawnError::Validation(format!(
+                "Refusing to replace non-regular administrator configuration: {}",
+                admin.display()
+            )));
+        }
+        let existing = tokio::fs::read_to_string(&admin)
+            .await
+            .map_err(|error| NspawnError::Io(admin.clone(), error))?;
+        validate_content_size(&existing)?;
+        if existing.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
+            return Err(NspawnError::Validation(format!(
+                "Refusing to replace existing administrator configuration: {}",
+                admin.display()
+            )));
+        }
+    }
+
+    let runtime = runtime_dir.join(filename);
+    if optional_symlink_metadata(&runtime).await?.is_some() {
+        return Err(NspawnError::Validation(format!(
+            "Refusing to mask existing runtime configuration: {}",
+            runtime.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn optional_symlink_metadata(path: &Path) -> Result<Option<std::fs::Metadata>> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(NspawnError::Io(path.to_path_buf(), error)),
+    }
+}
+
+async fn read_trusted_oci_config(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || read_trusted_oci_config_blocking(&path))
+        .await
+        .map_err(|error| NspawnError::Runtime(format!("OCI config reader failed: {error}")))?
+}
+
+fn read_trusted_oci_config_blocking(path: &Path) -> Result<String> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| {
+            if error.raw_os_error() == Some(libc::ELOOP) {
+                NspawnError::Validation(format!(
+                    "OCI runtime configuration is not a regular file: {}",
+                    path.display()
+                ))
+            } else {
+                NspawnError::Io(path.to_path_buf(), error)
+            }
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    if !metadata.file_type().is_file() {
+        return Err(NspawnError::Validation(format!(
+            "OCI runtime configuration is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.uid() != uzers::get_current_uid() || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(NspawnError::Validation(format!(
+            "OCI runtime configuration is not owned exclusively by the privileged executor: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() > MAX_NSPAWN_CONTENT_BYTES as u64 {
+        return Err(NspawnError::Validation(format!(
+            ".nspawn content exceeds {} bytes",
+            MAX_NSPAWN_CONTENT_BYTES
+        )));
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_NSPAWN_CONTENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+    if bytes.len() > MAX_NSPAWN_CONTENT_BYTES {
+        return Err(NspawnError::Validation(format!(
+            ".nspawn content exceeds {} bytes",
+            MAX_NSPAWN_CONTENT_BYTES
+        )));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        NspawnError::Validation(format!(
+            "OCI runtime configuration is not valid UTF-8: {error}"
+        ))
+    })
+}
+
+fn promote_oci_content(content: &str, network: OciNetworkMode) -> Result<String> {
+    let had_trailing_newline = content.ends_with('\n');
+    let mut result = Vec::new();
+    let mut in_exec = false;
+    let mut in_network = false;
+    let mut found_exec = false;
+    let mut found_network = false;
+
+    if content.lines().next() != Some(LASPER_OCI_CONFIG_MARKER) {
+        result.push(LASPER_OCI_CONFIG_MARKER.to_string());
+    }
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_network {
+                append_oci_network_policy(&mut result, network);
+            }
+            in_exec = trimmed == "[Exec]";
+            in_network = trimmed == "[Network]";
+            if in_exec {
+                found_exec = true;
+            }
+            if in_network {
+                found_network = true;
+            }
+            result.push(line.to_string());
+            if in_exec {
+                result.push("PrivateUsers=no".to_string());
+                result.push(format!("ResolvConf={}", oci_resolv_conf(network)));
+            }
+            continue;
+        }
+
+        let is_private_users = in_exec
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "PrivateUsers");
+        let is_resolv_conf = in_exec
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "ResolvConf");
+        let is_managed_network_key = in_network
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| oci_managed_network_key(key.trim()));
+        if !is_private_users && !is_resolv_conf && !is_managed_network_key {
+            result.push(line.to_string());
+        }
+    }
+
+    if !found_exec {
+        return Err(NspawnError::Validation(
+            "OCI runtime configuration has no [Exec] section".into(),
+        ));
+    }
+
+    if in_network {
+        append_oci_network_policy(&mut result, network);
+    }
+    if !found_network {
+        if result.last().is_some_and(|line| !line.is_empty()) {
+            result.push(String::new());
+        }
+        result.push("[Network]".to_string());
+        append_oci_network_policy(&mut result, network);
+    }
+
+    let mut promoted = result.join("\n");
+    if had_trailing_newline {
+        promoted.push('\n');
+    }
+    validate_content_size(&promoted)?;
+    Ok(promoted)
+}
+
+fn oci_resolv_conf(network: OciNetworkMode) -> &'static str {
+    match network {
+        OciNetworkMode::Host => "bind-host",
+        OciNetworkMode::Isolated | OciNetworkMode::Veth => "off",
+    }
+}
+
+fn append_oci_network_policy(result: &mut Vec<String>, network: OciNetworkMode) {
+    match network {
+        OciNetworkMode::Host => {
+            result.push("Private=no".to_string());
+            result.push("VirtualEthernet=no".to_string());
+        }
+        OciNetworkMode::Isolated => {
+            result.push("Private=yes".to_string());
+            result.push("VirtualEthernet=no".to_string());
+        }
+        OciNetworkMode::Veth => {
+            result.push("Private=yes".to_string());
+            result.push("VirtualEthernet=yes".to_string());
+        }
+    }
+}
+
+fn oci_managed_network_key(key: &str) -> bool {
+    matches!(
+        key,
+        "Private"
+            | "VirtualEthernet"
+            | "VirtualEthernetExtra"
+            | "Interface"
+            | "MACVLAN"
+            | "IPVLAN"
+            | "Bridge"
+            | "Zone"
+            | "NamespacePath"
+            | "Port"
+    )
+}
+
+async fn write_generated_at(
+    path: &Path,
+    spec: &NspawnConfigSpec,
+    wayland: &[WaylandGrant],
+    nvidia_state: Option<&NvidiaState>,
+    invoking_uid: u32,
+) -> Result<ResourceApplyStatus> {
+    spec.validate()?;
+    validate_custom_bind_sources(spec).await?;
+    validate_x11_bind_sources(&spec.x11_binds).await?;
+    let mut wayland_binds = Vec::new();
+    for grant in wayland {
+        let sockets = validate_wayland_grant(spec, grant, invoking_uid).await?;
+        wayland_binds.extend(grant.sockets().iter().zip(sockets).map(|(socket, source)| {
+            crate::adapters::wayland::WaylandBind::new(
+                source,
+                grant.target().uid,
+                socket.source().display(),
+                grant.bind_policy(),
+            )
+        }));
+    }
+    if let Some(state) = nvidia_state {
+        validate_nvidia_update(state, &[])?;
+    }
+
+    let mut content = nspawn_config_content_from_spec_with_wayland_binds(spec, &wayland_binds)?;
+    if let Some(state) = nvidia_state {
+        content = NspawnConfig::apply_gpu_passthrough_to_content(content, state, &[])?;
+    }
+    validate_content_size(&content)?;
+    apply_new_content_at(path, content, Some(0o644)).await
+}
+
+async fn validate_custom_bind_sources(spec: &NspawnConfigSpec) -> Result<()> {
+    for bind in &spec.bind_mounts {
+        let source = PathBuf::from(&bind.source);
+        match tokio::fs::metadata(&source).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(NspawnError::Validation(format!(
+                    "Bind source does not exist: {}",
+                    source.display()
+                )));
+            }
+            Err(error) => return Err(NspawnError::Io(source, error)),
+        }
+    }
+    Ok(())
+}
+
+async fn validate_x11_bind_sources(binds: &[X11BindIntent]) -> Result<()> {
+    for bind in binds {
+        let source = bind.source_path();
+        let canonical = tokio::fs::canonicalize(source)
+            .await
+            .map_err(|error| NspawnError::Io(source.to_path_buf(), error))?;
+        let metadata = tokio::fs::metadata(&canonical)
+            .await
+            .map_err(|error| NspawnError::Io(canonical.clone(), error))?;
+        if bind.is_directory() {
+            if canonical != Path::new(crate::domain::x11::X11_SOCKET_DIRECTORY)
+                || !metadata.is_dir()
+                || !crate::adapters::platform::x11::x11_socket_directory_available().await
+            {
+                return Err(NspawnError::Validation(format!(
+                    "X11 bind directory changed since selection: {}",
+                    source.display()
+                )));
+            }
+        } else {
+            let Some(socket) = bind.socket() else {
+                unreachable!("non-directory X11 bind must carry socket evidence")
+            };
+            if canonical != socket.canonical_path() {
+                return Err(NspawnError::Validation(format!(
+                    "X11 bind source changed since discovery: {}",
+                    source.display()
+                )));
+            }
+            let revision = socket.revision();
+            if !metadata.file_type().is_socket()
+                || metadata.dev() != revision.device
+                || metadata.ino() != revision.inode
+                || metadata.ctime() != revision.ctime_seconds
+                || metadata.ctime_nsec() != revision.ctime_nanoseconds
+            {
+                return Err(NspawnError::Validation(format!(
+                    "X11 bind endpoint changed since discovery: {}",
+                    source.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn update_gpu_at(
+    path: &Path,
+    machine: MachineName,
+    state: NvidiaState,
+    removed_binds: Vec<crate::adapters::platform::nvidia::state::PassthroughBind>,
+) -> Result<()> {
+    validate_nvidia_update(&state, &removed_binds)?;
+    AsyncLockedWriter::write_locked(path, move |existing| {
+        let content = existing.ok_or_else(|| {
+            NspawnError::Runtime(format!("No .nspawn configuration found for {machine}"))
+        })?;
+        let updated =
+            NspawnConfig::apply_gpu_passthrough_to_content(content, &state, &removed_binds)?;
+        validate_content_size(&updated)?;
+        Ok(updated)
+    })
+    .await
+}
+
+fn validate_content_size(content: &str) -> Result<()> {
+    if content.len() > MAX_NSPAWN_CONTENT_BYTES {
+        return Err(NspawnError::Validation(format!(
+            ".nspawn content exceeds {} bytes",
+            MAX_NSPAWN_CONTENT_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn validate_nvidia_update(
+    state: &NvidiaState,
+    removed_binds: &[crate::adapters::platform::nvidia::state::PassthroughBind],
+) -> Result<()> {
+    if state.binds.len() > MAX_NVIDIA_BINDS || removed_binds.len() > MAX_NVIDIA_BINDS {
+        return Err(NspawnError::Validation(
+            "Too many NVIDIA bind entries".into(),
+        ));
+    }
+
+    for bind in &state.binds {
+        validate_absolute_value("NVIDIA host path", &bind.host_path)?;
+        validate_absolute_value("NVIDIA container path", &bind.container_path)?;
+    }
+    for bind in removed_binds {
+        validate_absolute_value("removed NVIDIA host path", &bind.host_path)?;
+        validate_absolute_value("removed NVIDIA container path", &bind.container_path)?;
+    }
+    Ok(())
+}
+
+fn validate_absolute_value(label: &str, value: &str) -> Result<()> {
+    if value.is_empty() || value.chars().any(char::is_control) || !Path::new(value).is_absolute() {
+        return Err(NspawnError::Validation(format!(
+            "Invalid {label}: {value:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn validate_wayland_grant(
+    spec: &NspawnConfigSpec,
+    grant: &WaylandGrant,
+    invoking_uid: u32,
+) -> Result<Vec<PathBuf>> {
+    validate_resolved_wayland_policy(spec, grant)?;
+    let mut sockets = Vec::with_capacity(grant.sockets().len());
+    for socket in grant.sockets() {
+        sockets.push(
+            crate::adapters::wayland::revalidate_host_socket(socket.source(), invoking_uid).await?,
+        );
+    }
+    Ok(sockets)
+}
+
+fn validate_resolved_wayland_policy(spec: &NspawnConfigSpec, grant: &WaylandGrant) -> Result<()> {
+    let expected_policy = match spec.private_users {
+        Some(PrivateUsersMode::No) => WaylandBindPolicy::NoIdmap,
+        None | Some(PrivateUsersMode::Yes | PrivateUsersMode::Pick) => WaylandBindPolicy::Idmap,
+        Some(PrivateUsersMode::Managed | PrivateUsersMode::Identity) => {
+            return Err(NspawnError::Validation(
+                "Wayland grant uses an unsupported PrivateUsers mode".into(),
+            ));
+        }
+    };
+    if grant.bind_policy() != expected_policy {
+        return Err(NspawnError::Validation(
+            "Wayland grant idmap policy does not match PrivateUsers".into(),
+        ));
+    }
+    for socket in grant.sockets() {
+        let expected_access = socket.source().write_access_for(grant.target());
+        if expected_access != Some(socket.socket_access()) {
+            return Err(NspawnError::Validation(
+                "Wayland grant does not match socket DAC permissions".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn invoking_uid() -> u32 {
+    crate::adapters::platform::invoking_uid()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::provisioning::CreateUser;
+    use crate::domain::provisioning::{BindMount, IdmapSuffix};
+    use crate::domain::wayland::{SocketRevision, WaylandSocketAccess};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    struct StubNspawnConfigExecutor;
+
+    #[async_trait::async_trait]
+    impl NspawnConfigExecutor for StubNspawnConfigExecutor {
+        fn route(&self) -> &'static str {
+            "test"
+        }
+
+        async fn execute(&self, operation: NspawnConfigOperation) -> Result<NspawnConfigResult> {
+            assert!(matches!(operation, NspawnConfigOperation::Inspect(_)));
+            Ok(NspawnConfigResult {
+                content: Some(NspawnConfigInspection {
+                    path: PathBuf::from("/run/systemd/nspawn/vendor image.nspawn"),
+                    content: "[Exec]\nBoot=yes\n".into(),
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn store_delegates_to_its_fixed_executor() {
+        let store = NspawnConfigStore {
+            executor: Arc::new(StubNspawnConfigExecutor),
+        };
+
+        let inspection = store.inspect("vendor image").await.unwrap().unwrap();
+
+        assert_eq!(
+            inspection.path,
+            PathBuf::from("/run/systemd/nspawn/vendor image.nspawn")
+        );
+        assert!(inspection.content.contains("Boot=yes"));
+        assert!(format!("{store:?}").contains("test"));
+    }
+
+    #[test]
+    fn operation_deserialization_rejects_invalid_names() {
+        let managed_read = r#"{
+            "operation": "read",
+            "params": {"machine": "../escape"}
+        }"#;
+        let inspection = r#"{
+            "operation": "inspect",
+            "params": {"image": "../escape"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(managed_read).is_err());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(inspection).is_err());
+        for params in [
+            r#"{"kind":"machine","name":"../escape"}"#,
+            r#"{"kind":"image","name":"../escape"}"#,
+            r#"{"kind":"machine","name":"archlinux","path":"/tmp/untrusted"}"#,
+        ] {
+            let snapshot = format!(r#"{{"operation":"snapshot","params":{params}}}"#);
+            assert!(serde_json::from_str::<NspawnConfigOperation>(&snapshot).is_err());
+        }
+    }
+
+    #[test]
+    fn inspect_operation_accepts_image_names_beyond_machine_name_syntax() {
+        let json = r#"{
+            "operation": "inspect",
+            "params": {"image": "vendor image"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(json).is_ok());
+
+        let cleanup = r#"{
+            "operation": "cleanup_sidecar_locks",
+            "params": {"image": "vendor image"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(cleanup).is_ok());
+    }
+
+    #[test]
+    fn write_operation_contains_no_account_execution_data() {
+        let config = MachineProvisioningConfig {
+            name: "test".into(),
+            users: vec![CreateUser {
+                username: "alice".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let operation = NspawnConfigOperation::Write(Box::new(WriteNspawnConfig {
+            spec: NspawnConfigSpec::try_from(&config).unwrap(),
+            wayland: Vec::new(),
+            nvidia_state: None,
+        }));
+        let json = serde_json::to_string(&operation).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(!json.contains("root_password"));
+        assert!(value["params"]["spec"].get("users").is_none());
+    }
+
+    #[test]
+    fn oci_promotion_operation_accepts_only_supported_network_modes() {
+        let host = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "host"}
+        }"#;
+        let isolated = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "isolated"}
+        }"#;
+        let veth = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "veth"}
+        }"#;
+        let caller_selected_userns = r#"{
+            "operation": "promote_oci",
+            "params": {"machine": "web-app", "network": "host", "private_users": "managed"}
+        }"#;
+        assert!(serde_json::from_str::<NspawnConfigOperation>(host).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(isolated).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(veth).is_ok());
+        assert!(serde_json::from_str::<NspawnConfigOperation>(caller_selected_userns).is_err());
+    }
+
+    #[test]
+    fn oci_content_promotion_preserves_runtime_fields_and_unknown_content() {
+        let source = "# Generated from OCI configuration object\n\
+[Exec]\n\
+Boot=no\n\
+KillSignal=TERM\n\
+User=1000\n\
+WorkingDirectory=/srv/app\n\
+Environment=ONE=1\n\
+Environment=TWO=two words\n\
+Parameters=/usr/bin/example --serve\n\
+PrivateUsers=pick\n\
+\n\
+[Vendor]\n\
+Unknown=preserve-me\n";
+
+        let promoted = promote_oci_content(source, OciNetworkMode::Host).unwrap();
+
+        assert!(promoted.starts_with(&format!("{LASPER_OCI_CONFIG_MARKER}\n")));
+        assert_eq!(promoted.matches("PrivateUsers=no").count(), 1);
+        assert_eq!(promoted.matches("ResolvConf=bind-host").count(), 1);
+        assert!(!promoted.contains("PrivateUsers=pick"));
+        assert!(promoted.contains("[Network]"));
+        assert!(promoted.contains("Private=no"));
+        assert!(promoted.contains("VirtualEthernet=no"));
+        for preserved in [
+            "# Generated from OCI configuration object",
+            "Boot=no",
+            "KillSignal=TERM",
+            "User=1000",
+            "WorkingDirectory=/srv/app",
+            "Environment=ONE=1",
+            "Environment=TWO=two words",
+            "Parameters=/usr/bin/example --serve",
+            "[Vendor]",
+            "Unknown=preserve-me",
+        ] {
+            assert!(promoted.contains(preserved), "missing {preserved:?}");
+        }
+        assert!(promoted.ends_with('\n'));
+    }
+
+    #[test]
+    fn oci_content_promotion_rejects_missing_exec_section() {
+        let error = promote_oci_content(
+            "# Generated from OCI configuration object\n[Network]\nVirtualEthernet=no\n",
+            OciNetworkMode::Host,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("no [Exec] section")
+        ));
+    }
+
+    #[test]
+    fn oci_content_promotion_maps_network_modes_to_systemd_settings() {
+        let source = "[Exec]\nBoot=no\n\n[Network]\nBridge=br0\nPrivate=no\n";
+        for (mode, resolv_conf, private, veth) in [
+            (OciNetworkMode::Host, "bind-host", "no", "no"),
+            (OciNetworkMode::Isolated, "off", "yes", "no"),
+            (OciNetworkMode::Veth, "off", "yes", "yes"),
+        ] {
+            let promoted = promote_oci_content(source, mode).unwrap();
+            let parsed = ini::Ini::load_from_str(&promoted).unwrap();
+            assert_eq!(parsed.get_from(Some("Exec"), "PrivateUsers"), Some("no"));
+            assert_eq!(
+                parsed.get_from(Some("Exec"), "ResolvConf"),
+                Some(resolv_conf)
+            );
+            assert_eq!(parsed.get_from(Some("Network"), "Private"), Some(private));
+            assert_eq!(
+                parsed.get_from(Some("Network"), "VirtualEthernet"),
+                Some(veth)
+            );
+            assert_eq!(parsed.get_from(Some("Network"), "Bridge"), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_writes_trusted_copy_and_refreshes_owned_copy() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(
+            &source,
+            "[Exec]\nBoot=no\nEnvironment=VERSION=one\nParameters=/bin/app\n",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        let first_apply = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first_apply, ResourceApplyStatus::Created);
+        let first = tokio::fs::read_to_string(&destination).await.unwrap();
+        assert!(first.contains("PrivateUsers=no"));
+        assert!(first.contains("ResolvConf=bind-host"));
+        assert!(first.contains("Private=no"));
+        assert!(first.contains("VirtualEthernet=no"));
+        assert!(first.contains("Environment=VERSION=one"));
+        assert_eq!(
+            std::fs::metadata(&destination)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
+        );
+        assert!(crate::adapters::filesystem::lock_path_for(&destination).exists());
+
+        tokio::fs::write(
+            &source,
+            "[Exec]\nBoot=no\nEnvironment=VERSION=two\nParameters=/bin/app\n",
+        )
+        .await
+        .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let second_apply = promote_oci_config(
+            &machine,
+            OciNetworkMode::Veth,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second_apply, ResourceApplyStatus::ReplacedOwned);
+        let second = tokio::fs::read_to_string(&destination).await.unwrap();
+        assert!(second.contains("PrivateUsers=no"));
+        assert!(second.contains("ResolvConf=off"));
+        assert!(second.contains("Private=yes"));
+        assert!(second.contains("VirtualEthernet=yes"));
+        assert!(second.contains("Environment=VERSION=two"));
+        assert!(!second.contains("VERSION=one"));
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_refuses_existing_administrator_config() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        tokio::fs::write(&destination, "[Exec]\nPrivateUsers=no\n")
+            .await
+            .unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("Refusing to replace existing administrator configuration")
+        ));
+        assert_eq!(
+            tokio::fs::read_to_string(&destination).await.unwrap(),
+            "[Exec]\nPrivateUsers=no\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_does_not_accept_marker_outside_first_line() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        let destination = admin.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let existing = format!("# administrator file\n{LASPER_OCI_CONFIG_MARKER}\n[Exec]\n");
+        tokio::fs::write(&destination, &existing).await.unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, NspawnError::Validation(_)));
+        assert_eq!(
+            tokio::fs::read_to_string(&destination).await.unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_rejects_symlink_source() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let target = machines.path().join("target.nspawn");
+        let source = machines.path().join("web-app.nspawn");
+        tokio::fs::write(&target, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &source).unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("not a regular file")
+        ));
+        assert!(!admin.path().join("web-app.nspawn").exists());
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_rejects_group_writable_source() {
+        let machines = tempfile::tempdir().unwrap();
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = admin.path().join("runtime");
+        let machine = MachineName::new("web-app").unwrap();
+        let source = machines.path().join("web-app.nspawn");
+        tokio::fs::write(&source, "[Exec]\nBoot=no\nParameters=/bin/app\n")
+            .await
+            .unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o664)).unwrap();
+
+        let error = promote_oci_config(
+            &machine,
+            OciNetworkMode::Host,
+            machines.path(),
+            admin.path(),
+            &runtime,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("not owned exclusively by the privileged executor")
+        ));
+        assert!(!admin.path().join("web-app.nspawn").exists());
+    }
+
+    #[tokio::test]
+    async fn oci_promotion_preflight_rejects_runtime_config() {
+        let admin = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let machine = MachineName::new("web-app").unwrap();
+        let runtime_config = runtime.path().join("web-app.nspawn");
+        tokio::fs::write(&runtime_config, "[Exec]\nPrivateUsers=no\n")
+            .await
+            .unwrap();
+
+        let error = validate_oci_promotion_target(&machine, admin.path(), runtime.path())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message) if message.contains("existing runtime configuration")
+        ));
+    }
+
+    #[tokio::test]
+    async fn generated_write_is_typed_atomic_and_uses_persistent_lock() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.nspawn");
+        let config = MachineProvisioningConfig {
+            name: "test".into(),
+            guest_hostname: "test-host".into(),
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        let created = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(created, ResourceApplyStatus::Created);
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("Boot=yes"));
+        assert!(content.contains("Hostname=test-host"));
+        assert_eq!(
+            std::fs::symlink_metadata(&path).unwrap().mode() & 0o777,
+            0o644
+        );
+        assert!(crate::adapters::filesystem::lock_path_for(&path).exists());
+
+        let unchanged = write_generated_at(&path, &spec, &[], None, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(unchanged, ResourceApplyStatus::Unchanged);
+
+        let different = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            guest_hostname: "different".into(),
+            ..Default::default()
+        })
+        .unwrap();
+        let conflict = write_generated_at(&path, &different, &[], None, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(conflict, ResourceApplyStatus::ConflictUnknownOwner);
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), content);
+    }
+
+    #[tokio::test]
+    async fn config_discovery_prefers_admin_then_runtime_then_image_adjacent() {
+        let directory = tempfile::tempdir().unwrap();
+        let admin = directory.path().join("etc/test.nspawn");
+        let runtime = directory.path().join("run/test.nspawn");
+        let image = directory.path().join("machines/test.nspawn");
+        for path in [&admin, &runtime, &image] {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
+        }
+        tokio::fs::write(&runtime, "[Exec]\nBoot=yes\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&image, "[Exec]\nBoot=no\n").await.unwrap();
+
+        let sources = NspawnConfigSources::from_test_roots(
+            "test",
+            true,
+            admin.parent().unwrap(),
+            runtime.parent().unwrap(),
+            image.parent().unwrap(),
+        );
+        let discovered = read_discovered_config_from(sources.candidates())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(discovered.path, runtime);
+        assert!(discovered.content.contains("Boot=yes"));
+
+        tokio::fs::write(&admin, "[Exec]\nPrivateUsers=managed\n")
+            .await
+            .unwrap();
+        let discovered = read_discovered_config_from(sources.candidates())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(discovered.path, admin);
+        assert!(discovered.content.contains("PrivateUsers=managed"));
+    }
+
+    #[tokio::test]
+    async fn config_reads_reject_content_beyond_the_limit_before_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("oversized.nspawn");
+        tokio::fs::write(&path, vec![b'x'; MAX_NSPAWN_CONTENT_BYTES + 1])
+            .await
+            .unwrap();
+
+        let error = read_optional(&path).await.unwrap_err();
+        assert!(matches!(
+            error,
+            NspawnError::Io(ref error_path, ref source)
+                if error_path == &path
+                    && source.kind() == std::io::ErrorKind::InvalidData
+                    && source.to_string().contains("exceeds")
+        ));
+    }
+
+    #[tokio::test]
+    async fn generated_write_rejects_missing_custom_bind_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("test.nspawn");
+        let missing = directory.path().join("missing");
+        let config = MachineProvisioningConfig {
+            name: "test".into(),
+            bind_mounts: vec![BindMount {
+                source: missing.to_string_lossy().into_owned(),
+                target: "/srv/data".into(),
+                readonly: false,
+                suffix: IdmapSuffix::None,
+            }],
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        let error = write_generated_at(&output, &spec, &[], None, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            NspawnError::Validation(message)
+                if message.contains("Bind source does not exist")
+                    && message.contains(missing.to_str().unwrap())
+        ));
+        assert!(!output.exists());
+    }
+
+    #[tokio::test]
+    async fn generated_write_allows_custom_bind_source_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source");
+        let symlink = directory.path().join("source-link");
+        let output = directory.path().join("test.nspawn");
+        tokio::fs::write(&source, "data").await.unwrap();
+        std::os::unix::fs::symlink(&source, &symlink).unwrap();
+        let config = MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Yes),
+            bind_mounts: vec![BindMount {
+                source: symlink.to_string_lossy().into_owned(),
+                target: "/srv/data".into(),
+                readonly: true,
+                suffix: IdmapSuffix::Noidmap,
+            }],
+            ..Default::default()
+        };
+        let spec = NspawnConfigSpec::try_from(&config).unwrap();
+
+        write_generated_at(&output, &spec, &[], None, uzers::get_current_uid())
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&output).await.unwrap();
+        assert!(content.contains(&format!(
+            "BindReadOnly={}:/srv/data:noidmap",
+            symlink.display()
+        )));
+    }
+
+    #[tokio::test]
+    async fn remove_config_deletes_config_and_lock_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.nspawn");
+        let lock_path = crate::adapters::filesystem::lock_path_for(&path);
+        let legacy_lock_path = path.with_extension("lock");
+        tokio::fs::write(&path, "[Exec]\nBoot=yes\n").await.unwrap();
+        tokio::fs::write(&lock_path, "").await.unwrap();
+        tokio::fs::write(&legacy_lock_path, "").await.unwrap();
+
+        remove_config_at(&path).await.unwrap();
+
+        assert!(!path.exists());
+        assert!(!lock_path.exists());
+        assert!(!legacy_lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn cleanup_sidecar_locks_waits_for_config_removal_and_supports_spaces() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("vendor image.nspawn");
+        let lock_path = crate::adapters::filesystem::lock_path_for(&path);
+        let legacy_lock_path = path.with_extension("lock");
+        tokio::fs::write(&path, "[Exec]\nBoot=no\n").await.unwrap();
+        tokio::fs::write(&lock_path, "").await.unwrap();
+        tokio::fs::write(&legacy_lock_path, "").await.unwrap();
+
+        assert!(!cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
+        assert!(lock_path.exists());
+        assert!(legacy_lock_path.exists());
+
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
+        assert!(!lock_path.exists());
+        assert!(!legacy_lock_path.exists());
+        assert!(!cleanup_sidecar_locks_at(std::slice::from_ref(&path))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn gpu_update_preserves_existing_unmanaged_sections() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("test.nspawn");
+        tokio::fs::write(&path, "[Exec]\nBoot=yes\n\n[Custom]\nPreserve=this\n")
+            .await
+            .unwrap();
+
+        let state = NvidiaState {
+            binds: vec![crate::adapters::platform::nvidia::state::PassthroughBind {
+                host_path: "/host/libcuda.so".into(),
+                container_path: "/usr/lib/libcuda.so".into(),
+                readonly: true,
+            }],
+            ..Default::default()
+        };
+        update_gpu_at(&path, MachineName::new("test").unwrap(), state, Vec::new())
+            .await
+            .unwrap();
+
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(content.contains("Preserve=this"));
+        assert!(content.contains("X-Lasper-Nvidia-Begin=managed-by-lasper"));
+        assert!(content.contains("BindReadOnly=/host/libcuda.so:/usr/lib/libcuda.so"));
+    }
+
+    fn wayland_evidence(
+        runtime: &Path,
+        display: &str,
+    ) -> crate::domain::wayland::HostWaylandSocket {
+        let canonical_runtime = std::fs::canonicalize(runtime).unwrap();
+        let canonical_socket = std::fs::canonicalize(runtime.join(display)).unwrap();
+        let metadata = std::fs::metadata(&canonical_socket).unwrap();
+        crate::domain::wayland::HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new(display).unwrap(),
+            canonical_runtime,
+            canonical_socket,
+            uzers::get_current_uid(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            SocketRevision {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
+            },
+        )
+        .unwrap()
+    }
+
+    fn wayland_grant(runtime: &Path, display: &str) -> WaylandGrant {
+        let source = wayland_evidence(runtime, display);
+        resolved_wayland_grant(source, WaylandBindPolicy::Idmap)
+    }
+
+    fn resolved_wayland_grant(
+        source: crate::domain::wayland::HostWaylandSocket,
+        policy: WaylandBindPolicy,
+    ) -> WaylandGrant {
+        let target = crate::domain::wayland::ContainerUserIdentity {
+            username: "lumie".into(),
+            uid: source.owner_uid(),
+            gid: source.owner_gid(),
+        };
+        WaylandGrant::resolved(
+            target,
+            vec![WaylandGrant::socket(source, WaylandSocketAccess::Owner)],
+            policy,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_revalidates_private_runtime_and_socket_evidence() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = runtime.path().join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+
+        let resolved = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap();
+        assert_eq!(resolved, vec![socket_path]);
+
+        let mut forged = serde_json::to_value(&grant).unwrap();
+        forged["sockets"][0]["source"]["canonical_path"] = serde_json::json!("/etc/passwd");
+        let forged = serde_json::from_value::<WaylandGrant>(forged).unwrap();
+        assert!(
+            validate_wayland_grant(&spec, &forged, uzers::get_current_uid())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_rejects_evidence_for_a_different_runtime_socket() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let selected_path = runtime.path().join("wayland-0");
+        let other_path = runtime.path().join("wayland-1");
+        let _selected = std::os::unix::net::UnixListener::bind(&selected_path).unwrap();
+        let _other = std::os::unix::net::UnixListener::bind(&other_path).unwrap();
+        let metadata = std::fs::metadata(&other_path).unwrap();
+        let source = crate::domain::wayland::HostWaylandSocket::from_verified_parts(
+            crate::domain::wayland::WaylandDisplay::new("wayland-0").unwrap(),
+            std::fs::canonicalize(runtime.path()).unwrap(),
+            std::fs::canonicalize(&other_path).unwrap(),
+            uzers::get_current_uid(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            SocketRevision {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
+            },
+        )
+        .unwrap();
+        let grant = resolved_wayland_grant(source, WaylandBindPolicy::Idmap);
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("replaced after discovery"));
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_uses_noidmap_only_when_private_users_is_disabled() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = runtime.path().join("wayland-0");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::No),
+            ..Default::default()
+        })
+        .unwrap();
+        let idmapped = wayland_grant(runtime.path(), "wayland-0");
+        assert!(
+            validate_wayland_grant(&spec, &idmapped, uzers::get_current_uid())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("idmap policy")
+        );
+
+        let grant = resolved_wayland_grant(
+            idmapped.sockets()[0].source().clone(),
+            WaylandBindPolicy::NoIdmap,
+        );
+        let output = runtime.path().join("test.nspawn");
+        write_generated_at(
+            &output,
+            &spec,
+            std::slice::from_ref(&grant),
+            None,
+            uzers::get_current_uid(),
+        )
+        .await
+        .unwrap();
+
+        let content = tokio::fs::read_to_string(output).await.unwrap();
+        assert!(content.contains(&format!(
+            "Bind={}:/run/lasper/wayland/{}/wayland-0:noidmap",
+            socket_path.display(),
+            uzers::get_current_uid(),
+        )));
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_canonicalizes_leaf_symlink_outside_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        let target_runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(
+            target_runtime.path(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        let target_socket = target_runtime.path().join("wayland-real");
+        let _listener = std::os::unix::net::UnixListener::bind(&target_socket).unwrap();
+        let symlink_path = runtime.path().join("wayland-0");
+        std::os::unix::fs::symlink(&target_socket, &symlink_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+
+        let path = runtime.path().join("test.nspawn");
+        write_generated_at(
+            &path,
+            &spec,
+            std::slice::from_ref(&grant),
+            None,
+            uzers::get_current_uid(),
+        )
+        .await
+        .unwrap();
+        let content = tokio::fs::read_to_string(&path).await.unwrap();
+        let resolved = std::fs::canonicalize(&target_socket).unwrap();
+        assert!(content.contains(&format!(
+            "Bind={}:/run/lasper/wayland/{}/wayland-0:idmap",
+            resolved.display(),
+            uzers::get_current_uid(),
+        )));
+        assert!(!content.contains(symlink_path.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_rejects_regular_file_and_world_writable_runtime() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(runtime.path().join("wayland-0"), b"not a socket").unwrap();
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        assert!(
+            validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+                .await
+                .is_err()
+        );
+
+        std::fs::remove_file(runtime.path().join("wayland-0")).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(runtime.path().join("wayland-0")).unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let result = validate_wayland_grant(&spec, &grant, uzers::get_current_uid()).await;
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn wayland_grant_detects_socket_replacement() {
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = runtime.path().join("wayland-0");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let grant = wayland_grant(runtime.path(), "wayland-0");
+        drop(listener);
+        std::fs::remove_file(&socket_path).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+            name: "test".into(),
+            private_users: Some(PrivateUsersMode::Pick),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let error = validate_wayland_grant(&spec, &grant, uzers::get_current_uid())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after discovery"));
+    }
+
+    #[tokio::test]
+    async fn recovery_presence_probe_does_not_follow_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.nspawn");
+        assert_eq!(
+            probe_nspawn_config_at(&missing).await.unwrap(),
+            NspawnConfigPresence::Absent
+        );
+
+        let regular = directory.path().join("regular.nspawn");
+        std::fs::write(&regular, "[Exec]\nBoot=yes\n").unwrap();
+        assert_eq!(
+            probe_nspawn_config_at(&regular).await.unwrap(),
+            NspawnConfigPresence::Regular
+        );
+
+        let symlink = directory.path().join("symlink.nspawn");
+        std::os::unix::fs::symlink(&regular, &symlink).unwrap();
+        assert_eq!(
+            probe_nspawn_config_at(&symlink).await.unwrap(),
+            NspawnConfigPresence::Unsafe
+        );
+    }
+}

@@ -1,0 +1,4 @@
+[env]
+# Zig cannot compile simdutf's AVX-512 target attributes; retain SSE/AVX2 dispatch.
+# https://github.com/ziglang/zig/issues/20414
+CXXFLAGS_x86_64_unknown_linux_musl = "-DSIMDUTF_IMPLEMENTATION_ICELAKE=0"
