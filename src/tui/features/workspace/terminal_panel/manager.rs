@@ -582,7 +582,11 @@ impl TerminalManager {
                 )
             };
             if !bytes.is_empty() {
-                return match queue_input(&session.input, bytes) {
+                let status = queue_input(&session.input, bytes);
+                if matches!(status, TerminalInputStatus::Queued) {
+                    session.follow_input_cursor();
+                }
+                return match status {
                     TerminalInputStatus::Queued => TerminalKeyOutcome::Consumed,
                     TerminalInputStatus::Full => TerminalKeyOutcome::InputQueueFull,
                     TerminalInputStatus::Closed => TerminalKeyOutcome::InputChannelClosed,
@@ -938,6 +942,17 @@ impl TerminalSession {
         self.mode = mode;
     }
 
+    /// Return the embedded terminal viewport to the live input cursor after
+    /// input is accepted.  The cursor itself remains owned by rio; this only
+    /// changes the local scrollback view.
+    fn follow_input_cursor(&mut self) {
+        if self.scroll_offset == 0 {
+            return;
+        }
+        self.scroll_offset = 0;
+        self.terminal.lock().set_scrollback(0);
+    }
+
     fn begin_visual_mode(&mut self, kind: VisualSelectionMode) {
         self.set_mode(TerminalMode::Visual(kind));
         let selection = match kind {
@@ -1094,9 +1109,7 @@ fn adjust_scroll(session: &mut TerminalSession, action: ScrollAction) {
         )
     };
     session.scroll_offset = target;
-    if session.mode().is_browser() {
-        session.terminal.lock().set_scrollback(target);
-    }
+    session.terminal.lock().set_scrollback(target);
 }
 
 /// What the terminal key handler wants the caller (App) to do next.
@@ -1503,6 +1516,66 @@ mod tests {
             manager.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 3));
             assert_eq!(manager.sessions[0].mode(), TerminalMode::Visual(kind));
         }
+    }
+
+    #[tokio::test]
+    async fn insert_mouse_scroll_keeps_cursor_position_and_follows_accepted_input() {
+        crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
+        let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
+            DirectTerminalPolicy::LoginOnly,
+            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::config::NspawnConfigStore::direct(),
+        ))));
+        let mut manager = TerminalManager::new(service, 100);
+        let (session, _endpoint) = test_session(1, "demo");
+        session
+            .terminal
+            .lock()
+            .process("history\r\n".repeat(50).as_bytes(), &mut Vec::new());
+        let cursor_before = session.terminal.lock().screen().cursor_position();
+        manager.sessions.push(session);
+        manager.term_area = Rect::new(10, 5, 80, 24);
+
+        let status = manager.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(status, TerminalInputStatus::Queued);
+        let offset = manager.sessions[0].scroll_offset;
+        assert!(offset > 0);
+        assert_eq!(
+            manager.sessions[0].terminal.lock().scrollback_offset(),
+            offset
+        );
+        assert_eq!(
+            manager.sessions[0]
+                .terminal
+                .lock()
+                .screen()
+                .cursor_position(),
+            cursor_before
+        );
+
+        let panel = TerminalPanel;
+        let mut view = Terminal::new(TestBackend::new(80, 26)).unwrap();
+        view.draw(|frame| {
+            panel.render(frame, frame.area(), &mut manager, true, false);
+        })
+        .unwrap();
+        let status_line = (0..80)
+            .map(|column| view.backend().buffer()[(column, 25)].symbol())
+            .collect::<String>();
+        assert!(status_line.contains("[INSERT]"));
+        assert!(status_line.contains("(Scroll:"));
+
+        assert_eq!(
+            manager.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+            TerminalKeyOutcome::Consumed
+        );
+        assert_eq!(manager.sessions[0].scroll_offset, 0);
+        assert_eq!(manager.sessions[0].terminal.lock().scrollback_offset(), 0);
     }
 
     #[tokio::test]

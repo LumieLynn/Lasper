@@ -126,19 +126,26 @@ impl TerminalPanel {
         };
 
         let title_suffix = match session.handle.lifecycle() {
+            crate::domain::session::SessionLifecycle::Running if session.scroll_offset > 0 => {
+                let max_scroll = term.screen().row0_count();
+                let mode = if session.mode().is_insert() {
+                    "INSERT"
+                } else if session.mode().is_visual() {
+                    "VISUAL"
+                } else {
+                    "NORMAL"
+                };
+                format!(
+                    " [{mode}] (Scroll: {}/{}) ",
+                    session.scroll_offset.min(max_scroll),
+                    max_scroll
+                )
+            }
             crate::domain::session::SessionLifecycle::Running if session.mode().is_insert() => {
                 " [INSERT] ".to_string()
             }
             crate::domain::session::SessionLifecycle::Running if session.mode().is_visual() => {
                 " [VISUAL] ".to_string()
-            }
-            crate::domain::session::SessionLifecycle::Running if session.scroll_offset > 0 => {
-                let max_scroll = term.screen().row0_count();
-                format!(
-                    " [NORMAL] (Scroll: {}/{}) ",
-                    session.scroll_offset.min(max_scroll),
-                    max_scroll
-                )
             }
             crate::domain::session::SessionLifecycle::Running => " [NORMAL] ".to_string(),
             crate::domain::session::SessionLifecycle::Exited { code, .. } => match code {
@@ -173,11 +180,7 @@ impl TerminalPanel {
         // offset so cell() returns the scrolled viewport.  This does NOT
         // affect process(), so the PTY reader thread is unaffected.
         let max_scroll = term.screen().row0_count();
-        let viewport_offset = if session.mode().is_browser() {
-            session.scroll_offset.min(max_scroll)
-        } else {
-            0
-        };
+        let viewport_offset = session.scroll_offset.min(max_scroll);
         term.set_scrollback(viewport_offset);
 
         // Scoped block so the &Screen borrow is released before we restore
@@ -276,8 +279,9 @@ impl TerminalPanel {
             (position, style)
         }; // &Screen borrow released here
 
-        // Insert mode keeps the live PTY viewport. Browser mode owns its
-        // scrollback position and leaves rio there for the next motion.
+        // The local viewport is applied for both browser and insert scrolling.
+        // Restore rio's live offset after drawing so PTY output and cursor
+        // state continue to be processed against the live screen.
         if !session.mode().is_browser() {
             term.set_scrollback(0);
         }
