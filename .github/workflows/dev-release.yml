@@ -1,0 +1,46 @@
+name: Development release tag
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: development-release-tag
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: tag development snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Create development tag and dispatch release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [[ "${BASE_VERSION}" != *-dev ]]; then
+            echo "dev must use a -dev base version, got ${BASE_VERSION}" >&2
+            exit 1
+          fi
+
+          VERSION="${BASE_VERSION}.${GITHUB_SHA:0:7}"
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "${TAG} already exists; no new release dispatch is needed"
+            exit 0
+          fi
+
+          git tag --annotate "${TAG}" "${GITHUB_SHA}" --message "Lasper ${VERSION} development snapshot"
+          git push origin "refs/tags/${TAG}"
+          gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"

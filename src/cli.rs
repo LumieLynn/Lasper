@@ -23,6 +23,11 @@ use crate::domain::wayland::WaylandDisplay;
 
 const WAYLAND_FALLBACK_NOTICE: &str = "🪐 Continuing without Wayland...";
 
+pub(crate) const BUILD_VERSION: &str = match option_env!("LASPER_BUILD_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
+
 pub(crate) struct CliOptions {
     pub(crate) want_elevation: bool,
     pub(crate) want_systemd_tools: bool,
@@ -234,7 +239,7 @@ fn write_wrapped(
 fn help_text() -> String {
     HelpPage::new(format!(
         "lasper {} - A TUI for managing systemd-nspawn containers.",
-        env!("CARGO_PKG_VERSION")
+        BUILD_VERSION
     ))
     .usage("lasper [FLAGS]")
     .usage(
@@ -768,7 +773,7 @@ fn parse_flags(args: &[String]) -> std::result::Result<CliOptions, i32> {
     while i < args.len() {
         match args[i].as_str() {
             "--version" | "-v" => {
-                println!("lasper {}", env!("CARGO_PKG_VERSION"));
+                println!("lasper {}", BUILD_VERSION);
                 return Err(0);
             }
             "--help" | "-h" => {

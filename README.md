@@ -68,7 +68,7 @@ cargo build --release --locked
 install -Dm755 target/release/lasper ~/.local/bin/lasper
 ```
 
-Stable releases are built from `main`. Builds from `dev` use a `-dev` version suffix, such as `0.3.4-dev`, shown by `lasper --version`.
+Stable releases are built from `main`. Development releases use a commit-qualified version such as `0.3.4-dev.7dc320f`, shown by `lasper --version`.
 
 Lasper has a few compile-time path options for distributions with non-standard filesystem layouts. See `src/paths.rs` for details.
 

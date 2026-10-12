@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,6 +16,7 @@ jobs:
     outputs:
       note: ${{ steps.release.outputs.note }}
       prerelease: ${{ steps.release.outputs.prerelease }}
+      version: ${{ steps.release.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -24,37 +26,57 @@ jobs:
         id: release
         shell: bash
         run: |
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
-          EXPECTED_TAG="v${VERSION}"
-          NOTE="release-notes/${EXPECTED_TAG}.md"
-
-          if [[ "${GITHUB_REF_NAME}" != "${EXPECTED_TAG}" ]]; then
-            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${VERSION}" >&2
-            exit 1
-          fi
-
-          if [[ ! -s "${NOTE}" ]]; then
-            echo "Required release note ${NOTE} is missing or empty" >&2
-            exit 1
-          fi
-
-          git fetch origin main:refs/remotes/origin/main
-          if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
-            echo "Tag ${GITHUB_REF_NAME} is not attached to the main branch" >&2
-            exit 1
-          fi
-
-          echo "note=${NOTE}" >> "${GITHUB_OUTPUT}"
-          if [[ "${VERSION}" == *-* ]]; then
-            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
-          else
+          PACKAGE_VERSION=$(grep '^version = ' Cargo.toml | head -1 | cut -d'"' -f2)
+          if [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            NOTE="release-notes/${GITHUB_REF_NAME}.md"
+            if [[ "${PACKAGE_VERSION}" != "${VERSION}" ]]; then
+              echo "Stable tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${PACKAGE_VERSION}" >&2
+              exit 1
+            fi
+            if [[ ! -s "${NOTE}" ]]; then
+              echo "Required release note ${NOTE} is missing or empty" >&2
+              exit 1
+            fi
+            git fetch origin main:refs/remotes/origin/main
+            if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/main; then
+              echo "Stable tag ${GITHUB_REF_NAME} is not attached to the main branch" >&2
+              exit 1
+            fi
             echo "prerelease=false" >> "${GITHUB_OUTPUT}"
+            echo "note=${NOTE}" >> "${GITHUB_OUTPUT}"
+          elif [[ "${GITHUB_REF_NAME}" =~ ^v([0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9a-f]{7,40})$ ]]; then
+            VERSION="${BASH_REMATCH[1]}"
+            BASE_VERSION="${VERSION%.*}"
+            SHORT_SHA="${VERSION##*.}"
+            if [[ "${PACKAGE_VERSION}" != "${BASE_VERSION}" ]]; then
+              echo "Development tag ${GITHUB_REF_NAME} does not match the branch base version ${PACKAGE_VERSION}" >&2
+              exit 1
+            fi
+            if [[ "${GITHUB_SHA}" != "${SHORT_SHA}"* ]]; then
+              echo "Development tag ${GITHUB_REF_NAME} does not identify its target commit" >&2
+              exit 1
+            fi
+            git fetch origin dev:refs/remotes/origin/dev
+            if ! git merge-base --is-ancestor "${GITHUB_SHA}" origin/dev; then
+              echo "Development tag ${GITHUB_REF_NAME} is not attached to the dev branch" >&2
+              exit 1
+            fi
+            echo "prerelease=true" >> "${GITHUB_OUTPUT}"
+            echo "note=" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Unsupported release tag ${GITHUB_REF_NAME}" >&2
+            exit 1
           fi
+
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
   verify:
     name: verify release
     runs-on: ubuntu-latest
     needs: metadata
+    env:
+      LASPER_BUILD_VERSION: ${{ needs.metadata.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - run: rustup show
@@ -87,6 +109,8 @@ jobs:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: metadata
+    env:
+      LASPER_BUILD_VERSION: ${{ needs.metadata.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -180,6 +204,20 @@ jobs:
           merge-multiple: true
           path: dist
 
+      - name: Prepare release notes
+        env:
+          RELEASE_NOTE: ${{ needs.metadata.outputs.note }}
+          RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+          RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            printf '# Lasper %s\n\nDevelopment snapshot built from dev commit `%s`.\n' \
+              "${RELEASE_VERSION}" "${RELEASE_SHA}" > release-notes.md
+          else
+            cp "${RELEASE_NOTE}" release-notes.md
+          fi
+
       - name: Package project and dependency licenses
         run: tar -czf dist/lasper-licenses.tar.gz LICENSE THIRD_PARTY_LICENSES.md THIRD_PARTY_NOTICES.md licenses
 
@@ -190,7 +228,7 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          body_path: ${{ needs.metadata.outputs.note }}
+          body_path: release-notes.md
           files: dist/*
           prerelease: ${{ needs.metadata.outputs.prerelease }}
           make_latest: ${{ needs.metadata.outputs.prerelease == 'false' }}
