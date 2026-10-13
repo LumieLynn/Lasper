@@ -41,6 +41,8 @@ jobs:
             exit 0
           fi
 
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag --annotate "${TAG}" "${GITHUB_SHA}" --message "Lasper ${VERSION} development snapshot"
           git push origin "refs/tags/${TAG}"
           gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"
