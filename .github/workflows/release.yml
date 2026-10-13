@@ -197,6 +197,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v4
         with:
@@ -206,14 +208,15 @@ jobs:
 
       - name: Prepare release notes
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_NOTE: ${{ needs.metadata.outputs.note }}
           RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
           RELEASE_PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
+          set -euo pipefail
           if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
-            printf '# Lasper %s\n\nDevelopment snapshot built from dev commit `%s`.\n' \
-              "${RELEASE_VERSION}" "${RELEASE_SHA}" > release-notes.md
+            bash .github/scripts/dev-release-notes.sh > release-notes.md
           else
             cp "${RELEASE_NOTE}" release-notes.md
           fi
