@@ -268,40 +268,6 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
         want_systemd_tools,
         app_config.nvidia.source(),
     );
-    match services.x11_access.reconcile().await {
-        Ok(reports) => {
-            for report in reports {
-                if !report.revoked_record_ids().is_empty()
-                    || !report.pending_record_ids().is_empty()
-                    || !report.diagnostics().is_empty()
-                {
-                    log::debug!(
-                        "X11 lifecycle reconcile for :{}: revoked={}, pending={}, diagnostics={}",
-                        report.display(),
-                        report.revoked_record_ids().len(),
-                        report.pending_record_ids().len(),
-                        report.diagnostics().len(),
-                    );
-                    for diagnostic in report.diagnostics() {
-                        log::debug!(
-                            "X11 lifecycle reconcile :{}: {diagnostic}",
-                            report.display()
-                        );
-                    }
-                }
-            }
-        }
-        Err(error) => {
-            // Reconcile is deliberately best-effort at startup.  A missing
-            // local X server or an unavailable machine observation must not
-            // prevent the TUI from managing machines; the next activation or
-            // explicit X11 operation can retry the bounded pass.
-            log::debug!("X11 lifecycle reconcile unavailable at startup: {error}");
-        }
-    }
-    if let Err(error) = services.x11_access.synchronize_reconcile_activation().await {
-        log::debug!("X11 lifecycle activation unavailable at startup: {error}");
-    }
     let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
         None
     } else {
@@ -372,6 +338,7 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     if let Some((message, level)) = deployment_recovery {
         app.set_status_for(message, level, std::time::Duration::from_secs(20));
     }
+    log::debug!("Starting TUI terminal initialization");
     let result = crate::tui::run(&mut app).await;
 
     if let Err(ref e) = result {

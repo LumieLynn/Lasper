@@ -223,6 +223,7 @@ impl X11AccessService {
     /// returned as diagnostics so one broken display cannot prevent cleanup on
     /// another display.
     pub(crate) async fn reconcile(&self) -> Result<Vec<X11ReconcileReport>, X11AccessError> {
+        log::debug!("Reconciling X11 machine claims");
         let catalog = self.endpoints.discover(&[]).await;
         if catalog.sockets.is_empty() {
             return Err(X11AccessError::Selection(
@@ -244,6 +245,24 @@ impl X11AccessService {
                     vec![error.to_string()],
                 ),
             };
+            if !report.revoked_record_ids().is_empty()
+                || !report.pending_record_ids().is_empty()
+                || !report.diagnostics().is_empty()
+            {
+                log::debug!(
+                    "X11 lifecycle reconcile for :{}: revoked={}, pending={}, diagnostics={}",
+                    report.display(),
+                    report.revoked_record_ids().len(),
+                    report.pending_record_ids().len(),
+                    report.diagnostics().len(),
+                );
+                for diagnostic in report.diagnostics() {
+                    log::debug!(
+                        "X11 lifecycle reconcile :{}: {diagnostic}",
+                        report.display()
+                    );
+                }
+            }
             reports.push(report);
         }
         Ok(reports)

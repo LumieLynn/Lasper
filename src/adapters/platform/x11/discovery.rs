@@ -241,6 +241,7 @@ pub(super) fn inspect_endpoint(
     alternate: bool,
     source: PathBuf,
 ) -> Result<HostX11Socket, String> {
+    log::debug!("Inspecting X11 endpoint {}", source.display());
     let canonical_path = fs::canonicalize(&source)
         .map_err(|error| format!("resolve {}: {error}", source.display()))?;
     let metadata = fs::metadata(&canonical_path)

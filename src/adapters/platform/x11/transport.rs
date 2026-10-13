@@ -5,27 +5,154 @@
 //! modules decide when a transport operation is allowed.
 
 use std::fs;
-use std::os::fd::AsRawFd;
+use std::io::{self, IoSlice};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use x11rb::protocol::xproto::{ConnectionExt, Family, HostMode};
 use x11rb::reexports::x11rb_protocol::xauth;
-use x11rb::rust_connection::{DefaultStream, RustConnection};
+use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
+use x11rb::utils::RawFdContainer;
 
 use crate::application::x11::{X11AclEntry, X11AclSnapshot};
 use crate::domain::x11::{HostX11Socket, X11PeerIdentity, X11SocketRevision};
 
 use super::common::{ENDPOINT_IO_TIMEOUT, MAX_ACL_BYTES, MAX_ACL_ENTRIES};
 
-type AuthenticatedX11Connection = (RustConnection<DefaultStream>, X11PeerIdentity);
+type X11Connection = RustConnection<EndpointStream>;
+type AuthenticatedX11Connection = (X11Connection, X11PeerIdentity);
 
-pub(super) fn read_acl(
-    connection: &RustConnection<DefaultStream>,
-    display: u16,
-) -> Result<X11AclSnapshot, String> {
+/// x11rb makes its stream nonblocking and waits through `Stream::poll`, so
+/// socket read/write timeouts do not limit setup or reply waits. Keep its
+/// wire/FD handling and bound the readiness waits at that actual boundary.
+#[derive(Debug)]
+pub(super) struct EndpointStream {
+    inner: DefaultStream,
+}
+
+impl Stream for EndpointStream {
+    fn poll(&self, mode: PollMode) -> io::Result<()> {
+        let mut events = 0;
+        if mode.readable() {
+            events |= libc::POLLIN;
+        }
+        if mode.writable() {
+            events |= libc::POLLOUT;
+        }
+        wait_for_socket(self.inner.as_raw_fd(), events, ENDPOINT_IO_TIMEOUT)
+    }
+
+    fn read(&self, buf: &mut [u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.inner.read(buf, fds)
+    }
+
+    fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.inner.write(buf, fds)
+    }
+
+    fn write_vectored(
+        &self,
+        bufs: &[IoSlice<'_>],
+        fds: &mut Vec<RawFdContainer>,
+    ) -> io::Result<usize> {
+        self.inner.write_vectored(bufs, fds)
+    }
+}
+
+fn wait_for_socket(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut descriptor = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "X11 endpoint wait timed out",
+            ));
+        }
+        let millis = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // The descriptor remains owned by the caller throughout this wait.
+        let result = unsafe { libc::poll(&mut descriptor, 1, millis) };
+        if result > 0 {
+            if descriptor.revents & libc::POLLNVAL != 0 {
+                return Err(io::Error::from_raw_os_error(libc::EBADF));
+            }
+            // HUP/ERR are handled by the next stream read/write or SO_ERROR.
+            return Ok(());
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+fn connect_socket(source: &Path) -> io::Result<UnixStream> {
+    let path = source.as_os_str().as_bytes();
+    // Zero initialization supplies the terminating NUL and sockaddr padding.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid X11 socket path",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (destination, source) in address.sun_path.iter_mut().zip(path) {
+        *destination = *source as libc::c_char;
+    }
+    let length =
+        (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1) as libc::socklen_t;
+    // Nonblocking connect also avoids hanging on a full Unix socket backlog.
+    let fd = unsafe {
+        libc::socket(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // socket() returned a new descriptor; OwnedFd closes every error path.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
+    let result = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            std::ptr::addr_of!(address).cast(),
+            length,
+        )
+    };
+    if result < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINPROGRESS)
+            && error.kind() != io::ErrorKind::Interrupted
+        {
+            return Err(error);
+        }
+        wait_for_socket(stream.as_raw_fd(), libc::POLLOUT, ENDPOINT_IO_TIMEOUT)?;
+        if let Some(error) = stream.take_error()? {
+            return Err(error);
+        }
+        stream.peer_addr()?;
+    }
+    Ok(stream)
+}
+
+pub(super) fn read_acl(connection: &X11Connection, display: u16) -> Result<X11AclSnapshot, String> {
     let reply = connection
         .list_hosts()
         .map_err(|error| format!("send ListHosts to :{display}: {error}"))?
@@ -54,7 +181,7 @@ pub(super) fn read_acl(
     Ok(X11AclSnapshot::from_wire(reply.mode.into(), entries))
 }
 pub(super) fn insert_and_observe(
-    connection: &RustConnection<DefaultStream>,
+    connection: &X11Connection,
     display: u16,
     host_uid: u32,
 ) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
@@ -71,7 +198,7 @@ pub(super) fn insert_and_observe(
 }
 
 pub(super) fn remove_and_observe(
-    connection: &RustConnection<DefaultStream>,
+    connection: &X11Connection,
     display: u16,
     host_uid: u32,
 ) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
@@ -154,7 +281,7 @@ pub(super) fn authenticated_connection(
 ) -> Result<AuthenticatedX11Connection, String> {
     // The family/address used for Xauthority lookup is the same one that
     // x11rb derives from a freshly connected Unix stream.
-    let stream = UnixStream::connect(source)
+    let stream = connect_socket(source)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
     let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
         .map_err(|error| format!("prepare X11 authority lookup: {error}"))?;
@@ -194,20 +321,18 @@ pub(super) fn connect_x11(
     auth_name: Vec<u8>,
     auth_data: Vec<u8>,
 ) -> Result<AuthenticatedX11Connection, String> {
-    let stream = UnixStream::connect(source)
+    let stream = connect_socket(source)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
-    stream
-        .set_read_timeout(Some(ENDPOINT_IO_TIMEOUT))
-        .map_err(|error| format!("set X11 read deadline: {error}"))?;
-    stream
-        .set_write_timeout(Some(ENDPOINT_IO_TIMEOUT))
-        .map_err(|error| format!("set X11 write deadline: {error}"))?;
     let peer = peer_credentials(&stream)?;
     let (stream, _) = DefaultStream::from_unix_stream(stream)
         .map_err(|error| format!("prepare X11 connection: {error}"))?;
-    let connection =
-        RustConnection::connect_to_stream_with_auth_info(stream, 0, auth_name, auth_data)
-            .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
+    let connection = RustConnection::connect_to_stream_with_auth_info(
+        EndpointStream { inner: stream },
+        0,
+        auth_name,
+        auth_data,
+    )
+    .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
     Ok((connection, peer))
 }
 
@@ -223,7 +348,7 @@ pub(super) fn inspect_endpoint_peer_only(
     if !metadata.file_type().is_socket() {
         return Err(format!("{} is not a Unix socket", source.display()));
     }
-    let stream = UnixStream::connect(&source)
+    let stream = connect_socket(&source)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
     let peer = peer_credentials(&stream)?;
     drop(stream);

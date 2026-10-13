@@ -5,10 +5,14 @@ use super::lifecycle::*;
 use super::state::*;
 use super::transport::*;
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::time::Duration;
 
-use x11rb::protocol::xproto::Family;
+use x11rb::protocol::xproto::{AccessControl, Family, ListHostsReply, Setup};
+use x11rb::x11_utils::Serialize;
 
 use crate::application::sessions::{
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
@@ -110,6 +114,102 @@ fn source_observation_distinguishes_missing_invalid_and_unverified() {
         catalog.sources[0].state,
         X11SourceState::Unverified("X11 authentication failed".into())
     );
+}
+
+#[test]
+fn x11_setup_without_response_times_out() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let listener = UnixListener::bind(&source).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    // Close the queued connection if readiness polling regresses, so a
+    // failure reports an assertion instead of hanging the test suite.
+    let server = std::thread::spawn(move || {
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        drop(listener);
+    });
+    let result = connect_x11(&source, Vec::new(), Vec::new());
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("X11 endpoint wait timed out"), "{error}");
+}
+
+#[test]
+fn x11_acl_reply_waits_are_bounded() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let listener = UnixListener::bind(&source).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        receive_x11_setup(&mut stream);
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request[0], 110); // ListHosts
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    });
+    let result = connect_x11(&source, Vec::new(), Vec::new())
+        .and_then(|(connection, _)| read_acl(&connection, 0));
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("X11 endpoint wait timed out"), "{error}");
+}
+
+#[test]
+fn x11_transport_reads_a_valid_acl_reply() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let listener = UnixListener::bind(&source).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        receive_x11_setup(&mut stream);
+        let mut request = [0; 4];
+        stream.read_exact(&mut request).unwrap();
+        assert_eq!(request[0], 110); // ListHosts
+        stream
+            .write_all(
+                &ListHostsReply {
+                    mode: AccessControl::ENABLE,
+                    sequence: 1,
+                    ..Default::default()
+                }
+                .serialize(),
+            )
+            .unwrap();
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+    });
+    let result = connect_x11(&source, Vec::new(), Vec::new())
+        .and_then(|(connection, _)| read_acl(&connection, 0));
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    let acl = result.unwrap();
+    assert_eq!(
+        acl.mode(),
+        crate::application::x11::X11AccessControlMode::Enabled
+    );
+    assert!(acl.entries().is_empty());
+}
+
+fn receive_x11_setup(stream: &mut std::os::unix::net::UnixStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = [0; 12];
+    stream.read_exact(&mut request).unwrap();
+    let mut setup = Setup {
+        status: 1,
+        protocol_major_version: 11,
+        resource_id_base: 0x20_0000,
+        resource_id_mask: 0x1f_ffff,
+        maximum_request_length: u16::MAX,
+        roots: vec![Default::default()],
+        ..Default::default()
+    };
+    setup.length = ((setup.serialize().len() - 8) / 4) as u16;
+    stream.write_all(&setup.serialize()).unwrap();
 }
 
 #[test]
