@@ -1,5 +1,6 @@
 //! Requests, results, and the caller-owned desktop ACL port.
 
+use super::lifecycle::{X11ReconcileReport, X11ReconcileTarget};
 use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionContext};
 use crate::domain::x11::HostX11Socket;
 
@@ -98,53 +99,6 @@ pub enum X11RevocationDisposition {
     AlreadyAbsent { record_id: String },
 }
 
-/// Result of one bounded machine-lifecycle reconcile pass for one live X11
-/// endpoint. A pending ID means the machine registration has disappeared but
-/// the grace/revalidation state is not yet sufficient to revoke its ACL.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct X11ReconcileReport {
-    display: u16,
-    revoked_record_ids: Vec<String>,
-    pending_record_ids: Vec<String>,
-    diagnostics: Vec<String>,
-}
-
-impl X11ReconcileReport {
-    pub(crate) fn new(
-        display: u16,
-        revoked_record_ids: Vec<String>,
-        pending_record_ids: Vec<String>,
-        diagnostics: Vec<String>,
-    ) -> Self {
-        Self {
-            display,
-            revoked_record_ids,
-            pending_record_ids,
-            diagnostics,
-        }
-    }
-
-    pub(crate) const fn display(&self) -> u16 {
-        self.display
-    }
-
-    pub(crate) fn revoked_record_ids(&self) -> &[String] {
-        &self.revoked_record_ids
-    }
-
-    pub(crate) fn pending_record_ids(&self) -> &[String] {
-        &self.pending_record_ids
-    }
-
-    pub(crate) fn diagnostics(&self) -> &[String] {
-        &self.diagnostics
-    }
-
-    pub(crate) fn is_complete(&self) -> bool {
-        self.pending_record_ids.is_empty() && self.diagnostics.is_empty()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11DesktopAuthorization {
     pub(super) observation: X11DesktopObservation,
@@ -239,6 +193,9 @@ pub enum X11AccessError {
 
 #[async_trait::async_trait]
 pub(crate) trait X11DesktopAccessPort: Send + Sync {
+    /// Read local lifecycle state only; an empty list must not cause X11 I/O.
+    async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11DesktopAccessError>;
+
     async fn snapshot(
         &self,
         socket: &HostX11Socket,
@@ -256,11 +213,12 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
 
     async fn reconcile(
         &self,
-        _socket: &HostX11Socket,
+        target: &X11ReconcileTarget,
     ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
-        Err(X11DesktopAccessError::new(
-            "X11 lifecycle reconcile is not available on this desktop access adapter",
-        ))
+        Err(X11DesktopAccessError::new(format!(
+            "X11 lifecycle reconcile for {} is not available on this desktop access adapter",
+            target.source.display()
+        )))
     }
 
     async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {

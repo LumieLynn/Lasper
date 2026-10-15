@@ -5,9 +5,9 @@
 //! host-side machine-instance mapping needed by either runtime route.
 
 use super::instance::MachineInstanceSnapshot;
+use super::probe::SocketAccess;
 use super::x11_probe::{
     X11ProjectionProbeObservation, X11ProjectionProbeRequest as MachineX11ProbeRequest,
-    X11SocketAccess,
 };
 use super::{MachineSessionRequest, MachineSessionTransport};
 use crate::adapters::config::NspawnConfigStore;
@@ -140,21 +140,23 @@ fn validate_projection(
 }
 
 fn validate_socket_access(
-    access: X11SocketAccess,
+    access: SocketAccess,
     identity: Option<(u64, u64)>,
     expected_identities: &[(u64, u64)],
     label: &str,
     path: &Path,
 ) -> Result<bool, SessionError> {
     let detail = match access {
-        X11SocketAccess::Accessible | X11SocketAccess::Denied => {
+        SocketAccess::Accessible | SocketAccess::Denied => {
             if identity.is_some_and(|identity| expected_identities.contains(&identity)) {
-                return Ok(access == X11SocketAccess::Accessible);
+                return Ok(access == SocketAccess::Accessible);
             }
             "is not the selected host X11 server socket (the bind may be stale)"
         }
-        X11SocketAccess::Missing => "is missing",
-        X11SocketAccess::NotSocket => "is not a socket",
+        SocketAccess::Unavailable => {
+            "could not be inspected by the guest user (the path may be missing or inaccessible)"
+        }
+        SocketAccess::NotSocket => "is not a socket",
     };
     Err(SessionError::with_hint(
         format!("{label} {} {detail}", path.display()),
@@ -190,11 +192,11 @@ fn projection_not_configured() -> SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::x11_probe::X11SocketObservation;
+    use crate::adapters::session::probe::SocketObservation;
 
     fn observation(
-        mount: X11SocketObservation,
-        client: X11SocketObservation,
+        mount: SocketObservation,
+        client: SocketObservation,
     ) -> X11ProjectionProbeObservation {
         X11ProjectionProbeObservation {
             identity: crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
@@ -206,8 +208,8 @@ mod tests {
 
     #[test]
     fn projection_requires_both_mount_and_client_paths_to_match_the_server() {
-        let accessible = |identity| X11SocketObservation {
-            access: X11SocketAccess::Accessible,
+        let accessible = |identity| SocketObservation {
+            access: SocketAccess::Accessible,
             identity: Some(identity),
         };
         let revision = crate::domain::x11::X11SocketRevision {
@@ -244,12 +246,12 @@ mod tests {
 
     #[test]
     fn projection_keeps_dac_failure_distinct_from_stale_identity() {
-        let denied = X11SocketObservation {
-            access: X11SocketAccess::Denied,
+        let denied = SocketObservation {
+            access: SocketAccess::Denied,
             identity: Some((10, 20)),
         };
-        let missing = X11SocketObservation {
-            access: X11SocketAccess::Missing,
+        let unavailable = SocketObservation {
+            access: SocketAccess::Unavailable,
             identity: None,
         };
         assert!(!validate_socket_access(
@@ -269,7 +271,7 @@ mod tests {
         )
         .is_err());
         assert!(validate_socket_access(
-            missing.access,
+            unavailable.access,
             None,
             &[(10, 20)],
             "target",

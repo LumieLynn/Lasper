@@ -1,8 +1,8 @@
 //! Runtime validation for a Wayland bind that was declared before container
 //! startup. This module never creates or removes mounts.
 
-use super::wayland_probe::WaylandProbeRequest;
-use super::wayland_probe::{WaylandProbeObservation, WaylandTargetAccess};
+use super::probe::SocketAccess;
+use super::wayland_probe::{WaylandProbeObservation, WaylandProbeRequest};
 use super::{MachineSessionRequest, MachineSessionTransport};
 use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
@@ -129,17 +129,21 @@ fn validate_target(
     host: &crate::domain::wayland::HostWaylandSocket,
     target: &std::path::Path,
 ) -> Result<(), SessionError> {
-    let detail = match access.target {
-        WaylandTargetAccess::Accessible => {
+    let detail = match access.target.access {
+        SocketAccess::Accessible | SocketAccess::Denied => {
             let revision = host.revision();
-            if access.socket_identity == Some((revision.device, revision.inode)) {
+            if access.target.identity != Some((revision.device, revision.inode)) {
+                "is not the current host socket (the bind may be stale)"
+            } else if access.target.access == SocketAccess::Accessible {
                 return Ok(());
+            } else {
+                "is not accessible to the guest user"
             }
-            "is not the current host socket (the bind may be stale)"
         }
-        WaylandTargetAccess::Missing => "is missing",
-        WaylandTargetAccess::Denied => "is not accessible to the guest user",
-        WaylandTargetAccess::NotSocket => "is not a socket",
+        SocketAccess::Unavailable => {
+            "could not be inspected by the guest user (the path may be missing or inaccessible)"
+        }
+        SocketAccess::NotSocket => "is not a socket",
     };
     Err(SessionError::with_hint(
         format!("Wayland target {} {detail}", target.display()),
@@ -180,6 +184,7 @@ fn projection_not_configured() -> SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::session::probe::SocketObservation;
     use crate::application::sessions::ObservedGuestIdentity;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
     use std::path::{Path, PathBuf};
@@ -204,23 +209,36 @@ mod tests {
         .unwrap();
         let mut access = WaylandProbeObservation {
             identity: ObservedGuestIdentity::new(1234, 1234),
-            target: WaylandTargetAccess::Accessible,
-            socket_identity: Some((69, 100)),
+            target: SocketObservation {
+                access: SocketAccess::Accessible,
+                identity: Some((69, 100)),
+            },
         };
         let path = Path::new("/custom/desktop.sock");
         assert!(validate_target(&access, &host, path).is_ok());
         for identity in [None, Some((69, 101)), Some((70, 100))] {
-            access.socket_identity = identity;
+            access.target.identity = identity;
             assert!(validate_target(&access, &host, path).is_err());
         }
-        access.socket_identity = Some((69, 100));
+        access.target.identity = Some((69, 100));
         for state in [
-            WaylandTargetAccess::Missing,
-            WaylandTargetAccess::Denied,
-            WaylandTargetAccess::NotSocket,
+            SocketAccess::Unavailable,
+            SocketAccess::Denied,
+            SocketAccess::NotSocket,
         ] {
-            access.target = state;
+            access.target.access = state;
             assert!(validate_target(&access, &host, path).is_err());
         }
+
+        access.target.access = SocketAccess::Denied;
+        let denied = validate_target(&access, &host, path).unwrap_err();
+        assert!(denied
+            .to_string()
+            .contains("not accessible to the guest user"));
+        access.target.identity = Some((69, 101));
+        let wrong_socket = validate_target(&access, &host, path).unwrap_err();
+        assert!(wrong_socket
+            .to_string()
+            .contains("not the current host socket"));
     }
 }

@@ -8,7 +8,9 @@
 use std::fs;
 
 use crate::application::sessions::ObservedMachineInstance;
-use crate::application::x11::{X11AclEntry, X11GrantRecordPhase, X11ReconcileReport};
+use crate::application::x11::{
+    X11AclEntry, X11GrantRecordPhase, X11ReconcileReport, X11ReconcileRetry,
+};
 use crate::domain::x11::HostX11Socket;
 
 use super::common::{CLAIM_RECONCILE_GRACE_MILLIS, MAX_GRANT_DIAGNOSTICS, MAX_GRANT_RECORD_BYTES};
@@ -17,8 +19,8 @@ use super::state::{
     ManagedX11GrantRecord, ManagedX11MachineClaim, X11RuntimeState,
 };
 use super::transport::{
-    authenticated_connection, host_boot_id, inspect_endpoint_peer_only, read_acl,
-    remove_and_observe, require_current_socket, unix_millis, x11_peer_start_time,
+    connect_current_socket, host_boot_id, read_acl, remove_and_observe, require_current_socket,
+    unix_millis, x11_peer_start_time,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -291,7 +293,8 @@ impl MachineClaimObservation {
             Self::Active => ReconcileClaimStatus::Active,
             Self::EndedCandidate | Self::CleanupPending { .. } => ReconcileClaimStatus::Pending,
             Self::CleanupReady => ReconcileClaimStatus::Ready,
-            Self::NeedsReview(reason) | Self::Unavailable(reason) | Self::Blocked(reason) => {
+            Self::Unavailable(reason) => ReconcileClaimStatus::Unavailable(reason),
+            Self::NeedsReview(reason) | Self::Blocked(reason) => {
                 ReconcileClaimStatus::Blocked(reason)
             }
         }
@@ -351,6 +354,9 @@ pub(super) enum ReconcileClaimStatus {
     Active,
     Pending,
     Ready,
+    /// A transient machine-state read failure. It blocks ACL mutation for
+    /// this pass but remains eligible for the bounded observation retry.
+    Unavailable(String),
     Blocked(String),
 }
 
@@ -384,7 +390,9 @@ impl ReconcileGroup {
         self.claims.iter().any(|claim| {
             matches!(
                 &claim.status,
-                ReconcileClaimStatus::Active | ReconcileClaimStatus::Blocked(_)
+                ReconcileClaimStatus::Active
+                    | ReconcileClaimStatus::Unavailable(_)
+                    | ReconcileClaimStatus::Blocked(_)
             )
         })
     }
@@ -516,21 +524,10 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         ));
     }
 
-    let current_socket = inspect_endpoint_peer_only(
-        socket.display(),
-        socket.alternate(),
-        socket.source().to_path_buf(),
-    )?;
-    if current_socket != *socket {
-        return Err(format!(
-            "{} changed before X11 lifecycle reconcile",
-            socket.source().display()
-        ));
-    }
+    let connection = connect_current_socket(socket)?;
     let server_peer_start_time = x11_peer_start_time(socket)?;
     let current_boot_id = host_boot_id()?;
     let now = unix_millis()?;
-    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
     let mut acl = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "before X11 lifecycle reconcile")?;
     if !matches!(
@@ -596,9 +593,18 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
 
     let mut revoked_record_ids = Vec::new();
     let mut pending_record_ids = Vec::new();
+    let mut retry = X11ReconcileRetry::None;
     for group in groups {
         for claim in &group.claims {
-            if let ReconcileClaimStatus::Blocked(reason) = &claim.status {
+            if let ReconcileClaimStatus::Unavailable(reason) = &claim.status {
+                push_reconcile_diagnostic(
+                    &mut diagnostics,
+                    format!(
+                        "claim {} machine observation unavailable: {reason}",
+                        claim.claim_id
+                    ),
+                );
+            } else if let ReconcileClaimStatus::Blocked(reason) = &claim.status {
                 push_reconcile_diagnostic(
                     &mut diagnostics,
                     format!(
@@ -611,6 +617,17 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                 && !pending_record_ids.contains(&claim.record_id)
             {
                 pending_record_ids.push(claim.record_id.clone());
+            }
+            match &claim.status {
+                ReconcileClaimStatus::Active => {
+                    retry = X11ReconcileRetry::RegisteredMachine;
+                }
+                ReconcileClaimStatus::Pending | ReconcileClaimStatus::Unavailable(_)
+                    if retry == X11ReconcileRetry::None =>
+                {
+                    retry = X11ReconcileRetry::PendingObservation;
+                }
+                _ => {}
             }
         }
         if group.blocked() {
@@ -665,11 +682,24 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
             );
             if status != Some(ReconcileClaimStatus::Ready) {
                 still_ready = false;
-                if let Some(ReconcileClaimStatus::Blocked(reason)) = status {
-                    push_reconcile_diagnostic(
-                        &mut diagnostics,
-                        format!("claim {} changed before cleanup: {reason}", claim.claim_id),
-                    );
+                match status {
+                    Some(ReconcileClaimStatus::Unavailable(reason)) => {
+                        retry = X11ReconcileRetry::PendingObservation;
+                        push_reconcile_diagnostic(
+                            &mut diagnostics,
+                            format!(
+                                "claim {} machine observation unavailable before cleanup: {reason}",
+                                claim.claim_id
+                            ),
+                        );
+                    }
+                    Some(ReconcileClaimStatus::Blocked(reason)) => {
+                        push_reconcile_diagnostic(
+                            &mut diagnostics,
+                            format!("claim {} changed before cleanup: {reason}", claim.claim_id),
+                        );
+                    }
+                    _ => {}
                 }
             }
         }
@@ -752,5 +782,6 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         revoked_record_ids,
         pending_record_ids,
         diagnostics,
-    ))
+    )
+    .with_retry(retry))
 }

@@ -7,11 +7,12 @@ use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionConte
 use crate::domain::x11::HostX11Socket;
 
 use super::access::{
-    X11AccessError, X11Authorization, X11AuthorizationRequest, X11DesktopAccessPort,
-    X11ReconcileReport, X11Revocation, X11RevokeRequest,
+    X11AccessError, X11Authorization, X11AuthorizationRequest, X11DesktopAccessPort, X11Revocation,
+    X11RevokeRequest,
 };
 use super::catalog::X11EndpointDiscoveryService;
 use super::grants::X11AccessCheck;
+use super::lifecycle::{X11ReconcileReport, X11ReconcileRetry, X11ReconcileTarget};
 use super::session::{
     select_session_endpoints, X11SessionPreparation, X11SessionPreparationPort, X11SessionSelection,
 };
@@ -217,33 +218,36 @@ impl X11AccessService {
     }
 
     /// Run one bounded, system-scope machine claim reconcile pass. The
-    /// endpoint catalog is discovered in the invoking desktop process; the
-    /// adapter only receives verified live X11 endpoints and never receives a
-    /// target user-scope machine selector. Endpoint-local failures are
-    /// returned as diagnostics so one broken display cannot prevent cleanup on
-    /// another display.
+    /// Targets come from persisted Lasper records; this never broad-scans all
+    /// desktop X11 displays. Endpoint-local failures remain diagnostics so
+    /// one stale record cannot prevent cleanup of another record.
     pub(crate) async fn reconcile(&self) -> Result<Vec<X11ReconcileReport>, X11AccessError> {
-        log::debug!("Reconciling X11 machine claims");
-        let catalog = self.endpoints.discover(&[]).await;
-        if catalog.sockets.is_empty() {
-            return Err(X11AccessError::Selection(
-                catalog
-                    .diagnostics
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "no live local X11 endpoint was discovered".into()),
-            ));
+        let targets = self.reconcile_targets().await?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
         }
-        let mut reports = Vec::with_capacity(catalog.sockets.len());
-        for socket in catalog.sockets {
-            let report = match self.desktop.reconcile(&socket).await {
+        Ok(self.reconcile_pass(&targets).await)
+    }
+
+    async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11AccessError> {
+        self.desktop
+            .reconcile_targets()
+            .await
+            .map_err(X11AccessError::Desktop)
+    }
+
+    async fn reconcile_pass(&self, targets: &[X11ReconcileTarget]) -> Vec<X11ReconcileReport> {
+        let mut reports = Vec::with_capacity(targets.len());
+        for target in targets {
+            let report = match self.desktop.reconcile(target).await {
                 Ok(report) => report,
                 Err(error) => X11ReconcileReport::new(
-                    socket.display(),
+                    target.display,
                     Vec::new(),
                     Vec::new(),
-                    vec![error.to_string()],
-                ),
+                    vec![format!("{}: {error}", target.source.display())],
+                )
+                .with_retry(X11ReconcileRetry::PendingObservation),
             };
             if !report.revoked_record_ids().is_empty()
                 || !report.pending_record_ids().is_empty()
@@ -265,22 +269,36 @@ impl X11AccessService {
             }
             reports.push(report);
         }
-        Ok(reports)
+        reports
     }
 
     /// Reconcile after a system machine lifecycle event. A stop command may
     /// return before machined removes its registration, while the first pass
     /// after removal only records a cleanup-pending timestamp. Three bounded
-    /// passes cover both races: still-present -> pending -> grace elapsed.
+    /// passes allow both transitions: still-present -> pending -> grace elapsed.
     /// Neither the in-process stop path nor the user-manager path worker relies
-    /// on a second filesystem event.
+    /// on a second filesystem event. A complete endpoint report is not enough
+    /// to stop retries: it may describe a still-registered machine. Local claim
+    /// state decides whether there is anything left to observe.
     pub(crate) async fn reconcile_after_machine_event(
         &self,
     ) -> Result<Vec<X11ReconcileReport>, X11AccessError> {
-        let mut reports = self.reconcile().await?;
+        let targets = self.reconcile_targets().await?;
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut reports = self.reconcile_pass(&targets).await;
         for _ in 1..MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS {
+            if reports
+                .iter()
+                .all(|report| report.retry() == X11ReconcileRetry::None)
+            {
+                break;
+            }
             tokio::time::sleep(MACHINE_LIFECYCLE_RETRY_DELAY).await;
-            reports = self.reconcile().await?;
+            for (report, next) in reports.iter_mut().zip(self.reconcile_pass(&targets).await) {
+                report.update_from_pass(next);
+            }
         }
         Ok(reports)
     }

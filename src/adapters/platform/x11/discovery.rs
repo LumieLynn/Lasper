@@ -17,7 +17,7 @@ use crate::domain::x11::X11_SOCKET_DIRECTORY;
 use crate::domain::x11::{HostX11Socket, X11SocketRevision};
 
 use super::common::{MAX_DISCOVERED_DISPLAYS, MAX_INSPECTED_SOURCES};
-use super::transport::authenticated_connection;
+use super::transport::{authenticated_connection, require_current_socket};
 
 pub(super) fn discover_sync(configured_sources: &[PathBuf]) -> X11EndpointCatalog {
     let preferred_display = std::env::var("DISPLAY")
@@ -253,21 +253,8 @@ pub(super) fn inspect_endpoint(
     let (connection, peer) = authenticated_connection(&source, display)?;
     let _ = connection.setup();
 
-    let final_canonical = fs::canonicalize(&source)
-        .map_err(|error| format!("re-resolve {}: {error}", source.display()))?;
-    let final_metadata = fs::metadata(&final_canonical)
-        .map_err(|error| format!("re-inspect {}: {error}", final_canonical.display()))?;
-    if final_canonical != canonical_path
-        || final_metadata.dev() != metadata.dev()
-        || final_metadata.ino() != metadata.ino()
-        || final_metadata.ctime() != metadata.ctime()
-        || final_metadata.ctime_nsec() != metadata.ctime_nsec()
-    {
-        return Err(format!("{} changed during X11 discovery", source.display()));
-    }
-
     let (peer_pid, peer_uid, peer_gid) = peer.legacy_tuple();
-    HostX11Socket::from_verified_parts(
+    let socket = HostX11Socket::from_verified_parts(
         display,
         alternate,
         source,
@@ -285,5 +272,7 @@ pub(super) fn inspect_endpoint(
             ctime_nanoseconds: metadata.ctime_nsec(),
         },
     )
-    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
+    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))?;
+    require_current_socket(&socket, "during X11 discovery")?;
+    Ok(socket)
 }

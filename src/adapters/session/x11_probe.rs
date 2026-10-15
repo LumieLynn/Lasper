@@ -1,77 +1,45 @@
 //! Fixed guest-side observation used by the X11 projection resolver.
 //!
-//! The probe reports only the selected account, its user namespace, and two
-//! socket paths. Host UID mapping and X server ACL inspection stay outside the
-//! guest and are never accepted from probe output.
+//! Host UID mapping and X server ACL inspection stay outside the guest.
+//! Framing, socket observations, and PTY collection use the shared probe core.
+
+use std::path::Path;
 
 use crate::application::sessions::{
     ObservedGuestIdentity, ObservedNamespaceIdentity, SessionError, TerminalSessionHandle,
     ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
-use std::path::{Component, Path};
-use std::time::Duration;
 
-const PROBE_DEADLINE: Duration = Duration::from_secs(5);
-const MAX_PROBE_OUTPUT_BYTES: usize = 12 * 1024;
-const MAX_PROBE_LINE_BYTES: usize = 1024;
-const MAX_TARGET_PATH_BYTES: usize = 4096;
-const PROBE_MAGIC: &[u8] = b"LASPER_X11_PROJECTION_PROBE_V1";
+use super::probe::{
+    guest_script, validate_absolute_path, ProbePathError, ProbeProtocol, SocketObservation,
+};
 
-// Linux pathname AF_UNIX connect requires write access to the socket, not
-// read/execute bits or mode 0666. This does not test an abstract socket or an
-// X11 setup handshake. Keep that distinction when reporting probe results.
-const X11_PROBE_SCRIPT: &str = r#"euid=
-egid=
-while read -r key _real effective _rest; do
-    case "$key" in
-        Uid:) euid=$effective ;;
-        Gid:) egid=$effective ;;
-    esac
-done < /proc/self/status
-userns_stat=$(LC_ALL=C stat -Lc '%d:%i' -- /proc/self/ns/user) || exit 1
-userns_device=${userns_stat%%:*}
-userns_inode=${userns_stat#*:}
-socket_state() {
-    if [ ! -e "$1" ]; then
-        printf '%s' MISSING
-    elif [ ! -S "$1" ]; then
-        printf '%s' NOT_SOCKET
-    elif [ ! -w "$1" ]; then
-        printf '%s' DENIED
-    else
-        printf '%s' ACCESSIBLE
-    fi
-}
-mount_state=$(socket_state "$1")
-client_state=$(socket_state "$2")
-mount_stat=
-client_stat=
-if [ "$mount_state" = ACCESSIBLE ] || [ "$mount_state" = DENIED ]; then
-    mount_stat=$(LC_ALL=C stat -Lc '%d:%i' -- "$1") || exit 1
+const PROTOCOL: ProbeProtocol = ProbeProtocol {
+    magic: "LASPER_X11_PROJECTION_PROBE_V1",
+    label: "X11 projection probe",
+    maximum_output: 12 * 1024,
+};
+
+const X11_PROBE_BODY: &str = r#"if ! probe_guest_identity; then
+    probe_failure 'guest identity could not be read'
+    exit 0
 fi
-if [ "$client_state" = ACCESSIBLE ] || [ "$client_state" = DENIED ]; then
-    client_stat=$(LC_ALL=C stat -Lc '%d:%i' -- "$2") || exit 1
+if ! probe_userns=$(LC_ALL=C stat -Lc '%d:%i' -- /proc/self/ns/user 2>/dev/null); then
+    probe_failure 'guest user namespace could not be inspected'
+    exit 0
 fi
+probe_mount=$(probe_socket MOUNT "$1" MOUNT_DEVICE MOUNT_INODE)
+probe_client=$(probe_socket CLIENT "$2" CLIENT_DEVICE CLIENT_INODE)
 printf '%s\n' \
-    'LASPER_X11_PROJECTION_PROBE_V1' \
-    "EUID=$euid" \
-    "EGID=$egid" \
-    "USERNS_DEVICE=$userns_device" \
-    "USERNS_INODE=$userns_inode" \
-    "MOUNT=$mount_state"
-if [ -n "$mount_stat" ]; then
-    printf '%s\n' \
-        "MOUNT_DEVICE=${mount_stat%%:*}" \
-        "MOUNT_INODE=${mount_stat#*:}"
-fi
-printf '%s\n' "CLIENT=$client_state"
-if [ -n "$client_stat" ]; then
-    printf '%s\n' \
-        "CLIENT_DEVICE=${client_stat%%:*}" \
-        "CLIENT_INODE=${client_stat#*:}"
-fi
-printf '%s\n' 'RESULT=READY'
+    "$probe_magic" \
+    "EUID=$probe_euid" \
+    "EGID=$probe_egid" \
+    "USERNS_DEVICE=${probe_userns%%:*}" \
+    "USERNS_INODE=${probe_userns#*:}" \
+    "$probe_mount" \
+    "$probe_client" \
+    'RESULT=READY'
 "#;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,7 +56,7 @@ impl X11ProjectionProbeRequest {
         user: ValidatedGuestUserName,
         mount_target: &Path,
         client_path: &Path,
-    ) -> Result<Self, X11ProjectionProbeRequestError> {
+    ) -> Result<Self, ProbePathError> {
         Ok(Self {
             machine,
             user,
@@ -113,7 +81,7 @@ impl X11ProjectionProbeRequest {
         vec![
             "/bin/sh".into(),
             "-c".into(),
-            X11_PROBE_SCRIPT.into(),
+            guest_script(PROTOCOL.magic, X11_PROBE_BODY),
             "lasper-x11-projection-probe".into(),
             self.mount_target.clone(),
             self.client_path.clone(),
@@ -121,267 +89,29 @@ impl X11ProjectionProbeRequest {
     }
 }
 
-fn validate_absolute_path(path: &Path) -> Result<String, X11ProjectionProbeRequestError> {
-    if !path.is_absolute() {
-        return Err(X11ProjectionProbeRequestError::NotAbsolute);
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
-    {
-        return Err(X11ProjectionProbeRequestError::RelativeComponent);
-    }
-    let value = path
-        .to_str()
-        .ok_or(X11ProjectionProbeRequestError::NonUtf8)?;
-    if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(X11ProjectionProbeRequestError::InvalidValue);
-    }
-    if value.len() > MAX_TARGET_PATH_BYTES {
-        return Err(X11ProjectionProbeRequestError::TooLong {
-            maximum: MAX_TARGET_PATH_BYTES,
-        });
-    }
-    Ok(value.to_owned())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum X11ProjectionProbeRequestError {
-    #[error("X11 probe path must be absolute")]
-    NotAbsolute,
-    #[error("X11 probe path must not contain relative path components")]
-    RelativeComponent,
-    #[error("X11 probe path is not valid UTF-8")]
-    NonUtf8,
-    #[error("X11 probe path contains an empty or control-character value")]
-    InvalidValue,
-    #[error("X11 probe path exceeds the {maximum}-byte path limit")]
-    TooLong { maximum: usize },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum X11SocketAccess {
-    Accessible,
-    Missing,
-    Denied,
-    NotSocket,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct X11SocketObservation {
-    pub(crate) access: X11SocketAccess,
-    pub(crate) identity: Option<(u64, u64)>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct X11ProjectionProbeObservation {
     pub(crate) identity: ObservedGuestIdentity,
     pub(crate) user_namespace: ObservedNamespaceIdentity,
-    pub(crate) mount: X11SocketObservation,
-    pub(crate) client: X11SocketObservation,
+    pub(crate) mount: SocketObservation,
+    pub(crate) client: SocketObservation,
 }
 
 pub(crate) async fn collect_x11_probe(
     handle: &mut TerminalSessionHandle,
 ) -> Result<X11ProjectionProbeObservation, SessionError> {
-    let mut output = handle
-        .take_output()
-        .ok_or_else(|| SessionError::new("X11 projection probe output is unavailable"))?;
-    let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
-    let mut bytes = Vec::new();
-
-    loop {
-        match tokio::time::timeout_at(deadline, output.recv()).await {
-            Ok(Some(chunk)) => {
-                if bytes.len().saturating_add(chunk.len()) > MAX_PROBE_OUTPUT_BYTES {
-                    handle.close();
-                    return Err(SessionError::new(
-                        "X11 projection probe output exceeded its limit",
-                    ));
-                }
-                bytes.extend_from_slice(&chunk);
-                if let Some(frame_end) = complete_probe_frame_end(&bytes) {
-                    handle.close();
-                    return parse_x11_probe(&bytes[..frame_end]);
-                }
-            }
-            Ok(None) => break,
-            Err(_) => {
-                handle.close();
-                return Err(SessionError::new("X11 projection probe timed out"));
-            }
-        }
-    }
-    handle.close();
-    parse_x11_probe(&bytes)
-}
-
-fn complete_probe_frame_end(bytes: &[u8]) -> Option<usize> {
-    let marker_offset = bytes
-        .windows(PROBE_MAGIC.len())
-        .rposition(|window| window == PROBE_MAGIC)?;
-    let mut offset = marker_offset + PROBE_MAGIC.len();
-    if bytes[offset..].starts_with(b"\r\n") {
-        offset += 2;
-    } else if bytes[offset..].starts_with(b"\n") {
-        offset += 1;
-    } else {
-        return None;
-    }
-    while let Some(line_length) = bytes[offset..].iter().position(|byte| *byte == b'\n') {
-        let frame_end = offset + line_length + 1;
-        let line = bytes[offset..frame_end - 1]
-            .strip_suffix(b"\r")
-            .unwrap_or(&bytes[offset..frame_end - 1]);
-        if line == b"RESULT=READY" {
-            return Some(frame_end);
-        }
-        offset = frame_end;
-    }
-    None
-}
-
-#[derive(Default)]
-struct ProbeFields {
-    uid: Option<u32>,
-    gid: Option<u32>,
-    userns_device: Option<u64>,
-    userns_inode: Option<u64>,
-    mount_access: Option<X11SocketAccess>,
-    mount_device: Option<u64>,
-    mount_inode: Option<u64>,
-    client_access: Option<X11SocketAccess>,
-    client_device: Option<u64>,
-    client_inode: Option<u64>,
-    ready: bool,
+    parse_x11_probe(&PROTOCOL.collect(handle).await?)
 }
 
 fn parse_x11_probe(bytes: &[u8]) -> Result<X11ProjectionProbeObservation, SessionError> {
-    if bytes.len() > MAX_PROBE_OUTPUT_BYTES {
-        return Err(SessionError::new(
-            "X11 projection probe output exceeded its limit",
-        ));
-    }
-    let Some(marker_offset) = bytes
-        .windows(PROBE_MAGIC.len())
-        .rposition(|window| window == PROBE_MAGIC)
-    else {
-        return Err(incomplete_probe_error("protocol marker is missing", bytes));
-    };
-    let framed = &bytes[marker_offset + PROBE_MAGIC.len()..];
-    let Some(framed) = framed
-        .strip_prefix(b"\r\n")
-        .or_else(|| framed.strip_prefix(b"\n"))
-    else {
-        return Err(incomplete_probe_error(
-            "protocol marker is not followed by a line ending",
-            bytes,
-        ));
-    };
-
-    let mut fields = ProbeFields::default();
-    for raw_line in framed.split(|byte| *byte == b'\n') {
-        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
-        if line.len() > MAX_PROBE_LINE_BYTES {
-            return Err(SessionError::new(
-                "X11 projection probe line exceeded its limit",
-            ));
-        }
-        if line.is_empty() {
-            continue;
-        }
-        if fields.ready {
-            return Err(SessionError::new(
-                "X11 projection probe emitted data after its result",
-            ));
-        }
-        if line == b"RESULT=READY" {
-            fields.ready = true;
-            continue;
-        }
-        let Some(separator) = line.iter().position(|byte| *byte == b'=') else {
-            return Err(SessionError::new(
-                "X11 projection probe returned a malformed field",
-            ));
-        };
-        let (key, value) = (&line[..separator], &line[separator + 1..]);
-        match key {
-            b"EUID" => set_once(&mut fields.uid, parse_u32(value, "EUID")?, "EUID")?,
-            b"EGID" => set_once(&mut fields.gid, parse_u32(value, "EGID")?, "EGID")?,
-            b"USERNS_DEVICE" => set_once(
-                &mut fields.userns_device,
-                parse_u64(value, "USERNS_DEVICE")?,
-                "USERNS_DEVICE",
-            )?,
-            b"USERNS_INODE" => set_once(
-                &mut fields.userns_inode,
-                parse_u64(value, "USERNS_INODE")?,
-                "USERNS_INODE",
-            )?,
-            b"MOUNT" => set_once(
-                &mut fields.mount_access,
-                parse_access(value, "MOUNT")?,
-                "MOUNT",
-            )?,
-            b"MOUNT_DEVICE" => set_once(
-                &mut fields.mount_device,
-                parse_u64(value, "MOUNT_DEVICE")?,
-                "MOUNT_DEVICE",
-            )?,
-            b"MOUNT_INODE" => set_once(
-                &mut fields.mount_inode,
-                parse_u64(value, "MOUNT_INODE")?,
-                "MOUNT_INODE",
-            )?,
-            b"CLIENT" => set_once(
-                &mut fields.client_access,
-                parse_access(value, "CLIENT")?,
-                "CLIENT",
-            )?,
-            b"CLIENT_DEVICE" => set_once(
-                &mut fields.client_device,
-                parse_u64(value, "CLIENT_DEVICE")?,
-                "CLIENT_DEVICE",
-            )?,
-            b"CLIENT_INODE" => set_once(
-                &mut fields.client_inode,
-                parse_u64(value, "CLIENT_INODE")?,
-                "CLIENT_INODE",
-            )?,
-            _ => {
-                return Err(SessionError::new(format!(
-                    "X11 projection probe returned an unknown field: {}",
-                    escaped_field_key(key)
-                )))
-            }
-        }
-    }
-
-    let identity = ObservedGuestIdentity::new(
-        required(fields.uid, "EUID", bytes)?,
-        required(fields.gid, "EGID", bytes)?,
-    );
-    let user_namespace = ObservedNamespaceIdentity::new(
-        required(fields.userns_device, "USERNS_DEVICE", bytes)?,
-        required(fields.userns_inode, "USERNS_INODE", bytes)?,
-    );
-    let mount = socket_observation(
-        required(fields.mount_access, "MOUNT", bytes)?,
-        fields.mount_device,
-        fields.mount_inode,
-        "MOUNT",
-        bytes,
-    )?;
-    let client = socket_observation(
-        required(fields.client_access, "CLIENT", bytes)?,
-        fields.client_device,
-        fields.client_inode,
-        "CLIENT",
-        bytes,
-    )?;
-    if !fields.ready {
-        return Err(incomplete_probe_error("missing RESULT", bytes));
-    }
+    let mut frame = PROTOCOL.parse(bytes)?;
+    let identity = ObservedGuestIdentity::new(frame.u32(b"EUID")?, frame.u32(b"EGID")?);
+    let user_namespace =
+        ObservedNamespaceIdentity::new(frame.u64(b"USERNS_DEVICE")?, frame.u64(b"USERNS_INODE")?);
+    let mount = SocketObservation::parse(&mut frame, b"MOUNT", b"MOUNT_DEVICE", b"MOUNT_INODE")?;
+    let client =
+        SocketObservation::parse(&mut frame, b"CLIENT", b"CLIENT_DEVICE", b"CLIENT_INODE")?;
+    frame.finish()?;
     Ok(X11ProjectionProbeObservation {
         identity,
         user_namespace,
@@ -390,122 +120,13 @@ fn parse_x11_probe(bytes: &[u8]) -> Result<X11ProjectionProbeObservation, Sessio
     })
 }
 
-fn required<T>(value: Option<T>, field: &str, bytes: &[u8]) -> Result<T, SessionError> {
-    value.ok_or_else(|| incomplete_probe_error(&format!("missing {field}"), bytes))
-}
-
-fn socket_observation(
-    access: X11SocketAccess,
-    device: Option<u64>,
-    inode: Option<u64>,
-    field: &str,
-    bytes: &[u8],
-) -> Result<X11SocketObservation, SessionError> {
-    let identity = match (access, device, inode) {
-        (X11SocketAccess::Accessible | X11SocketAccess::Denied, Some(device), Some(inode)) => {
-            Some((device, inode))
-        }
-        (X11SocketAccess::Accessible | X11SocketAccess::Denied, _, _) => {
-            return Err(incomplete_probe_error(
-                &format!("{field} socket is missing DEVICE or INODE"),
-                bytes,
-            ));
-        }
-        (_, None, None) => None,
-        _ => {
-            return Err(SessionError::new(format!(
-                "X11 projection probe returned {field} identity for a non-socket"
-            )));
-        }
-    };
-    Ok(X11SocketObservation { access, identity })
-}
-
-fn set_once<T>(slot: &mut Option<T>, value: T, field: &str) -> Result<(), SessionError> {
-    if slot.replace(value).is_some() {
-        return Err(SessionError::new(format!(
-            "X11 projection probe repeated {field}"
-        )));
-    }
-    Ok(())
-}
-
-fn parse_access(value: &[u8], field: &str) -> Result<X11SocketAccess, SessionError> {
-    match value {
-        b"ACCESSIBLE" => Ok(X11SocketAccess::Accessible),
-        b"MISSING" => Ok(X11SocketAccess::Missing),
-        b"DENIED" => Ok(X11SocketAccess::Denied),
-        b"NOT_SOCKET" => Ok(X11SocketAccess::NotSocket),
-        _ => Err(SessionError::new(format!(
-            "X11 projection probe returned an invalid {field}"
-        ))),
-    }
-}
-
-fn parse_u32(value: &[u8], field: &str) -> Result<u32, SessionError> {
-    u32::try_from(parse_u64(value, field)?)
-        .map_err(|_| SessionError::new(format!("X11 projection probe returned an invalid {field}")))
-}
-
-fn parse_u64(value: &[u8], field: &str) -> Result<u64, SessionError> {
-    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-        return Err(SessionError::new(format!(
-            "X11 projection probe returned an invalid {field}"
-        )));
-    }
-    std::str::from_utf8(value)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .ok_or_else(|| {
-            SessionError::new(format!("X11 projection probe returned an invalid {field}"))
-        })
-}
-
-fn incomplete_probe_error(reason: &str, bytes: &[u8]) -> SessionError {
-    SessionError::new(format!(
-        "X11 projection probe result was incomplete ({reason}; captured output: {})",
-        escaped_output_tail(bytes)
-    ))
-}
-
-fn escaped_output_tail(bytes: &[u8]) -> String {
-    const PREVIEW_BYTES: usize = 512;
-    if bytes.is_empty() {
-        return "<empty>".into();
-    }
-    let truncated = bytes.len() > PREVIEW_BYTES;
-    let start = bytes.len().saturating_sub(PREVIEW_BYTES);
-    let mut preview = String::with_capacity(bytes.len().min(PREVIEW_BYTES));
-    if truncated {
-        preview.push_str("...");
-    }
-    for byte in &bytes[start..] {
-        preview.extend(std::ascii::escape_default(*byte).map(char::from));
-    }
-    preview
-}
-
-fn escaped_field_key(bytes: &[u8]) -> String {
-    const PREVIEW_BYTES: usize = 96;
-    let mut preview = String::new();
-    for byte in bytes.iter().take(PREVIEW_BYTES) {
-        preview.extend(std::ascii::escape_default(*byte).map(char::from));
-    }
-    if bytes.len() > PREVIEW_BYTES {
-        preview.push_str("...");
-    }
-    if preview.is_empty() {
-        "<empty>".into()
-    } else {
-        preview
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::session::probe::SocketAccess;
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use std::os::unix::fs::MetadataExt;
+    use std::time::Duration;
 
     fn machine() -> MachineName {
         MachineName::new("demo").unwrap()
@@ -531,8 +152,8 @@ mod tests {
         let observation = parse_x11_probe(&output.stdout).unwrap();
         let metadata = std::fs::metadata(&mount).unwrap();
         let userns = std::fs::metadata("/proc/self/ns/user").unwrap();
-        assert_eq!(observation.mount.access, X11SocketAccess::Accessible);
-        assert_eq!(observation.client.access, X11SocketAccess::Accessible);
+        assert_eq!(observation.mount.access, SocketAccess::Accessible);
+        assert_eq!(observation.client.access, SocketAccess::Accessible);
         assert_eq!(
             observation.mount.identity,
             Some((metadata.dev(), metadata.ino()))
@@ -559,10 +180,10 @@ mod tests {
         let _listener = UnixListener::bind(&socket).unwrap();
         let request = X11ProjectionProbeRequest::new(machine(), user(), &socket, &socket).unwrap();
         for (mode, expected) in [
-            (0o100, X11SocketAccess::Denied),
-            (0o500, X11SocketAccess::Denied),
-            (0o200, X11SocketAccess::Accessible),
-            (0o600, X11SocketAccess::Accessible),
+            (0o100, SocketAccess::Denied),
+            (0o500, SocketAccess::Denied),
+            (0o200, SocketAccess::Accessible),
+            (0o600, SocketAccess::Accessible),
         ] {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(mode)).unwrap();
             let output = std::process::Command::new(request.path())
@@ -574,10 +195,10 @@ mod tests {
             assert_eq!(observation.mount.access, expected, "mode {mode:04o}");
             assert_eq!(observation.client.access, expected, "mode {mode:04o}");
             match UnixStream::connect(&socket) {
-                Ok(_) => assert_eq!(expected, X11SocketAccess::Accessible),
+                Ok(_) => assert_eq!(expected, SocketAccess::Accessible),
                 Err(error) => {
                     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-                    assert_eq!(expected, X11SocketAccess::Denied);
+                    assert_eq!(expected, SocketAccess::Denied);
                 }
             }
         }
@@ -591,7 +212,7 @@ mod tests {
         );
         endpoint
             .output
-            .send(b"LASPER_X11_PROJECTION_PROBE_V1\r\nEUID=1000\r\nEGID=1000\r\nUSERNS_DEVICE=4\r\nUSERNS_INODE=5\r\nMOUNT=MISSING\r\nCLIENT=MISSING\r\nRESULT=READY\r\n".to_vec())
+            .send(b"LASPER_X11_PROJECTION_PROBE_V1\r\nEUID=1000\r\nEGID=1000\r\nUSERNS_DEVICE=4\r\nUSERNS_INODE=5\r\nMOUNT=UNAVAILABLE\r\nCLIENT=UNAVAILABLE\r\nRESULT=READY\r\n".to_vec())
             .await
             .unwrap();
         let observation =
@@ -599,25 +220,29 @@ mod tests {
                 .await
                 .expect("complete X11 probe waited for the PTY to close")
                 .unwrap();
-        assert_eq!(observation.mount.access, X11SocketAccess::Missing);
+        assert_eq!(observation.mount.access, SocketAccess::Unavailable);
     }
 
     #[test]
     fn parser_rejects_missing_duplicate_and_inconsistent_fields() {
         let prefix = "LASPER_X11_PROJECTION_PROBE_V1\nEUID=1000\nEGID=1000\nUSERNS_DEVICE=4\nUSERNS_INODE=5\n";
         assert!(parse_x11_probe(
-            format!("{prefix}MOUNT=ACCESSIBLE\nMOUNT_DEVICE=1\nCLIENT=MISSING\nRESULT=READY\n")
+            format!("{prefix}MOUNT=ACCESSIBLE\nMOUNT_DEVICE=1\nCLIENT=UNAVAILABLE\nRESULT=READY\n")
                 .as_bytes()
         )
         .is_err());
         assert!(parse_x11_probe(
-            format!("{prefix}MOUNT=MISSING\nCLIENT=MISSING\nCLIENT=MISSING\nRESULT=READY\n")
-                .as_bytes()
+            format!(
+                "{prefix}MOUNT=UNAVAILABLE\nCLIENT=UNAVAILABLE\nCLIENT=UNAVAILABLE\nRESULT=READY\n"
+            )
+            .as_bytes()
         )
         .is_err());
         assert!(parse_x11_probe(
-            format!("{prefix}MOUNT=MISSING\nMOUNT_DEVICE=1\nCLIENT=MISSING\nRESULT=READY\n")
-                .as_bytes()
+            format!(
+                "{prefix}MOUNT=UNAVAILABLE\nMOUNT_DEVICE=1\nCLIENT=UNAVAILABLE\nRESULT=READY\n"
+            )
+            .as_bytes()
         )
         .is_err());
     }
@@ -625,7 +250,7 @@ mod tests {
     #[test]
     fn parser_uses_the_last_frame_after_assignment_like_terminal_noise() {
         let observation = parse_x11_probe(
-            b"PAM_STATUS=ready\r\nLASPER_X11_PROJECTION_PROBE_V1\r\nEUID=1000\r\nEGID=1001\r\nUSERNS_DEVICE=4\r\nUSERNS_INODE=5\r\nMOUNT=MISSING\r\nCLIENT=MISSING\r\nRESULT=READY\r\n",
+            b"PAM_STATUS=ready\r\nLASPER_X11_PROJECTION_PROBE_V1\r\nEUID=1000\r\nEGID=1001\r\nUSERNS_DEVICE=4\r\nUSERNS_INODE=5\r\nMOUNT=UNAVAILABLE\r\nCLIENT=UNAVAILABLE\r\nRESULT=READY\r\n",
         )
         .unwrap();
 
@@ -635,11 +260,57 @@ mod tests {
     #[test]
     fn unknown_field_error_identifies_the_bounded_escaped_key() {
         let error = parse_x11_probe(
-            b"LASPER_X11_PROJECTION_PROBE_V1\nEUID=1000\nPAM_\x1b=unexpected\nRESULT=READY\n",
+            b"LASPER_X11_PROJECTION_PROBE_V1\nEUID=1000\nEGID=1000\nUSERNS_DEVICE=4\nUSERNS_INODE=5\nMOUNT=UNAVAILABLE\nCLIENT=UNAVAILABLE\nPAM_\x1b=unexpected\nRESULT=READY\n",
         )
         .unwrap_err();
 
         assert!(error.to_string().contains(r"PAM_\x1b"));
+    }
+
+    #[test]
+    fn failed_socket_stat_still_emits_a_complete_frame() {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let request = X11ProjectionProbeRequest::new(machine(), user(), &path, &path).unwrap();
+        let mut args = request.args();
+        args[2] = format!(
+            "probe_test_path=$1\nstat() {{\n    if [ \"$4\" = \"$probe_test_path\" ]; then return 1; fi\n    command stat \"$@\"\n}}\n{}",
+            args[2]
+        );
+        let output = std::process::Command::new(request.path())
+            .args(&args[1..])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let observed = parse_x11_probe(&output.stdout).unwrap();
+        assert_eq!(observed.mount.access, SocketAccess::Unavailable);
+        assert_eq!(observed.client.access, SocketAccess::Unavailable);
+        assert_eq!(observed.mount.identity, None);
+        assert_eq!(observed.client.identity, None);
+    }
+
+    #[test]
+    fn failed_namespace_stat_emits_an_explicit_error_frame() {
+        let request = X11ProjectionProbeRequest::new(
+            machine(),
+            user(),
+            Path::new("/mnt/x11/X0"),
+            Path::new("/tmp/.X11-unix/X0"),
+        )
+        .unwrap();
+        let mut args = request.args();
+        args[2] = format!("stat() {{ return 1; }}\n{}", args[2]);
+        let output = std::process::Command::new(request.path())
+            .args(&args[1..])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let error = parse_x11_probe(&output.stdout).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("guest user namespace could not be inspected"));
+        assert!(!error.to_string().contains("incomplete"));
     }
 
     #[test]

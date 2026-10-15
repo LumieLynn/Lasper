@@ -245,7 +245,7 @@ fn failed_observation_resets_grace_period_and_remains_retryable() {
             SystemMachineRegistration::Unknown("registration read failed".into()),
             101
         ),
-        ReconcileClaimStatus::Blocked(_)
+        ReconcileClaimStatus::Unavailable(_)
     ));
     assert!(matches!(fixture.claim().phase, MachineClaimPhase::Active));
     assert!(fixture.watcher_needed());
@@ -347,6 +347,7 @@ fn shared_grant_waits_for_every_machine_and_all_observation_failures() {
     for status in [
         ReconcileClaimStatus::Active,
         ReconcileClaimStatus::Pending,
+        ReconcileClaimStatus::Unavailable("read failed".into()),
         ReconcileClaimStatus::Blocked("read failed".into()),
     ] {
         let mut group = ReconcileGroup::new(ReconcileClaim {

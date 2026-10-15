@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use crate::application::x11::{
     X11AuthorizationRequest, X11DesktopAccessError, X11DesktopAccessPort, X11DesktopAuthorization,
     X11DesktopObservation, X11DesktopRevocation, X11EndpointCatalog, X11EndpointDiscoveryPort,
-    X11ReconcileReport, X11RevokeRequest,
+    X11ReconcileReport, X11ReconcileTarget, X11RevokeRequest,
 };
 use crate::domain::x11::HostX11Socket;
 use crate::domain::x11::X11_SOCKET_DIRECTORY;
@@ -105,6 +105,17 @@ impl X11EndpointDiscoveryPort for HostX11EndpointDiscovery {
 
 #[async_trait::async_trait]
 impl X11DesktopAccessPort for HostX11DesktopAccess {
+    async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11DesktopAccessError> {
+        tokio::task::spawn_blocking(state::reconcile_targets_sync)
+            .await
+            .map_err(|error| {
+                X11DesktopAccessError::new(format!(
+                    "X11 lifecycle state inspection task failed: {error}"
+                ))
+            })?
+            .map_err(X11DesktopAccessError::new)
+    }
+
     async fn snapshot(
         &self,
         socket: &HostX11Socket,
@@ -146,26 +157,25 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
 
     async fn reconcile(
         &self,
-        socket: &HostX11Socket,
+        target: &X11ReconcileTarget,
     ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
-        let socket = socket.clone();
-        tokio::task::spawn_blocking(move || lifecycle::reconcile_sync(&socket))
-            .await
-            .map_err(|error| {
-                X11DesktopAccessError::new(format!("X11 reconcile task failed: {error}"))
-            })?
-            .map_err(X11DesktopAccessError::new)
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || {
+            let socket = transport::inspect_endpoint_peer_only(
+                target.display,
+                target.alternate_endpoint,
+                target.source.clone(),
+            )
+            .map_err(|error| format!("{}: {error}", target.source.display()))?;
+            lifecycle::reconcile_sync(&socket)
+        })
+        .await
+        .map_err(|error| X11DesktopAccessError::new(format!("X11 reconcile task failed: {error}")))?
+        .map_err(X11DesktopAccessError::new)
     }
 
     async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
-        let claims_need_activation = tokio::task::spawn_blocking(state::has_unresolved_claims_sync)
-            .await
-            .map_err(|error| {
-                X11DesktopAccessError::new(format!(
-                    "X11 claim activation inspection task failed: {error}"
-                ))
-            })?
-            .map_err(X11DesktopAccessError::new)?;
+        let claims_need_activation = !self.reconcile_targets().await?.is_empty();
         activation::synchronize_system_machine_path_activation(
             self.activation_backend,
             claims_need_activation,

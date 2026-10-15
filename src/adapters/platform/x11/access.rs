@@ -1,9 +1,8 @@
 //! Authorization, observation, and revocation orchestration.
 //!
 //! This module coordinates discovery evidence, transport operations, and
-//! trusted state. It is the only child module that performs ACL mutations;
-//! persistence and machine-state reconciliation remain delegated to their
-//! respective modules.
+//! trusted state. Explicit access operations live here; stopped-machine
+//! cleanup lives in lifecycle and uses the same wire/state primitives.
 
 use x11rb::protocol::xproto::Family;
 
@@ -23,7 +22,7 @@ use super::state::{
     X11RuntimeState,
 };
 use super::transport::{
-    authenticated_connection, authorization_was_confirmed, host_boot_id, insert_and_observe,
+    authorization_was_confirmed, connect_current_socket, host_boot_id, insert_and_observe,
     numeric_local_user_address, read_acl, remove_and_observe, require_current_socket,
     x11_peer_start_time,
 };
@@ -31,8 +30,7 @@ use super::transport::{
 pub(super) fn snapshot_desktop_sync(
     socket: &HostX11Socket,
 ) -> Result<X11DesktopObservation, String> {
-    require_current_socket(socket, "before querying its ACL")?;
-    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let connection = connect_current_socket(socket)?;
     let acl = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "while querying its ACL")?;
     let observation = desktop_observation(socket, acl, None);
@@ -89,8 +87,7 @@ pub(super) fn ensure_access_sync(
 ) -> Result<X11DesktopAuthorization, String> {
     let projection = request.projection();
     let socket = projection.host_socket();
-    require_current_socket(socket, "before authorizing access")?;
-    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
+    let connection = connect_current_socket(socket)?;
     let before = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "before changing its ACL")?;
 
@@ -416,12 +413,11 @@ pub(super) fn revoke_access_sync(
     if evidence.boot_id != current_boot_id {
         return Err("X11 grant record belongs to another host boot".to_owned());
     }
-    require_current_socket(socket, "before revoking access")?;
+    let connection = connect_current_socket(socket)?;
     let current_server_start = x11_peer_start_time(socket)?;
     if current_server_start != evidence.server_peer_start_time {
         return Err("X11 server generation changed since the grant was created".to_owned());
     }
-    let (connection, _) = authenticated_connection(socket.source(), socket.display())?;
     let before = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "before changing its ACL")?;
     match before.mode() {

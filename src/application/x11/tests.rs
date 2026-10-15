@@ -124,6 +124,17 @@ fn assessed_check(
     complete: bool,
     boot_id: Option<&str>,
 ) -> X11AccessCheck {
+    assessed_check_for_socket(phase, acl_present, complete, boot_id, false, 2)
+}
+
+fn assessed_check_for_socket(
+    phase: Option<X11GrantRecordPhase>,
+    acl_present: bool,
+    complete: bool,
+    boot_id: Option<&str>,
+    socket_alternate: bool,
+    socket_inode: u64,
+) -> X11AccessCheck {
     let host_uid = 1_437_402_088;
     let entries = acl_present
         .then(|| {
@@ -140,7 +151,7 @@ fn assessed_check(
         .collect();
     X11AccessCheck::from_desktop_observation(
         target(),
-        projection(host_uid),
+        projection_for_socket(host_socket(0, socket_alternate, socket_inode), host_uid),
         X11DesktopObservation::new(
             X11AclSnapshot::from_wire(1, entries),
             1000,
@@ -271,6 +282,27 @@ fn confirmed_record_is_managed_only_with_current_server_and_instance_evidence() 
 }
 
 #[test]
+fn managed_grant_survives_a_listener_change_within_the_same_x_server() {
+    let check = assessed_check_for_socket(
+        Some(X11GrantRecordPhase::ConfirmedAdded),
+        true,
+        true,
+        Some("11111111-1111-4111-8111-111111111111"),
+        true,
+        3,
+    );
+
+    assert!(matches!(
+        check.grant_assessment().status(),
+        X11GrantAssessmentStatus::Managed { .. }
+    ));
+    assert_eq!(
+        check.grant_assessment().history()[0].detail(),
+        "confirmed for the current machine instance and X server; the selected listener changed"
+    );
+}
+
+#[test]
 fn current_acl_and_operation_history_remain_separate_facts() {
     let preexisting = assessed_check(None, true, true, None);
     assert_eq!(
@@ -312,7 +344,12 @@ fn current_acl_and_operation_history_remain_separate_facts() {
 
 #[test]
 fn uncertain_records_never_create_managed_ownership() {
-    let pending = assessed_check(Some(X11GrantRecordPhase::Pending), true, true, None);
+    let pending = assessed_check(
+        Some(X11GrantRecordPhase::Pending),
+        true,
+        true,
+        Some("11111111-1111-4111-8111-111111111111"),
+    );
     assert_eq!(
         pending.grant_assessment().status(),
         &X11GrantAssessmentStatus::OutcomeUnknown
@@ -321,6 +358,28 @@ fn uncertain_records_never_create_managed_ownership() {
         pending.grant_assessment().history()[0].status(),
         X11GrantHistoryStatus::OutcomeUnknown
     );
+
+    for phase in [
+        X11GrantRecordPhase::Pending,
+        X11GrantRecordPhase::OutcomeUnknown {
+            reason: "desktop confirmation failed".into(),
+        },
+    ] {
+        let stale = assessed_check(
+            Some(phase),
+            true,
+            true,
+            Some("22222222-2222-4222-8222-222222222222"),
+        );
+        assert_eq!(
+            stale.grant_assessment().status(),
+            &X11GrantAssessmentStatus::Historical
+        );
+        assert_eq!(
+            stale.grant_assessment().history()[0].status(),
+            X11GrantHistoryStatus::Historical
+        );
+    }
 
     let incomplete = assessed_check(None, true, false, None);
     assert_eq!(
@@ -436,6 +495,7 @@ impl SessionPort for ProjectionPort {
 }
 
 struct RecordingDesktopPort {
+    unresolved_claims: bool,
     snapshots: AtomicUsize,
     ensures: AtomicUsize,
     reconciles: AtomicUsize,
@@ -444,6 +504,20 @@ struct RecordingDesktopPort {
 
 #[async_trait::async_trait]
 impl X11DesktopAccessPort for RecordingDesktopPort {
+    async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11DesktopAccessError> {
+        if self.unresolved_claims {
+            Ok((0..2)
+                .map(|display| X11ReconcileTarget {
+                    display,
+                    alternate_endpoint: false,
+                    source: format!("/tmp/.X11-unix/X{display}").into(),
+                })
+                .collect())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
     async fn snapshot(
         &self,
         _socket: &HostX11Socket,
@@ -494,11 +568,11 @@ impl X11DesktopAccessPort for RecordingDesktopPort {
 
     async fn reconcile(
         &self,
-        socket: &HostX11Socket,
+        target: &X11ReconcileTarget,
     ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
         self.reconciles.fetch_add(1, Ordering::Relaxed);
         Ok(X11ReconcileReport::new(
-            socket.display(),
+            target.display,
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -509,10 +583,23 @@ impl X11DesktopAccessPort for RecordingDesktopPort {
 struct SequencedDesktopPort {
     reports: Mutex<VecDeque<X11ReconcileReport>>,
     reconciles: AtomicUsize,
+    fail_on_call: Option<usize>,
 }
 
 #[async_trait::async_trait]
 impl X11DesktopAccessPort for SequencedDesktopPort {
+    async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11DesktopAccessError> {
+        if self.reports.lock().is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(vec![X11ReconcileTarget {
+                display: 0,
+                alternate_endpoint: false,
+                source: "/tmp/.X11-unix/X0".into(),
+            }])
+        }
+    }
+
     async fn snapshot(
         &self,
         _socket: &HostX11Socket,
@@ -536,9 +623,14 @@ impl X11DesktopAccessPort for SequencedDesktopPort {
 
     async fn reconcile(
         &self,
-        _socket: &HostX11Socket,
+        _target: &X11ReconcileTarget,
     ) -> Result<X11ReconcileReport, X11DesktopAccessError> {
-        self.reconciles.fetch_add(1, Ordering::Relaxed);
+        let call = self.reconciles.fetch_add(1, Ordering::Relaxed) + 1;
+        if self.fail_on_call == Some(call) {
+            return Err(X11DesktopAccessError::new(
+                "transient lifecycle read failure",
+            ));
+        }
         self.reports
             .lock()
             .pop_front()
@@ -560,6 +652,7 @@ async fn explicit_session_tries_projected_endpoint_before_one_atomic_acl_ensure(
         }),
     )));
     let desktop = Arc::new(RecordingDesktopPort {
+        unresolved_claims: true,
         snapshots: AtomicUsize::new(0),
         ensures: AtomicUsize::new(0),
         reconciles: AtomicUsize::new(0),
@@ -600,6 +693,7 @@ async fn lifecycle_reconcile_routes_each_discovered_local_endpoint() {
         }),
     )));
     let desktop = Arc::new(RecordingDesktopPort {
+        unresolved_claims: true,
         snapshots: AtomicUsize::new(0),
         ensures: AtomicUsize::new(0),
         reconciles: AtomicUsize::new(0),
@@ -637,11 +731,14 @@ async fn lifecycle_event_reconcile_covers_stop_pending_and_cleanup_ready() {
     )));
     let desktop = Arc::new(SequencedDesktopPort {
         reports: Mutex::new(VecDeque::from([
-            X11ReconcileReport::new(0, Vec::new(), Vec::new(), Vec::new()),
-            X11ReconcileReport::new(0, Vec::new(), vec!["pending".into()], Vec::new()),
+            X11ReconcileReport::new(0, Vec::new(), Vec::new(), Vec::new())
+                .with_retry(X11ReconcileRetry::RegisteredMachine),
+            X11ReconcileReport::new(0, Vec::new(), vec!["pending".into()], Vec::new())
+                .with_retry(X11ReconcileRetry::PendingObservation),
             X11ReconcileReport::new(0, vec!["revoked".into()], Vec::new(), Vec::new()),
         ])),
         reconciles: AtomicUsize::new(0),
+        fail_on_call: None,
     });
     let service = X11AccessService::new(
         session_projection_port(sessions),
@@ -658,4 +755,149 @@ async fn lifecycle_event_reconcile_covers_stop_pending_and_cleanup_ready() {
     assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 3);
     assert_eq!(reports[0].revoked_record_ids(), ["revoked"]);
     assert!(reports[0].pending_record_ids().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_event_retry_survives_a_transient_second_pass_error() {
+    let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
+        probes: Mutex::new(Vec::new()),
+    })));
+    let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+        StaticEndpointPort(X11EndpointCatalog {
+            sockets: vec![host_socket(0, false, 2)],
+            ..Default::default()
+        }),
+    )));
+    let desktop = Arc::new(SequencedDesktopPort {
+        reports: Mutex::new(VecDeque::from([
+            X11ReconcileReport::new(0, Vec::new(), vec!["pending".into()], Vec::new())
+                .with_retry(X11ReconcileRetry::PendingObservation),
+            X11ReconcileReport::new(0, vec!["revoked".into()], Vec::new(), Vec::new()),
+        ])),
+        reconciles: AtomicUsize::new(0),
+        fail_on_call: Some(2),
+    });
+    let service = X11AccessService::new(
+        session_projection_port(sessions),
+        endpoints,
+        desktop.clone(),
+    );
+
+    let task = tokio::spawn(async move { service.reconcile_after_machine_event().await });
+    tokio::task::yield_now().await;
+    tokio::time::advance(MACHINE_LIFECYCLE_RETRY_DELAY).await;
+    tokio::task::yield_now().await;
+    tokio::time::advance(MACHINE_LIFECYCLE_RETRY_DELAY).await;
+    let reports = task.await.unwrap().unwrap();
+
+    assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 3);
+    assert_eq!(reports[0].revoked_record_ids(), ["revoked"]);
+    assert!(reports[0].is_complete());
+}
+
+#[tokio::test]
+async fn reconcile_without_claims_skips_endpoint_discovery_and_desktop_io() {
+    let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
+        probes: Mutex::new(Vec::new()),
+    })));
+    let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+        StaticEndpointPort(X11EndpointCatalog::default()),
+    )));
+    let desktop = Arc::new(RecordingDesktopPort {
+        unresolved_claims: false,
+        snapshots: AtomicUsize::new(0),
+        ensures: AtomicUsize::new(0),
+        reconciles: AtomicUsize::new(0),
+        purposes: Mutex::new(Vec::new()),
+    });
+    let service = X11AccessService::new(
+        session_projection_port(sessions),
+        endpoints,
+        desktop.clone(),
+    );
+
+    // This catalog would be an error if discovery were reached.
+    assert!(service.reconcile().await.unwrap().is_empty());
+    assert!(service
+        .reconcile_after_machine_event()
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 0);
+    assert_eq!(desktop.snapshots.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_reconcile_stops_retrying_when_local_claims_are_resolved() {
+    let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
+        probes: Mutex::new(Vec::new()),
+    })));
+    let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+        StaticEndpointPort(X11EndpointCatalog {
+            sockets: vec![host_socket(0, false, 2)],
+            ..Default::default()
+        }),
+    )));
+    let desktop = Arc::new(SequencedDesktopPort {
+        reports: Mutex::new(VecDeque::from([X11ReconcileReport::new(
+            0,
+            vec!["revoked".into()],
+            Vec::new(),
+            Vec::new(),
+        )])),
+        reconciles: AtomicUsize::new(0),
+        fail_on_call: None,
+    });
+    let service = X11AccessService::new(
+        session_projection_port(sessions),
+        endpoints,
+        desktop.clone(),
+    );
+    let started = tokio::time::Instant::now();
+
+    let reports = service.reconcile_after_machine_event().await.unwrap();
+
+    assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+    assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 1);
+    assert_eq!(reports[0].revoked_record_ids(), ["revoked"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn lifecycle_reconcile_retains_earlier_revocations_and_latest_pending_state() {
+    let sessions = Arc::new(SessionService::new(Arc::new(ProjectionPort {
+        probes: Mutex::new(Vec::new()),
+    })));
+    let endpoints = Arc::new(X11EndpointDiscoveryService::new(Arc::new(
+        StaticEndpointPort(X11EndpointCatalog {
+            sockets: vec![host_socket(0, false, 2)],
+            ..Default::default()
+        }),
+    )));
+    let desktop = Arc::new(SequencedDesktopPort {
+        reports: Mutex::new(VecDeque::from([
+            X11ReconcileReport::new(
+                0,
+                vec!["earlier".into()],
+                vec!["later".into()],
+                vec!["temporary".into()],
+            )
+            .with_retry(X11ReconcileRetry::PendingObservation),
+            X11ReconcileReport::new(0, Vec::new(), vec!["later".into()], Vec::new())
+                .with_retry(X11ReconcileRetry::PendingObservation),
+            X11ReconcileReport::new(0, vec!["later".into()], Vec::new(), Vec::new()),
+        ])),
+        reconciles: AtomicUsize::new(0),
+        fail_on_call: None,
+    });
+    let service = X11AccessService::new(
+        session_projection_port(sessions),
+        endpoints,
+        desktop.clone(),
+    );
+
+    let reports = service.reconcile_after_machine_event().await.unwrap();
+
+    assert_eq!(desktop.reconciles.load(Ordering::Relaxed), 3);
+    assert_eq!(reports[0].revoked_record_ids(), ["earlier", "later"]);
+    assert!(reports[0].is_complete());
 }

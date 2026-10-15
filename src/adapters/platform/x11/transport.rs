@@ -13,6 +13,7 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex;
 use x11rb::protocol::xproto::{ConnectionExt, Family, HostMode};
 use x11rb::reexports::x11rb_protocol::xauth;
 use x11rb::rust_connection::{DefaultStream, PollMode, RustConnection, Stream};
@@ -28,10 +29,26 @@ type AuthenticatedX11Connection = (X11Connection, X11PeerIdentity);
 
 /// x11rb makes its stream nonblocking and waits through `Stream::poll`, so
 /// socket read/write timeouts do not limit setup or reply waits. Keep its
-/// wire/FD handling and bound the readiness waits at that actual boundary.
+/// wire/FD handling and give each setup/query/change an absolute deadline.
+/// Partial replies and repeated readiness notifications must not extend it.
 #[derive(Debug)]
 pub(super) struct EndpointStream {
     inner: DefaultStream,
+    deadline: Mutex<Instant>,
+}
+
+impl EndpointStream {
+    fn begin_operation(&self) {
+        *self.deadline.lock() = Instant::now() + ENDPOINT_IO_TIMEOUT;
+    }
+
+    fn check_deadline(&self) -> io::Result<()> {
+        if Instant::now() >= *self.deadline.lock() {
+            Err(endpoint_timeout())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Stream for EndpointStream {
@@ -43,14 +60,16 @@ impl Stream for EndpointStream {
         if mode.writable() {
             events |= libc::POLLOUT;
         }
-        wait_for_socket(self.inner.as_raw_fd(), events, ENDPOINT_IO_TIMEOUT)
+        wait_for_socket(self.inner.as_raw_fd(), events, *self.deadline.lock())
     }
 
     fn read(&self, buf: &mut [u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.check_deadline()?;
         self.inner.read(buf, fds)
     }
 
     fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> io::Result<usize> {
+        self.check_deadline()?;
         self.inner.write(buf, fds)
     }
 
@@ -59,12 +78,16 @@ impl Stream for EndpointStream {
         bufs: &[IoSlice<'_>],
         fds: &mut Vec<RawFdContainer>,
     ) -> io::Result<usize> {
+        self.check_deadline()?;
         self.inner.write_vectored(bufs, fds)
     }
 }
 
-fn wait_for_socket(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
+fn endpoint_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "X11 endpoint wait timed out")
+}
+
+fn wait_for_socket(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()> {
     let mut descriptor = libc::pollfd {
         fd,
         events,
@@ -73,10 +96,7 @@ fn wait_for_socket(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::R
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "X11 endpoint wait timed out",
-            ));
+            return Err(endpoint_timeout());
         }
         let millis = remaining
             .as_millis()
@@ -88,7 +108,7 @@ fn wait_for_socket(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::R
             if descriptor.revents & libc::POLLNVAL != 0 {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
-            // HUP/ERR are handled by the next stream read/write or SO_ERROR.
+            // HUP/ERR are handled by the next stream read/write.
             return Ok(());
         }
         if result < 0 {
@@ -100,22 +120,29 @@ fn wait_for_socket(fd: RawFd, events: libc::c_short, timeout: Duration) -> io::R
     }
 }
 
-fn connect_socket(source: &Path) -> io::Result<UnixStream> {
+fn sockaddr_for(source: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
     let path = source.as_os_str().as_bytes();
     // Zero initialization supplies the terminating NUL and sockaddr padding.
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    if path.is_empty() || path.len() >= address.sun_path.len() || path.contains(&0) {
+    let mut sockaddr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path.is_empty() || path.len() >= sockaddr.sun_path.len() || path.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid X11 socket path",
         ));
     }
-    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    for (destination, source) in address.sun_path.iter_mut().zip(path) {
+    sockaddr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (destination, source) in sockaddr.sun_path.iter_mut().zip(path) {
         *destination = *source as libc::c_char;
     }
     let length =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1) as libc::socklen_t;
+    Ok((sockaddr, length))
+}
+
+fn connect_socket(source: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    const BACKLOG_RETRY_DELAY: Duration = Duration::from_millis(10);
+
+    let (address, length) = sockaddr_for(source)?;
     // Nonblocking connect also avoids hanging on a full Unix socket backlog.
     let fd = unsafe {
         libc::socket(
@@ -129,30 +156,43 @@ fn connect_socket(source: &Path) -> io::Result<UnixStream> {
     }
     // socket() returned a new descriptor; OwnedFd closes every error path.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(fd) });
-    let result = unsafe {
-        libc::connect(
-            stream.as_raw_fd(),
-            std::ptr::addr_of!(address).cast(),
-            length,
-        )
-    };
-    if result < 0 {
+    loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "X11 socket connection timed out",
+            ));
+        }
+        let result = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                std::ptr::addr_of!(address).cast(),
+                length,
+            )
+        };
+        if result == 0 {
+            return Ok(stream);
+        }
         let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::EINPROGRESS)
-            && error.kind() != io::ErrorKind::Interrupted
-        {
-            return Err(error);
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock => {
+                // Linux AF_UNIX returns EAGAIN when the listener backlog is
+                // full, without starting a connection. Retry connect rather
+                // than wait for TCP-style asynchronous completion.
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(BACKLOG_RETRY_DELAY),
+                );
+            }
+            _ => return Err(error),
         }
-        wait_for_socket(stream.as_raw_fd(), libc::POLLOUT, ENDPOINT_IO_TIMEOUT)?;
-        if let Some(error) = stream.take_error()? {
-            return Err(error);
-        }
-        stream.peer_addr()?;
     }
-    Ok(stream)
 }
 
 pub(super) fn read_acl(connection: &X11Connection, display: u16) -> Result<X11AclSnapshot, String> {
+    connection.stream().begin_operation();
     let reply = connection
         .list_hosts()
         .map_err(|error| format!("send ListHosts to :{display}: {error}"))?
@@ -185,6 +225,7 @@ pub(super) fn insert_and_observe(
     display: u16,
     host_uid: u32,
 ) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
+    connection.stream().begin_operation();
     let address = numeric_local_user_address(host_uid);
     let change_result =
         match connection.change_hosts(HostMode::INSERT, Family::SERVER_INTERPRETED, &address) {
@@ -202,6 +243,7 @@ pub(super) fn remove_and_observe(
     display: u16,
     host_uid: u32,
 ) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
+    connection.stream().begin_operation();
     let address = numeric_local_user_address(host_uid);
     let change_result =
         match connection.change_hosts(HostMode::DELETE, Family::SERVER_INTERPRETED, &address) {
@@ -264,36 +306,73 @@ pub(super) fn unix_millis() -> Result<u64, String> {
 }
 
 pub(super) fn require_current_socket(socket: &HostX11Socket, phase: &str) -> Result<(), String> {
-    let current = inspect_endpoint_peer_only(
-        socket.display(),
-        socket.alternate(),
-        socket.source().to_path_buf(),
-    )?;
-    if &current != socket {
+    let canonical = fs::canonicalize(socket.source())
+        .map_err(|error| format!("resolve {} {phase}: {error}", socket.source().display()))?;
+    let metadata = fs::metadata(&canonical)
+        .map_err(|error| format!("inspect {} {phase}: {error}", canonical.display()))?;
+    if !socket_metadata_matches(socket, &canonical, &metadata) {
         return Err(format!("{} changed {phase}", socket.source().display()));
     }
     Ok(())
+}
+
+fn socket_metadata_matches(
+    socket: &HostX11Socket,
+    canonical: &Path,
+    metadata: &fs::Metadata,
+) -> bool {
+    let revision = X11SocketRevision {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        ctime_seconds: metadata.ctime(),
+        ctime_nanoseconds: metadata.ctime_nsec(),
+    };
+    metadata.file_type().is_socket()
+        && canonical == socket.canonical_path()
+        && revision == socket.revision()
+        && metadata.uid() == socket.owner_uid()
+        && metadata.gid() == socket.owner_gid()
+        // HostX11Socket stores permission bits, not the file type in st_mode.
+        && (metadata.permissions().mode() & 0o7777) == socket.mode()
+}
+
+/// Bind ACL operations to the actual connection's peer. Later filesystem
+/// checks detect pathname replacement without making throwaway connections;
+/// they do not attempt to establish a different peer's identity.
+pub(super) fn connect_current_socket(socket: &HostX11Socket) -> Result<X11Connection, String> {
+    require_current_socket(socket, "before connecting")?;
+    let (connection, peer) = authenticated_connection(socket.source(), socket.display())?;
+    if peer != socket.peer_identity() {
+        return Err(format!(
+            "{} peer changed while connecting",
+            socket.source().display()
+        ));
+    }
+    require_current_socket(socket, "while connecting")?;
+    Ok(connection)
 }
 
 pub(super) fn authenticated_connection(
     source: &Path,
     display: u16,
 ) -> Result<AuthenticatedX11Connection, String> {
-    // The family/address used for Xauthority lookup is the same one that
-    // x11rb derives from a freshly connected Unix stream.
-    let stream = connect_socket(source)
+    let deadline = Instant::now() + ENDPOINT_IO_TIMEOUT;
+    let stream = connect_socket(source, deadline)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
-    let (stream, (family, address)) = DefaultStream::from_unix_stream(stream)
-        .map_err(|error| format!("prepare X11 authority lookup: {error}"))?;
-    drop(stream);
-    let authority = xauth::get_auth(family, &address, display)
+    let peer = peer_credentials(&stream)?;
+    let (stream, (family, peer_address)) = DefaultStream::from_unix_stream(stream)
+        .map_err(|error| format!("prepare X11 connection: {error}"))?;
+    let (auth_name, auth_data) = xauth::get_auth(family, &peer_address, display)
         .ok()
         .flatten()
         .unwrap_or_default();
+    let has_authority = !auth_name.is_empty() || !auth_data.is_empty();
 
-    match connect_x11(source, authority.0.clone(), authority.1.clone()) {
-        Ok(connection) => Ok(connection),
-        Err(with_authority_error) if !authority.0.is_empty() || !authority.1.is_empty() => {
+    // Authority lookup describes this local transport; setup must use the
+    // same stream rather than discard a connection just to obtain its address.
+    match setup_x11(source, stream, auth_name, auth_data, deadline) {
+        Ok(connection) => Ok((connection, peer)),
+        Err(with_authority_error) if has_authority => {
             // Some Xwayland environments expose a valid pathname socket but
             // deliberately run without Xauthority. A stale local cookie must
             // not hide that endpoint; retrying with empty credentials merely
@@ -321,19 +400,33 @@ pub(super) fn connect_x11(
     auth_name: Vec<u8>,
     auth_data: Vec<u8>,
 ) -> Result<AuthenticatedX11Connection, String> {
-    let stream = connect_socket(source)
+    let deadline = Instant::now() + ENDPOINT_IO_TIMEOUT;
+    let stream = connect_socket(source, deadline)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
     let peer = peer_credentials(&stream)?;
     let (stream, _) = DefaultStream::from_unix_stream(stream)
         .map_err(|error| format!("prepare X11 connection: {error}"))?;
-    let connection = RustConnection::connect_to_stream_with_auth_info(
-        EndpointStream { inner: stream },
+    let connection = setup_x11(source, stream, auth_name, auth_data, deadline)?;
+    Ok((connection, peer))
+}
+
+fn setup_x11(
+    source: &Path,
+    stream: DefaultStream,
+    auth_name: Vec<u8>,
+    auth_data: Vec<u8>,
+    deadline: Instant,
+) -> Result<X11Connection, String> {
+    RustConnection::connect_to_stream_with_auth_info(
+        EndpointStream {
+            inner: stream,
+            deadline: Mutex::new(deadline),
+        },
         0,
         auth_name,
         auth_data,
     )
-    .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))?;
-    Ok((connection, peer))
+    .map_err(|error| format!("X11 setup through {} failed: {error}", source.display()))
 }
 
 pub(super) fn inspect_endpoint_peer_only(
@@ -348,12 +441,12 @@ pub(super) fn inspect_endpoint_peer_only(
     if !metadata.file_type().is_socket() {
         return Err(format!("{} is not a Unix socket", source.display()));
     }
-    let stream = connect_socket(&source)
+    let stream = connect_socket(&source, Instant::now() + ENDPOINT_IO_TIMEOUT)
         .map_err(|error| format!("connect to {}: {error}", source.display()))?;
     let peer = peer_credentials(&stream)?;
     drop(stream);
     let (peer_pid, peer_uid, peer_gid) = peer.legacy_tuple();
-    HostX11Socket::from_verified_parts(
+    let socket = HostX11Socket::from_verified_parts(
         display,
         alternate,
         source,
@@ -371,7 +464,9 @@ pub(super) fn inspect_endpoint_peer_only(
             ctime_nanoseconds: metadata.ctime_nsec(),
         },
     )
-    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))
+    .map_err(|error| format!("X11 endpoint evidence is invalid: {error}"))?;
+    require_current_socket(&socket, "during peer observation")?;
+    Ok(socket)
 }
 
 pub(super) fn peer_credentials(stream: &UnixStream) -> Result<X11PeerIdentity, String> {
@@ -411,4 +506,82 @@ pub(super) fn x11_peer_start_time(socket: &HostX11Socket) -> Result<u64, String>
     crate::adapters::process_identity::process_start_time(Path::new(&format!("/proc/{pid}")))
         .map(std::num::NonZeroU64::get)
         .map_err(|error| format!("read X server process identity for pid {pid}: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pathname_address_keeps_filesystem_nul_termination() {
+        let (sockaddr, length) = sockaddr_for(Path::new("/tmp/.X11-unix/X0")).unwrap();
+        assert_eq!(sockaddr.sun_family, libc::AF_UNIX as libc::sa_family_t);
+        assert_eq!(sockaddr.sun_path[0] as u8, b'/');
+        let path = b"/tmp/.X11-unix/X0";
+        assert_eq!(sockaddr.sun_path[path.len()] as u8, 0);
+        assert_eq!(
+            length as usize,
+            std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len() + 1
+        );
+    }
+
+    #[test]
+    fn pathname_address_rejects_invalid_paths() {
+        for path in ["", "/tmp/X\0bad", &"x".repeat(108)] {
+            assert_eq!(
+                sockaddr_for(Path::new(path)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        assert!(sockaddr_for(Path::new(&"x".repeat(107))).is_ok());
+    }
+
+    #[test]
+    fn filesystem_socket_metadata_matches_its_recorded_permissions() {
+        // Keep the real socket out of the desktop's /tmp/.X11-unix directory.
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("X0");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        let metadata = fs::metadata(&canonical).unwrap();
+        let socket = HostX11Socket::from_verified_parts(
+            0,
+            false,
+            "/tmp/.X11-unix/X0".into(),
+            canonical.clone(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.permissions().mode(),
+            std::process::id(),
+            metadata.uid(),
+            metadata.gid(),
+            X11SocketRevision {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                ctime_seconds: metadata.ctime(),
+                ctime_nanoseconds: metadata.ctime_nsec(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(socket.mode(), 0o755);
+        assert!(socket_metadata_matches(&socket, &canonical, &metadata));
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!socket_metadata_matches(
+            &socket,
+            &canonical,
+            &fs::metadata(&path).unwrap()
+        ));
+
+        fs::rename(&path, temporary.path().join("previous-X0")).unwrap();
+        let _replacement = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!socket_metadata_matches(
+            &socket,
+            &canonical,
+            &fs::metadata(&path).unwrap()
+        ));
+    }
 }

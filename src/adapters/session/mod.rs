@@ -1,7 +1,8 @@
 //! Session adapter graph.
 //!
-//! `wayland` owns validation/orchestration, `wayland_probe` owns the fixed
-//! probe protocol, and `machine` is the route-fixed boundary.  The latter
+//! `wayland` and `x11` resolve startup-configured projections. Their fixed
+//! guest requests share `probe` for framing, collection, and filesystem
+//! observations; `machine` is the route-fixed execution boundary. The latter
 //! produces either a native D-Bus PTY (`runtime::dbus`) or a `machinectl`
 //! command (`runtime::systemd_tools`).  `terminal_attach` is only the default
 //! login/namespace selector; `terminal_io` owns the process-level I/O bridges.
@@ -10,6 +11,7 @@ mod direct;
 mod elevated;
 mod instance;
 mod machine;
+mod probe;
 mod pty;
 pub(crate) mod terminal_attach;
 pub(crate) mod terminal_io;

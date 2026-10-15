@@ -284,6 +284,7 @@ fn spawn_reader(
                     }
                 }
                 Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     if lifecycle.borrow().is_running() {
                         let _ = lifecycle.send(SessionLifecycle::Failed(format!(

@@ -6,10 +6,11 @@ use super::state::*;
 use super::transport::*;
 use std::fs;
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::os::unix::net::UnixListener;
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use x11rb::protocol::xproto::{AccessControl, Family, ListHostsReply, Setup};
 use x11rb::x11_utils::Serialize;
@@ -117,6 +118,89 @@ fn source_observation_distinguishes_missing_invalid_and_unverified() {
 }
 
 #[test]
+fn x11_authentication_reuses_the_connection_for_authority_lookup() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let listener = UnixListener::bind(&source).unwrap();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        receive_x11_setup(&mut stream);
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        listener.set_nonblocking(true).unwrap();
+        assert!(matches!(
+            listener.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    });
+    let result = authenticated_connection(&source, 0);
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn x11_connection_retries_when_the_backlog_drains() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let (listener, _queued_client) = listener_with_full_backlog(&source);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        if release_rx.recv_timeout(Duration::from_millis(50)).is_ok() {
+            return;
+        }
+        drop(listener.accept().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    receive_x11_setup(&mut stream);
+                    return;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if release_rx.recv_timeout(Duration::from_millis(5)).is_ok() {
+                        return;
+                    }
+                }
+                Err(error) => panic!("accept X11 test connection: {error}"),
+            }
+        }
+    });
+    let result = connect_x11(&source, Vec::new(), Vec::new());
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    result.unwrap();
+}
+
+#[test]
+fn x11_connection_with_a_full_backlog_times_out() {
+    let temporary = tempfile::tempdir().unwrap();
+    let source = temporary.path().join("X0");
+    let (listener, queued_client) = listener_with_full_backlog(&source);
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+        drop(listener);
+        drop(queued_client);
+    });
+    let result = connect_x11(&source, Vec::new(), Vec::new());
+    let _ = release_tx.send(());
+    server.join().unwrap();
+    let error = result.unwrap_err();
+    assert!(error.contains("X11 socket connection timed out"), "{error}");
+}
+
+fn listener_with_full_backlog(source: &Path) -> (UnixListener, UnixStream) {
+    let listener = UnixListener::bind(source).unwrap();
+    // Linux allows one pending connection with backlog zero. Keep it queued
+    // so the next nonblocking connect returns EAGAIN until accept drains it.
+    assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+    let queued_client = UnixStream::connect(source).unwrap();
+    (listener, queued_client)
+}
+
+#[test]
 fn x11_setup_without_response_times_out() {
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("X0");
@@ -199,6 +283,11 @@ fn receive_x11_setup(stream: &mut std::os::unix::net::UnixStream) {
         .unwrap();
     let mut request = [0; 12];
     stream.read_exact(&mut request).unwrap();
+    let auth_name_length = u16::from_ne_bytes([request[6], request[7]]) as usize;
+    let auth_data_length = u16::from_ne_bytes([request[8], request[9]]) as usize;
+    let mut authorization =
+        vec![0; auth_name_length.next_multiple_of(4) + auth_data_length.next_multiple_of(4)];
+    stream.read_exact(&mut authorization).unwrap();
     let mut setup = Setup {
         status: 1,
         protocol_major_version: 11,

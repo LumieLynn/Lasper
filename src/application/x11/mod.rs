@@ -2,6 +2,7 @@ mod access;
 mod acl;
 mod catalog;
 mod grants;
+mod lifecycle;
 mod service;
 mod session;
 
@@ -11,7 +12,7 @@ pub use access::{
 };
 pub(crate) use access::{
     X11AuthorizationPurpose, X11AuthorizationRequest, X11DesktopAccessPort,
-    X11DesktopAuthorization, X11DesktopRevocation, X11ReconcileReport, X11RevokeRequest,
+    X11DesktopAuthorization, X11DesktopRevocation, X11RevokeRequest,
 };
 pub use acl::{X11AccessControlMode, X11AclEntry, X11AclSnapshot};
 pub use catalog::{X11EndpointCatalog, X11SourceObservation, X11SourceState};
@@ -24,6 +25,7 @@ pub(crate) use grants::{
 };
 #[allow(unused_imports)]
 pub use grants::{X11GrantAssessment, X11GrantHistoryEntry};
+pub(crate) use lifecycle::{X11ReconcileReport, X11ReconcileRetry, X11ReconcileTarget};
 pub use service::X11AccessService;
 pub(crate) use service::X11ProjectionPort;
 pub(crate) use session::X11SessionPreparationPort;

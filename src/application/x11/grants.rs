@@ -285,10 +285,30 @@ fn assess_grants(
             let entry_present = observation.acl.contains(&record.acl_entry);
             let current_key = record.acl_entry == desired_entry;
             let (status, detail) = match &record.phase {
+                X11GrantRecordPhase::Pending
+                    if server_continuity(record, projection, observation)
+                        == ServerContinuity::Changed =>
+                {
+                    (
+                        X11GrantHistoryStatus::Historical,
+                        "uncertain authorization record belongs to a different X server generation"
+                            .to_owned(),
+                    )
+                }
                 X11GrantRecordPhase::Pending => (
                     X11GrantHistoryStatus::OutcomeUnknown,
                     "authorization was recorded as pending and never confirmed".to_owned(),
                 ),
+                X11GrantRecordPhase::OutcomeUnknown { .. }
+                    if server_continuity(record, projection, observation)
+                        == ServerContinuity::Changed =>
+                {
+                    (
+                        X11GrantHistoryStatus::Historical,
+                        "uncertain authorization record belongs to a different X server generation"
+                            .to_owned(),
+                    )
+                }
                 X11GrantRecordPhase::OutcomeUnknown { reason } => (
                     X11GrantHistoryStatus::OutcomeUnknown,
                     format!("authorization outcome is unknown: {reason}"),
@@ -315,19 +335,13 @@ fn assess_grants(
                     if record.caller_uid != observation.caller_uid {
                         differences.push("calling user changed");
                     }
-                    if observation.host_boot_id.as_deref() != Some(record.boot_id.as_str())
-                        || observation.server_peer_start_time
-                            != Some(record.server_peer_start_time)
-                        || projection.host_socket().peer_identity().legacy_tuple()
-                            != record.server_peer
+                    if server_continuity(record, projection, observation)
+                        != ServerContinuity::Confirmed
                     {
                         differences.push("X server continuity is not confirmed");
                     }
                     if !record.identity.matches(projection.identity()) {
                         differences.push("machine instance or mapped identity changed");
-                    }
-                    if endpoint_changed {
-                        differences.push("selected X11 endpoint changed");
                     }
                     if current_key && differences.is_empty() {
                         (
@@ -340,6 +354,9 @@ fn assess_grants(
                             .to_owned(),
                         )
                     } else {
+                        if endpoint_changed {
+                            differences.push("selected X11 endpoint changed");
+                        }
                         if !current_key {
                             differences.push("the mapped host UID changed");
                         }
@@ -411,5 +428,33 @@ fn assess_grants(
         history,
         diagnostics,
         records_complete: observation.records.complete,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ServerContinuity {
+    Confirmed,
+    Changed,
+    Unknown,
+}
+
+fn server_continuity(
+    record: &X11GrantRecordEvidence,
+    projection: &X11ProjectionContext,
+    observation: &X11DesktopObservation,
+) -> ServerContinuity {
+    let boot_id = observation.host_boot_id.as_deref();
+    let peer_start_time = observation.server_peer_start_time;
+    let peer = projection.host_socket().peer_identity().legacy_tuple();
+
+    if boot_id.is_some_and(|boot_id| boot_id != record.boot_id)
+        || peer_start_time.is_some_and(|start_time| start_time != record.server_peer_start_time)
+        || peer != record.server_peer
+    {
+        ServerContinuity::Changed
+    } else if boot_id.is_some() && peer_start_time.is_some() {
+        ServerContinuity::Confirmed
+    } else {
+        ServerContinuity::Unknown
     }
 }

@@ -14,7 +14,7 @@ use crate::application::sessions::{
 };
 use crate::application::x11::{
     X11AclEntry, X11AuthorizationRequest, X11GrantRecordCatalog, X11GrantRecordEvidence,
-    X11GrantRecordPhase,
+    X11GrantRecordPhase, X11ReconcileTarget,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::X11SocketRevision;
@@ -628,12 +628,54 @@ impl X11RuntimeState {
     }
 }
 
-pub(super) fn has_unresolved_claims_sync() -> Result<bool, String> {
+pub(super) fn reconcile_targets_sync() -> Result<Vec<X11ReconcileTarget>, String> {
     let Some(state) = X11RuntimeState::open_existing()? else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let _lock = state.lock()?;
-    claims_need_activation(&state.load_claims(), &state.load_records())
+    let claims = state.load_claims();
+    let records = state.load_records();
+    if !claims.complete {
+        return Err(claims
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 machine claim set is incomplete".into()));
+    }
+    if !records.complete {
+        return Err(records
+            .diagnostics
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "X11 grant record set is incomplete".into()));
+    }
+
+    let mut targets = Vec::new();
+    for claim in claims
+        .claims
+        .iter()
+        .filter(|claim| claim.phase.requires_reconcile())
+    {
+        targets.push(X11ReconcileTarget {
+            display: claim.key.display,
+            alternate_endpoint: claim.key.alternate_endpoint,
+            source: claim.key.source.clone(),
+        });
+    }
+    for record in records
+        .records
+        .iter()
+        .filter(|record| matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded))
+    {
+        targets.push(X11ReconcileTarget {
+            display: record.display,
+            alternate_endpoint: record.alternate_endpoint,
+            source: record.source.clone(),
+        });
+    }
+    targets.sort();
+    targets.dedup();
+    Ok(targets)
 }
 
 /// Keep the lifecycle wake-up while any claim or confirmed grant remains.
