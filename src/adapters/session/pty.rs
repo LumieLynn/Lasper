@@ -7,7 +7,7 @@ use crate::application::sessions::{
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 
 pub(crate) struct RemoteSessionControl {
@@ -55,11 +55,10 @@ pub(crate) fn spawn_direct_terminal(
 }
 
 pub(crate) fn spawn_fd_terminal(
-    master_fd: std::os::fd::RawFd,
+    master: OwnedFd,
     id: SessionId,
     attachment: TerminalAttachmentKind,
 ) -> Result<(TerminalSessionHandle, RemoteSessionControl), SessionError> {
-    let master = unsafe { OwnedFd::from_raw_fd(master_fd) };
     let reader_fd = master
         .try_clone()
         .map_err(|error| SessionError::new(format!("clone elevated terminal fd: {error}")))?;
@@ -422,6 +421,7 @@ mod tests {
     use super::*;
     use crate::adapters::session::MachinePty;
     use portable_pty::CommandBuilder;
+    use std::os::fd::FromRawFd;
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::Duration;
 

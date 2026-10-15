@@ -1,4 +1,4 @@
-use crate::adapters::elevated::{pipe_reader, ElevatedDaemon};
+use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
     SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
@@ -8,7 +8,6 @@ use crate::application::sessions::{
 use crate::domain::session::SessionLifecycle;
 use crate::ipc::protocol::session::WireTerminalLaunch;
 use async_trait::async_trait;
-use std::os::fd::FromRawFd;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt;
 
@@ -90,10 +89,9 @@ impl SessionPort for ElevatedSessionAdapter {
             .await
             .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
         let Some(lifecycle) = spawned.lifecycle else {
-            let master = unsafe { std::os::fd::OwnedFd::from_raw_fd(spawned.master_fd) };
             return crate::adapters::session::pty::spawn_machine_terminal(
                 super::MachinePty {
-                    master,
+                    master: spawned.master_fd,
                     machine_removed: spawned.machine_removed,
                 },
                 id,
@@ -169,7 +167,7 @@ impl SessionPort for ElevatedSessionAdapter {
             .spawn_journalctl(request.id.get(), request.machine.as_str())
             .await
             .map_err(|error| SessionError::new(format!("open elevated journal: {error}")))?;
-        let receiver = match pipe_reader(spawned.output_fd) {
+        let receiver = match pipe_reader_owned(spawned.output_fd) {
             Ok(receiver) => receiver,
             Err(error) => {
                 if let Err(close_error) = self.daemon.close_session(request.id.get()).await {

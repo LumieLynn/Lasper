@@ -30,11 +30,16 @@ use crate::ipc::transport::{
     MAX_RPC_FRAME_BYTES,
 };
 use sendfd::{RecvWithFd, SendWithFd};
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const RPC_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const FD_CHANNEL_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+// The daemon drains cancelled provisioning jobs for up to eight seconds and
+// then gives live sessions their own termination grace period. The parent I/O
+// task must wait long enough for that normal shutdown before escalating.
+const DAEMON_IO_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
 
 type PendingRpcResponses =
     std::collections::HashMap<u64, tokio::sync::oneshot::Sender<RpcResponse>>;
@@ -87,13 +92,71 @@ fn discard_cancelled_responses(pending: &mut PendingRpcResponses) -> usize {
     before - pending.len()
 }
 
-pub(crate) fn pipe_reader(
-    fd: std::os::fd::RawFd,
+pub(crate) fn pipe_reader_owned(
+    owned: OwnedFd,
 ) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
+}
+
+/// Receive one daemon FD response without exposing borrowed descriptor
+/// numbers to the async caller. Both session handoffs and deployment streams
+/// use this same `recvmsg` frame: a short status payload plus SCM_RIGHTS.
+///
+/// The blocking syscall runs on a worker thread, so the socket-level deadline
+/// is essential: cancelling the JoinHandle alone cannot interrupt `recvmsg`.
+fn receive_fd_response(
+    socket: &std::os::unix::net::UnixStream,
+    operation: &str,
+    timeout: std::time::Duration,
+) -> std::io::Result<(String, Vec<OwnedFd>)> {
+    let mut buffer = [0u8; 512];
+    let mut fds = [-1 as RawFd; 2];
+    let deadline = std::time::Instant::now() + timeout;
+    let (read, fd_count) = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(fd_receive_timeout(operation, timeout));
+        }
+        socket.set_read_timeout(Some(remaining))?;
+        match socket.recv_with_fd(&mut buffer, &mut fds) {
+            Ok(received) => break received,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(map_fd_receive_error(error, operation, timeout)),
+        }
+    };
+
+    // Take ownership before returning from the worker. If the caller is
+    // cancelled after this point, Vec<OwnedFd> still closes every descriptor.
+    let fds = fds[..fd_count]
+        .iter()
+        .copied()
+        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+        .collect::<Vec<_>>();
+    let message = String::from_utf8(buffer[..read].to_vec())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    Ok((message, fds))
+}
+
+fn map_fd_receive_error(
+    error: std::io::Error,
+    operation: &str,
+    timeout: std::time::Duration,
+) -> std::io::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        fd_receive_timeout(operation, timeout)
+    } else {
+        error
+    }
+}
+
+fn fd_receive_timeout(operation: &str, timeout: std::time::Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("timed out waiting for daemon {operation} FD response after {timeout:?}"),
+    )
 }
 
 fn configure_sudo_daemon_stdio(command: &mut tokio::process::Command) {
@@ -351,14 +414,22 @@ impl ElevatedDaemon {
                 }
             }
 
-            log::info!(
-                "[lasper] I/O task exiting, waiting for child pid={}...",
-                io_pid
-            );
+            // Stop accepting work and release every socket/channel before
+            // waiting for sudo. The daemon observes RPC EOF and performs its
+            // own bounded shutdown; waiting before closing these handles
+            // would keep that EOF from reaching it.
+            drop(request_rx);
+            drop(pending);
+            drop(reader);
             drop(writer);
-            let _ = child.wait().await;
-            let _ = sudo_stdout_task.await;
-            log::info!("[lasper] I/O task done (child reaped)");
+            drop(pending_sweep);
+
+            log::info!("[lasper] I/O task exiting, reaping sudo pid={}...", io_pid);
+            if reap_sudo_child(&mut child, sudo_stdout_task, DAEMON_IO_EXIT_GRACE).await {
+                log::info!("[lasper] I/O task done (sudo reaped)");
+            } else {
+                log::warn!("[lasper] I/O task done; sudo reap is unresolved");
+            }
         });
 
         // Health check
@@ -625,7 +696,7 @@ impl ElevatedDaemon {
         &self,
         params: SubmitDeploymentParams,
         artifact_source: Option<std::fs::File>,
-    ) -> std::io::Result<RawFd> {
+    ) -> std::io::Result<OwnedFd> {
         let socket = self
             .open_fd_channel(FdOperation::SubmitDeployment(Box::new(params)))
             .await?;
@@ -783,30 +854,77 @@ impl ElevatedDaemon {
     ) -> std::io::Result<std::os::unix::net::UnixStream> {
         use tokio::io::AsyncWriteExt;
 
-        let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
-        authorize_root_server(get_peer_credentials(&sock)?)?;
-        let request = FdRequest {
-            auth_token: self.fd_auth_token.to_string(),
-            operation,
-        };
-        let request_line = SecretBytes::new(
-            serde_json::to_vec(&request)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-        );
-        sock.write_all(request_line.as_slice()).await?;
-        sock.write_all(b"\n").await?;
+        tokio::time::timeout(FD_CHANNEL_SETUP_TIMEOUT, async {
+            let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
+            authorize_root_server(get_peer_credentials(&sock)?)?;
+            let request = FdRequest {
+                auth_token: self.fd_auth_token.to_string(),
+                operation,
+            };
+            let request_line = SecretBytes::new(
+                serde_json::to_vec(&request)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+            );
+            sock.write_all(request_line.as_slice()).await?;
+            sock.write_all(b"\n").await?;
 
-        let std_sock = sock.into_std()?;
-        std_sock.set_nonblocking(false)?;
-        Ok(std_sock)
+            let std_sock = sock.into_std()?;
+            std_sock.set_nonblocking(false)?;
+            Ok(std_sock)
+        })
+        .await
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out opening daemon FD channel after {}s",
+                    FD_CHANNEL_SETUP_TIMEOUT.as_secs()
+                ),
+            )
+        })?
     }
+}
+
+async fn reap_sudo_child(
+    child: &mut tokio::process::Child,
+    stdout_task: tokio::task::JoinHandle<()>,
+    grace: std::time::Duration,
+) -> bool {
+    let reaped = match tokio::time::timeout(grace, child.wait()).await {
+        Ok(Ok(status)) => {
+            log::debug!("[lasper] sudo exited with {status}");
+            true
+        }
+        Ok(Err(error)) => {
+            log::warn!("[lasper] failed to wait for sudo: {error}");
+            child.kill().await.is_ok()
+        }
+        Err(_) => {
+            log::warn!(
+                "[lasper] sudo did not exit within {}s after RPC shutdown; killing it",
+                grace.as_secs()
+            );
+            match child.kill().await {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!("[lasper] failed to kill sudo: {error}");
+                    false
+                }
+            }
+        }
+    };
+
+    stdout_task.abort();
+    let _ = stdout_task.await;
+    reaped
 }
 
 fn receive_deployment_stream(
     socket: &std::os::unix::net::UnixStream,
     artifact_source: Option<&std::fs::File>,
-) -> std::io::Result<RawFd> {
-    socket.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
+) -> std::io::Result<OwnedFd> {
+    let handoff_timeout = std::time::Duration::from_secs(10);
+    socket.set_read_timeout(Some(handoff_timeout))?;
     socket.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
     if let Some(source) = artifact_source {
         use std::io::BufRead;
@@ -823,33 +941,32 @@ fn receive_deployment_stream(
         socket.send_with_fd(b"artifact", &[source.as_raw_fd()])?;
     }
 
-    let mut buffer = [0u8; 512];
-    let mut fds = [-1 as RawFd; 1];
-    let (read, count) = socket.recv_with_fd(&mut buffer, &mut fds)?;
-    if count != 1 {
-        for fd in fds.into_iter().take(count).filter(|fd| *fd >= 0) {
-            unsafe { libc::close(fd) };
-        }
+    let (message, fds) = receive_fd_response(socket, "deployment stream", handoff_timeout)?;
+    if fds.len() != 1 {
         return Err(std::io::Error::other(format!(
-            "daemon deployment submission failed: {}",
-            String::from_utf8_lossy(&buffer[..read]).trim()
+            "daemon deployment submission returned {} fds: {}",
+            fds.len(),
+            message.trim()
         )));
     }
-    if &buffer[..read] != b"ok" {
-        unsafe { libc::close(fds[0]) };
+    if message.trim() != "ok" {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "daemon returned an invalid deployment stream response",
+            format!(
+                "daemon returned an invalid deployment stream response: {}",
+                message.trim()
+            ),
         ));
     }
-    Ok(fds[0])
+    Ok(fds.into_iter().next().expect("FD count checked"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        configure_sudo_daemon_stdio, discard_cancelled_responses, rpc_response_timeout,
-        wait_for_daemon_rpc_socket, wait_for_rpc_response, PendingRpcResponses,
+        configure_sudo_daemon_stdio, discard_cancelled_responses, reap_sudo_child,
+        rpc_response_timeout, wait_for_daemon_rpc_socket, wait_for_rpc_response,
+        PendingRpcResponses,
     };
     use crate::ipc::protocol::{RpcFamily, RpcMethod};
 
@@ -868,6 +985,26 @@ mod tests {
             .unwrap();
 
         assert!(child.wait().await.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn sudo_child_is_killed_and_reaped_after_rpc_shutdown_grace() {
+        let mut command = tokio::process::Command::new("sleep");
+        command.arg("30");
+        configure_sudo_daemon_stdio(&mut command);
+        let mut child = command.spawn().unwrap();
+        let stdout = child.stdout.take().expect("sudo stdout is piped");
+        let stdout_task = tokio::spawn(async move {
+            let mut stdout = stdout;
+            tokio::io::copy(&mut stdout, &mut tokio::io::sink())
+                .await
+                .unwrap();
+        });
+
+        assert!(
+            reap_sudo_child(&mut child, stdout_task, std::time::Duration::from_millis(1)).await
+        );
+        assert!(child.try_wait().unwrap().is_some());
     }
 
     #[tokio::test(start_paused = true)]

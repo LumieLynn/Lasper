@@ -1,6 +1,6 @@
 //! Session-scoped client for daemon-owned provisioning jobs.
 
-use crate::adapters::elevated::{pipe_reader, ElevatedDaemon};
+use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
 use crate::application::provisioning::{
     DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentRequestId,
     DeploymentSecrets, DeploymentSource, DeploymentStatus,
@@ -11,7 +11,7 @@ use crate::ipc::protocol::deployment::{
 };
 use crate::ipc::transport::read_bounded_line;
 use async_trait::async_trait;
-use std::os::fd::RawFd;
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -60,7 +60,7 @@ impl ElevatedProvisioningExecutor {
         request_id: DeploymentRequestId,
         deployment_id: crate::application::provisioning::DeploymentId,
         submission_error: std::io::Error,
-    ) -> Result<Option<RawFd>, DeploymentError> {
+    ) -> Result<Option<OwnedFd>, DeploymentError> {
         loop {
             let snapshot = self
                 .daemon
@@ -155,10 +155,10 @@ impl ElevatedProvisioningExecutor {
     async fn consume_stream(
         &self,
         deployment_id: crate::application::provisioning::DeploymentId,
-        stream_fd: RawFd,
+        stream_fd: OwnedFd,
         context: &DeploymentJobContext,
     ) -> Result<Option<DeploymentJobSnapshot>, DeploymentError> {
-        let stream = pipe_reader(stream_fd).map_err(|error| {
+        let stream = pipe_reader_owned(stream_fd).map_err(|error| {
             DeploymentError::reconciliation_required(format!(
                 "Could not attach to deployment {deployment_id} event stream: {error}"
             ))

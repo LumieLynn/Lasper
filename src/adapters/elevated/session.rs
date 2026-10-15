@@ -13,18 +13,24 @@ use crate::ipc::protocol::session::{
     WireTerminalSize,
 };
 use crate::ipc::protocol::FdOperation;
-use sendfd::RecvWithFd;
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::OwnedFd;
+use std::time::Duration;
+
+const JOURNAL_FD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(15);
+// Selected-user shells may try multiple configured Wayland targets. Each
+// machine1 shell call has a 60-second D-Bus deadline, so the handoff needs a
+// larger outer cap than one machine1 call while still bounding a stuck peer.
+const TERMINAL_FD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(150);
 
 pub(crate) struct SpawnedTerminalPty {
-    pub master_fd: RawFd,
+    pub master_fd: OwnedFd,
     pub attach_kind: TerminalAttachmentKind,
     pub lifecycle: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
     pub machine_removed: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
 }
 
 pub(crate) struct SpawnedJournalStream {
-    pub output_fd: RawFd,
+    pub output_fd: OwnedFd,
     pub lifecycle: tokio::sync::oneshot::Receiver<SessionLifecycle>,
 }
 
@@ -42,15 +48,25 @@ impl ElevatedDaemon {
         let socket = self
             .open_fd_channel(FdOperation::Journalctl(request))
             .await?;
-        let (message, fds) =
-            tokio::task::spawn_blocking(move || receive_two_fds(&socket)).await??;
+        let (message, fds) = tokio::task::spawn_blocking(move || {
+            super::receive_fd_response(&socket, "journal stream", JOURNAL_FD_HANDOFF_TIMEOUT)
+        })
+        .await??;
         if message.trim() != "ok" {
-            close_fds(&fds);
             return Err(daemon_fd_error(message.as_bytes()));
         }
+        if fds.len() != 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("daemon returned {} journal fds; expected 2", fds.len()),
+            ));
+        }
+        let mut fds = fds.into_iter();
+        let output_fd = fds.next().expect("journal fd count checked");
+        let status_fd = fds.next().expect("journal fd count checked");
         Ok(SpawnedJournalStream {
-            output_fd: fds[0],
-            lifecycle: monitor_lifecycle(fds[1]),
+            output_fd,
+            lifecycle: monitor_lifecycle(status_fd),
         })
     }
 
@@ -69,25 +85,32 @@ impl ElevatedDaemon {
             launch,
         };
         let socket = self.open_fd_channel(FdOperation::Terminal(request)).await?;
-        let (message, fds, fd_count) =
-            tokio::task::spawn_blocking(move || receive_terminal_fds(&socket)).await??;
-        if fd_count == 0 {
+        let (message, fds) = tokio::task::spawn_blocking(move || {
+            super::receive_fd_response(&socket, "terminal", TERMINAL_FD_HANDOFF_TIMEOUT)
+        })
+        .await??;
+        if fds.is_empty() {
             return Err(daemon_fd_error(message.as_bytes()));
         }
+        let fd_count = fds.len();
+        let mut fds = fds.into_iter();
+        let master_fd = fds.next().expect("terminal fd count checked");
+        let status_fd = fds.next();
         match serde_json::from_str::<SpawnTerminalResponse>(&message) {
             Ok(response) => {
                 let mut machine_removed = None;
                 let lifecycle = match response.lifecycle {
-                    WireTerminalLifecycleSource::DaemonStatus if fd_count == 2 => {
-                        Some(monitor_lifecycle(fds[1]))
-                    }
+                    WireTerminalLifecycleSource::DaemonStatus if fd_count == 2 => Some(
+                        monitor_lifecycle(status_fd.expect("terminal fd count checked")),
+                    ),
                     WireTerminalLifecycleSource::PtyEof if fd_count == 1 => None,
                     WireTerminalLifecycleSource::MachineRemoved if fd_count == 2 => {
-                        machine_removed = Some(monitor_lifecycle(fds[1]));
+                        machine_removed = Some(monitor_lifecycle(
+                            status_fd.expect("terminal fd count checked"),
+                        ));
                         None
                     }
                     expected => {
-                        close_fds(&fds[..fd_count]);
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
@@ -97,16 +120,13 @@ impl ElevatedDaemon {
                     }
                 };
                 Ok(SpawnedTerminalPty {
-                    master_fd: fds[0],
+                    master_fd,
                     attach_kind: response.attach_kind.into(),
                     lifecycle,
                     machine_removed,
                 })
             }
-            Err(error) => {
-                close_fds(&fds[..fd_count]);
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-            }
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
         }
     }
 
@@ -226,50 +246,7 @@ impl ElevatedDaemon {
     }
 }
 
-fn receive_two_fds(
-    socket: &std::os::unix::net::UnixStream,
-) -> std::io::Result<(String, [RawFd; 2])> {
-    let mut buffer = [0u8; 512];
-    let mut fds = [-1 as RawFd; 2];
-    let (read, fd_count) = socket.recv_with_fd(&mut buffer, &mut fds)?;
-    if fd_count != fds.len() {
-        close_fds(&fds[..fd_count]);
-        if fd_count == 0 {
-            return Err(daemon_fd_error(&buffer[..read]));
-        }
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("daemon returned {fd_count} session fds; expected 2"),
-        ));
-    }
-    let message = match String::from_utf8(buffer[..read].to_vec()) {
-        Ok(message) => message,
-        Err(error) => {
-            close_fds(&fds);
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-        }
-    };
-    Ok((message, fds))
-}
-
-fn receive_terminal_fds(
-    socket: &std::os::unix::net::UnixStream,
-) -> std::io::Result<(String, [RawFd; 2], usize)> {
-    let mut buffer = [0u8; 512];
-    let mut fds = [-1 as RawFd; 2];
-    let (read, fd_count) = socket.recv_with_fd(&mut buffer, &mut fds)?;
-    let message = match String::from_utf8(buffer[..read].to_vec()) {
-        Ok(message) => message,
-        Err(error) => {
-            close_fds(&fds[..fd_count]);
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
-        }
-    };
-    Ok((message, fds, fd_count))
-}
-
-fn monitor_lifecycle(status_fd: RawFd) -> tokio::sync::oneshot::Receiver<SessionLifecycle> {
-    let status_fd = unsafe { OwnedFd::from_raw_fd(status_fd) };
+fn monitor_lifecycle(status_fd: OwnedFd) -> tokio::sync::oneshot::Receiver<SessionLifecycle> {
     let (mut tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let lifecycle = tokio::select! {
@@ -285,7 +262,7 @@ async fn read_lifecycle(status_fd: OwnedFd) -> std::io::Result<SessionLifecycle>
     use tokio::io::AsyncReadExt;
 
     const MAX_STATUS_BYTES: u64 = 4096;
-    let receiver = super::pipe_reader(status_fd.into_raw_fd())?;
+    let receiver = super::pipe_reader_owned(status_fd)?;
     let mut bytes = Vec::new();
     receiver
         .take(MAX_STATUS_BYTES + 1)
@@ -300,14 +277,6 @@ async fn read_lifecycle(status_fd: OwnedFd) -> std::io::Result<SessionLifecycle>
     let lifecycle: WireSessionLifecycle = serde_json::from_slice(&bytes)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     Ok(lifecycle.into())
-}
-
-fn close_fds(fds: &[RawFd]) {
-    for fd in fds.iter().copied().filter(|fd| *fd >= 0) {
-        unsafe {
-            libc::close(fd);
-        }
-    }
 }
 
 fn daemon_fd_error(message: &[u8]) -> std::io::Error {
@@ -379,14 +348,64 @@ mod tests {
 
         server.send_with_fd(&response, &[master]).unwrap();
         unsafe { libc::close(master) };
-        let (message, fds, count) = receive_terminal_fds(&client).unwrap();
+        let (message, fds) =
+            super::super::receive_fd_response(&client, "terminal", Duration::from_secs(1)).unwrap();
 
         let decoded: SpawnTerminalResponse = serde_json::from_str(&message).unwrap();
         assert!(matches!(
             decoded.lifecycle,
             WireTerminalLifecycleSource::PtyEof
         ));
-        assert_eq!(count, 1);
-        close_fds(&fds[..count]);
+        assert_eq!(fds.len(), 1);
+        drop(fds);
+    }
+
+    #[test]
+    fn terminal_fd_receiver_times_out_without_a_daemon_response() {
+        let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let error =
+            super::super::receive_fd_response(&client, "terminal", Duration::from_millis(10))
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("terminal FD response"));
+    }
+
+    #[test]
+    fn received_descriptors_are_closed_when_the_response_is_discarded() {
+        use std::os::fd::AsRawFd;
+
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (read_fd, _writer) = pipe();
+        server.send_with_fd(b"ok", &[read_fd]).unwrap();
+        unsafe { libc::close(read_fd) };
+
+        let (_, received) =
+            super::super::receive_fd_response(&client, "journal stream", Duration::from_secs(1))
+                .unwrap();
+        let received_fd = received[0].as_raw_fd();
+        drop(received);
+
+        assert_eq!(unsafe { libc::fcntl(received_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
+    }
+
+    #[test]
+    fn dropping_lifecycle_read_future_closes_its_owned_fd() {
+        use std::os::fd::AsRawFd;
+
+        let (read_fd, _writer) = pipe();
+        let status_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
+        let raw_fd = status_fd.as_raw_fd();
+        let future = read_lifecycle(status_fd);
+        drop(future);
+
+        assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EBADF)
+        );
     }
 }
