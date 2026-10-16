@@ -496,6 +496,7 @@ impl SessionPort for ProjectionPort {
 
 struct RecordingDesktopPort {
     unresolved_claims: bool,
+    activation_error: bool,
     snapshots: AtomicUsize,
     ensures: AtomicUsize,
     reconciles: AtomicUsize,
@@ -504,6 +505,16 @@ struct RecordingDesktopPort {
 
 #[async_trait::async_trait]
 impl X11DesktopAccessPort for RecordingDesktopPort {
+    async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
+        if self.activation_error {
+            Err(X11DesktopAccessError::new(
+                "user manager rejected registration",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     async fn reconcile_targets(&self) -> Result<Vec<X11ReconcileTarget>, X11DesktopAccessError> {
         if self.unresolved_claims {
             Ok((0..2)
@@ -653,6 +664,7 @@ async fn explicit_session_tries_projected_endpoint_before_one_atomic_acl_ensure(
     )));
     let desktop = Arc::new(RecordingDesktopPort {
         unresolved_claims: true,
+        activation_error: true,
         snapshots: AtomicUsize::new(0),
         ensures: AtomicUsize::new(0),
         reconciles: AtomicUsize::new(0),
@@ -674,6 +686,15 @@ async fn explicit_session_tries_projected_endpoint_before_one_atomic_acl_ensure(
     assert_eq!(*projection_port.probes.lock(), [false, true]);
     assert_eq!(desktop.snapshots.load(Ordering::Relaxed), 0);
     assert_eq!(desktop.ensures.load(Ordering::Relaxed), 1);
+    assert!(prepared
+        .check()
+        .grant_assessment()
+        .diagnostics()
+        .iter()
+        .any(|message| {
+            message.contains("external-stop X11 reconcile is unavailable")
+                && message.contains("user manager rejected registration")
+        }));
     assert_eq!(
         *desktop.purposes.lock(),
         [X11AuthorizationPurpose::ExplicitSession]
@@ -694,6 +715,7 @@ async fn lifecycle_reconcile_routes_each_discovered_local_endpoint() {
     )));
     let desktop = Arc::new(RecordingDesktopPort {
         unresolved_claims: true,
+        activation_error: false,
         snapshots: AtomicUsize::new(0),
         ensures: AtomicUsize::new(0),
         reconciles: AtomicUsize::new(0),
@@ -805,6 +827,7 @@ async fn reconcile_without_claims_skips_endpoint_discovery_and_desktop_io() {
     )));
     let desktop = Arc::new(RecordingDesktopPort {
         unresolved_claims: false,
+        activation_error: false,
         snapshots: AtomicUsize::new(0),
         ensures: AtomicUsize::new(0),
         reconciles: AtomicUsize::new(0),

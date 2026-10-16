@@ -542,7 +542,7 @@ fn report_x11_preparation(preparation: &X11SessionPreparation) {
     let projection = preparation.check().projection();
     match preparation.disposition() {
         X11AuthorizationDisposition::Added { .. } => eprintln!(
-            "🪐 Authorized Host X11 :{display} for mapped uid #{}; this X-server ACL entry outlives the shell, so revoke it from Configure when no longer needed (an external ACL change or X-server reset may also remove it).",
+            "🪐 Authorized Host X11 :{display} for mapped uid #{}.",
             projection.identity().host_uid()
         ),
         X11AuthorizationDisposition::AccessControlDisabled => eprintln!(
@@ -550,6 +550,9 @@ fn report_x11_preparation(preparation: &X11SessionPreparation) {
         ),
         X11AuthorizationDisposition::PreExisting => {}
         X11AuthorizationDisposition::ReusedManaged { .. } => {}
+    }
+    for diagnostic in preparation.check().grant_assessment().diagnostics() {
+        eprintln!("lasper: warning: {diagnostic}");
     }
     if !projection.filesystem_access().client_writable() {
         eprintln!(

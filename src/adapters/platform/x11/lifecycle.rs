@@ -301,6 +301,8 @@ impl MachineClaimObservation {
     }
 }
 
+/// Report claim failures, not the ordinary lifecycle progress of every
+/// machine sharing the desktop catalog. Callers surface these as warnings.
 pub(super) fn machine_claim_diagnostics(
     claims: &MachineClaimCatalog,
     current_boot_id: Option<&str>,
@@ -315,17 +317,10 @@ pub(super) fn machine_claim_diagnostics(
         };
         let proposed = observation.next_phase(claim, now);
         let mut detail = match observation {
-            MachineClaimObservation::Active => "system machine registration is present".to_owned(),
-            MachineClaimObservation::EndedCandidate => {
-                "system machine registration is absent; cleanup is only a candidate".to_owned()
-            }
-            MachineClaimObservation::CleanupPending { since_unix_millis } => {
-                format!("cleanup pending since unix millisecond {since_unix_millis}")
-            }
-            MachineClaimObservation::CleanupReady => {
-                "machine registration stayed absent; cleanup is ready for a guarded reconcile"
-                    .to_owned()
-            }
+            MachineClaimObservation::Active
+            | MachineClaimObservation::EndedCandidate
+            | MachineClaimObservation::CleanupPending { .. }
+            | MachineClaimObservation::CleanupReady => continue,
             MachineClaimObservation::NeedsReview(reason)
             | MachineClaimObservation::Unavailable(reason)
             | MachineClaimObservation::Blocked(reason) => reason,

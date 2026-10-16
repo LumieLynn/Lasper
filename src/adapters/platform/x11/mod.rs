@@ -3,8 +3,8 @@
 //! The adapter is deliberately split by responsibility: discovery observes
 //! endpoint evidence, transport speaks X11 and revalidates sockets, state owns
 //! the user-runtime records, access coordinates ACL operations, lifecycle
-//! reconciles system-scope machine claims, and activation installs the user
-//! manager wake-up units. The application layer sees only the ports exposed
+//! reconciles system-scope machine claims, and activation registers transient
+//! user-manager wake-up units. The application layer sees only the ports exposed
 //! below.
 
 mod access;
@@ -175,13 +175,9 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
     }
 
     async fn synchronize_reconcile_activation(&self) -> Result<(), X11DesktopAccessError> {
-        let claims_need_activation = !self.reconcile_targets().await?.is_empty();
-        activation::synchronize_system_machine_path_activation(
-            self.activation_backend,
-            claims_need_activation,
-        )
-        .await
-        .map_err(X11DesktopAccessError::new)
+        activation::synchronize_system_machine_path_activation(self.activation_backend)
+            .await
+            .map_err(X11DesktopAccessError::new)
     }
 }
 

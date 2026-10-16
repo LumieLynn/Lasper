@@ -257,7 +257,7 @@ fn x11_preparation_notice(preparation: &X11SessionPreparation) -> String {
     let display = preparation.context().display();
     let mut message = match preparation.disposition() {
         X11AuthorizationDisposition::Added { .. } => format!(
-            "🪐 Authorized Host X11 :{display} for mapped uid #{}; the entry outlives this shell, so revoke it in Configure when no longer needed.\r\n",
+            "🪐 Authorized Host X11 :{display} for mapped uid #{}.\r\n",
             projection.identity().host_uid()
         ),
         X11AuthorizationDisposition::PreExisting => format!(
@@ -265,13 +265,16 @@ fn x11_preparation_notice(preparation: &X11SessionPreparation) -> String {
             projection.identity().host_uid()
         ),
         X11AuthorizationDisposition::ReusedManaged { .. } => format!(
-            "🪐 Reusing Lasper-managed Host X11 access on :{display} for mapped uid #{}; this machine's lifecycle is tracked.\r\n",
+            "🪐 Reusing Lasper-managed Host X11 access on :{display} for mapped uid #{}.\r\n",
             projection.identity().host_uid()
         ),
         X11AuthorizationDisposition::AccessControlDisabled => format!(
             "lasper: warning: X11 access control is disabled on :{display}; no per-user ACL entry was added.\r\n"
         ),
     };
+    for diagnostic in preparation.check().grant_assessment().diagnostics() {
+        message.push_str(&format!("lasper: warning: {diagnostic}\r\n"));
+    }
     if !projection.filesystem_access().client_writable() {
         message.push_str(&format!(
             "lasper: warning: {} is not writable by the selected guest user; compatible clients may still use the Linux abstract X11 transport.\r\n",
