@@ -1418,6 +1418,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_cancels_a_deployment_registered_by_an_accepted_submission() {
+        let state = Arc::new(DaemonServerState::default());
+        let submission = state.shutdown.admit().unwrap();
+        let cleanup = Arc::clone(&state);
+        let shutdown = tokio::spawn(async move {
+            crate::daemon::server::shutdown_daemon_resources(&cleanup).await;
+        });
+        state.shutdown.requested().await;
+        assert!(!shutdown.is_finished());
+
+        // Artifact transfer and validation may finish after shutdown was
+        // requested. Their accepted submission must enter the cancellation
+        // snapshot before its request lease is released.
+        let request_id = DeploymentRequestId::from_u128(52);
+        let deployment_id = DeploymentId::from_u128(53);
+        let plan = plan("shutdown-handoff");
+        state
+            .deployments
+            .reserve_submission(request_id, deployment_id, plan.fingerprint().clone())
+            .unwrap();
+        let cancellation = DeploymentCancellation::default();
+        state
+            .deployments
+            .register(
+                request_id,
+                deployment_id,
+                plan.resource_claims(),
+                cancellation.clone(),
+                &state.operations,
+            )
+            .unwrap();
+        let registry = Arc::clone(&state.deployments);
+        let executor = tokio::spawn(async move {
+            cancellation.cancelled().await;
+            registry
+                .finalize(
+                    deployment_id,
+                    DeploymentStatus::Cancelled("daemon shutdown".into()),
+                    DeploymentClaimStatus::Released,
+                )
+                .unwrap();
+        });
+        drop(submission);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        executor.await.unwrap();
+        assert!(matches!(
+            state.deployments.snapshot(deployment_id).unwrap().status,
+            DeploymentStatus::Cancelled(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn shutdown_waits_for_cancelled_job_to_publish_a_terminal_snapshot() {
         let registry = Arc::new(DeploymentRegistry::default());
         let operations = OperationRegistry::new();

@@ -19,6 +19,9 @@ pub(super) async fn handle(
     machine: crate::adapters::session::MachineSessionTransport,
     invoking_uid: u32,
 ) {
+    let Some(_active_request) = server_state.shutdown.admit() else {
+        return;
+    };
     log::trace!(
         "Daemon FD operation {} ({})",
         operation.wire_name(),
@@ -27,35 +30,20 @@ pub(super) async fn handle(
 
     match operation {
         FdOperation::Journalctl(params) => {
-            run_session_worker(stream, move |stream| {
-                sessions::server::spawn_journal(stream, params, server_state)
-            })
-            .await;
+            sessions::journal::open(stream, params, server_state.sessions.clone()).await;
         }
         FdOperation::Terminal(params) => {
-            sessions::server::spawn_terminal(stream, params, server_state, machine, invoking_uid)
-                .await;
+            sessions::terminal::open(
+                stream,
+                params,
+                server_state.sessions.clone(),
+                machine,
+                invoking_uid,
+            )
+            .await;
         }
         FdOperation::SubmitDeployment(params) => {
             jobs::server::submit(&stream, *params, server_state, trusted_state_root).await;
         }
-    }
-}
-
-async fn run_session_worker<F>(mut stream: UnixStream, operation: F)
-where
-    F: FnOnce(&mut UnixStream) + Send + 'static,
-{
-    let result = tokio::task::spawn_blocking(move || {
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
-        operation(&mut stream);
-        std::io::Result::Ok(())
-    })
-    .await;
-
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => log::error!("Daemon session FD worker failed: {error}"),
-        Err(error) => log::error!("Daemon session FD worker panicked: {error}"),
     }
 }

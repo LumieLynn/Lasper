@@ -1,4 +1,4 @@
-//! Shared contracts used by the daemon's RPC family handlers.
+//! Runtime query and mutation capabilities used by RPC handlers.
 
 use crate::adapters::lifecycle::error::map_system_operation_machine_error;
 use crate::adapters::runtime::source::RuntimeSource;
@@ -12,11 +12,6 @@ use crate::application::runtime::RuntimeResult;
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
-
-pub(crate) enum HandleOutcome {
-    Spawned,
-    Sync(Result<serde_json::Value, String>),
-}
 
 /// Read-only runtime queries exposed to daemon handlers.
 ///

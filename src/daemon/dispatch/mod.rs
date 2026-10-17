@@ -1,351 +1,90 @@
-//! Bounded control-channel request pump and typed privileged dispatch.
+//! Route validated RPC methods to their owning family.
+//!
+//! The connection owns admission, request tasks, and responses. Family handlers
+//! await their operation and return a value; they never own the RPC connection.
 
+pub(crate) mod backend;
+pub(super) mod claims;
 mod command;
-pub(crate) mod handler;
+mod connection;
 pub(crate) mod query;
 
-use self::handler::{DaemonRuntimeQueries, DaemonSystemExecutor, HandleOutcome};
-use super::server::DaemonServerState;
-use crate::adapters::system_operation::SystemOperation;
+pub(super) use connection::run_rpc_request_pump;
+
+use crate::adapters::session::MachineSessionTransport;
 use crate::adapters::trusted_state::TrustedStateRoot;
-use crate::application::image_lifecycle::ImageRemoveRequest;
-use crate::application::machine_lifecycle::{
-    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
-};
-use crate::domain::secret::zeroize_string;
-use crate::ipc::protocol::{error_code, RpcFamily, RpcMethod, RpcRequest};
-use crate::ipc::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
+use crate::daemon::dispatch::backend::{DaemonRuntimeQueries, DaemonSystemExecutor};
+use crate::daemon::server::DaemonServerState;
+use crate::ipc::protocol::{RpcFamily, RpcMethod};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use serde_json::Value;
 use std::sync::Arc;
 
-const MAX_RPC_IN_FLIGHT: usize = 64;
+pub(crate) type HandlerResult = Result<Value, String>;
 
-pub(super) async fn run_rpc_request_pump<R, B>(
-    reader: &mut R,
-    dbus: &Option<B>,
-    out_tx: &tokio::sync::mpsc::Sender<String>,
-    invoking_uid: u32,
-    server_state: Arc<DaemonServerState>,
-    trusted_state_root: TrustedStateRoot,
-    machine_sessions: crate::adapters::session::MachineSessionTransport,
-) -> std::io::Result<()>
-where
-    R: tokio::io::AsyncBufRead + Unpin,
-    B: DaemonRuntimeQueries + DaemonSystemExecutor + Clone + 'static,
-{
-    async fn send(out_tx: &tokio::sync::mpsc::Sender<String>, json: serde_json::Value) -> bool {
-        let line = serde_json::to_string(&json).expect("JSON-RPC values are serializable");
-        out_tx.send(line).await.is_ok()
-    }
-
-    let request_slots = Arc::new(tokio::sync::Semaphore::new(MAX_RPC_IN_FLIGHT));
-    loop {
-        let Some(mut line) = read_bounded_line(reader, MAX_RPC_FRAME_BYTES).await? else {
-            return Ok(());
-        };
-        if line.trim().is_empty() {
-            zeroize_string(&mut line);
-            continue;
-        }
-
-        let parsed = serde_json::from_str(&line);
-        zeroize_string(&mut line);
-        let request: RpcRequest = match parsed {
-            Ok(req) => req,
-            Err(e) => {
-                if !send(
-                    out_tx,
-                    serde_json::json!({
-                        "jsonrpc":"2.0","id":null,
-                        "error":{"code":error_code::PARSE_ERROR,"message":format!("Parse error: {}", e)}
-                    }),
-                )
-                .await
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let method = match request.method_kind() {
-            Ok(method) => method,
-            Err(error) => {
-                if !send(
-                    out_tx,
-                    serde_json::json!({
-                        "jsonrpc":"2.0","id":request.id,
-                        "error":{"code":error.code,"message":error.message}
-                    }),
-                )
-                .await
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        log::trace!(
-            "Daemon RPC: accepted {} method in {} family",
-            method.wire_name(),
-            method.family().as_str()
-        );
-
-        let reservation = match daemon_resource_claims(&request) {
-            Ok(claims) if !claims.is_empty() => match server_state.operations.reserve(claims) {
-                Ok(reservation) => Some(reservation),
-                Err(conflict) => {
-                    if !send(
-                        out_tx,
-                        serde_json::json!({
-                            "jsonrpc":"2.0","id":request.id,
-                            "error":{"code":error_code::RESOURCE_BUSY,"message":format!(
-                                "resource is busy: {:?}", conflict.key
-                            )}
-                        }),
-                    )
-                    .await
-                    {
-                        return Ok(());
-                    }
-                    continue;
-                }
-            },
-            Ok(_) => None,
-            Err(error) => {
-                if !send(
-                    out_tx,
-                    serde_json::json!({
-                        "jsonrpc":"2.0","id":request.id,
-                        "error":{"code":error_code::INVALID_PARAMS,"message":error}
-                    }),
-                )
-                .await
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-        let permit = match request_slots.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
-                if !send(
-                    out_tx,
-                    serde_json::json!({
-                        "jsonrpc":"2.0","id":request.id,
-                        "error":{"code":error_code::REQUEST_LIMIT,"message":"daemon request limit reached"}
-                    }),
-                )
-                .await
-                {
-                    return Ok(());
-                }
-                continue;
-            }
-        };
-
-        let dbus = dbus.clone();
-        let out_tx = out_tx.clone();
-        let server_state = Arc::clone(&server_state);
-        let trusted_state_root = trusted_state_root.clone();
-        let machine_sessions = machine_sessions.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            let _reservation = reservation;
-            let response_id = request.id;
-            match handle_request(
-                request,
-                &dbus,
-                &out_tx,
-                invoking_uid,
-                Arc::clone(&server_state),
-                trusted_state_root,
-                machine_sessions,
-            )
-            .await
-            {
-                HandleOutcome::Spawned => {}
-                HandleOutcome::Sync(Ok(result)) => {
-                    let _ = send(
-                        &out_tx,
-                        serde_json::json!({
-                            "jsonrpc":"2.0","id":response_id,"result":result
-                        }),
-                    )
-                    .await;
-                }
-                HandleOutcome::Sync(Err(e)) => {
-                    let _ = send(
-                        &out_tx,
-                        serde_json::json!({
-                            "jsonrpc":"2.0","id":response_id,"error":{"code":error_code::INTERNAL_ERROR,"message":e}
-                        }),
-                    )
-                    .await;
-                }
-            }
-        });
-    }
+#[derive(Clone)]
+pub(super) struct Dispatcher<B> {
+    pub(super) dbus: Option<B>,
+    pub(super) invoking_uid: u32,
+    pub(super) server_state: Arc<DaemonServerState>,
+    pub(super) trusted_state_root: TrustedStateRoot,
+    pub(super) machine_sessions: MachineSessionTransport,
 }
 
-pub(super) fn daemon_resource_claims(
-    request: &RpcRequest,
-) -> Result<Vec<crate::application::ResourceClaim>, String> {
-    use crate::application::{ResourceClaim, ResourceKey};
-
-    let method = request.method_kind().map_err(|error| error.message)?;
-    let claims = match method {
-        RpcMethod::ImageRemove => {
-            let request: ImageRemoveRequest = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid image_remove request: {error}"))?;
-            vec![ResourceClaim::exclusive(ResourceKey::for_image(
-                &request.image,
-            ))]
-        }
-        RpcMethod::NspawnLaunch => {
-            let request: NspawnLaunchRequest = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid nspawn_launch request: {error}"))?;
-            if !request.validates_same_name_route() {
-                return Err(
-                    "invalid nspawn_launch request: image and machine names must match".into(),
-                );
+impl<B: DaemonRuntimeQueries + DaemonSystemExecutor> Dispatcher<B> {
+    pub(super) async fn handle(&self, method: RpcMethod, params: Value) -> HandlerResult {
+        match method.family() {
+            RpcFamily::Query => query::handle(method, params, &self.dbus).await,
+            RpcFamily::Command => {
+                command::handle(
+                    method,
+                    command::CommandContext {
+                        params,
+                        dbus: &self.dbus,
+                        invoking_uid: self.invoking_uid,
+                        server_state: Arc::clone(&self.server_state),
+                        trusted_state_root: self.trusted_state_root.clone(),
+                    },
+                )
+                .await
             }
-            vec![ResourceClaim::exclusive(ResourceKey::for_image(
-                &request.image,
-            ))]
-        }
-        RpcMethod::MachineRuntimeControl => {
-            let request: MachineRuntimeControlRequest =
-                serde_json::from_value(request.params.clone())
-                    .map_err(|error| format!("invalid machine_runtime_control request: {error}"))?;
-            vec![ResourceClaim::exclusive(ResourceKey::for_machine(
-                &request.machine,
-            ))]
-        }
-        RpcMethod::NspawnUnitControl => {
-            let request: NspawnUnitControlRequest = serde_json::from_value(request.params.clone())
-                .map_err(|error| format!("invalid nspawn_unit_control request: {error}"))?;
-            vec![
-                ResourceClaim::exclusive(ResourceKey::for_machine(&request.machine)),
-                ResourceClaim::shared(ResourceKey::SystemdManager),
-            ]
-        }
-        RpcMethod::Configuration => {
-            let operation: crate::ipc::protocol::configuration::ConfigurationOperation =
-                serde_json::from_value(request.params.clone())
-                    .map_err(|error| format!("invalid configuration request: {error}"))?;
-            match operation {
-                crate::ipc::protocol::configuration::ConfigurationOperation::Apply(edit) => {
-                    use crate::application::configuration::ConfigurationTarget;
-                    let key = match edit.target {
-                        ConfigurationTarget::Machine(machine) => ResourceKey::for_machine(&machine),
-                        ConfigurationTarget::Image(image) => ResourceKey::for_image(&image),
-                    };
-                    vec![ResourceClaim::exclusive(key)]
-                }
-                _ => vec![],
+            RpcFamily::Job => {
+                crate::daemon::jobs::handle(
+                    method,
+                    crate::daemon::jobs::JobContext {
+                        params,
+                        dbus: &self.dbus,
+                        server_state: Arc::clone(&self.server_state),
+                        trusted_state_root: self.trusted_state_root.clone(),
+                    },
+                )
+                .await
             }
-        }
-        RpcMethod::SystemOperation => {
-            let wire_request: crate::ipc::protocol::system::SystemOperationRequest =
-                serde_json::from_value(request.params.clone())
-                    .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))?;
-            let operation = SystemOperation::from(wire_request.operation);
-            system_operation_claims(operation)
-        }
-        _ => Vec::new(),
-    };
-    Ok(claims)
-}
-
-fn system_operation_claims(operation: SystemOperation) -> Vec<crate::application::ResourceClaim> {
-    use crate::application::{ResourceClaim, ResourceKey};
-
-    match operation {
-        SystemOperation::Start { machine }
-        | SystemOperation::Terminate { machine }
-        | SystemOperation::Poweroff { machine }
-        | SystemOperation::Reboot { machine }
-        | SystemOperation::Kill { machine, .. } => {
-            vec![ResourceClaim::exclusive(ResourceKey::for_machine(&machine))]
-        }
-        SystemOperation::Enable { machine } | SystemOperation::Disable { machine } => vec![
-            ResourceClaim::exclusive(ResourceKey::for_machine(&machine)),
-            ResourceClaim::shared(ResourceKey::SystemdManager),
-        ],
-        SystemOperation::RemoveImage { image } => {
-            vec![ResourceClaim::exclusive(ResourceKey::for_image(&image))]
-        }
-        SystemOperation::CloneImage {
-            source,
-            destination,
-        } => vec![
-            ResourceClaim::shared(ResourceKey::for_image(&source)),
-            ResourceClaim::exclusive(ResourceKey::for_image(&destination)),
-        ],
-        SystemOperation::ReloadDaemon => {
-            vec![ResourceClaim::exclusive(ResourceKey::SystemdManager)]
+            RpcFamily::Session => {
+                crate::daemon::sessions::handle(
+                    method,
+                    crate::daemon::sessions::SessionContext {
+                        params,
+                        sessions: Arc::clone(&self.server_state.sessions),
+                        machine: self.machine_sessions.clone(),
+                        invoking_uid: self.invoking_uid,
+                    },
+                )
+                .await
+            }
         }
     }
 }
 
-pub(super) async fn handle_request<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
-    request: RpcRequest,
-    dbus: &Option<B>,
-    out_tx: &tokio::sync::mpsc::Sender<String>,
-    invoking_uid: u32,
-    server_state: Arc<DaemonServerState>,
-    trusted_state_root: TrustedStateRoot,
-    machine_sessions: crate::adapters::session::MachineSessionTransport,
-) -> HandleOutcome {
-    let RpcRequest {
-        id, method, params, ..
-    } = request;
-    let method = match RpcMethod::parse(&method) {
-        Some(method) => method,
-        None => return HandleOutcome::Sync(Err(format!("unknown method: {method}"))),
-    };
-    if method.family() == RpcFamily::Query {
-        return self::query::handle(method, id, params, dbus, out_tx).await;
-    }
-    if method.family() == RpcFamily::Command {
-        return self::command::handle(
-            method,
-            self::command::CommandContext {
-                id,
-                params,
-                dbus,
-                out_tx,
-                invoking_uid,
-                server_state,
-                trusted_state_root,
-            },
-        )
-        .await;
-    }
-    if method.family() == RpcFamily::Job {
-        return super::jobs::handle(
-            method,
-            super::jobs::JobContext {
-                params,
-                dbus,
-                server_state,
-                trusted_state_root,
-            },
-        )
-        .await;
-    }
-    if method.family() == RpcFamily::Session {
-        return super::sessions::handle(
-            method,
-            super::sessions::SessionContext {
-                params,
-                server_state,
-                machine: machine_sessions,
-                invoking_uid,
-            },
-        )
-        .await;
-    }
-    unreachable!("unhandled RPC family escaped dispatcher")
+pub(super) fn decode_params<T: DeserializeOwned>(
+    method: RpcMethod,
+    params: Value,
+) -> Result<T, String> {
+    serde_json::from_value(params)
+        .map_err(|error| format!("invalid {} request: {error}", method.wire_name()))
+}
+
+pub(super) fn encode_result<T: Serialize>(result: T) -> HandlerResult {
+    serde_json::to_value(result).map_err(|error| error.to_string())
 }

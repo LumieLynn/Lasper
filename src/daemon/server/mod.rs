@@ -2,12 +2,12 @@
 
 mod fd;
 pub(crate) mod logging;
-mod process_state;
+mod shutdown;
 mod state;
 
 use self::logging::{initialize_daemon_logging, AuthLogLimiter};
-use super::dispatch::run_rpc_request_pump;
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::daemon::dispatch::{run_rpc_request_pump, Dispatcher};
 use crate::domain::secret::zeroize_string;
 use crate::ipc::protocol::*;
 use crate::ipc::transport::{
@@ -52,8 +52,7 @@ fn monitor_parent(pidfd: OwnedFd, state: Arc<DaemonServerState>) -> std::io::Res
             Ok(_) => log::info!("Daemon: launching TUI exited; stopping elevated daemon"),
             Err(error) => log::error!("Daemon: parent pidfd monitor failed: {error}"),
         }
-        shutdown_daemon_resources(&state).await;
-        std::process::exit(0);
+        state.shutdown.begin();
     });
     Ok(())
 }
@@ -228,7 +227,12 @@ pub async fn daemon_main(
     }
 
     let auth_log = AuthLogLimiter::default();
-    let rpc = match accept_rpc_connection(&rpc_listener, expected_peer, auth_log.clone()).await {
+    let connection = tokio::select! {
+        biased;
+        () = server_state.shutdown.requested() => std::process::exit(0),
+        connection = accept_rpc_connection(&rpc_listener, expected_peer, auth_log.clone()) => connection,
+    };
+    let rpc = match connection {
         Ok(rpc) => rpc,
         Err(error) => {
             log::error!("Daemon: RPC authentication failed: {error}");
@@ -253,8 +257,7 @@ pub async fn daemon_main(
                 break;
             }
         }
-        shutdown_daemon_resources(&writer_state).await;
-        std::process::exit(0);
+        writer_state.shutdown.begin();
     });
 
     let dbus = initialize_dbus_backend(dbus_enabled).await;
@@ -306,7 +309,12 @@ pub async fn daemon_main(
     };
     tokio::spawn(async move {
         loop {
-            match listener.accept().await {
+            let connection = tokio::select! {
+                biased;
+                () = fd_server_state.shutdown.requested() => break,
+                connection = listener.accept() => connection,
+            };
+            match connection {
                 Ok((stream, _)) => {
                     let permit = match fd_slots.clone().try_acquire_owned() {
                         Ok(permit) => permit,
@@ -339,12 +347,14 @@ pub async fn daemon_main(
 
     let exit_code = match run_rpc_request_pump(
         &mut rpc_reader,
-        &dbus,
         &out_tx,
-        user_uid,
-        Arc::clone(&server_state),
-        trusted_state_root,
-        machine_sessions,
+        Dispatcher {
+            dbus,
+            invoking_uid: user_uid,
+            server_state: Arc::clone(&server_state),
+            trusted_state_root,
+            machine_sessions,
+        },
     )
     .await
     {
@@ -468,5 +478,5 @@ async fn handle_fd_connection(
     .await;
 }
 
-pub(crate) use process_state::shutdown_daemon_resources;
+pub(crate) use shutdown::{shutdown_daemon_resources, DaemonShutdown};
 pub(crate) use state::DaemonServerState;

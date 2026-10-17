@@ -1,13 +1,15 @@
-//! Session-family JSON-RPC handlers.
-//!
-//! Process spawning and session tracking live in `sessions::server`; this
-//! module owns only the typed control-plane transition exposed to the RPC
-//! dispatcher.
+//! Session control, FD delivery, and ownership of session child processes.
 
-pub(crate) mod server;
+mod handoff;
+pub(crate) mod journal;
+mod lifecycle;
+mod process;
+mod registry;
+pub(crate) mod terminal;
 
-use super::dispatch::handler::HandleOutcome;
-use super::server::DaemonServerState;
+pub(crate) use registry::SessionRegistry;
+
+use crate::daemon::dispatch::{decode_params, encode_result, HandlerResult};
 use crate::ipc::protocol::session::{
     CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, ProbeX11ProjectionParams,
     ProbeX11ProjectionResponse, WireMachineNamespaces,
@@ -18,15 +20,15 @@ use std::sync::Arc;
 
 pub(crate) struct SessionContext {
     pub(super) params: Value,
-    pub(super) server_state: Arc<DaemonServerState>,
+    pub(super) sessions: Arc<SessionRegistry>,
     pub(super) machine: crate::adapters::session::MachineSessionTransport,
     pub(super) invoking_uid: u32,
 }
 
-pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> HandleOutcome {
+pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> HandlerResult {
     let SessionContext {
         params,
-        server_state,
+        sessions,
         machine,
         invoking_uid,
     } = context;
@@ -34,30 +36,14 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
 
     match method {
         RpcMethod::CloseSession => {
-            let params: CloseSessionParams = match serde_json::from_value(params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid close_session request: {error}"
-                    )))
-                }
-            };
-            HandleOutcome::Sync(
-                server_state
-                    .close_and_escalate(params.session_id)
-                    .map(|()| Value::Null)
-                    .map_err(|error| error.to_string()),
-            )
+            let params: CloseSessionParams = decode_params(method, params)?;
+            sessions
+                .close_and_escalate(params.session_id)
+                .map(|()| Value::Null)
+                .map_err(|error| error.to_string())
         }
         RpcMethod::PrepareWayland => {
-            let params: PrepareWaylandParams = match serde_json::from_value(params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid prepare_wayland request: {error}"
-                    )))
-                }
-            };
+            let params: PrepareWaylandParams = decode_params(method, params)?;
             let resolver = crate::adapters::session::WaylandSessionResolver::for_authorized_uid(
                 machine,
                 crate::adapters::config::NspawnConfigStore::direct(),
@@ -85,17 +71,10 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     hint: error.hint().map(str::to_owned),
                 },
             };
-            HandleOutcome::Sync(serde_json::to_value(response).map_err(|error| error.to_string()))
+            encode_result(response)
         }
         RpcMethod::ProbeX11Projection => {
-            let params: ProbeX11ProjectionParams = match serde_json::from_value(params) {
-                Ok(params) => params,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid probe_x11_projection request: {error}"
-                    )))
-                }
-            };
+            let params: ProbeX11ProjectionParams = decode_params(method, params)?;
             let resolver = crate::adapters::session::X11SessionResolver::new(
                 machine,
                 crate::adapters::config::NspawnConfigStore::direct(),
@@ -142,7 +121,7 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     hint: error.hint().map(str::to_owned),
                 },
             };
-            HandleOutcome::Sync(serde_json::to_value(response).map_err(|error| error.to_string()))
+            encode_result(response)
         }
         _ => unreachable!("non-session method routed to session dispatcher"),
     }

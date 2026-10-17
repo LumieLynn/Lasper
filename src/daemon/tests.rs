@@ -1,4 +1,4 @@
-use super::dispatch::handler::*;
+use super::dispatch::backend::*;
 use super::dispatch::*;
 use super::server::logging::*;
 use super::server::*;
@@ -25,6 +25,15 @@ use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 
 const TEST_TOKEN: &str = "f865fd7e-a9f5-4ef1-b5b5-f3f257a75ce0";
+
+fn daemon_resource_claims(
+    request: &RpcRequest,
+) -> Result<Vec<crate::application::ResourceClaim>, String> {
+    super::dispatch::claims::resource_claims(
+        request.method_kind().map_err(|error| error.message)?,
+        &request.params,
+    )
+}
 
 fn systemd_tools_sessions() -> crate::adapters::session::MachineSessionTransport {
     crate::adapters::session::MachineSessionTransport::SystemdTools
@@ -451,7 +460,6 @@ async fn dbus_reload_failure_is_returned_without_running_systemd_tools() {
         started: Arc::new(tokio::sync::Notify::new()),
         release: Arc::new(tokio::sync::Notify::new()),
     });
-    let (out_tx, _) = tokio::sync::mpsc::channel(4);
     let directory = tempfile::tempdir().unwrap();
     let request = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -469,18 +477,20 @@ async fn dbus_reload_failure_is_returned_without_running_systemd_tools() {
             crate::application::ResourceKey::SystemdManager
         ),]
     );
-    match handle_request(
-        request,
-        &dbus,
-        &out_tx,
-        uzers::get_current_uid(),
-        Arc::new(DaemonServerState::default()),
-        crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().to_path_buf()),
-        systemd_tools_sessions(),
-    )
-    .await
+    let dispatcher = Dispatcher {
+        dbus,
+        invoking_uid: uzers::get_current_uid(),
+        server_state: Arc::new(DaemonServerState::default()),
+        trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::for_test(
+            directory.path().to_path_buf(),
+        ),
+        machine_sessions: systemd_tools_sessions(),
+    };
+    match dispatcher
+        .handle(RpcMethod::SystemOperation, request.params)
+        .await
     {
-        HandleOutcome::Sync(Err(error)) => {
+        Err(error) => {
             assert!(error.contains("test reload response was lost"), "{error}")
         }
         _ => panic!("failed reload must return its original error"),
@@ -528,12 +538,14 @@ async fn slow_remove_image_does_not_block_independent_requests() {
     let mut pump = tokio::spawn(async move {
         run_rpc_request_pump(
             &mut reader,
-            &dbus,
             &out_tx,
-            uzers::get_current_uid(),
-            server_state,
-            crate::adapters::trusted_state::TrustedStateRoot::production(),
-            systemd_tools_sessions(),
+            Dispatcher {
+                dbus,
+                invoking_uid: uzers::get_current_uid(),
+                server_state,
+                trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::production(),
+                machine_sessions: systemd_tools_sessions(),
+            },
         )
         .await
     });
@@ -606,12 +618,14 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
     let mut pump = tokio::spawn(async move {
         run_rpc_request_pump(
             &mut reader,
-            &dbus,
             &out_tx,
-            uzers::get_current_uid(),
-            server_state,
-            crate::adapters::trusted_state::TrustedStateRoot::production(),
-            systemd_tools_sessions(),
+            Dispatcher {
+                dbus,
+                invoking_uid: uzers::get_current_uid(),
+                server_state,
+                trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::production(),
+                machine_sessions: systemd_tools_sessions(),
+            },
         )
         .await
     });
@@ -824,50 +838,27 @@ fn dbus_inspection_request_revalidates_machine_name() {
 
 #[tokio::test]
 async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters() {
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
-    let server_state = Arc::new(DaemonServerState::default());
-    let request = RpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 7,
-        method: "assess_tar_runtime".into(),
-        params: serde_json::json!({}),
+    let dispatcher = Dispatcher {
+        dbus: None::<crate::adapters::runtime::dbus::DbusBackend>,
+        invoking_uid: uzers::get_current_uid(),
+        server_state: Arc::new(DaemonServerState::default()),
+        trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::production(),
+        machine_sessions: systemd_tools_sessions(),
     };
 
-    assert!(matches!(
-        handle_request(
-            request,
-            &None::<crate::adapters::runtime::dbus::DbusBackend>,
-            &out_tx,
-            uzers::get_current_uid(),
-            Arc::clone(&server_state),
-            crate::adapters::trusted_state::TrustedStateRoot::production(),
-            systemd_tools_sessions(),
-        )
-        .await,
-        HandleOutcome::Spawned
-    ));
-    let response: RpcResponse = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
-    assert!(response.error.is_none());
-    let _: TarRuntimeAssessment = serde_json::from_value(response.result.unwrap()).unwrap();
+    let result = dispatcher
+        .handle(RpcMethod::AssessTarRuntime, serde_json::json!({}))
+        .await
+        .unwrap();
+    let _: TarRuntimeAssessment = serde_json::from_value(result).unwrap();
 
-    let invalid = RpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 8,
-        method: "assess_tar_runtime".into(),
-        params: serde_json::json!({"program": "tar"}),
-    };
     assert!(matches!(
-        handle_request(
-            invalid,
-            &None::<crate::adapters::runtime::dbus::DbusBackend>,
-            &out_tx,
-            uzers::get_current_uid(),
-            server_state,
-            crate::adapters::trusted_state::TrustedStateRoot::production(),
-            systemd_tools_sessions(),
+        dispatcher.handle(
+            RpcMethod::AssessTarRuntime,
+            serde_json::json!({"program": "tar"}),
         )
         .await,
-        HandleOutcome::Sync(Err(error)) if error.contains("does not accept parameters")
+        Err(error) if error.contains("does not accept parameters")
     ));
 }
 
@@ -905,8 +896,14 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     let deployment_id = DeploymentId::from_u128(88);
     let manifest = DeploymentCrashManifest::prepared(deployment_id, &plan);
     state.create(manifest.clone()).await.unwrap();
-    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
     let server_state = Arc::new(DaemonServerState::default());
+    let dispatcher = Dispatcher {
+        dbus: None::<crate::adapters::runtime::dbus::DbusBackend>,
+        invoking_uid: uzers::get_current_uid(),
+        server_state,
+        trusted_state_root: root,
+        machine_sessions: systemd_tools_sessions(),
+    };
 
     let request = RpcRequest {
         jsonrpc: "2.0".into(),
@@ -918,20 +915,10 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         })
         .unwrap(),
     };
-    let result = match handle_request(
-        request,
-        &None::<crate::adapters::runtime::dbus::DbusBackend>,
-        &out_tx,
-        uzers::get_current_uid(),
-        Arc::clone(&server_state),
-        root.clone(),
-        systemd_tools_sessions(),
-    )
-    .await
-    {
-        HandleOutcome::Sync(Ok(result)) => result,
-        _ => panic!("recovery probe should return synchronously"),
-    };
+    let result = dispatcher
+        .handle(RpcMethod::ProbeDeploymentRecovery, request.params)
+        .await
+        .unwrap();
     let result: ProbeDeploymentRecoveryResult = serde_json::from_value(result).unwrap();
     assert_eq!(result.deployment_id, deployment_id);
     assert_eq!(result.manifest_revision, manifest.revision);
@@ -947,22 +934,14 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
         })
         .unwrap(),
     };
-    match handle_request(
-        stale,
-        &None::<crate::adapters::runtime::dbus::DbusBackend>,
-        &out_tx,
-        uzers::get_current_uid(),
-        server_state,
-        root,
-        systemd_tools_sessions(),
-    )
-    .await
+    match dispatcher
+        .handle(RpcMethod::ProbeDeploymentRecovery, stale.params)
+        .await
     {
-        HandleOutcome::Sync(Err(error)) => {
+        Err(error) => {
             assert!(error.contains("revision changed"), "{error}")
         }
-        HandleOutcome::Sync(Ok(result)) => panic!("stale recovery probe succeeded: {result}"),
-        HandleOutcome::Spawned => panic!("stale recovery probe unexpectedly spawned a task"),
+        Ok(result) => panic!("stale recovery probe succeeded: {result}"),
     }
 }
 

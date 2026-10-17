@@ -6,11 +6,12 @@
 
 pub(crate) mod server;
 
-use super::dispatch::handler::{DaemonRuntimeQueries, HandleOutcome};
 use super::server::DaemonServerState;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::DeploymentStatePort;
+use crate::daemon::dispatch::backend::DaemonRuntimeQueries;
+use crate::daemon::dispatch::{decode_params, encode_result, HandlerResult};
 use crate::domain::runtime::ImageEntry;
 use crate::ipc::protocol::deployment::{
     DeploymentClaimState, DeploymentJobRequest, DeploymentSubmissionRequest,
@@ -31,7 +32,7 @@ pub(crate) struct JobContext<'a, B> {
 pub(crate) async fn handle<B: DaemonRuntimeQueries>(
     method: RpcMethod,
     context: JobContext<'_, B>,
-) -> HandleOutcome {
+) -> HandlerResult {
     let JobContext {
         params,
         dbus,
@@ -42,113 +43,61 @@ pub(crate) async fn handle<B: DaemonRuntimeQueries>(
 
     match method {
         RpcMethod::DeploymentStatus => {
-            let request: DeploymentJobRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid deployment_status request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentJobRequest = decode_params(method, params)?;
             match server_state.deployments.snapshot(request.deployment_id) {
-                Ok(snapshot) => HandleOutcome::Sync(
-                    serde_json::to_value(Some(snapshot)).map_err(|error| error.to_string()),
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    HandleOutcome::Sync(Ok(Value::Null))
-                }
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(snapshot) => encode_result(Some(snapshot)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::ResolveDeploymentSubmission => {
-            let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid resolve_deployment_submission request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentSubmissionRequest = decode_params(method, params)?;
             match server_state
                 .deployments
                 .resolve_submission(request.request_id)
             {
-                Ok(snapshot) => HandleOutcome::Sync(
-                    serde_json::to_value(Some(snapshot)).map_err(|error| error.to_string()),
-                ),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    HandleOutcome::Sync(Ok(Value::Null))
-                }
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(snapshot) => encode_result(Some(snapshot)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Value::Null),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::AcknowledgeDeploymentSubmission => {
-            let request: DeploymentSubmissionRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid acknowledge_deployment_submission request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentSubmissionRequest = decode_params(method, params)?;
             match server_state
                 .deployments
                 .acknowledge_submission(request.request_id)
             {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::json!({}))),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(()) => Ok(serde_json::json!({})),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::CancelDeployment => {
-            let request: DeploymentJobRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid cancel_deployment request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentJobRequest = decode_params(method, params)?;
             match server_state.deployments.cancel(request.deployment_id) {
-                Ok(snapshot) => HandleOutcome::Sync(
-                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
-                ),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(snapshot) => encode_result(snapshot),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::AcknowledgeDeployment => {
-            let request: DeploymentJobRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid acknowledge_deployment request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentJobRequest = decode_params(method, params)?;
             match server_state.deployments.acknowledge(request.deployment_id) {
-                Ok(()) => HandleOutcome::Sync(Ok(serde_json::json!({}))),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(()) => Ok(serde_json::json!({})),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::ProbeDeploymentRecovery => {
-            let request: ProbeDeploymentRecoveryRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid probe_deployment_recovery request: {error}"
-                    )));
-                }
-            };
+            let request: ProbeDeploymentRecoveryRequest = decode_params(method, params)?;
             let state = crate::adapters::provisioning::state::FilesystemDeploymentState::new(
                 trusted_state_root.clone(),
             );
             let manifests = match state.unfinished().await {
                 Ok(manifests) => manifests,
-                Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+                Err(error) => return Err(error.to_string()),
             };
             let manifest = match manifests
                 .into_iter()
@@ -156,25 +105,25 @@ pub(crate) async fn handle<B: DaemonRuntimeQueries>(
             {
                 Some(manifest) if manifest.revision == request.expected_revision => manifest,
                 Some(manifest) => {
-                    return HandleOutcome::Sync(Err(format!(
+                    return Err(format!(
                         "deployment {} manifest revision changed from {} to {}",
                         request.deployment_id, request.expected_revision, manifest.revision
-                    )));
+                    ));
                 }
                 None => {
-                    return HandleOutcome::Sync(Err(format!(
+                    return Err(format!(
                         "deployment {} crash manifest is missing",
                         request.deployment_id
-                    )));
+                    ));
                 }
             };
             let _reservation = match server_state.operations.reserve([manifest.recovery_claim()]) {
                 Ok(reservation) => reservation,
                 Err(conflict) => {
-                    return HandleOutcome::Sync(Err(format!(
+                    return Err(format!(
                         "deployment recovery resource is busy: {:?}",
                         conflict.key
-                    )));
+                    ));
                 }
             };
             let images =
@@ -195,36 +144,29 @@ pub(crate) async fn handle<B: DaemonRuntimeQueries>(
                 manifest_revision: manifest.revision,
                 observations,
             };
-            HandleOutcome::Sync(serde_json::to_value(result).map_err(|error| error.to_string()))
+            encode_result(result)
         }
 
         RpcMethod::ReconcileDeployment => {
-            let request: DeploymentJobRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid reconcile_deployment request: {error}"
-                    )));
-                }
-            };
+            let request: DeploymentJobRequest = decode_params(method, params)?;
             let current = match server_state.deployments.snapshot(request.deployment_id) {
                 Ok(snapshot) if snapshot.claim == DeploymentClaimState::ReconciliationRequired => {
                     snapshot
                 }
                 Ok(_) => {
-                    return HandleOutcome::Sync(Err(format!(
+                    return Err(format!(
                         "deployment {} does not require reconciliation",
                         request.deployment_id
-                    )));
+                    ));
                 }
-                Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+                Err(error) => return Err(error.to_string()),
             };
             let state = crate::adapters::provisioning::state::FilesystemDeploymentState::new(
                 trusted_state_root,
             );
             let manifests = match state.unfinished().await {
                 Ok(manifests) => manifests,
-                Err(error) => return HandleOutcome::Sync(Err(error.to_string())),
+                Err(error) => return Err(error.to_string()),
             };
             let manifest_present = manifests
                 .iter()
@@ -238,30 +180,19 @@ pub(crate) async fn handle<B: DaemonRuntimeQueries>(
                 .deployments
                 .reconcile(request.deployment_id, manifest_present)
             {
-                Ok(snapshot) => HandleOutcome::Sync(
-                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
-                ),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(snapshot) => encode_result(snapshot),
+                Err(error) => Err(error.to_string()),
             }
         }
 
         RpcMethod::ReleaseUnresolvedDeployment => {
-            let request: ReleaseUnresolvedDeploymentRequest = match serde_json::from_value(params) {
-                Ok(request) => request,
-                Err(error) => {
-                    return HandleOutcome::Sync(Err(format!(
-                        "invalid release_unresolved_deployment request: {error}"
-                    )));
-                }
-            };
+            let request: ReleaseUnresolvedDeploymentRequest = decode_params(method, params)?;
             match server_state
                 .deployments
                 .release_unresolved(request.deployment_id, request.confirmed)
             {
-                Ok(snapshot) => HandleOutcome::Sync(
-                    serde_json::to_value(snapshot).map_err(|error| error.to_string()),
-                ),
-                Err(error) => HandleOutcome::Sync(Err(error.to_string())),
+                Ok(snapshot) => encode_result(snapshot),
+                Err(error) => Err(error.to_string()),
             }
         }
 
