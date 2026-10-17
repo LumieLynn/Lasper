@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod configuration;
 pub(crate) mod deployment;
-pub(crate) mod rootfs;
 pub(crate) mod session;
 pub(crate) mod system;
 pub(crate) mod systemd_unit;
@@ -14,9 +13,9 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-// v26: inspection properties carry typed values, display text and interface
-// provenance instead of bare strings.
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 26;
+// v27: machine start preparation is one typed operation; rootfs stages remain
+// inside host workflows instead of being standalone RPC methods.
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 27;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.
@@ -107,7 +106,6 @@ rpc_methods! {
     ProbeDeploymentRecovery => ("probe_deployment_recovery", Job),
     ReconcileDeployment => ("reconcile_deployment", Job),
     ReleaseUnresolvedDeployment => ("release_unresolved_deployment", Job),
-    Rootfs => ("rootfs", Command),
     AssessTarRuntime => ("assess_tar_runtime", Query),
     SystemOperation => ("system_operation", Command),
     SystemdToolsInspectMachine => ("systemd_tools_inspect_machine", Query),
@@ -115,6 +113,7 @@ rpc_methods! {
     DbusListMachines => ("dbus_list_machines", Query),
     DbusListImages => ("dbus_list_images", Query),
     NspawnLaunch => ("nspawn_launch", Command),
+    PrepareMachineStart => ("prepare_machine_start", Command),
     MachineRuntimeControl => ("machine_runtime_control", Command),
     NspawnUnitControl => ("nspawn_unit_control", Command),
     ImageRemove => ("image_remove", Command),

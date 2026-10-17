@@ -4,6 +4,7 @@ use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::application::image_lifecycle::ArtifactOwnership;
 use crate::application::provisioning::ResourceApplyStatus;
+use crate::application::{ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use ini::Ini;
 use serde::{Deserialize, Serialize};
@@ -221,6 +222,29 @@ pub(crate) enum SystemdUnitOperation {
     WriteNvidiaDeviceAllow(WriteNvidiaDeviceAllow),
     RemoveOverride(RemoveServiceOverride),
     RemoveOwnedOverrides(RemoveServiceOverrides),
+}
+
+impl SystemdUnitOperation {
+    pub(crate) fn resource_claims(&self) -> Vec<ResourceClaim> {
+        let machine = match self {
+            Self::Read(_) | Self::ProbeOwnedOverrides(_) => return Vec::new(),
+            Self::WriteOverride(request) => &request.machine,
+            Self::WriteNvidiaDeviceAllow(request) => &request.machine,
+            Self::RemoveOverride(request) => &request.machine,
+            Self::RemoveOwnedOverrides(request) => &request.machine,
+            Self::CloneOverride(request) => {
+                return vec![
+                    ResourceClaim::shared(ResourceKey::for_machine(&request.source)),
+                    ResourceClaim::exclusive(ResourceKey::for_machine(&request.destination)),
+                    ResourceClaim::shared(ResourceKey::SystemdManager),
+                ];
+            }
+        };
+        vec![
+            ResourceClaim::exclusive(ResourceKey::for_machine(machine)),
+            ResourceClaim::shared(ResourceKey::SystemdManager),
+        ]
+    }
 }
 
 #[derive(Clone, Debug)]

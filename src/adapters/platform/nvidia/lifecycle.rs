@@ -210,14 +210,15 @@ pub(crate) async fn ensure_gpu_passthrough(
         Err(error) if is_permission_denied(&error) => return Err(NspawnError::PermissionDenied),
         Err(error) => return Err(error),
     };
-    let external_cache = persisted_state.clone().unwrap_or_default();
-    let profile = external_cache.profile.clone().unwrap_or_default();
+    let had_persisted_state = persisted_state.is_some();
+    let old_state = persisted_state.unwrap_or_default();
+    let profile = old_state.profile.clone().unwrap_or_default();
 
     // Check the persisted projection independently of the fresh host scan.
     // This keeps a hand-edited or partially-written `.nspawn` visible in the
     // lifecycle log and ensures the later fast path can only accept an exact
     // managed block, including duplicate/unknown entries checks.
-    if persisted_state.is_some() && !marker_binds_match_state(&config.content, &external_cache) {
+    if had_persisted_state && !marker_binds_match_state(&config.content, &old_state) {
         log::info!(
             "NVIDIA state and managed .nspawn projection differ for {}; scheduling reconciliation",
             name
@@ -238,8 +239,6 @@ pub(crate) async fn ensure_gpu_passthrough(
     );
 
     // 3. Compare old vs new state
-    let old_state = external_cache.clone();
-
     if old_state.same_payload(&host_state) && !old_state.driver_version.is_empty() {
         // State matches — verify .nspawn markers exist and have content.
         if config

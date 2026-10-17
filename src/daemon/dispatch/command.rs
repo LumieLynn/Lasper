@@ -12,7 +12,6 @@ use crate::adapters::platform::nvidia::state::{
 use crate::adapters::provisioning::state::{
     execute_deployment_state_operation, DeploymentStateOperation,
 };
-use crate::adapters::rootfs::store::{execute_rootfs_operation, RootfsOperation};
 use crate::adapters::system_operation::{
     execute_system_operation, execute_systemd_tools_image_remove, SystemOperation,
 };
@@ -22,14 +21,14 @@ use crate::application::image_lifecycle::{
 };
 use crate::application::machine_lifecycle::{
     validate_nspawn_runtime_entry, MachineControlOutcome, MachineControlTransport,
-    MachineRuntimeControlRequest, NspawnLaunchRequest, NspawnUnitControlRequest,
+    MachineRuntimeControlRequest, MachineStartPreparationRequest, NspawnLaunchRequest,
+    NspawnUnitControlRequest,
 };
 use crate::daemon::dispatch::backend::{DaemonRuntimeQueries, DaemonSystemExecutor};
 use crate::daemon::dispatch::{decode_params, encode_result, HandlerResult};
 use crate::daemon::server::DaemonServerState;
 use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
-use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
 use crate::ipc::protocol::{RpcFamily, RpcMethod};
 use serde_json::Value;
@@ -103,16 +102,6 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
             encode_result(result)
         }
 
-        RpcMethod::Rootfs => {
-            let wire_operation: rootfs_wire::RootfsOperation = decode_params(method, params)?;
-            let operation = RootfsOperation::try_from(wire_operation)
-                .map_err(|error| format!("invalid rootfs request: {error}"))?;
-            let result = execute_rootfs_operation(operation)
-                .await
-                .map_err(|error| error.to_string())?;
-            encode_result(rootfs_wire::RootfsResult::from(result))
-        }
-
         RpcMethod::SystemOperation => {
             let request: crate::ipc::protocol::system::SystemOperationRequest =
                 decode_params(method, params)?;
@@ -130,6 +119,31 @@ pub(super) async fn handle<B: DaemonRuntimeQueries + DaemonSystemExecutor>(
                 Ok(()) => Ok(Value::Null),
                 Err(error) => Err(error.to_string()),
             }
+        }
+
+        RpcMethod::PrepareMachineStart => {
+            let request: MachineStartPreparationRequest = decode_params(method, params)?;
+            let host = crate::adapters::lifecycle::machine::DirectStartPreparation::new(
+                trusted_state_root,
+                request.nvidia_cdi_source,
+                false,
+            );
+            let reload = async {
+                let operation = SystemOperation::ReloadDaemon;
+                let result = match request.transport {
+                    MachineControlTransport::Dbus => match dbus.as_ref() {
+                        Some(dbus) if dbus.is_available().await => {
+                            dbus.system_operation(operation).await
+                        }
+                        _ => execute_system_operation(operation).await,
+                    },
+                    MachineControlTransport::SystemdTools => {
+                        execute_system_operation(operation).await
+                    }
+                };
+                result.map_err(crate::adapters::error::NspawnError::from)
+            };
+            encode_result(host.prepare(&request.machine, reload).await)
         }
 
         RpcMethod::NspawnLaunch => {

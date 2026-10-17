@@ -85,13 +85,15 @@ where
         let out_tx = out_tx.clone();
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
-            // Keep both guards through the operation and its response. Handlers
-            // cannot detach work that escapes the connection's request limit.
-            let _admission = admission;
+            // Bound the operation and its response with one request slot.
+            // Resource ownership ends when the operation finishes, before its
+            // reply can let the client submit a dependent request.
+            let (_request_slot, reservation) = admission;
             let result = dispatcher
                 .handle(method, request.params)
                 .await
                 .map_err(|error| RpcError::new(error_code::INTERNAL_ERROR, error));
+            drop(reservation);
             drop(active_request);
             respond(&out_tx, &shutdown, Some(request.id), result).await;
         });

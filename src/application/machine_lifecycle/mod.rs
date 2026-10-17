@@ -1,9 +1,12 @@
 //! Application-owned machine lifecycle workflow and transition projection.
 
-mod error;
+mod preparation;
 mod readiness;
 
-pub use error::MachinePreparationError;
+pub(crate) use preparation::MachineStartPreparationRequest;
+#[cfg(test)]
+pub(crate) use preparation::MockMachineStartPreparation;
+pub use preparation::{MachinePreparationError, MachineStartPreparation};
 pub use readiness::MachineReadyError;
 
 use super::operations::{ExecutionRoute, RouteFallback};
@@ -247,12 +250,6 @@ pub trait MachineControl: Send + Sync + 'static {
         machine: &MachineName,
         action: NspawnUnitAction,
     ) -> RoutedMachineControlOutcome;
-}
-
-#[cfg_attr(test, mockall::automock)]
-#[async_trait::async_trait]
-pub trait MachineStartPreparation: Send + Sync + 'static {
-    async fn prepare(&self, machine: &MachineName) -> Result<(), MachinePreparationError>;
 }
 
 #[cfg_attr(test, mockall::automock)]
@@ -630,6 +627,14 @@ impl MachineOperation {
                         rejection: MachineRejection::InvalidTarget,
                         reason,
                     }
+                } else if error.is_busy() {
+                    MachineLifecycleResult::Rejected {
+                        rejection: MachineRejection::Busy,
+                        reason,
+                    }
+                } else if error.is_outcome_unknown() {
+                    self.retain_transition = self.transition.is_some();
+                    MachineLifecycleResult::OutcomeUnknown(reason)
                 } else {
                     MachineLifecycleResult::Failed(reason)
                 };
@@ -1035,6 +1040,70 @@ mod tests {
             Err(MachineRejection::Busy)
         ));
         drop(first);
+    }
+
+    #[tokio::test]
+    async fn uncertain_preparation_does_not_start_the_machine_or_clear_its_transition() {
+        let mut preparation = MockMachineStartPreparation::new();
+        preparation.expect_prepare().once().returning(|_| {
+            Err(MachinePreparationError::outcome_unknown(
+                "daemon reply was lost during NVIDIA synchronization",
+            ))
+        });
+        let service = Arc::new(MachineLifecycleService::new(
+            Arc::new(MockMachineControl::new()),
+            Arc::new(preparation),
+            Arc::new(MockMachineObservation::new()),
+            Arc::new(MockMachineStartDiagnostics::new()),
+            OperationRegistry::new(),
+        ));
+
+        let outcome = service
+            .begin_launch(&image("test"), None)
+            .unwrap()
+            .run()
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            MachineLifecycleResult::OutcomeUnknown(_)
+        ));
+        assert_eq!(
+            service.project_machines(vec![]),
+            vec![entry("test", MachineState::Starting)]
+        );
+    }
+
+    #[tokio::test]
+    async fn preparation_admission_conflict_is_a_busy_rejection() {
+        let mut preparation = MockMachineStartPreparation::new();
+        preparation.expect_prepare().once().returning(|_| {
+            Err(MachinePreparationError::busy(
+                "manager reload is in progress",
+            ))
+        });
+        let service = Arc::new(MachineLifecycleService::new(
+            Arc::new(MockMachineControl::new()),
+            Arc::new(preparation),
+            Arc::new(MockMachineObservation::new()),
+            Arc::new(MockMachineStartDiagnostics::new()),
+            OperationRegistry::new(),
+        ));
+
+        let outcome = service
+            .begin_launch(&image("test"), None)
+            .unwrap()
+            .run()
+            .await;
+
+        assert!(matches!(
+            outcome.result,
+            MachineLifecycleResult::Rejected {
+                rejection: MachineRejection::Busy,
+                ..
+            }
+        ));
+        assert!(service.project_machines(vec![]).is_empty());
     }
 
     #[test]

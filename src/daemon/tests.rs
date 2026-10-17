@@ -4,7 +4,6 @@ use super::server::logging::*;
 use super::server::*;
 use crate::adapters::process::open_pidfd;
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
-use crate::adapters::rootfs::store::RootfsOperation;
 use crate::adapters::system_operation::{SystemOperation, SystemOperationError};
 use crate::application::image_lifecycle::{ImageRemoveRequest, ImageRemoveTransport};
 use crate::application::machine_lifecycle::{
@@ -15,7 +14,6 @@ use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use crate::domain::session::SessionSize;
-use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
 use crate::ipc::protocol::*;
 use crate::ipc::transport::*;
@@ -138,35 +136,6 @@ fn rpc_bootstrap_carries_transport_mode_and_session_secret() {
         "auth_token": TEST_TOKEN,
     });
     assert!(serde_json::from_value::<RpcBootstrap>(missing_mode).is_err());
-}
-
-#[test]
-fn rootfs_rpc_uses_the_typed_outbound_envelope() {
-    let wire_operation: rootfs_wire::RootfsOperation = serde_json::from_value(serde_json::json!({
-        "operation": "set_root_password",
-        "params": {
-            "target": {"kind": "machine", "machine": "test"},
-            "password": "wire-sentinel"
-        }
-    }))
-    .unwrap();
-    let operation = RootfsOperation::try_from(wire_operation).unwrap();
-    let bytes = OutboundRpcRequest::General(RpcRequest {
-        jsonrpc: "2.0".into(),
-        id: 41,
-        method: "rootfs".into(),
-        params: serde_json::to_value(rootfs_wire::RootfsOperation::from(operation)).unwrap(),
-    })
-    .into_wire_bytes()
-    .unwrap();
-    let request: RpcRequest = serde_json::from_slice(bytes.as_slice()).unwrap();
-
-    assert_eq!(request.id, 41);
-    assert_eq!(request.method, "rootfs");
-    assert_eq!(
-        request.params["params"]["password"].as_str(),
-        Some("wire-sentinel")
-    );
 }
 
 #[test]
@@ -665,6 +634,83 @@ async fn slow_remove_image_rejects_same_resource_start_promptly() {
         .expect("request pump did not stop after input EOF")
         .expect("request pump task panicked")
         .expect("request pump returned an error");
+}
+
+#[tokio::test]
+async fn completed_operation_releases_its_resource_before_queuing_the_reply() {
+    use crate::application::{ResourceClaim, ResourceKey};
+    use tokio::io::AsyncWriteExt;
+
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let state = Arc::new(DaemonServerState::default());
+    let operations = Arc::clone(&state.operations);
+    let directory = tempfile::tempdir().unwrap();
+    let dispatcher = Dispatcher {
+        dbus: Some(SlowRemoveDbus {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+        }),
+        invoking_uid: uzers::get_current_uid(),
+        server_state: state,
+        trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::for_test(
+            directory.path().to_path_buf(),
+        ),
+        machine_sessions: systemd_tools_sessions(),
+    };
+    let image = ImageName::new("slow-image").unwrap();
+    let claim = ResourceClaim::exclusive(ResourceKey::for_image(&image));
+    let request = RpcRequest {
+        jsonrpc: "2.0".into(),
+        id: 1,
+        method: "image_remove".into(),
+        params: serde_json::to_value(ImageRemoveRequest {
+            image,
+            transport: ImageRemoveTransport::Dbus,
+        })
+        .unwrap(),
+    };
+
+    // The completed handler must release the resource even while its reply is
+    // blocked. Otherwise a fast client can receive the reply on another thread
+    // and submit a dependent operation before the previous claim is dropped.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(1);
+    out_tx.send("occupied".into()).await.unwrap();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let pump = tokio::spawn(async move {
+        run_rpc_request_pump(&mut tokio::io::BufReader::new(server), &out_tx, dispatcher).await
+    });
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), started.notified())
+        .await
+        .unwrap();
+    assert!(operations.reserve([claim.clone()]).is_err());
+    release.notify_one();
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if let Ok(reservation) = operations.reserve([claim.clone()]) {
+                drop(reservation);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed operation kept its resource until the reply queue drained");
+    assert_eq!(out_rx.recv().await.unwrap(), "occupied");
+    let response = tokio::time::timeout(std::time::Duration::from_secs(1), out_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let response: RpcResponse = serde_json::from_str(&response).unwrap();
+    assert!(response.error.is_none());
+
+    drop(client);
+    pump.await.unwrap().unwrap();
 }
 
 #[test]

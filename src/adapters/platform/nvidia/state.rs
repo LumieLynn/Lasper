@@ -350,6 +350,19 @@ pub(crate) enum NvidiaStateOperation {
     RemoveOwned(RemoveNvidiaState),
 }
 
+impl NvidiaStateOperation {
+    pub(crate) fn resource_claims(&self) -> Vec<crate::application::ResourceClaim> {
+        use crate::application::{ResourceClaim, ResourceKey};
+
+        let machine = match self {
+            Self::Read(_) | Self::ProbeOwned(_) => return Vec::new(),
+            Self::Write(request) | Self::WriteInitial(request) => &request.machine,
+            Self::Remove(request) | Self::RemoveOwned(request) => &request.machine,
+        };
+        vec![ResourceClaim::exclusive(ResourceKey::for_machine(machine))]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ReadNvidiaState {

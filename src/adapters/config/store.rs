@@ -9,6 +9,7 @@ use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::filesystem::AsyncLockedWriter;
 use crate::adapters::platform::nvidia::NvidiaState;
 use crate::application::provisioning::{MachineProvisioningConfig, ResourceApplyStatus};
+use crate::application::{ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::{OciNetworkMode, PrivateUsersMode};
 use crate::domain::runtime::ImageName;
@@ -219,6 +220,18 @@ pub(crate) enum NspawnConfigOperation {
 }
 
 impl NspawnConfigOperation {
+    pub(crate) fn resource_claims(&self) -> Vec<ResourceClaim> {
+        let key = match self {
+            Self::Read(_) | Self::Inspect(_) | Self::PrepareOciPromotion(_) => return Vec::new(),
+            Self::Write(request) => ResourceKey::for_machine(&request.spec.machine),
+            Self::PromoteOci(request) => ResourceKey::for_machine(&request.machine),
+            Self::UpdateGpu(request) => ResourceKey::for_machine(&request.machine),
+            Self::Remove(request) => ResourceKey::for_machine(&request.machine),
+            Self::CleanupSidecarLocks(request) => ResourceKey::for_image(&request.image),
+        };
+        vec![ResourceClaim::exclusive(key)]
+    }
+
     fn settings_machine(&self) -> Option<MachineName> {
         match self {
             Self::Read(_)

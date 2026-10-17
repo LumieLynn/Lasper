@@ -71,13 +71,8 @@ pub(crate) fn compose_process_launch_services(
         route,
         crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
             local_cmd,
-            nspawn: crate::adapters::config::NspawnConfigStore::direct(),
-            systemd_unit: crate::adapters::config::SystemdUnitStore::direct(),
-            nvidia_state: crate::adapters::platform::nvidia::NvidiaStateStore::direct(
-                crate::adapters::trusted_state::TrustedStateRoot::production(),
-            ),
+            trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::production(),
             nvidia_cdi_source,
-            rootfs: crate::adapters::rootfs::RootfsStore::direct(),
             skip_nvidia_permission_denied: permission_level == PermissionLevel::User,
         },
     );
@@ -142,7 +137,6 @@ pub(crate) fn compose_application_services(
         nspawn,
         configuration_adapter,
         systemd_unit,
-        rootfs,
         nvidia_state,
         provisioning_route,
     ) = match daemon.as_ref() {
@@ -151,7 +145,6 @@ pub(crate) fn compose_application_services(
             crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(daemon)),
             crate::adapters::config::editor::ConfigurationAdapter::elevated(Arc::clone(daemon)),
             crate::adapters::config::SystemdUnitStore::elevated(Arc::clone(daemon)),
-            crate::adapters::rootfs::RootfsStore::elevated(Arc::clone(daemon)),
             crate::adapters::platform::nvidia::NvidiaStateStore::elevated(Arc::clone(daemon)),
             crate::adapters::provisioning::ProvisioningRoute::Elevated(Arc::clone(daemon)),
         ),
@@ -162,7 +155,6 @@ pub(crate) fn compose_application_services(
                 crate::adapters::config::NspawnConfigStore::direct(),
                 crate::adapters::config::editor::ConfigurationAdapter::direct(),
                 crate::adapters::config::SystemdUnitStore::direct(),
-                crate::adapters::rootfs::RootfsStore::direct(),
                 crate::adapters::platform::nvidia::NvidiaStateStore::direct(
                     trusted_state_root.clone(),
                 ),
@@ -294,11 +286,8 @@ pub(crate) fn compose_application_services(
         machine_route,
         crate::adapters::lifecycle::machine::MachineLifecycleAdapters {
             local_cmd: local_cmd.clone(),
-            nspawn: nspawn.clone(),
-            systemd_unit: systemd_unit.clone(),
-            nvidia_state: nvidia_state.clone(),
+            trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::production(),
             nvidia_cdi_source: nvidia_cdi_source.clone(),
-            rootfs,
             skip_nvidia_permission_denied: level == PermissionLevel::User,
         },
     );

@@ -1,13 +1,13 @@
 //! Authenticated daemon client facade, RPC multiplexer, and typed proxies.
 
 mod configuration;
+mod machine;
 mod session;
 
 use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
 use crate::adapters::platform::nvidia::state::{NvidiaStateOperation, NvidiaStateResult};
 use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentStateResult};
-use crate::adapters::rootfs::store::{RootfsOperation, RootfsResult};
 use crate::adapters::system_operation::SystemOperation;
 use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemoveRequest};
 use crate::application::machine_lifecycle::{
@@ -22,7 +22,6 @@ use crate::ipc::protocol::deployment::{
     DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
     ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
 };
-use crate::ipc::protocol::rootfs as rootfs_wire;
 use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
 use crate::ipc::protocol::*;
 use crate::ipc::transport::{
@@ -810,28 +809,6 @@ impl ElevatedDaemon {
             .await?;
         serde_json::from_value(result)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn rootfs(&self, operation: RootfsOperation) -> std::io::Result<RootfsResult> {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let params = serde_json::to_value(rootfs_wire::RootfsOperation::from(operation))
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self
-            .send_rpc_request(
-                OutboundRpcRequest::General(RpcRequest {
-                    jsonrpc: "2.0".into(),
-                    id,
-                    method: RpcMethod::Rootfs.wire_name().into(),
-                    params,
-                }),
-                RpcMethod::Rootfs,
-            )
-            .await?;
-        let result: rootfs_wire::RootfsResult = serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        Ok(result.into())
     }
 
     pub(super) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {

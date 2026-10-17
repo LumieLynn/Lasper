@@ -114,20 +114,6 @@ pub(crate) fn replace_secret_string(value: &mut String, replacement: &str) {
 pub(crate) mod serde_secret {
     use super::*;
 
-    pub fn serialize<S>(value: &SecretString, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(value.expose_secret())
-    }
-
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SecretString, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        String::deserialize(deserializer).map(SecretString::new)
-    }
-
     pub mod optional {
         use super::*;
 

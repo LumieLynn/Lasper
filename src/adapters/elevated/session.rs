@@ -291,13 +291,25 @@ mod tests {
     use super::*;
     use sendfd::SendWithFd;
     use std::io::Write;
-    use std::os::fd::{FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
     fn pipe() -> (RawFd, std::fs::File) {
         let mut fds = [-1; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let writer = unsafe { std::fs::File::from_raw_fd(fds[1]) };
         (fds[0], writer)
+    }
+
+    fn assert_pipe_reader_closed(writer: &std::fs::File) {
+        // Observe the pipe through an FD we still own. Checking the closed
+        // reader's number races with FD reuse by parallel tests.
+        let mut descriptor = libc::pollfd {
+            fd: writer.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
+        assert_ne!(descriptor.revents & libc::POLLERR, 0);
     }
 
     #[tokio::test]
@@ -372,40 +384,24 @@ mod tests {
 
     #[test]
     fn received_descriptors_are_closed_when_the_response_is_discarded() {
-        use std::os::fd::AsRawFd;
-
         let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
-        let (read_fd, _writer) = pipe();
+        let (read_fd, writer) = pipe();
         server.send_with_fd(b"ok", &[read_fd]).unwrap();
         unsafe { libc::close(read_fd) };
 
         let (_, received) =
             super::super::receive_fd_response(&client, "journal stream", Duration::from_secs(1))
                 .unwrap();
-        let received_fd = received[0].as_raw_fd();
         drop(received);
-
-        assert_eq!(unsafe { libc::fcntl(received_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        assert_pipe_reader_closed(&writer);
     }
 
     #[test]
     fn dropping_lifecycle_read_future_closes_its_owned_fd() {
-        use std::os::fd::AsRawFd;
-
-        let (read_fd, _writer) = pipe();
+        let (read_fd, writer) = pipe();
         let status_fd = unsafe { OwnedFd::from_raw_fd(read_fd) };
-        let raw_fd = status_fd.as_raw_fd();
         let future = read_lifecycle(status_fd);
         drop(future);
-
-        assert_eq!(unsafe { libc::fcntl(raw_fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        assert_pipe_reader_closed(&writer);
     }
 }

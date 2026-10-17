@@ -40,10 +40,6 @@ impl MachineName {
         &self.0
     }
 
-    pub fn into_string(self) -> String {
-        self.0
-    }
-
     /// Compatibility projection used by the current systemd adapters.
     pub fn systemd_nspawn_unit(&self) -> String {
         format!("systemd-nspawn@{}.service", self.0)
