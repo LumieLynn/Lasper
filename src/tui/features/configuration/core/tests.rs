@@ -682,7 +682,6 @@ fn wayland_session_dialog_checks_and_enters_through_typed_session_actions() {
     assert_eq!(target.user().as_str(), "alice");
     assert_eq!(host_socket.display().as_str(), "wayland-1");
     let context = crate::application::sessions::WaylandSessionContext::verified(
-        host_socket.clone(),
         "/run/lasper/wayland/1000/wayland-1".into(),
         crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
     );

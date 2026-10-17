@@ -1180,7 +1180,10 @@ mod tests {
         async fn open_terminal(
             &self,
             request: crate::application::sessions::TerminalSessionRequest,
-        ) -> Result<crate::application::sessions::TerminalSessionHandle, SessionError> {
+        ) -> Result<
+            crate::application::sessions::TerminalSessionHandle,
+            crate::application::sessions::TerminalOpenError,
+        > {
             use crate::application::sessions::{terminal_session_channel, TerminalLaunch};
             use crate::domain::session::{SessionLifecycle, TerminalAttachmentKind};
 

@@ -425,26 +425,16 @@ impl ShellOpenIntent {
 /// obtain a fresh value from `SessionPort::prepare_wayland`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaylandSessionContext {
-    host_socket: HostWaylandSocket,
     guest_socket: PathBuf,
     identity: ObservedGuestIdentity,
 }
 
 impl WaylandSessionContext {
-    pub(crate) fn verified(
-        host_socket: HostWaylandSocket,
-        guest_socket: PathBuf,
-        identity: ObservedGuestIdentity,
-    ) -> Self {
+    pub(crate) fn verified(guest_socket: PathBuf, identity: ObservedGuestIdentity) -> Self {
         Self {
-            host_socket,
             guest_socket,
             identity,
         }
-    }
-
-    pub fn host_socket(&self) -> &HostWaylandSocket {
-        &self.host_socket
     }
 
     pub fn guest_socket(&self) -> &Path {
@@ -569,11 +559,13 @@ impl X11SessionContext {
     }
 }
 
-/// Closed, feature-owned environment allowlist for `OpenMachineShell`.
+/// Closed display intent and terminal environment for a selected-user shell.
+/// The execution adapter validates the Wayland projection before opening;
+/// X11 authorization remains owned by the invoking desktop user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TypedSessionEnvironment {
     terminal: InteractiveShellEnvironment,
-    wayland: Option<WaylandSessionContext>,
+    wayland: Option<HostWaylandSocket>,
     x11: Option<X11SessionContext>,
 }
 
@@ -588,11 +580,11 @@ impl TypedSessionEnvironment {
 
     pub(crate) fn wayland(
         terminal: InteractiveShellEnvironment,
-        context: WaylandSessionContext,
+        socket: HostWaylandSocket,
     ) -> Self {
         Self {
             terminal,
-            wayland: Some(context),
+            wayland: Some(socket),
             x11: None,
         }
     }
@@ -606,7 +598,7 @@ impl TypedSessionEnvironment {
         &self.terminal
     }
 
-    pub(crate) fn wayland_context(&self) -> Option<&WaylandSessionContext> {
+    pub(crate) fn wayland_socket(&self) -> Option<&HostWaylandSocket> {
         self.wayland.as_ref()
     }
 
@@ -879,6 +871,31 @@ impl From<std::io::Error> for SessionError {
     }
 }
 
+/// Only a failure before opening the selected-user terminal can safely be
+/// retried without Wayland. Transport errors after an open request are terminal
+/// failures: the peer may already have created the session.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalOpenError {
+    #[error("{0}")]
+    WaylandPreparation(#[source] SessionError),
+    #[error("{0}")]
+    Terminal(#[from] SessionError),
+}
+
+impl TerminalOpenError {
+    pub fn into_session_error(self) -> SessionError {
+        match self {
+            Self::WaylandPreparation(error) | Self::Terminal(error) => error,
+        }
+    }
+}
+
+impl From<std::io::Error> for TerminalOpenError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Terminal(error.into())
+    }
+}
+
 /// Preserve whether a selected-user shell failed while preparing Wayland or
 /// while opening the terminal itself. Callers may safely retry only the first
 /// phase without risking a duplicate shell attachment.
@@ -905,6 +922,15 @@ impl ShellOpenError {
     }
 }
 
+impl From<TerminalOpenError> for ShellOpenError {
+    fn from(error: TerminalOpenError) -> Self {
+        match error {
+            TerminalOpenError::WaylandPreparation(error) => Self::WaylandPreparation(error),
+            TerminalOpenError::Terminal(error) => Self::Terminal(error),
+        }
+    }
+}
+
 #[async_trait]
 pub trait SessionPort: Send + Sync + 'static {
     async fn discover_host_wayland_sockets(&self) -> Vec<HostWaylandSocket>;
@@ -917,7 +943,7 @@ pub trait SessionPort: Send + Sync + 'static {
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError>;
+    ) -> Result<TerminalSessionHandle, TerminalOpenError>;
 
     async fn prepare_wayland(
         &self,

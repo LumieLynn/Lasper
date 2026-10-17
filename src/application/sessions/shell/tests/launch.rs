@@ -139,7 +139,7 @@ async fn wayland_fallback_preserves_x11_command_environment_and_size() {
     assert_eq!(user, target.user());
     assert_eq!(launched_command.as_ref(), Some(&command));
     assert_eq!(environment.terminal_environment(), &terminal_environment);
-    assert!(environment.wayland_context().is_none());
+    assert!(environment.wayland_socket().is_none());
     assert_eq!(
         environment.x11_context(),
         Some(opened.x11.as_ref().unwrap().context())
@@ -171,7 +171,7 @@ async fn wayland_and_x11_can_be_prepared_together() {
     let TerminalLaunch::SelectedUserShell { environment, .. } = &requests[0].launch else {
         panic!("expected selected-user shell");
     };
-    assert!(environment.wayland_context().is_some());
+    assert!(environment.wayland_socket().is_some());
     assert!(environment.x11_context().is_some());
     opened.handle.close();
 }

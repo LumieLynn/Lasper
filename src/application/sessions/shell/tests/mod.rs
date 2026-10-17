@@ -3,7 +3,7 @@ use crate::application::sessions::{
     journal_session_channel, terminal_session_channel, InteractiveShellEnvironment,
     JournalSessionHandle, JournalSessionRequest, MappedGuestIdentity, ObservedGuestIdentity,
     ObservedMachineInstance, ObservedNamespaceIdentity, SessionPort, TerminalLaunch,
-    TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
+    TerminalOpenError, TerminalSessionRequest, ValidatedGuestUserName, WaylandPreparationRequest,
     WaylandSessionContext, X11FilesystemAccess, X11ProjectionContext,
 };
 use crate::application::x11::{
@@ -61,7 +61,7 @@ impl SessionPort for CountingSessionPort {
     async fn open_terminal(
         &self,
         _request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, TerminalOpenError> {
         panic!("CLI preparation must not open a terminal")
     }
 
@@ -130,29 +130,42 @@ impl SessionPort for FallbackSessionPort {
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, TerminalOpenError> {
+        if let TerminalLaunch::SelectedUserShell {
+            user, environment, ..
+        } = &request.launch
+        {
+            if let Some(host_socket) = environment.wayland_socket() {
+                self.prepare_wayland(WaylandPreparationRequest {
+                    probe_id: request.id,
+                    target: ShellTarget::new(request.machine.clone(), user.clone()),
+                    host_socket: host_socket.clone(),
+                })
+                .await
+                .map_err(TerminalOpenError::WaylandPreparation)?;
+            }
+        }
         self.open_calls.fetch_add(1, Ordering::Relaxed);
         let has_wayland = matches!(
             &request.launch,
             TerminalLaunch::SelectedUserShell { environment, .. }
-                if environment.wayland_context().is_some()
+                if environment.wayland_socket().is_some()
         );
         self.open_wayland.lock().push(has_wayland);
         self.requests.lock().push(request.clone());
         if self.fail_fallback {
-            return Err(SessionError::new("simulated terminal open failure"));
+            return Err(SessionError::new("simulated terminal open failure").into());
         }
         Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
     }
 
     async fn prepare_wayland(
         &self,
-        request: WaylandPreparationRequest,
+        _request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.prepare_calls.fetch_add(1, Ordering::Relaxed);
         if self.probe_succeeds {
             return Ok(WaylandSessionContext::verified(
-                request.host_socket,
                 PathBuf::from("/run/lasper/wayland/1000/wayland-0"),
                 crate::application::sessions::ObservedGuestIdentity::new(1000, 1000),
             ));

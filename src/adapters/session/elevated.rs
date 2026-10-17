@@ -1,7 +1,7 @@
 use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
+    SessionPort, TerminalLaunch, TerminalOpenError, TerminalSessionHandle, TerminalSessionRequest,
     WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
     X11ProjectionProbeRequest,
 };
@@ -43,7 +43,7 @@ impl SessionPort for ElevatedSessionAdapter {
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, TerminalOpenError> {
         let TerminalSessionRequest {
             id,
             machine,
@@ -75,9 +75,7 @@ impl SessionPort for ElevatedSessionAdapter {
                 WireTerminalLaunch::SelectedUserShell {
                     user,
                     terminal: Box::new(environment.terminal_environment().clone()),
-                    wayland: environment
-                        .wayland_context()
-                        .map(|context| Box::new(context.host_socket().clone())),
+                    wayland: environment.wayland_socket().cloned().map(Box::new),
                     x11_display,
                     command: command.map(Into::into),
                 }
@@ -86,8 +84,7 @@ impl SessionPort for ElevatedSessionAdapter {
         let spawned = self
             .daemon
             .spawn_terminal(id.get(), machine.as_str(), size, launch)
-            .await
-            .map_err(|error| SessionError::new(format!("open elevated terminal: {error}")))?;
+            .await?;
         let Some(lifecycle) = spawned.lifecycle else {
             return crate::adapters::session::pty::spawn_machine_terminal(
                 super::MachinePty {
@@ -96,7 +93,8 @@ impl SessionPort for ElevatedSessionAdapter {
                 },
                 id,
                 size,
-            );
+            )
+            .map_err(Into::into);
         };
         let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
             spawned.master_fd,
@@ -110,7 +108,7 @@ impl SessionPort for ElevatedSessionAdapter {
                         "failed to close elevated terminal after local setup error: {close_error}"
                     );
                 }
-                return Err(error);
+                return Err(error.into());
             }
         };
         let daemon = Arc::clone(&self.daemon);

@@ -6,7 +6,8 @@ use super::wayland_probe::{WaylandProbeObservation, WaylandProbeRequest};
 use super::{MachineSessionRequest, MachineSessionTransport};
 use crate::adapters::config::NspawnConfigStore;
 use crate::application::sessions::{
-    SessionError, TerminalSessionHandle, WaylandPreparationRequest, WaylandSessionContext,
+    SessionError, ShellTarget, TerminalSessionHandle, WaylandPreparationRequest,
+    WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -67,7 +68,6 @@ impl WaylandSessionResolver {
                 Ok(()) => {
                     revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
                     return Ok(WaylandSessionContext::verified(
-                        request.host_socket,
                         guest_socket,
                         access.identity,
                     ));
@@ -85,15 +85,25 @@ impl WaylandSessionResolver {
         automatic_wayland(&self.nspawn, machine).await
     }
 
-    pub(crate) async fn guest_display(
+    /// Resolve and probe immediately before terminal creation. A shell carries
+    /// the selected host socket, never an earlier Check Access observation.
+    pub(crate) async fn prepare_display(
         &self,
-        context: Option<&WaylandSessionContext>,
+        target: ShellTarget,
+        socket: Option<crate::domain::wayland::HostWaylandSocket>,
+        probe_id: SessionId,
     ) -> Result<Option<std::path::PathBuf>, SessionError> {
-        match context {
-            Some(context) => {
-                revalidate_host_socket(context.host_socket(), self.authorized_uid).await?;
-                Ok(Some(context.guest_socket().to_path_buf()))
-            }
+        match socket {
+            Some(host_socket) => Ok(Some(
+                self.prepare(WaylandPreparationRequest {
+                    probe_id,
+                    target,
+                    host_socket,
+                })
+                .await?
+                .guest_socket()
+                .to_path_buf(),
+            )),
             None => Ok(None),
         }
     }

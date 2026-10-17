@@ -5,14 +5,14 @@ use crate::adapters::session::{
     MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
     MachineShellEnvironment, MachineShellRequest, WaylandSessionResolver,
 };
-use crate::application::sessions::{GuestCommand, ShellTarget, WaylandPreparationRequest};
+use crate::application::sessions::{GuestCommand, SessionError, ShellTarget, TerminalOpenError};
 use crate::daemon::sessions::process::{self, SessionChild};
 use crate::daemon::sessions::{handoff, lifecycle, SessionRegistry};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, TerminalAttachmentKind};
 use crate::ipc::protocol::session::{
     SpawnTerminalParams, SpawnTerminalResponse, WireSessionId, WireTerminalAttachmentKind,
-    WireTerminalLaunch, WireTerminalLifecycleSource, WireTerminalSize,
+    WireTerminalLaunch, WireTerminalLifecycleSource, WireTerminalSize, WireTerminalStartupError,
 };
 use anyhow::Context;
 use sendfd::SendWithFd;
@@ -33,11 +33,23 @@ pub(crate) async fn open(
         size,
         launch,
     } = params;
-    let opening = prepare(&name, launch, machine, invoking_uid).await;
-    handoff::respond(stream, move |stream| match opening? {
-        MachineSessionOpening::Dbus(pty) => deliver_machine_terminal(stream, pty),
-        MachineSessionOpening::SystemdTools(command) => {
-            spawn_process_terminal(stream, session_id, name, size, *command, sessions)
+    let probe_id = SessionId::new(session_id.get()).expect("wire session id is non-zero");
+    let opening = prepare(&name, launch, machine, invoking_uid, probe_id).await;
+    handoff::respond(stream, move |stream| {
+        let opening = match opening {
+            Ok(opening) => opening,
+            Err(error) => {
+                log::warn!("Daemon terminal preparation failed: {error}");
+                let response = serde_json::to_vec(&WireTerminalStartupError::from(error))?;
+                stream.send_with_fd(&response, &[])?;
+                return Ok(());
+            }
+        };
+        match opening {
+            MachineSessionOpening::Dbus(pty) => deliver_machine_terminal(stream, pty),
+            MachineSessionOpening::SystemdTools(command) => {
+                spawn_process_terminal(stream, session_id, name, size, *command, sessions)
+            }
         }
     })
     .await;
@@ -48,23 +60,26 @@ async fn prepare(
     launch: WireTerminalLaunch,
     machine: MachineSessionTransport,
     invoking_uid: u32,
-) -> anyhow::Result<MachineSessionOpening> {
+    probe_id: SessionId,
+) -> Result<MachineSessionOpening, TerminalOpenError> {
     match launch {
         WireTerminalLaunch::DefaultAttachment => {
-            let command =
-                terminal_attach::select(name).context("terminal attach planning failed")?;
+            let command = terminal_attach::select(name).map_err(|error| {
+                SessionError::new(format!("terminal attach planning failed: {error}"))
+            })?;
             Ok(MachineSessionOpening::SystemdTools(Box::new(command)))
         }
         WireTerminalLaunch::LoginPrompt => {
-            let attachment =
-                terminal_attach::select(name).context("terminal attach planning failed")?;
+            let attachment = terminal_attach::select(name).map_err(|error| {
+                SessionError::new(format!("terminal attach planning failed: {error}"))
+            })?;
             if attachment.kind() == TerminalAttachmentKind::Namespace {
                 Ok(MachineSessionOpening::SystemdTools(Box::new(attachment)))
             } else {
                 machine
                     .open(MachineSessionRequest::login_prompt(name.clone()))
                     .await
-                    .context("machine login prompt failed")
+                    .map_err(Into::into)
             }
         }
         WireTerminalLaunch::SelectedUserShell {
@@ -77,32 +92,31 @@ async fn prepare(
             let command = command
                 .map(GuestCommand::try_from)
                 .transpose()
-                .context("selected-user shell command validation failed")?;
+                .map_err(|error| {
+                    SessionError::new(format!(
+                        "selected-user shell command validation failed: {error}"
+                    ))
+                })?;
             let resolver = WaylandSessionResolver::for_authorized_uid(
                 machine.clone(),
                 crate::adapters::config::NspawnConfigStore::direct(),
                 invoking_uid,
             );
-            let wayland_context = match wayland {
-                Some(host_socket) => Some(
-                    resolver
-                        .prepare(WaylandPreparationRequest {
-                            probe_id: next_probe_id(),
-                            target: ShellTarget::new(name.clone(), user.clone()),
-                            host_socket: *host_socket,
-                        })
-                        .await
-                        .context("Wayland shell validation failed")?,
-                ),
-                None => None,
-            };
             let wayland_display = resolver
-                .guest_display(wayland_context.as_ref())
+                .prepare_display(
+                    ShellTarget::new(name.clone(), user.clone()),
+                    wayland.map(|socket| *socket),
+                    probe_id,
+                )
                 .await
-                .context("Wayland environment validation failed")?;
+                .map_err(TerminalOpenError::WaylandPreparation)?;
             let environment =
                 MachineShellEnvironment::shell(*terminal, wayland_display.as_deref(), x11_display)
-                    .context("selected-user shell environment validation failed")?;
+                    .map_err(|error| {
+                        SessionError::new(format!(
+                            "selected-user shell environment validation failed: {error}"
+                        ))
+                    })?;
             let request = MachineShellRequest::new(name.clone(), user, environment);
             let request = match command {
                 Some(command) => request.with_command(command),
@@ -111,7 +125,7 @@ async fn prepare(
             machine
                 .open(MachineSessionRequest::shell(request))
                 .await
-                .context("selected-user shell failed")
+                .map_err(Into::into)
         }
     }
 }
@@ -188,14 +202,66 @@ fn deliver_machine_terminal(stream: &UnixStream, pty: MachinePty) -> anyhow::Res
     Ok(())
 }
 
-fn next_probe_id() -> SessionId {
-    use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::sessions::{InteractiveShellEnvironment, ValidatedGuestUserName};
+    use crate::domain::session::SessionSize;
+    use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
+    use sendfd::RecvWithFd;
 
-    static NEXT_PROBE_ID: AtomicU64 = AtomicU64::new(1);
-    loop {
-        let value = NEXT_PROBE_ID.fetch_add(1, Ordering::Relaxed);
-        if let Ok(id) = SessionId::new(value) {
-            return id;
-        }
+    #[tokio::test]
+    async fn rejected_wayland_preparation_returns_a_typed_failure_without_terminal_fds() {
+        let directory = tempfile::tempdir().unwrap();
+        let uid = uzers::get_current_uid();
+        let socket = HostWaylandSocket::from_verified_parts(
+            WaylandDisplay::new("wayland-0").unwrap(),
+            directory.path().to_path_buf(),
+            directory.path().join("wayland-0"),
+            uid,
+            uid,
+            uzers::get_current_gid(),
+            0o755,
+            SocketRevision {
+                device: 0,
+                inode: 0,
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+            },
+        )
+        .unwrap();
+        let (server, client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        open(
+            server,
+            SpawnTerminalParams {
+                session_id: WireSessionId::new(1).unwrap(),
+                name: MachineName::new("unused-machine").unwrap(),
+                size: SessionSize::new(80, 24).unwrap().into(),
+                launch: WireTerminalLaunch::SelectedUserShell {
+                    user: ValidatedGuestUserName::new("alice").unwrap(),
+                    terminal: Box::new(InteractiveShellEnvironment::default()),
+                    wayland: Some(Box::new(socket)),
+                    x11_display: None,
+                    command: None,
+                },
+            },
+            Arc::new(SessionRegistry::default()),
+            MachineSessionTransport::SystemdTools,
+            uid,
+        )
+        .await;
+
+        let mut message = [0; 4096];
+        let mut fds = [-1; 2];
+        let (bytes, fd_count) = client.recv_with_fd(&mut message, &mut fds).unwrap();
+        assert_eq!(fd_count, 0);
+        let failure: WireTerminalStartupError = serde_json::from_slice(&message[..bytes]).unwrap();
+        assert!(matches!(
+            TerminalOpenError::from(failure),
+            TerminalOpenError::WaylandPreparation(_)
+        ));
     }
 }

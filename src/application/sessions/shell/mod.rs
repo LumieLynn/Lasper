@@ -117,7 +117,7 @@ impl SessionService {
         })
     }
 
-    async fn open_prepared_shell(
+    async fn open_shell_attempt(
         &self,
         intent: &ShellOpenIntent,
         socket: Option<HostWaylandSocket>,
@@ -134,19 +134,14 @@ impl SessionService {
         let command = intent.command().cloned();
         let mut environment = match socket {
             None => TypedSessionEnvironment::terminal(terminal_environment),
-            Some(socket) => TypedSessionEnvironment::wayland(
-                terminal_environment,
-                self.test_wayland(intent.target().clone(), socket)
-                    .await
-                    .map_err(ShellOpenError::WaylandPreparation)?,
-            ),
+            Some(socket) => TypedSessionEnvironment::wayland(terminal_environment, socket),
         };
         if let Some(context) = intent.x11().cloned() {
             environment = environment.with_x11(context);
         }
         self.open_selected_user_terminal(intent.target(), environment, command, intent.size())
             .await
-            .map_err(ShellOpenError::Terminal)
+            .map_err(ShellOpenError::from)
     }
 }
 
@@ -211,10 +206,10 @@ impl SessionService {
             }
         };
         let has_socket = socket.is_some();
-        let result = match self.open_prepared_shell(&intent, socket).await {
+        let result = match self.open_shell_attempt(&intent, socket).await {
             Err(ShellOpenError::WaylandPreparation(error)) if allow_fallback && has_socket => {
                 cause = Some(WaylandFallbackCause::Validation(error));
-                self.open_prepared_shell(&intent, None).await
+                self.open_shell_attempt(&intent, None).await
             }
             result => result,
         };

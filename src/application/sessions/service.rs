@@ -1,8 +1,8 @@
 use super::{
     GuestCommand, JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort,
-    ShellTarget, TerminalSessionHandle, TerminalSessionRequest, TypedSessionEnvironment,
-    WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
-    X11ProjectionProbeRequest,
+    ShellTarget, TerminalOpenError, TerminalSessionHandle, TerminalSessionRequest,
+    TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext,
+    X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
@@ -34,6 +34,7 @@ impl SessionService {
                 size,
             ))
             .await
+            .map_err(TerminalOpenError::into_session_error)
     }
 
     pub async fn discover_host_wayland_sockets(
@@ -89,7 +90,7 @@ impl SessionService {
         environment: TypedSessionEnvironment,
         command: Option<GuestCommand>,
         size: SessionSize,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, TerminalOpenError> {
         self.port
             .open_terminal(TerminalSessionRequest::selected_user_shell_with_command(
                 self.allocate_id(),
@@ -156,7 +157,7 @@ mod tests {
         async fn open_terminal(
             &self,
             request: TerminalSessionRequest,
-        ) -> Result<TerminalSessionHandle, SessionError> {
+        ) -> Result<TerminalSessionHandle, TerminalOpenError> {
             self.ids.lock().push(request.id);
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
         }

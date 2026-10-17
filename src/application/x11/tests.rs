@@ -464,7 +464,7 @@ impl SessionPort for ProjectionPort {
     async fn open_terminal(
         &self,
         _request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, crate::application::sessions::TerminalOpenError> {
         panic!("X11 preparation must not open a user terminal")
     }
 

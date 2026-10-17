@@ -8,9 +8,9 @@ pub use contract::{
     InteractiveShellEnvironmentError, JournalSessionHandle, JournalSessionRequest,
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
     SessionError, SessionPort, SessionSendStatus, ShellOpenError, ShellOpenIntent, ShellTarget,
-    TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest, ValidatedGuestUserName,
-    WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest, X11FilesystemAccess,
-    X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
+    TerminalOpenError, TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest,
+    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
+    X11FilesystemAccess, X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
 };
 pub use service::SessionService;
 #[allow(unused_imports)]

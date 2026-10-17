@@ -1,8 +1,8 @@
 use super::ElevatedDaemon;
 use crate::application::sessions::{
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
-    SessionError, WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
-    X11ProjectionProbeRequest,
+    SessionError, TerminalOpenError, WaylandPreparationRequest, WaylandSessionContext,
+    X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionLifecycle, SessionSize, TerminalAttachmentKind};
@@ -10,16 +10,16 @@ use crate::ipc::protocol::session::{
     CloseSessionParams, PrepareWaylandParams, PrepareWaylandResponse, ProbeX11ProjectionParams,
     ProbeX11ProjectionResponse, SpawnJournalctlParams, SpawnTerminalParams, SpawnTerminalResponse,
     WireSessionId, WireSessionLifecycle, WireTerminalLaunch, WireTerminalLifecycleSource,
-    WireTerminalSize,
+    WireTerminalSize, WireTerminalStartupError,
 };
 use crate::ipc::protocol::FdOperation;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 const JOURNAL_FD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(15);
-// Selected-user shells may try multiple configured Wayland targets. Each
-// machine1 shell call has a 60-second D-Bus deadline, so the handoff needs a
-// larger outer cap than one machine1 call while still bounding a stuck peer.
+// One selected-user opening includes Wayland preparation, which may try
+// multiple configured targets. Keep the whole handoff bounded without turning
+// an uncertain timeout into a retryable pre-open rejection.
 const TERMINAL_FD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(150);
 
 pub(crate) struct SpawnedTerminalPty {
@@ -76,7 +76,7 @@ impl ElevatedDaemon {
         name: &str,
         size: SessionSize,
         launch: WireTerminalLaunch,
-    ) -> std::io::Result<SpawnedTerminalPty> {
+    ) -> Result<SpawnedTerminalPty, TerminalOpenError> {
         let request = SpawnTerminalParams {
             session_id: WireSessionId::new(session_id)?,
             name: MachineName::try_from(name)
@@ -88,9 +88,10 @@ impl ElevatedDaemon {
         let (message, fds) = tokio::task::spawn_blocking(move || {
             super::receive_fd_response(&socket, "terminal", TERMINAL_FD_HANDOFF_TIMEOUT)
         })
-        .await??;
+        .await
+        .map_err(std::io::Error::other)??;
         if fds.is_empty() {
-            return Err(daemon_fd_error(message.as_bytes()));
+            return Err(decode_terminal_startup_error(&message));
         }
         let fd_count = fds.len();
         let mut fds = fds.into_iter();
@@ -111,12 +112,13 @@ impl ElevatedDaemon {
                         None
                     }
                     expected => {
-                        return Err(std::io::Error::new(
+                        let error = std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
                                 "daemon terminal response has {fd_count} fds for {expected:?} lifecycle"
                             ),
-                        ));
+                        );
+                        return Err(error.into());
                     }
                 };
                 Ok(SpawnedTerminalPty {
@@ -126,7 +128,7 @@ impl ElevatedDaemon {
                     machine_removed,
                 })
             }
-            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error).into()),
         }
     }
 
@@ -134,7 +136,6 @@ impl ElevatedDaemon {
         &self,
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
-        let host_socket = request.host_socket.clone();
         let params = PrepareWaylandParams {
             probe_id: WireSessionId::new(request.probe_id.get())
                 .map_err(|error| SessionError::new(error.to_string()))?,
@@ -158,7 +159,6 @@ impl ElevatedDaemon {
                 uid,
                 gid,
             } => Ok(WaylandSessionContext::verified(
-                host_socket,
                 guest_socket,
                 ObservedGuestIdentity::new(uid, gid),
             )),
@@ -246,6 +246,13 @@ impl ElevatedDaemon {
     }
 }
 
+fn decode_terminal_startup_error(message: &str) -> TerminalOpenError {
+    match serde_json::from_str::<WireTerminalStartupError>(message) {
+        Ok(error) => error.into(),
+        Err(_) => daemon_fd_error(message.as_bytes()).into(),
+    }
+}
+
 fn monitor_lifecycle(status_fd: OwnedFd) -> tokio::sync::oneshot::Receiver<SessionLifecycle> {
     let (mut tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -310,6 +317,40 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 0) }, 1);
         assert_ne!(descriptor.revents & libc::POLLERR, 0);
+    }
+
+    #[test]
+    fn only_a_typed_wayland_preparation_failure_permits_fallback() {
+        let failure = TerminalOpenError::WaylandPreparation(SessionError::with_hint(
+            "startup bind is stale",
+            "restart the machine",
+        ));
+        let message = serde_json::to_string(&WireTerminalStartupError::from(failure)).unwrap();
+        let TerminalOpenError::WaylandPreparation(error) = decode_terminal_startup_error(&message)
+        else {
+            panic!("daemon lost the pre-open failure category");
+        };
+        assert_eq!(error.to_string(), "startup bind is stale");
+        assert_eq!(error.hint(), Some("restart the machine"));
+
+        let terminal = WireTerminalStartupError::from(TerminalOpenError::Terminal(
+            SessionError::new("machine shell failed"),
+        ));
+        for message in [
+            serde_json::to_string(&terminal).unwrap(),
+            "Wayland shell failed after opening".into(),
+            r#"{"phase":"unknown","message":"failed"}"#.into(),
+            r#"{"phase":"wayland_preparation"}"#.into(),
+        ] {
+            assert!(matches!(
+                decode_terminal_startup_error(&message),
+                TerminalOpenError::Terminal(_)
+            ));
+        }
+        assert!(matches!(
+            TerminalOpenError::from(std::io::Error::from(std::io::ErrorKind::TimedOut)),
+            TerminalOpenError::Terminal(_)
+        ));
     }
 
     #[tokio::test]

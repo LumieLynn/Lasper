@@ -1178,7 +1178,27 @@ mod tests {
         async fn open_terminal(
             &self,
             request: TerminalSessionRequest,
-        ) -> Result<TerminalSessionHandle, SessionError> {
+        ) -> Result<TerminalSessionHandle, crate::application::sessions::TerminalOpenError>
+        {
+            if let crate::application::sessions::TerminalLaunch::SelectedUserShell {
+                user,
+                environment,
+                ..
+            } = &request.launch
+            {
+                if let Some(host_socket) = environment.wayland_socket() {
+                    self.prepare_wayland(WaylandPreparationRequest {
+                        probe_id: request.id,
+                        target: crate::application::sessions::ShellTarget::new(
+                            request.machine.clone(),
+                            user.clone(),
+                        ),
+                        host_socket: host_socket.clone(),
+                    })
+                    .await
+                    .map_err(crate::application::sessions::TerminalOpenError::WaylandPreparation)?;
+                }
+            }
             self.open_calls.fetch_add(1, Ordering::Relaxed);
             Ok(terminal_session_channel(request.id, TerminalAttachmentKind::Login).0)
         }

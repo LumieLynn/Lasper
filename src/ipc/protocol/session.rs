@@ -1,5 +1,6 @@
 use crate::application::sessions::{
-    GuestCommand, InteractiveShellEnvironment, ValidatedGuestUserName,
+    GuestCommand, InteractiveShellEnvironment, SessionError, TerminalOpenError,
+    ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
@@ -256,6 +257,54 @@ impl std::error::Error for WireTerminalSizeError {}
 pub(crate) struct SpawnTerminalResponse {
     pub attach_kind: WireTerminalAttachmentKind,
     pub lifecycle: WireTerminalLifecycleSource,
+}
+
+/// A daemon-reported pre-open failure can permit Wayland fallback. FD-channel
+/// timeouts, malformed replies and errors after opening must never do so.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireTerminalStartupError {
+    phase: WireTerminalFailurePhase,
+    message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireTerminalFailurePhase {
+    WaylandPreparation,
+    Terminal,
+}
+
+impl From<TerminalOpenError> for WireTerminalStartupError {
+    fn from(error: TerminalOpenError) -> Self {
+        let phase = match &error {
+            TerminalOpenError::WaylandPreparation(_) => {
+                WireTerminalFailurePhase::WaylandPreparation
+            }
+            TerminalOpenError::Terminal(_) => WireTerminalFailurePhase::Terminal,
+        };
+        let error = error.into_session_error();
+        Self {
+            phase,
+            message: error.to_string(),
+            hint: error.hint().map(str::to_owned),
+        }
+    }
+}
+
+impl From<WireTerminalStartupError> for TerminalOpenError {
+    fn from(error: WireTerminalStartupError) -> Self {
+        let reason = match error.hint {
+            Some(hint) => SessionError::with_hint(error.message, hint),
+            None => SessionError::new(error.message),
+        };
+        match error.phase {
+            WireTerminalFailurePhase::WaylandPreparation => Self::WaylandPreparation(reason),
+            WireTerminalFailurePhase::Terminal => Self::Terminal(reason),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, TerminalLaunch, TerminalSessionHandle, TerminalSessionRequest,
-    WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
+    SessionPort, ShellTarget, TerminalLaunch, TerminalOpenError, TerminalSessionHandle,
+    TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
     X11ProjectionProbeRequest,
 };
 use crate::domain::session::SessionLifecycle;
@@ -56,7 +56,7 @@ impl SessionPort for DirectSessionAdapter {
     async fn open_terminal(
         &self,
         request: TerminalSessionRequest,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, TerminalOpenError> {
         let TerminalSessionRequest {
             id,
             machine,
@@ -71,8 +71,13 @@ impl SessionPort for DirectSessionAdapter {
             } => {
                 let wayland_display = self
                     .wayland
-                    .guest_display(environment.wayland_context())
-                    .await?;
+                    .prepare_display(
+                        ShellTarget::new(machine.clone(), user.clone()),
+                        environment.wayland_socket().cloned(),
+                        id,
+                    )
+                    .await
+                    .map_err(TerminalOpenError::WaylandPreparation)?;
                 let x11_display = match environment.x11_context() {
                     Some(context) => {
                         crate::adapters::platform::x11::revalidate_for_desktop(
@@ -104,19 +109,20 @@ impl SessionPort for DirectSessionAdapter {
                 self.machine
                     .open_local(super::MachineSessionRequest::shell(request), id, size)
                     .await
+                    .map_err(Into::into)
             }
             // Root may attach by namespace when the guest has no bus. Native
             // login prompts otherwise use the selected D-Bus/systemd tools route.
             TerminalLaunch::LoginPrompt => match self.terminal_policy {
-                DirectTerminalPolicy::LoginOnly => {
-                    self.machine
-                        .open_local(
-                            super::MachineSessionRequest::login_prompt(machine),
-                            id,
-                            size,
-                        )
-                        .await
-                }
+                DirectTerminalPolicy::LoginOnly => self
+                    .machine
+                    .open_local(
+                        super::MachineSessionRequest::login_prompt(machine),
+                        id,
+                        size,
+                    )
+                    .await
+                    .map_err(Into::into),
                 DirectTerminalPolicy::Automatic => {
                     let attachment = crate::adapters::session::terminal_attach::select(&machine)
                         .map_err(|error| {
@@ -131,12 +137,14 @@ impl SessionPort for DirectSessionAdapter {
                                 id,
                                 size,
                             )
-                            .await;
+                            .await
+                            .map_err(Into::into);
                     }
                     let command = attachment.into_pty_command().map_err(|error| {
                         SessionError::new(format!("validate terminal attachment: {error}"))
                     })?;
                     crate::adapters::session::pty::spawn_direct_terminal(command, id, kind, size)
+                        .map_err(Into::into)
                 }
             },
         }
