@@ -37,11 +37,13 @@ pub enum MachineRuntimeAction {
 }
 
 impl MachineRuntimeAction {
+    /// Runtime control acknowledges a request; the observed registration may
+    /// remain present while the guest shuts down or reboots.
     pub fn success_label(self) -> &'static str {
         match self {
-            Self::Terminate => "Terminated",
-            Self::Poweroff => "Powered off",
-            Self::Reboot => "Rebooting",
+            Self::Terminate => "Termination requested for",
+            Self::Poweroff => "Poweroff requested for",
+            Self::Reboot => "Reboot requested for",
             Self::Kill {
                 signal: AllowedSignal::Kill,
             } => "Sent SIGKILL to",
@@ -189,6 +191,7 @@ impl std::fmt::Display for MachineRejection {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum MachineControlOutcome {
+    /// The control call succeeded, not necessarily the machine transition.
     Succeeded,
     NotAttempted {
         reason: String,
@@ -214,6 +217,9 @@ pub struct RoutedMachineControlOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MachineLifecycleResult {
+    /// Launch observed an active unit; runtime control accepted the request;
+    /// unit policy changes were applied. Later observations determine the
+    /// machine's state after shutdown or reboot requests.
     Succeeded,
     NotAttempted(String),
     Rejected {
@@ -413,58 +419,66 @@ impl MachineLifecycleService {
         })
     }
 
-    pub fn project_machines(&self, mut entries: Vec<MachineEntry>) -> Vec<MachineEntry> {
-        let now = Instant::now();
-        let mut transitions = self.transitions.lock();
-        transitions.retain(|name, transition| {
-            let timeout = if matches!(transition.kind, MachineTransitionKind::Starting) {
-                START_TRANSITION_TIMEOUT
-            } else {
-                OTHER_TRANSITION_TIMEOUT
-            };
-            if now.duration_since(transition.started_at) > timeout {
-                return false;
-            }
-            let entry = entries.iter_mut().find(|entry| entry.name == *name);
+    /// Advance pending transitions using a fresh backend observation only.
+    /// Projected UI entries must never be used to confirm a transition.
+    pub fn observe_machines(&self, entries: &[MachineEntry]) {
+        self.transitions.lock().retain(|name, transition| {
+            let entry = entries.iter().find(|entry| entry.name == *name);
             match (&mut transition.kind, entry) {
-                (MachineTransitionKind::Starting, Some(entry))
-                    if entry.state == MachineState::Running =>
-                {
-                    false
-                }
                 (MachineTransitionKind::Starting, Some(entry)) => {
-                    entry.state = MachineState::Starting;
-                    true
+                    entry.state != MachineState::Running
                 }
                 (MachineTransitionKind::Starting, None) => true,
-                (MachineTransitionKind::Stopping, Some(entry)) => {
-                    entry.state = MachineState::Exiting;
-                    true
-                }
+                (MachineTransitionKind::Stopping, Some(_)) => true,
                 (MachineTransitionKind::Stopping, None) => false,
                 (MachineTransitionKind::Rebooting { saw_absent }, None) => {
                     *saw_absent = true;
                     true
                 }
                 (MachineTransitionKind::Rebooting { saw_absent: true }, Some(_)) => false,
-                (MachineTransitionKind::Rebooting { saw_absent: false }, Some(entry)) => {
-                    entry.state = MachineState::Exiting;
-                    true
-                }
+                (MachineTransitionKind::Rebooting { saw_absent: false }, Some(_)) => true,
             }
         });
-        let missing_starts = transitions
-            .iter()
-            .filter(|(_, transition)| matches!(transition.kind, MachineTransitionKind::Starting))
-            .filter(|(name, _)| entries.iter().all(|entry| entry.name != name.as_str()))
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        drop(transitions);
-        entries.extend(
-            missing_starts
-                .into_iter()
-                .map(|name| MachineEntry::optimistic_nspawn(name, MachineState::Starting)),
-        );
+    }
+
+    /// Expire optimistic states independently of backend snapshot publication.
+    /// Return whether the display needs to be rebuilt from the last observation.
+    pub fn expire_transitions(&self) -> bool {
+        let now = Instant::now();
+        let mut transitions = self.transitions.lock();
+        let previous_len = transitions.len();
+        transitions.retain(|_, transition| {
+            let timeout = match transition.kind {
+                MachineTransitionKind::Starting => START_TRANSITION_TIMEOUT,
+                MachineTransitionKind::Stopping | MachineTransitionKind::Rebooting { .. } => {
+                    OTHER_TRANSITION_TIMEOUT
+                }
+            };
+            now.duration_since(transition.started_at) < timeout
+        });
+        previous_len != transitions.len()
+    }
+
+    /// Build a display list from the latest observation without advancing or
+    /// expiring transitions. Repeated projections cannot confirm an operation.
+    pub fn project_machines(&self, observed: &[MachineEntry]) -> Vec<MachineEntry> {
+        let transitions = self.transitions.lock();
+        let mut entries = observed.to_vec();
+        for (name, transition) in transitions.iter() {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.name == *name) {
+                entry.state = match transition.kind {
+                    MachineTransitionKind::Starting => MachineState::Starting,
+                    MachineTransitionKind::Stopping | MachineTransitionKind::Rebooting { .. } => {
+                        MachineState::Exiting
+                    }
+                };
+            } else if matches!(transition.kind, MachineTransitionKind::Starting) {
+                entries.push(MachineEntry::optimistic_nspawn(
+                    name,
+                    MachineState::Starting,
+                ));
+            }
+        }
         entries.sort();
         entries
     }
@@ -613,6 +627,20 @@ impl MachineOperationKind {
 }
 
 impl MachineOperation {
+    pub fn machine(&self) -> &MachineName {
+        &self.machine
+    }
+
+    pub fn action(&self) -> MachineLifecycleAction {
+        self.kind.lifecycle_action()
+    }
+
+    /// Finish before host execution, releasing the reservation and optimistic
+    /// transition through the same ownership path as any unsubmitted operation.
+    pub fn not_attempted(self, reason: String) -> MachineLifecycleOutcome {
+        self.outcome(MachineLifecycleResult::NotAttempted(reason), None, None)
+    }
+
     pub async fn run(mut self) -> MachineLifecycleOutcome {
         if matches!(self.kind, MachineOperationKind::Launch { .. }) {
             if let Err(error) = self.service.preparation.prepare(&self.machine).await {
@@ -703,7 +731,7 @@ impl MachineOperation {
     ) -> MachineLifecycleOutcome {
         MachineLifecycleOutcome {
             machine: self.machine.clone(),
-            action: self.kind.lifecycle_action(),
+            action: self.action(),
             result,
             route,
             fallback,
@@ -816,21 +844,88 @@ mod tests {
     }
 
     #[test]
-    fn transition_projection_synthesizes_start_and_resolves_running_state() {
+    fn only_an_observation_can_confirm_a_pending_start() {
         let control = MockMachineControl::new();
         let observation = MockMachineObservation::new();
         let service = service(control, observation);
         let operation = service.begin_launch(&image("test"), None).unwrap();
 
         assert_eq!(
-            service.project_machines(vec![]),
+            service.project_machines(&[]),
             vec![entry("test", MachineState::Starting)]
         );
+        let running = [entry("test", MachineState::Running)];
+        // Rebuilding the display is not evidence that the start completed.
         assert_eq!(
-            service.project_machines(vec![entry("test", MachineState::Running)]),
-            vec![entry("test", MachineState::Running)]
+            service.project_machines(&running),
+            vec![entry("test", MachineState::Starting)]
         );
+        service.observe_machines(&running);
+        assert_eq!(service.project_machines(&running), running);
         drop(operation);
+    }
+
+    #[test]
+    fn rebuilding_a_display_cannot_mark_a_reboot_as_observed_absent() {
+        let service = service(MockMachineControl::new(), MockMachineObservation::new());
+        let running = [entry("test", MachineState::Running)];
+        let operation = service
+            .begin_runtime(&running[0], MachineRuntimeAction::Reboot)
+            .unwrap();
+
+        assert!(service.project_machines(&[]).is_empty());
+        service.observe_machines(&running);
+        assert_eq!(
+            service.project_machines(&running)[0].state,
+            MachineState::Exiting
+        );
+
+        service.observe_machines(&[]);
+        service.observe_machines(&running);
+        assert_eq!(service.project_machines(&running), running);
+        drop(operation);
+    }
+
+    #[test]
+    fn expired_optimism_returns_to_the_observed_state() {
+        let service = service(MockMachineControl::new(), MockMachineObservation::new());
+        let running = [entry("test", MachineState::Running)];
+        let operation = service
+            .begin_runtime(&running[0], MachineRuntimeAction::Poweroff)
+            .unwrap();
+        service
+            .transitions
+            .lock()
+            .get_mut("test")
+            .unwrap()
+            .started_at = Instant::now() - OTHER_TRANSITION_TIMEOUT - Duration::from_secs(1);
+
+        assert_eq!(
+            service.project_machines(&running)[0].state,
+            MachineState::Exiting
+        );
+        assert!(service.expire_transitions());
+        assert_eq!(service.project_machines(&running), running);
+        assert!(!service.expire_transitions());
+        drop(operation);
+    }
+
+    #[test]
+    fn not_attempted_operation_reports_its_target_and_releases_its_reservation() {
+        let service = service(MockMachineControl::new(), MockMachineObservation::new());
+        let operation = service.begin_launch(&image("test"), None).unwrap();
+
+        let outcome = operation.not_attempted("authentication was cancelled".into());
+
+        assert_eq!(outcome.machine.as_str(), "test");
+        assert_eq!(outcome.action, MachineLifecycleAction::Launch);
+        assert_eq!(
+            outcome.result,
+            MachineLifecycleResult::NotAttempted("authentication was cancelled".into())
+        );
+        assert_eq!(outcome.route, None);
+        assert!(service.project_machines(&[]).is_empty());
+        assert!(service.begin_launch(&image("test"), None).is_ok());
     }
 
     #[test]
@@ -841,7 +936,7 @@ mod tests {
         let operation = service.begin_launch(&image("test"), None).unwrap();
         drop(operation);
 
-        assert!(service.project_machines(vec![]).is_empty());
+        assert!(service.project_machines(&[]).is_empty());
     }
 
     #[tokio::test]
@@ -959,7 +1054,7 @@ mod tests {
             MachineLifecycleResult::OutcomeUnknown(_)
         ));
         assert_eq!(
-            service.project_machines(vec![]),
+            service.project_machines(&[]),
             vec![entry("test", MachineState::Starting)]
         );
     }
@@ -991,7 +1086,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(service.project_machines(vec![]).is_empty());
+        assert!(service.project_machines(&[]).is_empty());
     }
 
     #[tokio::test]
@@ -1069,7 +1164,7 @@ mod tests {
             MachineLifecycleResult::OutcomeUnknown(_)
         ));
         assert_eq!(
-            service.project_machines(vec![]),
+            service.project_machines(&[]),
             vec![entry("test", MachineState::Starting)]
         );
     }
@@ -1103,7 +1198,7 @@ mod tests {
                 ..
             }
         ));
-        assert!(service.project_machines(vec![]).is_empty());
+        assert!(service.project_machines(&[]).is_empty());
     }
 
     #[test]

@@ -607,10 +607,32 @@ impl RuntimeSource for DbusBackend {
             .await;
         let machines = result.map_err(NspawnError::Dbus)?;
         let mut entries = Vec::new();
-        for (name, class, service, _path) in machines {
+        for (name, class, service, path) in machines {
             if name == ".host" {
                 continue;
             }
+            let state_result = self
+                .query_with_deadline(generation, "machine State", async {
+                    let machine = MachineProxy::builder(proxy.inner().connection())
+                        .path(path)?
+                        .cache_properties(zbus::proxy::CacheProperties::No)
+                        .build()
+                        .await?;
+                    machine.state().await
+                })
+                .await;
+            let state = match state_result {
+                Ok(state) => MachineState::from_systemd(state),
+                // A registration can disappear between ListMachines and Get.
+                Err(error) if is_missing_machine(&error) => continue,
+                Err(error) if is_connection_error(&error) => {
+                    return Err(NspawnError::Dbus(error));
+                }
+                Err(error) => {
+                    log::warn!("D-Bus State is unavailable for machine '{name}': {error}");
+                    MachineState::Unknown("unavailable".into())
+                }
+            };
             let class = crate::domain::runtime::MachineClass::from(class);
             let service = crate::domain::runtime::MachineProvider::from(service);
             let addresses = if class.is_container() {
@@ -646,7 +668,7 @@ impl RuntimeSource for DbusBackend {
                 name,
                 class,
                 service,
-                state: MachineState::Running,
+                state,
                 addresses,
             });
         }
@@ -856,6 +878,17 @@ fn is_connection_error(error: &zbus::Error) -> bool {
             zbus::fdo::Error::ZBus(error) => is_connection_error(error),
             _ => false,
         },
+        _ => false,
+    }
+}
+
+fn is_missing_machine(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => matches!(
+            name.as_str(),
+            "org.freedesktop.DBus.Error.UnknownObject" | "org.freedesktop.machine1.NoSuchMachine"
+        ),
+        zbus::Error::FDO(error) => matches!(error.as_ref(), zbus::fdo::Error::UnknownObject(_)),
         _ => false,
     }
 }
@@ -1097,5 +1130,127 @@ mod tests {
             failure,
             MachineAddressObservation::Unavailable("temporary failure".into())
         );
+    }
+
+    mod machine_snapshots {
+        use super::*;
+        use std::sync::Arc;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        struct Registry;
+
+        #[zbus::interface(name = "org.freedesktop.machine1.Manager")]
+        impl Registry {
+            fn list_machines(&self) -> Vec<(String, String, String, OwnedObjectPath)> {
+                ["tracked", "gone", "unreadable"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            name.into(),
+                            "container".into(),
+                            "systemd-nspawn".into(),
+                            OwnedObjectPath::try_from(format!(
+                                "/org/freedesktop/machine1/machine/{name}"
+                            ))
+                            .unwrap(),
+                        )
+                    })
+                    .collect()
+            }
+
+            fn get_machine_addresses(&self, _name: &str) -> Vec<(i32, Vec<u8>)> {
+                Vec::new()
+            }
+        }
+
+        struct Registration {
+            state: Arc<parking_lot::Mutex<String>>,
+            readable: bool,
+        }
+
+        #[zbus::interface(name = "org.freedesktop.machine1.Machine")]
+        impl Registration {
+            #[zbus(property)]
+            fn state(&self) -> zbus::fdo::Result<String> {
+                if self.readable {
+                    Ok(self.state.lock().clone())
+                } else {
+                    Err(zbus::fdo::Error::AccessDenied("test denies State".into()))
+                }
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires dbus-daemon; uses an isolated session bus"]
+        async fn list_reads_live_states_and_handles_disappearing_or_unreadable_registrations() {
+            let mut bus = tokio::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap();
+            let mut address = String::new();
+            tokio::time::timeout(
+                DBUS_CONNECT_TIMEOUT,
+                BufReader::new(bus.stdout.take().unwrap()).read_line(&mut address),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+            let state = Arc::new(parking_lot::Mutex::new("opening".into()));
+            let _server = zbus::connection::Builder::address(address.trim())
+                .unwrap()
+                .name("org.freedesktop.machine1")
+                .unwrap()
+                .serve_at("/org/freedesktop/machine1", Registry)
+                .unwrap()
+                .serve_at(
+                    "/org/freedesktop/machine1/machine/tracked",
+                    Registration {
+                        state: state.clone(),
+                        readable: true,
+                    },
+                )
+                .unwrap()
+                .serve_at(
+                    "/org/freedesktop/machine1/machine/unreadable",
+                    Registration {
+                        state: state.clone(),
+                        readable: false,
+                    },
+                )
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let connection = zbus::connection::Builder::address(address.trim())
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let backend = DbusBackend::new();
+            let _ = backend.conn.lock().await.insert(connection);
+
+            for (reported, expected) in [
+                ("opening", MachineState::Starting),
+                ("running", MachineState::Running),
+                ("closing", MachineState::Exiting),
+                ("future-state", MachineState::Unknown("future-state".into())),
+            ] {
+                *state.lock() = reported.into();
+                let machines = RuntimeSource::list_machines(&backend).await.unwrap();
+                assert_eq!(machines.len(), 2, "a vanished object must leave the list");
+                assert_eq!(machines[0].name, "tracked");
+                assert_eq!(machines[0].state, expected);
+                assert_eq!(machines[1].name, "unreadable");
+                assert_eq!(
+                    machines[1].state,
+                    MachineState::Unknown("unavailable".into())
+                );
+            }
+            bus.kill().await.unwrap();
+            bus.wait().await.unwrap();
+        }
     }
 }

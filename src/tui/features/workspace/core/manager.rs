@@ -204,6 +204,7 @@ impl Workspace {
             .start_refresh(&self.resources.catalog.entries, services, tx)
     }
 
+    /// Commit the visible list and release inspector data for removed rows.
     pub(crate) fn replace_machines(&mut self, entries: Vec<MachineEntry>) {
         if self.resources.catalog.replace_entries(entries) {
             self.inspector.invalidate_overview();
@@ -211,6 +212,16 @@ impl Workspace {
         self.resources.catalog.retain_metrics_for_entries();
         self.inspector
             .retain_machine_logs(&self.resources.catalog.entries);
+    }
+
+    /// Rebuild the display from the retained observation, never from a previous
+    /// projection. This also restores observed states when an operation fails.
+    pub(crate) fn project_machines(
+        &mut self,
+        project: impl FnOnce(&[MachineEntry]) -> Vec<MachineEntry>,
+    ) {
+        let entries = project(self.resources.catalog.observed_machines());
+        self.replace_machines(entries);
     }
 
     pub(crate) fn replace_images(&mut self, images: Vec<ImageEntry>) {
@@ -225,8 +236,12 @@ impl Workspace {
         &mut self,
         snapshot: RuntimeSnapshot,
         terminal_machine: Option<&str>,
+        project: impl FnOnce(&[MachineEntry]) -> Vec<MachineEntry>,
     ) {
-        self.replace_machines(snapshot.machines);
+        self.resources
+            .catalog
+            .replace_observed_machines(snapshot.machines);
+        self.project_machines(project);
         self.replace_images(snapshot.images);
         self.request_inspection(terminal_machine);
     }

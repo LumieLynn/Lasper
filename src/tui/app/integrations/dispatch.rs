@@ -37,7 +37,9 @@ impl App {
             AppEvent::ImageRemovalFinished(completion) => {
                 self.handle_image_removal_completion(completion)
             }
-            AppEvent::MachineLifecycleFinished(outcome) => self.handle_machine_completion(outcome),
+            AppEvent::MachineOperationFinished(outcome) => {
+                self.handle_machine_operation_result(outcome)
+            }
             AppEvent::MetricsUpdate(name, time_x, cpu, ram) => self
                 .workspace
                 .resources

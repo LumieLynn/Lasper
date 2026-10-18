@@ -1,5 +1,6 @@
 //! Resource action integration: resolve UI targets, then submit narrow workflows.
-use crate::application::{MachineLifecycleAction, MachineRuntimeAction, NspawnUnitAction};
+use crate::application::machine_lifecycle::MachineOperation;
+use crate::application::{MachineRuntimeAction, NspawnUnitAction};
 use crate::domain::machine::AllowedSignal;
 use crate::tui::app::App;
 use crate::tui::features::workspace::resources::actions::{
@@ -9,11 +10,14 @@ use crate::tui::foundation::status::StatusLevel;
 
 impl App {
     pub(in crate::tui::app) fn apply_machine_projection(&mut self) {
+        let lifecycle = &self.services.machine_lifecycle;
         self.workspace
-            .resources
-            .catalog
-            .project_entries(|entries| self.services.machine_lifecycle.project_machines(entries));
-        self.workspace.inspector.invalidate_overview();
+            .project_machines(|observed| lifecycle.project_machines(observed));
+        let machine = self
+            .terminal
+            .active_session()
+            .map(|session| session.machine_name.as_str());
+        self.workspace.request_inspection(machine);
     }
 
     pub fn action_start(&mut self) {
@@ -59,11 +63,7 @@ impl App {
             .begin_runtime(&entry, action)
         {
             Ok(operation) => {
-                self.submit_machine_operation(
-                    name,
-                    MachineLifecycleAction::Runtime(action),
-                    operation,
-                );
+                self.submit_machine_operation(operation);
             }
             Err(rejection) => self.set_status(
                 format!("{}: {}", name, rejection),
@@ -129,9 +129,7 @@ impl App {
                 return;
             }
         };
-        if self.submit_machine_operation(name.clone(), MachineLifecycleAction::Launch, operation)
-            && is_mstack
-        {
+        if self.submit_machine_operation(operation) && is_mstack {
             self.set_status(
                 format!(
                     "{} is an OCI application and may not be bootable; systemd will still try to start it.",
@@ -159,11 +157,7 @@ impl App {
         let name = image.name.clone();
         match self.services.machine_lifecycle.begin_unit(&image, action) {
             Ok(operation) => {
-                self.submit_machine_operation(
-                    name,
-                    MachineLifecycleAction::Unit(action),
-                    operation,
-                );
+                self.submit_machine_operation(operation);
             }
             Err(rejection) => self.set_status(
                 format!("{}: {}", name, rejection),
@@ -238,30 +232,23 @@ impl App {
 
     pub(in crate::tui::app) fn submit_machine_operation(
         &mut self,
-        name: String,
-        action: crate::application::MachineLifecycleAction,
-        operation: crate::application::machine_lifecycle::MachineOperation,
+        operation: MachineOperation,
     ) -> bool {
         let Some(tx) = self.ui.app_tx.clone() else {
             return false;
         };
         self.apply_machine_projection();
-        machine::submit(
-            name,
-            action,
-            operation,
-            &self.resource_action_services(),
-            tx,
-        );
+        machine::submit(operation, &self.resource_action_services(), tx);
         true
     }
 
-    pub(in crate::tui::app) fn handle_machine_completion(
+    pub(in crate::tui::app) fn handle_machine_operation_result(
         &mut self,
         outcome: crate::application::MachineLifecycleOutcome,
     ) {
         machine::reconcile_x11(outcome.action, self.services.x11_access.clone());
         let (message, level) = machine_outcome_status(outcome);
+        self.apply_machine_projection();
         self.refresh();
         self.set_status(message, level);
     }

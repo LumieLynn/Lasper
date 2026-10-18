@@ -46,21 +46,16 @@ impl App {
 
     /// Apply the independent machine/image snapshot returned by the backend.
     pub(in crate::tui::app) fn sync_snapshot(&mut self, snapshot: RuntimeSnapshot) {
-        let machines = self
-            .services
-            .machine_lifecycle
-            .project_machines(snapshot.machines);
+        let lifecycle = &self.services.machine_lifecycle;
+        lifecycle.observe_machines(&snapshot.machines);
         let machine = self
             .terminal
             .active_session()
             .map(|session| session.machine_name.as_str());
-        self.workspace.replace_snapshot(
-            RuntimeSnapshot {
-                machines,
-                images: snapshot.images,
-            },
-            machine,
-        );
+        self.workspace
+            .replace_snapshot(snapshot, machine, |observed| {
+                lifecycle.project_machines(observed)
+            });
         if let Some(wizard) = &mut self.ui.overlays.wizard {
             wizard.draft.entries = self.workspace.resources.catalog.entries.clone();
             wizard.draft.images = self.workspace.resources.catalog.images.clone();
@@ -87,6 +82,9 @@ impl App {
         &mut self,
         detail_tx: &tokio::sync::mpsc::Sender<DetailRefreshCompletion>,
     ) {
+        if self.services.machine_lifecycle.expire_transitions() {
+            self.apply_machine_projection();
+        }
         self.terminal.reclaim_exited_scrollback();
         self.start_detail_refresh(detail_tx);
     }

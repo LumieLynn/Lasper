@@ -1,52 +1,31 @@
 //! Dispatch and presentation of machine lifecycle operations.
 use crate::application::machine_lifecycle::MachineOperation;
 use crate::application::MachineLifecycleAction;
-use crate::domain::machine::MachineName;
 use crate::tui::features::workspace::resources::actions::ResourceActionServices;
 use crate::tui::protocol::events::AppEvent;
 use tokio::sync::mpsc::Sender;
 
 pub(crate) fn submit(
-    name: String,
-    action: MachineLifecycleAction,
     operation: MachineOperation,
     services: &ResourceActionServices,
     tx: Sender<AppEvent>,
 ) {
-    let pm = services.permissions.clone();
+    let permissions = services.permissions.clone();
     let host_operation = services.host_operations.begin();
     tokio::spawn(async move {
         let _host_operation = host_operation;
-        let audit = match pm
-            .request_elevation(format!("{} {}", action.audit_label(), name))
+        let outcome = match permissions
+            .request_elevation(format!(
+                "{} {}",
+                operation.action().audit_label(),
+                operation.machine()
+            ))
             .await
         {
-            Ok(audit) => audit,
-            Err(error) => {
-                drop(operation);
-                let _ = tx
-                    .send(
-                        crate::tui::protocol::events::AppEvent::MachineLifecycleFinished(
-                            crate::application::MachineLifecycleOutcome {
-                                machine: MachineName::new(name)
-                                    .expect("lifecycle operation already validated the name"),
-                                action,
-                                result: crate::application::MachineLifecycleResult::NotAttempted(
-                                    error.to_string(),
-                                ),
-                                route: None,
-                                fallback: None,
-                            },
-                        ),
-                    )
-                    .await;
-                return;
-            }
+            Ok(audit) => audit.run(operation.run()).await,
+            Err(error) => operation.not_attempted(error.to_string()),
         };
-        let outcome = audit.run(async move { operation.run().await }).await;
-        let _ = tx
-            .send(crate::tui::protocol::events::AppEvent::MachineLifecycleFinished(outcome))
-            .await;
+        let _ = tx.send(AppEvent::MachineOperationFinished(outcome)).await;
     });
 }
 

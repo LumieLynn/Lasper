@@ -12,7 +12,9 @@ pub(crate) enum ResourceListKind {
 }
 
 pub(crate) struct ResourceCatalog {
-    /// Running systemd-machined instances plus optimistic `Starting` rows.
+    /// The latest backend observation, before any optimistic display changes.
+    observed_entries: Vec<MachineEntry>,
+    /// Visible machines, including optimistic state changes and `Starting` rows.
     pub(crate) entries: Vec<MachineEntry>,
     /// Normally visible images. Hidden dot-prefixed images are kept separate.
     pub(crate) images: Vec<ImageEntry>,
@@ -29,6 +31,7 @@ pub(crate) struct ResourceCatalog {
 impl ResourceCatalog {
     pub(crate) fn new(systemd_tools: bool) -> Self {
         Self {
+            observed_entries: Vec::new(),
             entries: Vec::new(),
             images: Vec::new(),
             internal_images: Vec::new(),
@@ -44,7 +47,15 @@ impl ResourceCatalog {
         }
     }
 
-    /// Apply an observed machine list while keeping the selection on its name.
+    pub(crate) fn observed_machines(&self) -> &[MachineEntry] {
+        &self.observed_entries
+    }
+
+    pub(crate) fn replace_observed_machines(&mut self, entries: Vec<MachineEntry>) {
+        self.observed_entries = entries;
+    }
+
+    /// Apply a display list while keeping the selection on its name.
     /// Return whether the visible entries changed.
     pub(crate) fn replace_entries(&mut self, entries: Vec<MachineEntry>) -> bool {
         let selected_name = self
@@ -58,22 +69,6 @@ impl ResourceCatalog {
         self.entries = entries;
         self.selected = selected;
         changed
-    }
-
-    /// Let the application project lifecycle transitions onto the existing
-    /// list without cloning it or losing the selected name during the move.
-    pub(crate) fn project_entries(
-        &mut self,
-        project: impl FnOnce(Vec<MachineEntry>) -> Vec<MachineEntry>,
-    ) {
-        let selected_name = self
-            .entries
-            .get(self.selected)
-            .map(|entry| entry.name.clone());
-        self.entries = project(std::mem::take(&mut self.entries));
-        self.selected = selected_name
-            .and_then(|name| self.entries.iter().position(|entry| entry.name == name))
-            .unwrap_or(0);
     }
 
     /// Split and sort the image catalog without coupling either selection to
@@ -187,25 +182,22 @@ mod tests {
     }
 
     #[test]
-    fn projection_keeps_the_selected_machine_across_reordering_and_removal() {
+    fn replacement_keeps_the_selected_machine_across_reordering_and_removal() {
         let mut runtime = ResourceCatalog::new(false);
         runtime.replace_entries(vec![machine("first"), machine("selected")]);
         runtime.selected = 1;
 
-        runtime.project_entries(|mut entries| {
-            entries.reverse();
-            entries.push(machine("starting"));
-            entries
-        });
+        runtime.replace_entries(vec![
+            machine("selected"),
+            machine("first"),
+            machine("starting"),
+        ]);
         assert_eq!(runtime.entries[runtime.selected].name, "selected");
 
-        runtime.project_entries(|mut entries| {
-            entries.retain(|entry| entry.name != "selected");
-            entries
-        });
+        runtime.replace_entries(vec![machine("first"), machine("starting")]);
         assert_eq!(runtime.entries[runtime.selected].name, "first");
 
-        runtime.project_entries(|_| Vec::new());
+        runtime.replace_entries(Vec::new());
         assert_eq!(runtime.selected, 0);
     }
 

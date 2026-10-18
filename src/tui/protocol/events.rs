@@ -40,8 +40,8 @@ pub enum AppEvent {
     ImageRemovalFinished(
         crate::tui::features::workspace::resources::actions::ImageRemovalCompletion,
     ),
-    /// A machine lifecycle workflow reached a semantic outcome.
-    MachineLifecycleFinished(crate::application::MachineLifecycleOutcome),
+    /// Operation execution returned; machine state is delivered by runtime snapshots.
+    MachineOperationFinished(crate::application::MachineLifecycleOutcome),
     /// Real-time metrics: (machine name, timestamp, CPU percent, RAM MiB)
     MetricsUpdate(String, f64, f64, f64),
     /// Request a UI redraw for the terminal.
@@ -61,7 +61,7 @@ impl AppEvent {
             Self::ConfigurationPage(event) => event.label(),
             Self::Wizard(event) => event.label(),
             Self::ImageRemovalFinished(_) => "image-removal-finished",
-            Self::MachineLifecycleFinished(_) => "machine-lifecycle-finished",
+            Self::MachineOperationFinished(_) => "machine-operation-finished",
             Self::MetricsUpdate(_, _, _, _) => "metrics-update",
             Self::TerminalRedraw => "terminal-redraw",
         }

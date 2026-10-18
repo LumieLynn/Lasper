@@ -337,15 +337,18 @@ mod image_start_transitions {
         assert_eq!(app.services.host_operations.active_count(), 0);
         assert!(matches!(
             event,
-            AppEvent::MachineLifecycleFinished(outcome)
+            AppEvent::MachineOperationFinished(outcome)
                 if outcome.result == MachineLifecycleResult::Succeeded
         ));
 
-        let resolved = app
-            .services
-            .machine_lifecycle
-            .project_machines(vec![make_entry("test", MachineState::Running)]);
-        assert_eq!(resolved, vec![make_entry("test", MachineState::Running)]);
+        app.sync_snapshot(RuntimeSnapshot::new(
+            vec![make_entry("test", MachineState::Running)],
+            vec![make_image("test")],
+        ));
+        assert_eq!(
+            app.workspace.resources.catalog.entries,
+            vec![make_entry("test", MachineState::Running)]
+        );
     }
 
     #[tokio::test]
@@ -360,18 +363,15 @@ mod image_start_transitions {
             .await
             .expect("start task should finish")
             .expect("start task should report a result");
-        let AppEvent::MachineLifecycleFinished(outcome) = event else {
+        let AppEvent::MachineOperationFinished(outcome) = event else {
             panic!("start failure should report a semantic outcome");
         };
         assert_eq!(
             outcome.result,
             MachineLifecycleResult::Failed("start rejected".into())
         );
-        assert!(app
-            .services
-            .machine_lifecycle
-            .project_machines(vec![])
-            .is_empty());
+        app.handle_machine_operation_result(outcome);
+        assert!(app.workspace.resources.catalog.entries.is_empty());
     }
 
     #[tokio::test]
@@ -385,7 +385,7 @@ mod image_start_transitions {
             .await
             .expect("first start task should finish")
             .expect("first start task should report a result");
-        assert!(matches!(event, AppEvent::MachineLifecycleFinished(..)));
+        assert!(matches!(event, AppEvent::MachineOperationFinished(..)));
         assert_eq!(
             app.ui
                 .status_message
@@ -427,7 +427,7 @@ mod image_start_transitions {
             .await
             .expect("start task should finish")
             .expect("start task should report a result");
-        let AppEvent::MachineLifecycleFinished(outcome) = event else {
+        let AppEvent::MachineOperationFinished(outcome) = event else {
             panic!("start should report a machine lifecycle outcome");
         };
         assert_eq!(outcome.machine.as_str(), "test");
@@ -458,7 +458,7 @@ mod image_start_transitions {
                 .await
                 .expect("mstack start should finish")
                 .expect("mstack start should report a result"),
-            AppEvent::MachineLifecycleFinished(..)
+            AppEvent::MachineOperationFinished(..)
         ));
     }
 }
@@ -1852,22 +1852,28 @@ mod machine_actions {
     use crate::application::operations::route::ExecutionRoute;
     use crate::application::OperationRegistry;
 
-    fn prepare_poweroff_app() -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
+    fn prepare_poweroff_app(
+        control_outcome: MachineControlOutcome,
+        requests: usize,
+    ) -> (App, tokio::sync::mpsc::Receiver<AppEvent>) {
         let mut control = MockMachineControl::new();
         control
             .expect_execute_runtime()
-            .times(2)
-            .returning(|_, action| {
+            .times(requests)
+            .returning(move |_, action| {
                 assert_eq!(action, crate::application::MachineRuntimeAction::Poweroff);
                 RoutedMachineControlOutcome {
-                    outcome: MachineControlOutcome::Succeeded,
+                    outcome: control_outcome.clone(),
                     route: ExecutionRoute::DirectDbus,
                     fallback: None,
                 }
             });
         let preparation = MockMachineStartPreparation::new();
         let mut observation = MockMachineObservation::new();
-        observation.expect_invalidate().times(2).return_const(());
+        observation
+            .expect_invalidate()
+            .times(requests)
+            .return_const(());
         let diagnostics = MockMachineStartDiagnostics::new();
         let lifecycle = std::sync::Arc::new(MachineLifecycleService::new(
             std::sync::Arc::new(control),
@@ -1878,10 +1884,13 @@ mod machine_actions {
         ));
         let mut app = make_app();
         app.services.machine_lifecycle = lifecycle;
-        app.workspace.resources.catalog.entries = vec![
-            make_entry("first", MachineState::Running),
-            make_entry("second", MachineState::Running),
-        ];
+        app.sync_snapshot(RuntimeSnapshot::new(
+            vec![
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
+            ],
+            vec![],
+        ));
         let (tx, rx) = tokio::sync::mpsc::channel(2);
         app.ui.app_tx = Some(tx);
         (app, rx)
@@ -1889,12 +1898,20 @@ mod machine_actions {
 
     #[tokio::test]
     async fn different_machines_accept_back_to_back_poweroff_actions() {
-        let (mut app, mut rx) = prepare_poweroff_app();
+        let (mut app, mut rx) = prepare_poweroff_app(MachineControlOutcome::Succeeded, 2);
 
         app.workspace.resources.catalog.selected = 0;
         app.action_poweroff();
         app.workspace.resources.catalog.selected = 1;
         app.action_poweroff();
+
+        assert!(app
+            .workspace
+            .resources
+            .catalog
+            .entries
+            .iter()
+            .all(|entry| entry.state == MachineState::Exiting));
 
         let mut completed = Vec::new();
         for _ in 0..2 {
@@ -1902,14 +1919,60 @@ mod machine_actions {
                 .await
                 .expect("both poweroff actions should finish")
                 .expect("both poweroff actions should report a result");
-            let AppEvent::MachineLifecycleFinished(outcome) = event else {
+            let AppEvent::MachineOperationFinished(outcome) = event else {
                 panic!("poweroff should report a machine lifecycle outcome");
             };
-            completed.push(outcome.machine.as_str().to_string());
+            let name = outcome.machine.as_str().to_string();
+            let (message, level) =
+                crate::tui::features::workspace::resources::actions::machine_outcome_status(
+                    outcome,
+                );
+            assert_eq!(message, format!("Poweroff requested for {name}"));
+            assert_eq!(level, crate::tui::foundation::status::StatusLevel::Success);
+            completed.push(name);
         }
         completed.sort();
 
         assert_eq!(completed, ["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn failed_poweroff_restores_the_observed_state_without_another_query() {
+        let (mut app, mut rx) = prepare_poweroff_app(
+            MachineControlOutcome::Failed {
+                reason: "poweroff rejected".into(),
+            },
+            1,
+        );
+        app.action_poweroff();
+        assert_eq!(
+            app.workspace.resources.machine("first").unwrap().state,
+            MachineState::Exiting
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("poweroff task should finish")
+            .expect("poweroff task should report a result");
+        let AppEvent::MachineOperationFinished(outcome) = event else {
+            panic!("poweroff should report a machine operation outcome");
+        };
+        app.handle_machine_operation_result(outcome);
+
+        assert_eq!(
+            app.workspace.resources.catalog.entries,
+            vec![
+                make_entry("first", MachineState::Running),
+                make_entry("second", MachineState::Running),
+            ]
+        );
+        assert!(app
+            .ui
+            .status_message
+            .as_ref()
+            .unwrap()
+            .0
+            .contains("poweroff rejected"));
     }
 }
 
