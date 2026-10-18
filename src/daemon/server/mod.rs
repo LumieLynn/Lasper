@@ -6,7 +6,6 @@ mod shutdown;
 mod state;
 
 use self::logging::{initialize_daemon_logging, AuthLogLimiter};
-use crate::adapters::runtime::source::RuntimeSource;
 use crate::daemon::dispatch::{run_rpc_request_pump, Dispatcher};
 use crate::domain::secret::zeroize_string;
 use crate::ipc::protocol::*;
@@ -271,8 +270,7 @@ pub async fn daemon_main(
         let out_tx_bg = out_tx.clone();
         let dbus_bg = dbus.clone();
         tokio::spawn(async move {
-            let (ev_tx, mut ev_rx) =
-                tokio::sync::mpsc::channel::<crate::domain::runtime::StatusUpdate>(16);
+            let (ev_tx, mut ev_rx) = tokio::sync::watch::channel(());
             let watcher = tokio::spawn(async move {
                 let mut retry_delay = std::time::Duration::from_secs(1);
                 loop {
@@ -289,7 +287,7 @@ pub async fn daemon_main(
                     retry_delay = (retry_delay * 2).min(std::time::Duration::from_secs(30));
                 }
             });
-            while ev_rx.recv().await.is_some() {
+            while ev_rx.changed().await.is_ok() {
                 let notif = serde_json::json!({"jsonrpc":"2.0","method":"dbus_event","params":{}});
                 let line = serde_json::to_string(&notif).unwrap();
                 if out_tx_bg.send(line).await.is_err() {

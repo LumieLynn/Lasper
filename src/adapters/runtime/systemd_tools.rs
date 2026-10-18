@@ -7,12 +7,11 @@ use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::application::operations::ExecutionRoute;
 use crate::domain::inspection::{InspectionCompleteness, InspectionSource, MachineProperties};
 use crate::domain::machine::MachineName;
-use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
+use crate::domain::runtime::{ImageEntry, MachineEntry};
 use serde::Deserialize;
 use std::io;
 use std::time::Duration;
 
-const WATCH_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const HOST_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,39 +49,11 @@ fn parse_list_images_json(output: &[u8]) -> Result<Vec<ImageEntry>> {
     Ok(images)
 }
 
-fn snapshot_update(
-    previous: &mut Option<RuntimeSnapshot>,
-    consecutive_failures: &mut u32,
-    result: Result<RuntimeSnapshot>,
-) -> Option<StatusUpdate> {
-    match result {
-        Ok(snapshot) => {
-            let recovered = *consecutive_failures > 0;
-            *consecutive_failures = 0;
-            let changed = previous.as_ref() != Some(&snapshot);
-            if changed || recovered {
-                *previous = Some(snapshot.clone());
-                Some(StatusUpdate::Snapshot(snapshot))
-            } else {
-                None
-            }
-        }
-        Err(error) => {
-            *consecutive_failures = consecutive_failures.saturating_add(1);
-            Some(StatusUpdate::BackendFailure {
-                message: error.to_string(),
-                consecutive_failures: *consecutive_failures,
-            })
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct SystemdToolsBackend {
     cmd_runner: std::sync::Arc<dyn CommandRunner>,
     property_query_route: SystemdToolsPropertyQueryRoute,
     runtime_machines_dir: std::path::PathBuf,
-    nudge_rx: std::sync::Arc<parking_lot::Mutex<Option<tokio::sync::watch::Receiver<()>>>>,
 }
 
 #[derive(Clone)]
@@ -106,7 +77,6 @@ impl SystemdToolsBackend {
             cmd_runner: std::sync::Arc::clone(&runner),
             property_query_route: SystemdToolsPropertyQueryRoute::Local(runner),
             runtime_machines_dir: crate::paths::runtime_machines_dir(),
-            nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
@@ -118,16 +88,11 @@ impl SystemdToolsBackend {
             cmd_runner: runner,
             property_query_route: SystemdToolsPropertyQueryRoute::Elevated(daemon),
             runtime_machines_dir: crate::paths::runtime_machines_dir(),
-            nudge_rx: std::sync::Arc::new(parking_lot::Mutex::new(None)),
         }
     }
 
     pub(crate) fn property_query_route(&self) -> ExecutionRoute {
         self.property_query_route.route()
-    }
-
-    pub fn set_nudge(&self, rx: tokio::sync::watch::Receiver<()>) {
-        *self.nudge_rx.lock() = Some(rx);
     }
 
     #[cfg(test)]
@@ -289,51 +254,6 @@ impl RuntimeSource for SystemdToolsBackend {
                     )
                 }),
         }
-    }
-
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
-        let mut nudge_rx = self.nudge_rx.lock().take().ok_or_else(|| {
-            NspawnError::Dbus(zbus::Error::Failure(
-                "watch_events: no nudge channel set on SystemdToolsBackend".into(),
-            ))
-        })?;
-
-        let mut previous = None;
-        let mut consecutive_failures = 0;
-        let mut nudge_open = true;
-        let mut interval = tokio::time::interval(WATCH_POLL_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            if nudge_open {
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    changed = nudge_rx.changed() => {
-                        if changed.is_err() {
-                            nudge_open = false;
-                        }
-                    }
-                }
-            } else {
-                interval.tick().await;
-            }
-            if nudge_open {
-                // Coalesce a nudge that arrived with the interval tick. A
-                // nudge arriving during the snapshot remains pending and
-                // triggers the next pass.
-                let _ = nudge_rx.borrow_and_update();
-            }
-
-            if let Some(update) = snapshot_update(
-                &mut previous,
-                &mut consecutive_failures,
-                RuntimeSource::snapshot(self).await,
-            ) {
-                if tx.send(update).await.is_err() {
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -567,25 +487,6 @@ mod tests {
         }
     }
 
-    fn observer_snapshot() -> RuntimeSnapshot {
-        RuntimeSnapshot::new(
-            vec![MachineEntry {
-                name: "active".into(),
-                class: MachineEntry::NSPAWN_CLASS.into(),
-                service: MachineEntry::NSPAWN_SERVICE.into(),
-                state: MachineState::Running,
-                addresses: Default::default(),
-            }],
-            vec![ImageEntry {
-                name: "active".into(),
-                image_type: "directory".into(),
-                readonly: false,
-                usage: None,
-                dbus_object_path: None,
-            }],
-        )
-    }
-
     #[test]
     fn selected_user_shell_is_a_fixed_machinectl_argv() {
         let name = MachineName::new("test-machine").unwrap();
@@ -770,38 +671,6 @@ mod tests {
         );
         let command = command.into_pty_command().unwrap();
         assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
-    }
-
-    #[test]
-    fn snapshot_observer_publishes_changes_failures_and_recovery() {
-        let snapshot = observer_snapshot();
-        let mut previous = None;
-        let mut failures = 0;
-
-        assert!(matches!(
-            snapshot_update(&mut previous, &mut failures, Ok(snapshot.clone())),
-            Some(StatusUpdate::Snapshot(_))
-        ));
-        assert!(snapshot_update(&mut previous, &mut failures, Ok(snapshot.clone())).is_none());
-
-        let failure = snapshot_update(
-            &mut previous,
-            &mut failures,
-            Err(NspawnError::Runtime("temporary failure".into())),
-        );
-        assert!(matches!(
-            failure,
-            Some(StatusUpdate::BackendFailure {
-                consecutive_failures: 1,
-                ..
-            })
-        ));
-
-        assert!(matches!(
-            snapshot_update(&mut previous, &mut failures, Ok(snapshot)),
-            Some(StatusUpdate::Snapshot(_))
-        ));
-        assert_eq!(failures, 0);
     }
 
     #[tokio::test]

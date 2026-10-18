@@ -110,8 +110,7 @@ mod tests {
         Arc::new(RuntimeCatalog::new(
             None,
             Arc::new(crate::application::runtime::MockRuntimePort::new()),
-            vec![],
-            None,
+            Default::default(),
         ))
     }
 

@@ -2,17 +2,19 @@
 
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::lifecycle::error::map_image_control_error;
+use crate::adapters::runtime::map_runtime_error;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::runtime::systemd_properties::{self, format_ip_address, PropertyScope};
 use crate::adapters::session::{MachineSessionRequest, MachineShellRequest};
 use crate::application::image_lifecycle::ImageControlOutcome;
+use crate::application::runtime::{RuntimeChangePort, RuntimeResult};
 use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::inspection::{
     InspectionCompleteness, InspectionSource, MachineProperties, GROUP_SYSTEMD_UNIT,
 };
 use crate::domain::machine::{AllowedSignal, MachineName};
 use crate::domain::runtime::{
-    ImageEntry, ImageName, MachineAddressObservation, MachineEntry, MachineState, StatusUpdate,
+    ImageEntry, ImageName, MachineAddressObservation, MachineEntry, MachineState,
 };
 use std::collections::HashMap;
 use std::future::Future;
@@ -760,8 +762,17 @@ impl RuntimeSource for DbusBackend {
         }
         Ok(properties)
     }
+}
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
+#[async_trait::async_trait]
+impl RuntimeChangePort for DbusBackend {
+    async fn watch_changes(&self, changed: tokio::sync::watch::Sender<()>) -> RuntimeResult<()> {
+        self.watch_events(changed).await.map_err(map_runtime_error)
+    }
+}
+
+impl DbusBackend {
+    pub(crate) async fn watch_events(&self, changed: tokio::sync::watch::Sender<()>) -> Result<()> {
         use futures_util::StreamExt;
         let (generation, proxy) = self
             .manager_proxy()
@@ -794,7 +805,7 @@ impl RuntimeSource for DbusBackend {
                             "machine-new signal stream closed".into(),
                         )));
                     }
-                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                    if changed.send(()).is_err() {
                         return Ok(());
                     }
                 }
@@ -805,7 +816,7 @@ impl RuntimeSource for DbusBackend {
                             "machine-removed signal stream closed".into(),
                         )));
                     }
-                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                    if changed.send(()).is_err() {
                         return Ok(());
                     }
                 }

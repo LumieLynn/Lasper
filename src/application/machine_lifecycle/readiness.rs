@@ -164,7 +164,7 @@ mod tests {
     }
 
     fn runtime(port: MockRuntimePort) -> RuntimeCatalog {
-        RuntimeCatalog::new(None, Arc::new(port), vec![], None)
+        RuntimeCatalog::new(None, Arc::new(port), Default::default())
     }
 
     fn lifecycle(

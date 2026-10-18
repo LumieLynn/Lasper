@@ -2,6 +2,7 @@
 
 pub(crate) mod dbus;
 pub(crate) mod elevated;
+mod filesystem;
 pub(crate) mod source;
 pub(crate) mod state;
 pub(crate) mod systemd_properties;
@@ -13,18 +14,18 @@ use crate::adapters::runtime::elevated::DaemonBackend;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::runtime::systemd_tools::SystemdToolsBackend;
 use crate::application::operations::ExecutionRoute;
-use crate::application::runtime::{RuntimeCatalog, RuntimeError, RuntimePort, RuntimeResult};
+use crate::application::runtime::{
+    RuntimeCatalog, RuntimeChangePort, RuntimeError, RuntimeObservers, RuntimePort, RuntimeResult,
+};
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
-use crate::domain::runtime::{MachineEntry, RuntimeSnapshot, StatusUpdate};
+use crate::domain::runtime::{MachineEntry, RuntimeSnapshot};
 use std::sync::Arc;
 
 pub(crate) fn compose_runtime_catalog(
     systemd_tools: SystemdToolsBackend,
     primary_route: PrimaryRuntimeRoute,
 ) -> Arc<RuntimeCatalog> {
-    let (nudge_tx, nudge_rx) = tokio::sync::watch::channel(());
-    systemd_tools.set_nudge(nudge_rx);
     let property_query_route = systemd_tools.property_query_route();
     let fallback_source: Arc<dyn RuntimeSource> = Arc::new(systemd_tools);
     let fallback: Arc<dyn RuntimePort> = Arc::new(SourceRuntimePort {
@@ -33,18 +34,30 @@ pub(crate) fn compose_runtime_catalog(
         snapshot_route: ExecutionRoute::LocalSystemdTools,
     });
 
-    let primary = match primary_route {
-        PrimaryRuntimeRoute::Disabled => None,
-        PrimaryRuntimeRoute::DirectDbus(dbus) => Some((
-            Arc::new(dbus) as Arc<dyn RuntimeSource>,
-            ExecutionRoute::DirectDbus,
-        )),
-        PrimaryRuntimeRoute::ElevatedDbus(daemon) => Some((
-            Arc::new(DaemonBackend::new(daemon)) as Arc<dyn RuntimeSource>,
-            ExecutionRoute::ElevatedDbus,
-        )),
-    }
-    .map(|(source, route)| {
+    let (primary, backend): (_, Option<Arc<dyn RuntimeChangePort>>) = match primary_route {
+        PrimaryRuntimeRoute::Disabled => (None, None),
+        PrimaryRuntimeRoute::DirectDbus(dbus) => {
+            let dbus = Arc::new(dbus);
+            (
+                Some((
+                    Arc::clone(&dbus) as Arc<dyn RuntimeSource>,
+                    ExecutionRoute::DirectDbus,
+                )),
+                Some(dbus),
+            )
+        }
+        PrimaryRuntimeRoute::ElevatedDbus(daemon) => {
+            let daemon = Arc::new(DaemonBackend::new(daemon));
+            (
+                Some((
+                    Arc::clone(&daemon) as Arc<dyn RuntimeSource>,
+                    ExecutionRoute::ElevatedDbus,
+                )),
+                Some(daemon),
+            )
+        }
+    };
+    let primary = primary.map(|(source, route)| {
         Arc::new(SourceRuntimePort {
             source,
             snapshot_route: route,
@@ -55,11 +68,13 @@ pub(crate) fn compose_runtime_catalog(
     Arc::new(RuntimeCatalog::new(
         primary,
         fallback,
-        vec![
-            crate::paths::machines_dir(),
-            crate::paths::runtime_machines_dir(),
-        ],
-        Some(nudge_tx),
+        RuntimeObservers {
+            backend,
+            filesystem: Some(Arc::new(filesystem::FilesystemChanges::new(vec![
+                crate::paths::machines_dir(),
+                crate::paths::runtime_machines_dir(),
+            ]))),
+        },
     ))
 }
 
@@ -111,13 +126,6 @@ impl RuntimePort for SourceRuntimePort {
     async fn inspect_unit(&self, machine: &MachineName) -> RuntimeResult<MachineProperties> {
         self.source
             .get_unit_properties(machine)
-            .await
-            .map_err(map_runtime_error)
-    }
-
-    async fn watch(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> RuntimeResult<()> {
-        self.source
-            .watch_events(tx)
             .await
             .map_err(map_runtime_error)
     }

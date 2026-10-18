@@ -508,17 +508,6 @@ impl RuntimeSnapshot {
     }
 }
 
-/// Notification emitted by a status observer.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatusUpdate {
-    Snapshot(RuntimeSnapshot),
-    Dirty,
-    BackendFailure {
-        message: String,
-        consecutive_failures: u32,
-    },
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageVisibility {
     Regular,

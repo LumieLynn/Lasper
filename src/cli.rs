@@ -1244,7 +1244,7 @@ mod tests {
             .returning(move || Ok(vec![MachineEntry::optimistic_nspawn("demo", state.clone())]));
         port.expect_snapshot_route()
             .return_const(ExecutionRoute::LocalSystemdTools);
-        let runtime = RuntimeCatalog::new(None, Arc::new(port), vec![], None);
+        let runtime = RuntimeCatalog::new(None, Arc::new(port), Default::default());
         let lifecycle = Arc::new(MachineLifecycleService::new(
             Arc::new(MockMachineControl::new()),
             Arc::new(MockMachineStartPreparation::new()),

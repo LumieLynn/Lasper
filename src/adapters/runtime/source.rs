@@ -1,11 +1,9 @@
 use crate::adapters::error::Result;
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
-use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot, StatusUpdate};
+use crate::domain::runtime::{ImageEntry, MachineEntry, RuntimeSnapshot};
 
-/// Read-only runtime discovery, inspection, and observation.
-///
-/// Application services depend on this port without gaining mutation methods.
+/// Host-side runtime reads shared by catalog adapters and daemon dispatch.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub trait RuntimeSource: Send + Sync + 'static {
@@ -21,6 +19,5 @@ pub trait RuntimeSource: Send + Sync + 'static {
         name: &str,
         include_nspawn_unit: bool,
     ) -> Result<MachineProperties>;
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()>;
     async fn get_unit_properties(&self, machine: &MachineName) -> Result<MachineProperties>;
 }

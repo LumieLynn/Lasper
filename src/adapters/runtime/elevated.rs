@@ -8,9 +8,10 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::runtime::source::RuntimeSource;
+use crate::application::runtime::{RuntimeChangePort, RuntimeError, RuntimeResult};
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::MachineName;
-use crate::domain::runtime::{ImageEntry, MachineEntry, StatusUpdate};
+use crate::domain::runtime::{ImageEntry, MachineEntry};
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -92,25 +93,29 @@ impl RuntimeSource for DaemonBackend {
             )))
         })
     }
+}
 
-    async fn watch_events(&self, tx: tokio::sync::mpsc::Sender<StatusUpdate>) -> Result<()> {
+#[async_trait::async_trait]
+impl RuntimeChangePort for DaemonBackend {
+    async fn watch_changes(&self, changed: tokio::sync::watch::Sender<()>) -> RuntimeResult<()> {
         let mut event_rx = self.daemon.subscribe_events();
         loop {
             match event_rx.recv().await {
                 Ok(()) => {
-                    if tx.send(StatusUpdate::Dirty).await.is_err() {
+                    if changed.send(()).is_err() {
                         break; // receiver dropped
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                     log::warn!("DaemonBackend event receiver lagged by {} messages", n);
-                    // Still nudge — something changed
-                    let _ = tx.send(StatusUpdate::Dirty).await;
+                    if changed.send(()).is_err() {
+                        break;
+                    }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                     log::error!("DaemonBackend event channel closed");
-                    return Err(NspawnError::Runtime(
-                        "elevated daemon event channel closed".into(),
+                    return Err(RuntimeError::unavailable(
+                        "elevated daemon event channel closed",
                     ));
                 }
             }

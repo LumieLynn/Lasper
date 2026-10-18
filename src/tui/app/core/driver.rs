@@ -45,7 +45,7 @@ pub(super) async fn run(
         app.workspace.resources.catalog.cpu_representation,
     );
 
-    app.services.runtime_catalog.watch(refresh_tx).await;
+    let runtime_observation = app.services.runtime_catalog.observe(refresh_tx);
 
     let mut mouse_motion_open = true;
     let loop_result = loop {
@@ -134,6 +134,7 @@ pub(super) async fn run(
         }
     };
     log::info!("[lasper] run() cleaning up...");
+    runtime_observation.shutdown().await;
     app.shutdown().await;
     metrics.shutdown().await;
     // Shut down the EventStream while the terminal is still in raw mode
