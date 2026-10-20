@@ -36,6 +36,7 @@ If the file parses but a bootstrap profile is invalid, Lasper skips that profile
 ```toml
 [settings]
 elevate = false
+elevation-method = "sudo"
 systemd-tools = false
 log-buffer-lines = 5000
 scrollback-lines = 2000
@@ -44,13 +45,23 @@ scrollback-lines = 2000
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `elevate` | boolean | `false` | Start the isolated elevated daemon, equivalent to `lasper -e`. The TUI remains owned by the invoking user. This setting does not apply to `lasper launch`, which relies on the caller's systemd/polkit authority. |
+| `elevation-method` | string | `"sudo"` | Choose `"sudo"` or `"run0"` to start the elevated daemon. This setting takes effect when elevation is requested; it does not enable elevation by itself. Run0 requires systemd 256 or newer. |
 | `systemd-tools` | boolean | `false` | Use systemd tools and runtime-state discovery instead of Lasper's own D-Bus client. Equivalent to forcing `-s`; this also selects the `machinectl` transport for `shell` and `launch`. |
 | `log-buffer-lines` | integer | `5000` | Maximum number of journal lines retained per container in the detail panel. `0` also means `5000`. |
 | `scrollback-lines` | integer | `2000` | Maximum history rows retained by each running embedded terminal, in addition to its visible screen. `0` disables history. Finished sessions retain their last screen while their history is released, including hidden tabs. |
 
-The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell`, while `lasper -s` always enables the systemd tools path. `lasper launch` deliberately rejects `--elevate` and ignores the `elevate` setting because a `Terminal=false` desktop invocation cannot service a sudo password prompt.
+The command-line flags take precedence over the corresponding configuration values. `lasper -e` requests elevation for the TUI and interactive `shell` using the configured `elevation-method`, while `lasper -s` always enables the systemd tools path. `lasper --elevate=run0` requests elevation and overrides the configured launcher for that invocation; `--elevate=sudo` selects sudo in the same way. `lasper launch` rejects elevation flags and ignores both elevation settings; it uses the caller's systemd/polkit authority.
 
-`-s/--systemd-tools` selects the same execution path previously named `-c/--cli-mode`; it does not select a command-line UI or change the authority of an operation. The old flags and `[settings] cli-mode` remain accepted as compatibility aliases. Use only one of `systemd-tools` and `cli-mode` in a configuration file; declaring both is a duplicate-setting error. The theme key `badge_systemd_tools` likewise accepts the old `badge_cli` name.
+To make run0 the launcher for ordinary `-e` invocations:
+
+```toml
+[settings]
+elevation-method = "run0"
+```
+
+Run0 asks the system service manager to start a separate temporary root service, with authorization handled by polkit. The host must provide `run0` and permit the request through its polkit policy; a password prompt may use the controlling terminal or a graphical authentication agent. Authentication happens before the TUI opens. Choosing run0 leaves `systemd-tools` independent: either launcher can be used with either runtime backend. If the daemon fails to exit normally, Lasper requests a service stop without another authentication prompt and reports any failure to confirm cleanup.
+
+`-s/--systemd-tools` selects how Lasper communicates with systemd; it does not select a command-line UI or change the authority of an operation. Use `[settings] systemd-tools` to configure this choice and `[theme] badge_systemd_tools` to set its badge color.
 
 ## NVIDIA CDI Source
 
@@ -63,8 +74,8 @@ cdi-source = "generate"
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `cdi-source` | `generate` or `existing` | `generate` | `generate` runs `nvidia-ctk cdi generate --format=json`. `existing` reads a complete NVIDIA CDI document without invoking `nvidia-ctk`. |
-| `cdi-file` | absolute path | omitted | Select one existing YAML or JSON document explicitly. It is used only with `cdi-source = "existing"`. |
+| `cdi-source` | string | `"generate"` | `"generate"` runs `nvidia-ctk cdi generate --format=json`. `"existing"` reads a complete NVIDIA CDI document without invoking `nvidia-ctk`. |
+| `cdi-file` | string | omitted | Absolute path to one existing YAML or JSON document. It is used only with `cdi-source = "existing"`. |
 
 When `existing` has no explicit file, Lasper looks for `nvidia.yaml`, `nvidia.yml`, or `nvidia.json` in `/etc/cdi` and `/var/run/cdi`. Discovery must find exactly one candidate; configure `cdi-file` when more than one exists. An explicit path must be absolute. CDI files are bounded to 8 MiB, must be regular files rather than symlinks, must be owned by root or the executing user, and must not be group- or world-writable. Consequently, an explicit user-owned file is accepted in a direct user process but is intentionally rejected by the elevated root daemon; use a root-owned host CDI file for elevated deployment.
 
@@ -166,8 +177,8 @@ Table location:
 | `extra_suites` | array of strings | `[]` | Additional archive suites used during bootstrap. |
 | `variant` | string | omitted | Optional debootstrap variant. |
 | `components` | array of strings | `[]` | Optional repository components. |
-| `usr_merge` | `provider_default`, `merged`, `unmerged` | `provider_default` | Leave `/usr` merge behavior to debootstrap or force either layout. |
-| `dependency_resolution` | `resolve`, `skip_resolution` | `resolve` | Enable normal dependency resolution or pass `--no-resolve-deps`. |
+| `usr_merge` | string | `"provider_default"` | `"provider_default"` leaves `/usr` merge behavior to debootstrap; `"merged"` and `"unmerged"` force either layout. |
+| `dependency_resolution` | string | `"resolve"` | `"resolve"` enables normal dependency resolution; `"skip_resolution"` passes `--no-resolve-deps`. |
 | `log_extra_dependencies` | boolean | `false` | Record additional dependency information in `debootstrap.log`. |
 | `policy` | table | provider defaults | Debootstrap mirror and Release verification policy. |
 
@@ -227,9 +238,9 @@ Table location:
 | --- | --- | --- | --- |
 | `packages` | array of strings | `[]` | Packages appended to the inherited defaults, or the explicit package set when inheritance is disabled. |
 | `inherit_default_packages` | boolean | `true` | Include the pacstrap default package set before `packages`. |
-| `cache` | `host`, `target` | `host` | Use the host package cache (`-c`) or create/use the target cache. |
-| `isolation` | `host`, `unshare` | `host` | Use normal execution or pacstrap's unshare mode (`-N`). |
-| `dependency_checks` | `check`, `skip_checks` | `check` | Use normal pacman dependency checks or pass `-D`. |
+| `cache` | string | `"host"` | `"host"` uses the host package cache (`-c`); `"target"` creates or uses the target cache. |
+| `isolation` | string | `"host"` | `"host"` uses normal execution; `"unshare"` uses pacstrap's unshare mode (`-N`). |
+| `dependency_checks` | string | `"check"` | `"check"` uses normal pacman dependency checks; `"skip_checks"` passes `-D`. |
 | `policy` | table | host-integrated defaults | Controls which host pacman trust and repository state pacstrap inherits. |
 
 Pacstrap policy fields:
@@ -275,11 +286,11 @@ Table location:
 | `packages` | array of strings | `[]` | Packages appended to the inherited defaults, or the explicit package set when inheritance is disabled. |
 | `inherit_default_packages` | boolean | `true` | Include the Fedora/RHEL-oriented DNF5 default package set before `packages`. |
 | `exclude_packages` | array of strings | `[]` | Package specs excluded from the transaction. |
-| `only_repositories` | array of repository selectors | `[]` | Enable only these repositories with `--repo`. Cannot be combined with the enable/disable lists. |
-| `enable_repositories` | array of repository selectors | `[]` | Additionally enable matching host repositories. |
-| `disable_repositories` | array of repository selectors | `[]` | Disable matching host repositories. |
-| `metadata` | `provider_default`, `refresh`, `cache_only` | `provider_default` | Use normal metadata behavior, force refresh, or require cached data. |
-| `repository` | `host` | required for named profiles | Explicitly use the host DNF repository configuration while the install root is empty. The built-in editable source currently resolves to `host` automatically. |
+| `only_repositories` | array of strings | `[]` | Repository selectors to enable with `--repo`. Cannot be combined with the enable/disable lists. |
+| `enable_repositories` | array of strings | `[]` | Repository selectors to additionally enable matching host repositories. |
+| `disable_repositories` | array of strings | `[]` | Repository selectors to disable matching host repositories. |
+| `metadata` | string | `"provider_default"` | `"provider_default"` uses normal metadata behavior; `"refresh"` forces refresh; `"cache_only"` requires cached data. |
+| `repository` | string | required for named profiles | Accepts `"host"` to use the host DNF repository configuration while the install root is empty. The built-in editable source selects this automatically. |
 | `policy` | table | provider defaults | DNF5 package verification and transaction policy. |
 
 DNF5 policy fields:
@@ -328,7 +339,7 @@ format = "tar"
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `path` | string | required | Local tarball or raw image path. `~` and `~/...` are supported. |
-| `format` | `auto`, `tar`, `raw` | `auto` | Selects how the artifact is handled. |
+| `format` | string | `"auto"` | Choose `"auto"`, `"tar"`, or `"raw"` to select how the artifact is handled. |
 
 With `auto`, `.raw`, `.img`, and their gzip, xz, zstd, or bzip2-compressed forms are treated as raw images; archive-like extensions are treated as tar archives. Explicit `tar` and `raw` values must match the corresponding file extension when the extension is recognizable. Compression is confirmed from the file content before decoding. Raw artifacts use externally managed storage; tar archives are extracted into the selected Lasper storage backend.
 
@@ -447,6 +458,7 @@ The following combines the settings, a debootstrap default prefill, a named prof
 ```toml
 [settings]
 elevate = true
+elevation-method = "sudo"
 systemd-tools = false
 log-buffer-lines = 10000
 scrollback-lines = 2000

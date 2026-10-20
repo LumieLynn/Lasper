@@ -1,1081 +1,220 @@
-//! Authenticated daemon client facade, RPC multiplexer, and typed proxies.
+//! Client for the isolated root daemon.
+//!
+//! This facade starts the launcher, authenticates IPC, and coordinates shutdown.
+//! RPC and FD channels own their transports; the sibling proxy modules translate
+//! configuration, runtime, provisioning, and session operations.
 
 mod configuration;
-mod machine;
+mod fd_channel;
+mod launcher;
+mod provisioning;
+mod rpc;
+mod runtime;
 mod session;
 
-use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
-use crate::adapters::platform::nvidia::state::{NvidiaStateOperation, NvidiaStateResult};
-use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
-use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentStateResult};
-use crate::adapters::system_operation::SystemOperation;
-use crate::application::image_lifecycle::{ImageControlOutcome, ImageRemoveRequest};
-use crate::application::machine_lifecycle::{
-    MachineControlOutcome, MachineRuntimeControlRequest, NspawnLaunchRequest,
-    NspawnUnitControlRequest,
-};
-use crate::domain::inspection::MachineProperties;
-use crate::domain::machine::MachineName;
-use crate::domain::secret::SecretBytes;
-use crate::ipc::protocol::deployment::{
-    DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
-    DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
-    ReleaseUnresolvedDeploymentRequest, SubmitDeploymentParams,
-};
-use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
-use crate::ipc::protocol::*;
-use crate::ipc::transport::{
-    authorize_root_server, create_fd_socket_dir, get_peer_credentials, read_bounded_line,
-    MAX_RPC_FRAME_BYTES,
-};
-use sendfd::{RecvWithFd, SendWithFd};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+pub(crate) use fd_channel::pipe_reader_owned;
+pub(crate) use launcher::ElevationMethod;
+
+use fd_channel::FdChannel;
+use launcher::{DaemonInvocation, DaemonLauncher};
+use rpc::RpcClient;
+
+use crate::ipc::transport::create_fd_socket_dir;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const RPC_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const FD_CHANNEL_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-// The daemon drains cancelled provisioning jobs for up to eight seconds and
-// then gives live sessions their own termination grace period. The parent I/O
-// task must wait long enough for that normal shutdown before escalating.
-const DAEMON_IO_EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
-
-type PendingRpcResponses =
-    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<RpcResponse>>;
-
-fn rpc_response_timeout(family: RpcFamily) -> std::time::Duration {
-    match family {
-        RpcFamily::Query | RpcFamily::Session => std::time::Duration::from_secs(15),
-        RpcFamily::Job => std::time::Duration::from_secs(30),
-        RpcFamily::Command => std::time::Duration::from_secs(60),
-    }
-}
-
-fn rpc_timeout_error(method: RpcMethod, timeout: std::time::Duration) -> std::io::Error {
-    let consequence = match method.family() {
-        RpcFamily::Query => "the query can be retried",
-        RpcFamily::Session => "the session request was not confirmed",
-        RpcFamily::Job => "deployment state must be reconciled before retrying",
-        RpcFamily::Command => "the operation may still be running and its outcome is unknown",
-    };
-    std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!(
-            "daemon {} '{}' timed out after {}s; {}",
-            method.family().as_str(),
-            method.wire_name(),
-            timeout.as_secs(),
-            consequence
-        ),
-    )
-}
-
-async fn wait_for_rpc_response(
-    response_rx: tokio::sync::oneshot::Receiver<RpcResponse>,
-    method: RpcMethod,
-    timeout: std::time::Duration,
-) -> std::io::Result<RpcResponse> {
-    match tokio::time::timeout(timeout, response_rx).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "daemon response channel cancelled",
-        )),
-        Err(_) => Err(rpc_timeout_error(method, timeout)),
-    }
-}
-
-fn discard_cancelled_responses(pending: &mut PendingRpcResponses) -> usize {
-    let before = pending.len();
-    pending.retain(|_, response_tx| !response_tx.is_closed());
-    before - pending.len()
-}
-
-pub(crate) fn pipe_reader_owned(
-    owned: OwnedFd,
-) -> std::io::Result<tokio::net::unix::pipe::Receiver> {
-    tokio::net::unix::pipe::Receiver::from_owned_fd(owned)
-}
-
-/// Receive one daemon FD response without exposing borrowed descriptor
-/// numbers to the async caller. Both session handoffs and deployment streams
-/// use this same `recvmsg` frame: a short status payload plus SCM_RIGHTS.
-///
-/// The blocking syscall runs on a worker thread, so the socket-level deadline
-/// is essential: cancelling the JoinHandle alone cannot interrupt `recvmsg`.
-fn receive_fd_response(
-    socket: &std::os::unix::net::UnixStream,
-    operation: &str,
-    timeout: std::time::Duration,
-) -> std::io::Result<(String, Vec<OwnedFd>)> {
-    let mut buffer = [0u8; 512];
-    let mut fds = [-1 as RawFd; 2];
-    let deadline = std::time::Instant::now() + timeout;
-    let (read, fd_count) = loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(fd_receive_timeout(operation, timeout));
-        }
-        socket.set_read_timeout(Some(remaining))?;
-        match socket.recv_with_fd(&mut buffer, &mut fds) {
-            Ok(received) => break received,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(map_fd_receive_error(error, operation, timeout)),
-        }
-    };
-
-    // Take ownership before returning from the worker. If the caller is
-    // cancelled after this point, Vec<OwnedFd> still closes every descriptor.
-    let fds = fds[..fd_count]
-        .iter()
-        .copied()
-        .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-        .collect::<Vec<_>>();
-    let message = String::from_utf8(buffer[..read].to_vec())
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    Ok((message, fds))
-}
-
-fn map_fd_receive_error(
-    error: std::io::Error,
-    operation: &str,
-    timeout: std::time::Duration,
-) -> std::io::Error {
-    if matches!(
-        error.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    ) {
-        fd_receive_timeout(operation, timeout)
-    } else {
-        error
-    }
-}
-
-fn fd_receive_timeout(operation: &str, timeout: std::time::Duration) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!("timed out waiting for daemon {operation} FD response after {timeout:?}"),
-    )
-}
-
-fn configure_sudo_daemon_stdio(command: &mut tokio::process::Command) {
-    // sudo-rs with use_pty relays the controlling terminal for as long as a
-    // foreground command lives. A stdout pipe makes this a non-foreground I/O
-    // path, so the long-lived daemon cannot compete with the TUI for input.
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
-}
-
-fn rpc_socket_may_not_be_ready(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::NotFound
-            | std::io::ErrorKind::ConnectionRefused
-            | std::io::ErrorKind::Interrupted
-            | std::io::ErrorKind::WouldBlock
-    )
-}
-
-async fn wait_for_daemon_rpc_socket(
-    path: &std::path::Path,
-    sudo_child: &mut tokio::process::Child,
-) -> std::io::Result<tokio::net::UnixStream> {
-    loop {
-        match tokio::net::UnixStream::connect(path).await {
-            Ok(stream) => return Ok(stream),
-            Err(connect_error) => {
-                if let Some(status) = sudo_child.try_wait().map_err(|error| {
-                    std::io::Error::new(
-                        error.kind(),
-                        format!("failed to inspect sudo daemon process: {error}"),
-                    )
-                })? {
-                    return Err(std::io::Error::other(format!(
-                        "sudo daemon exited before its RPC socket became ready ({status}); \
-                         last connection error: {connect_error}"
-                    )));
-                }
-                if !rpc_socket_may_not_be_ready(&connect_error) {
-                    return Err(connect_error);
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-}
-
-// ── Parent-side handle ──
-
 pub(crate) struct ElevatedDaemon {
-    request_tx: tokio::sync::mpsc::Sender<RpcCall>,
-    next_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    event_tx: tokio::sync::broadcast::Sender<()>,
+    rpc: RpcClient,
+    fd_channel: FdChannel,
+    launcher_exit: tokio::sync::watch::Receiver<Option<Result<(), String>>>,
     pid: u32,
     rpc_sock_path: PathBuf,
-    fd_sock_path: PathBuf,
-    fd_auth_token: Arc<str>,
-    _fd_sock_dir: Arc<tempfile::TempDir>,
+    socket_directory: Arc<tempfile::TempDir>,
 }
 
 impl std::fmt::Debug for ElevatedDaemon {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ElevatedDaemon")
             .field("pid", &self.pid)
-            .field("fd_sock_path", &self.fd_sock_path)
-            .field("fd_auth_token", &"<redacted>")
+            .field("fd_sock_path", &self.fd_channel.path())
             .finish_non_exhaustive()
     }
 }
 
 impl ElevatedDaemon {
-    pub(crate) async fn spawn(dbus_enabled: bool) -> std::io::Result<Self> {
+    pub(crate) async fn spawn(
+        method: ElevationMethod,
+        dbus_enabled: bool,
+    ) -> std::io::Result<Self> {
         let exe = std::env::current_exe()?;
         let user_uid = uzers::get_current_uid();
         let parent_pid = std::process::id();
-        let fd_auth_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
-        let fd_sock_dir = Arc::new(create_fd_socket_dir(user_uid)?);
-        let fd_sock_path = fd_sock_dir.path().join("fd.sock");
-        let rpc_sock_path = fd_sock_dir.path().join("rpc.sock");
+        let auth_token: Arc<str> = Arc::from(uuid::Uuid::new_v4().to_string());
+        let socket_directory = Arc::new(create_fd_socket_dir(user_uid)?);
+        let fd_sock_path = socket_directory.path().join("fd.sock");
+        let rpc_sock_path = socket_directory.path().join("rpc.sock");
 
-        let mut command = tokio::process::Command::new("sudo");
-        command
-            .kill_on_drop(true)
-            .arg(&exe)
-            .arg("--daemon")
-            .arg("--fd-sock")
-            .arg(&fd_sock_path)
-            .arg("--rpc-sock")
-            .arg(&rpc_sock_path)
-            .arg("--daemon-uid")
-            .arg(user_uid.to_string())
-            .arg("--daemon-pid")
-            .arg(parent_pid.to_string());
-        configure_sudo_daemon_stdio(&mut command);
-        let mut child = command.spawn().map_err(|error| {
-            std::io::Error::new(
-                error.kind(),
-                format!("failed to launch sudo daemon: {}", error),
-            )
-        })?;
-
-        let pid = child.id().expect("child has pid");
-        let mut sudo_stdout = child.stdout.take().expect("sudo stdout was piped");
-        let sudo_stdout_task = tokio::spawn(async move {
-            if let Err(error) = tokio::io::copy(&mut sudo_stdout, &mut tokio::io::sink()).await {
-                log::debug!("Failed to drain elevated daemon stdout: {error}");
-            }
-        });
-
-        use tokio::io::AsyncWriteExt;
-        let mut rpc_stream = wait_for_daemon_rpc_socket(&rpc_sock_path, &mut child).await?;
-        authorize_root_server(get_peer_credentials(&rpc_stream)?)?;
-        let rpc_bootstrap = RpcBootstrap {
-            protocol_version: RPC_PROTOCOL_VERSION,
-            auth_token: fd_auth_token.to_string(),
-            dbus_enabled,
+        let mut launcher = DaemonLauncher::spawn(
+            method,
+            DaemonInvocation {
+                executable: &exe,
+                fd_socket: &fd_sock_path,
+                rpc_socket: &rpc_sock_path,
+                invoking_uid: user_uid,
+                frontend_pid: parent_pid,
+            },
+            Arc::clone(&socket_directory),
+        )?;
+        let connection: std::io::Result<_> = async {
+            let mut stream = launcher.connect_rpc_socket(&rpc_sock_path).await?;
+            let pid = rpc::authenticate(&mut stream, &auth_token, dbus_enabled).await?;
+            Ok((stream, pid))
+        }
+        .await;
+        let (stream, pid) = match connection {
+            Ok(connection) => connection,
+            Err(error) => return Err(with_cleanup_error(error, launcher.abort().await)),
         };
-        let rpc_bootstrap_line =
-            SecretBytes::new(serde_json::to_vec(&rpc_bootstrap).map_err(|error| {
-                std::io::Error::other(format!("serialize RPC authentication: {error}"))
-            })?);
-        rpc_stream.write_all(rpc_bootstrap_line.as_slice()).await?;
-        rpc_stream.write_all(b"\n").await?;
-        rpc_stream.flush().await?;
-        let (rpc_reader, rpc_writer) = rpc_stream.into_split();
 
-        let (request_tx, mut request_rx) = tokio::sync::mpsc::channel::<RpcCall>(8);
-        let (event_tx, _) = tokio::sync::broadcast::channel::<()>(16);
-
-        let io_pid = pid;
-        let event_tx_io = event_tx.clone();
+        let (rpc, connection) = RpcClient::new(stream);
+        let (launcher_exit_tx, launcher_exit) = tokio::sync::watch::channel(None);
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
-
-            let mut writer = tokio::io::BufWriter::new(rpc_writer);
-            let mut reader = tokio::io::BufReader::new(rpc_reader);
-
-            let mut pending = PendingRpcResponses::new();
-            let mut pending_sweep = tokio::time::interval(std::time::Duration::from_secs(5));
-            pending_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = pending_sweep.tick() => {
-                        let discarded = discard_cancelled_responses(&mut pending);
-                        if discarded > 0 {
-                            log::debug!(
-                                "Daemon I/O: discarded {discarded} cancelled response slots"
-                            );
-                        }
-                    }
-
-                    req_opt = request_rx.recv() => {
-                        let (request, response_tx) = match req_opt {
-                            Some(r) => r,
-                            None => break,
-                        };
-
-                        if response_tx.is_closed() {
-                            continue;
-                        }
-
-                        let id = request.id();
-
-                        let req_line = match request.into_wire_bytes() {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                log::error!("Daemon I/O: failed to serialize request: {}", e);
-                                continue;
-                            }
-                        };
-                        if req_line.len().saturating_add(1) > MAX_RPC_FRAME_BYTES {
-                            let _ = response_tx.send(RpcResponse {
-                                jsonrpc: "2.0".into(),
-                                id,
-                                result: None,
-                                error: Some(RpcError {
-                                    code: error_code::INTERNAL_ERROR,
-                                    message: format!(
-                                        "daemon request exceeds {MAX_RPC_FRAME_BYTES} bytes"
-                                    ),
-                                }),
-                            });
-                            continue;
-                        }
-
-                        if let Err(e) = writer.write_all(req_line.as_slice()).await {
-                            log::error!("Daemon I/O: failed to write to daemon RPC socket: {}", e);
-                            break;
-                        }
-                        if let Err(e) = writer.write_all(b"\n").await {
-                            log::error!("Daemon I/O: failed to terminate RPC request: {}", e);
-                            break;
-                        }
-                        if let Err(e) = writer.flush().await {
-                            log::error!("Daemon I/O: failed to flush daemon RPC socket: {}", e);
-                            break;
-                        }
-
-                        if !response_tx.is_closed() {
-                            pending.insert(id, response_tx);
-                        }
-                    }
-
-                    read_res = read_bounded_line(&mut reader, MAX_RPC_FRAME_BYTES) => {
-                        match read_res {
-                            Ok(None) => {
-                                log::info!("[lasper] I/O task: daemon RPC socket EOF");
-                                log::error!("Daemon I/O: RPC socket closed (EOF)");
-                                break;
-                            }
-                            Ok(Some(line)) => {
-                                let raw: serde_json::Value = match serde_json::from_str(&line) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        log::error!("Daemon I/O: failed to parse JSON: {}", e);
-                                        continue;
-                                    }
-                                };
-
-                                if raw.get("method").is_some() && raw.get("id").is_none() {
-                                    let _ = event_tx_io.send(());
-                                    continue;
-                                }
-
-                                if let Some(id) = raw.get("id").and_then(|v| v.as_u64()) {
-                                    if let Some(tx) = pending.remove(&id) {
-                                        let response: RpcResponse = match serde_json::from_value(raw) {
-                                            Ok(r) => r,
-                                            Err(e) => {
-                                                log::error!("Daemon I/O: failed to parse response: {}", e);
-                                                break;
-                                            }
-                                        };
-                                        let _ = tx.send(response);
-                                    } else {
-                                        log::warn!(
-                                            "Daemon I/O: received response for unknown id={}",
-                                            id
-                                        );
-                                    }
-                                } else {
-                                    log::warn!("Daemon I/O: unexpected JSON format");
-                                }
-                            }
-                            Err(e) => {
-                                log::error!("Daemon I/O: failed to read daemon RPC socket: {}", e);
-                                break;
-                            }
-                        }
-                    }
-                }
+            // run() releases both socket halves and every pending response.
+            // Only then may we wait for the daemon to observe EOF and exit.
+            connection.run().await;
+            let result = launcher.finish().await.map_err(|error| error.to_string());
+            if let Err(error) = &result {
+                log::error!("Elevated daemon cleanup failed: {error}");
             }
-
-            // Stop accepting work and release every socket/channel before
-            // waiting for sudo. The daemon observes RPC EOF and performs its
-            // own bounded shutdown; waiting before closing these handles
-            // would keep that EOF from reaching it.
-            drop(request_rx);
-            drop(pending);
-            drop(reader);
-            drop(writer);
-            drop(pending_sweep);
-
-            log::info!("[lasper] I/O task exiting, reaping sudo pid={}...", io_pid);
-            if reap_sudo_child(&mut child, sudo_stdout_task, DAEMON_IO_EXIT_GRACE).await {
-                log::info!("[lasper] I/O task done (sudo reaped)");
-            } else {
-                log::warn!("[lasper] I/O task done; sudo reap is unresolved");
-            }
+            let _ = launcher_exit_tx.send(Some(result));
         });
 
-        // Health check
-        let next_id = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
         let daemon = Self {
-            request_tx,
-            next_id,
-            event_tx,
+            rpc,
+            fd_channel: FdChannel::new(fd_sock_path, auth_token),
+            launcher_exit,
             pid,
             rpc_sock_path,
-            fd_sock_path,
-            fd_auth_token,
-            _fd_sock_dir: fd_sock_dir,
+            socket_directory,
         };
-        daemon.ping().await.map_err(|error| {
-            std::io::Error::new(
+        if let Err(error) = daemon.rpc.call("ping", serde_json::json!({})).await {
+            let error = std::io::Error::new(
                 error.kind(),
-                format!("daemon health check failed after sudo launch: {}", error),
-            )
-        })?;
+                format!("daemon health check failed after {method} launch: {error}"),
+            );
+            return Err(with_cleanup_error(error, daemon.finish_shutdown().await));
+        }
 
-        log::info!("Elevated daemon ready (pid={})", pid);
+        log::info!("Elevated daemon ready (pid={pid})");
         Ok(daemon)
     }
 
     pub(super) fn subscribe_events(&self) -> tokio::sync::broadcast::Receiver<()> {
-        self.event_tx.subscribe()
+        self.rpc.subscribe_events()
     }
-
-    // ── JSON-RPC dispatch ──
 
     pub(super) async fn rpc_call(
         &self,
         method: &str,
         params: serde_json::Value,
     ) -> std::io::Result<serde_json::Value> {
-        let method_kind = RpcMethod::parse(method).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("unknown daemon RPC method: {method}"),
-            )
-        })?;
-        log::trace!(
-            "[lasper] RPC method {} ({})",
-            method_kind.wire_name(),
-            method_kind.family().as_str()
-        );
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let request = RpcRequest {
-            jsonrpc: "2.0".into(),
-            id,
-            method: method.into(),
-            params,
+        self.rpc.call(method, params).await
+    }
+
+    pub(crate) async fn exit(&self) -> std::io::Result<()> {
+        // The daemon may close RPC before replying. Launcher completion, rather
+        // than this response, confirms whether the process has been reaped.
+        let _ = self.rpc.call("exit", serde_json::json!({})).await;
+        self.finish_shutdown().await
+    }
+
+    async fn finish_shutdown(&self) -> std::io::Result<()> {
+        self.rpc.shutdown();
+        let mut completion = self.launcher_exit.clone();
+        let result = match completion.wait_for(Option::is_some).await {
+            Ok(result) => result
+                .as_ref()
+                .expect("launcher finished")
+                .clone()
+                .map_err(std::io::Error::other),
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "daemon launcher completion channel closed; process exit is unconfirmed",
+            )),
         };
-        self.send_rpc_request(OutboundRpcRequest::General(request), method_kind)
-            .await
-    }
-
-    async fn send_rpc_request(
-        &self,
-        request: OutboundRpcRequest,
-        method_kind: RpcMethod,
-    ) -> std::io::Result<serde_json::Value> {
-        let id = request.id();
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        log::trace!(
-            "[lasper] rpc_call: sending {} (id={})",
-            method_kind.wire_name(),
-            id
-        );
-        match tokio::time::timeout(
-            RPC_QUEUE_TIMEOUT,
-            self.request_tx.send((request, response_tx)),
-        )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                log::warn!("[lasper] rpc_call: mpsc send failed (I/O task stopped)");
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "daemon I/O task has stopped",
-                ));
-            }
-            Err(_) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "daemon request queue remained full for {}s; '{}' was not submitted",
-                        RPC_QUEUE_TIMEOUT.as_secs(),
-                        method_kind.wire_name()
-                    ),
-                ));
-            }
-        }
-        log::trace!("[lasper] rpc_call: waiting for response id={}", id);
-        let timeout = rpc_response_timeout(method_kind.family());
-        let response = wait_for_rpc_response(response_rx, method_kind, timeout)
-            .await
-            .inspect_err(|error| {
-                log::warn!(
-                    "[lasper] rpc_call: response failed id={} method={}: {}",
-                    id,
-                    method_kind.wire_name(),
-                    error
-                );
-            })?;
-        if let Some(err) = response.error {
-            return Err(std::io::Error::other(err));
-        }
-        Ok(response.result.unwrap_or(serde_json::Value::Null))
-    }
-
-    async fn ping(&self) -> std::io::Result<()> {
-        self.rpc_call("ping", serde_json::json!({})).await?;
-        Ok(())
-    }
-
-    pub(crate) async fn exit(&self) {
-        log::info!("[lasper] daemon::exit() sending RPC...");
-        // Send exit command and ignore response since daemon will exit immediately
-        let _ = self.rpc_call("exit", serde_json::json!({})).await;
         let _ = tokio::fs::remove_file(&self.rpc_sock_path).await;
-        let _ = tokio::fs::remove_file(&self.fd_sock_path).await;
-        let _ = tokio::fs::remove_dir(self._fd_sock_dir.path()).await;
-        log::info!("[lasper] daemon::exit() RPC returned");
-    }
-
-    pub(super) async fn nspawn_config(
-        &self,
-        operation: NspawnConfigOperation,
-    ) -> std::io::Result<NspawnConfigResult> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("nspawn_config", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn system_operation(
-        &self,
-        operation: SystemOperation,
-        transport: crate::application::machine_lifecycle::MachineControlTransport,
-    ) -> std::io::Result<()> {
-        let params = serde_json::to_value(crate::ipc::protocol::system::SystemOperationRequest {
-            operation: operation.into(),
-            transport,
-        })
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        self.rpc_call("system_operation", params).await?;
-        Ok(())
-    }
-
-    pub(super) async fn image_remove(
-        &self,
-        request: ImageRemoveRequest,
-    ) -> std::io::Result<ImageControlOutcome> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("image_remove", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn nspawn_launch(
-        &self,
-        request: NspawnLaunchRequest,
-    ) -> std::io::Result<MachineControlOutcome> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("nspawn_launch", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn machine_runtime_control(
-        &self,
-        request: MachineRuntimeControlRequest,
-    ) -> std::io::Result<MachineControlOutcome> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("machine_runtime_control", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn nspawn_unit_control(
-        &self,
-        request: NspawnUnitControlRequest,
-    ) -> std::io::Result<MachineControlOutcome> {
-        let params = serde_json::to_value(request)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("nspawn_unit_control", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn systemd_tools_inspect_machine(
-        &self,
-        name: &str,
-        include_nspawn_unit: bool,
-    ) -> std::io::Result<MachineProperties> {
-        let request = InspectMachineRequest {
-            machine: MachineName::new(name)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
-            include_nspawn_unit,
-        };
-        let params = serde_json::to_value(request)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self
-            .rpc_call("systemd_tools_inspect_machine", params)
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn systemd_tools_inspect_unit(
-        &self,
-        machine: &MachineName,
-    ) -> std::io::Result<MachineProperties> {
-        let result = self
-            .rpc_call("systemd_tools_inspect_unit", serde_json::json!(machine))
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn systemd_unit(
-        &self,
-        operation: systemd_unit_wire::SystemdUnitOperation,
-    ) -> std::io::Result<systemd_unit_wire::SystemdUnitResult> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("systemd_unit", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn nvidia_state(
-        &self,
-        operation: NvidiaStateOperation,
-    ) -> std::io::Result<NvidiaStateResult> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("nvidia_state", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn deployment_state(
-        &self,
-        operation: DeploymentStateOperation,
-    ) -> std::io::Result<DeploymentStateResult> {
-        let params = serde_json::to_value(operation)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("deployment_state", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn submit_deployment(
-        &self,
-        params: SubmitDeploymentParams,
-        artifact_source: Option<std::fs::File>,
-    ) -> std::io::Result<OwnedFd> {
-        let socket = self
-            .open_fd_channel(FdOperation::SubmitDeployment(Box::new(params)))
-            .await?;
-        tokio::task::spawn_blocking(move || {
-            receive_deployment_stream(&socket, artifact_source.as_ref())
-        })
-        .await?
-    }
-
-    pub(super) async fn deployment_status(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-    ) -> std::io::Result<Option<DeploymentJobSnapshot>> {
-        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("deployment_status", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn resolve_deployment_submission(
-        &self,
-        request_id: crate::application::provisioning::DeploymentRequestId,
-    ) -> std::io::Result<Option<DeploymentSubmissionSnapshot>> {
-        let params = serde_json::to_value(DeploymentSubmissionRequest { request_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self
-            .rpc_call("resolve_deployment_submission", params)
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn acknowledge_deployment_submission(
-        &self,
-        request_id: crate::application::provisioning::DeploymentRequestId,
-    ) -> std::io::Result<()> {
-        let params = serde_json::to_value(DeploymentSubmissionRequest { request_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        self.rpc_call("acknowledge_deployment_submission", params)
-            .await?;
-        Ok(())
-    }
-
-    pub(super) async fn cancel_deployment(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-    ) -> std::io::Result<DeploymentJobSnapshot> {
-        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("cancel_deployment", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn acknowledge_deployment(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-    ) -> std::io::Result<()> {
-        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        self.rpc_call("acknowledge_deployment", params).await?;
-        Ok(())
-    }
-
-    pub(super) async fn probe_deployment_recovery(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-        expected_revision: u64,
-    ) -> std::io::Result<Vec<crate::application::provisioning::DeploymentRecoveryObservation>> {
-        let params = serde_json::to_value(ProbeDeploymentRecoveryRequest {
-            deployment_id,
-            expected_revision,
-        })
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result: ProbeDeploymentRecoveryResult =
-            serde_json::from_value(self.rpc_call("probe_deployment_recovery", params).await?)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if result.deployment_id != deployment_id || result.manifest_revision != expected_revision {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "daemon recovery probe returned a mismatched deployment revision",
-            ));
-        }
-        Ok(result.observations)
-    }
-
-    pub(super) async fn reconcile_deployment(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-    ) -> std::io::Result<DeploymentJobSnapshot> {
-        let params = serde_json::to_value(DeploymentJobRequest { deployment_id })
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self.rpc_call("reconcile_deployment", params).await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn release_unresolved_deployment(
-        &self,
-        deployment_id: crate::application::provisioning::DeploymentId,
-        confirmed: bool,
-    ) -> std::io::Result<DeploymentJobSnapshot> {
-        let params = serde_json::to_value(ReleaseUnresolvedDeploymentRequest {
-            deployment_id,
-            confirmed,
-        })
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        let result = self
-            .rpc_call("release_unresolved_deployment", params)
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    pub(super) async fn assess_tar_runtime(&self) -> std::io::Result<TarRuntimeAssessment> {
-        let result = self
-            .rpc_call("assess_tar_runtime", serde_json::json!({}))
-            .await?;
-        serde_json::from_value(result)
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
-    }
-
-    // ── FD-passing ──
-    //
-    // Connect and write the request async, then hand the fd to a blocking
-    // thread for recv_with_fd (sendfd on tokio::UnixStream uses try_io which
-    // is unreliable when mixed with prior read/write ops on the same fd).
-
-    pub(super) async fn open_fd_channel(
-        &self,
-        operation: FdOperation,
-    ) -> std::io::Result<std::os::unix::net::UnixStream> {
-        use tokio::io::AsyncWriteExt;
-
-        tokio::time::timeout(FD_CHANNEL_SETUP_TIMEOUT, async {
-            let mut sock = tokio::net::UnixStream::connect(&self.fd_sock_path).await?;
-            authorize_root_server(get_peer_credentials(&sock)?)?;
-            let request = FdRequest {
-                auth_token: self.fd_auth_token.to_string(),
-                operation,
-            };
-            let request_line = SecretBytes::new(
-                serde_json::to_vec(&request)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
-            );
-            sock.write_all(request_line.as_slice()).await?;
-            sock.write_all(b"\n").await?;
-
-            let std_sock = sock.into_std()?;
-            std_sock.set_nonblocking(false)?;
-            Ok(std_sock)
-        })
-        .await
-        .map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                format!(
-                    "timed out opening daemon FD channel after {}s",
-                    FD_CHANNEL_SETUP_TIMEOUT.as_secs()
-                ),
-            )
-        })?
+        let _ = tokio::fs::remove_file(self.fd_channel.path()).await;
+        let _ = tokio::fs::remove_dir(self.socket_directory.path()).await;
+        result
     }
 }
 
-async fn reap_sudo_child(
-    child: &mut tokio::process::Child,
-    stdout_task: tokio::task::JoinHandle<()>,
-    grace: std::time::Duration,
-) -> bool {
-    let reaped = match tokio::time::timeout(grace, child.wait()).await {
-        Ok(Ok(status)) => {
-            log::debug!("[lasper] sudo exited with {status}");
-            true
-        }
-        Ok(Err(error)) => {
-            log::warn!("[lasper] failed to wait for sudo: {error}");
-            child.kill().await.is_ok()
-        }
-        Err(_) => {
-            log::warn!(
-                "[lasper] sudo did not exit within {}s after RPC shutdown; killing it",
-                grace.as_secs()
-            );
-            match child.kill().await {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!("[lasper] failed to kill sudo: {error}");
-                    false
-                }
-            }
-        }
-    };
-
-    stdout_task.abort();
-    let _ = stdout_task.await;
-    reaped
-}
-
-fn receive_deployment_stream(
-    socket: &std::os::unix::net::UnixStream,
-    artifact_source: Option<&std::fs::File>,
-) -> std::io::Result<OwnedFd> {
-    let handoff_timeout = std::time::Duration::from_secs(10);
-    socket.set_read_timeout(Some(handoff_timeout))?;
-    socket.set_write_timeout(Some(std::time::Duration::from_secs(10)))?;
-    if let Some(source) = artifact_source {
-        use std::io::BufRead;
-
-        let mut reader = std::io::BufReader::new(socket.try_clone()?);
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line.trim() != "artifact-ready" {
-            return Err(std::io::Error::other(format!(
-                "daemon refused deployment artifact fd: {}",
-                line.trim()
-            )));
-        }
-        socket.send_with_fd(b"artifact", &[source.as_raw_fd()])?;
+fn with_cleanup_error(error: std::io::Error, cleanup: std::io::Result<()>) -> std::io::Error {
+    match cleanup {
+        Ok(()) => error,
+        Err(cleanup) => std::io::Error::new(
+            error.kind(),
+            format!("{error}; launcher cleanup failed: {cleanup}"),
+        ),
     }
-
-    let (message, fds) = receive_fd_response(socket, "deployment stream", handoff_timeout)?;
-    if fds.len() != 1 {
-        return Err(std::io::Error::other(format!(
-            "daemon deployment submission returned {} fds: {}",
-            fds.len(),
-            message.trim()
-        )));
-    }
-    if message.trim() != "ok" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "daemon returned an invalid deployment stream response: {}",
-                message.trim()
-            ),
-        ));
-    }
-    Ok(fds.into_iter().next().expect("FD count checked"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        configure_sudo_daemon_stdio, discard_cancelled_responses, reap_sudo_child,
-        rpc_response_timeout, wait_for_daemon_rpc_socket, wait_for_rpc_response,
-        PendingRpcResponses,
-    };
-    use crate::ipc::protocol::{RpcFamily, RpcMethod};
+    use super::*;
+    use crate::ipc::protocol::{RpcRequest, RpcResponse};
+    use crate::ipc::transport::{read_bounded_line, MAX_RPC_FRAME_BYTES};
+    use tokio::io::{AsyncWriteExt, BufReader};
 
     #[tokio::test]
-    async fn sudo_daemon_stdio_detaches_input_and_pipes_stdout() {
-        let mut command = tokio::process::Command::new("sh");
-        command
-            .arg("-c")
-            .arg("test ! -t 0 && test -p /proc/self/fd/1");
-        configure_sudo_daemon_stdio(&mut command);
-
-        let mut child = command.spawn().unwrap();
-        let mut stdout = child.stdout.take().expect("stdout must be piped");
-        tokio::io::copy(&mut stdout, &mut tokio::io::sink())
-            .await
-            .unwrap();
-
-        assert!(child.wait().await.unwrap().success());
-    }
-
-    #[tokio::test]
-    async fn sudo_child_is_killed_and_reaped_after_rpc_shutdown_grace() {
-        let mut command = tokio::process::Command::new("sleep");
-        command.arg("30");
-        configure_sudo_daemon_stdio(&mut command);
-        let mut child = command.spawn().unwrap();
-        let stdout = child.stdout.take().expect("sudo stdout is piped");
-        let stdout_task = tokio::spawn(async move {
-            let mut stdout = stdout;
-            tokio::io::copy(&mut stdout, &mut tokio::io::sink())
+    async fn exit_closes_client_io_without_waiting_for_server_eof() {
+        let directory = Arc::new(tempfile::tempdir().unwrap());
+        let (client, server) = tokio::net::UnixStream::pair().unwrap();
+        let (rpc, connection) = RpcClient::new(client);
+        let (completed_tx, completed_rx) = tokio::sync::watch::channel(None);
+        let io = tokio::spawn(async move {
+            connection.run().await;
+            completed_tx.send(Some(Ok(()))).unwrap();
+        });
+        let server = tokio::spawn(async move {
+            let (reader, mut writer) = server.into_split();
+            let mut reader = BufReader::new(reader);
+            let line = read_bounded_line(&mut reader, MAX_RPC_FRAME_BYTES)
+                .await
+                .unwrap()
+                .unwrap();
+            let request: RpcRequest = serde_json::from_str(&line).unwrap();
+            assert_eq!(request.method, "exit");
+            let response = RpcResponse {
+                jsonrpc: "2.0".into(),
+                id: request.id,
+                result: Some(serde_json::Value::Null),
+                error: None,
+            };
+            writer
+                .write_all(&serde_json::to_vec(&response).unwrap())
                 .await
                 .unwrap();
+            writer.write_all(b"\n").await.unwrap();
+            // Keep the server open until the client closes its own socket.
+            assert!(read_bounded_line(&mut reader, MAX_RPC_FRAME_BYTES)
+                .await
+                .unwrap()
+                .is_none());
         });
-
-        assert!(
-            reap_sudo_child(&mut child, stdout_task, std::time::Duration::from_millis(1)).await
-        );
-        assert!(child.try_wait().unwrap().is_some());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn daemon_socket_wait_outlives_the_old_sudo_deadline() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket_path = directory.path().join("rpc.sock");
-        let listener_path = socket_path.clone();
-        let listener = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            tokio::net::UnixListener::bind(listener_path).unwrap()
-        });
-        let mut sudo_child = tokio::process::Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-
-        let stream = wait_for_daemon_rpc_socket(&socket_path, &mut sudo_child)
+        let daemon = ElevatedDaemon {
+            rpc,
+            fd_channel: FdChannel::new(directory.path().join("fd.sock"), Arc::from("test")),
+            launcher_exit: completed_rx,
+            pid: 0,
+            rpc_sock_path: directory.path().join("rpc.sock"),
+            socket_directory: directory,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(1), daemon.exit())
             .await
+            .unwrap()
             .unwrap();
-
-        drop(stream);
-        drop(listener.await.unwrap());
-        sudo_child.start_kill().unwrap();
-        let _ = sudo_child.wait().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn daemon_socket_wait_reports_an_early_sudo_exit() {
-        let directory = tempfile::tempdir().unwrap();
-        let socket_path = directory.path().join("rpc.sock");
-        let mut sudo_child = tokio::process::Command::new("sh")
-            .args(["-c", "exit 23"])
-            .spawn()
-            .unwrap();
-
-        let error = wait_for_daemon_rpc_socket(&socket_path, &mut sudo_child)
-            .await
-            .unwrap_err();
-
-        assert!(error.to_string().contains("exit status: 23"));
-    }
-
-    #[test]
-    fn rpc_timeout_policy_keeps_commands_longer_than_coordination_calls() {
-        assert_eq!(
-            rpc_response_timeout(RpcFamily::Query),
-            rpc_response_timeout(RpcFamily::Session)
-        );
-        assert!(rpc_response_timeout(RpcFamily::Query) < rpc_response_timeout(RpcFamily::Job));
-        assert!(rpc_response_timeout(RpcFamily::Job) < rpc_response_timeout(RpcFamily::Command));
-    }
-
-    #[tokio::test]
-    async fn mutating_rpc_timeout_reports_an_unknown_outcome() {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let error = wait_for_rpc_response(
-            response_rx,
-            RpcMethod::MachineRuntimeControl,
-            std::time::Duration::from_millis(1),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("outcome is unknown"));
-        assert!(response_tx.is_closed());
-    }
-
-    #[tokio::test]
-    async fn job_rpc_timeout_requires_reconciliation() {
-        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
-        let error = wait_for_rpc_response(
-            response_rx,
-            RpcMethod::CancelDeployment,
-            std::time::Duration::from_millis(1),
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(error.to_string().contains("must be reconciled"));
-        assert!(response_tx.is_closed());
-    }
-
-    #[test]
-    fn pending_rpc_cleanup_removes_only_cancelled_receivers() {
-        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
-        let (active_tx, _active_rx) = tokio::sync::oneshot::channel();
-        drop(cancelled_rx);
-        let mut pending = PendingRpcResponses::from([(1, cancelled_tx), (2, active_tx)]);
-
-        assert_eq!(discard_cancelled_responses(&mut pending), 1);
-        assert!(!pending.contains_key(&1));
-        assert!(pending.contains_key(&2));
+        io.await.unwrap();
+        server.await.unwrap();
     }
 }

@@ -21,11 +21,11 @@ pub(crate) enum PermissionError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionLevel {
-    /// Process is root — all operations work without sudo.
+    /// Process is root — all operations work without a privilege launcher.
     Root,
-    /// Non-root with privileged operations routed through a sudo daemon.
+    /// Non-root with privileged operations routed through a root daemon.
     Elevated,
-    /// Non-root, no sudo — polkit handles authorization.
+    /// Non-root, no daemon — polkit handles authorization.
     User,
 }
 
@@ -85,8 +85,8 @@ impl DefaultPermissionManager {
     }
 
     /// Apply the elevation flag/config — upgrade User → Elevated.
-    pub fn with_elevation(mut self, use_sudo: bool) -> Self {
-        if use_sudo && self.level == PermissionLevel::User {
+    pub fn with_elevation(mut self, enabled: bool) -> Self {
+        if enabled && self.level == PermissionLevel::User {
             self.level = PermissionLevel::Elevated;
         }
         self

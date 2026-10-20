@@ -605,7 +605,12 @@ mod tests {
             Some(std::ffi::OsStr::new("truecolor"))
         );
         assert_eq!(command.get_env("NO_COLOR"), Some(std::ffi::OsStr::new("")));
-        assert_eq!(command.get_env("DISPLAY"), None);
+        // Guest DISPLAY is passed with --setenv; the machinectl client's own
+        // display stays as it was in the invoking environment.
+        assert_eq!(
+            command.get_env("DISPLAY"),
+            std::env::var_os("DISPLAY").as_deref()
+        );
     }
 
     #[test]

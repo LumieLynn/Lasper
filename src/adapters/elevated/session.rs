@@ -1,4 +1,7 @@
-use super::ElevatedDaemon;
+//! Session requests, descriptor handoffs, and lifecycle notifications.
+
+use crate::adapters::elevated::fd_channel::{pipe_reader_owned, receive_fd_response};
+use crate::adapters::elevated::ElevatedDaemon;
 use crate::application::sessions::{
     MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
     SessionError, TerminalOpenError, WaylandPreparationRequest, WaylandSessionContext,
@@ -46,10 +49,11 @@ impl ElevatedDaemon {
                 .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
         };
         let socket = self
-            .open_fd_channel(FdOperation::Journalctl(request))
+            .fd_channel
+            .open(FdOperation::Journalctl(request))
             .await?;
         let (message, fds) = tokio::task::spawn_blocking(move || {
-            super::receive_fd_response(&socket, "journal stream", JOURNAL_FD_HANDOFF_TIMEOUT)
+            receive_fd_response(&socket, "journal stream", JOURNAL_FD_HANDOFF_TIMEOUT)
         })
         .await??;
         if message.trim() != "ok" {
@@ -84,9 +88,9 @@ impl ElevatedDaemon {
             size: WireTerminalSize::from(size),
             launch,
         };
-        let socket = self.open_fd_channel(FdOperation::Terminal(request)).await?;
+        let socket = self.fd_channel.open(FdOperation::Terminal(request)).await?;
         let (message, fds) = tokio::task::spawn_blocking(move || {
-            super::receive_fd_response(&socket, "terminal", TERMINAL_FD_HANDOFF_TIMEOUT)
+            receive_fd_response(&socket, "terminal", TERMINAL_FD_HANDOFF_TIMEOUT)
         })
         .await
         .map_err(std::io::Error::other)??;
@@ -146,7 +150,8 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(params)
             .map_err(|error| SessionError::new(format!("encode Wayland validation: {error}")))?;
         let result = self
-            .rpc_call("prepare_wayland", params)
+            .rpc
+            .call("prepare_wayland", params)
             .await
             .map_err(|error| {
                 SessionError::new(format!("validate Wayland through daemon: {error}"))
@@ -184,7 +189,8 @@ impl ElevatedDaemon {
         let params = serde_json::to_value(params)
             .map_err(|error| SessionError::new(format!("encode X11 validation: {error}")))?;
         let result = self
-            .rpc_call("probe_x11_projection", params)
+            .rpc
+            .call("probe_x11_projection", params)
             .await
             .map_err(|error| SessionError::new(format!("validate X11 through daemon: {error}")))?;
         let response: ProbeX11ProjectionResponse = serde_json::from_value(result)
@@ -241,7 +247,7 @@ impl ElevatedDaemon {
             session_id: WireSessionId::new(session_id)?,
         })
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        self.rpc_call("close_session", params).await?;
+        self.rpc.call("close_session", params).await?;
         Ok(())
     }
 }
@@ -269,7 +275,7 @@ async fn read_lifecycle(status_fd: OwnedFd) -> std::io::Result<SessionLifecycle>
     use tokio::io::AsyncReadExt;
 
     const MAX_STATUS_BYTES: u64 = 4096;
-    let receiver = super::pipe_reader_owned(status_fd)?;
+    let receiver = pipe_reader_owned(status_fd)?;
     let mut bytes = Vec::new();
     receiver
         .take(MAX_STATUS_BYTES + 1)
@@ -402,7 +408,7 @@ mod tests {
         server.send_with_fd(&response, &[master]).unwrap();
         unsafe { libc::close(master) };
         let (message, fds) =
-            super::super::receive_fd_response(&client, "terminal", Duration::from_secs(1)).unwrap();
+            super::receive_fd_response(&client, "terminal", Duration::from_secs(1)).unwrap();
 
         let decoded: SpawnTerminalResponse = serde_json::from_str(&message).unwrap();
         assert!(matches!(
@@ -417,8 +423,7 @@ mod tests {
     fn terminal_fd_receiver_times_out_without_a_daemon_response() {
         let (_server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         let error =
-            super::super::receive_fd_response(&client, "terminal", Duration::from_millis(10))
-                .unwrap_err();
+            super::receive_fd_response(&client, "terminal", Duration::from_millis(10)).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("terminal FD response"));
     }
@@ -431,8 +436,7 @@ mod tests {
         unsafe { libc::close(read_fd) };
 
         let (_, received) =
-            super::super::receive_fd_response(&client, "journal stream", Duration::from_secs(1))
-                .unwrap();
+            super::receive_fd_response(&client, "journal stream", Duration::from_secs(1)).unwrap();
         drop(received);
         assert_pipe_reader_closed(&writer);
     }

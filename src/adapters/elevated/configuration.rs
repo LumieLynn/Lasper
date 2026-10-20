@@ -1,11 +1,47 @@
 //! Configuration replies preserve operation errors separately from RPC loss.
 
+use crate::adapters::config::store::{NspawnConfigOperation, NspawnConfigResult};
 use crate::adapters::elevated::ElevatedDaemon;
+use crate::adapters::platform::nvidia::state::{NvidiaStateOperation, NvidiaStateResult};
 use crate::application::configuration::ConfigurationError;
 use crate::ipc::protocol::configuration::{ConfigurationOperation, ConfigurationResult};
+use crate::ipc::protocol::systemd_unit as systemd_unit_wire;
 use crate::ipc::protocol::{error_code, RpcError};
 
 impl ElevatedDaemon {
+    pub(crate) async fn nspawn_config(
+        &self,
+        operation: NspawnConfigOperation,
+    ) -> std::io::Result<NspawnConfigResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc.call("nspawn_config", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn systemd_unit(
+        &self,
+        operation: systemd_unit_wire::SystemdUnitOperation,
+    ) -> std::io::Result<systemd_unit_wire::SystemdUnitResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc.call("systemd_unit", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    pub(crate) async fn nvidia_state(
+        &self,
+        operation: NvidiaStateOperation,
+    ) -> std::io::Result<NvidiaStateResult> {
+        let params = serde_json::to_value(operation)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let result = self.rpc.call("nvidia_state", params).await?;
+        serde_json::from_value(result)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     pub(crate) async fn configuration(
         &self,
         operation: ConfigurationOperation,
@@ -13,7 +49,8 @@ impl ElevatedDaemon {
         let mutation = operation.is_mutation();
         let params = serde_json::to_value(operation).map_err(ConfigurationError::invalid_input)?;
         let result = self
-            .rpc_call("configuration", params)
+            .rpc
+            .call("configuration", params)
             .await
             .map_err(|error| map_rpc_error(error, mutation))?;
         decode_reply(result, mutation)

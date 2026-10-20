@@ -35,7 +35,6 @@ pub struct PartialTheme {
     // Badges and status bar
     pub badge_root: Option<ColorDef>,
     pub badge_readonly: Option<ColorDef>,
-    #[serde(alias = "badge_cli")]
     pub badge_systemd_tools: Option<ColorDef>,
     pub status_info: Option<ColorDef>,
     pub status_success: Option<ColorDef>,

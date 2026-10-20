@@ -29,6 +29,8 @@ Each daemon session uses:
 
 The daemon exits when Lasper shuts it down normally or when its launching TUI exits. A crashed or forcibly terminated session can still leave a temporary directory behind, but its random path, directory permissions, peer checks, and session token prevent it from becoming a reusable daemon endpoint. Each daemon writes a uniquely named, root-owned `0600` session log under `/var/lib/lasper/logs`; a session is capped at 8 MiB, and startup cleanup keeps the retained logs within a fixed budget while leaving active logs untouched.
 
+The default privilege launcher is sudo. `--elevate=run0` uses polkit to start the daemon in a separate transient system service on systemd 256 or newer. The same RPC authentication and frontend pidfd monitor apply. Killing the run0 client alone does not stop that service. If the daemon fails to exit normally, Lasper requests a service stop without interactive authentication; host policy can reject that request, in which case Lasper reports that cleanup was not confirmed and identifies the service.
+
 ## Remaining Trust Boundary
 
 The authentication above isolates independent local processes and Lasper sessions. It does not protect against code already executing inside the launching Lasper process.

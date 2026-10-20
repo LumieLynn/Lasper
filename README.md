@@ -40,7 +40,7 @@ Optional:
 
 Read [CAVEATS.md](CAVEATS.md) and [SECURITY.md](SECURITY.md) before use. They describe host-side effects, experimental providers, the elevated daemon trust model, and the current dependency audit status. For common questions, see [FAQ.md](FAQ.md).
 
-The recommended mode is `lasper -e`. The TUI stays unprivileged and starts a separate root daemon through `sudo`, which brings a better experience for host integration. Running the entire TUI with `sudo lasper` remains supported for compatibility but exposes a larger root attack surface.
+The recommended mode is `lasper -e`. The TUI stays unprivileged and starts a separate root daemon through `sudo` by default, which brings a better experience for host integration. On systemd 256 or newer, `lasper --elevate=run0` can start the same daemon through run0 and polkit. Running the entire TUI with `sudo lasper` remains supported for compatibility but exposes a larger root attack surface.
 
 ## Installation
 
@@ -78,7 +78,7 @@ Lasper reads an optional TOML file from `~/.config/lasper/lasper.toml` once at s
 
 The configuration is typed and can control:
 
-- startup and communication behavior, including `elevate`, `systemd-tools`, journal `log-buffer-lines`, and terminal `scrollback-lines` limits;
+- startup and communication behavior, including `elevate`, `elevation-method`, `systemd-tools`, journal `log-buffer-lines`, and terminal `scrollback-lines` limits;
 - bootstrap defaults, named profiles, provider-specific policies, package inheritance, and local artifact paths for `debootstrap`, `pacstrap`, `dnf5`, and artifact imports;
 - NVIDIA CDI acquisition, including generated snapshots or an existing host `nvidia.yaml`/JSON document;
 - TUI colors and semantic status styling through the `[theme]` section.
@@ -95,9 +95,11 @@ Start the UI in the recommended elevated-daemon mode:
 lasper -e
 ```
 
+To try run0 as the privilege launcher, use `lasper --elevate=run0` or `lasper --elevate=run0 shell user@machine`. Set `elevation-method = "run0"` under `[settings]` to use it with ordinary `-e` invocations. Choosing a launcher does not change the D-Bus/systemd-tools backend selection. Authentication completes before the TUI takes over the terminal. Each run0 daemon uses its own temporary system service; if forced cleanup is needed, Lasper requests a stop without another authentication prompt and reports any failure.
+
 Run `lasper` without `-e` to rely on systemd/polkit for operations supported by the host policy.
 
-Pass `--version` or `--help` for version info and usage.
+Pass `--version` or `--help` for version info and usage. Use `lasper shell --help` or `lasper launch --help` for command-specific options.
 
 Press `a` or `n` to open the creation wizard.
 
@@ -110,13 +112,15 @@ Lasper also provides process-level selected-user shell commands that follow `mac
 ```bash
 lasper shell user@machine
 lasper shell --quiet user@machine
-lasper shell user@machine -- /usr/bin/kitty --single-instance
+lasper shell user@machine /usr/bin/kitty --single-instance
 lasper shell --with-x11 user@machine
-lasper launch user@machine -- /usr/bin/kitty --single-instance
-lasper launch --with-x11=:0 user@machine -- /usr/bin/kitty --single-instance
+lasper launch user@machine /usr/bin/kitty --single-instance
+lasper launch --with-x11=:0 user@machine /usr/bin/kitty --single-instance
 ```
 
 The executable is an absolute guest path, and the remaining values are passed as its `argv`. Automatic Wayland selection uses the current `WAYLAND_DISPLAY` only when its host socket is declared as a bind source in the machine's effective `.nspawn` configuration. Use `--no-wayland` to request a terminal-only session directly. `--with-x11` explicitly selects the current local `DISPLAY`.
+
+`--` is optional and ends Lasper option parsing: both `lasper shell user@machine -- /usr/bin/kitty` and `lasper shell -- user@machine /usr/bin/kitty` work. With no executable, `lasper shell user@machine --` opens the default shell. After the executable, all arguments belong to the guest command; for example, `lasper shell user@machine /bin/echo --help` passes `--help` to `/bin/echo`.
 
 Use `--wayland=SOCKET_NAME` or `--with-x11=:N` to explicitly select a Wayland or X11 display. Pass `--quiet` after `shell` to suppress detach and successful Wayland fallback notices; errors and guest output remain visible.
 
@@ -128,7 +132,7 @@ A desktop entry example:
 [Desktop Entry]
 Type=Application
 Name=Kitty (archlinux)
-Exec=lasper launch Lumie@archlinux -- /usr/bin/kitty --single-instance
+Exec=lasper launch Lumie@archlinux /usr/bin/kitty --single-instance
 Terminal=false
 ```
 

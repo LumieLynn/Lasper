@@ -3,6 +3,7 @@
 //! Reads `~/.config/lasper/lasper.toml`, which holds `[theme]` color overrides,
 //! `[settings]` for general application options, and typed bootstrap profiles.
 
+use crate::adapters::elevated::ElevationMethod;
 use crate::domain::bootstrap::{
     DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
@@ -20,8 +21,11 @@ pub const DEFAULT_SCROLLBACK_LINES: usize = 2_000;
 pub struct AppSettings {
     /// Always request root elevation on startup (equivalent to -e / --elevate).
     pub elevate: bool,
+    /// Privilege launcher used when elevation is enabled.
+    #[serde(rename = "elevation-method")]
+    pub elevation_method: ElevationMethod,
     /// Use runtime-state and systemd command backends instead of Lasper's DBus backend.
-    #[serde(rename = "systemd-tools", alias = "cli-mode")]
+    #[serde(rename = "systemd-tools")]
     pub systemd_tools: bool,
     /// Maximum log lines retained per container buffer.
     #[serde(rename = "log-buffer-lines")]
@@ -35,6 +39,7 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             elevate: false,
+            elevation_method: ElevationMethod::Sudo,
             systemd_tools: false,
             log_buffer_lines: 0,
             scrollback_lines: DEFAULT_SCROLLBACK_LINES,
@@ -376,13 +381,31 @@ mod tests {
     use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     #[test]
-    fn systemd_tools_setting_accepts_the_legacy_name() {
-        for key in ["systemd-tools", "cli-mode"] {
-            for enabled in [false, true] {
-                let config: AppConfig =
-                    toml::from_str(&format!("[settings]\n{key} = {enabled}\n")).unwrap();
-                assert_eq!(config.settings.systemd_tools, enabled);
-            }
+    fn elevation_method_defaults_to_sudo_and_does_not_enable_elevation_itself() {
+        assert_eq!(
+            AppSettings::default().elevation_method,
+            ElevationMethod::Sudo
+        );
+        for (name, method) in [
+            ("sudo", ElevationMethod::Sudo),
+            ("run0", ElevationMethod::Run0),
+        ] {
+            let config: AppConfig =
+                toml::from_str(&format!("[settings]\nelevation-method = \"{name}\"\n")).unwrap();
+            assert_eq!(config.settings.elevation_method, method);
+            assert!(!config.settings.elevate);
+        }
+        assert!(
+            toml::from_str::<AppConfig>("[settings]\nelevation-method = \"pkexec\"\n").is_err()
+        );
+    }
+
+    #[test]
+    fn systemd_tools_setting_selects_the_transport() {
+        for enabled in [false, true] {
+            let config: AppConfig =
+                toml::from_str(&format!("[settings]\nsystemd-tools = {enabled}\n")).unwrap();
+            assert_eq!(config.settings.systemd_tools, enabled);
         }
         assert!(!AppSettings::default().systemd_tools);
     }
@@ -409,29 +432,27 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_transport_settings_are_reported_instead_of_choosing_a_route() {
-        let loaded = parse_config(
-            "[settings]\nsystemd-tools = false\ncli-mode = true\n",
-            Path::new("lasper.toml"),
-        );
-        assert!(loaded
-            .diagnostic
-            .unwrap()
-            .summary
-            .contains("duplicate field"));
-    }
-
-    #[test]
-    fn systemd_tools_badge_accepts_the_legacy_theme_key() {
-        for key in ["badge_systemd_tools", "badge_cli"] {
-            let config: AppConfig = toml::from_str(&format!("[theme]\n{key} = 'cyan'\n")).unwrap();
-            assert!(config.theme.unwrap().badge_systemd_tools.is_some());
+    fn removed_cli_mode_setting_does_not_select_the_transport() {
+        for settings in ["cli-mode = true", "systemd-tools = false\ncli-mode = true"] {
+            let config: AppConfig = toml::from_str(&format!("[settings]\n{settings}\n")).unwrap();
+            assert!(!config.settings.systemd_tools);
         }
     }
 
     #[test]
+    fn systemd_tools_badge_accepts_its_theme_key() {
+        let config: AppConfig = toml::from_str("[theme]\nbadge_systemd_tools = 'cyan'\n").unwrap();
+        assert!(config.theme.unwrap().badge_systemd_tools.is_some());
+    }
+
+    #[test]
     fn unknown_theme_keys_produce_a_config_diagnostic() {
-        for key in ["accentt", "wizard_footer", "highlight_secondary"] {
+        for key in [
+            "accentt",
+            "wizard_footer",
+            "highlight_secondary",
+            "badge_cli",
+        ] {
             let loaded = parse_config(
                 &format!("[theme]\n{key} = 'cyan'\n"),
                 Path::new("lasper.toml"),

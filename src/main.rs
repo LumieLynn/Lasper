@@ -49,12 +49,12 @@ fn main() -> Result<()> {
     match dispatch {
         crate::cli::CliDispatch::Shell(command) => {
             let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
-            let code = runtime.block_on(run_shell_command(command));
+            let code = runtime.block_on(run_shell_command(*command));
             std::process::exit(code);
         }
         // 1b. Internal daemon mode — run as root child process with its
         //     dedicated current-thread runtime.
-        crate::cli::CliDispatch::Application(options) if options.is_daemon => {
+        crate::cli::CliDispatch::Daemon(options) => {
             let runtime = build_current_thread_runtime(DAEMON_MAX_BLOCKING_THREADS)?;
             runtime.block_on(crate::daemon::daemon_main(
                 options.fd_sock,
@@ -63,9 +63,9 @@ fn main() -> Result<()> {
                 options.daemon_pid,
             ));
         }
-        crate::cli::CliDispatch::Application(options) if options.internal_x11_reconcile => {
+        crate::cli::CliDispatch::X11Reconcile { want_systemd_tools } => {
             let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
-            runtime.block_on(run_x11_reconcile(options.want_systemd_tools))?;
+            runtime.block_on(run_x11_reconcile(want_systemd_tools))?;
         }
         crate::cli::CliDispatch::Application(options) => {
             let runtime = build_tui_runtime()?;
@@ -134,16 +134,21 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
     }
     let systemd_tools =
         command.wants_systemd_tools() || loaded_config.config.settings.systemd_tools;
-    let use_sudo = command.permits_elevation()
+    let use_elevation = command.permits_elevation()
         && crate::composition::DefaultPermissionManager::wants_elevation(
             command.wants_elevation(),
             &loaded_config.config.settings,
         );
     let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
-        crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
+        crate::composition::DefaultPermissionManager::new().with_elevation(use_elevation),
     );
+    let elevation_method = command
+        .elevation_method()
+        .unwrap_or(loaded_config.config.settings.elevation_method);
     let daemon = if pm.level() == crate::composition::PermissionLevel::Elevated {
-        match crate::adapters::elevated::ElevatedDaemon::spawn(!systemd_tools).await {
+        match crate::adapters::elevated::ElevatedDaemon::spawn(elevation_method, !systemd_tools)
+            .await
+        {
             Ok(daemon) => Some(std::sync::Arc::new(daemon)),
             Err(error) => {
                 eprintln!("lasper: failed to start elevated daemon: {error}");
@@ -183,8 +188,12 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
     } else {
         crate::cli::run_shell(command, &services.session, services.x11_access.as_ref()).await
     };
+    let mut cleanup_failed = false;
     if let Some(daemon) = daemon {
-        daemon.exit().await;
+        if let Err(error) = daemon.exit().await {
+            eprintln!("lasper: elevated daemon cleanup failed: {error}");
+            cleanup_failed = true;
+        }
     }
     let (code, failure) = match result {
         Ok(0) => (0, None),
@@ -208,7 +217,11 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
             eprintln!("lasper: desktop notification unavailable: {error}");
         }
     }
-    code
+    if code == 0 && cleanup_failed {
+        1
+    } else {
+        code
+    }
 }
 
 async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
@@ -225,31 +238,39 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     }
 
     // 3. Permission manager — no full-process elevation.
-    //    `-e` / `elevate = true` routes privileged work through a sudo daemon.
-    let use_sudo =
+    //    `-e` / `elevate = true` routes privileged work through a root daemon.
+    let use_elevation =
         crate::composition::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
     let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
-        crate::composition::DefaultPermissionManager::new().with_elevation(use_sudo),
+        crate::composition::DefaultPermissionManager::new().with_elevation(use_elevation),
     );
+    let elevation_method = options
+        .elevation_method
+        .unwrap_or(app_settings.elevation_method);
 
-    // 3b. Spawn elevated daemon before terminal takeover so the sudo
+    // 3b. Spawn elevated daemon before terminal takeover so the authentication
     //     password prompt (if any) appears on the clean terminal.
-    let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> =
-        if pm.level() == crate::composition::PermissionLevel::Elevated {
-            match crate::adapters::elevated::ElevatedDaemon::spawn(!want_systemd_tools).await {
-                Ok(d) => Some(std::sync::Arc::new(d)),
-                Err(e) => {
-                    eprintln!("Failed to start elevated daemon: {}", e);
-                    eprintln!(
-                        "For sudo errors, run `sudo -v`; otherwise inspect the reported \
-                         path or permission details."
-                    );
-                    std::process::exit(1);
+    let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> = if pm.level()
+        == crate::composition::PermissionLevel::Elevated
+    {
+        match crate::adapters::elevated::ElevatedDaemon::spawn(
+            elevation_method,
+            !want_systemd_tools,
+        )
+        .await
+        {
+            Ok(d) => Some(std::sync::Arc::new(d)),
+            Err(e) => {
+                eprintln!("Failed to start elevated daemon: {}", e);
+                if elevation_method == crate::adapters::elevated::ElevationMethod::Sudo {
+                    eprintln!("For sudo errors, run `sudo -v`; otherwise inspect the reported path or permission details.");
                 }
+                std::process::exit(1);
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // 3c. Validate the authority/daemon pairing before composing host adapters.
     let composition_mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
@@ -258,7 +279,11 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     let (log_dir, _log_guard) = crate::logging::init()?;
 
     log::info!("Lasper starting (log dir: {})", log_dir.display());
-    log::info!("Elevation mode: {}", use_sudo);
+    log::info!(
+        "Elevation mode: {} (launcher: {})",
+        use_elevation,
+        elevation_method
+    );
 
     // 5. Compose and run the application. Terminal ownership stays inside
     // the TUI launcher so a future CLI entry point can bypass it entirely.
@@ -347,12 +372,21 @@ async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
     }
 
     log::info!("[lasper] calling daemon.exit()...");
+    let mut cleanup_failed = false;
     if let Some(daemon) = daemon {
-        daemon.exit().await;
+        if let Err(error) = daemon.exit().await {
+            log::error!("Elevated daemon cleanup failed: {error}");
+            eprintln!("lasper: elevated daemon cleanup failed: {error}");
+            cleanup_failed = true;
+        }
     }
     log::info!("[lasper] daemon.exit() completed");
 
     log::info!("[lasper] main() returning");
-    let code = if result.is_ok() { 0 } else { 1 };
+    let code = if result.is_ok() && !cleanup_failed {
+        0
+    } else {
+        1
+    };
     std::process::exit(code);
 }
