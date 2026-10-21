@@ -1,4 +1,14 @@
-use anyhow::Result;
+//! Dispatch process entry points before initializing their runtime or services.
+
+use anyhow::{Context, Result};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
+
+use adapters::elevated::{ElevatedDaemon, ElevationMethod};
+use cli::{CliDispatch, CliOptions, ShellCommand, ShellIoMode};
+use composition::{CompositionMode, DefaultPermissionManager, PermissionLevel, PermissionManager};
+use tui::foundation::status::StatusLevel;
 
 mod adapters;
 mod application;
@@ -36,43 +46,79 @@ fn build_tui_runtime() -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-fn main() -> Result<()> {
-    // 1. Parse CLI flags — all early exits happen here, before terminal
-    //    takeover, so raw-mode / alternate-screen restoration is never needed.
-    //    The runtime is created only after dispatch so the daemon can use a
-    //    smaller current-thread executor than the interactive TUI.
-    let dispatch = match crate::cli::dispatch() {
+fn main() -> Result<ExitCode> {
+    // 1. Help, version and invalid arguments finish without a runtime,
+    //    configuration loading or terminal takeover.
+    let dispatch = match cli::dispatch() {
         Ok(dispatch) => dispatch,
-        Err(code) => std::process::exit(code),
+        Err(code) => return Ok(ExitCode::from(code as u8)),
     };
 
-    match dispatch {
-        crate::cli::CliDispatch::Shell(command) => {
-            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
-            let code = runtime.block_on(run_shell_command(*command));
-            std::process::exit(code);
+    // 2. Only the TUI needs a multithreaded scheduler. Shells and internal
+    //    workers obtain blocking threads on demand.
+    let runtime = match &dispatch {
+        CliDispatch::Application(_) => build_tui_runtime()?,
+        CliDispatch::Daemon(_) => build_current_thread_runtime(DAEMON_MAX_BLOCKING_THREADS)?,
+        CliDispatch::Shell(_) | CliDispatch::X11Reconcile { .. } => {
+            build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?
         }
-        // 1b. Internal daemon mode — run as root child process with its
-        //     dedicated current-thread runtime.
-        crate::cli::CliDispatch::Daemon(options) => {
-            let runtime = build_current_thread_runtime(DAEMON_MAX_BLOCKING_THREADS)?;
-            runtime.block_on(crate::daemon::daemon_main(
-                options.fd_sock,
-                options.rpc_sock,
-                options.daemon_uid,
-                options.daemon_pid,
-            ));
-        }
-        crate::cli::CliDispatch::X11Reconcile { want_systemd_tools } => {
-            let runtime = build_current_thread_runtime(SHELL_MAX_BLOCKING_THREADS)?;
-            runtime.block_on(run_x11_reconcile(want_systemd_tools))?;
-        }
-        crate::cli::CliDispatch::Application(options) => {
-            let runtime = build_tui_runtime()?;
-            runtime.block_on(run_application(options))?;
-        }
-    }
+    };
 
+    // 3. Each entry point owns its configuration, services and cleanup.
+    //    The daemon has its own authenticated bootstrap and shutdown path.
+    let result = runtime.block_on(async {
+        match dispatch {
+            CliDispatch::Shell(command) => Ok(run_shell_command(*command).await),
+            CliDispatch::Daemon(options) => {
+                daemon::daemon_main(
+                    options.fd_sock,
+                    options.rpc_sock,
+                    options.daemon_uid,
+                    options.daemon_pid,
+                )
+                .await
+            }
+            CliDispatch::X11Reconcile { want_systemd_tools } => {
+                run_x11_reconcile(want_systemd_tools).await.map(|()| 0)
+            }
+            CliDispatch::Application(options) => run_application(options).await.map(|()| 0),
+        }
+    });
+
+    // 4. Entry-point cleanup has completed. Tokio stdin may still have an
+    //    uncancellable blocking read; do not wait for it at process exit.
+    runtime.shutdown_background();
+    result.map(|code| ExitCode::from(code as u8))
+}
+
+async fn start_daemon(
+    level: PermissionLevel,
+    method: ElevationMethod,
+    systemd_tools: bool,
+) -> Result<Option<Arc<ElevatedDaemon>>> {
+    if level != PermissionLevel::Elevated {
+        return Ok(None);
+    }
+    let daemon = ElevatedDaemon::spawn(method, !systemd_tools)
+        .await
+        .with_context(|| match method {
+            ElevationMethod::Sudo => {
+                "failed to start elevated daemon using sudo; for authentication errors, try `sudo -v`"
+            }
+            ElevationMethod::Run0 => "failed to start elevated daemon using run0",
+        })?;
+    Ok(Some(Arc::new(daemon)))
+}
+
+async fn stop_daemon(daemon: Option<Arc<ElevatedDaemon>>) -> Result<()> {
+    if let Some(daemon) = daemon {
+        log::info!("Stopping elevated daemon");
+        if let Err(error) = daemon.exit().await {
+            log::error!("Elevated daemon cleanup failed: {error}");
+            return Err(error).context("elevated daemon cleanup failed");
+        }
+        log::info!("Elevated daemon stopped");
+    }
     Ok(())
 }
 
@@ -125,8 +171,8 @@ async fn run_x11_reconcile(systemd_tools: bool) -> Result<()> {
     }
 }
 
-async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
-    let launch_target = (command.io_mode() == crate::cli::ShellIoMode::Launcher)
+async fn run_shell_command(command: ShellCommand) -> i32 {
+    let launch_target = (command.io_mode() == ShellIoMode::Launcher)
         .then(|| format!("{}@{}", command.target().user(), command.target().machine()));
     let loaded_config = crate::config::load_config();
     if let Some(diagnostic) = loaded_config.diagnostic {
@@ -135,34 +181,29 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
     let systemd_tools =
         command.wants_systemd_tools() || loaded_config.config.settings.systemd_tools;
     let use_elevation = command.permits_elevation()
-        && crate::composition::DefaultPermissionManager::wants_elevation(
+        && DefaultPermissionManager::wants_elevation(
             command.wants_elevation(),
             &loaded_config.config.settings,
         );
-    let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
-        crate::composition::DefaultPermissionManager::new().with_elevation(use_elevation),
-    );
+    let pm = DefaultPermissionManager::new().with_elevation(use_elevation);
     let elevation_method = command
         .elevation_method()
         .unwrap_or(loaded_config.config.settings.elevation_method);
-    let daemon = if pm.level() == crate::composition::PermissionLevel::Elevated {
-        match crate::adapters::elevated::ElevatedDaemon::spawn(elevation_method, !systemd_tools)
-            .await
-        {
-            Ok(daemon) => Some(std::sync::Arc::new(daemon)),
-            Err(error) => {
-                eprintln!("lasper: failed to start elevated daemon: {error}");
-                std::process::exit(1);
-            }
+    let daemon = match start_daemon(pm.level(), elevation_method, systemd_tools).await {
+        Ok(daemon) => daemon,
+        Err(error) => {
+            eprintln!("lasper: {error:#}");
+            return 1;
         }
-    } else {
-        None
     };
-    let mode = match crate::composition::CompositionMode::new(pm.level(), daemon.clone()) {
+    let mode = match CompositionMode::new(pm.level(), daemon.clone()) {
         Ok(mode) => mode,
         Err(error) => {
             eprintln!("lasper: failed to compose shell services: {error}");
-            std::process::exit(1);
+            if let Err(error) = stop_daemon(daemon).await {
+                eprintln!("lasper: {error:#}");
+            }
+            return 1;
         }
     };
     let services = crate::composition::compose_process_shell_services(&mode, systemd_tools);
@@ -188,13 +229,15 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
     } else {
         crate::cli::run_shell(command, &services.session, services.x11_access.as_ref()).await
     };
-    let mut cleanup_failed = false;
-    if let Some(daemon) = daemon {
-        if let Err(error) = daemon.exit().await {
-            eprintln!("lasper: elevated daemon cleanup failed: {error}");
-            cleanup_failed = true;
+    drop(services);
+    drop(mode);
+    let cleanup_failed = match stop_daemon(daemon).await {
+        Ok(()) => false,
+        Err(error) => {
+            eprintln!("lasper: {error:#}");
+            true
         }
-    }
+    };
     let (code, failure) = match result {
         Ok(0) => (0, None),
         Ok(code) => {
@@ -224,169 +267,145 @@ async fn run_shell_command(command: crate::cli::ShellCommand) -> i32 {
     }
 }
 
-async fn run_application(options: crate::cli::CliOptions) -> Result<()> {
-    let want_elevation = options.want_elevation;
-    let mut want_systemd_tools = options.want_systemd_tools;
-
-    // 2. Parse configuration once for settings, theme, and bootstrap profiles.
+async fn run_application(options: CliOptions) -> Result<()> {
+    // 1. Resolve settings once; the same configuration supplies the TUI's
+    //    theme and bootstrap profiles later.
     let loaded_config = crate::config::load_config();
-    let config_diagnostic = loaded_config.diagnostic;
-    let app_config = std::sync::Arc::new(loaded_config.config);
-    let app_settings = &app_config.settings;
-    if !want_systemd_tools {
-        want_systemd_tools = app_settings.systemd_tools;
-    }
-
-    // 3. Permission manager — no full-process elevation.
-    //    `-e` / `elevate = true` routes privileged work through a root daemon.
+    let app_settings = &loaded_config.config.settings;
+    let systemd_tools = options.want_systemd_tools || app_settings.systemd_tools;
     let use_elevation =
-        crate::composition::DefaultPermissionManager::wants_elevation(want_elevation, app_settings);
-    let pm: std::sync::Arc<dyn crate::composition::PermissionManager> = std::sync::Arc::new(
-        crate::composition::DefaultPermissionManager::new().with_elevation(use_elevation),
-    );
+        DefaultPermissionManager::wants_elevation(options.want_elevation, app_settings);
+    let pm: Arc<dyn PermissionManager> =
+        Arc::new(DefaultPermissionManager::new().with_elevation(use_elevation));
     let elevation_method = options
         .elevation_method
         .unwrap_or(app_settings.elevation_method);
 
-    // 3b. Spawn elevated daemon before terminal takeover so the authentication
-    //     password prompt (if any) appears on the clean terminal.
-    let daemon: Option<std::sync::Arc<crate::adapters::elevated::ElevatedDaemon>> = if pm.level()
-        == crate::composition::PermissionLevel::Elevated
-    {
-        match crate::adapters::elevated::ElevatedDaemon::spawn(
-            elevation_method,
-            !want_systemd_tools,
-        )
-        .await
-        {
-            Ok(d) => Some(std::sync::Arc::new(d)),
-            Err(e) => {
-                eprintln!("Failed to start elevated daemon: {}", e);
-                if elevation_method == crate::adapters::elevated::ElevationMethod::Sudo {
-                    eprintln!("For sudo errors, run `sudo -v`; otherwise inspect the reported path or permission details.");
-                }
-                std::process::exit(1);
-            }
-        }
-    } else {
-        None
-    };
-
-    // 3c. Validate the authority/daemon pairing before composing host adapters.
-    let composition_mode = crate::composition::CompositionMode::new(pm.level(), daemon.clone())?;
-
-    // 4. Setup logging — always owned by the current user.
+    // 2. The current user owns the log. Keep its guard through daemon
+    //    shutdown, and record startup failures before taking over the terminal.
     let (log_dir, _log_guard) = crate::logging::init()?;
-
     log::info!("Lasper starting (log dir: {})", log_dir.display());
     log::info!(
-        "Elevation mode: {} (launcher: {})",
-        use_elevation,
+        "Process authority: {:?} (launcher: {})",
+        pm.level(),
         elevation_method
     );
 
-    // 5. Compose and run the application. Terminal ownership stays inside
-    // the TUI launcher so a future CLI entry point can bypass it entirely.
-    let log_buffer_lines = app_settings.log_buffer_lines;
+    // 3. Only privileged operations enter the root daemon. Authenticate
+    //    before raw mode so sudo/run0 can use the caller's terminal normally.
+    let daemon = start_daemon(pm.level(), elevation_method, systemd_tools)
+        .await
+        .inspect_err(|error| log::error!("{error:#}"))?;
+
+    // 4. All paths after a successful daemon launch meet at shutdown,
+    //    including service composition and terminal initialization failures.
+    let result = match CompositionMode::new(pm.level(), daemon.clone()) {
+        Ok(mode) => run_tui(loaded_config, pm, mode, systemd_tools).await,
+        Err(error) => Err(error.into()),
+    };
+    if let Err(error) = &result {
+        log::error!("Application error: {error:#}");
+    }
+    let cleanup = stop_daemon(daemon).await;
+    log::info!("Lasper stopped");
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => Err(error.context(format!("also {cleanup:#}"))),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+async fn run_tui(
+    loaded_config: crate::config::LoadedConfig,
+    permissions: Arc<dyn PermissionManager>,
+    mode: CompositionMode,
+    systemd_tools: bool,
+) -> Result<()> {
+    let app_config = Arc::new(loaded_config.config);
     let services = crate::composition::compose_application_services(
-        composition_mode,
-        want_systemd_tools,
+        mode,
+        systemd_tools,
         app_config.nvidia.source(),
     );
-    let deployment_recovery = if pm.level() == crate::composition::PermissionLevel::User {
-        None
+    let recovery_notice = if permissions.level().is_elevated() {
+        deployment_recovery_notice(&services.provisioning).await
     } else {
-        match services.provisioning.unfinished_deployments().await {
-            Ok(reports) if reports.is_empty() => None,
-            Ok(reports) => {
-                log::warn!(
-                    "Found {} unfinished deployment crash manifest(s); automatic replay and rollback are disabled",
-                    reports.len()
-                );
-                for report in &reports {
-                    log::warn!(
-                        "Unfinished deployment {} targets {} at revision {} ({:?})",
-                        report.manifest.deployment_id,
-                        report.manifest.target,
-                        report.manifest.revision,
-                        report.manifest.state,
-                    );
-                    if let Some(error) = &report.probe_error {
-                        log::warn!(
-                            "Deployment {} host evidence could not be collected: {error}",
-                            report.manifest.deployment_id
-                        );
-                    }
-                    for observation in &report.observations {
-                        log::info!(
-                            "Deployment {} recovery evidence: {} = {:?} (recorded={:?}, applying={})",
-                            report.manifest.deployment_id,
-                            observation.subject.resource.label(),
-                            observation.evidence,
-                            observation.subject.recorded_disposition,
-                            observation.subject.applying_when_interrupted,
-                        );
-                    }
-                }
-                Some((
-                    format!(
-                        "{} previous deployment(s) may be incomplete; inspect before cleanup.",
-                        reports.len()
-                    ),
-                    crate::tui::foundation::status::StatusLevel::Warn,
-                ))
-            }
-            Err(error) => {
-                log::error!("Could not inspect deployment recovery state: {error}");
-                Some((
-                    format!("Could not inspect deployment recovery state: {error}"),
-                    crate::tui::foundation::status::StatusLevel::Error,
-                ))
-            }
-        }
+        None
     };
     let mut app = tui::app::App::new(
-        pm,
-        want_systemd_tools,
-        log_buffer_lines,
+        permissions,
+        systemd_tools,
+        app_config.settings.log_buffer_lines,
         services,
         app_config,
     );
-    if let Some(diagnostic) = config_diagnostic {
+    if let Some(diagnostic) = loaded_config.diagnostic {
         log::warn!("{}", diagnostic.detail);
         app.set_status_for(
             diagnostic.summary,
-            crate::tui::foundation::status::StatusLevel::Warn,
-            std::time::Duration::from_secs(12),
+            StatusLevel::Warn,
+            Duration::from_secs(12),
         );
     }
-    if let Some((message, level)) = deployment_recovery {
-        app.set_status_for(message, level, std::time::Duration::from_secs(20));
+    if let Some((message, level)) = recovery_notice {
+        app.set_status_for(message, level, Duration::from_secs(20));
     }
+
+    // Display checks stay with shell/access actions, not TUI startup.
+    // Terminal takeover and restoration belong to the TUI launcher.
     log::debug!("Starting TUI terminal initialization");
-    let result = crate::tui::run(&mut app).await;
+    tui::run(&mut app).await
+}
 
-    if let Err(ref e) = result {
-        log::error!("Application error: {:#}", e);
-        eprintln!("Error: {:#}", e);
-    }
-
-    log::info!("[lasper] calling daemon.exit()...");
-    let mut cleanup_failed = false;
-    if let Some(daemon) = daemon {
-        if let Err(error) = daemon.exit().await {
-            log::error!("Elevated daemon cleanup failed: {error}");
-            eprintln!("lasper: elevated daemon cleanup failed: {error}");
-            cleanup_failed = true;
+async fn deployment_recovery_notice(
+    provisioning: &crate::application::provisioning::ProvisioningService,
+) -> Option<(String, StatusLevel)> {
+    match provisioning.unfinished_deployments().await {
+        Ok(reports) if reports.is_empty() => None,
+        Ok(reports) => {
+            log::warn!(
+                "Found {} unfinished deployment crash manifest(s); automatic replay and rollback are disabled",
+                reports.len()
+            );
+            for report in &reports {
+                log::warn!(
+                    "Unfinished deployment {} targets {} at revision {} ({:?})",
+                    report.manifest.deployment_id,
+                    report.manifest.target,
+                    report.manifest.revision,
+                    report.manifest.state,
+                );
+                if let Some(error) = &report.probe_error {
+                    log::warn!(
+                        "Deployment {} host evidence could not be collected: {error}",
+                        report.manifest.deployment_id
+                    );
+                }
+                for observation in &report.observations {
+                    log::info!(
+                        "Deployment {} recovery evidence: {} = {:?} (recorded={:?}, applying={})",
+                        report.manifest.deployment_id,
+                        observation.subject.resource.label(),
+                        observation.evidence,
+                        observation.subject.recorded_disposition,
+                        observation.subject.applying_when_interrupted,
+                    );
+                }
+            }
+            Some((
+                format!(
+                    "{} previous deployment(s) may be incomplete; inspect before cleanup.",
+                    reports.len()
+                ),
+                StatusLevel::Warn,
+            ))
+        }
+        Err(error) => {
+            log::error!("Could not inspect deployment recovery state: {error}");
+            Some((
+                format!("Could not inspect deployment recovery state: {error}"),
+                StatusLevel::Error,
+            ))
         }
     }
-    log::info!("[lasper] daemon.exit() completed");
-
-    log::info!("[lasper] main() returning");
-    let code = if result.is_ok() && !cleanup_failed {
-        0
-    } else {
-        1
-    };
-    std::process::exit(code);
 }
