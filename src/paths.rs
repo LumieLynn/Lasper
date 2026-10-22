@@ -48,6 +48,20 @@ const IMAGE_MOUNT_ROOT: &str = match option_env!("LASPER_IMAGE_MOUNT_DIR") {
     None => "/mnt",
 };
 
+const PCI_IDS_PATHS: &[&str] = match option_env!("LASPER_PCI_IDS_PATH") {
+    Some(path) => &[path],
+    None => &[
+        "/usr/share/hwdata/pci.ids",
+        "/usr/share/misc/pci.ids",
+        "/run/current-system/sw/share/pci.ids",
+    ],
+};
+
+/// Hardware names used by GPU discovery; packaging may supply a single path.
+pub(crate) fn pci_ids_paths() -> &'static [&'static str] {
+    PCI_IDS_PATHS
+}
+
 /// Persistent systemd administrator configuration root.
 pub fn systemd_config_root() -> PathBuf {
     PathBuf::from(SYSTEMD_CONFIG_ROOT)

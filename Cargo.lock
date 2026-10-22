@@ -1125,7 +1125,6 @@ dependencies = [
  "mockall",
  "notify",
  "parking_lot",
- "pciid-parser",
  "portable-pty",
  "ratatui",
  "rio-vt",
@@ -1546,12 +1545,6 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
-
-[[package]]
-name = "pciid-parser"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "978d5ddc523f0b9c63a3ccc75aef5b924962edf2097dd48f5b991df2951482f3"
 
 [[package]]
 name = "percent-encoding"
