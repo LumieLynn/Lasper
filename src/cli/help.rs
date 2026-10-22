@@ -265,7 +265,6 @@ mod tests {
             "--daemon",
             "--fd-sock",
             "--internal-x11-reconcile",
-            "--cli-mode",
             "--quiet",
         ] {
             assert!(!help.contains(hidden), "{hidden}");

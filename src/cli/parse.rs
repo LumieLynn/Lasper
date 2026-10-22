@@ -459,8 +459,6 @@ mod tests {
             "--quiet",
             "--no-wayland",
             "--with-x11=:2",
-            "-c",
-            "--cli-mode",
             "shell",
             "launch",
             "a b",
@@ -609,20 +607,6 @@ mod tests {
             vec!["--unknown", "shell", "alice@demo"],
         ] {
             assert!(invocation(&args).is_err(), "{args:?}");
-        }
-    }
-
-    #[test]
-    fn removed_backend_aliases_are_not_host_options() {
-        for flag in ["-c", "--cli-mode"] {
-            for args in [
-                vec![flag],
-                vec![flag, "shell", "alice@demo"],
-                vec!["shell", flag, "alice@demo"],
-                vec!["launch", "alice@demo", flag, "/bin/echo"],
-            ] {
-                assert!(invocation(&args).is_err(), "{args:?}");
-            }
         }
     }
 

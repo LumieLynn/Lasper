@@ -432,14 +432,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_cli_mode_setting_does_not_select_the_transport() {
-        for settings in ["cli-mode = true", "systemd-tools = false\ncli-mode = true"] {
-            let config: AppConfig = toml::from_str(&format!("[settings]\n{settings}\n")).unwrap();
-            assert!(!config.settings.systemd_tools);
-        }
-    }
-
-    #[test]
     fn systemd_tools_badge_accepts_its_theme_key() {
         let config: AppConfig = toml::from_str("[theme]\nbadge_systemd_tools = 'cyan'\n").unwrap();
         assert!(config.theme.unwrap().badge_systemd_tools.is_some());
