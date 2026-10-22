@@ -71,17 +71,16 @@ Tar rootfs extraction runs with the authority required to populate a managed con
 
 ## Dependency Audit
 
-The current lockfile has no direct dependency with a published RustSec vulnerability. `serde_yml` was replaced with the maintained `serde_yaml_ng` parser for NVIDIA CDI YAML input; the previous `libyml` and `serde_yml` advisories are therefore no longer present.
-
-`cargo audit` currently reports three transitive warnings from `ratatui 0.29`:
+On October 22, 2026, `cargo audit` completed without a vulnerability error and reported four unmaintained transitive dependency warnings for the current lockfile:
 
 | Advisory | Dependency path | Current assessment |
 | --- | --- | --- |
-| `RUSTSEC-2024-0436` | `ratatui -> paste` | `paste` is unmaintained, but the advisory reports no known vulnerability. |
-| `RUSTSEC-2026-0002` | `ratatui -> lru` | The advisory concerns `LruCache::iter_mut`; the ratatui layout cache does not call that API. |
-| `RUSTSEC-2026-0253` | `ratatui -> lru` | Exploitation requires `LruCache::pop` with a key whose destructor panics; the ratatui layout cache does not call that API. |
+| `RUSTSEC-2024-0449` | `serde_yaml_ng -> unsafe-libyaml` | The YAML parser's low-level dependency is unmaintained. This affects NVIDIA CDI YAML input. |
+| `RUSTSEC-2026-0370` | `zbus -> zvariant` | The standalone crate has been merged into zbus 6; Lasper currently uses zbus 5. |
+| `RUSTSEC-2026-0371` | `zbus -> zbus_names` | The standalone crate has been merged into zbus 6. |
+| `RUSTSEC-2026-0372` | `zbus -> zbus_macros -> zvariant_derive` | The derive macros are provided by zbus 6. |
 
-These are tracked as transitive dependency maintenance work, not ignored as direct application vulnerabilities. A future ratatui upgrade should remove them when it can be made without destabilizing the supported TUI and compiler matrix.
+These warnings remain dependency maintenance work. They are not evidence that the dependencies are safe, and resolving them requires a YAML parser change or a zbus migration. Run `cargo audit` against the current advisory database when building or redistributing Lasper.
 
 ## Native Tools Remain Useful
 
