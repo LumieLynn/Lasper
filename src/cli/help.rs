@@ -37,7 +37,7 @@ fn application_help() -> HelpPage<'static> {
         )
         .section(
             HelpSection::new("CONFIGURATION")
-                .paragraph("Defaults are read from ~/.config/lasper/config.toml. -e and -s enable their settings for this invocation; --elevate=METHOD also selects the launcher. See CONFIGURATION.md for all settings."),
+                .paragraph("Defaults are read from $XDG_CONFIG_HOME/lasper/lasper.toml (normally ~/.config/lasper/lasper.toml). -e and -s enable their settings for this invocation; --elevate=METHOD also selects the launcher. See CONFIGURATION.md for all settings."),
         )
 }
 
@@ -271,6 +271,8 @@ mod tests {
         }
         assert!(help.contains("-s, --systemd-tools"));
         let help = normalized(HelpTopic::Application);
+        assert!(help.contains("$XDG_CONFIG_HOME/lasper/lasper.toml"));
+        assert!(help.contains("~/.config/lasper/lasper.toml"));
         assert!(help.contains("lasper shell --help"));
         assert!(help.contains("lasper launch --help"));
     }
