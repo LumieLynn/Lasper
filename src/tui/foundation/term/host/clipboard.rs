@@ -1,4 +1,4 @@
-//! OSC 52 clipboard transport for the terminal panel.
+//! OSC 52 clipboard output to the outer terminal.
 //!
 //! The TUI already owns the user's terminal output.  Sending the selection
 //! through that output keeps clipboard integration independent of a desktop
@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SelectionTarget {
+pub enum ClipboardTarget {
     Clipboard,
     Primary,
 }
@@ -21,7 +21,7 @@ enum Transport {
     Screen,
 }
 
-impl SelectionTarget {
+impl ClipboardTarget {
     const fn parameter(self) -> &'static [u8] {
         match self {
             Self::Clipboard => b"c",
@@ -31,14 +31,27 @@ impl SelectionTarget {
 }
 
 /// Ask the outer terminal to store `text` in the requested selection.
-pub(crate) fn set(target: SelectionTarget, text: &str) -> io::Result<()> {
+pub(crate) fn set_clipboard(target: ClipboardTarget, text: &str) -> io::Result<()> {
+    write_clipboard(
+        &mut io::stdout().lock(),
+        target,
+        text,
+        transport_from_environment(),
+    )
+}
+
+fn write_clipboard(
+    output: &mut impl Write,
+    target: ClipboardTarget,
+    text: &str,
+    transport: Transport,
+) -> io::Result<()> {
     let mut encoded = String::with_capacity(encoded_len(text.len()));
     encode_base64(text.as_bytes(), &mut encoded);
 
-    let sequence = sequence(target, &encoded, transport_from_environment());
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(&sequence)?;
-    stdout.flush()
+    let sequence = sequence(target, &encoded, transport);
+    output.write_all(&sequence)?;
+    output.flush()
 }
 
 fn transport_from_environment() -> Transport {
@@ -51,7 +64,7 @@ fn transport_from_environment() -> Transport {
     }
 }
 
-fn sequence(target: SelectionTarget, encoded: &str, transport: Transport) -> Vec<u8> {
+fn sequence(target: ClipboardTarget, encoded: &str, transport: Transport) -> Vec<u8> {
     let mut osc = Vec::with_capacity(8 + encoded.len());
     osc.extend_from_slice(b"\x1b]52;");
     osc.extend_from_slice(target.parameter());
@@ -113,7 +126,9 @@ fn encode_base64(input: &[u8], output: &mut String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_base64, encoded_len, sequence, SelectionTarget, Transport};
+    use super::{
+        encode_base64, encoded_len, sequence, write_clipboard, ClipboardTarget, Transport,
+    };
 
     fn encode(input: &str) -> String {
         let mut output = String::with_capacity(encoded_len(input.len()));
@@ -140,21 +155,26 @@ mod tests {
     }
 
     #[test]
-    fn emits_direct_osc52_sequence() {
-        assert_eq!(
-            sequence(SelectionTarget::Clipboard, "Zm8=", Transport::Direct),
-            b"\x1b]52;c;Zm8=\x07"
-        );
+    fn a_clipboard_write_emits_one_encoded_request() {
+        let mut output = Vec::new();
+        write_clipboard(
+            &mut output,
+            ClipboardTarget::Clipboard,
+            "foo",
+            Transport::Direct,
+        )
+        .unwrap();
+        assert_eq!(output, b"\x1b]52;c;Zm9v\x07");
     }
 
     #[test]
     fn wraps_osc52_for_tmux_and_screen() {
         assert_eq!(
-            sequence(SelectionTarget::Primary, "Zg==", Transport::Tmux),
+            sequence(ClipboardTarget::Primary, "Zg==", Transport::Tmux),
             b"\x1bPtmux;\x1b\x1b]52;p;Zg==\x07\x1b\\"
         );
         assert_eq!(
-            sequence(SelectionTarget::Primary, "Zg==", Transport::Screen),
+            sequence(ClipboardTarget::Primary, "Zg==", Transport::Screen),
             b"\x1bP\x1b]52;p;Zg==\x07\x1b\\"
         );
     }

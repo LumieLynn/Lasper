@@ -122,7 +122,7 @@ impl App {
     pub async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-        cursor: &mut crate::tui::foundation::term::HostCursor,
+        cursor: &mut crate::tui::foundation::term::host::HostCursor,
     ) -> Result<()> {
         driver::run(self, terminal, cursor).await
     }

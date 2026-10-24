@@ -23,7 +23,7 @@ use std::sync::{
 };
 
 use crate::tui::app::App;
-use crate::tui::foundation::term::{HostCursor, HostCursorStyle};
+use crate::tui::foundation::term::host::{self, HostCursor, HostCursorStyle};
 
 struct TerminalRestoreGuard<F: FnMut()> {
     restore: F,
@@ -116,11 +116,10 @@ pub(crate) async fn run(app: &mut App) -> Result<()> {
     terminal_restore.arm();
 
     let mut stdout = io::stdout();
-    let appearance = crate::tui::foundation::term::probe_host_appearance(&mut stdout);
+    let appearance = host::probe_host_appearance(&mut stdout);
     cursor.set_original(appearance.cursor_style);
-    if let Some(background) = appearance.background {
-        app.terminal.set_host_background_color(background);
-    }
+    app.terminal
+        .set_host_colors(appearance.foreground, appearance.background);
     if let Some(HostCursorStyle::Explicit(style)) = appearance.cursor_style {
         app.terminal.set_host_cursor_style(style);
     }

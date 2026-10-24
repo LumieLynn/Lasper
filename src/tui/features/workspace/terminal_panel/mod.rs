@@ -1,6 +1,5 @@
 pub mod manager;
 mod mode;
-mod osc52;
 mod shell_prompt;
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
 use crate::tui::foundation::term::CursorStyle;

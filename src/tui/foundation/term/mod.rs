@@ -1,14 +1,12 @@
-mod appearance;
 pub mod attrs;
 pub mod color;
 mod cursor;
+pub(crate) mod host;
+mod osc;
 mod rio;
 
-pub(crate) use appearance::{
-    default_query_colors, probe_host_appearance, query_colors_with_background,
-};
 pub use color::Color;
-pub(crate) use cursor::{CursorStyle, HostCursor, HostCursorStyle};
+pub(crate) use host::CursorStyle;
 pub use rio::{
     BrowserMotion, BrowserSelectionKind, Cell, MouseProtocolEncoding, MouseProtocolMode,
     TerminalCore, TerminalKeyProtocol, VtEvent,

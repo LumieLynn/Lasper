@@ -18,7 +18,7 @@ const MAX_BACKGROUND_EVENTS_PER_FRAME: usize = 16;
 pub(super) async fn run(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    cursor: &mut crate::tui::foundation::term::HostCursor,
+    cursor: &mut crate::tui::foundation::term::host::HostCursor,
 ) -> Result<()> {
     // Initialize the global theme before any rendering.
     crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::load_theme(

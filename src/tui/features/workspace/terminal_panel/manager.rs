@@ -10,7 +10,8 @@ use crate::domain::machine::MachineName;
 use crate::domain::runtime::MachineEntry;
 use crate::domain::session::{SessionSize, TerminalAttachmentKind};
 use crate::tui::foundation::scrolling::ScrollAction;
-use crate::tui::foundation::term::{BrowserMotion, BrowserSelectionKind};
+use crate::tui::foundation::term::host::{self, ClipboardTarget};
+use crate::tui::foundation::term::{BrowserMotion, BrowserSelectionKind, VtEvent};
 use crate::tui::foundation::widgets::display::title_tabs::{
     clicked_title_tab, TitleTabHitbox, TitleTabViewport,
 };
@@ -103,11 +104,20 @@ fn spawn_output_parser(
                 events
             };
             for event in events {
-                let crate::tui::foundation::term::VtEvent::Reply(reply) = event else {
-                    continue;
-                };
-                if input.send_reply(reply.as_bytes().to_vec()).await == SessionSendStatus::Closed {
-                    return;
+                match event {
+                    VtEvent::Reply(reply) => {
+                        if input.send_reply(reply.as_bytes().to_vec()).await
+                            == SessionSendStatus::Closed
+                        {
+                            return;
+                        }
+                    }
+                    VtEvent::ClipboardWrite { target, text } => {
+                        if let Err(error) = host::set_clipboard(target, &text) {
+                            log::error!("Failed to send OSC 52 clipboard sequence: {error}");
+                        }
+                    }
+                    VtEvent::Bell => {}
                 }
             }
             redraw_gate.notify(&app_tx);
@@ -154,13 +164,17 @@ impl TerminalManager {
             session_service,
             redraw_gate: RedrawGate::new(),
             scrollback_lines,
-            query_colors: crate::tui::foundation::term::default_query_colors(),
+            query_colors: host::default_query_colors(),
             host_cursor_style: None,
         }
     }
 
-    pub(crate) fn set_host_background_color(&mut self, background: ColorRgb) {
-        self.query_colors = crate::tui::foundation::term::query_colors_with_background(background);
+    pub(crate) fn set_host_colors(
+        &mut self,
+        foreground: Option<ColorRgb>,
+        background: Option<ColorRgb>,
+    ) {
+        self.query_colors = host::query_colors_with_defaults(foreground, background);
         for session in &self.sessions {
             session.terminal.lock().set_query_colors(self.query_colors);
         }
@@ -644,7 +658,7 @@ impl TerminalManager {
                         let has_native_selection = mode.is_visual()
                             && s.terminal.lock().browser_selection_text().is_some();
                         if has_native_selection || s.selection.anchor != s.selection.extent {
-                            copy_selection(s, CopyTarget::Clipboard);
+                            copy_selection(s, ClipboardTarget::Clipboard);
                             if !has_native_selection {
                                 s.yanked = true;
                             }
@@ -884,7 +898,7 @@ impl TerminalManager {
             MouseEventKind::Up(MouseButton::Left) if session.selection.active => {
                 session.selection.active = false;
                 session.mouse_capture = false;
-                copy_selection(session, CopyTarget::Primary);
+                copy_selection(session, ClipboardTarget::Primary);
             }
             MouseEventKind::ScrollUp => {
                 adjust_scroll(session, ScrollAction::Up(3));
@@ -1063,13 +1077,7 @@ fn queue_input(input: &TerminalSessionInput, bytes: Vec<u8>) -> TerminalInputSta
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum CopyTarget {
-    Primary,
-    Clipboard,
-}
-
-fn copy_selection(session: &TerminalSession, target: CopyTarget) {
+fn copy_selection(session: &TerminalSession, target: ClipboardTarget) {
     let (ar, ac) = session.selection.anchor;
     let (er, ec) = session.selection.extent;
     let text = {
@@ -1087,11 +1095,7 @@ fn copy_selection(session: &TerminalSession, target: CopyTarget) {
         return;
     }
 
-    let target = match target {
-        CopyTarget::Clipboard => super::osc52::SelectionTarget::Clipboard,
-        CopyTarget::Primary => super::osc52::SelectionTarget::Primary,
-    };
-    if let Err(error) = super::osc52::set(target, &text) {
+    if let Err(error) = host::set_clipboard(target, &text) {
         log::error!("Failed to send OSC 52 clipboard sequence: {error}");
     }
 }
@@ -1146,6 +1150,7 @@ mod tests {
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use crate::tui::features::workspace::terminal_panel::mode::TerminalMode;
     use crate::tui::features::workspace::terminal_panel::TerminalPanel;
+    use crate::tui::foundation::term::host;
     use crate::tui::foundation::widgets::display::title_tabs::TitleTabHitbox;
     use crossterm::event::{
         KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1271,7 +1276,7 @@ mod tests {
                         24,
                         80,
                         100,
-                        crate::tui::foundation::term::default_query_colors(),
+                        host::default_query_colors(),
                         None,
                     ),
                 )),

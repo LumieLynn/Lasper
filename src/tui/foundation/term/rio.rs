@@ -7,7 +7,11 @@
 use compact_str::CompactString;
 use rio_vt::ansi::CursorShape;
 use rio_vt::ansi::KeyboardModes;
-use rio_vt::config::colors::{AnsiColor, ColorRgb, NamedColor};
+use rio_vt::clipboard::ClipboardType;
+use rio_vt::config::colors::{
+    term::{List as ColorPalette, TermColors},
+    AnsiColor, ColorRgb, Colors, NamedColor,
+};
 use rio_vt::crosswords::grid::Scroll;
 use rio_vt::crosswords::pos::{Boundary, Column, Line, Pos, Side};
 use rio_vt::crosswords::style::{Style, StyleFlags};
@@ -16,13 +20,15 @@ use rio_vt::crosswords::{Crosswords, CrosswordsSize, Mode};
 use rio_vt::event::{EventListener, RioEvent, WindowId};
 use rio_vt::performer::handler::{Handler, Processor};
 use rio_vt::selection::{Selection, SelectionType};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
-#[cfg(test)]
-use super::appearance::default_query_colors;
 use super::attrs::Attrs;
 use super::color::Color;
-use super::cursor::CursorStyle;
+use super::cursor::CursorRequestTracker;
+#[cfg(test)]
+use super::host::default_query_colors;
+use super::host::{ClipboardTarget, CursorStyle};
+use super::osc::OscMetadataFilter;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Size {
@@ -34,11 +40,15 @@ pub struct Size {
 pub enum VtEvent {
     Bell,
     Reply(CompactString),
+    /// A decoded application copy request, not a reply to its PTY.
+    ClipboardWrite {
+        target: ClipboardTarget,
+        text: String,
+    },
 }
 
 enum ListenerEvent {
-    Bell,
-    Reply(CompactString),
+    Terminal(VtEvent),
     ColorRequest(
         usize,
         Arc<dyn Fn(ColorRgb) -> String + Sync + Send + 'static>,
@@ -139,7 +149,6 @@ impl BrowserSelectionRange {
 #[derive(Default)]
 struct ListenerState {
     events: Vec<ListenerEvent>,
-    cursor_style_requested: bool,
 }
 
 #[derive(Clone, Default)]
@@ -150,18 +159,24 @@ struct Listener {
 impl EventListener for Listener {
     fn send_event(&self, event: RioEvent, _id: WindowId) {
         if matches!(event, RioEvent::CursorBlinkingChange) {
-            self.state
-                .lock()
-                .expect("rio event queue lock poisoned")
-                .cursor_style_requested = true;
             return;
         }
         // Rio's graphical frontend notifications have no consumer here. In
         // particular, viewport updates can emit events without any PTY output
         // arriving to drain this queue.
         let event = match event {
-            RioEvent::PtyWrite(_, text) => ListenerEvent::Reply(text.into()),
-            RioEvent::Bell(_) => ListenerEvent::Bell,
+            RioEvent::PtyWrite(_, text) => ListenerEvent::Terminal(VtEvent::Reply(text.into())),
+            RioEvent::Bell(_) => ListenerEvent::Terminal(VtEvent::Bell),
+            RioEvent::ClipboardStore(target, text) => {
+                let target = match target {
+                    ClipboardType::Clipboard => ClipboardTarget::Clipboard,
+                    ClipboardType::Selection => ClipboardTarget::Primary,
+                };
+                ListenerEvent::Terminal(VtEvent::ClipboardWrite { target, text })
+            }
+            // Reading the host clipboard would need a separate reply route
+            // and permission policy. OSC 52 writes do not imply read access.
+            RioEvent::ClipboardLoad(..) => return,
             RioEvent::ColorRequest(_, index, formatter) => {
                 ListenerEvent::ColorRequest(index, formatter)
             }
@@ -181,10 +196,11 @@ pub struct TerminalCore {
     processor: Processor,
     listener: Listener,
     input_buffer: Vec<u8>,
+    metadata_filter: OscMetadataFilter,
+    cursor_request_tracker: CursorRequestTracker,
     query_colors: [ColorRgb; 3],
     suppress_initial_line_breaks: bool,
     clear_primary_history_on_alt_exit: bool,
-    cursor_style_requested: bool,
     saved_primary_cursor: Option<EmbeddedCursorState>,
     browser_cursor_enabled: bool,
     saved_browser_cursor: Option<Pos>,
@@ -226,10 +242,11 @@ impl TerminalCore {
             processor: Processor::default(),
             listener,
             input_buffer: Vec::new(),
+            metadata_filter: OscMetadataFilter::default(),
+            cursor_request_tracker: CursorRequestTracker::default(),
             query_colors,
             suppress_initial_line_breaks: false,
             clear_primary_history_on_alt_exit: false,
-            cursor_style_requested: false,
             saved_primary_cursor: None,
             browser_cursor_enabled: false,
             saved_browser_cursor: None,
@@ -245,6 +262,7 @@ impl TerminalCore {
     }
 
     pub(crate) fn set_host_cursor_style(&mut self, style: CursorStyle) {
+        self.cursor_request_tracker.set_host_shape_known();
         let (shape, blinking) = match style {
             CursorStyle::BlinkingBlock => (CursorShape::Block, true),
             CursorStyle::SteadyBlock => (CursorShape::Block, false),
@@ -254,16 +272,16 @@ impl TerminalCore {
             CursorStyle::SteadyBar => (CursorShape::Beam, false),
         };
         self.core.default_cursor_shape = shape;
-        if !self.cursor_style_requested {
+        if !self.cursor_request_tracker.style_requested() {
             self.core.cursor_shape = shape;
             self.core.blinking_cursor = blinking;
         }
     }
 
-    /// Feed PTY output into the VT parser and return replies requested by the
-    /// application (for example DSR cursor reports).
+    /// Feed PTY output into the VT parser and emit PTY replies and host actions.
+    /// The caller routes them separately; a clipboard write is never PTY input.
     pub fn process(&mut self, data: &[u8], events: &mut Vec<VtEvent>) {
-        self.input_buffer.extend_from_slice(data);
+        self.metadata_filter.push(data, &mut self.input_buffer);
         self.process_input_buffer();
         let mut queued = self
             .listener
@@ -272,29 +290,37 @@ impl TerminalCore {
             .expect("rio event queue lock poisoned");
         for event in queued.events.drain(..) {
             match event {
-                ListenerEvent::Bell => events.push(VtEvent::Bell),
-                ListenerEvent::Reply(reply) => events.push(VtEvent::Reply(reply)),
+                ListenerEvent::Terminal(event) => events.push(event),
                 ListenerEvent::ColorRequest(index, formatter) => {
-                    events.push(VtEvent::Reply(formatter(self.query_color(index)).into()));
+                    if let Some(color) = self.query_color(index) {
+                        events.push(VtEvent::Reply(formatter(color).into()));
+                    }
                 }
             }
         }
     }
 
-    fn query_color(&self, index: usize) -> ColorRgb {
-        let fallback = match index {
-            value if value == NamedColor::Foreground as usize => self.query_colors[0],
-            value if value == NamedColor::Background as usize => self.query_colors[1],
-            value if value == NamedColor::Cursor as usize => self.query_colors[2],
-            _ => self.query_colors[1],
-        };
-
+    fn query_color(&self, index: usize) -> Option<ColorRgb> {
         if index < rio_vt::config::colors::term::COUNT {
-            self.core.colors()[index]
-                .map(ColorRgb::from_color_arr)
-                .unwrap_or(fallback)
-        } else {
-            fallback
+            if let Some(color) = self.core.colors()[index] {
+                return Some(ColorRgb::from_color_arr(color));
+            }
+        }
+        match index {
+            value if value == NamedColor::Foreground as usize => Some(self.query_colors[0]),
+            value if value == NamedColor::Background as usize => Some(self.query_colors[1]),
+            value if value == NamedColor::Cursor as usize => Some(self.query_colors[2]),
+            16..=255 => {
+                // Reuse Rio's extended palette, once per process. Its theme
+                // defaults must not replace the host's ANSI or default colors.
+                static PALETTE: LazyLock<ColorPalette> =
+                    LazyLock::new(|| ColorPalette::from(&Colors::default()));
+                Some(ColorRgb::from_color_arr(PALETTE[index]))
+            }
+            // The host's configurable ANSI palette is not captured. Leave
+            // unknown queries unanswered, rather than inventing background-
+            // colored entries which can make application text invisible.
+            _ => None,
         }
     }
 
@@ -331,6 +357,7 @@ impl TerminalCore {
     }
 
     fn advance(&mut self, bytes: &[u8]) {
+        self.cursor_request_tracker.advance(bytes);
         let was_alt_screen = self.core.mode().contains(Mode::ALT_SCREEN);
         if self.suppress_initial_line_breaks {
             for byte in bytes {
@@ -346,7 +373,6 @@ impl TerminalCore {
         } else {
             self.processor.advance(&mut self.core, bytes);
         }
-        self.consume_cursor_style_request();
         let is_alt_screen = self.core.mode().contains(Mode::ALT_SCREEN);
         if was_alt_screen && !is_alt_screen {
             self.restore_primary_cursor();
@@ -362,19 +388,7 @@ impl TerminalCore {
         EmbeddedCursorState {
             shape: self.core.cursor_shape,
             blinking: self.core.blinking_cursor,
-            requested: self.cursor_style_requested,
-        }
-    }
-
-    fn consume_cursor_style_request(&mut self) {
-        let mut state = self
-            .listener
-            .state
-            .lock()
-            .expect("rio event queue lock poisoned");
-        if state.cursor_style_requested {
-            self.cursor_style_requested = true;
-            state.cursor_style_requested = false;
+            requested: self.cursor_request_tracker.style_requested(),
         }
     }
 
@@ -384,7 +398,8 @@ impl TerminalCore {
         };
         self.core.cursor_shape = saved.shape;
         self.core.blinking_cursor = saved.blinking;
-        self.cursor_style_requested = saved.requested;
+        self.cursor_request_tracker
+            .restore_style_requested(saved.requested);
     }
 
     pub fn set_size(&mut self, rows: u16, cols: u16) {
@@ -433,13 +448,7 @@ impl TerminalCore {
     /// terminal-program cursor changes. The toggle is a local browser detail,
     /// so it must not turn on `cursor_style_requested` on the next PTY write.
     fn toggle_internal_vi_mode(&mut self) {
-        self.consume_cursor_style_request();
         self.core.toggle_vi_mode();
-        self.listener
-            .state
-            .lock()
-            .expect("rio event queue lock poisoned")
-            .cursor_style_requested = false;
     }
 
     #[must_use]
@@ -524,7 +533,7 @@ impl TerminalCore {
     pub fn screen(&self) -> TerminalScreen<'_> {
         TerminalScreen {
             core: &self.core,
-            cursor_style_requested: self.cursor_style_requested,
+            cursor_request_tracker: &self.cursor_request_tracker,
             browser_cursor_enabled: self.browser_cursor_enabled,
         }
     }
@@ -539,7 +548,7 @@ fn longest_suffix_prefix(bytes: &[u8], pattern: &[u8]) -> usize {
 
 pub struct TerminalScreen<'a> {
     core: &'a Crosswords<Listener>,
-    cursor_style_requested: bool,
+    cursor_request_tracker: &'a CursorRequestTracker,
     browser_cursor_enabled: bool,
 }
 
@@ -590,18 +599,8 @@ impl TerminalScreen<'_> {
     pub(crate) fn cursor_style(&self) -> Option<CursorStyle> {
         // Rio's configured default is screen state, not an application request
         // to overwrite the real host cursor.
-        if !self.cursor_style_requested {
-            return None;
-        }
-        match (self.core.cursor_shape, self.core.blinking_cursor) {
-            (CursorShape::Hidden, _) => None,
-            (CursorShape::Block, true) => Some(CursorStyle::BlinkingBlock),
-            (CursorShape::Block, false) => Some(CursorStyle::SteadyBlock),
-            (CursorShape::Underline, true) => Some(CursorStyle::BlinkingUnderline),
-            (CursorShape::Underline, false) => Some(CursorStyle::SteadyUnderline),
-            (CursorShape::Beam, true) => Some(CursorStyle::BlinkingBar),
-            (CursorShape::Beam, false) => Some(CursorStyle::SteadyBar),
-        }
+        self.cursor_request_tracker
+            .style(self.core.cursor_shape, self.core.blinking_cursor)
     }
 
     #[must_use]
@@ -670,7 +669,7 @@ impl TerminalScreen<'_> {
             .filter(|character| *character != '\0')
             .collect();
         let style = self.core.grid.style_of(&square);
-        Some(Cell::new(text, style))
+        Some(Cell::new(text, style, self.core.colors()))
     }
 
     /// Extract a stream selection using the same row-coordinate contract as
@@ -746,10 +745,10 @@ pub struct Cell {
 }
 
 impl Cell {
-    fn new(text: CompactString, style: Style) -> Self {
+    fn new(text: CompactString, style: Style, colors: &TermColors) -> Self {
         let mut attrs = Attrs {
-            fgcolor: map_color(style.fg),
-            bgcolor: map_color(style.bg),
+            fgcolor: map_color(style.fg, colors),
+            bgcolor: map_color(style.bg, colors),
             ..Attrs::default()
         };
         attrs.set_bold(style.flags.contains(StyleFlags::BOLD));
@@ -775,33 +774,44 @@ impl Cell {
     }
 }
 
-fn map_color(color: AnsiColor) -> Color {
-    match color {
-        AnsiColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
-        AnsiColor::Indexed(index) => Color::Idx(index),
-        AnsiColor::Named(named) => match named {
-            NamedColor::Foreground | NamedColor::LightForeground | NamedColor::DimForeground => {
-                Color::Default
-            }
-            NamedColor::Background => Color::Default,
-            NamedColor::Black | NamedColor::DimBlack => Color::BLACK,
-            NamedColor::Red | NamedColor::DimRed => Color::RED,
-            NamedColor::Green | NamedColor::DimGreen => Color::GREEN,
-            NamedColor::Yellow | NamedColor::DimYellow => Color::YELLOW,
-            NamedColor::Blue | NamedColor::DimBlue => Color::BLUE,
-            NamedColor::Magenta | NamedColor::DimMagenta => Color::MAGENTA,
-            NamedColor::Cyan | NamedColor::DimCyan => Color::CYAN,
-            NamedColor::White | NamedColor::DimWhite => Color::WHITE,
-            NamedColor::LightBlack => Color::BRIGHT_BLACK,
-            NamedColor::LightRed => Color::BRIGHT_RED,
-            NamedColor::LightGreen => Color::BRIGHT_GREEN,
-            NamedColor::LightYellow => Color::BRIGHT_YELLOW,
-            NamedColor::LightBlue => Color::BRIGHT_BLUE,
-            NamedColor::LightMagenta => Color::BRIGHT_MAGENTA,
-            NamedColor::LightCyan => Color::BRIGHT_CYAN,
-            NamedColor::LightWhite => Color::BRIGHT_WHITE,
-            NamedColor::Cursor => Color::Default,
-        },
+fn map_color(color: AnsiColor, colors: &TermColors) -> Color {
+    let (index, fallback) = match color {
+        AnsiColor::Spec(rgb) => return Color::Rgb(rgb.r, rgb.g, rgb.b),
+        AnsiColor::Indexed(index) => (usize::from(index), Color::Idx(index)),
+        AnsiColor::Named(named) => (named as usize, map_named_color(named)),
+    };
+    // Rio stores OSC 4/10/11 changes separately from cell styles. Resolve
+    // overrides when drawing so existing cells change too, without changing
+    // the host terminal's own palette or losing its defaults on OSC resets.
+    colors[index].map_or(fallback, |color| {
+        let rgb = ColorRgb::from_color_arr(color);
+        Color::Rgb(rgb.r, rgb.g, rgb.b)
+    })
+}
+
+fn map_named_color(named: NamedColor) -> Color {
+    match named {
+        NamedColor::Foreground | NamedColor::LightForeground | NamedColor::DimForeground => {
+            Color::Default
+        }
+        NamedColor::Background => Color::Default,
+        NamedColor::Black | NamedColor::DimBlack => Color::BLACK,
+        NamedColor::Red | NamedColor::DimRed => Color::RED,
+        NamedColor::Green | NamedColor::DimGreen => Color::GREEN,
+        NamedColor::Yellow | NamedColor::DimYellow => Color::YELLOW,
+        NamedColor::Blue | NamedColor::DimBlue => Color::BLUE,
+        NamedColor::Magenta | NamedColor::DimMagenta => Color::MAGENTA,
+        NamedColor::Cyan | NamedColor::DimCyan => Color::CYAN,
+        NamedColor::White | NamedColor::DimWhite => Color::WHITE,
+        NamedColor::LightBlack => Color::BRIGHT_BLACK,
+        NamedColor::LightRed => Color::BRIGHT_RED,
+        NamedColor::LightGreen => Color::BRIGHT_GREEN,
+        NamedColor::LightYellow => Color::BRIGHT_YELLOW,
+        NamedColor::LightBlue => Color::BRIGHT_BLUE,
+        NamedColor::LightMagenta => Color::BRIGHT_MAGENTA,
+        NamedColor::LightCyan => Color::BRIGHT_CYAN,
+        NamedColor::LightWhite => Color::BRIGHT_WHITE,
+        NamedColor::Cursor => Color::Default,
     }
 }
 
@@ -1035,6 +1045,98 @@ mod tests {
     }
 
     #[test]
+    fn rio_applies_and_resets_palette_changes_to_existing_cells() {
+        use crate::tui::foundation::term::Color;
+
+        let mut terminal = TerminalCore::new(24, 80, 100);
+        terminal.process(b"\x1b[31mA\x1b[38;5;1mB", &mut Vec::new());
+        terminal.process(b"\x1b]4;1;rgb:33/66/99\x07", &mut Vec::new());
+        for col in [0, 1] {
+            assert_eq!(
+                terminal.screen().cell(0, col).unwrap().attrs().fgcolor,
+                Color::Rgb(51, 102, 153)
+            );
+        }
+        terminal.process(b"\x1b]104;1\x07", &mut Vec::new());
+        for col in [0, 1] {
+            assert_eq!(
+                terminal.screen().cell(0, col).unwrap().attrs().fgcolor,
+                Color::Idx(1)
+            );
+        }
+    }
+
+    #[test]
+    fn palette_queries_do_not_report_unknown_entries_as_the_background() {
+        let mut terminal = TerminalCore::new(24, 80, 100);
+        let mut events = Vec::new();
+        terminal.process(b"\x1b]4;1;?\x07", &mut events);
+        assert!(events.is_empty());
+
+        terminal.process(
+            b"\x1b]4;196;?;244;?\x07\x1b]4;1;rgb:33/66/99\x07\x1b]4;1;?\x07",
+            &mut events,
+        );
+        let replies: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                super::VtEvent::Reply(reply) => Some(reply.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                "\x1b]4;196;rgb:ffff/0000/0000\x07",
+                "\x1b]4;244;rgb:8080/8080/8080\x07",
+                "\x1b]4;1;rgb:3333/6666/9999\x07",
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_metadata_does_not_change_text_styles_or_hide_following_queries() {
+        let mut terminal = TerminalCore::new(24, 80, 100);
+        let mut events = Vec::new();
+        let output = b"\x1b]3008;start=abc;user=root\x1b\\\x1b]1;working\x07\x1b[2;38;2;128;129;130mW\x1b[0m\x1b[6n";
+        for chunk in output.chunks(3) {
+            terminal.process(chunk, &mut events);
+        }
+        let cell = terminal.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.contents(), "W");
+        assert_eq!(
+            cell.attrs().fgcolor,
+            crate::tui::foundation::term::Color::Rgb(128, 129, 130)
+        );
+        assert!(cell.attrs().dim());
+        assert!(
+            matches!(events.as_slice(), [super::VtEvent::Reply(reply)] if reply == "\x1b[1;2R")
+        );
+    }
+
+    #[test]
+    fn rio_applies_and_resets_default_colors_without_leaking_to_the_host() {
+        use crate::tui::foundation::term::Color;
+
+        let mut terminal = TerminalCore::new(24, 80, 100);
+        let mut events = Vec::new();
+        terminal.process(
+            b"A\x1b]10;rgb:33/66/99\x07\x1b]11;rgb:66/99/cc\x07",
+            &mut events,
+        );
+        let cell = terminal.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.attrs().fgcolor, Color::Rgb(51, 102, 153));
+        assert_eq!(cell.attrs().bgcolor, Color::Rgb(102, 153, 204));
+        assert!(events.is_empty());
+
+        terminal.process(b"\x1b]110\x07\x1b]111\x07", &mut events);
+        let cell = terminal.screen().cell(0, 0).unwrap();
+        assert_eq!(cell.attrs().fgcolor, Color::Default);
+        assert_eq!(cell.attrs().bgcolor, Color::Default);
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn rio_delivers_replies_and_bells_without_forwarding_window_events() {
         let mut terminal = TerminalCore::new(24, 80, 100);
         let mut events = Vec::new();
@@ -1046,6 +1148,43 @@ mod tests {
 
         terminal.process(b"", &mut events);
         assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn osc52_writes_emit_one_clipboard_event_and_no_pty_reply() {
+        for (selector, target) in [
+            ("c", super::ClipboardTarget::Clipboard),
+            ("p", super::ClipboardTarget::Primary),
+            ("s", super::ClipboardTarget::Primary),
+        ] {
+            for terminator in ["\x07", "\x1b\\"] {
+                let sequence = format!("\x1b]52;{selector};Zm9v{terminator}");
+                for chunk_size in 1..=sequence.len() {
+                    let mut terminal = TerminalCore::new(24, 80, 100);
+                    let mut events = Vec::new();
+                    for chunk in sequence.as_bytes().chunks(chunk_size) {
+                        terminal.process(chunk, &mut events);
+                    }
+                    assert!(matches!(
+                        events.as_slice(),
+                        [super::VtEvent::ClipboardWrite { target: actual, text }]
+                            if *actual == target && text == "foo"
+                    ));
+
+                    events.clear();
+                    terminal.process(b"", &mut events);
+                    assert!(events.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn osc52_queries_do_not_read_or_echo_the_host_clipboard() {
+        let mut terminal = TerminalCore::new(24, 80, 100);
+        let mut events = Vec::new();
+        terminal.process(b"\x1b]52;c;?\x07\x1b]52;p;?\x1b\\", &mut events);
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -1175,6 +1314,17 @@ mod tests {
         // an explicit application style. A later PTY write must not turn Rio's
         // internal VI notification into a steady-block override.
         terminal.process(b"prompt", &mut Vec::new());
+        assert_eq!(terminal.screen().cursor_style(), None);
+    }
+
+    #[test]
+    fn application_cursor_reset_after_browser_navigation_returns_to_inheritance() {
+        let mut terminal = TerminalCore::new(4, 20, 20);
+        terminal.process(b"prompt\x1b[?12l", &mut Vec::new());
+        terminal.set_browser_mode(true);
+        terminal.browser_motion(BrowserMotion::Left);
+        terminal.set_browser_mode(false);
+        terminal.process(b"\x1b[0 q", &mut Vec::new());
         assert_eq!(terminal.screen().cursor_style(), None);
     }
 
