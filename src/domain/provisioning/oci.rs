@@ -233,3 +233,26 @@ mod tests {
         assert!(serde_json::from_str::<OciReference>(r#""docker://nginx""#).is_err());
     }
 }
+
+/// Network modes supported by the system-scoped OCI import operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OciNetworkMode {
+    /// Share the host network namespace.
+    #[default]
+    Host,
+    /// Create a private network namespace with loopback only.
+    Isolated,
+    /// Create a veth pair connected to a private network namespace.
+    Veth,
+}
+
+impl OciNetworkMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::Isolated => "isolated",
+            Self::Veth => "veth",
+        }
+    }
+}

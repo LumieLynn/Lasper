@@ -650,9 +650,11 @@ pub(crate) async fn submit(
         request,
         secrets,
     } = params;
-    if let Err(error) = crate::adapters::provisioning::validate_nspawn_config(&request.config) {
-        let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
-        return;
+    if let Some(machine) = request.machine_config() {
+        if let Err(error) = crate::adapters::provisioning::validate_nspawn_config(machine) {
+            let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
+            return;
+        }
     }
     let plan = match DeploymentPlan::build(request.clone()) {
         Ok(plan) => plan,
@@ -669,10 +671,7 @@ pub(crate) async fn submit(
         let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }
-    let expects_artifact = matches!(
-        &request.source,
-        crate::application::provisioning::DeploymentSource::Artifact(_)
-    );
+    let expects_artifact = request.local_artifact_path().is_some();
     let artifact_source = if expects_artifact {
         match receive_artifact_source(stream).await {
             Ok(source) => Some(source),
@@ -973,11 +972,9 @@ fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
-    use crate::application::provisioning::{
-        DeploymentEvent, DeploymentRequest, DeploymentSource, DeploymentStorage,
-    };
+    use crate::application::provisioning::DeploymentEvent;
     use crate::domain::machine::MachineName;
+    use crate::domain::provisioning::DeploymentSpec;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncBufReadExt;
@@ -1003,20 +1000,12 @@ mod tests {
     }
 
     fn plan(target: &str) -> DeploymentPlan {
-        DeploymentPlan::build(DeploymentRequest {
-            config: MachineProvisioningConfig {
+        DeploymentPlan::build(DeploymentSpec::Clone(
+            crate::domain::provisioning::CloneDeployment {
                 name: target.into(),
-                ..Default::default()
-            },
-            source: DeploymentSource::Copy {
                 source_name: "base".into(),
             },
-            storage: DeploymentStorage::Directory,
-            nvidia_profile: None,
-            nvidia_cdi_source: Default::default(),
-            wayland: Vec::new(),
-            allow_unsafe_remote_tar: false,
-        })
+        ))
         .unwrap()
     }
 

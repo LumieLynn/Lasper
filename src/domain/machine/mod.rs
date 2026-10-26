@@ -1,3 +1,12 @@
+pub mod accounts;
+pub mod config;
+
+pub use accounts::{validate_login_shell, validate_login_username, CreateUser};
+pub use config::{
+    validate_network_interface_name, BindMount, IdmapSuffix, MachineConfig, NetworkMode,
+    PortForward, PrivateUsersMode,
+};
+
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 

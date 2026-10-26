@@ -380,27 +380,18 @@ fn map_state_error(error: NspawnError) -> DeploymentStateError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
-        DeploymentManifestState, DeploymentPlan, DeploymentRequest, DeploymentSource,
-        DeploymentStage, DeploymentStorage, ResourceLedger,
+        DeploymentManifestState, DeploymentPlan, DeploymentStage, ResourceLedger,
     };
+    use crate::domain::provisioning::DeploymentSpec;
 
     fn plan() -> DeploymentPlan {
-        DeploymentPlan::build(DeploymentRequest {
-            config: MachineProvisioningConfig {
+        DeploymentPlan::build(DeploymentSpec::Clone(
+            crate::domain::provisioning::CloneDeployment {
                 name: "test".into(),
-                ..Default::default()
-            },
-            source: DeploymentSource::Copy {
                 source_name: "base".into(),
             },
-            storage: DeploymentStorage::Directory,
-            nvidia_profile: None,
-            nvidia_cdi_source: Default::default(),
-            wayland: Vec::new(),
-            allow_unsafe_remote_tar: false,
-        })
+        ))
         .unwrap()
     }
 

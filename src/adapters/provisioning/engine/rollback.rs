@@ -60,7 +60,7 @@ pub(super) async fn inspect_deployment_sidecars(
 pub(super) async fn rollback_apply_report(
     name: &str,
     report: &mut ApplyReport,
-    storage: &dyn StorageBackend,
+    storage: Option<&dyn StorageBackend>,
     host: &DirectProvisioningCapabilities,
     logs: &Sender<DeployLogEvent>,
     job: &DeploymentJobContext,
@@ -103,7 +103,12 @@ pub(super) async fn rollback_apply_report(
             DeploymentResource::LocalStorage(_) => {
                 let blockers = report.removal_blockers(AppliedResource::LocalStorage);
                 if blockers.is_empty() {
-                    storage.delete(name).await
+                    match storage {
+                        Some(storage) => storage.delete(name).await,
+                        None => Err(NspawnError::Runtime(
+                            "local storage was recorded without a storage backend".into(),
+                        )),
+                    }
                 } else {
                     Err(NspawnError::Runtime(format!(
                         "local storage removal blocked: {}",

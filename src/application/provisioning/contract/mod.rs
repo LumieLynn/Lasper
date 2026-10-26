@@ -1,11 +1,8 @@
-mod config;
 mod identity;
 mod job;
-mod request;
 mod resource;
 mod secrets;
 
-pub use config::MachineProvisioningConfig;
 pub use identity::DeploymentId;
 pub(crate) use identity::DeploymentRequestId;
 pub(crate) use job::{
@@ -16,7 +13,6 @@ pub use job::{
     DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentStatus,
     RemoteTarSafety, SourcePreflight,
 };
-pub use request::{DeploymentRequest, DeploymentSource, DeploymentStorage};
 pub(crate) use resource::ResourceApplyStatus;
 pub(crate) use secrets::DeploymentSecretsWire;
 pub use secrets::{DeploymentSecrets, DeploymentStartError, DeploymentSubmission, UserSecret};

@@ -10,9 +10,9 @@ use crate::adapters::rootfs::process::{
     DefaultRootfsProcessRunner, RootfsProcessRunner, ROOTFS_COMMAND_TIMEOUT,
 };
 use crate::adapters::rootfs::users;
+use crate::domain::machine::CreateUser;
 use crate::domain::machine::GuestHostname;
 use crate::domain::machine::MachineName;
-use crate::domain::provisioning::CreateUser;
 use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;
 use serde::{Deserialize, Serialize};
@@ -417,7 +417,7 @@ async fn execute_rootfs_operation_with_runners(
             })
         }
         RootfsOperation::ResolveUserIdentity(request) => {
-            crate::domain::provisioning::validate_login_username(&request.username)
+            crate::domain::machine::validate_login_username(&request.username)
                 .map_err(|error| NspawnError::Validation(error.to_string()))?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;

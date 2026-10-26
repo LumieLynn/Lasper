@@ -1,7 +1,7 @@
 use super::{NspawnConfigSpec, ALL_DRM_DEVICES_PATH};
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::wayland::WaylandBind;
-use crate::domain::provisioning::PrivateUsersMode;
+use crate::domain::machine::PrivateUsersMode;
 use crate::domain::wayland::WaylandBindPolicy;
 use ini::{EscapePolicy, Ini};
 use std::collections::{BTreeSet, HashSet};
@@ -564,7 +564,7 @@ pub(crate) fn nspawn_config_content_from_spec_with_wayland_binds(
 
     //[Network]
     if let Some(mode) = &spec.network {
-        use crate::domain::provisioning::NetworkMode;
+        use crate::domain::machine::NetworkMode;
         match mode {
             NetworkMode::Host => {
                 conf.with_section(Some("Network"))
@@ -754,14 +754,14 @@ fn validated_nspawn_path<'a>(label: &str, path: &'a Path) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
-    use crate::domain::provisioning::{BindMount, IdmapSuffix};
+    use crate::domain::machine::MachineConfig;
+    use crate::domain::machine::{BindMount, IdmapSuffix};
 
-    fn nspawn_config_content(cfg: &MachineProvisioningConfig) -> Result<String> {
+    fn nspawn_config_content(cfg: &MachineConfig) -> Result<String> {
         let spec = NspawnConfigSpec::try_from(cfg)?;
         nspawn_config_content_from_spec_with_wayland_binds(&spec, &[])
     }
-    use crate::domain::provisioning::{NetworkMode, PortForward, PrivateUsersMode};
+    use crate::domain::machine::{NetworkMode, PortForward, PrivateUsersMode};
 
     // Validation
 
@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_minimal() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             boot: true,
             ..Default::default()
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_boot_disabled() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             boot: false,
             ..Default::default()
@@ -942,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_host_network() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Host),
             ..Default::default()
@@ -955,7 +955,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_network_veth_with_ports() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Veth),
             port_forwards: vec![
@@ -981,7 +981,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_bridge_mode() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::Bridge("br0".into())),
             ..Default::default()
@@ -992,7 +992,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_privileged() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             privileged: true,
             ..Default::default()
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_no() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::No),
             ..Default::default()
@@ -1014,7 +1014,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_explicit_yes() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Yes),
             ..Default::default()
@@ -1025,7 +1025,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_pick() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1036,7 +1036,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_managed() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             network: Some(NetworkMode::None),
             private_users: Some(PrivateUsersMode::Managed),
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_private_users_identity() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             private_users: Some(PrivateUsersMode::Identity),
             ..Default::default()
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_nvidia_marker() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".to_string(),
             nvidia_gpu: true,
             ..Default::default()
@@ -1072,7 +1072,7 @@ mod tests {
 
     #[test]
     fn test_nspawn_config_content_rejects_invalid_name() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "../escape".to_string(),
             ..Default::default()
         };
@@ -1244,9 +1244,9 @@ mod tests {
 
     #[test]
     fn ordinary_binds_escape_colons_and_backslashes() {
-        use crate::domain::provisioning::{BindMount, IdmapSuffix};
+        use crate::domain::machine::{BindMount, IdmapSuffix};
 
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".into(),
             device_binds: vec![r"/dev/dri/by-path/pci-0000:01:00.0-card".into()],
             readonly_binds: vec![r"/srv/driver\archive:current".into()],
@@ -1297,7 +1297,7 @@ mod tests {
         .unwrap();
         let intent = crate::domain::x11::X11BindIntent::same_path(socket);
 
-        let idmapped = MachineProvisioningConfig {
+        let idmapped = MachineConfig {
             name: "idmapped".into(),
             private_users: Some(PrivateUsersMode::Pick),
             x11_binds: vec![intent.clone()],
@@ -1307,7 +1307,7 @@ mod tests {
         assert!(content.contains("BindReadOnly=/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:idmap"));
         assert!(!content.contains("\nBind=/tmp/.X11-unix/X0:"));
 
-        let noidmap = MachineProvisioningConfig {
+        let noidmap = MachineConfig {
             name: "noidmap".into(),
             private_users: Some(PrivateUsersMode::No),
             x11_binds: vec![intent],
@@ -1321,7 +1321,7 @@ mod tests {
     #[test]
     fn x11_directory_bind_is_read_only_and_uses_the_effective_namespace_policy() {
         let directory = crate::domain::x11::X11BindIntent::standard_directory();
-        let idmapped = MachineProvisioningConfig {
+        let idmapped = MachineConfig {
             name: "directory-idmapped".into(),
             private_users: Some(PrivateUsersMode::Pick),
             x11_binds: vec![directory.clone()],
@@ -1330,7 +1330,7 @@ mod tests {
         let content = nspawn_config_content(&idmapped).unwrap();
         assert!(content.contains("BindReadOnly=/tmp/.X11-unix:/tmp/.X11-unix:idmap"));
 
-        let noidmap = MachineProvisioningConfig {
+        let noidmap = MachineConfig {
             name: "directory-noidmap".into(),
             private_users: Some(PrivateUsersMode::No),
             x11_binds: vec![directory],
@@ -1342,7 +1342,7 @@ mod tests {
 
     #[test]
     fn all_drm_passthrough_is_explicit_and_deduplicated() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".into(),
             graphics_acceleration: true,
             gpu_passthrough_all: true,
@@ -1357,7 +1357,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_binds_only_the_verified_socket() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".into(),
             network: Some(NetworkMode::Veth),
             private_users: Some(PrivateUsersMode::Pick),
@@ -1378,7 +1378,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_emits_each_selected_display_under_one_user_namespace() {
-        let spec = NspawnConfigSpec::try_from(&MachineProvisioningConfig {
+        let spec = NspawnConfigSpec::try_from(&MachineConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             ..Default::default()
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn wayland_passthrough_rejects_a_conflicting_custom_bind_target() {
-        let cfg = MachineProvisioningConfig {
+        let cfg = MachineConfig {
             name: "test".into(),
             private_users: Some(PrivateUsersMode::Pick),
             bind_mounts: vec![BindMount {

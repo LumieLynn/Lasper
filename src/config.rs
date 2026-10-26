@@ -4,11 +4,11 @@
 //! `[settings]` for general application options, and typed bootstrap profiles.
 
 use crate::adapters::elevated::ElevationMethod;
-use crate::domain::bootstrap::{
+use crate::domain::nvidia::NvidiaCdiSource;
+use crate::domain::provisioning::bootstrap::{
     DebootstrapSpec, Dnf5Spec, PacstrapSpec, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::domain::nvidia::NvidiaCdiSource;
-use crate::domain::source::{ArtifactSpec, BootstrapMethod};
+use crate::domain::provisioning::source::{ArtifactSpec, BootstrapMethod};
 use crate::tui::foundation::theme::PartialTheme;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -378,7 +378,7 @@ pub fn config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
+    use crate::domain::provisioning::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     #[test]
     fn elevation_method_defaults_to_sudo_and_does_not_enable_elevation_itself() {

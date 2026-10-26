@@ -16,7 +16,7 @@ use crate::adapters::provisioning::engine::{
     DeployLogEvent, DeploymentCancellation,
 };
 
-const MAX_IMAGE_BYTES: u64 = crate::domain::storage::MAX_DISK_IMAGE_SIZE_BYTES;
+const MAX_IMAGE_BYTES: u64 = crate::domain::provisioning::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
 const CURL_MAX_REDIRECTS: &str = "10";
 

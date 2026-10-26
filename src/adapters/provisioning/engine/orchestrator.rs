@@ -2,45 +2,26 @@ use super::rollback::{inspect_deployment_sidecars, rollback_apply_report};
 use super::{
     capture_uncommitted_effects, check_deployment_cancellation, finish_manifest, persist_applying,
     persist_cleanup_pending, persist_committed, send_deploy_log, AppliedResource, ApplyReport,
-    Deployer, DirectProvisioningCapabilities,
+    DeploymentExecution, DirectProvisioningCapabilities, StoragePreparation, SystemConfiguration,
 };
 use crate::adapters::error::{NspawnError, Result};
-use crate::adapters::storage::StorageBackend;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
-    DeploymentStage, MachineProvisioningConfig, ResourceDisposition,
+    DeploymentStage, ResourceDisposition,
 };
-use crate::domain::provisioning::PrivateUsersMode;
+use crate::domain::machine::PrivateUsersMode;
 
 /// Runs one deployment using application-owned job state and event transport.
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_deployment(
-    deployer: Box<dyn Deployer>,
-    storage: Box<dyn StorageBackend>,
-    name: String,
-    cfg: MachineProvisioningConfig,
-    nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
-    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
-    wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
+    execution: DeploymentExecution,
     host: DirectProvisioningCapabilities,
     secrets: DeploymentSecrets,
     job: DeploymentJobContext,
 ) -> Result<()> {
     let logs = job.event_sender();
-    let result = run_deploy_internal(
-        deployer,
-        storage,
-        name.clone(),
-        cfg,
-        nvidia_profile,
-        nvidia_cdi_source,
-        wayland_intents,
-        host,
-        secrets,
-        job,
-    )
-    .await;
+    let name = execution.target.to_string();
+    let result = run_deploy_internal(execution, host, secrets, job).await;
     if let Err(error) = &result {
         let err_msg = format!("FATAL ERROR: {error}");
         match logs.try_send(DeployLogEvent::Line(err_msg.clone())) {
@@ -65,24 +46,21 @@ pub(crate) fn is_cancelled_outcome(error: &NspawnError) -> bool {
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_deploy_internal(
-    deployer: Box<dyn Deployer>,
-    storage: Box<dyn StorageBackend>,
-    name: String,
-    cfg: MachineProvisioningConfig,
-    nvidia_profile: Option<crate::domain::nvidia::NvidiaPassthroughProfile>,
-    nvidia_cdi_source: crate::domain::nvidia::NvidiaCdiSource,
-    wayland_intents: Vec<crate::domain::wayland::WaylandGrantIntent>,
+    execution: DeploymentExecution,
     host: DirectProvisioningCapabilities,
     mut secrets: DeploymentSecrets,
     job: DeploymentJobContext,
 ) -> Result<()> {
+    let DeploymentExecution {
+        target,
+        source: deployer,
+        storage,
+        configuration,
+    } = execution;
+    let name = target.to_string();
     let logs = job.event_sender();
     let cancellation = job.cancellation();
-    let nspawn_spec = crate::adapters::config::NspawnConfigSpec::try_from(&cfg)?;
-    let target = nspawn_spec.machine;
-    let guest_hostname = nspawn_spec.guest_hostname;
     let system_operations = host.system_operations.clone();
 
     macro_rules! push_log {
@@ -93,7 +71,6 @@ async fn run_deploy_internal(
 
     push_log!(format!("=== Deploying '{}' ===", name));
 
-    let is_ext = deployer.is_external_storage_managed();
     let mut report = ApplyReport::new(target.clone());
     let mut raw_mount_target: Option<crate::adapters::rootfs::RootfsTarget> = None;
     let mut storage_mount_attempted = false;
@@ -107,7 +84,7 @@ async fn run_deploy_internal(
         }
         check_deployment_cancellation(&cancellation)?;
 
-        if !is_ext {
+        if let Some(storage) = storage.backend() {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
                 name,
@@ -131,7 +108,7 @@ async fn run_deploy_internal(
             check_deployment_cancellation(&cancellation)?;
         }
 
-        let rootfs = if !is_ext {
+        let rootfs = if let Some(storage) = storage.backend() {
             log::info!(
                 "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
                 name
@@ -160,7 +137,7 @@ async fn run_deploy_internal(
             "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
             name
         );
-        external_provider_started = is_ext;
+        external_provider_started = matches!(storage, StoragePreparation::ProviderImage);
         let source_resources = deployer.source_stage_resources(&target);
         persist_applying(
             &job,
@@ -172,7 +149,6 @@ async fn run_deploy_internal(
         deployer
             .deploy(
                 &name,
-                &cfg,
                 &rootfs,
                 logs.clone(),
                 &cancellation,
@@ -182,12 +158,14 @@ async fn run_deploy_internal(
         persist_committed(&job, DeploymentStage::SourceDeployment, &report).await?;
         check_deployment_cancellation(&cancellation)?;
 
-        // 4. Post-deployment configuration
-        if !deployer.requires_post_config() {
-            log::info!("[AUDIT] [Container: {}] [Step: Config] Skipping post-config for pre-configured clones.", name);
+        let Some(SystemConfiguration { machine: cfg, users, wayland: wayland_intents, integration }) = configuration else {
             check_deployment_cancellation(&cancellation)?;
             return Ok(());
-        }
+        };
+        let guest_hostname = crate::domain::machine::GuestHostname::resolve(&cfg.guest_hostname, &target)
+            .map_err(|error| NspawnError::Validation(error.to_string()))?;
+        let nvidia_profile = integration.nvidia_profile;
+        let nvidia_cdi_source = integration.nvidia_cdi_source;
 
         let mut actual_rootfs_target =
             crate::adapters::rootfs::RootfsTarget::from_provisioned_path(&name, &rootfs)?;
@@ -273,9 +251,9 @@ async fn run_deploy_internal(
                 check_deployment_cancellation(&cancellation)?;
             }
 
-            let mut users = cfg.users.iter().collect::<Vec<_>>();
-            users.sort_by_key(|user| user.uid.is_none());
-            for user in users {
+            let mut ordered_users = users.iter().collect::<Vec<_>>();
+            ordered_users.sort_by_key(|user| user.uid.is_none());
+            for user in ordered_users {
                 push_log!(format!("Creating user {}...", user.username));
                 let password = secrets
                     .take_user_password(&user.username)
@@ -305,8 +283,7 @@ async fn run_deploy_internal(
                     "Wayland grant requires a rootfs that supports user identity lookup".into(),
                 ));
             }
-            let user = cfg
-                .users
+            let user = users
                 .iter()
                 .find(|user| user.username == intent.target_username())
                 .ok_or_else(|| {
@@ -322,7 +299,7 @@ async fn run_deploy_internal(
                 .rootfs
                 .resolve_user_identity(&actual_rootfs_target, &user.username)
                 .await?;
-            let grant = crate::application::provisioning::resolve_wayland_grant(
+            let grant = crate::domain::provisioning::wayland::resolve_wayland_grant(
                 intent,
                 identity,
                 cfg.private_users,
@@ -587,7 +564,7 @@ async fn run_deploy_internal(
         }
     }
 
-    if storage_mount_attempted {
+    if let Some(storage) = storage.backend().filter(|_| storage_mount_attempted) {
         push_log!("Cleaning up storage mount...".to_string());
         let resource = DeploymentResource::StorageMount(report.target.clone());
         if durable_cleanup_failed {
@@ -659,7 +636,7 @@ async fn run_deploy_internal(
                 .push("rollback was not attempted after durable cleanup state failed".into());
         } else {
             rollback_errors.extend(
-                rollback_apply_report(&name, &mut report, storage.as_ref(), &host, &logs, &job)
+                rollback_apply_report(&name, &mut report, storage.backend(), &host, &logs, &job)
                     .await,
             );
         }

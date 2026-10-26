@@ -1,4 +1,4 @@
-use crate::domain::provisioning::{validate_login_shell, validate_login_username};
+use crate::domain::machine::{validate_login_shell, validate_login_username};
 use crate::domain::secret::validate_chpasswd_secret;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::tui::features::wizard::dialogs::wayland_bindings::WaylandBindingsDialog;

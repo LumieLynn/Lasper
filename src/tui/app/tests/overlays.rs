@@ -2,6 +2,7 @@ use super::make_app;
 use crate::application::configuration::ConfigurationTarget;
 use crate::application::provisioning::HostHardwareSnapshot;
 use crate::domain::machine::MachineName;
+use crate::domain::provisioning::DeploymentSpec;
 use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
 use crate::tui::app::{App, ModalLayer};
 use crate::tui::features::configuration::ConfigurationView;
@@ -55,8 +56,8 @@ async fn press(app: &mut App, code: KeyCode) {
 #[tokio::test]
 async fn opening_wizard_explains_ignored_profiles_without_blocking_valid_sources() {
     use crate::application::provisioning::{
-        DeploymentError, DeploymentRequest, ImagePartitionProbe, InterfaceValidation,
-        ProvisioningHostSnapshot, ProvisioningPreparationPort, ProvisioningPreparationService,
+        DeploymentError, ImagePartitionProbe, InterfaceValidation, ProvisioningHostSnapshot,
+        ProvisioningPreparationPort, ProvisioningPreparationService,
     };
     use crate::composition::DefaultPermissionManager;
     use std::sync::Arc;
@@ -83,7 +84,7 @@ async fn opening_wizard_explains_ignored_profiles_without_blocking_valid_sources
         ) -> Result<Option<ImagePartitionProbe>, DeploymentError> {
             unreachable!()
         }
-        fn preview(&self, _: &DeploymentRequest) -> String {
+        fn preview(&self, _: &DeploymentSpec) -> String {
             unreachable!()
         }
     }
@@ -177,8 +178,8 @@ async fn opening_wizard_explains_ignored_profiles_without_blocking_valid_sources
 #[tokio::test]
 async fn cancelling_wizard_opening_drops_host_inspection_and_ignores_its_late_result() {
     use crate::application::provisioning::{
-        DeploymentError, DeploymentRequest, ImagePartitionProbe, InterfaceValidation,
-        ProvisioningHostSnapshot, ProvisioningPreparationPort, ProvisioningPreparationService,
+        DeploymentError, ImagePartitionProbe, InterfaceValidation, ProvisioningHostSnapshot,
+        ProvisioningPreparationPort, ProvisioningPreparationService,
     };
     use crate::composition::DefaultPermissionManager;
     use std::sync::Arc;
@@ -220,7 +221,7 @@ async fn cancelling_wizard_opening_drops_host_inspection_and_ignores_its_late_re
         ) -> Result<Option<ImagePartitionProbe>, DeploymentError> {
             unreachable!()
         }
-        fn preview(&self, _: &DeploymentRequest) -> String {
+        fn preview(&self, _: &DeploymentSpec) -> String {
             unreachable!()
         }
     }

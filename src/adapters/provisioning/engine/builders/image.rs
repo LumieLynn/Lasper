@@ -7,24 +7,12 @@ use crate::adapters::provisioning::engine::{
     check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
     Deployer, DeploymentCancellation, ImageAcquisitionStore, ImageImportStore, ImageSource,
 };
-use crate::application::provisioning::MachineProvisioningConfig;
 use crate::domain::machine::MachineName;
-use crate::domain::source::{ArtifactFormat, ArtifactSpec};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
     Tar,
     Raw,
-}
-
-impl ImageFormat {
-    pub fn from_artifact(artifact: &ArtifactSpec) -> Self {
-        match artifact.resolved_format() {
-            ArtifactFormat::Tar => Self::Tar,
-            ArtifactFormat::Raw => Self::Raw,
-            ArtifactFormat::Auto => unreachable!("format was resolved"),
-        }
-    }
 }
 
 pub struct ImageDeployer {
@@ -37,14 +25,20 @@ pub struct ImageDeployer {
 
 #[async_trait]
 impl Deployer for ImageDeployer {
-    fn is_external_storage_managed(&self) -> bool {
-        self.format == ImageFormat::Raw
+    fn source_stage_resources(
+        &self,
+        target: &crate::domain::machine::MachineName,
+    ) -> Vec<crate::application::provisioning::DeploymentResource> {
+        use crate::application::provisioning::DeploymentResource;
+        vec![match self.format {
+            ImageFormat::Tar => DeploymentResource::LocalStorage(target.clone()),
+            ImageFormat::Raw => DeploymentResource::ExternalImage(target.clone()),
+        }]
     }
 
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
@@ -86,28 +80,5 @@ impl Deployer for ImageDeployer {
             }
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn artifact_format_is_resolved_before_privileged_import() {
-        assert_eq!(
-            ImageFormat::from_artifact(&ArtifactSpec {
-                path: "rootfs.raw.xz".into(),
-                format: ArtifactFormat::Auto,
-            }),
-            ImageFormat::Raw
-        );
-        assert_eq!(
-            ImageFormat::from_artifact(&ArtifactSpec {
-                path: "rootfs.tar.xz".into(),
-                format: ArtifactFormat::Auto,
-            }),
-            ImageFormat::Tar
-        );
     }
 }

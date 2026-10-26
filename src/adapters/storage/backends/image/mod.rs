@@ -7,7 +7,7 @@ use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::storage::{
     ImageMountSource, ManagedImageKind, ManagedStorageStore, StorageBackend, StorageType,
 };
-use crate::domain::storage::DiskImageConfig;
+use crate::domain::provisioning::storage::DiskImageConfig;
 use std::path::PathBuf;
 
 pub struct DiskImageBackend {
@@ -126,7 +126,7 @@ impl StorageBackend for DiskImageBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::storage::{DiskImageFilesystem, DiskImageSource};
+    use crate::domain::provisioning::storage::{DiskImageFilesystem, DiskImageSource};
 
     #[test]
     fn new_imports_publish_to_canonical_raw_path() {

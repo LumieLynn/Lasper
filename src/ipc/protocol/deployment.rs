@@ -1,9 +1,10 @@
 //! Private wire contract for daemon-owned provisioning jobs.
 
 use crate::application::provisioning::{
-    DeploymentEvent, DeploymentId, DeploymentRecoveryObservation, DeploymentRequest,
-    DeploymentRequestId, DeploymentSecretsWire, DeploymentStatus,
+    DeploymentEvent, DeploymentId, DeploymentRecoveryObservation, DeploymentRequestId,
+    DeploymentSecretsWire, DeploymentStatus,
 };
+use crate::domain::provisioning::DeploymentSpec;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const MAX_DEPLOYMENT_STREAM_FRAME_BYTES: usize = 256 * 1024;
@@ -13,7 +14,7 @@ pub(crate) const MAX_DEPLOYMENT_STREAM_FRAME_BYTES: usize = 256 * 1024;
 pub(crate) struct SubmitDeploymentParams {
     pub(crate) request_id: DeploymentRequestId,
     pub(crate) deployment_id: DeploymentId,
-    pub(crate) request: DeploymentRequest,
+    pub(crate) request: DeploymentSpec,
     pub(crate) secrets: DeploymentSecretsWire,
 }
 
@@ -108,30 +109,30 @@ pub(crate) struct ProbeDeploymentRecoveryResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
-    use crate::application::provisioning::{
-        DeploymentSecrets, DeploymentSource, DeploymentStorage,
-    };
+    use crate::application::provisioning::DeploymentSecrets;
+    use crate::domain::machine::MachineConfig;
+    use crate::domain::provisioning::DeploymentStorage;
 
     #[test]
     fn submission_debug_redacts_wire_secrets_and_json_keeps_them_in_the_capsule() {
         let params = SubmitDeploymentParams {
             request_id: DeploymentRequestId::from_u128(1),
             deployment_id: DeploymentId::from_u128(2),
-            request: DeploymentRequest {
-                config: MachineProvisioningConfig {
-                    name: "test".into(),
-                    ..Default::default()
+            request: DeploymentSpec::Bootstrap(Box::new(
+                crate::domain::provisioning::BootstrapDeployment {
+                    machine: MachineConfig {
+                        name: "test".into(),
+                        ..Default::default()
+                    },
+                    provider: crate::domain::provisioning::bootstrap::BootstrapSpec::Pacstrap(
+                        Default::default(),
+                    ),
+                    storage: DeploymentStorage::Directory,
+                    users: Vec::new(),
+                    wayland: Vec::new(),
+                    integration: Default::default(),
                 },
-                source: DeploymentSource::Copy {
-                    source_name: "base".into(),
-                },
-                storage: DeploymentStorage::Directory,
-                nvidia_profile: None,
-                nvidia_cdi_source: Default::default(),
-                wayland: Vec::new(),
-                allow_unsafe_remote_tar: false,
-            },
+            )),
             secrets: DeploymentSecrets::new("root-secret".into(), Vec::new()).into_wire(),
         };
 
@@ -142,6 +143,8 @@ mod tests {
         let wire = serde_json::to_value(params).unwrap();
         assert_eq!(wire["secrets"]["root_password"], "root-secret");
         assert!(wire["request"].get("root_password").is_none());
-        assert!(wire["request"]["config"].get("password").is_none());
+        assert!(!serde_json::to_string(&wire["request"])
+            .unwrap()
+            .contains("root-secret"));
     }
 }

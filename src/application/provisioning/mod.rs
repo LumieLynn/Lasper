@@ -3,13 +3,12 @@ mod preparation;
 mod recovery;
 mod service;
 mod state;
-mod wayland;
 
 pub use contract::{
     DeploymentClaimStatus, DeploymentError, DeploymentEvent, DeploymentExecutor, DeploymentId,
-    DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentRequest,
-    DeploymentSecrets, DeploymentSource, DeploymentStartError, DeploymentStatus, DeploymentStorage,
-    DeploymentSubmission, MachineProvisioningConfig, RemoteTarSafety, SourcePreflight, UserSecret,
+    DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentSecrets,
+    DeploymentStartError, DeploymentStatus, DeploymentSubmission, RemoteTarSafety, SourcePreflight,
+    UserSecret,
 };
 pub use preparation::{
     HostCapability, HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo, ImagePartitionProbe,
@@ -40,4 +39,3 @@ pub(crate) use state::{
 pub(crate) use recovery::MemoryDeploymentRecoveryProbe;
 #[cfg(test)]
 pub(crate) use state::MemoryDeploymentStatePort;
-pub(crate) use wayland::{resolve_wayland_bind_policy, resolve_wayland_grant};

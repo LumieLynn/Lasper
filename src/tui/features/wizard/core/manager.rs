@@ -1,7 +1,7 @@
-use crate::application::provisioning::{
-    DeploymentError, DeploymentJobHandle, DeploymentPreflight, DeploymentRequest,
-};
-use crate::domain::provisioning::NetworkMode;
+use crate::application::provisioning::{DeploymentError, DeploymentJobHandle, DeploymentPreflight};
+use crate::domain::machine::NetworkMode;
+use crate::domain::provisioning::DeploymentCategory;
+use crate::domain::provisioning::DeploymentSpec;
 use crate::tui::features::wizard::core::draft::{SourceKind, WizardDraft};
 use crate::tui::features::wizard::dialogs::{
     bind_mount::BindMountBox, nvidia_config::NvidiaConfigDialog, port_mapping::PortMappingBox,
@@ -70,7 +70,7 @@ pub struct Wizard {
 
     permission_level: crate::composition::PermissionLevel,
     preparation: std::sync::Arc<crate::application::provisioning::ProvisioningPreparationService>,
-    pending_request: Option<DeploymentRequest>,
+    pending_request: Option<DeploymentSpec>,
     pub loading: bool,
 }
 
@@ -189,41 +189,27 @@ impl Wizard {
     }
 
     pub fn active_flow(&self) -> Vec<WizardStep> {
-        let is_copy = self.draft.source.kind == SourceKind::Copy;
-        let is_oci = self.draft.source.kind == SourceKind::Oci;
-
-        if is_copy {
-            vec![
-                WizardStep::Source,
-                WizardStep::CopySelect,
-                WizardStep::Basic,
-                WizardStep::Review,
-                WizardStep::Deploy,
-            ]
-        } else if is_oci {
-            vec![
-                WizardStep::Source,
-                WizardStep::Basic,
-                WizardStep::Review,
-                WizardStep::Deploy,
-            ]
-        } else {
-            let mut flow = vec![
-                WizardStep::Source,
-                WizardStep::Basic,
-                WizardStep::User,
+        let category = self.draft.source.deployment_category();
+        let mut flow = vec![WizardStep::Source];
+        if category == DeploymentCategory::Clone {
+            flow.push(WizardStep::CopySelect);
+        }
+        flow.push(WizardStep::Basic);
+        if category.selects_storage() {
+            flow.push(WizardStep::Storage);
+        }
+        if category.configures_accounts() {
+            flow.push(WizardStep::User);
+        }
+        if category.configures_machine() {
+            flow.extend([
                 WizardStep::Network,
                 WizardStep::HostIntegration,
                 WizardStep::BindMounts,
-                WizardStep::Review,
-                WizardStep::Deploy,
-            ];
-
-            if !self.draft.source.is_storage_managed_externally() {
-                flow.insert(2, WizardStep::Storage);
-            }
-            flow
+            ]);
         }
+        flow.extend([WizardStep::Review, WizardStep::Deploy]);
+        flow
     }
 
     fn total_steps(&self) -> usize {
@@ -615,14 +601,14 @@ impl Wizard {
         }
 
         self.loading = true;
-        let request = self.draft.build_deployment_request();
+        let request = self.draft.build_deployment_spec();
         self.pending_request = Some(request.clone());
         StepAction::PreflightDeployment(request)
     }
 
     pub fn finish_preflight(
         &mut self,
-        request: DeploymentRequest,
+        request: DeploymentSpec,
         result: Result<DeploymentPreflight, DeploymentError>,
     ) -> StepAction {
         self.loading = false;

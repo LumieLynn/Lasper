@@ -7,7 +7,7 @@ use super::bootstrap_args::{
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::rootfs::RootfsTarget;
-use crate::domain::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
+use crate::domain::provisioning::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;

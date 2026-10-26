@@ -1,7 +1,9 @@
 use crate::application::provisioning::{
     ImagePartitionProbe, ProvisioningPreparationService, StorageBackendKind,
 };
-use crate::domain::storage::{parse_disk_image_size, DiskImageFilesystem, DiskImagePartition};
+use crate::domain::provisioning::storage::{
+    parse_disk_image_size, DiskImageFilesystem, DiskImagePartition,
+};
 use crate::tui::features::wizard::core::input::expand_user_path;
 use crate::tui::features::wizard::draft::{StorageState, WizardDraft};
 use crate::tui::features::wizard::steps::{field_event, register_step_form, StepComponent};
@@ -454,9 +456,10 @@ impl StepComponent for StorageStepView {
 mod tests {
     use super::*;
     use crate::application::provisioning::{
-        DeploymentError, DeploymentRequest, HostHardwareSnapshot, ImagePartitionInfo,
-        InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort,
+        DeploymentError, HostHardwareSnapshot, ImagePartitionInfo, InterfaceValidation,
+        ProvisioningHostSnapshot, ProvisioningPreparationPort,
     };
+    use crate::domain::provisioning::DeploymentSpec;
     use crate::tui::features::wizard::draft::StorageInfo;
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -489,7 +492,7 @@ mod tests {
             unreachable!("image probing is not used by these tests")
         }
 
-        fn preview(&self, _request: &DeploymentRequest) -> String {
+        fn preview(&self, _request: &DeploymentSpec) -> String {
             unreachable!("preview generation is not used by these tests")
         }
     }

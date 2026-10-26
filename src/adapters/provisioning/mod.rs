@@ -1,3 +1,4 @@
+use crate::domain::machine::MachineConfig;
 mod claim;
 pub(crate) mod direct;
 mod elevated;
@@ -8,7 +9,7 @@ pub(crate) mod state;
 
 use crate::application::provisioning::{
     DeploymentClaimControl, DeploymentError, DeploymentRecoveryProbe, DeploymentStatePort,
-    MachineProvisioningConfig, ProvisioningService, RemoteTarSafety, SourcePreflight,
+    ProvisioningService, RemoteTarSafety, SourcePreflight,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -18,9 +19,7 @@ use std::sync::Arc;
 /// The application contract deliberately does not depend on nspawn syntax. The
 /// nspawn adapter therefore owns these checks and is called again at each
 /// execution boundary (daemon admission and direct execution).
-pub(crate) fn validate_nspawn_config(
-    config: &MachineProvisioningConfig,
-) -> Result<(), DeploymentError> {
+pub(crate) fn validate_nspawn_config(config: &MachineConfig) -> Result<(), DeploymentError> {
     crate::adapters::config::NspawnConfigSpec::try_from(config)
         .map(|_| ())
         .map_err(|error| DeploymentError::rejected(error.to_string()))

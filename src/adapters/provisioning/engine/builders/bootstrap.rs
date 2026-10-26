@@ -9,13 +9,13 @@ use crate::adapters::provisioning::engine::{
     DeploymentCancellation,
 };
 use crate::adapters::rootfs::RootfsTarget;
-use crate::application::provisioning::MachineProvisioningConfig;
-use crate::domain::bootstrap::{
+use crate::domain::provisioning::bootstrap::{
     BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,
     Dnf5RepositorySource, PacmanKeyringMode, PacmanMirrorlistMode, PacstrapCacheMode,
 };
 
 pub struct BootstrapDeployer {
+    pub include_sudo: bool,
     pub spec: BootstrapSpec,
     pub bootstrap: BootstrapStore,
 }
@@ -25,7 +25,6 @@ impl Deployer for BootstrapDeployer {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
@@ -85,7 +84,7 @@ impl Deployer for BootstrapDeployer {
         let request = BootstrapRequest {
             target: RootfsTarget::from_provisioned_path(name, rootfs)?,
             spec: self.spec.clone(),
-            include_sudo: cfg.users.iter().any(|user| user.sudoer),
+            include_sudo: self.include_sudo,
         };
         let spawned = self.bootstrap.spawn(request).await?;
         let status = stream_deploy_command(spawned, &logs, cancellation, label).await?;

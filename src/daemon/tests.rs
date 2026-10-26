@@ -12,6 +12,7 @@ use crate::application::machine_lifecycle::{
 };
 use crate::domain::inspection::MachineProperties;
 use crate::domain::machine::{AllowedSignal, MachineName};
+use crate::domain::provisioning::DeploymentSpec;
 use crate::domain::runtime::{ImageEntry, ImageName, MachineEntry};
 use crate::domain::session::SessionSize;
 use crate::ipc::protocol::session::{self as session, SpawnTerminalParams};
@@ -911,10 +912,8 @@ async fn tar_runtime_assessment_rpc_returns_typed_result_and_rejects_parameters(
 #[tokio::test]
 async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     use crate::adapters::provisioning::state::FilesystemDeploymentState;
-    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
-        DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource,
-        DeploymentStatePort, DeploymentStorage,
+        DeploymentCrashManifest, DeploymentId, DeploymentPlan, DeploymentStatePort,
     };
     use crate::ipc::protocol::deployment::{
         ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,
@@ -924,20 +923,12 @@ async fn deployment_recovery_probe_reloads_the_trusted_manifest_revision() {
     let root =
         crate::adapters::trusted_state::TrustedStateRoot::for_test(directory.path().join("lasper"));
     let state = FilesystemDeploymentState::new(root.clone());
-    let plan = DeploymentPlan::build(DeploymentRequest {
-        config: MachineProvisioningConfig {
+    let plan = DeploymentPlan::build(DeploymentSpec::Clone(
+        crate::domain::provisioning::CloneDeployment {
             name: "recovery-target".into(),
-            ..Default::default()
-        },
-        source: DeploymentSource::Copy {
             source_name: "base".into(),
         },
-        storage: DeploymentStorage::Directory,
-        nvidia_profile: None,
-        nvidia_cdi_source: Default::default(),
-        wayland: Vec::new(),
-        allow_unsafe_remote_tar: false,
-    })
+    ))
     .unwrap();
     let deployment_id = DeploymentId::from_u128(88);
     let manifest = DeploymentCrashManifest::prepared(deployment_id, &plan);

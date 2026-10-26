@@ -1,4 +1,4 @@
-use crate::domain::provisioning::{BindMount, IdmapSuffix};
+use crate::domain::machine::{BindMount, IdmapSuffix};
 use crate::tui::foundation::components::form::{Form, FormItem, FormOutcome, FormState};
 use crate::tui::foundation::widgets::inputs::{
     button::ButtonControl,

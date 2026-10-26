@@ -1,5 +1,5 @@
+use crate::domain::machine::{BindMount, IdmapSuffix};
 use crate::domain::nvidia::NvidiaPassthroughMode;
-use crate::domain::provisioning::{BindMount, IdmapSuffix};
 use crate::tui::features::wizard::dialogs::bind_mount::idmap_suffix_label;
 use crate::tui::features::wizard::draft::{PassthroughConfig, UnclassifiedFile, WizardDraft};
 use crate::tui::features::wizard::steps::{field_event, register_step_form, StepComponent};

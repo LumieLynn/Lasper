@@ -7,8 +7,7 @@ use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentJobContext,
-    DeploymentResource, DeploymentStage, MachineProvisioningConfig, ResourceApplyStatus,
-    ResourceDisposition, ResourceLedger,
+    DeploymentResource, DeploymentStage, ResourceApplyStatus, ResourceDisposition, ResourceLedger,
 };
 
 /// Direct host capabilities used by the provisioning implementation.
@@ -336,17 +335,11 @@ pub(crate) trait Deployer: Send + Sync {
     async fn deploy(
         &self,
         name: &str,
-        cfg: &MachineProvisioningConfig,
         rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> Result<()>;
-
-    /// Returns true if this deployer manages its own storage (e.g. machinectl clone).
-    fn is_external_storage_managed(&self) -> bool {
-        false
-    }
 
     /// Resources whose outcome may change while the source stage is running.
     ///
@@ -357,16 +350,6 @@ pub(crate) trait Deployer: Send + Sync {
         &self,
         target: &crate::domain::machine::MachineName,
     ) -> Vec<DeploymentResource> {
-        vec![if self.is_external_storage_managed() {
-            DeploymentResource::ExternalImage(target.clone())
-        } else {
-            DeploymentResource::LocalStorage(target.clone())
-        }]
-    }
-
-    /// Returns true if this deployer requires post-deployment configuration (passwords, etc).
-    /// Default is true. Clones might set this to false if they are already configured.
-    fn requires_post_config(&self) -> bool {
-        true
+        vec![DeploymentResource::LocalStorage(target.clone())]
     }
 }

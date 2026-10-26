@@ -1,8 +1,9 @@
 //! Secret-free deployment planning, resource ownership, and crash state.
 
-use super::{DeploymentError, DeploymentId, DeploymentRequest};
+use super::{DeploymentError, DeploymentId};
 use crate::application::{ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
+use crate::domain::provisioning::DeploymentSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,17 +13,18 @@ pub(crate) const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct DeploymentPlan {
-    request: DeploymentRequest,
+    spec: DeploymentSpec,
     target: MachineName,
     fingerprint: PlanFingerprint,
 }
 
 impl DeploymentPlan {
-    pub(crate) fn build(request: DeploymentRequest) -> Result<Self, DeploymentError> {
-        request.validate()?;
-        let target = MachineName::new(request.config.name.clone())
+    pub(crate) fn build(spec: DeploymentSpec) -> Result<Self, DeploymentError> {
+        spec.validate()
             .map_err(|error| DeploymentError::rejected(error.to_string()))?;
-        let normalized = serde_json::to_vec(&request).map_err(|error| {
+        let target = MachineName::new(spec.target_name())
+            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+        let normalized = serde_json::to_vec(&spec).map_err(|error| {
             DeploymentError::failed(format!("Could not normalize deployment plan: {error}"))
         })?;
         let digest = Sha256::digest(&normalized);
@@ -33,7 +35,7 @@ impl DeploymentPlan {
                 .collect::<String>(),
         );
         Ok(Self {
-            request,
+            spec,
             target,
             fingerprint,
         })
@@ -47,16 +49,16 @@ impl DeploymentPlan {
         &self.fingerprint
     }
 
-    pub(crate) fn into_request(self) -> DeploymentRequest {
-        self.request
+    pub(crate) fn into_spec(self) -> DeploymentSpec {
+        self.spec
     }
 
     pub(crate) fn resource_claims(&self) -> Vec<ResourceClaim> {
         let mut claims = vec![ResourceClaim::exclusive(ResourceKey::for_machine(
             &self.target,
         ))];
-        if let super::DeploymentSource::Copy { source_name } = &self.request.source {
-            let source = crate::domain::runtime::ImageName::new(source_name.clone())
+        if let DeploymentSpec::Clone(deployment) = &self.spec {
+            let source = crate::domain::runtime::ImageName::new(&deployment.source_name)
                 .expect("validated deployment plan has a valid clone source");
             claims.push(ResourceClaim::shared(ResourceKey::for_image(&source)));
         }
@@ -529,24 +531,21 @@ impl DeploymentStateSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
-    use crate::application::provisioning::{DeploymentSource, DeploymentStorage};
+    use crate::domain::machine::MachineConfig;
 
-    fn request() -> DeploymentRequest {
-        DeploymentRequest {
-            config: MachineProvisioningConfig {
+    fn request() -> DeploymentSpec {
+        DeploymentSpec::Import(Box::new(crate::domain::provisioning::ImportDeployment {
+            machine: MachineConfig {
                 name: "test".into(),
                 ..Default::default()
             },
-            source: DeploymentSource::Copy {
-                source_name: "base".into(),
+            image: crate::domain::provisioning::ImageImport::DiskImage {
+                source: crate::domain::provisioning::ImportSource::Remote {
+                    url: "https://example.test/rootfs.raw".into(),
+                },
             },
-            storage: DeploymentStorage::Directory,
-            nvidia_profile: None,
-            nvidia_cdi_source: Default::default(),
-            wayland: Vec::new(),
-            allow_unsafe_remote_tar: false,
-        }
+            integration: Default::default(),
+        }))
     }
 
     #[test]
@@ -556,7 +555,10 @@ mod tests {
         assert_eq!(first.fingerprint(), second.fingerprint());
 
         let mut changed = request();
-        changed.config.guest_hostname = "different".into();
+        let DeploymentSpec::Import(deployment) = &mut changed else {
+            unreachable!()
+        };
+        deployment.machine.guest_hostname = "different".into();
         let changed = DeploymentPlan::build(changed).unwrap();
         assert_ne!(first.fingerprint(), changed.fingerprint());
     }
@@ -581,9 +583,15 @@ mod tests {
             .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
 
         let mut first_request = request();
-        first_request.nvidia_profile = Some(first_profile);
+        let DeploymentSpec::Import(first) = &mut first_request else {
+            unreachable!()
+        };
+        first.integration.nvidia_profile = Some(first_profile);
         let mut second_request = request();
-        second_request.nvidia_profile = Some(second_profile);
+        let DeploymentSpec::Import(second) = &mut second_request else {
+            unreachable!()
+        };
+        second.integration.nvidia_profile = Some(second_profile);
 
         assert_eq!(
             DeploymentPlan::build(first_request).unwrap().fingerprint(),
@@ -715,9 +723,13 @@ mod tests {
     #[test]
     fn manifest_contains_only_the_plan_hash_not_source_credentials() {
         let mut request = request();
-        request.source = DeploymentSource::Pull {
-            url: "https://user:secret@example.test/rootfs.raw?token=private".into(),
-            is_raw: true,
+        let DeploymentSpec::Import(deployment) = &mut request else {
+            unreachable!()
+        };
+        deployment.image = crate::domain::provisioning::ImageImport::DiskImage {
+            source: crate::domain::provisioning::ImportSource::Remote {
+                url: "https://user:secret@example.test/rootfs.raw?token=private".into(),
+            },
         };
         let plan = DeploymentPlan::build(request).unwrap();
         let manifest = DeploymentCrashManifest::prepared(DeploymentId::from_u128(10), &plan);

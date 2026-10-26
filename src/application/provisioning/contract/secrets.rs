@@ -2,9 +2,9 @@ use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::config::MachineProvisioningConfig;
 use super::job::DeploymentError;
-use super::request::DeploymentRequest;
+use crate::domain::machine::CreateUser;
+use crate::domain::provisioning::DeploymentSpec;
 
 pub struct UserSecret {
     username: String,
@@ -54,17 +54,17 @@ impl DeploymentSecrets {
         }
     }
 
-    pub fn validate_for(&self, config: &MachineProvisioningConfig) -> Result<(), DeploymentError> {
+    pub fn validate_for(&self, users: &[CreateUser]) -> Result<(), DeploymentError> {
         if let Some(password) = &self.root_password {
             validate_chpasswd_secret(password.expose_secret())
                 .map_err(|error| DeploymentError::rejected(error.message("root password")))?;
         }
 
-        if self.users.len() != config.users.len()
+        if self.users.len() != users.len()
             || self
                 .users
                 .iter()
-                .zip(&config.users)
+                .zip(users)
                 .any(|(secret, user)| secret.username != user.username)
         {
             return Err(DeploymentError::rejected(
@@ -175,33 +175,35 @@ impl fmt::Debug for DeploymentSecretsWire {
 }
 
 pub struct DeploymentSubmission {
-    request: DeploymentRequest,
+    request: DeploymentSpec,
     secrets: DeploymentSecrets,
 }
 
 impl DeploymentSubmission {
-    pub fn new(request: DeploymentRequest, secrets: DeploymentSecrets) -> Self {
+    pub fn new(request: DeploymentSpec, secrets: DeploymentSecrets) -> Self {
         Self { request, secrets }
     }
 
-    pub fn request(&self) -> &DeploymentRequest {
+    pub fn request(&self) -> &DeploymentSpec {
         &self.request
     }
 
-    pub(crate) fn into_parts(self) -> (DeploymentRequest, DeploymentSecrets) {
+    pub(crate) fn into_parts(self) -> (DeploymentSpec, DeploymentSecrets) {
         (self.request, self.secrets)
     }
 
     pub(crate) fn validate_secrets(&self) -> Result<(), DeploymentError> {
-        self.secrets.validate_for(&self.request.config)?;
-        if !self.request.source.supports_rootfs_configuration()
-            && self.secrets.has_account_changes()
-        {
-            return Err(DeploymentError::rejected(
-                "This deployment source does not support account configuration",
-            ));
+        match &self.request {
+            DeploymentSpec::Bootstrap(deployment) => self.secrets.validate_for(&deployment.users),
+            DeploymentSpec::Import(_) | DeploymentSpec::Clone(_) | DeploymentSpec::Oci(_) => {
+                if self.secrets.has_account_changes() {
+                    return Err(DeploymentError::rejected(
+                        "Only Bootstrap deployments accept account initialization secrets",
+                    ));
+                }
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 

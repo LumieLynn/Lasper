@@ -44,7 +44,7 @@ pub enum StepAction {
     OpenDialog(Box<dyn crate::tui::protocol::Component>),
     CloseDialog,
     ValidateInterface { name: String, is_bridge_mode: bool },
-    PreflightDeployment(crate::application::provisioning::DeploymentRequest),
+    PreflightDeployment(crate::domain::provisioning::DeploymentSpec),
     StartDeployment(crate::application::provisioning::DeploymentSubmission),
     ReleaseUnresolvedDeployment(crate::application::provisioning::DeploymentId),
 }

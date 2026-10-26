@@ -1,6 +1,6 @@
 use crate::adapters::platform::nvidia::cdi::{CdiHook, CdiMount};
+use crate::domain::machine::BindMount;
 use crate::domain::nvidia::NvidiaFileCategory;
-use crate::domain::provisioning::BindMount;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 

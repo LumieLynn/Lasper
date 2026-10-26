@@ -4,7 +4,7 @@
 //! provider-neutral invariants of that intent. Host command argument
 //! construction remains in the provisioning adapter.
 
-use crate::domain::source::{ArtifactSpec, ArtifactValidationError, BootstrapMethod};
+use crate::domain::provisioning::source::{ArtifactSpec, ArtifactValidationError, BootstrapMethod};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_BOOTSTRAP_PROFILE: &str = "default";
@@ -381,10 +381,6 @@ impl RootfsSourceSpec {
         }
     }
 
-    pub fn is_external_storage(&self) -> bool {
-        matches!(self, Self::Artifact(spec) if spec.is_external_storage())
-    }
-
     pub fn method(&self) -> BootstrapMethod {
         match self {
             Self::Debootstrap(_) => BootstrapMethod::Debootstrap,
@@ -625,9 +621,6 @@ mod tests {
                 .method()
                 .required_tools(),
             &["pacstrap", "pacman"]
-        );
-        assert!(
-            RootfsSourceSpec::Artifact(ArtifactSpec::from_path("rootfs.raw")).is_external_storage()
         );
     }
 }

@@ -1,6 +1,7 @@
-use super::{DeploymentError, DeploymentRequest};
+use super::DeploymentError;
 use crate::domain::nvidia::NvidiaFileCategory;
-use crate::domain::storage::{DiskImageFilesystem, DiskImagePartition};
+use crate::domain::provisioning::storage::{DiskImageFilesystem, DiskImagePartition};
+use crate::domain::provisioning::DeploymentSpec;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::domain::x11::HostX11Socket;
 use async_trait::async_trait;
@@ -171,7 +172,7 @@ pub trait ProvisioningPreparationPort: Send + Sync {
 
     fn probe_image(&self, path: &Path) -> Result<Option<ImagePartitionProbe>, DeploymentError>;
 
-    fn preview(&self, request: &DeploymentRequest) -> String;
+    fn preview(&self, request: &DeploymentSpec) -> String;
 }
 
 pub struct ProvisioningPreparationService {
@@ -218,7 +219,7 @@ impl ProvisioningPreparationService {
         self.port.probe_image(path)
     }
 
-    pub fn preview(&self, request: &DeploymentRequest) -> String {
+    pub fn preview(&self, request: &DeploymentSpec) -> String {
         self.port.preview(request)
     }
 }
@@ -266,7 +267,7 @@ mod tests {
             unreachable!()
         }
 
-        fn preview(&self, _: &DeploymentRequest) -> String {
+        fn preview(&self, _: &DeploymentSpec) -> String {
             unreachable!()
         }
     }

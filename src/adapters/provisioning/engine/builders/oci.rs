@@ -1,5 +1,6 @@
 //! systemd-native OCI application image deployment.
 
+use crate::domain::provisioning::oci::OciNetworkMode;
 use async_trait::async_trait;
 
 use crate::adapters::error::{NspawnError, Result};
@@ -10,10 +11,9 @@ use crate::adapters::provisioning::engine::{
     check_deployment_cancellation, send_deploy_log, stream_deploy_command, AppliedResource,
     ApplyReport, DeployLogEvent, Deployer, DeploymentCancellation, OciPullStore,
 };
-use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
+use crate::application::provisioning::DeploymentResource;
 use crate::domain::machine::MachineName;
-use crate::domain::oci::OciReference;
-use crate::domain::provisioning::OciNetworkMode;
+use crate::domain::provisioning::oci::OciReference;
 
 pub struct OciDeployer {
     pub reference: String,
@@ -25,14 +25,6 @@ pub struct OciDeployer {
 
 #[async_trait]
 impl Deployer for OciDeployer {
-    fn is_external_storage_managed(&self) -> bool {
-        true
-    }
-
-    fn requires_post_config(&self) -> bool {
-        false
-    }
-
     fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
         vec![
             DeploymentResource::ExternalImage(target.clone()),
@@ -43,7 +35,6 @@ impl Deployer for OciDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &MachineProvisioningConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
@@ -128,7 +119,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oci_deployer_uses_external_storage_and_skips_rootfs_post_config() {
+    fn oci_source_declares_native_image_and_configuration_effects() {
         let deployer = OciDeployer {
             reference: "docker.io/library/nginx:latest".into(),
             read_only: false,
@@ -137,8 +128,6 @@ mod tests {
             nspawn: crate::adapters::config::NspawnConfigStore::direct(),
         };
 
-        assert!(deployer.is_external_storage_managed());
-        assert!(!deployer.requires_post_config());
         let target = MachineName::new("test").unwrap();
         assert_eq!(
             deployer.source_stage_resources(&target),

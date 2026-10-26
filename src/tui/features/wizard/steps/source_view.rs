@@ -1,8 +1,9 @@
 use crate::application::provisioning::HostCapability;
-use crate::domain::bootstrap::RootfsSourceSpec;
-use crate::domain::oci::OciReference;
-use crate::domain::provisioning::OciNetworkMode;
-use crate::domain::source::BootstrapMethod;
+use crate::domain::provisioning::bootstrap::RootfsSourceSpec;
+use crate::domain::provisioning::oci::OciNetworkMode;
+use crate::domain::provisioning::oci::OciReference;
+
+use crate::domain::provisioning::source::BootstrapMethod;
 use crate::tui::features::wizard::core::input::expand_user_path;
 use crate::tui::features::wizard::draft::{
     ConfiguredSourceProfile, SourceKind, SourceState, WizardDraft,
@@ -555,8 +556,8 @@ fn is_tar_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::bootstrap::PacstrapSpec;
-    use crate::domain::source::BootstrapMethod;
+    use crate::domain::provisioning::bootstrap::PacstrapSpec;
+    use crate::domain::provisioning::source::BootstrapMethod;
 
     #[test]
     fn source_kind_descriptions_align_with_wide_profile_names() {

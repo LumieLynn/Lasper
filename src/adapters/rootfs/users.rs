@@ -1,7 +1,7 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
 use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
-use crate::domain::provisioning::{validate_login_username, CreateUser};
+use crate::domain::machine::{validate_login_username, CreateUser};
 use crate::domain::secret::{validate_chpasswd_secret, SecretBytes};
 use crate::domain::wayland::ContainerUserIdentity;
 use std::path::Path;

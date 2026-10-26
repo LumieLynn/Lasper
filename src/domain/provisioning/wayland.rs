@@ -1,5 +1,5 @@
-use super::DeploymentError;
-use crate::domain::provisioning::PrivateUsersMode;
+use crate::domain::machine::PrivateUsersMode;
+use crate::domain::provisioning::DeploymentValidationError;
 use crate::domain::wayland::{
     ContainerUserIdentity, WaylandBindPolicy, WaylandGrant, WaylandGrantIntent,
 };
@@ -7,10 +7,10 @@ use crate::domain::wayland::{
 pub(crate) fn validate_wayland_intent(
     intent: &WaylandGrantIntent,
     private_users: Option<PrivateUsersMode>,
-) -> Result<(), DeploymentError> {
+) -> Result<(), DeploymentValidationError> {
     for source in intent.sources() {
         if source.owner_uid() != source.session_uid() {
-            return Err(DeploymentError::rejected(
+            return Err(DeploymentValidationError::invalid(
                 "Wayland socket is not owned by the selected host session user",
             ));
         }
@@ -23,10 +23,10 @@ pub(crate) fn resolve_wayland_grant(
     intent: WaylandGrantIntent,
     target: ContainerUserIdentity,
     private_users: Option<PrivateUsersMode>,
-) -> Result<WaylandGrant, DeploymentError> {
+) -> Result<WaylandGrant, DeploymentValidationError> {
     validate_wayland_intent(&intent, private_users)?;
     if intent.target_username() != target.username {
-        return Err(DeploymentError::rejected(
+        return Err(DeploymentValidationError::invalid(
             "resolved Wayland user does not match the requested target",
         ));
     }
@@ -35,7 +35,7 @@ pub(crate) fn resolve_wayland_grant(
     for source in intent.sources() {
         let mode = source.mode();
         let Some(socket_access) = source.write_access_for(&target) else {
-            return Err(DeploymentError::rejected(format!(
+            return Err(DeploymentValidationError::invalid(format!(
                 "container user {} (uid {}, gid {}) cannot write host Wayland socket {} owned by {}:{} with mode {:04o}",
                 target.username,
                 target.uid,
@@ -50,21 +50,21 @@ pub(crate) fn resolve_wayland_grant(
     }
 
     WaylandGrant::resolved(target, sockets, resolve_wayland_bind_policy(private_users)?)
-        .map_err(|error| DeploymentError::rejected(error.to_string()))
+        .map_err(|error| DeploymentValidationError::invalid(error.to_string()))
 }
 
 pub(crate) fn resolve_wayland_bind_policy(
     private_users: Option<PrivateUsersMode>,
-) -> Result<WaylandBindPolicy, DeploymentError> {
+) -> Result<WaylandBindPolicy, DeploymentValidationError> {
     match private_users {
         Some(PrivateUsersMode::No) => Ok(WaylandBindPolicy::NoIdmap),
         None | Some(PrivateUsersMode::Yes | PrivateUsersMode::Pick) => {
             Ok(WaylandBindPolicy::Idmap)
         }
-        Some(PrivateUsersMode::Managed) => Err(DeploymentError::rejected(
+        Some(PrivateUsersMode::Managed) => Err(DeploymentValidationError::invalid(
             "Wayland grants are not supported with PrivateUsers=managed because systemd-nspawn does not map ordinary bind mounts into the managed namespace",
         )),
-        Some(PrivateUsersMode::Identity) => Err(DeploymentError::rejected(
+        Some(PrivateUsersMode::Identity) => Err(DeploymentValidationError::invalid(
             "Wayland grants are not supported with PrivateUsers=identity",
         )),
     }

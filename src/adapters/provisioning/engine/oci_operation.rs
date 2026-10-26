@@ -3,7 +3,7 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::SpawnedProcess;
 use crate::domain::machine::MachineName;
-use crate::domain::oci::OciReference;
+use crate::domain::provisioning::oci::OciReference;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::os::unix::process::ExitStatusExt;

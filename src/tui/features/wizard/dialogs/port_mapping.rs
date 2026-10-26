@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::domain::provisioning::PortForward;
+use crate::domain::machine::PortForward;
 use crate::tui::foundation::components::form::{Form, FormItem, FormOutcome, FormState};
 use crate::tui::foundation::footer::FooterRegistry;
 use crate::tui::foundation::widgets::inputs::button::ButtonControl;

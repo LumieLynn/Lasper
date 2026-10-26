@@ -1,4 +1,4 @@
-use crate::domain::provisioning::{validate_network_interface_name, NetworkMode, PortForward};
+use crate::domain::machine::{validate_network_interface_name, NetworkMode, PortForward};
 use crate::tui::features::wizard::draft::{NetworkConfig, WizardDraft};
 use crate::tui::features::wizard::steps::{field_event, register_step_form, StepComponent};
 use crate::tui::features::wizard::StepAction;

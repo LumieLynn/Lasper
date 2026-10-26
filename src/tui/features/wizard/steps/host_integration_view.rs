@@ -1,5 +1,5 @@
 use crate::application::provisioning::HostGpuDevice;
-use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
+use crate::domain::machine::{NetworkMode, PrivateUsersMode};
 use crate::domain::x11::HostX11Socket;
 use crate::tui::features::wizard::draft::{PassthroughConfig, WizardDraft, X11ProjectionSelection};
 use crate::tui::features::wizard::steps::{field_event, register_step_form, StepComponent};

@@ -9,7 +9,7 @@ pub mod source_view;
 pub mod storage_view;
 pub mod user_view;
 
-use crate::tui::features::wizard::draft::{SourceKind, WizardDraft};
+use crate::tui::features::wizard::draft::WizardDraft;
 use crate::tui::features::wizard::{StepAction, WizardStep};
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
 use crate::tui::protocol::{AppMessage, Component};
@@ -69,7 +69,7 @@ pub fn build_view(
         WizardStep::Basic => Box::new(basic_view::BasicStepView::new(
             &context.basic.extract_config(),
             &context.entries,
-            !matches!(&context.source.kind, SourceKind::Copy | SourceKind::Oci),
+            context.source.deployment_category().configures_machine(),
         )),
 
         WizardStep::Storage => Box::new(storage_view::StorageStepView::new(
@@ -90,7 +90,8 @@ pub fn build_view(
             Box::new(host_integration_view::HostIntegrationStepView::new(
                 &context.passthrough.extract_config(),
                 context.network.network_mode(),
-                context.user.users.iter().any(|user| user.wayland.is_some()),
+                context.source.deployment_category().configures_accounts()
+                    && context.user.users.iter().any(|user| user.wayland.is_some()),
                 context.host.preferred_x11_display,
                 context.host.x11_sockets.clone(),
                 context.host.x11_socket_directory_available,
@@ -106,7 +107,7 @@ pub fn build_view(
         )),
 
         WizardStep::Review => Box::new(review_view::ReviewStepView::new(
-            preparation.preview(&context.build_deployment_request()),
+            preparation.preview(&context.build_deployment_spec()),
         )),
 
         WizardStep::Deploy => {

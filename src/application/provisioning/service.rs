@@ -5,12 +5,13 @@ use super::contract::{
 use super::DeploymentCrashManifest;
 use super::{
     DeploymentClaimControl, DeploymentExecutor, DeploymentJobHandle, DeploymentPlan,
-    DeploymentPreflight, DeploymentRequest, DeploymentStartError, DeploymentSubmission,
-    RemoteTarSafety, SourcePreflight,
+    DeploymentPreflight, DeploymentStartError, DeploymentSubmission, RemoteTarSafety,
+    SourcePreflight,
 };
 use super::{DeploymentRecoveryProbe, DeploymentRecoveryReport, DeploymentStatePort};
 use crate::application::operations::ResourceReservation;
 use crate::application::OperationRegistry;
+use crate::domain::provisioning::DeploymentSpec;
 use futures_util::FutureExt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -62,13 +63,12 @@ impl ProvisioningService {
 
     pub async fn preflight(
         &self,
-        request: &DeploymentRequest,
+        request: &DeploymentSpec,
     ) -> Result<DeploymentPreflight, DeploymentError> {
-        request.validate()?;
-        if !request
-            .source
-            .is_unacknowledged_remote_tar(request.allow_unsafe_remote_tar)
-        {
+        request
+            .validate()
+            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
+        if !request.needs_remote_tar_confirmation() {
             return Ok(DeploymentPreflight::Ready);
         }
 
@@ -372,15 +372,15 @@ pub(crate) async fn run_deployment_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
         DeploymentClaimControl, DeploymentId, MemoryDeploymentClaimControl,
         MemoryDeploymentRecoveryProbe, MemoryDeploymentStatePort,
     };
     use crate::application::provisioning::{
-        DeploymentEvent, DeploymentJobContext, DeploymentSecrets, DeploymentSource,
-        DeploymentStorage,
+        DeploymentEvent, DeploymentJobContext, DeploymentSecrets,
     };
+    use crate::domain::machine::MachineConfig;
+    use crate::domain::provisioning::DeploymentStorage;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -497,22 +497,30 @@ mod tests {
 
     fn submission() -> DeploymentSubmission {
         DeploymentSubmission::new(
-            DeploymentRequest {
-                config: MachineProvisioningConfig {
-                    name: "test".into(),
-                    ..Default::default()
-                },
-                source: DeploymentSource::Copy {
-                    source_name: "base".into(),
-                },
-                storage: DeploymentStorage::Directory,
-                nvidia_profile: None,
-                nvidia_cdi_source: Default::default(),
-                wayland: Vec::new(),
-                allow_unsafe_remote_tar: false,
-            },
+            DeploymentSpec::Clone(crate::domain::provisioning::CloneDeployment {
+                name: "test".into(),
+                source_name: "base".into(),
+            }),
             DeploymentSecrets::new(String::new(), Vec::new()),
         )
+    }
+
+    fn archive_import(allow_unsafe_remote_tar: bool) -> DeploymentSpec {
+        use crate::domain::provisioning::{ImageImport, ImportDeployment, ImportSource};
+        DeploymentSpec::Import(Box::new(ImportDeployment {
+            machine: MachineConfig {
+                name: "test".into(),
+                ..Default::default()
+            },
+            image: ImageImport::Archive {
+                source: ImportSource::Remote {
+                    url: "https://example.invalid/rootfs.tar".into(),
+                },
+                storage: DeploymentStorage::Directory,
+                allow_unsafe_remote_tar,
+            },
+            integration: Default::default(),
+        }))
     }
 
     fn executor(outcome: Result<(), DeploymentError>) -> Arc<RecordingExecutor> {
@@ -576,11 +584,7 @@ mod tests {
             claim_control(),
             OperationRegistry::new(),
         );
-        let (mut request, _) = submission().into_parts();
-        request.source = DeploymentSource::Pull {
-            url: "https://example.invalid/rootfs.tar".into(),
-            is_raw: false,
-        };
+        let mut request = archive_import(false);
 
         assert_eq!(
             service.preflight(&request).await.unwrap(),
@@ -588,7 +592,7 @@ mod tests {
         );
         assert_eq!(preflight.calls.load(Ordering::Relaxed), 1);
 
-        request.allow_unsafe_remote_tar = true;
+        request = archive_import(true);
         assert_eq!(
             service.preflight(&request).await.unwrap(),
             DeploymentPreflight::Ready
@@ -607,11 +611,7 @@ mod tests {
             claim_control(),
             registry.clone(),
         );
-        let (mut request, _) = submission().into_parts();
-        request.source = DeploymentSource::Pull {
-            url: "https://example.invalid/rootfs.tar".into(),
-            is_raw: false,
-        };
+        let request = archive_import(false);
         let started = tokio::time::Instant::now();
         let error = service.preflight(&request).await.unwrap_err();
         assert!(error.to_string().contains("Deployment preflight timed out"));
@@ -956,7 +956,20 @@ mod tests {
             claim_control(),
             OperationRegistry::new(),
         );
-        let (request, _) = submission().into_parts();
+        let request =
+            DeploymentSpec::Bootstrap(Box::new(crate::domain::provisioning::BootstrapDeployment {
+                machine: MachineConfig {
+                    name: "test".into(),
+                    ..Default::default()
+                },
+                provider: crate::domain::provisioning::bootstrap::BootstrapSpec::Pacstrap(
+                    Default::default(),
+                ),
+                storage: DeploymentStorage::Directory,
+                users: Vec::new(),
+                wayland: Vec::new(),
+                integration: Default::default(),
+            }));
         let invalid = DeploymentSubmission::new(
             request,
             DeploymentSecrets::new(

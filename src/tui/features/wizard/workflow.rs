@@ -4,13 +4,13 @@
 //! wizard owns the requests, task handles and acceptance of their results.
 
 use crate::application::provisioning::{
-    DeploymentError, DeploymentId, DeploymentPreflight, DeploymentRequest, HostHardwareSnapshot,
-    InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationService,
-    ProvisioningService,
+    DeploymentError, DeploymentId, DeploymentPreflight, HostHardwareSnapshot, InterfaceValidation,
+    ProvisioningHostSnapshot, ProvisioningPreparationService, ProvisioningService,
 };
 use crate::application::HostOperationTracker;
 use crate::composition::PermissionLevel;
 use crate::config::AppConfig;
+use crate::domain::provisioning::DeploymentSpec;
 use crate::domain::runtime::{ImageEntry, MachineEntry};
 use crate::tui::features::wizard::core::draft::WizardDraft;
 use crate::tui::features::wizard::dialogs::bootstrap_warning::BootstrapWarningDialog;
@@ -137,7 +137,7 @@ pub(crate) enum WizardCompletion {
     },
     Preflight {
         query: u64,
-        request: Box<DeploymentRequest>,
+        request: Box<DeploymentSpec>,
         result: Result<DeploymentPreflight, DeploymentError>,
     },
     ClaimRelease {

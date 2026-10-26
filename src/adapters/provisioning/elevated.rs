@@ -3,8 +3,9 @@
 use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
 use crate::application::provisioning::{
     DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentRequestId,
-    DeploymentSecrets, DeploymentSource, DeploymentStatus,
+    DeploymentSecrets, DeploymentStatus,
 };
+use crate::domain::provisioning::DeploymentSpec;
 use crate::ipc::protocol::deployment::{
     DeploymentClaimState, DeploymentJobSnapshot, DeploymentStreamFrame, DeploymentSubmissionStatus,
     SubmitDeploymentParams, MAX_DEPLOYMENT_STREAM_FRAME_BYTES,
@@ -27,12 +28,13 @@ impl ElevatedProvisioningExecutor {
     }
 
     async fn open_artifact(
-        source: &DeploymentSource,
+        spec: &DeploymentSpec,
     ) -> Result<Option<std::fs::File>, DeploymentError> {
-        let DeploymentSource::Artifact(artifact) = source else {
+        let Some(path) = spec.local_artifact_path() else {
             return Ok(None);
         };
-        let path = artifact.expanded_path();
+        let path =
+            crate::domain::provisioning::source::ArtifactSpec::from_path(path).expanded_path();
         tokio::task::spawn_blocking(move || {
             let file = std::fs::File::open(&path).map_err(|error| {
                 DeploymentError::failed(format!(
@@ -289,8 +291,8 @@ impl DeploymentExecutor for ElevatedProvisioningExecutor {
     ) -> Result<(), DeploymentError> {
         let deployment_id = context.id();
         let request_id = DeploymentRequestId::new();
-        let request = plan.into_request();
-        let artifact_source = Self::open_artifact(&request.source).await?;
+        let request = plan.into_spec();
+        let artifact_source = Self::open_artifact(&request).await?;
         let params = SubmitDeploymentParams {
             request_id,
             deployment_id,

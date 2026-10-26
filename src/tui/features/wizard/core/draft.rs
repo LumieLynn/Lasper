@@ -1,20 +1,24 @@
 use crate::application::provisioning::{
-    DeploymentRequest, DeploymentSecrets, DeploymentSource, DeploymentStorage,
-    DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot, ProvisioningHostSnapshot,
-    StorageBackendKind, UserSecret,
+    DeploymentSecrets, DeploymentSubmission, HostGpuDevice, HostHardwareSnapshot,
+    ProvisioningHostSnapshot, StorageBackendKind, UserSecret,
 };
-use crate::domain::bootstrap::{
+use crate::domain::machine::MachineConfig;
+use crate::domain::machine::{BindMount, CreateUser, NetworkMode, PortForward, PrivateUsersMode};
+use crate::domain::provisioning::bootstrap::{
     BootstrapSpec, Dnf5RepositorySource, RootfsSourceSpec, DEFAULT_BOOTSTRAP_PROFILE,
 };
-use crate::domain::provisioning::{
-    BindMount, CreateUser, NetworkMode, OciNetworkMode, PortForward, PrivateUsersMode,
-};
-use crate::domain::runtime::{ImageEntry, MachineEntry};
-use crate::domain::secret::zeroize_string;
-use crate::domain::source::{ArtifactSpec, BootstrapMethod};
-use crate::domain::storage::{
+use crate::domain::provisioning::oci::OciNetworkMode;
+use crate::domain::provisioning::source::{ArtifactSpec, BootstrapMethod};
+use crate::domain::provisioning::storage::{
     DiskImageConfig, DiskImageFilesystem, DiskImagePartition, DiskImageSource,
 };
+use crate::domain::provisioning::{
+    BootstrapDeployment, CloneDeployment, DeploymentCategory, DeploymentIntegration, ImageImport,
+    ImportDeployment, ImportSource, OciDeployment,
+};
+use crate::domain::provisioning::{DeploymentSpec, DeploymentStorage};
+use crate::domain::runtime::{ImageEntry, MachineEntry};
+use crate::domain::secret::zeroize_string;
 use crate::domain::wayland::{HostWaylandSocket, WaylandGrantIntent, WaylandValidationError};
 use crate::domain::x11::{HostX11Socket, X11BindIntent};
 
@@ -219,17 +223,24 @@ impl SourceState {
         }
     }
 
-    pub fn is_storage_managed_externally(&self) -> bool {
-        match &self.kind {
-            SourceKind::Oci => true,
-            SourceKind::Pull => self.is_pull_raw,
-            SourceKind::LocalFile => self.artifact_spec().is_external_storage(),
-            SourceKind::Profile { method, name } => self
-                .profiles
-                .iter()
-                .find(|profile| &profile.method == method && &profile.name == name)
-                .is_some_and(|profile| profile.source.is_external_storage()),
-            _ => false,
+    pub fn deployment_category(&self) -> DeploymentCategory {
+        match self.extract_config() {
+            SourceConfig::Copy { .. } => DeploymentCategory::Clone,
+            SourceConfig::Oci { .. } => DeploymentCategory::Oci,
+            SourceConfig::Bootstrap(_) => DeploymentCategory::Bootstrap,
+            SourceConfig::Pull { is_raw: true, .. } => DeploymentCategory::DiskImageImport,
+            SourceConfig::Pull { is_raw: false, .. } => DeploymentCategory::ArchiveImport,
+            SourceConfig::Artifact(artifact) => match artifact.resolved_format() {
+                crate::domain::provisioning::source::ArtifactFormat::Raw => {
+                    DeploymentCategory::DiskImageImport
+                }
+                crate::domain::provisioning::source::ArtifactFormat::Tar => {
+                    DeploymentCategory::ArchiveImport
+                }
+                crate::domain::provisioning::source::ArtifactFormat::Auto => {
+                    unreachable!("artifact format was resolved")
+                }
+            },
         }
     }
 
@@ -754,95 +765,105 @@ impl WizardDraft {
         }
     }
 
-    pub fn build_deployment_request(&self) -> DeploymentRequest {
-        let source = match self.source.extract_config() {
-            SourceConfig::Copy { source_name } => DeploymentSource::Copy { source_name },
+    pub fn build_deployment_spec(&self) -> DeploymentSpec {
+        let source = self.source.extract_config();
+        let basic = self.basic.extract_config();
+        match source {
+            SourceConfig::Copy { source_name } => DeploymentSpec::Clone(CloneDeployment {
+                name: basic.name,
+                source_name,
+            }),
             SourceConfig::Oci {
                 reference,
                 read_only,
                 network,
-            } => DeploymentSource::Oci {
+            } => DeploymentSpec::Oci(OciDeployment {
+                name: basic.name,
                 reference,
                 read_only,
                 network,
-            },
-            SourceConfig::Bootstrap(spec) => DeploymentSource::Bootstrap(spec),
-            SourceConfig::Pull { url, is_raw } => DeploymentSource::Pull { url, is_raw },
-            SourceConfig::Artifact(spec) => DeploymentSource::Artifact(spec),
-        };
-        let basic = self.basic.extract_config();
-        if !source.supports_rootfs_configuration() {
-            let config = match &source {
-                DeploymentSource::Copy { .. } => {
-                    crate::application::provisioning::MachineProvisioningConfig {
-                        name: basic.name,
-                        ..Default::default()
-                    }
-                }
-                DeploymentSource::Oci { network, .. } => {
-                    crate::application::provisioning::MachineProvisioningConfig {
-                        name: basic.name,
-                        network: Some(network.into_network_mode()),
-                        private_users: Some(PrivateUsersMode::No),
-                        boot: false,
-                        ..Default::default()
-                    }
-                }
-                DeploymentSource::Bootstrap(_)
-                | DeploymentSource::Pull { .. }
-                | DeploymentSource::Artifact(_) => unreachable!(
-                    "sources with rootfs configuration must use the full request projection"
-                ),
-            };
-            return DeploymentRequest {
-                config,
-                source,
-                storage: DeploymentStorage::Directory,
-                nvidia_profile: None,
-                nvidia_cdi_source: self.nvidia_cdi_source.clone(),
-                wayland: Vec::new(),
-                allow_unsafe_remote_tar: false,
-            };
+            }),
+            SourceConfig::Bootstrap(provider) => {
+                let (machine, integration) = self.system_configuration(basic);
+                DeploymentSpec::Bootstrap(Box::new(BootstrapDeployment {
+                    machine,
+                    provider,
+                    storage: self.deployment_storage(),
+                    users: self.user.extract_config().users,
+                    wayland: self
+                        .user
+                        .users
+                        .iter()
+                        .filter_map(|user| {
+                            user.wayland
+                                .as_ref()
+                                .map(|access| access.intent_for(&user.username))
+                        })
+                        .collect(),
+                    integration,
+                }))
+            }
+            SourceConfig::Pull { url, is_raw } => {
+                self.import_deployment(basic, ImportSource::Remote { url }, is_raw)
+            }
+            SourceConfig::Artifact(artifact) => {
+                let is_raw = artifact.is_external_storage();
+                self.import_deployment(
+                    basic,
+                    ImportSource::Local {
+                        path: artifact.path,
+                    },
+                    is_raw,
+                )
+            }
         }
+    }
 
-        let storage_config = self.storage.extract_config();
-        let storage = match storage_config {
-            StorageConfig {
-                storage_type: StorageBackendKind::Directory,
-                ..
-            } => DeploymentStorage::Directory,
-            StorageConfig {
-                storage_type: StorageBackendKind::Subvolume,
-                ..
-            } => DeploymentStorage::Subvolume,
-            StorageConfig {
-                storage_type: StorageBackendKind::DiskImage,
-                disk_config,
-            } => DeploymentStorage::DiskImage(disk_config.unwrap_or_default()),
+    fn import_deployment(
+        &self,
+        basic: BasicConfig,
+        source: ImportSource,
+        is_raw: bool,
+    ) -> DeploymentSpec {
+        let (machine, integration) = self.system_configuration(basic);
+        let image = if is_raw {
+            ImageImport::DiskImage { source }
+        } else {
+            ImageImport::Archive {
+                source,
+                storage: self.deployment_storage(),
+                allow_unsafe_remote_tar: self.source.unsafe_remote_tar_accepted(),
+            }
         };
+        DeploymentSpec::Import(Box::new(ImportDeployment {
+            machine,
+            image,
+            integration,
+        }))
+    }
+
+    fn deployment_storage(&self) -> DeploymentStorage {
+        let storage = self.storage.extract_config();
+        match storage.storage_type {
+            StorageBackendKind::Directory => DeploymentStorage::Directory,
+            StorageBackendKind::Subvolume => DeploymentStorage::Subvolume,
+            StorageBackendKind::DiskImage => {
+                DeploymentStorage::DiskImage(storage.disk_config.unwrap_or_default())
+            }
+        }
+    }
+
+    fn system_configuration(&self, basic: BasicConfig) -> (MachineConfig, DeploymentIntegration) {
         let network = self.network.extract_config();
-        let users = self.user.extract_config();
         let passthrough = self.passthrough.extract_config();
-        let wayland = self
-            .user
-            .users
-            .iter()
-            .filter_map(|user| {
-                user.wayland
-                    .as_ref()
-                    .map(|access| access.intent_for(&user.username))
-            })
-            .collect();
         let x11_binds = match passthrough.x11_projection {
             X11ProjectionSelection::None => Vec::new(),
-            X11ProjectionSelection::Directory => {
-                vec![X11BindIntent::standard_directory()]
-            }
+            X11ProjectionSelection::Directory => vec![X11BindIntent::standard_directory()],
             X11ProjectionSelection::Sockets(sockets) => {
                 sockets.into_iter().map(X11BindIntent::same_path).collect()
             }
         };
-        let config = crate::application::provisioning::MachineProvisioningConfig {
+        let machine = MachineConfig {
             name: basic.name,
             guest_hostname: basic.guest_hostname,
             network: network.mode,
@@ -855,29 +876,21 @@ impl WizardDraft {
             private_users: passthrough.private_users,
             graphics_acceleration: passthrough.graphics_acceleration,
             gpu_passthrough_all: passthrough.gpu_passthrough_all,
-            users: users.users,
             nvidia_gpu: passthrough.nvidia_gpu,
-            disk_config: match &storage {
-                DeploymentStorage::DiskImage(config) => Some(config.clone()),
-                DeploymentStorage::Directory | DeploymentStorage::Subvolume => None,
-            },
             boot: true,
         };
-
-        DeploymentRequest {
-            config,
-            source,
-            storage,
-            nvidia_profile: passthrough.nvidia_profile,
-            nvidia_cdi_source: self.nvidia_cdi_source.clone(),
-            wayland,
-            allow_unsafe_remote_tar: self.source.unsafe_remote_tar_accepted(),
-        }
+        (
+            machine,
+            DeploymentIntegration {
+                nvidia_profile: passthrough.nvidia_profile,
+                nvidia_cdi_source: self.nvidia_cdi_source.clone(),
+            },
+        )
     }
 
-    pub fn take_submission(&mut self, request: DeploymentRequest) -> DeploymentSubmission {
+    pub fn take_submission(&mut self, request: DeploymentSpec) -> DeploymentSubmission {
         let secrets = self.user.take_secrets();
-        let secrets = if request.source.supports_rootfs_configuration() {
+        let secrets = if request.category().configures_accounts() {
             secrets
         } else {
             drop(secrets);
@@ -888,7 +901,7 @@ impl WizardDraft {
 
     pub fn restore_submission(&mut self, submission: DeploymentSubmission) {
         let (request, mut secrets) = submission.into_parts();
-        if !request.source.supports_rootfs_configuration() {
+        if !request.category().configures_accounts() {
             return;
         }
         if let Some(password) = secrets.take_root_password() {
@@ -972,7 +985,7 @@ impl WizardDraft {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::bootstrap::DebootstrapReleaseSignaturePolicy;
+    use crate::domain::provisioning::bootstrap::DebootstrapReleaseSignaturePolicy;
 
     fn test_wayland_access() -> WaylandAccessDraft {
         let source = HostWaylandSocket::from_verified_parts(
@@ -1069,21 +1082,21 @@ mod tests {
     }
 
     #[test]
-    fn test_source_state_externally_managed() {
+    fn image_formats_control_storage_selection() {
         let mut state = test_source_state();
         state.kind = SourceKind::Oci;
-        assert!(state.is_storage_managed_externally());
+        assert!(!state.deployment_category().selects_storage());
 
         state.kind = SourceKind::Pull;
         state.is_pull_raw = true;
-        assert!(state.is_storage_managed_externally());
+        assert!(!state.deployment_category().selects_storage());
 
         state.kind = SourceKind::LocalFile;
         state.local_path = "test.raw".into();
-        assert!(state.is_storage_managed_externally());
+        assert!(!state.deployment_category().selects_storage());
 
         state.local_path = "test.tar.gz".into();
-        assert!(!state.is_storage_managed_externally());
+        assert!(!!state.deployment_category().selects_storage());
     }
 
     #[test]
@@ -1324,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn deployment_request_drops_wayland_grant_for_sources_without_user_setup() {
+    fn source_switch_only_projects_settings_the_selected_category_can_apply() {
         let mut draft = WizardDraft::new(
             vec![],
             vec![],
@@ -1339,26 +1352,35 @@ mod tests {
             shell: "/bin/bash".into(),
             wayland: Some(test_wayland_access()),
         });
-
         draft.source.kind = SourceKind::Pacstrap;
-        let request = draft.build_deployment_request();
-        assert_eq!(request.wayland.len(), 1);
-        assert_eq!(request.config.users[0].uid, Some(1001));
+        let DeploymentSpec::Bootstrap(bootstrap) = draft.build_deployment_spec() else {
+            panic!("expected bootstrap")
+        };
+        assert_eq!(bootstrap.wayland.len(), 1);
+        assert_eq!(bootstrap.users[0].uid, Some(1001));
 
         draft.source.kind = SourceKind::Copy;
-        let request = draft.build_deployment_request();
-        assert!(request.wayland.is_empty());
-        assert!(request.config.users.is_empty());
-        assert!(request.config.bind_mounts.is_empty());
-        assert_eq!(request.storage, DeploymentStorage::Directory);
-
+        assert!(matches!(
+            draft.build_deployment_spec(),
+            DeploymentSpec::Clone(_)
+        ));
         draft.source.kind = SourceKind::Oci;
-        let request = draft.build_deployment_request();
-        assert!(request.wayland.is_empty());
-        assert!(request.config.users.is_empty());
-        assert!(request.config.bind_mounts.is_empty());
-        assert_eq!(request.config.private_users, Some(PrivateUsersMode::No));
-        assert!(!request.config.boot);
+        assert!(matches!(
+            draft.build_deployment_spec(),
+            DeploymentSpec::Oci(_)
+        ));
+        draft.source.kind = SourceKind::Pull;
+        assert!(matches!(
+            draft.build_deployment_spec(),
+            DeploymentSpec::Import(_)
+        ));
+
+        draft.source.kind = SourceKind::Pacstrap;
+        let DeploymentSpec::Bootstrap(bootstrap) = draft.build_deployment_spec() else {
+            panic!("expected bootstrap")
+        };
+        assert_eq!(bootstrap.users[0].username, "lumie");
+        assert_eq!(bootstrap.wayland.len(), 1);
     }
 
     #[test]
@@ -1380,7 +1402,7 @@ mod tests {
             wayland: None,
         });
 
-        let request = draft.build_deployment_request();
+        let request = draft.build_deployment_spec();
         let submission = draft.take_submission(request);
         assert!(submission.validate_secrets().is_ok());
         let (_, secrets) = submission.into_parts();

@@ -1,7 +1,7 @@
 //! Requests and edits produced by wizard steps and their dialogs.
 
 use crate::application::provisioning::DeploymentId;
-use crate::domain::provisioning::{BindMount, PortForward};
+use crate::domain::machine::{BindMount, PortForward};
 use crate::tui::features::wizard::dialogs::nvidia_config::NvidiaConfigResult;
 use crate::tui::features::wizard::draft::{UnclassifiedFile, UserDraft, WaylandAccessDraft};
 

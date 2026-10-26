@@ -1,11 +1,12 @@
 use crate::application::provisioning::{
-    DeploymentError, DeploymentRequest, DeploymentSource, DeploymentStorage, HostCapability,
-    HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo, ImagePartitionProbe,
-    InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort, StorageBackendKind,
-    UnclassifiedNvidiaFile,
+    DeploymentError, HostCapability, HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo,
+    ImagePartitionProbe, InterfaceValidation, ProvisioningHostSnapshot,
+    ProvisioningPreparationPort, StorageBackendKind, UnclassifiedNvidiaFile,
 };
-use crate::domain::source::BootstrapMethod;
-use crate::domain::storage::DiskImageFilesystem;
+use crate::domain::provisioning::source::BootstrapMethod;
+use crate::domain::provisioning::storage::DiskImageFilesystem;
+use crate::domain::provisioning::ImageImport;
+use crate::domain::provisioning::{DeploymentSpec, DeploymentStorage};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -227,64 +228,59 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             .transpose()
     }
 
-    fn preview(&self, request: &DeploymentRequest) -> String {
-        if let DeploymentSource::Oci {
-            reference,
-            read_only,
-            network,
-        } = &request.source
-        {
-            let mode = if *read_only {
-                "read-only layers"
-            } else {
-                "writable overlay"
-            };
-            return format!(
-                " [SYSTEMD OCI APPLICATION]\n\n Reference: {reference}\n Name: {}\n Storage: /var/lib/machines/{}.mstack\n Mode: {mode}\n Network: {}\n PrivateUsers: no (system-scope import)\n Runtime config: OCI settings preserved in trusted host config\n Verification: HTTPS transport authentication; no publisher signature verification\n",
-                request.config.name,
-                request.config.name,
-                network.as_str(),
-            );
-        }
-        if let DeploymentSource::Copy { source_name } = &request.source {
-            return format!(
-                " [CLONE OPERATION]\n\n Source: {source_name}\n Destination: {}\n\n Image data, effective .nspawn settings, and Lasper's service override\n are copied when present.\n\n WARNING: {}",
-                request.config.name,
+    fn preview(&self, request: &DeploymentSpec) -> String {
+        let (machine, storage, wayland, provider) = match request {
+            DeploymentSpec::Oci(deployment) => {
+                let mode = if deployment.read_only { "read-only layers" } else { "writable overlay" };
+                return format!(
+                    " [SYSTEMD OCI APPLICATION]\n\n Reference: {}\n Name: {}\n Storage: /var/lib/machines/{}.mstack\n Mode: {mode}\n Network: {}\n PrivateUsers: no (system-scope import)\n Runtime config: OCI settings preserved in trusted host config\n Verification: HTTPS transport authentication; no publisher signature verification\n",
+                    deployment.reference, deployment.name, deployment.name, deployment.network.as_str(),
+                );
+            }
+            DeploymentSpec::Clone(deployment) => return format!(
+                " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n Image data, effective .nspawn settings, and Lasper's service override\n are copied when present.\n\n WARNING: {}",
+                deployment.source_name, deployment.name,
                 crate::adapters::provisioning::engine::builders::clone::CLONE_IDENTITY_NOTICE,
-            );
-        }
-
-        let (storage_label, storage_path) = match &request.storage {
-            DeploymentStorage::Directory => (
-                "Directory",
-                crate::paths::machine_root(&request.config.name),
             ),
-            DeploymentStorage::Subvolume => (
-                "Btrfs Subvolume",
-                crate::paths::machine_root(&request.config.name),
-            ),
-            DeploymentStorage::DiskImage(_) => (
+            DeploymentSpec::Bootstrap(deployment) => (&deployment.machine, Some(&deployment.storage), deployment.wayland.as_slice(), Some(&deployment.provider)),
+            DeploymentSpec::Import(deployment) => {
+                let storage = match &deployment.image {
+                    ImageImport::Archive { storage, .. } => Some(storage),
+                    ImageImport::DiskImage { .. } => None,
+                };
+                (&deployment.machine, storage, &[][..], None)
+            }
+        };
+        let (storage_label, storage_path) = match storage {
+            Some(DeploymentStorage::Directory) => {
+                ("Directory", crate::paths::machine_root(&machine.name))
+            }
+            Some(DeploymentStorage::Subvolume) => {
+                ("Btrfs Subvolume", crate::paths::machine_root(&machine.name))
+            }
+            Some(DeploymentStorage::DiskImage(_)) | None => (
                 "Disk Image (Raw/Block)",
-                crate::paths::machine_raw_image(&request.config.name),
+                crate::paths::machine_raw_image(&machine.name),
             ),
         };
-        let guest_hostname = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
+        let guest_hostname = crate::adapters::config::NspawnConfigSpec::try_from(machine)
             .map(|spec| spec.guest_hostname.into_string())
-            .unwrap_or_else(|_| request.config.guest_hostname.clone());
-        let mut content = format!(
+            .unwrap_or_else(|_| machine.guest_hostname.clone());
+        let mut content =
+            format!(
             " [DEPLOYMENT PREVIEW - {}]\n\n Storage: {storage_label} ({})\n Guest hostname: {}\n",
-            request.config.name,
-            storage_path.display(),
-            guest_hostname,
+            machine.name, storage_path.display(), guest_hostname,
         );
-        if let DeploymentSource::Bootstrap(spec) = &request.source {
-            if spec.inherits_default_packages() {
+        if let Some(provider) = provider {
+            if provider.inherits_default_packages() {
                 content.push_str(" Bootstrap packages: defaults + configured additions\n");
             } else {
                 content.push_str(" WARNING: Default packages are disabled; configured packages must satisfy the container runtime and network requirements.\n");
             }
+        } else {
+            content.push_str(" Accounts: existing users and credentials are preserved\n");
         }
-        for intent in &request.wayland {
+        for intent in wayland {
             let displays = intent
                 .sources()
                 .iter()
@@ -293,22 +289,21 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                 .join(", ");
             content.push_str(&format!(
                 " Wayland access: {displays} -> {}\n",
-                intent.target_username(),
+                intent.target_username()
             ));
         }
         let rendered = (|| -> Result<String, String> {
             request.validate().map_err(|error| error.to_string())?;
-            let spec = crate::adapters::config::NspawnConfigSpec::try_from(&request.config)
+            let spec = crate::adapters::config::NspawnConfigSpec::try_from(machine)
                 .map_err(|error| error.to_string())?;
-            let wayland_binds = if request.wayland.is_empty() {
+            let wayland_binds = if wayland.is_empty() {
                 Vec::new()
             } else {
-                let policy = crate::application::provisioning::resolve_wayland_bind_policy(
-                    request.config.private_users,
+                let policy = crate::domain::provisioning::wayland::resolve_wayland_bind_policy(
+                    machine.private_users,
                 )
                 .map_err(|error| error.to_string())?;
-                request
-                    .wayland
+                wayland
                     .iter()
                     .flat_map(|intent| {
                         intent.sources().iter().map(move |source| {
@@ -322,19 +317,15 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
                     })
                     .collect::<Vec<_>>()
             };
-            crate::adapters::config::nspawn_file::nspawn_config_content_from_spec_with_wayland_binds(
-                &spec,
-                &wayland_binds,
-            )
-            .map_err(|error| error.to_string())
+            crate::adapters::config::nspawn_file::nspawn_config_content_from_spec_with_wayland_binds(&spec, &wayland_binds).map_err(|error| error.to_string())
         })();
         content.push_str(&rendered.unwrap_or_else(|error| format!(" [ERROR: {error}]")));
-        if !request.config.device_binds.is_empty() || request.config.gpu_passthrough_all {
+        if !machine.device_binds.is_empty() || machine.gpu_passthrough_all {
             content.push_str("\n#[systemd override.conf]\n");
             content.push_str(
                 &crate::adapters::config::systemd_unit::systemd_override_content(
-                    &request.config.device_binds,
-                    request.config.gpu_passthrough_all,
+                    &machine.device_binds,
+                    machine.gpu_passthrough_all,
                 ),
             );
         }
@@ -349,14 +340,14 @@ fn tool_available(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
-    use crate::domain::provisioning::CreateUser;
-    use crate::domain::provisioning::{NetworkMode, PrivateUsersMode};
+    use crate::domain::machine::CreateUser;
+    use crate::domain::machine::MachineConfig;
+    use crate::domain::machine::{NetworkMode, PrivateUsersMode};
     use crate::domain::wayland::{
         HostWaylandSocket, SocketRevision, WaylandDisplay, WaylandGrantIntent,
     };
 
-    fn request(private_users: PrivateUsersMode) -> DeploymentRequest {
+    fn request(private_users: PrivateUsersMode) -> DeploymentSpec {
         let source = HostWaylandSocket::from_verified_parts(
             WaylandDisplay::new("wayland-0").unwrap(),
             "/run/user/1001".into(),
@@ -373,29 +364,26 @@ mod tests {
             },
         )
         .unwrap();
-        DeploymentRequest {
-            config: MachineProvisioningConfig {
+        DeploymentSpec::Bootstrap(Box::new(crate::domain::provisioning::BootstrapDeployment {
+            machine: MachineConfig {
                 name: "test".into(),
                 private_users: Some(private_users),
                 network: Some(NetworkMode::Veth),
-                users: vec![CreateUser {
-                    username: "lumie".into(),
-                    uid: Some(1001),
-                    shell: "/bin/bash".into(),
-                    sudoer: false,
-                }],
                 ..Default::default()
             },
-            source: DeploymentSource::Pull {
-                url: "https://example.test/rootfs.raw".into(),
-                is_raw: true,
-            },
+            provider: crate::domain::provisioning::bootstrap::BootstrapSpec::Pacstrap(
+                Default::default(),
+            ),
+            users: vec![CreateUser {
+                username: "lumie".into(),
+                uid: Some(1001),
+                shell: "/bin/bash".into(),
+                sudoer: false,
+            }],
             storage: DeploymentStorage::Directory,
-            nvidia_profile: None,
-            nvidia_cdi_source: Default::default(),
-            wayland: vec![WaylandGrantIntent::new("lumie", vec![source.clone()]).unwrap()],
-            allow_unsafe_remote_tar: false,
-        }
+            integration: Default::default(),
+            wayland: vec![WaylandGrantIntent::new("lumie", vec![source]).unwrap()],
+        }))
     }
 
     #[test]
@@ -422,10 +410,10 @@ mod tests {
 
     #[test]
     fn clone_preview_discloses_preserved_guest_identity() {
-        let mut request = request(PrivateUsersMode::Pick);
-        request.source = DeploymentSource::Copy {
+        let request = DeploymentSpec::Clone(crate::domain::provisioning::CloneDeployment {
+            name: "test".into(),
             source_name: "source-machine".into(),
-        };
+        });
 
         let preview = NspawnProvisioningPreparation::new(Default::default()).preview(&request);
 

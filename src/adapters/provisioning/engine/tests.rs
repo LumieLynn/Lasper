@@ -3,11 +3,11 @@ use super::*;
 use crate::adapters::error::NspawnError;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
-    deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentResource,
-    DeploymentSource, DeploymentStage, DeploymentStatePort, DeploymentStateSession,
-    DeploymentStorage, MachineProvisioningConfig, MemoryDeploymentStatePort, ResourceDisposition,
+    deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentResource, DeploymentStage,
+    DeploymentStatePort, DeploymentStateSession, MemoryDeploymentStatePort, ResourceDisposition,
     ResourceLedger,
 };
+use crate::domain::provisioning::DeploymentSpec;
 use std::sync::Arc;
 
 fn apply_report() -> ApplyReport {
@@ -135,20 +135,12 @@ fn removing_owned_storage_resolves_unknown_rootfs_effects() {
 
 #[tokio::test]
 async fn interrupted_applying_effect_is_persisted_as_unknown_not_owned() {
-    let plan = DeploymentPlan::build(DeploymentRequest {
-        config: MachineProvisioningConfig {
+    let plan = DeploymentPlan::build(DeploymentSpec::Clone(
+        crate::domain::provisioning::CloneDeployment {
             name: "test".into(),
-            ..Default::default()
-        },
-        source: DeploymentSource::Copy {
             source_name: "base".into(),
         },
-        storage: DeploymentStorage::Directory,
-        nvidia_profile: None,
-        nvidia_cdi_source: Default::default(),
-        wayland: Vec::new(),
-        allow_unsafe_remote_tar: false,
-    })
+    ))
     .unwrap();
     let id = DeploymentId::from_u128(42);
     let state = Arc::new(MemoryDeploymentStatePort::default());

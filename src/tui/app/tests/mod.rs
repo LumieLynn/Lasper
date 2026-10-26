@@ -829,8 +829,11 @@ mod tar_risk_confirmation {
             registry,
         ));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
-            .await;
+        app.ui.overlays.active_dialog = None;
+        let wizard = app.ui.overlays.wizard.as_mut().unwrap();
+        wizard.draft.source.kind = crate::tui::features::wizard::draft::SourceKind::Pacstrap;
+        let action = wizard.process_message(AppMessage::Wizard(WizardMessage::Submit));
+        app.handle_wizard_action(action).await;
         app.handle_event(event_rx.recv().await.unwrap()).await;
         let wizard = app.ui.overlays.wizard.as_ref().unwrap();
         assert_eq!(wizard.step, WizardStep::Review);
@@ -925,7 +928,17 @@ mod tar_risk_confirmation {
         else {
             panic!("confirmation must run deployment preflight");
         };
-        assert!(request.allow_unsafe_remote_tar);
+        let crate::domain::provisioning::DeploymentSpec::Import(deployment) = request.as_ref()
+        else {
+            panic!("expected import")
+        };
+        assert!(matches!(
+            deployment.image,
+            crate::domain::provisioning::ImageImport::Archive {
+                allow_unsafe_remote_tar: true,
+                ..
+            }
+        ));
         app.handle_event(event).await;
         assert!(event_rx.try_recv().is_err());
 

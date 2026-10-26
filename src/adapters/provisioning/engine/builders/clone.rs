@@ -7,8 +7,8 @@ use crate::adapters::provisioning::engine::{
     check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
     Deployer, DeploymentCancellation,
 };
+use crate::application::provisioning::DeploymentResource;
 use crate::application::provisioning::ResourceApplyStatus;
-use crate::application::provisioning::{DeploymentResource, MachineProvisioningConfig};
 use crate::domain::machine::MachineName;
 
 pub(crate) const CLONE_IDENTITY_NOTICE: &str = "Exact clone: guest hostname, machine-id, SSH host keys, user accounts, and application state are preserved. Reset guest identity manually before treating the clone as an independent machine.";
@@ -61,14 +61,6 @@ impl CloneApplyResult {
 
 #[async_trait]
 impl Deployer for CloneDeployer {
-    fn is_external_storage_managed(&self) -> bool {
-        true
-    }
-
-    fn requires_post_config(&self) -> bool {
-        false
-    }
-
     fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
         vec![
             DeploymentResource::ExternalImage(target.clone()),
@@ -80,7 +72,6 @@ impl Deployer for CloneDeployer {
     async fn deploy(
         &self,
         name: &str,
-        _cfg: &MachineProvisioningConfig,
         _rootfs: &std::path::Path,
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,

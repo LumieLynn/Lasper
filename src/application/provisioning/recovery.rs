@@ -110,28 +110,19 @@ impl DeploymentRecoveryProbe for MemoryDeploymentRecoveryProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::MachineProvisioningConfig;
     use crate::application::provisioning::{
-        DeploymentId, DeploymentPlan, DeploymentRequest, DeploymentSource, DeploymentStage,
-        DeploymentStorage, ResourceLedger,
+        DeploymentId, DeploymentPlan, DeploymentStage, ResourceLedger,
     };
     use crate::domain::machine::MachineName;
+    use crate::domain::provisioning::DeploymentSpec;
 
     fn manifest() -> DeploymentCrashManifest {
-        let plan = DeploymentPlan::build(DeploymentRequest {
-            config: MachineProvisioningConfig {
+        let plan = DeploymentPlan::build(DeploymentSpec::Clone(
+            crate::domain::provisioning::CloneDeployment {
                 name: "target".into(),
-                ..Default::default()
-            },
-            source: DeploymentSource::Copy {
                 source_name: "base".into(),
             },
-            storage: DeploymentStorage::Directory,
-            nvidia_profile: None,
-            nvidia_cdi_source: Default::default(),
-            wayland: Vec::new(),
-            allow_unsafe_remote_tar: false,
-        })
+        ))
         .unwrap();
         DeploymentCrashManifest::prepared(DeploymentId::from_u128(1), &plan)
     }

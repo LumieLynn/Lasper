@@ -1,7 +1,7 @@
 //! Host command projections for typed bootstrap intent.
 
 use crate::adapters::error::{NspawnError, Result};
-use crate::domain::bootstrap::{
+use crate::domain::provisioning::bootstrap::{
     BootstrapValidationError, DebootstrapDependencyMode, DebootstrapReleaseSignaturePolicy,
     DebootstrapSpec, DebootstrapUsrMergeMode, Dnf5BestCandidatePolicy, Dnf5DocumentationPolicy,
     Dnf5MetadataMode, Dnf5PackageSignaturePolicy, Dnf5RepositorySource, Dnf5Spec,
@@ -265,7 +265,7 @@ fn validation(message: impl Into<String>) -> NspawnError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::bootstrap::{
+    use crate::domain::provisioning::bootstrap::{
         DebootstrapPolicy, DebootstrapTransportPolicy, Dnf5Policy, PacstrapPolicy,
     };
     use std::path::Path;
