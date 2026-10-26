@@ -206,6 +206,13 @@ async fn run_deploy_internal(
                 .supports_nspawn_commands(&actual_rootfs_target)
                 .await?;
 
+        let has_account_changes = secrets.has_account_changes();
+        if has_account_changes && !supports_offline_commands {
+            return Err(NspawnError::Validation(
+                "Requested account initialization requires a bootstrapped rootfs with an OS layout and support for systemd-nspawn commands".into(),
+            ));
+        }
+
         if has_os_layout {
             push_log!(format!(
                 "Setting guest hostname to {}...",
@@ -227,7 +234,6 @@ async fn run_deploy_internal(
             check_deployment_cancellation(&cancellation)?;
         }
 
-        let has_account_changes = secrets.has_account_changes();
         if supports_offline_commands {
             if has_account_changes {
                 persist_applying(
@@ -240,14 +246,9 @@ async fn run_deploy_internal(
             }
             if let Some(password) = secrets.take_root_password() {
                 push_log!("Setting root password...".to_string());
-                for warning in host
-                    .rootfs
+                host.rootfs
                     .set_root_password(&actual_rootfs_target, password)
-                    .await?
-                {
-                    log::warn!("{}", warning);
-                    push_log!(warning);
-                }
+                    .await?;
                 check_deployment_cancellation(&cancellation)?;
             }
 
@@ -258,22 +259,13 @@ async fn run_deploy_internal(
                 let password = secrets
                     .take_user_password(&user.username)
                     .map_err(|error| NspawnError::Validation(error.to_string()))?;
-                for warning in host
-                    .rootfs
+                host.rootfs
                     .create_user(&actual_rootfs_target, user, password)
-                    .await?
-                {
-                    log::warn!("{}", warning);
-                    push_log!(warning);
-                }
+                    .await?;
                 check_deployment_cancellation(&cancellation)?;
             }
         } else if !has_os_layout {
-            log::warn!("[AUDIT] [Container: {}] rootfs OS layout could not be verified. Skipping internal modifications.", name);
-            push_log!("WARNING: Could not verify the rootfs OS layout. Skipping guest hostname, passwords, and user creation.".to_string());
-        } else if has_account_changes {
-            log::warn!("[AUDIT] [Container: {}] rootfs has no /usr tree required by systemd-nspawn offline commands. Skipping account modifications.", name);
-            push_log!("WARNING: This rootfs has no /usr tree required by systemd-nspawn; skipping password and user creation.".to_string());
+            push_log!("WARNING: Could not verify the rootfs OS layout; the guest hostname was not changed.".to_string());
         }
 
         let mut resolved_wayland = Vec::with_capacity(wayland_intents.len());
@@ -321,6 +313,31 @@ async fn run_deploy_internal(
             persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
         }
 
+        if supports_offline_commands {
+            if let Some(mode) = &cfg.network {
+                if mode.uses_default_guest_network_stack() {
+                    push_log!(
+                        "Enabling container network and DNS services (systemd-networkd, systemd-resolved)..."
+                            .to_string()
+                    );
+                    let rootfs_network = DeploymentResource::RootfsNetwork(target.clone());
+                    persist_applying(
+                        &job,
+                        DeploymentStage::RootfsMutation,
+                        vec![rootfs_network.clone()],
+                        &report,
+                    )
+                    .await?;
+                    for warning in host.rootfs.configure_network(&actual_rootfs_target).await? {
+                        push_log!(warning);
+                    }
+                    report.record_typed(rootfs_network, ResourceDisposition::Committed);
+                    persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
+                    check_deployment_cancellation(&cancellation)?;
+                }
+            }
+        }
+
         let mut initial_nvidia_state = None;
 
         if cfg.nvidia_gpu {
@@ -336,32 +353,6 @@ async fn run_deploy_internal(
             .map_err(|error| {
                 NspawnError::Runtime(format!("NVIDIA CDI discovery failed: {error}"))
             })?;
-            check_deployment_cancellation(&cancellation)?;
-
-            // Persist the validated snapshot and its profile for lifecycle diffing.
-            persist_applying(
-                &job,
-                DeploymentStage::HostConfiguration,
-                vec![DeploymentResource::NvidiaState(target.clone())],
-                &report,
-            )
-            .await?;
-            let state_apply = host.nvidia_state.write_initial(&name, &state).await?;
-            report.record_apply(AppliedResource::NvidiaState, state_apply)?;
-            persist_committed(&job, DeploymentStage::HostConfiguration, &report).await?;
-            match state_apply {
-                ResourceApplyStatus::ReplacedOwned => {
-                    let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
-                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
-                    push_log!(format!("WARNING: {warning}"));
-                }
-                ResourceApplyStatus::ConflictUnknownOwner => {
-                    let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
-                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
-                    push_log!(format!("WARNING: {warning}"));
-                }
-                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
-            }
             check_deployment_cancellation(&cancellation)?;
 
             // Write ld.so.conf.d and env vars into rootfs (one-time setup)
@@ -391,8 +382,33 @@ async fn run_deploy_internal(
             } else {
                 push_log!("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
             }
-            initial_nvidia_state = Some(state);
+            // Persist the validated snapshot and its profile for lifecycle diffing.
+            persist_applying(
+                &job,
+                DeploymentStage::HostConfiguration,
+                vec![DeploymentResource::NvidiaState(target.clone())],
+                &report,
+            )
+            .await?;
+            let state_apply = host.nvidia_state.write_initial(&name, &state).await?;
+            report.record_apply(AppliedResource::NvidiaState, state_apply)?;
+            persist_committed(&job, DeploymentStage::HostConfiguration, &report).await?;
+            match state_apply {
+                ResourceApplyStatus::ReplacedOwned => {
+                    let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ResourceApplyStatus::ConflictUnknownOwner => {
+                    let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
+                    log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
+                    push_log!(format!("WARNING: {warning}"));
+                }
+                ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
+            }
             check_deployment_cancellation(&cancellation)?;
+
+            initial_nvidia_state = Some(state);
         }
 
         if cfg.private_users == Some(PrivateUsersMode::No) {
@@ -466,39 +482,6 @@ async fn run_deploy_internal(
             check_deployment_cancellation(&cancellation)?;
         }
 
-        if supports_offline_commands {
-            if let Some(mode) = &cfg.network {
-                if mode.uses_default_guest_network_stack() {
-                    push_log!(
-                        "Enabling container network and DNS services (systemd-networkd, systemd-resolved)..."
-                            .to_string()
-                    );
-                    let rootfs_network = DeploymentResource::RootfsNetwork(target.clone());
-                    persist_applying(
-                        &job,
-                        DeploymentStage::RootfsMutation,
-                        vec![rootfs_network.clone()],
-                        &report,
-                    )
-                    .await?;
-                    let configured = match host.rootfs.configure_network(&actual_rootfs_target).await {
-                        Ok(warnings) => {
-                            for warning in warnings {
-                                log::warn!("{}", warning);
-                                push_log!(warning);
-                            }
-                            true
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if configured {
-                        report.record_typed(rootfs_network, ResourceDisposition::Committed);
-                    }
-                    persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
-                    check_deployment_cancellation(&cancellation)?;
-                }
-            }
-        }
         check_deployment_cancellation(&cancellation)?;
         Ok::<(), NspawnError>(())
     }

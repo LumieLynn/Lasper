@@ -11,7 +11,7 @@ pub(crate) async fn create_user_in_container(
     user: &CreateUser,
     password: Option<&str>,
     runner: &dyn RootfsProcessRunner,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     user.validate()
         .map_err(|error| NspawnError::Validation(error.to_string()))?;
     if let Some(password) = password {
@@ -43,19 +43,10 @@ pub(crate) async fn create_user_in_container(
         configure_sudoer(rootfs, &user.username, runner).await?;
     }
 
-    let mut warnings = Vec::new();
     if let Some(password) = password.filter(|password| !password.is_empty()) {
-        let output = run_chpasswd(rootfs, &user.username, password, runner).await?;
-        if !output.status.success() {
-            warnings.push(format!(
-                "WARNING: chpasswd failed for user '{}': {}",
-                user.username,
-                command_error(&output)
-            ));
-        }
+        set_password(rootfs, &user.username, password, runner).await?;
     }
-
-    Ok(warnings)
+    Ok(())
 }
 
 pub(crate) async fn resolve_user_identity(
@@ -111,19 +102,28 @@ pub(crate) async fn set_root_password(
     rootfs: &Path,
     password: &str,
     runner: &dyn RootfsProcessRunner,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     if password.is_empty() {
-        return Ok(Vec::new());
+        return Ok(());
     }
-    let output = run_chpasswd(rootfs, "root", password, runner).await?;
-    if output.status.success() {
-        Ok(Vec::new())
-    } else {
-        Ok(vec![format!(
-            "WARNING: chpasswd for root failed: {}",
-            command_error(&output)
-        )])
+    set_password(rootfs, "root", password, runner).await
+}
+
+async fn set_password(
+    rootfs: &Path,
+    username: &str,
+    password: &str,
+    runner: &dyn RootfsProcessRunner,
+) -> Result<()> {
+    let output = run_chpasswd(rootfs, username, password, runner).await?;
+    if !output.status.success() {
+        return Err(NspawnError::cmd_failed(
+            format!("set password for {username}"),
+            format!("systemd-nspawn -D {:?} -- chpasswd", rootfs),
+            &output,
+        ));
     }
+    Ok(())
 }
 
 async fn run_chpasswd(
@@ -403,6 +403,57 @@ mod tests {
         set_root_password(Path::new("/tmp/rootfs"), "secret-value", &runner)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_root_password_change_fails_initialization_without_exposing_the_secret() {
+        let mut runner = MockRootfsProcessRunner::new();
+        runner.expect_run().once().returning(|_, command, _| {
+            assert_eq!(command, vec!["chpasswd"]);
+            Ok(failure_output("password update rejected"))
+        });
+        let error = set_root_password(Path::new("/tmp/rootfs"), "root-sentinel", &runner)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("set password for root"));
+        assert!(error.to_string().contains("password update rejected"));
+        assert!(!error.to_string().contains("root-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn failed_user_password_change_does_not_report_a_successful_account_initialization() {
+        let mut runner = MockRootfsProcessRunner::new();
+        let mut sequence = mockall::Sequence::new();
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .returning(|_, command, _| {
+                assert_eq!(command[0], "useradd");
+                Ok(success_output())
+            });
+        runner
+            .expect_run()
+            .once()
+            .in_sequence(&mut sequence)
+            .returning(|_, command, _| {
+                assert_eq!(command, vec!["chpasswd"]);
+                Ok(failure_output("password update rejected"))
+            });
+        let user = CreateUser {
+            username: "alice".into(),
+            ..Default::default()
+        };
+        let error = create_user_in_container(
+            Path::new("/tmp/rootfs"),
+            &user,
+            Some("user-sentinel"),
+            &runner,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("set password for alice"));
+        assert!(!error.to_string().contains("user-sentinel"));
     }
 
     #[tokio::test]

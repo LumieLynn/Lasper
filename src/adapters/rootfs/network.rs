@@ -1,31 +1,22 @@
 use crate::adapters::error::{NspawnError, Result};
-use crate::adapters::process::{log_output, CommandRunner};
-use crate::adapters::rootfs::process::ROOTFS_COMMAND_TIMEOUT;
-use std::path::{Path, PathBuf};
+use crate::adapters::process::log_output;
+use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use std::path::Path;
 use std::process::Output;
 
 /// Enable the guest services used by Lasper's veth and bridge network setup.
 pub(crate) async fn configure_network_at(
     rootfs: &Path,
-    cmd_runner: &dyn CommandRunner,
+    runner: &dyn RootfsProcessRunner,
 ) -> Result<Vec<String>> {
-    let rootfs_s = rootfs.to_string_lossy().to_string();
-    let systemctl_probe = cmd_runner
-        .run_bounded(
-            "systemd-nspawn",
-            vec![
-                "-D".into(),
-                rootfs_s.clone(),
-                "--quiet".into(),
-                "--settings=no".into(),
-                "test".into(),
-                "-e".into(),
-                "/usr/bin/systemctl".into(),
-            ],
-            ROOTFS_COMMAND_TIMEOUT,
+    let systemctl_probe = runner
+        .run(
+            rootfs,
+            vec!["test".into(), "-e".into(), "/usr/bin/systemctl".into()],
+            None,
         )
         .await
-        .map_err(|error| NspawnError::Io(PathBuf::from("systemd-nspawn"), error))?;
+        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
     log_output("systemctl probe", &systemctl_probe);
     if !systemctl_probe.status.success() {
         return Ok(vec![
@@ -45,7 +36,7 @@ pub(crate) async fn configure_network_at(
             "Veth/bridge DNS resolution may not work",
         ),
     ] {
-        let output = enable_systemd_unit(rootfs, &rootfs_s, unit, cmd_runner).await?;
+        let output = enable_systemd_unit(rootfs, unit, runner).await?;
         if !output.status.success() {
             warnings.push(format!(
                 "WARNING: Could not enable {unit} inside the container; the unit may be missing. {consequence}."
@@ -58,26 +49,17 @@ pub(crate) async fn configure_network_at(
 
 async fn enable_systemd_unit(
     rootfs: &Path,
-    rootfs_s: &str,
     unit: &str,
-    cmd_runner: &dyn CommandRunner,
+    runner: &dyn RootfsProcessRunner,
 ) -> Result<Output> {
-    let out = cmd_runner
-        .run_bounded(
-            "systemd-nspawn",
-            vec![
-                "-D".into(),
-                rootfs_s.to_string(),
-                "--quiet".into(),
-                "--settings=no".into(),
-                "systemctl".into(),
-                "enable".into(),
-                unit.into(),
-            ],
-            ROOTFS_COMMAND_TIMEOUT,
+    let out = runner
+        .run(
+            rootfs,
+            vec!["systemctl".into(), "enable".into(), unit.into()],
+            None,
         )
         .await
-        .map_err(|e| NspawnError::Io(PathBuf::from("systemd-nspawn"), e))?;
+        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
     log_output(&format!("systemctl enable {unit}"), &out);
     if !out.status.success() {
         log::warn!("Failed to enable {} inside {}", unit, rootfs.display());
@@ -88,7 +70,7 @@ async fn enable_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::process::MockCommandRunner;
+    use crate::adapters::rootfs::process::MockRootfsProcessRunner;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
 
@@ -100,29 +82,18 @@ mod tests {
         }
     }
 
-    fn rootfs_with_systemctl() -> tempfile::TempDir {
-        let rootfs = tempfile::tempdir().unwrap();
-        let bin = rootfs.path().join("usr/bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("systemctl"), "systemctl").unwrap();
-        rootfs
-    }
-
     #[tokio::test]
     async fn network_services_are_enabled_without_rewriting_resolver_configuration() {
-        let rootfs = rootfs_with_systemctl();
+        let rootfs = tempfile::tempdir().unwrap();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
+        let mut runner = MockRootfsProcessRunner::new();
         {
             let calls = calls.clone();
-            runner
-                .expect_run_bounded()
-                .returning(move |program, args, timeout| {
-                    assert_eq!(program, "systemd-nspawn");
-                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
-                    calls.lock().unwrap().push(args.clone());
-                    Ok(mock_output(true, ""))
-                });
+            runner.expect_run().returning(move |_, args, stdin| {
+                assert!(stdin.is_none());
+                calls.lock().unwrap().push(args.clone());
+                Ok(mock_output(true, ""))
+            });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
@@ -141,23 +112,20 @@ mod tests {
 
     #[tokio::test]
     async fn network_unit_failures_are_reported_independently() {
-        let rootfs = rootfs_with_systemctl();
+        let rootfs = tempfile::tempdir().unwrap();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
+        let mut runner = MockRootfsProcessRunner::new();
         {
             let calls = calls.clone();
-            runner
-                .expect_run_bounded()
-                .returning(move |program, args, timeout| {
-                    assert_eq!(program, "systemd-nspawn");
-                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
-                    calls.lock().unwrap().push(args.clone());
-                    if args.iter().any(|arg| arg == "test") {
-                        Ok(mock_output(true, ""))
-                    } else {
-                        Ok(mock_output(false, "networkd failed"))
-                    }
-                });
+            runner.expect_run().returning(move |_, args, stdin| {
+                assert!(stdin.is_none());
+                calls.lock().unwrap().push(args.clone());
+                if args.iter().any(|arg| arg == "test") {
+                    Ok(mock_output(true, ""))
+                } else {
+                    Ok(mock_output(false, "networkd failed"))
+                }
+            });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();
@@ -179,17 +147,14 @@ mod tests {
     async fn missing_systemctl_skips_network_configuration() {
         let rootfs = tempfile::tempdir().unwrap();
         let calls = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
-        let mut runner = MockCommandRunner::new();
+        let mut runner = MockRootfsProcessRunner::new();
         {
             let calls = calls.clone();
-            runner
-                .expect_run_bounded()
-                .returning(move |program, args, timeout| {
-                    assert_eq!(program, "systemd-nspawn");
-                    assert_eq!(timeout, ROOTFS_COMMAND_TIMEOUT);
-                    calls.lock().unwrap().push(args);
-                    Ok(mock_output(false, "missing"))
-                });
+            runner.expect_run().returning(move |_, args, stdin| {
+                assert!(stdin.is_none());
+                calls.lock().unwrap().push(args);
+                Ok(mock_output(false, "missing"))
+            });
         }
 
         let warnings = configure_network_at(rootfs.path(), &runner).await.unwrap();

@@ -154,14 +154,13 @@ impl RootfsStore {
         &self,
         target: &RootfsTarget,
         password: SecretString,
-    ) -> Result<Vec<String>> {
-        let result = self
-            .execute(RootfsOperation::SetRootPassword(SetRootPasswordRequest {
-                target: target.clone(),
-                password,
-            }))
-            .await?;
-        Ok(result.warnings)
+    ) -> Result<()> {
+        self.execute(RootfsOperation::SetRootPassword(SetRootPasswordRequest {
+            target: target.clone(),
+            password,
+        }))
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn create_user(
@@ -169,18 +168,17 @@ impl RootfsStore {
         target: &RootfsTarget,
         user: &CreateUser,
         password: Option<SecretString>,
-    ) -> Result<Vec<String>> {
-        let result = self
-            .execute(RootfsOperation::CreateUser(CreateUserRequest {
-                target: target.clone(),
-                username: user.username.clone(),
-                uid: user.uid,
-                password,
-                sudoer: user.sudoer,
-                shell: user.shell.clone(),
-            }))
-            .await?;
-        Ok(result.warnings)
+    ) -> Result<()> {
+        self.execute(RootfsOperation::CreateUser(CreateUserRequest {
+            target: target.clone(),
+            username: user.username.clone(),
+            uid: user.uid,
+            password,
+            sudoer: user.sudoer,
+            shell: user.shell.clone(),
+        }))
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn resolve_user_identity(
@@ -370,7 +368,7 @@ async fn execute_rootfs_operation_with_runners(
         RootfsOperation::ConfigureNetwork(request) => {
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
-            let warnings = configure_network_at(&path, runner).await?;
+            let warnings = configure_network_at(&path, rootfs_runner).await?;
             Ok(RootfsResult {
                 warnings,
                 ..Default::default()
@@ -381,13 +379,9 @@ async fn execute_rootfs_operation_with_runners(
                 .map_err(|error| NspawnError::Validation(error.message("root password")))?;
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
-            let warnings =
-                users::set_root_password(&path, request.password.expose_secret(), rootfs_runner)
-                    .await?;
-            Ok(RootfsResult {
-                warnings,
-                ..Default::default()
-            })
+            users::set_root_password(&path, request.password.expose_secret(), rootfs_runner)
+                .await?;
+            Ok(RootfsResult::default())
         }
         RootfsOperation::CreateUser(request) => {
             let user = CreateUser {
@@ -404,17 +398,14 @@ async fn execute_rootfs_operation_with_runners(
             }
             let path = request.target.path()?;
             validate_required_rootfs_directory(&path).await?;
-            let warnings = users::create_user_in_container(
+            users::create_user_in_container(
                 &path,
                 &user,
                 request.password.as_ref().map(SecretString::expose_secret),
                 rootfs_runner,
             )
             .await?;
-            Ok(RootfsResult {
-                warnings,
-                ..Default::default()
-            })
+            Ok(RootfsResult::default())
         }
         RootfsOperation::ResolveUserIdentity(request) => {
             crate::domain::machine::validate_login_username(&request.username)
