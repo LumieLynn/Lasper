@@ -1,5 +1,6 @@
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::adapters::process::SpawnedProcess;
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult as Result};
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentProgress as DeployProgress,
 };
@@ -59,7 +60,7 @@ pub(crate) async fn send_deploy_progress(
 pub(crate) fn check_deployment_cancellation(cancellation: &DeploymentCancellation) -> Result<()> {
     cancellation
         .checkpoint()
-        .map_err(|_| NspawnError::DeploymentCancelled)
+        .map_err(|_| OperationFailure::Cancelled)
 }
 
 pub(crate) async fn stream_deploy_command(
@@ -100,11 +101,11 @@ pub(crate) async fn stream_deploy_command(
         let status = spawned
             .terminate_and_wait()
             .await
-            .map_err(|error| process_state_unknown(label, error))?;
+            .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))?;
         if completion_wins && status.success() {
             return Ok(status);
         }
-        return Err(NspawnError::DeploymentCancelled);
+        return Err(OperationFailure::Cancelled);
     }
 
     if let Some(error) = stream_error {
@@ -116,18 +117,12 @@ pub(crate) async fn stream_deploy_command(
         spawned
             .terminate_and_wait()
             .await
-            .map_err(|wait_error| process_state_unknown(label, wait_error))?;
-        return Err(NspawnError::Io(std::path::PathBuf::from(label), error));
+            .map_err(|wait_error| OperationFailure::process_exit_unconfirmed(label, wait_error))?;
+        return Err(NspawnError::Io(std::path::PathBuf::from(label), error).into());
     }
 
     spawned
         .wait()
         .await
-        .map_err(|error| process_state_unknown(label, error))
-}
-
-pub(crate) fn process_state_unknown(label: &str, error: std::io::Error) -> NspawnError {
-    NspawnError::DeploymentProcessStateUnknown(format!(
-        "could not confirm that {label} exited: {error}"
-    ))
+        .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))
 }

@@ -8,12 +8,13 @@ use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::adapters::process::{log_output, terminate_child_process_group};
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult as Result};
 use crate::adapters::provisioning::engine::image_operation::TarSourceOrigin;
 use crate::adapters::provisioning::engine::{
-    process_state_unknown, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
-    DeployLogEvent, DeploymentCancellation,
+    send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent,
+    DeploymentCancellation,
 };
 
 const MAX_IMAGE_BYTES: u64 = crate::domain::provisioning::storage::MAX_DISK_IMAGE_SIZE_BYTES;
@@ -94,7 +95,7 @@ async fn download_image(
     drop(stderr);
     let Some(stream_result) = stream_result else {
         terminate_child_group(&mut child, pid, "curl").await?;
-        return Err(NspawnError::DeploymentCancelled);
+        return Err(OperationFailure::Cancelled);
     };
     if let Err(error) = stream_result {
         terminate_child_group(&mut child, pid, "curl").await?;
@@ -102,13 +103,13 @@ async fn download_image(
     }
     if cancellation.is_requested() {
         terminate_child_group(&mut child, pid, "curl").await?;
-        return Err(NspawnError::DeploymentCancelled);
+        return Err(OperationFailure::Cancelled);
     }
     let status = tokio::select! {
-        status = child.wait() => status.map_err(|error| process_state_unknown("curl", error))?,
+        status = child.wait() => status.map_err(|error| OperationFailure::process_exit_unconfirmed("curl", error))?,
         _ = cancellation.cancelled() => {
             terminate_child_group(&mut child, pid, "curl").await?;
-            return Err(NspawnError::DeploymentCancelled);
+            return Err(OperationFailure::Cancelled);
         }
     };
     if !status.success() {
@@ -118,11 +119,10 @@ async fn download_image(
             return Err(NspawnError::Validation(format!(
                 "Downloaded image exceeds the {} byte limit",
                 MAX_IMAGE_BYTES
-            )));
+            ))
+            .into());
         }
-        return Err(NspawnError::DeployError(format!(
-            "Network download failed: {status}"
-        )));
+        return Err(NspawnError::DeployError(format!("Network download failed: {status}")).into());
     }
     validate_source_size(&destination, "Downloaded image")?;
     destination
@@ -204,14 +204,13 @@ fn validate_download_url(value: &str) -> Result<url::Url> {
     let url = url::Url::parse(value.trim())
         .map_err(|error| NspawnError::Validation(format!("Invalid image URL: {error}")))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(NspawnError::Validation(
-            "Image URL must use HTTP or HTTPS".into(),
-        ));
+        return Err(NspawnError::Validation("Image URL must use HTTP or HTTPS".into()).into());
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(NspawnError::Validation(
             "Image URL must not contain embedded credentials".into(),
-        ));
+        )
+        .into());
     }
     Ok(url)
 }
@@ -302,9 +301,10 @@ async fn normalize_compression(
     drop(completed);
     let Some((status, stderr_result)) = completed_result else {
         terminate_child_group(&mut child, pid, program).await?;
-        return Err(NspawnError::DeploymentCancelled);
+        return Err(OperationFailure::Cancelled);
     };
-    let status = status.map_err(|error| process_state_unknown(program, error))?;
+    let status =
+        status.map_err(|error| OperationFailure::process_exit_unconfirmed(program, error))?;
     stderr_result.map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
     let result = std::process::Output {
         status,
@@ -317,13 +317,15 @@ async fn normalize_compression(
             return Err(NspawnError::Validation(format!(
                 "Decompressed image exceeds the {} byte limit",
                 MAX_IMAGE_BYTES
-            )));
+            ))
+            .into());
         }
         return Err(NspawnError::cmd_failed(
             "decompress image source",
             format!("{program} -d -c"),
             &result,
-        ));
+        )
+        .into());
     }
     validate_source_size(&destination, "Decompressed image")?;
     destination
@@ -341,10 +343,9 @@ fn validate_source_size_with_limit(source: &std::fs::File, label: &str, limit: u
         .metadata()
         .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
     if metadata.is_file() && metadata.len() > limit {
-        return Err(NspawnError::Validation(format!(
-            "{label} exceeds the {} byte limit",
-            limit
-        )));
+        return Err(
+            NspawnError::Validation(format!("{label} exceeds the {} byte limit", limit)).into(),
+        );
     }
     Ok(())
 }
@@ -361,7 +362,7 @@ async fn terminate_child_group(
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     terminate_child_process_group(child, pid, label, STOP_TIMEOUT)
         .await
-        .map_err(|error| process_state_unknown(label, error))?;
+        .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))?;
     Ok(())
 }
 
@@ -437,7 +438,7 @@ fn check_tool(name: &str) -> Result<()> {
     if found {
         Ok(())
     } else {
-        Err(NspawnError::ToolNotFound(name.to_string()))
+        Err(NspawnError::ToolNotFound(name.to_string()).into())
     }
 }
 

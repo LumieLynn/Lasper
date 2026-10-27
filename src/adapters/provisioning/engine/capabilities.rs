@@ -339,7 +339,7 @@ pub(crate) trait Deployer: Send + Sync {
         logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
-    ) -> Result<()>;
+    ) -> super::failure::OperationResult<()>;
 
     /// Resources whose outcome may change while the source stage is running.
     ///

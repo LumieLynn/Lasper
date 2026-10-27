@@ -5,6 +5,7 @@ pub(crate) mod bootstrap_operation;
 pub mod builders;
 mod capabilities;
 mod execution;
+mod failure;
 mod image_acquisition;
 pub(crate) mod image_operation;
 pub(crate) mod oci_operation;
@@ -28,11 +29,12 @@ pub(crate) use capabilities::{
     AppliedResource, ApplyReport, Deployer, DirectProvisioningCapabilities,
 };
 pub(crate) use execution::{DeploymentExecution, StoragePreparation, SystemConfiguration};
+pub(crate) use failure::DeploymentFailure;
 pub(crate) use image_acquisition::{ImageAcquisitionStore, ImageSource};
 pub use image_operation::ImageImportStore;
 pub use oci_operation::OciPullStore;
-pub(crate) use orchestrator::{is_cancelled_outcome, run_deployment};
+pub(crate) use orchestrator::run_deployment;
 pub(crate) use stream::{
-    check_deployment_cancellation, process_state_unknown, send_deploy_log, send_deploy_progress,
-    send_deploy_stream_log, stream_deploy_command,
+    check_deployment_cancellation, send_deploy_log, send_deploy_progress, send_deploy_stream_log,
+    stream_deploy_command,
 };

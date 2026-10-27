@@ -1,6 +1,6 @@
+use super::failure::OperationFailure;
 use super::stream::is_high_signal_deploy_stream;
 use super::*;
-use crate::adapters::error::NspawnError;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     deployment_job_channel, DeploymentId, DeploymentPlan, DeploymentResource, DeploymentStage,
@@ -207,7 +207,7 @@ async fn deployment_cancellation_notifies_waiters_and_fails_checkpoints() {
     cancellation.request();
     task.await.unwrap();
     let result = check_deployment_cancellation(&cancellation);
-    assert!(matches!(result, Err(NspawnError::DeploymentCancelled)));
+    assert!(matches!(result, Err(OperationFailure::Cancelled)));
 }
 
 #[tokio::test]
@@ -230,8 +230,8 @@ async fn failed_process_wait_is_not_treated_as_a_rollback_safe_failure() {
 
     assert!(matches!(
         error,
-        NspawnError::DeploymentProcessStateUnknown(message)
-            if message.contains("test deployer") && message.contains("wait channel closed")
+        OperationFailure::ProcessExitUnconfirmed { operation, source }
+            if operation == "test deployer" && source.to_string().contains("wait channel closed")
     ));
 }
 
@@ -254,15 +254,4 @@ async fn authoritative_completion_wins_a_racing_cancellation() {
         .unwrap();
 
     assert!(status.success());
-}
-
-#[test]
-fn only_confirmed_cancellation_outcomes_are_reported_as_cancelled() {
-    assert!(is_cancelled_outcome(&NspawnError::DeploymentCancelled));
-    assert!(is_cancelled_outcome(
-        &NspawnError::DeploymentCancellationRollbackIncomplete("cleanup failed".into())
-    ));
-    assert!(!is_cancelled_outcome(
-        &NspawnError::DeploymentProcessStateUnknown("still running".into())
-    ));
 }

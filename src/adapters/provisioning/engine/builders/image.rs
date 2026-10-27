@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
+use crate::adapters::provisioning::engine::failure::OperationResult as Result;
 use crate::adapters::provisioning::engine::{
     check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
     Deployer, DeploymentCancellation, ImageAcquisitionStore, ImageImportStore, ImageSource,

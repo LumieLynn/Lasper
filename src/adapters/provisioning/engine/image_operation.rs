@@ -1,5 +1,6 @@
 //! Typed image import operations shared by direct and elevated modes.
 
+use super::failure::{OperationFailure, OperationResult};
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{read_bounded_stream, terminate_child_process_group};
 use crate::adapters::rootfs::RootfsTarget;
@@ -64,7 +65,7 @@ impl ImageImportStore {
         source_origin: TarSourceOrigin,
         allow_unsafe_remote: bool,
         cancellation: &super::DeploymentCancellation,
-    ) -> Result<ImageImportReport> {
+    ) -> OperationResult<ImageImportReport> {
         validate_source(&source)?;
         let request = ImportTarRequest {
             target,
@@ -128,7 +129,7 @@ pub(crate) async fn import_tar_image(
     request: ImportTarRequest,
     source: std::fs::File,
     cancellation: &super::DeploymentCancellation,
-) -> Result<ImageImportReport> {
+) -> OperationResult<ImageImportReport> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
     let target = request.target.path()?;
@@ -138,7 +139,7 @@ pub(crate) async fn import_tar_image(
     let preparation = prepare_tar_import(source, source_origin, allow_unsafe_remote);
     let (source, report) = tokio::select! {
         result = preparation => result?,
-        _ = cancellation.cancelled() => return Err(NspawnError::DeploymentCancelled),
+        _ = cancellation.cancelled() => return Err(OperationFailure::Cancelled),
     };
     super::check_deployment_cancellation(cancellation)?;
     extract_tar_at(&target, source, cancellation).await?;
@@ -168,7 +169,7 @@ async fn extract_tar_at(
     target: &std::path::Path,
     source: std::fs::File,
     cancellation: &super::DeploymentCancellation,
-) -> Result<()> {
+) -> OperationResult<()> {
     let mut command = async_tar_command();
     crate::adapters::process::limit_file_size(
         command.as_std_mut(),
@@ -189,14 +190,15 @@ async fn extract_tar_at(
             "extract rootfs archive",
             format!("tar --numeric-owner -pxf - -C {}", target.display()),
             &output,
-        ))
+        )
+        .into())
     }
 }
 
 async fn run_tar_extract(
     mut command: tokio::process::Command,
     cancellation: &super::DeploymentCancellation,
-) -> Result<std::process::Output> {
+) -> OperationResult<std::process::Output> {
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
     command.kill_on_drop(true).as_std_mut().process_group(0);
@@ -210,22 +212,23 @@ async fn run_tar_extract(
             child.wait(),
             read_bounded_stream(stderr, MAX_TAR_DIAGNOSTIC_BYTES),
         );
-        Ok::<std::process::Output, std::io::Error>(std::process::Output {
-            status: status?,
+        Ok::<std::process::Output, OperationFailure>(std::process::Output {
+            status: status
+                .map_err(|error| OperationFailure::process_exit_unconfirmed("tar", error))?,
             stdout: Vec::new(),
-            stderr: stderr?,
+            stderr: stderr.map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?,
         })
     });
     tokio::select! {
         biased;
-        result = &mut completion => return result.map_err(|error| NspawnError::Io(PathBuf::from("tar"), error)),
+        result = &mut completion => return result,
         _ = cancellation.cancelled() => {},
     }
     drop(completion);
     terminate_child_process_group(&mut child, pid, "tar", STOP_TIMEOUT)
         .await
-        .map_err(|error| super::process_state_unknown("tar", error))?;
-    Err(NspawnError::DeploymentCancelled)
+        .map_err(|error| OperationFailure::process_exit_unconfirmed("tar", error))?;
+    Err(OperationFailure::Cancelled)
 }
 
 #[cfg(test)]
@@ -516,6 +519,6 @@ mod tests {
         .expect("cancelled tar child did not stop")
         .unwrap_err();
 
-        assert!(matches!(error, NspawnError::DeploymentCancelled));
+        assert!(matches!(error, OperationFailure::Cancelled));
     }
 }

@@ -51,20 +51,8 @@ pub enum NspawnError {
     #[error("Deployment failed: {0}")]
     DeployError(String),
 
-    #[error("Deployment cancelled")]
-    DeploymentCancelled,
-
-    #[error("Deployment cancelled; rollback incomplete: {0}")]
-    DeploymentCancellationRollbackIncomplete(String),
-
-    #[error("Deployment process state is unknown: {0}")]
-    DeploymentProcessStateUnknown(String),
-
     #[error("System operation outcome is unknown: {0}")]
     SystemOperationOutcomeUnknown(String),
-
-    #[error("Deployment rollback incomplete: {0}")]
-    DeploymentRollbackIncomplete(String),
 
     #[error("DBus error: {0}")]
     Dbus(#[from] zbus::Error),

@@ -11,6 +11,42 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 static DAEMON_CHILD_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug, thiserror::Error)]
+#[error("could not confirm that {operation} exited: {source}")]
+struct ProcessExitUnconfirmed {
+    operation: String,
+    #[source]
+    source: std::io::Error,
+}
+
+/// Preserve lifecycle evidence through the I/O interfaces used by command runners.
+pub(crate) fn unconfirmed_process_exit(operation: &str, source: std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        source.kind(),
+        ProcessExitUnconfirmed {
+            operation: operation.into(),
+            source,
+        },
+    )
+}
+
+pub(crate) fn process_exit_is_unconfirmed(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<ProcessExitUnconfirmed>() {
+            return true;
+        }
+        let inner = error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &dyn std::error::Error)
+            .or_else(|| error.source());
+        match inner {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
+
 /// Mark commands created after daemon startup so the kernel terminates their
 /// direct child when the root daemon itself disappears unexpectedly.
 pub(crate) fn enable_daemon_child_lifecycle() {
@@ -316,9 +352,10 @@ pub(crate) async fn run_bounded_child_command(
             read_bounded_stream(stdout, output_limit),
             read_bounded_stream(stderr, output_limit),
         );
+        let status = status.map_err(|error| unconfirmed_process_exit(label, error))?;
         input_result?;
         Ok::<Output, std::io::Error>(Output {
-            status: status?,
+            status,
             stdout: stdout?,
             stderr: stderr?,
         })
@@ -335,14 +372,13 @@ pub(crate) async fn run_bounded_child_command(
     );
     let termination =
         terminate_child_process_group(&mut child, pid, label, BOUNDED_TERMINATION_GRACE).await;
-    let detail = match termination {
-        Ok(_) => "termination was confirmed".to_string(),
-        Err(error) => format!("process exit was not confirmed: {error}"),
-    };
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!("command {label} exceeded its completion deadline; {detail}"),
-    ))
+    match termination {
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("command {label} exceeded its completion deadline; termination was confirmed"),
+        )),
+        Err(error) => Err(unconfirmed_process_exit(label, error)),
+    }
 }
 
 pub(crate) async fn terminate_child_process_group(
@@ -579,6 +615,7 @@ mod tests {
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
         assert!(error.to_string().contains("termination was confirmed"));
+        assert!(!process_exit_is_unconfirmed(&error));
     }
 
     #[tokio::test]

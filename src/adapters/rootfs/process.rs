@@ -43,19 +43,11 @@ impl RootfsProcessRunner for DefaultRootfsProcessRunner {
             process,
             stdin,
             ROOTFS_COMMAND_TIMEOUT,
-            "systemd-nspawn rootfs helper",
+            &format!("systemd-nspawn for {}", rootfs.display()),
             MAX_ROOTFS_COMMAND_OUTPUT_BYTES,
         )
         .await
-        .map_err(|error| contextual_io_error(rootfs, error))
     }
-}
-
-fn contextual_io_error(rootfs: &Path, error: std::io::Error) -> std::io::Error {
-    std::io::Error::new(
-        error.kind(),
-        format!("systemd-nspawn for {}: {error}", rootfs.display()),
-    )
 }
 
 pub(crate) fn nspawn_io_path() -> PathBuf {

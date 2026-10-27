@@ -2,8 +2,9 @@
 
 use async_trait::async_trait;
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::adapters::provisioning::engine::bootstrap_operation::BootstrapRequest;
+use crate::adapters::provisioning::engine::failure::OperationResult as Result;
 use crate::adapters::provisioning::engine::{
     send_deploy_log, stream_deploy_command, ApplyReport, BootstrapStore, DeployLogEvent, Deployer,
     DeploymentCancellation,
@@ -93,7 +94,8 @@ impl Deployer for BootstrapDeployer {
                 format!("Bootstrap tool ({label})"),
                 format!("typed {label} operation"),
                 "Command failed. Check deployment logs for detailed output.".to_string(),
-            ));
+            )
+            .into());
         }
         Ok(())
     }

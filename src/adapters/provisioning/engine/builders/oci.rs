@@ -3,7 +3,8 @@
 use crate::domain::provisioning::oci::OciNetworkMode;
 use async_trait::async_trait;
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
+use crate::adapters::provisioning::engine::failure::OperationResult as Result;
 use crate::adapters::provisioning::engine::oci_operation::{
     ensure_pull_oci_available, OciPullRequest,
 };
@@ -71,7 +72,8 @@ impl Deployer for OciDeployer {
                 "systemd OCI pull".into(),
                 "typed systemd-importd PullOci operation".into(),
                 "Command failed. Check deployment logs for detailed output.".into(),
-            ));
+            )
+            .into());
         }
         report.record_created(AppliedResource::ExternalImage);
         check_deployment_cancellation(cancellation)?;

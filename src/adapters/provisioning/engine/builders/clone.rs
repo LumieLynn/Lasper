@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
+use crate::adapters::provisioning::engine::failure::OperationResult as Result;
 use crate::adapters::provisioning::engine::{
     check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
     Deployer, DeploymentCancellation,
@@ -127,12 +128,7 @@ impl Deployer for CloneDeployer {
             None
         };
 
-        self.system_operations
-            .reload_daemon()
-            .await
-            .map_err(|error| {
-                NspawnError::Runtime(format!("Failed to reload systemd after clone: {error}"))
-            })?;
+        self.system_operations.reload_daemon().await?;
         check_deployment_cancellation(cancellation)?;
 
         let result = CloneApplyResult {
@@ -159,14 +155,16 @@ async fn verify_systemd_cloned_config(
         }
         (Some(_), None) => Err(NspawnError::Runtime(
             "machinectl clone completed without copying the source .nspawn settings".into(),
-        )),
+        )
+        .into()),
         (Some(_), Some(_)) => {
             report.block_external_image_removal(
                 "the cloned .nspawn settings do not match the source snapshot",
             );
             Err(NspawnError::Runtime(
                 "machinectl clone produced .nspawn settings that do not match the source".into(),
-            ))
+            )
+            .into())
         }
         (None, None) => Ok(ClonedConfigStatus::NotPresent),
         (None, Some(destination)) => {
@@ -182,7 +180,8 @@ async fn verify_systemd_cloned_config(
                 );
                 Err(NspawnError::Runtime(
                     "unexpected .nspawn settings appeared while cloning the image".into(),
-                ))
+                )
+                .into())
             }
         }
     }

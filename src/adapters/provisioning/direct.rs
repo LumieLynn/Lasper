@@ -7,7 +7,6 @@ use super::engine::{
     SystemConfiguration,
 };
 use super::state::FilesystemDeploymentState;
-use crate::adapters::error::NspawnError;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::adapters::storage::{
     DirectoryBackend, DiskImageBackend, StorageBackend, SubvolumeBackend,
@@ -230,37 +229,11 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
             .prepare()
             .await
             .map_err(|error| DeploymentError::failed(error.to_string()))?;
-        let job = job.with_state_session(deployment_state.clone());
+        let job = job.with_state_session(deployment_state);
         let _operation = self.host_operations.begin();
-        let result = super::engine::run_deployment(execution, self.host.clone(), secrets, job)
+        super::engine::run_deployment(execution, self.host.clone(), secrets, job)
             .await
-            .map_err(map_deployment_error);
-        if result.is_ok() {
-            deployment_state
-                .finish()
-                .await
-                .map_err(|error| DeploymentError::reconciliation_required(error.to_string()))?;
-        }
-        result
-    }
-}
-
-fn map_deployment_error(error: NspawnError) -> DeploymentError {
-    let process_outcome_unknown = matches!(
-        &error,
-        NspawnError::DeploymentProcessStateUnknown(_)
-            | NspawnError::DeploymentCancellationRollbackIncomplete(_)
-            | NspawnError::DeploymentRollbackIncomplete(_)
-    ) || matches!(
-        &error,
-        NspawnError::Io(_, source) if source.kind() == std::io::ErrorKind::TimedOut
-    );
-    if process_outcome_unknown {
-        DeploymentError::reconciliation_required(error.to_string())
-    } else if super::engine::is_cancelled_outcome(&error) {
-        DeploymentError::cancelled(error.to_string())
-    } else {
-        DeploymentError::failed(error.to_string())
+            .map_err(super::engine::DeploymentFailure::into_application_error)
     }
 }
 
@@ -368,21 +341,5 @@ mod tests {
             assert!(execution.storage.backend().is_none());
             assert!(execution.configuration.is_none());
         }
-    }
-
-    #[test]
-    fn timed_out_mutation_requires_reconciliation() {
-        let error = NspawnError::Io(
-            "systemd-nspawn".into(),
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "rootfs helper exceeded its deadline; termination was confirmed",
-            ),
-        );
-
-        let mapped = map_deployment_error(error);
-
-        assert!(mapped.requires_reconciliation());
-        assert!(mapped.retains_resource_claim());
     }
 }

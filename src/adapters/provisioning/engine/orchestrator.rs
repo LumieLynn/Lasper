@@ -1,10 +1,11 @@
+use super::failure::{DeploymentFailure, OperationFailure};
 use super::rollback::{inspect_deployment_sidecars, rollback_apply_report};
 use super::{
     capture_uncommitted_effects, check_deployment_cancellation, finish_manifest, persist_applying,
     persist_cleanup_pending, persist_committed, send_deploy_log, AppliedResource, ApplyReport,
     DeploymentExecution, DirectProvisioningCapabilities, StoragePreparation, SystemConfiguration,
 };
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::application::provisioning::{
     DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentSecrets,
@@ -18,7 +19,7 @@ pub(crate) async fn run_deployment(
     host: DirectProvisioningCapabilities,
     secrets: DeploymentSecrets,
     job: DeploymentJobContext,
-) -> Result<()> {
+) -> Result<(), DeploymentFailure> {
     let logs = job.event_sender();
     let name = execution.target.to_string();
     let result = run_deploy_internal(execution, host, secrets, job).await;
@@ -39,19 +40,12 @@ pub(crate) async fn run_deployment(
     result
 }
 
-pub(crate) fn is_cancelled_outcome(error: &NspawnError) -> bool {
-    matches!(
-        error,
-        NspawnError::DeploymentCancelled | NspawnError::DeploymentCancellationRollbackIncomplete(_)
-    )
-}
-
 async fn run_deploy_internal(
     execution: DeploymentExecution,
     host: DirectProvisioningCapabilities,
     mut secrets: DeploymentSecrets,
     job: DeploymentJobContext,
-) -> Result<()> {
+) -> Result<(), DeploymentFailure> {
     let DeploymentExecution {
         target,
         source: deployer,
@@ -76,7 +70,7 @@ async fn run_deploy_internal(
     let mut storage_mount_attempted = false;
     let mut external_provider_started = false;
 
-    let result = async {
+    let result: Result<(), OperationFailure> = async {
         check_deployment_cancellation(&cancellation)?;
         for warning in inspect_deployment_sidecars(&name, &host).await? {
             log::warn!("[AUDIT] [Container: {}] [Step: Preflight] {}", name, warning);
@@ -190,7 +184,7 @@ async fn run_deploy_internal(
                     report.record_typed(raw_mount, ResourceDisposition::Created);
                 }
                 Ok(None) => {}
-                Err(error) => return Err(error),
+                Err(error) => return Err(error.into()),
             }
             persist_committed(&job, DeploymentStage::RootfsMutation, &report).await?;
             check_deployment_cancellation(&cancellation)?;
@@ -210,7 +204,7 @@ async fn run_deploy_internal(
         if has_account_changes && !supports_offline_commands {
             return Err(NspawnError::Validation(
                 "Requested account initialization requires a bootstrapped rootfs with an OS layout and support for systemd-nspawn commands".into(),
-            ));
+            ).into());
         }
 
         if has_os_layout {
@@ -273,7 +267,7 @@ async fn run_deploy_internal(
             if !supports_offline_commands {
                 return Err(NspawnError::Validation(
                     "Wayland grant requires a rootfs that supports user identity lookup".into(),
-                ));
+                ).into());
             }
             let user = users
                 .iter()
@@ -483,7 +477,7 @@ async fn run_deploy_internal(
         }
 
         check_deployment_cancellation(&cancellation)?;
-        Ok::<(), NspawnError>(())
+        Ok::<(), OperationFailure>(())
     }
     .await;
 
@@ -491,16 +485,20 @@ async fn run_deploy_internal(
         capture_uncommitted_effects(&job, &mut report).await;
     }
 
-    if let Err(NspawnError::DeploymentProcessStateUnknown(message)) = &result {
-        let warning = format!(
-            "could not safely clean up deployment {name:?}: {message}; mounts and resources were preserved for manual inspection"
-        );
-        log::error!("[DEPLOY] {warning}");
-        push_log!(format!("FATAL: {warning}"));
+    if result
+        .as_ref()
+        .err()
+        .is_some_and(OperationFailure::outcome_is_unconfirmed)
+    {
+        let error = result.unwrap_err();
+        let message =
+            "mounts and resources were preserved because the operation outcome is unconfirmed";
+        push_log!(format!("FATAL: {error}; {message}"));
+        let mut cleanup_errors = vec![message.into()];
         if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
-            log::error!("[DEPLOY] could not persist cleanup-pending state: {state_error}");
+            cleanup_errors.push(format!("cleanup-pending state: {state_error}"));
         }
-        return Err(NspawnError::DeploymentProcessStateUnknown(message.clone()));
+        return Err(DeploymentFailure::new(error, cleanup_errors));
     }
 
     let mut cleanup_errors = Vec::new();
@@ -598,11 +596,9 @@ async fn run_deploy_internal(
     }
 
     let result = if result.is_ok() && cancellation.is_requested() {
-        Err(NspawnError::DeploymentCancelled)
+        Err(OperationFailure::Cancelled)
     } else if result.is_ok() && !cleanup_errors.is_empty() {
-        Err(NspawnError::Runtime(
-            "Deployment cleanup failed before completion".into(),
-        ))
+        Err(NspawnError::Runtime("Deployment cleanup failed before completion".into()).into())
     } else {
         result
     };
@@ -641,43 +637,30 @@ async fn run_deploy_internal(
 
         job.set_rolling_back(false);
         if rollback_errors.is_empty() {
-            push_log!("Rollback complete.".to_string());
-            if let Err(manifest_error) = finish_manifest(&job).await {
-                let message = format!("deployment crash manifest: {manifest_error}");
-                push_log!(format!("ROLLBACK ERROR: {message}"));
-                return if matches!(error, NspawnError::DeploymentCancelled) {
-                    Err(NspawnError::DeploymentCancellationRollbackIncomplete(
-                        message,
-                    ))
-                } else {
-                    Err(NspawnError::DeploymentRollbackIncomplete(format!(
-                        "{error}; rollback completed but durable state cleanup failed: {message}"
-                    )))
-                };
+            match finish_manifest(&job).await {
+                Ok(()) => {
+                    push_log!("Rollback complete.");
+                }
+                Err(manifest_error) => {
+                    rollback_errors.push(format!("deployment crash manifest: {manifest_error}"))
+                }
             }
-            return Err(error);
-        }
-
-        if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
+        } else if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
             rollback_errors.push(format!("deployment cleanup state: {state_error}"));
         }
-
         for rollback_error in &rollback_errors {
             push_log!(format!("ROLLBACK ERROR: {rollback_error}"));
         }
-        let rollback_errors = rollback_errors.join("; ");
-        return if matches!(error, NspawnError::DeploymentCancelled) {
-            Err(NspawnError::DeploymentCancellationRollbackIncomplete(
-                rollback_errors,
-            ))
-        } else {
-            Err(NspawnError::DeploymentRollbackIncomplete(format!(
-                "{error}; rollback incomplete: {rollback_errors}"
-            )))
-        };
+        return Err(DeploymentFailure::new(error, rollback_errors));
     }
 
+    finish_manifest(&job).await.map_err(|error| {
+        DeploymentFailure::new(
+            error.into(),
+            vec!["durable deployment state could not be finalized".into()],
+        )
+    })?;
     push_log!("");
-    push_log!("=== Deployment Complete ===".to_string());
+    push_log!("=== Deployment Complete ===");
     Ok(())
 }
