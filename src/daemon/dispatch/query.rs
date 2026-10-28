@@ -5,7 +5,7 @@
 //! like the other protocol families; this module only owns their dispatch and
 //! wire-result shaping.
 
-use crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime;
+use crate::adapters::provisioning::inspect_tar_runtime;
 use crate::daemon::dispatch::backend::DaemonRuntimeQueries;
 use crate::daemon::dispatch::{decode_params, encode_result, HandlerResult};
 use crate::ipc::protocol::{InspectMachineRequest, RpcFamily, RpcMethod};

@@ -292,15 +292,24 @@ async fn wait_for_lock_retry(
     policy: LockWaitPolicy,
 ) -> Result<()> {
     let Some(wait_budget) = remaining(policy, started) else {
-        return Err(timeout_error(lock_path, started, attempts));
+        return Err(NspawnError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        ));
     };
     if wait_budget.is_zero() {
-        return Err(timeout_error(lock_path, started, attempts));
+        return Err(NspawnError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        ));
     }
     sleep(policy.retry_delay.min(wait_budget)).await;
     match remaining(policy, started) {
         Some(wait_budget) if !wait_budget.is_zero() => Ok(()),
-        _ => Err(timeout_error(lock_path, started, attempts)),
+        _ => Err(NspawnError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        )),
     }
 }
 

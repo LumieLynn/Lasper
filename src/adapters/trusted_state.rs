@@ -1,6 +1,5 @@
 //! Directory-FD based access to Lasper's privileged durable state.
 
-use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::locking::{is_contention, remaining, timeout_error, LockWaitPolicy};
 use fs2::FileExt;
 use std::ffi::{CStr, CString};
@@ -15,6 +14,18 @@ use std::sync::{Arc, OnceLock};
 const DIRECTORY_MODE: u32 = 0o700;
 const LOCK_MODE: u32 = 0o600;
 const MAX_NAME_BYTES: usize = 240;
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum TrustedStateError {
+    #[error("invalid trusted state: {0}")]
+    Invalid(String),
+    #[error("I/O error in {0}: {1}")]
+    Io(PathBuf, #[source] std::io::Error),
+    #[error("trusted state lock is unavailable in {0}")]
+    LockUnavailable(PathBuf),
+}
+
+type Result<T> = std::result::Result<T, TrustedStateError>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StateDirectory {
@@ -132,13 +143,13 @@ impl TrustedDirectory {
     /// relative to the held directory FD.
     pub(crate) fn open_existing(path: &Path, expected_uid: u32) -> Result<Self> {
         if !path.is_absolute() {
-            return Err(NspawnError::Validation(format!(
+            return Err(TrustedStateError::Invalid(format!(
                 "trusted state root must be absolute: {}",
                 path.display()
             )));
         }
-        let file =
-            open_directory(path).map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+        let file = open_directory(path)
+            .map_err(|error| TrustedStateError::Io(path.to_path_buf(), error))?;
         Self::new(file, path.to_path_buf(), expected_uid)
     }
 
@@ -203,7 +214,7 @@ impl TrustedDirectory {
             )
         };
         if directory_fd < 0 {
-            return Err(NspawnError::Io(
+            return Err(TrustedStateError::Io(
                 (*self.path).clone(),
                 std::io::Error::last_os_error(),
             ));
@@ -212,7 +223,7 @@ impl TrustedDirectory {
         if directory.is_null() {
             let error = std::io::Error::last_os_error();
             unsafe { libc::close(directory_fd) };
-            return Err(NspawnError::Io((*self.path).clone(), error));
+            return Err(TrustedStateError::Io((*self.path).clone(), error));
         }
 
         let mut names = Vec::new();
@@ -225,7 +236,7 @@ impl TrustedDirectory {
                 return if error.raw_os_error().unwrap_or(0) == 0 {
                     Ok(names)
                 } else {
-                    Err(NspawnError::Io((*self.path).clone(), error))
+                    Err(TrustedStateError::Io((*self.path).clone(), error))
                 };
             }
             let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
@@ -250,17 +261,17 @@ impl TrustedDirectory {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(map_open_error(&self.path, &name, error)),
         };
-        let metadata = file
-            .metadata()
-            .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+        let metadata = file.metadata().map_err(|error| {
+            TrustedStateError::Io(self.path.join(name.to_str().unwrap()), error)
+        })?;
         if !metadata.file_type().is_file() {
-            return Err(NspawnError::Validation(format!(
+            return Err(TrustedStateError::Invalid(format!(
                 "trusted state entry is not a regular file: {}",
                 self.path.join(name.to_str().unwrap()).display()
             )));
         }
         if metadata.len() > max_bytes as u64 {
-            return Err(NspawnError::Validation(format!(
+            return Err(TrustedStateError::Invalid(format!(
                 "trusted state entry exceeds {max_bytes} bytes: {}",
                 self.path.join(name.to_str().unwrap()).display()
             )));
@@ -269,9 +280,11 @@ impl TrustedDirectory {
         Read::by_ref(&mut file)
             .take(max_bytes as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+            .map_err(|error| {
+                TrustedStateError::Io(self.path.join(name.to_str().unwrap()), error)
+            })?;
         if bytes.len() > max_bytes {
-            return Err(NspawnError::Validation(format!(
+            return Err(TrustedStateError::Invalid(format!(
                 "trusted state entry exceeds {max_bytes} bytes: {}",
                 self.path.join(name.to_str().unwrap()).display()
             )));
@@ -283,11 +296,14 @@ impl TrustedDirectory {
         }))
     }
 
-    pub(crate) fn with_exclusive_lock<T>(
+    pub(crate) fn with_exclusive_lock<T, E>(
         &self,
         target: &str,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        operation: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<TrustedStateError>,
+    {
         self.with_exclusive_lock_inner(target, false, operation)
     }
 
@@ -298,37 +314,43 @@ impl TrustedDirectory {
         let name = CString::new(format!(".{}.lock", target.to_string_lossy()))
             .expect("validated target contains no NUL");
         self.acquire_stable_lock(&name, true)?
-            .ok_or_else(|| NspawnError::Runtime("trusted lock unexpectedly disappeared".into()))
+            .ok_or_else(|| TrustedStateError::LockUnavailable((*self.path).clone()))
     }
 
-    pub(crate) fn with_exclusive_lock_and_cleanup<T>(
+    pub(crate) fn with_exclusive_lock_and_cleanup<T, E>(
         &self,
         target: &str,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        operation: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<TrustedStateError>,
+    {
         self.with_exclusive_lock_inner(target, true, operation)
     }
 
-    fn with_exclusive_lock_inner<T>(
+    fn with_exclusive_lock_inner<T, E>(
         &self,
         target: &str,
         cleanup_if_absent: bool,
-        operation: impl FnOnce() -> Result<T>,
-    ) -> Result<T> {
+        operation: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<TrustedStateError>,
+    {
         let target = validate_name(target)?;
         let lock_name = CString::new(format!(".{}.lock", target.to_string_lossy()))
-            .map_err(|_| NspawnError::Validation("trusted state lock name is invalid".into()))?;
-        let _lock = self.acquire_stable_lock(&lock_name, true)?.ok_or_else(|| {
-            NspawnError::Runtime("trusted state lock unexpectedly disappeared".into())
-        })?;
+            .map_err(|_| TrustedStateError::Invalid("trusted state lock name is invalid".into()))?;
+        let _lock = self
+            .acquire_stable_lock(&lock_name, true)?
+            .ok_or_else(|| TrustedStateError::LockUnavailable((*self.path).clone()))?;
         let result = operation();
         if cleanup_if_absent && result.is_ok() && !self.entry_exists(&target)? {
             unlink_at(self.file.as_raw_fd(), &lock_name).map_err(|error| {
-                NspawnError::Io(self.path.join(lock_name.to_str().unwrap()), error)
+                TrustedStateError::Io(self.path.join(lock_name.to_str().unwrap()), error)
             })?;
             self.file
                 .sync_all()
-                .map_err(|error| NspawnError::Io((*self.path).clone(), error))?;
+                .map_err(|error| TrustedStateError::Io((*self.path).clone(), error))?;
         }
         result
     }
@@ -354,19 +376,20 @@ impl TrustedDirectory {
         let result = (|| {
             file.set_permissions(std::fs::Permissions::from_mode(mode))
                 .map_err(|error| {
-                    NspawnError::Io(self.path.join(temporary.to_str().unwrap()), error)
+                    TrustedStateError::Io(self.path.join(temporary.to_str().unwrap()), error)
                 })?;
             file.write_all(bytes).map_err(|error| {
-                NspawnError::Io(self.path.join(temporary.to_str().unwrap()), error)
+                TrustedStateError::Io(self.path.join(temporary.to_str().unwrap()), error)
             })?;
             file.sync_all().map_err(|error| {
-                NspawnError::Io(self.path.join(temporary.to_str().unwrap()), error)
+                TrustedStateError::Io(self.path.join(temporary.to_str().unwrap()), error)
             })?;
-            rename_at(self.file.as_raw_fd(), &temporary, &name)
-                .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+            rename_at(self.file.as_raw_fd(), &temporary, &name).map_err(|error| {
+                TrustedStateError::Io(self.path.join(name.to_str().unwrap()), error)
+            })?;
             self.file
                 .sync_all()
-                .map_err(|error| NspawnError::Io((*self.path).clone(), error))
+                .map_err(|error| TrustedStateError::Io((*self.path).clone(), error))
         })();
 
         if result.is_err() {
@@ -386,7 +409,7 @@ impl TrustedDirectory {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
-                return Err(NspawnError::Io(
+                return Err(TrustedStateError::Io(
                     self.path.join(name.to_str().unwrap()),
                     error,
                 ))
@@ -394,7 +417,7 @@ impl TrustedDirectory {
         }
         self.file
             .sync_all()
-            .map_err(|error| NspawnError::Io((*self.path).clone(), error))
+            .map_err(|error| TrustedStateError::Io((*self.path).clone(), error))
     }
 
     fn entry_exists(&self, name: &CStr) -> Result<bool> {
@@ -414,7 +437,7 @@ impl TrustedDirectory {
         if error.kind() == std::io::ErrorKind::NotFound {
             Ok(false)
         } else {
-            Err(NspawnError::Io(
+            Err(TrustedStateError::Io(
                 self.path.join(name.to_str().unwrap()),
                 error,
             ))
@@ -433,7 +456,7 @@ impl TrustedDirectory {
         };
         if result == 0 {
             if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
-                return Err(NspawnError::Validation(format!(
+                return Err(TrustedStateError::Invalid(format!(
                     "trusted state target is not a regular file: {}",
                     self.path.join(name.to_str().unwrap()).display()
                 )));
@@ -444,7 +467,7 @@ impl TrustedDirectory {
         if error.kind() == std::io::ErrorKind::NotFound {
             Ok(())
         } else {
-            Err(NspawnError::Io(
+            Err(TrustedStateError::Io(
                 self.path.join(name.to_str().unwrap()),
                 error,
             ))
@@ -476,20 +499,22 @@ impl TrustedDirectory {
                 }
                 Err(error) => return Err(map_open_error(&self.path, name, error)),
             };
-            let metadata = file
-                .metadata()
-                .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+            let metadata = file.metadata().map_err(|error| {
+                TrustedStateError::Io(self.path.join(name.to_str().unwrap()), error)
+            })?;
             if !metadata.file_type().is_file()
                 || metadata.uid() != self.expected_uid
                 || metadata.permissions().mode() & 0o022 != 0
             {
-                return Err(NspawnError::Validation(format!(
+                return Err(TrustedStateError::Invalid(format!(
                     "trusted state lock has unsafe ownership or mode: {}",
                     self.path.join(name.to_str().unwrap()).display()
                 )));
             }
             file.set_permissions(std::fs::Permissions::from_mode(LOCK_MODE))
-                .map_err(|error| NspawnError::Io(self.path.join(name.to_str().unwrap()), error))?;
+                .map_err(|error| {
+                    TrustedStateError::Io(self.path.join(name.to_str().unwrap()), error)
+                })?;
             match file.try_lock_exclusive() {
                 Ok(()) => {}
                 Err(error) if is_contention(&error) => {
@@ -497,9 +522,11 @@ impl TrustedDirectory {
                     wait_for_lock_retry_sync(&path, started, attempts, policy)?;
                     continue;
                 }
-                Err(error) => return Err(NspawnError::Io(path.clone(), error)),
+                Err(error) => return Err(TrustedStateError::Io(path.clone(), error)),
             }
-            if same_opened_entry(&file, self.file.as_raw_fd(), name)? {
+            if same_opened_entry(&file, self.file.as_raw_fd(), name)
+                .map_err(|error| TrustedStateError::Io(path.clone(), error))?
+            {
                 return Ok(Some(file));
             }
             let _ = FileExt::unlock(&file);
@@ -516,15 +543,24 @@ fn wait_for_lock_retry_sync(
     policy: LockWaitPolicy,
 ) -> Result<()> {
     let Some(wait_budget) = remaining(policy, started) else {
-        return Err(timeout_error(lock_path, started, attempts));
+        return Err(TrustedStateError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        ));
     };
     if wait_budget.is_zero() {
-        return Err(timeout_error(lock_path, started, attempts));
+        return Err(TrustedStateError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        ));
     }
     std::thread::sleep(policy.retry_delay.min(wait_budget));
     match remaining(policy, started) {
         Some(wait_budget) if !wait_budget.is_zero() => Ok(()),
-        _ => Err(timeout_error(lock_path, started, attempts)),
+        _ => Err(TrustedStateError::Io(
+            lock_path.to_path_buf(),
+            timeout_error(started, attempts),
+        )),
     }
 }
 
@@ -534,7 +570,7 @@ fn open_or_create_absolute_directory(
     verify_ancestors: bool,
 ) -> Result<TrustedDirectory> {
     if !path.is_absolute() {
-        return Err(NspawnError::Validation(format!(
+        return Err(TrustedStateError::Invalid(format!(
             "trusted state root must be absolute: {}",
             path.display()
         )));
@@ -544,7 +580,7 @@ fn open_or_create_absolute_directory(
         .filter_map(|component| match component {
             Component::RootDir => None,
             Component::Normal(component) => Some(Ok(component.to_os_string())),
-            _ => Some(Err(NspawnError::Validation(format!(
+            _ => Some(Err(TrustedStateError::Invalid(format!(
                 "trusted state root contains an unsafe component: {}",
                 path.display()
             )))),
@@ -553,13 +589,13 @@ fn open_or_create_absolute_directory(
 
     let mut current_path = PathBuf::from("/");
     let mut current = open_directory(Path::new("/"))
-        .map_err(|error| NspawnError::Io(current_path.clone(), error))?;
+        .map_err(|error| TrustedStateError::Io(current_path.clone(), error))?;
     if verify_ancestors {
         validate_directory(&current, &current_path, expected_uid)?;
     }
     for component in components {
         let name = CString::new(component.as_bytes())
-            .map_err(|_| NspawnError::Validation("trusted state path contains NUL".into()))?;
+            .map_err(|_| TrustedStateError::Invalid("trusted state path contains NUL".into()))?;
         current_path.push(&component);
         current =
             open_or_create_directory_at(current.as_raw_fd(), &name, DIRECTORY_MODE, &current_path)?;
@@ -588,7 +624,10 @@ fn open_or_create_directory_at(
             if created != 0 {
                 let mkdir_error = std::io::Error::last_os_error();
                 if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(NspawnError::Io(display_path.to_path_buf(), mkdir_error));
+                    return Err(TrustedStateError::Io(
+                        display_path.to_path_buf(),
+                        mkdir_error,
+                    ));
                 }
             }
             open_file_at(
@@ -597,7 +636,7 @@ fn open_or_create_directory_at(
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
                 0,
             )
-            .map_err(|error| NspawnError::Io(display_path.to_path_buf(), error))
+            .map_err(|error| TrustedStateError::Io(display_path.to_path_buf(), error))
         }
         Err(error) => Err(map_open_error(display_path, name, error)),
     }
@@ -606,12 +645,12 @@ fn open_or_create_directory_at(
 fn validate_directory(file: &File, path: &Path, expected_uid: u32) -> Result<()> {
     let metadata = file
         .metadata()
-        .map_err(|error| NspawnError::Io(path.to_path_buf(), error))?;
+        .map_err(|error| TrustedStateError::Io(path.to_path_buf(), error))?;
     if !metadata.file_type().is_dir()
         || metadata.uid() != expected_uid
         || metadata.permissions().mode() & 0o022 != 0
     {
-        return Err(NspawnError::Validation(format!(
+        return Err(TrustedStateError::Invalid(format!(
             "trusted state directory must be owned by uid {expected_uid} and not group/world writable: {}",
             path.display()
         )));
@@ -628,12 +667,12 @@ fn validate_name(name: &str) -> Result<CString> {
             Some(Component::Normal(_))
         )
     {
-        return Err(NspawnError::Validation(format!(
+        return Err(TrustedStateError::Invalid(format!(
             "trusted state filename is invalid: {name:?}"
         )));
     }
     CString::new(name)
-        .map_err(|_| NspawnError::Validation("trusted state filename contains NUL".into()))
+        .map_err(|_| TrustedStateError::Invalid("trusted state filename contains NUL".into()))
 }
 
 fn open_directory(path: &Path) -> std::io::Result<File> {
@@ -677,8 +716,8 @@ fn unlink_at(parent: RawFd, name: &CStr) -> std::io::Result<()> {
     }
 }
 
-fn same_opened_entry(file: &File, parent: RawFd, name: &CStr) -> Result<bool> {
-    let opened = file.metadata().map_err(NspawnError::GenericIo)?;
+fn same_opened_entry(file: &File, parent: RawFd, name: &CStr) -> std::io::Result<bool> {
+    let opened = file.metadata()?;
     let mut current: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe {
         libc::fstatat(
@@ -693,24 +732,24 @@ fn same_opened_entry(file: &File, parent: RawFd, name: &CStr) -> Result<bool> {
         return if error.kind() == std::io::ErrorKind::NotFound {
             Ok(false)
         } else {
-            Err(NspawnError::GenericIo(error))
+            Err(error)
         };
     }
     Ok(opened.dev() == current.st_dev && opened.ino() == current.st_ino)
 }
 
-fn map_open_error(parent: &Path, name: &CStr, error: std::io::Error) -> NspawnError {
+fn map_open_error(parent: &Path, name: &CStr, error: std::io::Error) -> TrustedStateError {
     let path = name
         .to_str()
         .map(|name| parent.join(name))
         .unwrap_or_else(|_| parent.to_path_buf());
     if error.raw_os_error() == Some(libc::ELOOP) {
-        NspawnError::Validation(format!(
+        TrustedStateError::Invalid(format!(
             "trusted state path must not be a symlink: {}",
             path.display()
         ))
     } else {
-        NspawnError::Io(path, error)
+        TrustedStateError::Io(path, error)
     }
 }
 
@@ -830,7 +869,7 @@ mod tests {
             .unwrap_err();
 
         match error {
-            NspawnError::Io(path, source) => {
+            TrustedStateError::Io(path, source) => {
                 assert_eq!(
                     path,
                     temporary.path().join("lasper/states/.machine.json.lock")

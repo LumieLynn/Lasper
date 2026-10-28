@@ -1,10 +1,14 @@
-//! Typed image import operations shared by direct and elevated modes.
+//! Archive validation, extraction, and host tar compatibility policy.
 
-use super::failure::{OperationFailure, OperationResult};
-use crate::adapters::error::{NspawnError, Result};
+mod limits;
+
+use super::validate_source;
 use crate::adapters::process::{read_bounded_stream, terminate_child_process_group};
+use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
+use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::rootfs::RootfsTarget;
-use crate::domain::machine::MachineName;
+use crate::application::provisioning::DeploymentCancellation;
 use serde::{Deserialize, Serialize};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -12,8 +16,6 @@ use std::process::Stdio;
 
 const MAX_TAR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const TAR_RUNTIME_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const IMAGE_VALIDATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-const MAX_IMAGE_VALIDATION_OUTPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,98 +43,17 @@ pub(crate) struct ImageImportReport {
     pub(crate) warnings: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ImageImportStore;
-
-impl ImageImportStore {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub(crate) async fn import_raw(
-        &self,
-        machine: MachineName,
-        source: std::fs::File,
-    ) -> Result<()> {
-        validate_source(&source)?;
-        import_raw_system_image(machine, source).await
-    }
-
-    pub(crate) async fn import_tar(
-        &self,
-        target: RootfsTarget,
-        source: std::fs::File,
-        source_origin: TarSourceOrigin,
-        allow_unsafe_remote: bool,
-        cancellation: &super::DeploymentCancellation,
-    ) -> OperationResult<ImageImportReport> {
-        validate_source(&source)?;
-        let request = ImportTarRequest {
-            target,
-            source_origin,
-            allow_unsafe_remote,
-        };
-        import_tar_image(request, source, cancellation).await
-    }
-}
-
-pub(crate) async fn import_raw_system_image(
-    machine: MachineName,
-    source: std::fs::File,
-) -> Result<()> {
-    validate_source(&source)?;
-    let path = crate::adapters::storage::image_ops::import_raw_image(&machine, source).await?;
-    let mut command = crate::adapters::process::new_command("systemd-dissect");
-    command.args(["--validate"]).arg(&path);
-    let output = match crate::adapters::process::run_bounded_child_command(
-        command,
-        None,
-        IMAGE_VALIDATION_TIMEOUT,
-        "systemd-dissect --validate",
-        MAX_IMAGE_VALIDATION_OUTPUT_BYTES,
-    )
-    .await
-    {
-        Ok(output) => output,
-        Err(error) => {
-            remove_failed_raw_import(&path).await;
-            return Err(NspawnError::Io(PathBuf::from("systemd-dissect"), error));
-        }
-    };
-    crate::adapters::process::log_output("systemd-dissect --validate", &output);
-    if !output.status.success() {
-        remove_failed_raw_import(&path).await;
-        return Err(NspawnError::cmd_failed(
-            "validate imported raw system image",
-            format!("systemd-dissect --validate {}", path.display()),
-            &output,
-        ));
-    }
-    Ok(())
-}
-
-async fn remove_failed_raw_import(path: &std::path::Path) {
-    if let Err(error) = tokio::fs::remove_file(path).await {
-        log::warn!(
-            "Failed to remove rejected raw image {}: {}",
-            path.display(),
-            error
-        );
-    }
-}
-
-fn validate_source(source: &std::fs::File) -> Result<()> {
-    crate::adapters::storage::image_ops::validate_import_source(source)
-}
-
 pub(crate) async fn import_tar_image(
     request: ImportTarRequest,
     source: std::fs::File,
-    cancellation: &super::DeploymentCancellation,
+    cancellation: &DeploymentCancellation,
 ) -> OperationResult<ImageImportReport> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
-    let target = request.target.path()?;
+    let target = request
+        .target
+        .path()
+        .host_context("resolve archive extraction path")?;
     let source_origin = request.source_origin;
     let allow_unsafe_remote = request.allow_unsafe_remote;
 
@@ -141,7 +62,7 @@ pub(crate) async fn import_tar_image(
         result = preparation => result?,
         _ = cancellation.cancelled() => return Err(OperationFailure::Cancelled),
     };
-    super::check_deployment_cancellation(cancellation)?;
+    check_deployment_cancellation(cancellation)?;
     extract_tar_at(&target, source, cancellation).await?;
     Ok(report)
 }
@@ -150,13 +71,16 @@ async fn prepare_tar_import(
     source: std::fs::File,
     source_origin: TarSourceOrigin,
     allow_unsafe_remote: bool,
-) -> Result<(std::fs::File, ImageImportReport)> {
+) -> OperationResult<(std::fs::File, ImageImportReport)> {
     let source = tokio::task::spawn_blocking(move || {
-        super::tar_limits::validate(&source)?;
-        Ok::<_, NspawnError>(source)
+        limits::validate(&source)?;
+        Ok::<_, OperationFailure>(source)
     })
     .await
-    .map_err(|error| NspawnError::Runtime(format!("tar import task failed: {error}")))??;
+    .map_err(|source| OperationFailure::Worker {
+        operation: "tar validation",
+        source,
+    })??;
     let assessment = inspect_tar_runtime().await?;
     let report = tar_runtime_policy(source_origin, &assessment, allow_unsafe_remote)?;
     for warning in &report.warnings {
@@ -168,13 +92,10 @@ async fn prepare_tar_import(
 async fn extract_tar_at(
     target: &std::path::Path,
     source: std::fs::File,
-    cancellation: &super::DeploymentCancellation,
+    cancellation: &DeploymentCancellation,
 ) -> OperationResult<()> {
     let mut command = async_tar_command();
-    crate::adapters::process::limit_file_size(
-        command.as_std_mut(),
-        super::tar_limits::MAX_EXPANDED_BYTES,
-    );
+    crate::adapters::process::limit_file_size(command.as_std_mut(), limits::MAX_EXPANDED_BYTES);
     command
         .args(["--numeric-owner", "-pxf", "-", "-C"])
         .arg(target)
@@ -186,25 +107,24 @@ async fn extract_tar_at(
     if output.status.success() {
         Ok(())
     } else {
-        Err(NspawnError::cmd_failed(
+        Err(OperationFailure::command_failed(
             "extract rootfs archive",
             format!("tar --numeric-owner -pxf - -C {}", target.display()),
             &output,
-        )
-        .into())
+        ))
     }
 }
 
 async fn run_tar_extract(
     mut command: tokio::process::Command,
-    cancellation: &super::DeploymentCancellation,
+    cancellation: &DeploymentCancellation,
 ) -> OperationResult<std::process::Output> {
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 
     command.kill_on_drop(true).as_std_mut().process_group(0);
     let mut child = command
         .spawn()
-        .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+        .map_err(|error| OperationFailure::Io(PathBuf::from("tar"), error))?;
     let pid = child.id().expect("tar has pid");
     let stderr = child.stderr.take().expect("tar stderr piped");
     let mut completion = Box::pin(async {
@@ -216,7 +136,7 @@ async fn run_tar_extract(
             status: status
                 .map_err(|error| OperationFailure::process_exit_unconfirmed("tar", error))?,
             stdout: Vec::new(),
-            stderr: stderr.map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?,
+            stderr: stderr.map_err(|error| OperationFailure::Io(PathBuf::from("tar"), error))?,
         })
     });
     tokio::select! {
@@ -246,7 +166,7 @@ fn async_tar_command() -> tokio::process::Command {
     command
 }
 
-pub(crate) async fn inspect_tar_runtime() -> Result<TarRuntimeAssessment> {
+pub(crate) async fn inspect_tar_runtime() -> OperationResult<TarRuntimeAssessment> {
     let mut command = async_tar_command();
     command.arg("--version");
     let output = crate::adapters::process::run_bounded_child_command(
@@ -257,7 +177,7 @@ pub(crate) async fn inspect_tar_runtime() -> Result<TarRuntimeAssessment> {
         MAX_TAR_DIAGNOSTIC_BYTES,
     )
     .await
-    .map_err(|error| NspawnError::Io(PathBuf::from("tar"), error))?;
+    .map_err(|error| OperationFailure::Io(PathBuf::from("tar"), error))?;
     crate::adapters::process::log_output("tar --version", &output);
 
     let version = output
@@ -308,7 +228,7 @@ fn tar_runtime_policy(
     source_origin: TarSourceOrigin,
     assessment: &TarRuntimeAssessment,
     allow_unsafe_remote: bool,
-) -> Result<ImageImportReport> {
+) -> OperationResult<ImageImportReport> {
     let Some(risk) = assessment.risk.as_deref() else {
         return Ok(ImageImportReport::default());
     };
@@ -324,19 +244,21 @@ fn tar_runtime_policy(
                 "{risk} Continuing with the remote archive after explicit confirmation; import only trusted archives or upgrade to GNU tar 1.35+."
             )],
         }),
-        TarSourceOrigin::Remote => Err(NspawnError::Validation(format!(
+        TarSourceOrigin::Remote => Err(OperationFailure::InvalidInput(format!(
             "Remote tar import requires explicit risk confirmation: {risk}"
         ))),
     }
 }
 
-async fn validate_tar_target(target: &RootfsTarget) -> Result<()> {
-    let path = target.path()?;
+async fn validate_tar_target(target: &RootfsTarget) -> OperationResult<()> {
+    let path = target
+        .path()
+        .host_context("resolve archive extraction path")?;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
-        .map_err(|error| NspawnError::Io(path.clone(), error))?;
+        .map_err(|error| OperationFailure::Io(path.clone(), error))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(NspawnError::Validation(format!(
+        return Err(OperationFailure::InvalidInput(format!(
             "Tar import target is not a managed directory: {}",
             path.display()
         )));
@@ -348,6 +270,7 @@ async fn validate_tar_target(target: &RootfsTarget) -> Result<()> {
 mod tests {
     use super::*;
     use crate::application::provisioning::DeploymentCancellation;
+    use crate::domain::machine::MachineName;
     use std::io::{Seek, SeekFrom};
 
     #[test]

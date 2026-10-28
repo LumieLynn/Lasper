@@ -90,13 +90,23 @@ impl ProvisioningService {
     ) -> Result<DeploymentJobHandle, DeploymentStartError> {
         let (plan, reservation) = match self.prepare_submission(&submission) {
             Ok(prepared) => prepared,
-            Err(error) => return Err(DeploymentStartError::new(error, submission)),
+            Err(error) => {
+                log::warn!(
+                    "[DEPLOY admission] Rejected target {:?}: {error}",
+                    submission.request().target_name()
+                );
+                return Err(DeploymentStartError::new(error, submission));
+            }
         };
         // Ownership of the secrets changes only after all rejecting checks
         // have completed and the deployment resources have been reserved.
         let (_, secrets) = submission.into_parts();
 
         let id = super::DeploymentId::new();
+        log::info!(
+            "[DEPLOY {id}] [Container: {}] Submission accepted",
+            plan.target()
+        );
         let (handle, context) = deployment_job_channel(id);
         let terminal_status = context.status_sender();
         let claim_status = context.claim_status_sender();

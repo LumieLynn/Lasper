@@ -123,12 +123,18 @@ impl ImageControl for RoutedImageControl {
                 if RuntimeSource::is_available(dbus).await {
                     dbus.disable(machine.as_str()).await
                 } else {
-                    fallback_operations.disable(machine.as_str()).await
+                    fallback_operations
+                        .disable(machine.as_str())
+                        .await
+                        .map_err(Into::into)
                 }
             }
             ImageControlRoute::LocalSystemdTools {
                 system_operations, ..
-            } => system_operations.disable(machine.as_str()).await,
+            } => system_operations
+                .disable(machine.as_str())
+                .await
+                .map_err(Into::into),
             ImageControlRoute::Daemon {
                 daemon,
                 system_operations,
@@ -136,9 +142,10 @@ impl ImageControl for RoutedImageControl {
                 ..
             } => match transport {
                 ImageRemoveTransport::Dbus => disable_unit_via_daemon(daemon, machine).await,
-                ImageRemoveTransport::SystemdTools => {
-                    system_operations.disable(machine.as_str()).await
-                }
+                ImageRemoveTransport::SystemdTools => system_operations
+                    .disable(machine.as_str())
+                    .await
+                    .map_err(Into::into),
             },
         };
         match result {

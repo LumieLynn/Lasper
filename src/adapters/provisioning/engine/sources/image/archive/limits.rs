@@ -1,6 +1,6 @@
 //! Resource-budget validation for uncompressed tar archives.
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 
@@ -24,11 +24,15 @@ impl PaxSizeHints {
     }
 }
 
-pub(super) fn validate(source: &std::fs::File) -> Result<()> {
+pub(super) fn validate(source: &std::fs::File) -> OperationResult<()> {
     validate_with_limit(source, MAX_EXPANDED_BYTES, MAX_ENTRIES)
 }
 
-fn validate_with_limit(source: &std::fs::File, limit: u64, max_entries: u64) -> Result<()> {
+fn validate_with_limit(
+    source: &std::fs::File,
+    limit: u64,
+    max_entries: u64,
+) -> OperationResult<()> {
     let mut header = [0u8; 512];
     let mut offset = 0u64;
     let mut zero_blocks = 0u8;
@@ -49,11 +53,11 @@ fn validate_with_limit(source: &std::fs::File, limit: u64, max_entries: u64) -> 
         }
         zero_blocks = 0;
 
-        entries = entries
-            .checked_add(1)
-            .ok_or_else(|| NspawnError::Validation("Tar archive entry count overflowed".into()))?;
+        entries = entries.checked_add(1).ok_or_else(|| {
+            OperationFailure::InvalidInput("Tar archive entry count overflowed".into())
+        })?;
         if entries > max_entries {
-            return Err(NspawnError::Validation(format!(
+            return Err(OperationFailure::InvalidInput(format!(
                 "Tar archive contains more than {max_entries} entries"
             )));
         }
@@ -92,9 +96,9 @@ fn validate_with_limit(source: &std::fs::File, limit: u64, max_entries: u64) -> 
     }
 }
 
-fn reject_large_metadata(size: u64, kind: &str) -> Result<()> {
+fn reject_large_metadata(size: u64, kind: &str) -> OperationResult<()> {
     if size > MAX_METADATA_BYTES {
-        return Err(NspawnError::Validation(format!(
+        return Err(OperationFailure::InvalidInput(format!(
             "Tar {kind} metadata exceeds the {MAX_METADATA_BYTES} byte limit"
         )));
     }
@@ -106,14 +110,14 @@ fn skip_oldgnu_sparse_headers(
     mut offset: u64,
     mut extended: bool,
     limit: u64,
-) -> Result<u64> {
+) -> OperationResult<u64> {
     let mut count = 0u64;
     while extended {
-        count = count
-            .checked_add(1)
-            .ok_or_else(|| NspawnError::Validation("Tar sparse header count overflowed".into()))?;
+        count = count.checked_add(1).ok_or_else(|| {
+            OperationFailure::InvalidInput("Tar sparse header count overflowed".into())
+        })?;
         if count > limit {
-            return Err(NspawnError::Validation(format!(
+            return Err(OperationFailure::InvalidInput(format!(
                 "Tar archive contains more than {limit} sparse extension headers"
             )));
         }
@@ -125,39 +129,39 @@ fn skip_oldgnu_sparse_headers(
     Ok(offset)
 }
 
-fn add_payload(total: &mut u64, size: u64, limit: u64) -> Result<()> {
-    *total = total
-        .checked_add(size)
-        .ok_or_else(|| NspawnError::Validation("Tar archive payload size overflowed".into()))?;
+fn add_payload(total: &mut u64, size: u64, limit: u64) -> OperationResult<()> {
+    *total = total.checked_add(size).ok_or_else(|| {
+        OperationFailure::InvalidInput("Tar archive payload size overflowed".into())
+    })?;
     if *total > limit {
-        return Err(NspawnError::Validation(format!(
+        return Err(OperationFailure::InvalidInput(format!(
             "Tar archive declares more than the {limit} byte extraction limit"
         )));
     }
     Ok(())
 }
 
-fn padded_size(size: u64) -> Result<u64> {
+fn padded_size(size: u64) -> OperationResult<u64> {
     size.checked_add(511)
         .map(|value| value / 512 * 512)
-        .ok_or_else(|| NspawnError::Validation("Tar archive entry size overflowed".into()))
+        .ok_or_else(|| OperationFailure::InvalidInput("Tar archive entry size overflowed".into()))
 }
 
-fn checked_offset(offset: u64, addition: u64) -> Result<u64> {
+fn checked_offset(offset: u64, addition: u64) -> OperationResult<u64> {
     offset
         .checked_add(addition)
-        .ok_or_else(|| NspawnError::Validation("Tar archive offset overflowed".into()))
+        .ok_or_else(|| OperationFailure::InvalidInput("Tar archive offset overflowed".into()))
 }
 
-fn read_block(source: &std::fs::File, offset: u64, block: &mut [u8]) -> Result<()> {
+fn read_block(source: &std::fs::File, offset: u64, block: &mut [u8]) -> OperationResult<()> {
     let mut filled = 0usize;
     while filled < block.len() {
         let position = checked_offset(offset, filled as u64)?;
         let count = source
             .read_at(&mut block[filled..], position)
-            .map_err(|error| NspawnError::Io(PathBuf::from("tar archive"), error))?;
+            .map_err(|error| OperationFailure::Io(PathBuf::from("tar archive"), error))?;
         if count == 0 {
-            return Err(NspawnError::Validation(
+            return Err(OperationFailure::InvalidInput(
                 "Tar archive ended before its end-of-archive blocks".into(),
             ));
         }
@@ -166,13 +170,13 @@ fn read_block(source: &std::fs::File, offset: u64, block: &mut [u8]) -> Result<(
     Ok(())
 }
 
-fn read_bytes(source: &std::fs::File, offset: u64, size: usize) -> Result<Vec<u8>> {
+fn read_bytes(source: &std::fs::File, offset: u64, size: usize) -> OperationResult<Vec<u8>> {
     let mut bytes = vec![0u8; size];
     read_block(source, offset, &mut bytes)?;
     Ok(bytes)
 }
 
-fn parse_pax_size_hints(payload: &[u8]) -> Result<PaxSizeHints> {
+fn parse_pax_size_hints(payload: &[u8]) -> OperationResult<PaxSizeHints> {
     let mut hints = PaxSizeHints::default();
     let mut offset = 0usize;
     while offset < payload.len() {
@@ -180,15 +184,15 @@ fn parse_pax_size_hints(payload: &[u8]) -> Result<PaxSizeHints> {
             .iter()
             .position(|byte| *byte == b' ')
             .map(|position| offset + position)
-            .ok_or_else(|| NspawnError::Validation("Tar PAX record has no length".into()))?;
+            .ok_or_else(|| OperationFailure::InvalidInput("Tar PAX record has no length".into()))?;
         let length = usize::try_from(parse_decimal_size(&payload[offset..length_end])?)
-            .map_err(|_| NspawnError::Validation("Tar PAX record is too large".into()))?;
+            .map_err(|_| OperationFailure::InvalidInput("Tar PAX record is too large".into()))?;
         let record_end = offset
             .checked_add(length)
             .filter(|end| *end <= payload.len())
-            .ok_or_else(|| NspawnError::Validation("Tar PAX record is truncated".into()))?;
+            .ok_or_else(|| OperationFailure::InvalidInput("Tar PAX record is truncated".into()))?;
         if length_end + 1 >= record_end || payload[record_end - 1] != b'\n' {
-            return Err(NspawnError::Validation(
+            return Err(OperationFailure::InvalidInput(
                 "Tar PAX record has an invalid length".into(),
             ));
         }
@@ -196,7 +200,7 @@ fn parse_pax_size_hints(payload: &[u8]) -> Result<PaxSizeHints> {
         let separator = record
             .iter()
             .position(|byte| *byte == b'=')
-            .ok_or_else(|| NspawnError::Validation("Tar PAX record has no value".into()))?;
+            .ok_or_else(|| OperationFailure::InvalidInput("Tar PAX record has no value".into()))?;
         let value = &record[separator + 1..];
         match &record[..separator] {
             b"size" => hints.stream_size = Some(parse_decimal_size(value)?),
@@ -210,9 +214,9 @@ fn parse_pax_size_hints(payload: &[u8]) -> Result<PaxSizeHints> {
     Ok(hints)
 }
 
-fn parse_decimal_size(value: &[u8]) -> Result<u64> {
+fn parse_decimal_size(value: &[u8]) -> OperationResult<u64> {
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
-        return Err(NspawnError::Validation(
+        return Err(OperationFailure::InvalidInput(
             "Tar metadata contains an invalid decimal size".into(),
         ));
     }
@@ -220,14 +224,14 @@ fn parse_decimal_size(value: &[u8]) -> Result<u64> {
         total
             .checked_mul(10)
             .and_then(|total| total.checked_add((byte - b'0') as u64))
-            .ok_or_else(|| NspawnError::Validation("Tar metadata size overflowed".into()))
+            .ok_or_else(|| OperationFailure::InvalidInput("Tar metadata size overflowed".into()))
     })
 }
 
-fn parse_tar_size(field: &[u8]) -> Result<u64> {
+fn parse_tar_size(field: &[u8]) -> OperationResult<u64> {
     if field.first().is_some_and(|byte| byte & 0x80 != 0) {
         if field[0] & 0x40 != 0 {
-            return Err(NspawnError::Validation(
+            return Err(OperationFailure::InvalidInput(
                 "Tar archive contains a negative entry size".into(),
             ));
         }
@@ -240,7 +244,9 @@ fn parse_tar_size(field: &[u8]) -> Result<u64> {
                 value
                     .checked_mul(256)
                     .and_then(|value| value.checked_add(byte as u64))
-                    .ok_or_else(|| NspawnError::Validation("Tar entry size overflowed".into()))
+                    .ok_or_else(|| {
+                        OperationFailure::InvalidInput("Tar entry size overflowed".into())
+                    })
             });
     }
 
@@ -254,14 +260,14 @@ fn parse_tar_size(field: &[u8]) -> Result<u64> {
         + 1;
     field[start..end].iter().try_fold(0u64, |value, byte| {
         if !matches!(byte, b'0'..=b'7') {
-            return Err(NspawnError::Validation(
+            return Err(OperationFailure::InvalidInput(
                 "Tar archive contains an invalid entry size".into(),
             ));
         }
         value
             .checked_mul(8)
             .and_then(|value| value.checked_add((byte - b'0') as u64))
-            .ok_or_else(|| NspawnError::Validation("Tar entry size overflowed".into()))
+            .ok_or_else(|| OperationFailure::InvalidInput("Tar entry size overflowed".into()))
     })
 }
 

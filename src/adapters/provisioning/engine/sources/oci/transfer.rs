@@ -1,7 +1,7 @@
 //! Typed systemd-native OCI acquisition shared by direct and elevated modes.
 
-use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::SpawnedProcess;
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::oci::OciReference;
 use futures_util::StreamExt;
@@ -68,7 +68,7 @@ impl OciPullStore {
         Self
     }
 
-    pub(crate) async fn spawn(&self, request: OciPullRequest) -> Result<SpawnedProcess> {
+    pub(crate) async fn spawn(&self, request: OciPullRequest) -> OperationResult<SpawnedProcess> {
         spawn_local_pull(request)
     }
 }
@@ -126,9 +126,9 @@ fn pull_flags(request: &OciPullRequest) -> u64 {
     }
 }
 
-fn spawn_local_pull(request: OciPullRequest) -> Result<SpawnedProcess> {
+fn spawn_local_pull(request: OciPullRequest) -> OperationResult<SpawnedProcess> {
     let (writer, reader) = tokio::net::unix::pipe::pipe()
-        .map_err(|error| NspawnError::Io(PathBuf::from("OCI transfer pipe"), error))?;
+        .map_err(|error| OperationFailure::Io(PathBuf::from("OCI transfer pipe"), error))?;
     let cancellation = OciTransferCancellation::default();
     let task_cancellation = cancellation.clone();
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
@@ -136,7 +136,7 @@ fn spawn_local_pull(request: OciPullRequest) -> Result<SpawnedProcess> {
         let result = run_oci_transfer(request, writer, task_cancellation).await;
         let wait_result = result
             .map(|outcome| std::process::ExitStatus::from_raw(outcome.exit_code() << 8))
-            .map_err(|error| std::io::Error::other(error.to_string()));
+            .map_err(std::io::Error::other);
         let _ = done_tx.send(wait_result);
     });
 
@@ -166,7 +166,7 @@ pub(crate) async fn run_oci_transfer<W>(
     request: OciPullRequest,
     mut output: W,
     cancellation: OciTransferCancellation,
-) -> Result<OciTransferOutcome>
+) -> OperationResult<OciTransferOutcome>
 where
     W: AsyncWrite + Unpin,
 {
@@ -176,16 +176,16 @@ where
 
     let connection = zbus::Connection::system()
         .await
-        .map_err(NspawnError::Dbus)?;
+        .map_err(OperationFailure::ImportTransport)?;
     let manager = ImportManagerProxy::new(&connection)
         .await
-        .map_err(NspawnError::Dbus)?;
+        .map_err(OperationFailure::ImportTransport)?;
     // Install the completion match before PullOci so a very small image cannot
     // finish between the method reply and signal subscription.
     let mut removed = manager
         .receive_transfer_removed()
         .await
-        .map_err(NspawnError::Dbus)?;
+        .map_err(OperationFailure::ImportTransport)?;
     let (transfer_id, transfer_path) = manager
         .pull_oci(
             request.reference.as_str(),
@@ -194,7 +194,7 @@ where
             pull_flags(&request),
         )
         .await
-        .map_err(NspawnError::Dbus)?;
+        .map_err(OperationFailure::ImportTransport)?;
 
     write_transfer_line(
         &mut output,
@@ -204,21 +204,21 @@ where
 
     let transfer = ImportTransferProxy::builder(&connection)
         .path(transfer_path.clone())
-        .map_err(NspawnError::Dbus)?
+        .map_err(OperationFailure::ImportTransport)?
         .build()
         .await
-        .map_err(NspawnError::Dbus)?;
+        .map_err(OperationFailure::ImportTransport)?;
     let mut messages = Some(
         transfer
             .receive_log_message()
             .await
-            .map_err(NspawnError::Dbus)?,
+            .map_err(OperationFailure::ImportTransport)?,
     );
     let mut progress = Some(
         transfer
             .receive_progress_update()
             .await
-            .map_err(NspawnError::Dbus)?,
+            .map_err(OperationFailure::ImportTransport)?,
     );
     let mut cancel_sent = false;
     let mut last_progress_bucket = None;
@@ -249,11 +249,11 @@ where
             }
             event = removed.next() => {
                 let event = event.ok_or_else(|| {
-                    NspawnError::Runtime(format!(
+                    OperationFailure::InconsistentState(format!(
                         "systemd-importd completion stream closed while transfer {transfer_id} was active"
                     ))
                 })?;
-                let args = event.args().map_err(NspawnError::Dbus)?;
+                let args = event.args().map_err(OperationFailure::ImportTransport)?;
                 if *args.transfer_id() != transfer_id || args.path() != &transfer_path {
                     continue;
                 }
@@ -276,7 +276,7 @@ where
             } => {
                 match event {
                     Some(event) => {
-                        let args = event.args().map_err(NspawnError::Dbus)?;
+                        let args = event.args().map_err(OperationFailure::ImportTransport)?;
                         write_transfer_line(&mut output, args.line()).await;
                     }
                     None => messages = None,
@@ -290,7 +290,7 @@ where
             } => {
                 match event {
                     Some(event) => {
-                        let args = event.args().map_err(NspawnError::Dbus)?;
+                        let args = event.args().map_err(OperationFailure::ImportTransport)?;
                         let bucket = ((*args.progress() * 100.0).clamp(0.0, 100.0) as u8) / 5 * 5;
                         if last_progress_bucket != Some(bucket) {
                             last_progress_bucket = Some(bucket);
@@ -319,11 +319,11 @@ async fn write_transfer_line(output: &mut (impl AsyncWrite + Unpin), line: impl 
 }
 
 /// Probe the actual importctl verb instead of trusting a parsed version number.
-pub fn ensure_pull_oci_available() -> Result<()> {
+pub fn ensure_pull_oci_available() -> OperationResult<()> {
     let output = crate::adapters::process::new_sync_command("importctl")
         .arg("--help")
         .output()
-        .map_err(|error| NspawnError::Io(PathBuf::from("importctl --help"), error))?;
+        .map_err(|error| OperationFailure::Io(PathBuf::from("importctl --help"), error))?;
     let help = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
@@ -336,7 +336,7 @@ pub fn ensure_pull_oci_available() -> Result<()> {
     {
         Ok(())
     } else {
-        Err(NspawnError::Validation(
+        Err(OperationFailure::InvalidInput(
             "OCI applications require systemd 260 or newer with importctl pull-oci".into(),
         ))
     }

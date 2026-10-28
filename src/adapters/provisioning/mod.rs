@@ -1,16 +1,18 @@
-use crate::domain::machine::MachineConfig;
 mod claim;
 pub(crate) mod direct;
 mod elevated;
-pub(crate) mod engine;
+mod engine;
 mod preparation;
 pub(crate) mod recovery;
 pub(crate) mod state;
+
+pub(crate) use engine::sources::{inspect_tar_runtime, TarRuntimeAssessment};
 
 use crate::application::provisioning::{
     DeploymentClaimControl, DeploymentError, DeploymentRecoveryProbe, DeploymentStatePort,
     ProvisioningService, RemoteTarSafety, SourcePreflight,
 };
+use crate::domain::machine::MachineConfig;
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -115,14 +117,9 @@ struct DirectSourcePreflight;
 #[async_trait]
 impl SourcePreflight for DirectSourcePreflight {
     async fn inspect_remote_tar(&self) -> Result<RemoteTarSafety, DeploymentError> {
-        let assessment =
-            crate::adapters::provisioning::engine::image_operation::inspect_tar_runtime()
-                .await
-                .map_err(|error| {
-                    DeploymentError::failed(format!(
-                        "Could not inspect the host tar runtime: {error}"
-                    ))
-                })?;
+        let assessment = inspect_tar_runtime().await.map_err(|error| {
+            DeploymentError::failed(format!("Could not inspect the host tar runtime: {error}"))
+        })?;
         Ok(tar_safety(assessment))
     }
 }
@@ -141,9 +138,7 @@ impl SourcePreflight for ElevatedSourcePreflight {
     }
 }
 
-fn tar_safety(
-    assessment: crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment,
-) -> RemoteTarSafety {
+fn tar_safety(assessment: TarRuntimeAssessment) -> RemoteTarSafety {
     match assessment.risk {
         Some(risk) => RemoteTarSafety::Risk(risk),
         None => RemoteTarSafety::Compatible,

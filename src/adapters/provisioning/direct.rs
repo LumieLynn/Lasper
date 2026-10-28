@@ -1,9 +1,11 @@
 //! Direct provisioning runner used by root/direct mode and inside the daemon.
 
-use super::engine::builders::{bootstrap, clone, image, oci};
+use super::engine::sources::{
+    BootstrapDeployer, BootstrapStore, CloneDeployer, Deployer, ImageAcquisitionStore,
+    ImageDeployer, ImageFormat, ImageImportStore, ImageSource, OciDeployer, OciPullStore,
+};
 use super::engine::{
-    BootstrapStore, Deployer, DeploymentExecution, DirectProvisioningCapabilities,
-    ImageAcquisitionStore, ImageImportStore, ImageSource, OciPullStore, StoragePreparation,
+    DeploymentDiagnostics, DeploymentExecution, DirectProvisioningCapabilities, StoragePreparation,
     SystemConfiguration,
 };
 use super::state::FilesystemDeploymentState;
@@ -14,7 +16,7 @@ use crate::adapters::storage::{
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
     DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentSecrets,
-    DeploymentStatePort, DeploymentStateSession,
+    DeploymentStage, DeploymentStatePort, DeploymentStateSession,
 };
 use crate::application::HostOperationTracker;
 use crate::domain::machine::MachineName;
@@ -125,7 +127,7 @@ impl DirectProvisioningExecutor {
         }
         let (source, storage, configuration): (Box<dyn Deployer>, _, _) = match spec {
             DeploymentSpec::Bootstrap(deployment) => {
-                let source = Box::new(bootstrap::BootstrapDeployer {
+                let source = Box::new(BootstrapDeployer {
                     include_sudo: deployment.users.iter().any(|user| user.sudoer),
                     spec: deployment.provider,
                     bootstrap: self.bootstrap.clone(),
@@ -149,19 +151,19 @@ impl DirectProvisioningExecutor {
                         allow_unsafe_remote_tar,
                     } => (
                         source,
-                        image::ImageFormat::Tar,
+                        ImageFormat::Tar,
                         StoragePreparation::Allocate(self.storage(storage)),
                         allow_unsafe_remote_tar,
                     ),
                     ImageImport::DiskImage { source } => (
                         source,
-                        image::ImageFormat::Raw,
+                        ImageFormat::Raw,
                         StoragePreparation::ProviderImage,
                         false,
                     ),
                 };
                 (
-                    Box::new(image::ImageDeployer {
+                    Box::new(ImageDeployer {
                         source: self.image_source(source),
                         format,
                         acquisition: self.image_acquisition.clone(),
@@ -178,7 +180,7 @@ impl DirectProvisioningExecutor {
                 )
             }
             DeploymentSpec::Clone(deployment) => (
-                Box::new(clone::CloneDeployer {
+                Box::new(CloneDeployer {
                     source_name: deployment.source_name,
                     system_operations: self.host.system_operations().clone(),
                     nspawn: self.host.nspawn().clone(),
@@ -188,7 +190,7 @@ impl DirectProvisioningExecutor {
                 None,
             ),
             DeploymentSpec::Oci(deployment) => (
-                Box::new(oci::OciDeployer {
+                Box::new(OciDeployer {
                     reference: deployment.reference,
                     read_only: deployment.read_only,
                     network: deployment.network,
@@ -216,24 +218,38 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
         secrets: DeploymentSecrets,
         job: DeploymentJobContext,
     ) -> Result<(), DeploymentError> {
-        let planned_target = plan.target().clone();
-        let deployment_state =
-            DeploymentStateSession::new(Arc::clone(&self.deployment_state), job.id(), &plan);
-        let spec = plan.into_spec();
-        if let Some(machine) = spec.machine_config() {
-            super::validate_nspawn_config(machine)?;
-        }
-        let execution = self.execution(planned_target, spec)?;
+        let mut diagnostics =
+            DeploymentDiagnostics::new(job.id(), plan.target().clone(), job.event_sender());
+        let result = async {
+            diagnostics.enter_stage(DeploymentStage::Validation);
+            let planned_target = plan.target().clone();
+            let deployment_state =
+                DeploymentStateSession::new(Arc::clone(&self.deployment_state), job.id(), &plan);
+            let spec = plan.into_spec();
+            if let Some(machine) = spec.machine_config() {
+                super::validate_nspawn_config(machine)?;
+            }
+            let execution = self.execution(planned_target, spec)?;
 
-        deployment_state
-            .prepare()
-            .await
-            .map_err(|error| DeploymentError::failed(error.to_string()))?;
-        let job = job.with_state_session(deployment_state);
-        let _operation = self.host_operations.begin();
-        super::engine::run_deployment(execution, self.host.clone(), secrets, job)
+            deployment_state
+                .prepare()
+                .await
+                .map_err(|error| DeploymentError::failed(error.to_string()))?;
+            let job = job.with_state_session(deployment_state);
+            let _operation = self.host_operations.begin();
+            super::engine::run_deployment(
+                execution,
+                self.host.clone(),
+                secrets,
+                job,
+                &mut diagnostics,
+            )
             .await
             .map_err(super::engine::DeploymentFailure::into_application_error)
+        }
+        .await;
+        diagnostics.finish(&result);
+        result
     }
 }
 

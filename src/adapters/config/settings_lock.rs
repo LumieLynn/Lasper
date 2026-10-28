@@ -16,6 +16,7 @@ pub(super) async fn acquire(machine: MachineName) -> Result<File> {
     })
     .await
     .map_err(|error| NspawnError::Runtime(format!("configuration lock failed: {error}")))?
+    .map_err(NspawnError::from)
 }
 
 #[cfg(test)]

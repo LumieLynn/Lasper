@@ -1,7 +1,7 @@
 //! Typed host system operations shared by direct and elevated modes.
 
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::error::NspawnError;
 use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
 use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
@@ -239,23 +239,20 @@ impl SystemOperationStore {
         }
     }
 
-    async fn execute(&self, operation: SystemOperation) -> Result<()> {
-        self.executor
-            .execute(operation)
-            .await
-            .map_err(NspawnError::from)
+    async fn execute(&self, operation: SystemOperation) -> SystemOperationResult<()> {
+        self.executor.execute(operation).await
     }
 
-    pub async fn disable(&self, name: &str) -> Result<()> {
+    pub async fn disable(&self, name: &str) -> SystemOperationResult<()> {
         self.execute(SystemOperation::Disable {
             machine: machine_name(name)?,
         })
         .await
     }
 
-    pub async fn remove_image(&self, name: &str) -> Result<()> {
+    pub async fn remove_image(&self, name: &str) -> SystemOperationResult<()> {
         if ImageEntry::is_protected_name(name) {
-            return Err(NspawnError::ProtectedImage(name.into()));
+            return Err(SystemOperationError::ProtectedImage(name.into()));
         }
         self.execute(SystemOperation::RemoveImage {
             image: image_name(name)?,
@@ -263,7 +260,7 @@ impl SystemOperationStore {
         .await
     }
 
-    pub async fn clone_image(&self, source: &str, destination: &str) -> Result<()> {
+    pub async fn clone_image(&self, source: &str, destination: &str) -> SystemOperationResult<()> {
         self.execute(SystemOperation::CloneImage {
             source: image_name(source)?,
             destination: image_name(destination)?,
@@ -271,7 +268,7 @@ impl SystemOperationStore {
         .await
     }
 
-    pub async fn reload_daemon(&self) -> Result<()> {
+    pub async fn reload_daemon(&self) -> SystemOperationResult<()> {
         self.execute(SystemOperation::ReloadDaemon).await
     }
 }
@@ -361,12 +358,12 @@ impl SystemOperationExecutor for ElevatedSystemOperationExecutor {
     }
 }
 
-fn machine_name(name: &str) -> Result<MachineName> {
-    MachineName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+fn machine_name(name: &str) -> SystemOperationResult<MachineName> {
+    MachineName::new(name).map_err(|error| SystemOperationError::InvalidTarget(error.to_string()))
 }
 
-fn image_name(name: &str) -> Result<ImageName> {
-    ImageName::new(name).map_err(|error| NspawnError::Validation(error.to_string()))
+fn image_name(name: &str) -> SystemOperationResult<ImageName> {
+    ImageName::new(name).map_err(|error| SystemOperationError::InvalidTarget(error.to_string()))
 }
 
 pub(crate) async fn execute_system_operation(

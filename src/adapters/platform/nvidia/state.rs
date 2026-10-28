@@ -1,7 +1,9 @@
 use crate::adapters::elevated::ElevatedDaemon;
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::platform::nvidia::classify::{ClassifiedEntry, SymlinkEntry};
-use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
+use crate::adapters::trusted_state::{
+    StateDirectory, TrustedDirectory, TrustedStateError, TrustedStateRoot,
+};
 use crate::application::image_lifecycle::ArtifactOwnership;
 use crate::application::provisioning::ResourceApplyStatus;
 use crate::domain::machine::MachineName;
@@ -495,7 +497,9 @@ fn write_state(directory: &TrustedDirectory, name: &str, state: &NvidiaState) ->
                 )));
             }
         }
-        directory.write_atomic(name, &content, 0o600)
+        directory
+            .write_atomic(name, &content, 0o600)
+            .map_err(NspawnError::from)
     })
 }
 
@@ -546,8 +550,8 @@ fn probe_owned_state(directory: &TrustedDirectory, name: &str) -> Result<Artifac
     let file = match directory.read_bounded(name, MAX_NVIDIA_STATE_BYTES) {
         Ok(Some(file)) => file,
         Ok(None) => return Ok(ArtifactOwnership::NotPresent),
-        Err(NspawnError::Validation(_)) => return Ok(ArtifactOwnership::AmbiguousLegacy),
-        Err(error) => return Err(error),
+        Err(TrustedStateError::Invalid(_)) => return Ok(ArtifactOwnership::AmbiguousLegacy),
+        Err(error) => return Err(error.into()),
     };
     if file.uid != directory.expected_uid() || file.mode != 0o600 {
         return Ok(ArtifactOwnership::AmbiguousLegacy);

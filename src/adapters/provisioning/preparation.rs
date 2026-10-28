@@ -72,12 +72,11 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             })
             .collect();
 
-        let oci =
-            match crate::adapters::provisioning::engine::oci_operation::ensure_pull_oci_available()
-            {
-                Ok(()) => HostCapability::available(),
-                Err(error) => HostCapability::unavailable(error.to_string()),
-            };
+        let oci = match crate::adapters::provisioning::engine::sources::ensure_pull_oci_available()
+        {
+            Ok(()) => HostCapability::available(),
+            Err(error) => HostCapability::unavailable(error.to_string()),
+        };
 
         let x11 = crate::adapters::platform::x11::discover_host_x11_sockets().await;
         let x11_socket_directory_available =
@@ -240,7 +239,7 @@ impl ProvisioningPreparationPort for NspawnProvisioningPreparation {
             DeploymentSpec::Clone(deployment) => return format!(
                 " [CLONE OPERATION]\n\n Source: {}\n Destination: {}\n\n Image data, effective .nspawn settings, and Lasper's service override\n are copied when present.\n\n WARNING: {}",
                 deployment.source_name, deployment.name,
-                crate::adapters::provisioning::engine::builders::clone::CLONE_IDENTITY_NOTICE,
+                crate::adapters::provisioning::engine::sources::CLONE_IDENTITY_NOTICE,
             ),
             DeploymentSpec::Bootstrap(deployment) => (&deployment.machine, Some(&deployment.storage), deployment.wayland.as_slice(), Some(&deployment.provider)),
             DeploymentSpec::Import(deployment) => {

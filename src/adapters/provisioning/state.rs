@@ -1,7 +1,8 @@
 //! Durable deployment crash manifests under the composed trusted state root.
 
-use crate::adapters::error::NspawnError;
-use crate::adapters::trusted_state::{StateDirectory, TrustedDirectory, TrustedStateRoot};
+use crate::adapters::trusted_state::{
+    StateDirectory, TrustedDirectory, TrustedStateError, TrustedStateRoot,
+};
 use crate::application::provisioning::{
     DeploymentCrashManifest, DeploymentId, DeploymentStateError, DeploymentStatePort,
 };
@@ -173,20 +174,17 @@ impl DeploymentStatePort for FilesystemDeploymentState {
             let directory = deployment_directory(&root)?;
             let name = manifest_name(manifest.deployment_id);
             let bytes = serialize_manifest(&manifest)?;
-            directory
-                .with_exclusive_lock(&name, || {
-                    if read_manifest(&directory, &name)
-                        .map_err(state_error_to_nspawn)?
-                        .is_some()
-                    {
-                        return Err(state_conflict(format!(
-                            "deployment {} already has a crash manifest",
-                            manifest.deployment_id
-                        )));
-                    }
-                    directory.write_atomic(&name, &bytes, 0o600)
-                })
-                .map_err(map_state_error)
+            directory.with_exclusive_lock(&name, || {
+                if read_manifest(&directory, &name)?.is_some() {
+                    return Err(DeploymentStateError::Conflict(format!(
+                        "deployment {} already has a crash manifest",
+                        manifest.deployment_id
+                    )));
+                }
+                directory
+                    .write_atomic(&name, &bytes, 0o600)
+                    .map_err(DeploymentStateError::from)
+            })
         })
         .await
     }
@@ -208,27 +206,25 @@ impl DeploymentStatePort for FilesystemDeploymentState {
             let directory = deployment_directory(&root)?;
             let name = manifest_name(manifest.deployment_id);
             let bytes = serialize_manifest(&manifest)?;
-            directory
-                .with_exclusive_lock(&name, || {
-                    let current = read_manifest(&directory, &name)
-                        .map_err(state_error_to_nspawn)?
-                        .ok_or_else(|| {
-                            state_conflict(format!(
-                                "deployment {} crash manifest is missing",
-                                manifest.deployment_id
-                            ))
-                        })?;
-                    if current.deployment_id != manifest.deployment_id
-                        || current.revision != expected_revision
-                    {
-                        return Err(state_conflict(format!(
+            directory.with_exclusive_lock(&name, || {
+                let current = read_manifest(&directory, &name)?.ok_or_else(|| {
+                    DeploymentStateError::Conflict(format!(
+                        "deployment {} crash manifest is missing",
+                        manifest.deployment_id
+                    ))
+                })?;
+                if current.deployment_id != manifest.deployment_id
+                    || current.revision != expected_revision
+                {
+                    return Err(DeploymentStateError::Conflict(format!(
                         "deployment {} crash manifest changed from revision {expected_revision}",
                         manifest.deployment_id
                     )));
-                    }
-                    directory.write_atomic(&name, &bytes, 0o600)
-                })
-                .map_err(map_state_error)
+                }
+                directory
+                    .write_atomic(&name, &bytes, 0o600)
+                    .map_err(DeploymentStateError::from)
+            })
         })
         .await
     }
@@ -244,23 +240,21 @@ impl DeploymentStatePort for FilesystemDeploymentState {
             let name = manifest_name(deployment_id);
             directory
                 .with_exclusive_lock_and_cleanup(&name, || {
-                    let current = read_manifest(&directory, &name)
-                        .map_err(state_error_to_nspawn)?
+                    let current = read_manifest(&directory, &name)?
                         .ok_or_else(|| {
-                        state_conflict(format!(
+                        DeploymentStateError::Conflict(format!(
                             "deployment {deployment_id} crash manifest is missing"
                         ))
                         })?;
                     if current.deployment_id != deployment_id
                         || current.revision != expected_revision
                     {
-                        return Err(state_conflict(format!(
+                        return Err(DeploymentStateError::Conflict(format!(
                             "deployment {deployment_id} crash manifest changed from revision {expected_revision}"
                         )));
                     }
-                    directory.remove_unlocked(&name)
+                    directory.remove_unlocked(&name).map_err(DeploymentStateError::from)
                 })
-                .map_err(map_state_error)
         })
         .await
     }
@@ -270,7 +264,10 @@ impl DeploymentStatePort for FilesystemDeploymentState {
         run_blocking(move || {
             let directory = deployment_directory(&root)?;
             let mut manifests = Vec::new();
-            for name in directory.entry_names().map_err(map_state_error)? {
+            for name in directory
+                .entry_names()
+                .map_err(DeploymentStateError::from)?
+            {
                 if !name.starts_with("deployment-") || !name.ends_with(".json") {
                     continue;
                 }
@@ -307,7 +304,7 @@ async fn run_blocking<T: Send + 'static>(
 
 fn deployment_directory(root: &TrustedStateRoot) -> Result<TrustedDirectory, DeploymentStateError> {
     root.directory(StateDirectory::Deployments)
-        .map_err(map_state_error)
+        .map_err(DeploymentStateError::from)
 }
 
 fn manifest_name(id: DeploymentId) -> String {
@@ -332,7 +329,7 @@ fn read_manifest(
 ) -> Result<Option<DeploymentCrashManifest>, DeploymentStateError> {
     let Some(file) = directory
         .read_bounded(name, MAX_DEPLOYMENT_MANIFEST_BYTES)
-        .map_err(map_state_error)?
+        .map_err(DeploymentStateError::from)?
     else {
         return Ok(None);
     };
@@ -351,29 +348,12 @@ fn read_manifest(
     Ok(Some(manifest))
 }
 
-fn state_conflict(message: String) -> NspawnError {
-    NspawnError::Runtime(format!("deployment state conflict: {message}"))
-}
-
-fn state_error_to_nspawn(error: DeploymentStateError) -> NspawnError {
-    match error {
-        DeploymentStateError::Invalid(message) => NspawnError::Validation(message),
-        DeploymentStateError::Conflict(message) => state_conflict(message),
-        DeploymentStateError::Unavailable(message) => NspawnError::Runtime(message),
-    }
-}
-
-fn map_state_error(error: NspawnError) -> DeploymentStateError {
-    match error {
-        NspawnError::Validation(message) => DeploymentStateError::Invalid(message),
-        NspawnError::Runtime(message) if message.starts_with("deployment state conflict: ") => {
-            DeploymentStateError::Conflict(
-                message
-                    .trim_start_matches("deployment state conflict: ")
-                    .to_owned(),
-            )
+impl From<TrustedStateError> for DeploymentStateError {
+    fn from(error: TrustedStateError) -> Self {
+        match error {
+            TrustedStateError::Invalid(message) => Self::Invalid(message),
+            error => Self::Unavailable(error.to_string()),
         }
-        error => DeploymentStateError::Unavailable(error.to_string()),
     }
 }
 
@@ -423,6 +403,11 @@ mod tests {
         ));
 
         assert_eq!(state.unfinished().await.unwrap(), vec![next.clone()]);
+        assert!(matches!(
+            state.remove(id, 1).await,
+            Err(DeploymentStateError::Conflict(_))
+        ));
+        assert_eq!(state.unfinished().await.unwrap(), vec![next.clone()]);
         state.remove(id, 2).await.unwrap();
         assert!(state.unfinished().await.unwrap().is_empty());
         assert!(!temporary
@@ -447,11 +432,41 @@ mod tests {
         )
         .unwrap();
 
-        assert!(state
-            .create(DeploymentCrashManifest::prepared(id, &plan()))
-            .await
-            .is_err());
+        assert!(matches!(
+            state
+                .create(DeploymentCrashManifest::prepared(id, &plan()))
+                .await,
+            Err(DeploymentStateError::Invalid(_))
+        ));
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "unchanged");
+    }
+
+    #[tokio::test]
+    async fn invalid_manifest_stays_typed_and_is_preserved_by_locked_operations() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = TrustedStateRoot::for_test(temporary.path().join("lasper"));
+        let directory = root.directory(StateDirectory::Deployments).unwrap();
+        let state = FilesystemDeploymentState::new(root);
+        let id = DeploymentId::from_u128(9);
+        let name = manifest_name(id);
+        directory
+            .write_atomic(&name, b"{invalid json", 0o600)
+            .unwrap();
+
+        assert!(matches!(
+            state
+                .create(DeploymentCrashManifest::prepared(id, &plan()))
+                .await,
+            Err(DeploymentStateError::Invalid(_))
+        ));
+        assert!(matches!(
+            state.remove(id, 1).await,
+            Err(DeploymentStateError::Invalid(_))
+        ));
+        assert_eq!(
+            directory.read_bounded(&name, 64).unwrap().unwrap().bytes,
+            b"{invalid json"
+        );
     }
 
     #[test]

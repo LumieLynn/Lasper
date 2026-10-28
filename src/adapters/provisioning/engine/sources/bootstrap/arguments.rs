@@ -1,6 +1,6 @@
 //! Host command projections for typed bootstrap intent.
 
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::domain::provisioning::bootstrap::{
     BootstrapValidationError, DebootstrapDependencyMode, DebootstrapReleaseSignaturePolicy,
     DebootstrapSpec, DebootstrapUsrMergeMode, Dnf5BestCandidatePolicy, Dnf5DocumentationPolicy,
@@ -42,7 +42,7 @@ fn debootstrap_args(
     spec: &DebootstrapSpec,
     target: &Path,
     include_sudo: bool,
-) -> Result<Vec<String>> {
+) -> OperationResult<Vec<String>> {
     debootstrap_args_with_signature_style(
         spec,
         target,
@@ -56,7 +56,7 @@ pub(crate) fn debootstrap_args_with_signature_style(
     target: &Path,
     include_sudo: bool,
     signature_style: DebootstrapSignatureOptionStyle,
-) -> Result<Vec<String>> {
+) -> OperationResult<Vec<String>> {
     validate_intent(spec.validate())?;
     let mut args = Vec::new();
     if let Some(architecture) = &spec.architecture {
@@ -123,7 +123,7 @@ pub(crate) fn pacstrap_args(
     spec: &PacstrapSpec,
     target: &Path,
     include_sudo: bool,
-) -> Result<Vec<String>> {
+) -> OperationResult<Vec<String>> {
     validate_intent(spec.validate())?;
     let mut args = Vec::new();
     if spec.cache == PacstrapCacheMode::Host {
@@ -162,7 +162,11 @@ pub(crate) fn pacstrap_args(
     Ok(args)
 }
 
-pub(crate) fn dnf5_args(spec: &Dnf5Spec, target: &Path, include_sudo: bool) -> Result<Vec<String>> {
+pub(crate) fn dnf5_args(
+    spec: &Dnf5Spec,
+    target: &Path,
+    include_sudo: bool,
+) -> OperationResult<Vec<String>> {
     validate_intent(spec.validate())?;
     let mut args = vec![
         "--installroot".into(),
@@ -254,12 +258,14 @@ fn effective_packages(
     packages
 }
 
-fn validate_intent(result: std::result::Result<(), BootstrapValidationError>) -> Result<()> {
+fn validate_intent(
+    result: std::result::Result<(), BootstrapValidationError>,
+) -> OperationResult<()> {
     result.map_err(|error| validation(error.to_string()))
 }
 
-fn validation(message: impl Into<String>) -> NspawnError {
-    NspawnError::Validation(message.into())
+fn validation(message: impl Into<String>) -> OperationFailure {
+    OperationFailure::InvalidInput(message.into())
 }
 
 #[cfg(test)]

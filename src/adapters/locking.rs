@@ -1,7 +1,5 @@
 //! Shared lock-wait policy for adapter-owned sidecar and trusted-state locks.
 
-use crate::adapters::error::NspawnError;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub(crate) const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
@@ -35,16 +33,11 @@ pub(crate) fn is_contention(error: &std::io::Error) -> bool {
         )
 }
 
-pub(crate) fn timeout_error(lock_path: &Path, started: Instant, attempts: usize) -> NspawnError {
+pub(crate) fn timeout_error(started: Instant, attempts: usize) -> std::io::Error {
     let waited_ms = started.elapsed().as_millis();
-    NspawnError::Io(
-        lock_path.to_path_buf(),
-        std::io::Error::new(
-            std::io::ErrorKind::TimedOut,
-            format!(
-                "lock acquisition deadline exceeded after {waited_ms} ms ({attempts} attempts)"
-            ),
-        ),
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("lock acquisition deadline exceeded after {waited_ms} ms ({attempts} attempts)"),
     )
 }
 

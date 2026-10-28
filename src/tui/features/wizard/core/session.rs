@@ -144,7 +144,6 @@ impl WizardSession {
                 self.pending_preflight = None;
                 match services.provisioning.start(submission) {
                     Ok(handle) => {
-                        log::info!("[DEPLOY] accepted application job {}", handle.id());
                         self.wizard.start_deployment(handle);
                         WizardEffect::CloseDialog
                     }

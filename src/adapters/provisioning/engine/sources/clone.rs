@@ -1,16 +1,16 @@
 //! Container cloning deployment implementation.
 
-use async_trait::async_trait;
-
-use crate::adapters::error::NspawnError;
-use crate::adapters::provisioning::engine::failure::OperationResult as Result;
-use crate::adapters::provisioning::engine::{
-    check_deployment_cancellation, send_deploy_log, AppliedResource, ApplyReport, DeployLogEvent,
-    Deployer, DeploymentCancellation,
+use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
+use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
+use crate::adapters::provisioning::engine::host::HostResultExt;
+use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
+use crate::adapters::provisioning::engine::sources::Deployer;
+use crate::application::provisioning::{
+    DeploymentCancellation, DeploymentResource, ResourceApplyStatus,
 };
-use crate::application::provisioning::DeploymentResource;
-use crate::application::provisioning::ResourceApplyStatus;
 use crate::domain::machine::MachineName;
+use async_trait::async_trait;
 
 pub(crate) const CLONE_IDENTITY_NOTICE: &str = "Exact clone: guest hostname, machine-id, SSH host keys, user accounts, and application state are preserved. Reset guest identity manually before treating the clone as an independent machine.";
 
@@ -74,14 +74,22 @@ impl Deployer for CloneDeployer {
         &self,
         name: &str,
         _rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
+        logs: &DeploymentDiagnostics,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         check_deployment_cancellation(cancellation)?;
-        let source_config = self.nspawn.inspect(&self.source_name).await?;
+        let source_config = self
+            .nspawn
+            .inspect(&self.source_name)
+            .await
+            .host_context("inspect clone source configuration")?;
         let source_has_override = if MachineName::new(&self.source_name).is_ok() {
-            let source_unit = self.systemd_unit.read(&self.source_name).await?;
+            let source_unit = self
+                .systemd_unit
+                .read(&self.source_name)
+                .await
+                .host_context("inspect clone source service")?;
             source_unit.drop_ins.iter().any(|drop_in| {
                 std::path::Path::new(&drop_in.path)
                     .file_name()
@@ -93,12 +101,8 @@ impl Deployer for CloneDeployer {
         };
         check_deployment_cancellation(cancellation)?;
 
-        send_deploy_log(
-            &logs,
-            format!("Cloning image {} to {}...", self.source_name, name),
-        )
-        .await;
-        send_deploy_log(&logs, format!("WARNING: {CLONE_IDENTITY_NOTICE}")).await;
+        logs.message(format!("Cloning image {} to {}...", self.source_name, name));
+        logs.message(format!("WARNING: {CLONE_IDENTITY_NOTICE}"));
 
         self.system_operations
             .clone_image(&self.source_name, name)
@@ -120,7 +124,8 @@ impl Deployer for CloneDeployer {
             let apply = self
                 .systemd_unit
                 .clone_override(&self.source_name, name)
-                .await?;
+                .await
+                .host_context("clone service override")?;
             report.record_apply(AppliedResource::SystemdOverride, apply)?;
             check_deployment_cancellation(cancellation)?;
             Some(apply)
@@ -135,7 +140,7 @@ impl Deployer for CloneDeployer {
             config: config_result,
             service_override: override_apply,
         };
-        send_deploy_log(&logs, format!("Clone result: {}.", result.summary())).await;
+        logs.message(format!("Clone result: {}.", result.summary()));
 
         Ok(())
     }
@@ -147,28 +152,32 @@ async fn verify_systemd_cloned_config(
     destination: &str,
     source_before: Option<&crate::adapters::config::nspawn_file::NspawnConfig>,
     report: &mut ApplyReport,
-) -> Result<ClonedConfigStatus> {
-    let destination_config = nspawn.inspect(destination).await?;
+) -> OperationResult<ClonedConfigStatus> {
+    let destination_config = nspawn
+        .inspect(destination)
+        .await
+        .host_context("inspect cloned nspawn configuration")?;
     match (source_before, destination_config.as_ref()) {
         (Some(source), Some(destination)) if source.content == destination.content => {
             Ok(ClonedConfigStatus::ClonedBySystemd)
         }
-        (Some(_), None) => Err(NspawnError::Runtime(
+        (Some(_), None) => Err(OperationFailure::InconsistentState(
             "machinectl clone completed without copying the source .nspawn settings".into(),
-        )
-        .into()),
+        )),
         (Some(_), Some(_)) => {
             report.block_external_image_removal(
                 "the cloned .nspawn settings do not match the source snapshot",
             );
-            Err(NspawnError::Runtime(
+            Err(OperationFailure::InconsistentState(
                 "machinectl clone produced .nspawn settings that do not match the source".into(),
-            )
-            .into())
+            ))
         }
         (None, None) => Ok(ClonedConfigStatus::NotPresent),
         (None, Some(destination)) => {
-            let source_after = nspawn.inspect(source_name).await?;
+            let source_after = nspawn
+                .inspect(source_name)
+                .await
+                .host_context("inspect clone source after transfer")?;
             if source_after
                 .as_ref()
                 .is_some_and(|source| source.content == destination.content)
@@ -178,10 +187,9 @@ async fn verify_systemd_cloned_config(
                 report.block_external_image_removal(
                     "unexpected .nspawn settings appeared while cloning",
                 );
-                Err(NspawnError::Runtime(
+                Err(OperationFailure::InconsistentState(
                     "unexpected .nspawn settings appeared while cloning the image".into(),
-                )
-                .into())
+                ))
             }
         }
     }

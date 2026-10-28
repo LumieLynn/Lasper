@@ -1,11 +1,12 @@
 //! Typed bootstrap execution shared by direct and elevated modes.
 
-use super::bootstrap_args::{
+use super::arguments::{
     debootstrap_args_with_signature_style, dnf5_args, pacstrap_args,
     DebootstrapSignatureOptionStyle,
 };
-use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
+use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::rootfs::RootfsTarget;
 use crate::domain::provisioning::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
 use serde::{Deserialize, Serialize};
@@ -32,7 +33,7 @@ impl BootstrapStore {
         Self { cmd_runner }
     }
 
-    pub(crate) async fn spawn(&self, request: BootstrapRequest) -> Result<SpawnedProcess> {
+    pub(crate) async fn spawn(&self, request: BootstrapRequest) -> OperationResult<SpawnedProcess> {
         validate_target(&request.target).await?;
         check_required_tools(&request.spec, |tool| which::which(tool).is_ok())?;
         let signature_style = self.probe_debootstrap_signature_style(&request).await?;
@@ -40,13 +41,13 @@ impl BootstrapStore {
         self.cmd_runner
             .spawn(&program, args)
             .await
-            .map_err(|error| NspawnError::Io(PathBuf::from(program), error))
+            .map_err(|error| OperationFailure::Io(PathBuf::from(program), error))
     }
 
     async fn probe_debootstrap_signature_style(
         &self,
         request: &BootstrapRequest,
-    ) -> Result<DebootstrapSignatureOptionStyle> {
+    ) -> OperationResult<DebootstrapSignatureOptionStyle> {
         let policy = debootstrap_signature_policy(request);
         if policy == DebootstrapReleaseSignaturePolicy::ProviderDefault {
             return Ok(DebootstrapSignatureOptionStyle::Sig);
@@ -59,7 +60,7 @@ impl BootstrapStore {
                 BOOTSTRAP_PROBE_TIMEOUT,
             )
             .await
-            .map_err(|error| NspawnError::Io(PathBuf::from("debootstrap --help"), error))?;
+            .map_err(|error| OperationFailure::Io(PathBuf::from("debootstrap --help"), error))?;
         signature_style_from_output(policy, &output.stdout, &output.stderr)
     }
 }
@@ -67,10 +68,10 @@ impl BootstrapStore {
 fn check_required_tools(
     spec: &BootstrapSpec,
     mut available: impl FnMut(&str) -> bool,
-) -> Result<()> {
+) -> OperationResult<()> {
     for tool in spec.method().required_tools() {
         if !available(tool) {
-            return Err(NspawnError::ToolNotFound((*tool).into()));
+            return Err(OperationFailure::MissingTool((*tool).into()));
         }
     }
     Ok(())
@@ -79,8 +80,11 @@ fn check_required_tools(
 pub(crate) fn build_command(
     request: &BootstrapRequest,
     signature_style: DebootstrapSignatureOptionStyle,
-) -> Result<(String, Vec<String>)> {
-    let target = request.target.path()?;
+) -> OperationResult<(String, Vec<String>)> {
+    let target = request
+        .target
+        .path()
+        .host_context("resolve bootstrap target path")?;
     let args = match &request.spec {
         BootstrapSpec::Debootstrap(spec) => debootstrap_args_with_signature_style(
             spec,
@@ -107,7 +111,7 @@ fn signature_style_from_output(
     policy: DebootstrapReleaseSignaturePolicy,
     stdout: &[u8],
     stderr: &[u8],
-) -> Result<DebootstrapSignatureOptionStyle> {
+) -> OperationResult<DebootstrapSignatureOptionStyle> {
     let help = format!(
         "{}\n{}",
         String::from_utf8_lossy(stdout),
@@ -125,19 +129,21 @@ fn signature_style_from_output(
     } else if help.contains(legacy) {
         Ok(DebootstrapSignatureOptionStyle::Gpg)
     } else {
-        Err(NspawnError::Validation(format!(
+        Err(OperationFailure::InvalidInput(format!(
             "Installed debootstrap supports neither {modern} nor {legacy}"
         )))
     }
 }
 
-pub(crate) async fn validate_target(target: &RootfsTarget) -> Result<()> {
-    let path = target.path()?;
+pub(crate) async fn validate_target(target: &RootfsTarget) -> OperationResult<()> {
+    let path = target
+        .path()
+        .host_context("resolve bootstrap target path")?;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
-        .map_err(|error| NspawnError::Io(path.clone(), error))?;
+        .map_err(|error| OperationFailure::Io(path.clone(), error))?;
     if !metadata.file_type().is_dir() {
-        return Err(NspawnError::Validation(format!(
+        return Err(OperationFailure::InvalidInput(format!(
             "Bootstrap target is not a directory: {}",
             path.display()
         )));
@@ -172,7 +178,7 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(checked, ["pacstrap", "pacman"]);
-        assert!(matches!(error, NspawnError::ToolNotFound(tool) if tool == "pacman"));
+        assert!(matches!(error, OperationFailure::MissingTool(tool) if tool == "pacman"));
         assert!(check_required_tools(&spec, |_| true).is_ok());
     }
 

@@ -1,75 +1,28 @@
-use super::{
-    persist_applying, persist_committed, send_deploy_log, AppliedResource, ApplyReport,
-    DirectProvisioningCapabilities,
-};
-use crate::adapters::error::{NspawnError, Result};
+//! Compensate resources whose ownership was established by this deployment.
+
+use super::journal::{persist_applying, persist_committed};
+use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
+use crate::adapters::provisioning::engine::failure::OperationFailure;
+use crate::adapters::provisioning::engine::host::{DirectProvisioningCapabilities, HostResultExt};
+use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
 use crate::adapters::storage::StorageBackend;
 use crate::application::provisioning::{
-    DeploymentEvent as DeployLogEvent, DeploymentJobContext, DeploymentResource, DeploymentStage,
-    ResourceDisposition,
+    DeploymentJobContext, DeploymentResource, DeploymentStage, ResourceDisposition,
 };
-use tokio::sync::mpsc::Sender;
-
-pub(super) async fn inspect_deployment_sidecars(
-    name: &str,
-    host: &DirectProvisioningCapabilities,
-) -> Result<Vec<String>> {
-    if let Some(config) = host.nspawn.inspect(name).await? {
-        return Err(NspawnError::Validation(format!(
-            "Deployment target has existing .nspawn configuration: {}",
-            config.path.display()
-        )));
-    }
-    let mut warnings = Vec::new();
-    match host.nvidia_state.read(name).await {
-        Ok(Some(_)) => warnings.push(format!(
-            "Deployment target {name:?} has existing NVIDIA state; it will be replaced only when current Lasper ownership can be proven."
-        )),
-        Ok(None) => {}
-        Err(error) => warnings.push(format!(
-            "Existing NVIDIA state could not be safely inspected and will be preserved: {error}"
-        )),
-    }
-
-    match host.systemd_unit.read(name).await {
-        Ok(unit) => {
-            for drop_in in unit.drop_ins {
-                let file_name = std::path::Path::new(&drop_in.path)
-                    .file_name()
-                    .and_then(|name| name.to_str());
-                if file_name == Some("90-lasper.conf") {
-                    warnings.push(format!(
-                        "Existing systemd service drop-in {} will be replaced only when current Lasper ownership can be proven.",
-                        drop_in.path
-                    ));
-                } else {
-                    warnings.push(format!(
-                        "Existing systemd service drop-in {} will be preserved.",
-                        drop_in.path
-                    ));
-                }
-            }
-        }
-        Err(error) => warnings.push(format!(
-            "Existing systemd service drop-ins could not be safely inspected and will be preserved unless a validated Lasper-owned target is updated: {error}"
-        )),
-    }
-    Ok(warnings)
-}
 
 pub(super) async fn rollback_apply_report(
     name: &str,
     report: &mut ApplyReport,
     storage: Option<&dyn StorageBackend>,
     host: &DirectProvisioningCapabilities,
-    logs: &Sender<DeployLogEvent>,
+    logs: &DeploymentDiagnostics,
     job: &DeploymentJobContext,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     let mut reload_daemon = false;
 
     for resource in report.typed_owned_in_reverse() {
-        send_deploy_log(logs, format!("Rolling back {}...", resource.label())).await;
+        logs.message(format!("Rolling back {}...", resource.label()));
         if let Err(error) = persist_applying(
             job,
             DeploymentStage::Rollback,
@@ -82,19 +35,33 @@ pub(super) async fn rollback_apply_report(
             errors.push(format!("rollback was not attempted: {error}"));
             break;
         }
-        let result = match &resource {
+        let result: Result<(), OperationFailure> = match &resource {
             DeploymentResource::SystemdOverride(_) => {
                 reload_daemon = true;
-                host.systemd_unit.remove_service_override(name).await
+                host.systemd_unit
+                    .remove_service_override(name)
+                    .await
+                    .host_context("remove deployment service override")
             }
-            DeploymentResource::NspawnConfig(_) => host.nspawn.remove(name).await,
-            DeploymentResource::NvidiaState(_) => host.nvidia_state.remove(name).await,
+            DeploymentResource::NspawnConfig(_) => host
+                .nspawn
+                .remove(name)
+                .await
+                .host_context("remove deployment nspawn configuration"),
+            DeploymentResource::NvidiaState(_) => host
+                .nvidia_state
+                .remove(name)
+                .await
+                .host_context("remove deployment NVIDIA state"),
             DeploymentResource::ExternalImage(_) => {
                 let blockers = report.removal_blockers(AppliedResource::ExternalImage);
                 if blockers.is_empty() {
-                    host.system_operations.remove_image(name).await
+                    host.system_operations
+                        .remove_image(name)
+                        .await
+                        .map_err(OperationFailure::from)
                 } else {
-                    Err(NspawnError::Runtime(format!(
+                    Err(OperationFailure::InconsistentState(format!(
                         "external image removal blocked: {}",
                         blockers.join("; ")
                     )))
@@ -104,13 +71,16 @@ pub(super) async fn rollback_apply_report(
                 let blockers = report.removal_blockers(AppliedResource::LocalStorage);
                 if blockers.is_empty() {
                     match storage {
-                        Some(storage) => storage.delete(name).await,
-                        None => Err(NspawnError::Runtime(
+                        Some(storage) => storage
+                            .delete(name)
+                            .await
+                            .host_context("remove deployment storage"),
+                        None => Err(OperationFailure::InconsistentState(
                             "local storage was recorded without a storage backend".into(),
                         )),
                     }
                 } else {
-                    Err(NspawnError::Runtime(format!(
+                    Err(OperationFailure::InconsistentState(format!(
                         "local storage removal blocked: {}",
                         blockers.join("; ")
                     )))

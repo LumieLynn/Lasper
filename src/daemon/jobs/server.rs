@@ -118,6 +118,10 @@ impl DeploymentRegistry {
         let mut inner = self.inner.lock();
         let sequence = next_sequence(&mut inner);
         if let Some(record) = inner.submissions.get_mut(&request_id) {
+            log::warn!(
+                "[DEPLOY {}] [Admission: {request_id}] Rejected: {message}",
+                record.identity.deployment_id
+            );
             record.status = DeploymentSubmissionStatus::Rejected { message };
             record.sequence = sequence;
         }
@@ -652,6 +656,7 @@ pub(crate) async fn submit(
     } = params;
     if let Some(machine) = request.machine_config() {
         if let Err(error) = crate::adapters::provisioning::validate_nspawn_config(machine) {
+            log::warn!("[DEPLOY {deployment_id}] [Admission: {request_id}] Invalid machine configuration: {error}");
             let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
@@ -659,6 +664,9 @@ pub(crate) async fn submit(
     let plan = match DeploymentPlan::build(request.clone()) {
         Ok(plan) => plan,
         Err(error) => {
+            log::warn!(
+                "[DEPLOY {deployment_id}] [Admission: {request_id}] Invalid deployment: {error}"
+            );
             let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
             return;
         }
@@ -668,6 +676,9 @@ pub(crate) async fn submit(
         deployment_id,
         plan.fingerprint().clone(),
     ) {
+        log::warn!(
+            "[DEPLOY {deployment_id}] [Admission: {request_id}] Reservation failed: {error}"
+        );
         let _ = send_fd_payload(stream, error.to_string().into_bytes(), None).await;
         return;
     }

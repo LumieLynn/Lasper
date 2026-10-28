@@ -116,6 +116,20 @@ fn is_permission_dbus_error(error: &zbus::Error) -> bool {
 
 pub type Result<T> = std::result::Result<T, NspawnError>;
 
+impl From<crate::adapters::trusted_state::TrustedStateError> for NspawnError {
+    fn from(error: crate::adapters::trusted_state::TrustedStateError) -> Self {
+        use crate::adapters::trusted_state::TrustedStateError;
+        match error {
+            TrustedStateError::Invalid(message) => Self::Validation(message),
+            TrustedStateError::Io(path, source) => Self::Io(path, source),
+            TrustedStateError::LockUnavailable(path) => Self::Runtime(format!(
+                "trusted state lock is unavailable in {}",
+                path.display()
+            )),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

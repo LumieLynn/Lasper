@@ -2,8 +2,8 @@
 
 use crate::adapters::elevated::fd_channel::receive_fd_response;
 use crate::adapters::elevated::ElevatedDaemon;
-use crate::adapters::provisioning::engine::image_operation::TarRuntimeAssessment;
 use crate::adapters::provisioning::state::{DeploymentStateOperation, DeploymentStateResult};
+use crate::adapters::provisioning::TarRuntimeAssessment;
 use crate::ipc::protocol::deployment::{
     DeploymentJobRequest, DeploymentJobSnapshot, DeploymentSubmissionRequest,
     DeploymentSubmissionSnapshot, ProbeDeploymentRecoveryRequest, ProbeDeploymentRecoveryResult,

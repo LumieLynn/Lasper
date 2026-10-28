@@ -1,5 +1,6 @@
 //! Acquisition and normalization of custom image artifacts.
 
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use std::ffi::{OsStr, OsString};
 use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
@@ -8,18 +9,15 @@ use std::process::Stdio;
 
 use tokio::io::AsyncReadExt;
 
-use crate::adapters::error::NspawnError;
-use crate::adapters::process::{log_output, terminate_child_process_group};
-use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult as Result};
-use crate::adapters::provisioning::engine::image_operation::TarSourceOrigin;
-use crate::adapters::provisioning::engine::{
-    send_deploy_log, send_deploy_progress, send_deploy_stream_log, DeployLogEvent,
-    DeploymentCancellation,
-};
+use super::archive::TarSourceOrigin;
+use crate::adapters::process::{log_output, read_bounded_stream, terminate_child_process_group};
+use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
+use crate::application::provisioning::DeploymentCancellation;
 
 const MAX_IMAGE_BYTES: u64 = crate::domain::provisioning::storage::MAX_DISK_IMAGE_SIZE_BYTES;
 const CURL_FILESIZE_EXCEEDED_EXIT_CODE: i32 = 63;
 const CURL_MAX_REDIRECTS: &str = "10";
+const MAX_DECOMPRESSION_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 pub(crate) enum ImageSource {
@@ -48,15 +46,15 @@ impl ImageAcquisitionStore {
     pub(crate) async fn acquire(
         &self,
         source: &ImageSource,
-        logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+        logs: &DeploymentDiagnostics,
         cancellation: &DeploymentCancellation,
-    ) -> Result<std::fs::File> {
+    ) -> OperationResult<std::fs::File> {
         let source = match source {
             ImageSource::Local(path) => std::fs::File::open(path)
-                .map_err(|error| NspawnError::Io(std::path::PathBuf::from(path), error))?,
+                .map_err(|error| OperationFailure::Io(std::path::PathBuf::from(path), error))?,
             ImageSource::Remote(url) => download_image(url, logs, cancellation).await?,
             ImageSource::Opened(source) => source.try_clone().map_err(|error| {
-                NspawnError::Io(std::path::PathBuf::from("artifact source fd"), error)
+                OperationFailure::Io(std::path::PathBuf::from("artifact source fd"), error)
             })?,
         };
         normalize_compression(source, logs, cancellation).await
@@ -65,18 +63,19 @@ impl ImageAcquisitionStore {
 
 async fn download_image(
     url: &str,
-    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    logs: &DeploymentDiagnostics,
     cancellation: &DeploymentCancellation,
-) -> Result<std::fs::File> {
+) -> OperationResult<std::fs::File> {
     check_tool("curl")?;
     let url = validate_download_url(url)?;
-    send_deploy_log(logs, "Downloading container image...").await;
+    logs.message("Downloading container image...");
 
-    let mut destination = tempfile::tempfile()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
-    let output = destination
-        .try_clone()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
+    let mut destination = tempfile::tempfile().map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("temporary image"), error)
+    })?;
+    let output = destination.try_clone().map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("temporary image"), error)
+    })?;
     let mut command = curl_command(&url, MAX_IMAGE_BYTES);
     command.kill_on_drop(true);
     command.as_std_mut().process_group(0);
@@ -85,7 +84,7 @@ async fn download_image(
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+        .map_err(|error| OperationFailure::Io(std::path::PathBuf::from("curl"), error))?;
     let pid = child.id().expect("curl has pid");
     let mut stderr = child.stderr.take().expect("curl stderr piped");
     let stream_result = tokio::select! {
@@ -116,18 +115,21 @@ async fn download_image(
         if status.code() == Some(CURL_FILESIZE_EXCEEDED_EXIT_CODE)
             || file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES)
         {
-            return Err(NspawnError::Validation(format!(
+            return Err(OperationFailure::InvalidInput(format!(
                 "Downloaded image exceeds the {} byte limit",
                 MAX_IMAGE_BYTES
-            ))
-            .into());
+            )));
         }
-        return Err(NspawnError::DeployError(format!("Network download failed: {status}")).into());
+        return Err(OperationFailure::command_exit(
+            "download image",
+            "curl",
+            status,
+        ));
     }
     validate_source_size(&destination, "Downloaded image")?;
-    destination
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("temporary image"), error))?;
+    destination.seek(SeekFrom::Start(0)).map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("temporary image"), error)
+    })?;
     Ok(destination)
 }
 
@@ -200,17 +202,18 @@ fn curl_environment_allowed(key: &OsStr) -> bool {
     )
 }
 
-fn validate_download_url(value: &str) -> Result<url::Url> {
+fn validate_download_url(value: &str) -> OperationResult<url::Url> {
     let url = url::Url::parse(value.trim())
-        .map_err(|error| NspawnError::Validation(format!("Invalid image URL: {error}")))?;
+        .map_err(|error| OperationFailure::InvalidInput(format!("Invalid image URL: {error}")))?;
     if !matches!(url.scheme(), "http" | "https") {
-        return Err(NspawnError::Validation("Image URL must use HTTP or HTTPS".into()).into());
+        return Err(OperationFailure::InvalidInput(
+            "Image URL must use HTTP or HTTPS".into(),
+        ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(NspawnError::Validation(
+        return Err(OperationFailure::InvalidInput(
             "Image URL must not contain embedded credentials".into(),
-        )
-        .into());
+        ));
     }
     Ok(url)
 }
@@ -234,11 +237,11 @@ impl ImageCompression {
     }
 }
 
-fn detect_compression(source: &std::fs::File) -> Result<Option<ImageCompression>> {
+fn detect_compression(source: &std::fs::File) -> OperationResult<Option<ImageCompression>> {
     let mut header = [0u8; 6];
-    let count = source
-        .read_at(&mut header, 0)
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+    let count = source.read_at(&mut header, 0).map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("image source fd"), error)
+    })?;
     let header = &header[..count];
     let compression = if header.starts_with(&[0x1f, 0x8b]) {
         Some(ImageCompression::Gzip)
@@ -256,28 +259,29 @@ fn detect_compression(source: &std::fs::File) -> Result<Option<ImageCompression>
 
 async fn normalize_compression(
     mut source: std::fs::File,
-    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+    logs: &DeploymentDiagnostics,
     cancellation: &DeploymentCancellation,
-) -> Result<std::fs::File> {
+) -> OperationResult<std::fs::File> {
     validate_source_size(&source, "Image source")?;
     let Some(compression) = detect_compression(&source)? else {
-        source
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+        source.seek(SeekFrom::Start(0)).map_err(|error| {
+            OperationFailure::Io(std::path::PathBuf::from("image source fd"), error)
+        })?;
         return Ok(source);
     };
 
     let program = compression.program();
     check_tool(program)?;
-    send_deploy_log(logs, format!("Decompressing image with {program}...")).await;
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
-    let mut destination = tempfile::tempfile()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
-    let output = destination
-        .try_clone()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
+    logs.message(format!("Decompressing image with {program}..."));
+    source.seek(SeekFrom::Start(0)).map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("image source fd"), error)
+    })?;
+    let mut destination = tempfile::tempfile().map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("decompressed image"), error)
+    })?;
+    let output = destination.try_clone().map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("decompressed image"), error)
+    })?;
     let mut command = crate::adapters::process::new_command(program);
     command.kill_on_drop(true);
     command.as_std_mut().process_group(0);
@@ -288,12 +292,15 @@ async fn normalize_compression(
         .stdout(Stdio::from(output))
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+        .map_err(|error| OperationFailure::Io(std::path::PathBuf::from(program), error))?;
     let pid = child.id().expect("decompressor has pid");
-    let mut stderr = child.stderr.take().expect("decompressor stderr piped");
-    let mut stderr_bytes = Vec::new();
-    let mut completed =
-        Box::pin(async { tokio::join!(child.wait(), stderr.read_to_end(&mut stderr_bytes)) });
+    let stderr = child.stderr.take().expect("decompressor stderr piped");
+    let mut completed = Box::pin(async {
+        tokio::join!(
+            child.wait(),
+            read_bounded_stream(stderr, MAX_DECOMPRESSION_DIAGNOSTIC_BYTES),
+        )
+    });
     let completed_result = tokio::select! {
         result = &mut completed => Some(result),
         _ = cancellation.cancelled() => None,
@@ -305,7 +312,8 @@ async fn normalize_compression(
     };
     let status =
         status.map_err(|error| OperationFailure::process_exit_unconfirmed(program, error))?;
-    stderr_result.map_err(|error| NspawnError::Io(std::path::PathBuf::from(program), error))?;
+    let stderr_bytes = stderr_result
+        .map_err(|error| OperationFailure::Io(std::path::PathBuf::from(program), error))?;
     let result = std::process::Output {
         status,
         stdout: Vec::new(),
@@ -314,38 +322,41 @@ async fn normalize_compression(
     log_output(program, &result);
     if !result.status.success() {
         if file_size(&destination).is_some_and(|size| size >= MAX_IMAGE_BYTES) {
-            return Err(NspawnError::Validation(format!(
+            return Err(OperationFailure::InvalidInput(format!(
                 "Decompressed image exceeds the {} byte limit",
                 MAX_IMAGE_BYTES
-            ))
-            .into());
+            )));
         }
-        return Err(NspawnError::cmd_failed(
+        return Err(OperationFailure::command_failed(
             "decompress image source",
             format!("{program} -d -c"),
             &result,
-        )
-        .into());
+        ));
     }
     validate_source_size(&destination, "Decompressed image")?;
-    destination
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("decompressed image"), error))?;
+    destination.seek(SeekFrom::Start(0)).map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("decompressed image"), error)
+    })?;
     Ok(destination)
 }
 
-fn validate_source_size(source: &std::fs::File, label: &str) -> Result<()> {
+fn validate_source_size(source: &std::fs::File, label: &str) -> OperationResult<()> {
     validate_source_size_with_limit(source, label, MAX_IMAGE_BYTES)
 }
 
-fn validate_source_size_with_limit(source: &std::fs::File, label: &str, limit: u64) -> Result<()> {
-    let metadata = source
-        .metadata()
-        .map_err(|error| NspawnError::Io(std::path::PathBuf::from("image source fd"), error))?;
+fn validate_source_size_with_limit(
+    source: &std::fs::File,
+    label: &str,
+    limit: u64,
+) -> OperationResult<()> {
+    let metadata = source.metadata().map_err(|error| {
+        OperationFailure::Io(std::path::PathBuf::from("image source fd"), error)
+    })?;
     if metadata.is_file() && metadata.len() > limit {
-        return Err(
-            NspawnError::Validation(format!("{label} exceeds the {} byte limit", limit)).into(),
-        );
+        return Err(OperationFailure::InvalidInput(format!(
+            "{label} exceeds the {} byte limit",
+            limit
+        )));
     }
     Ok(())
 }
@@ -358,7 +369,7 @@ async fn terminate_child_group(
     child: &mut tokio::process::Child,
     pid: u32,
     label: &str,
-) -> Result<()> {
+) -> OperationResult<()> {
     const STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     terminate_child_process_group(child, pid, label, STOP_TIMEOUT)
         .await
@@ -369,46 +380,53 @@ async fn terminate_child_group(
 /// Parse curl's carriage-return progress frames and forward normal output.
 async fn stream_curl_output(
     stderr: &mut tokio::process::ChildStderr,
-    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
-) -> Result<()> {
+    logs: &DeploymentDiagnostics,
+) -> OperationResult<()> {
     const MAX_FRAME_BYTES: usize = 16 * 1024;
     let mut chunk = [0u8; 4096];
     let mut frame = Vec::new();
+    let mut truncated = false;
     loop {
         let count = stderr
             .read(&mut chunk)
             .await
-            .map_err(|error| NspawnError::Io(std::path::PathBuf::from("curl"), error))?;
+            .map_err(|error| OperationFailure::Io(std::path::PathBuf::from("curl"), error))?;
         if count == 0 {
             break;
         }
         for byte in &chunk[..count] {
             if *byte == b'\r' || *byte == b'\n' {
-                forward_curl_frame(logs, &frame, *byte == b'\r').await;
+                forward_curl_frame(logs, &frame, *byte == b'\r', truncated);
                 frame.clear();
+                truncated = false;
             } else if frame.len() < MAX_FRAME_BYTES {
                 frame.push(*byte);
+            } else {
+                truncated = true;
             }
         }
     }
-    forward_curl_frame(logs, &frame, false).await;
+    forward_curl_frame(logs, &frame, false, truncated);
     Ok(())
 }
 
-async fn forward_curl_frame(
-    logs: &tokio::sync::mpsc::Sender<DeployLogEvent>,
+fn forward_curl_frame(
+    logs: &DeploymentDiagnostics,
     frame: &[u8],
     carriage_return: bool,
+    truncated: bool,
 ) {
     let text = String::from_utf8_lossy(frame);
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return;
     }
-    if let Some(permille) = parse_curl_progress(trimmed) {
-        send_deploy_progress(logs, "Downloading image", permille).await;
+    if truncated {
+        logs.message(format!("{trimmed} [command output truncated]"));
+    } else if let Some(permille) = parse_curl_progress(trimmed) {
+        logs.progress("Downloading image", permille);
     } else if !carriage_return || !looks_like_curl_progress(trimmed) {
-        send_deploy_stream_log(logs, trimmed).await;
+        logs.message(trimmed);
     }
 }
 
@@ -428,7 +446,7 @@ fn looks_like_curl_progress(frame: &str) -> bool {
         .all(|byte| matches!(byte, b' ' | b'#' | b'=' | b'-' | b'.' | b'0'..=b'9' | b'%'))
 }
 
-fn check_tool(name: &str) -> Result<()> {
+fn check_tool(name: &str) -> OperationResult<()> {
     let found = std::env::var_os("PATH")
         .unwrap_or_default()
         .to_string_lossy()
@@ -438,13 +456,15 @@ fn check_tool(name: &str) -> Result<()> {
     if found {
         Ok(())
     } else {
-        Err(NspawnError::ToolNotFound(name.to_string()).into())
+        Err(OperationFailure::MissingTool(name.to_string()))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::DeploymentId;
+    use crate::domain::machine::MachineName;
     use std::collections::BTreeMap;
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -606,6 +626,11 @@ mod tests {
         compressed.seek(SeekFrom::Start(0)).unwrap();
 
         let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+        let logs = DeploymentDiagnostics::new(
+            DeploymentId::from_u128(1),
+            MachineName::new("test").unwrap(),
+            logs,
+        );
         let mut decoded = ImageAcquisitionStore::new()
             .acquire(
                 &ImageSource::Opened(std::sync::Arc::new(compressed)),
@@ -626,6 +651,11 @@ mod tests {
         compressed.seek(SeekFrom::Start(0)).unwrap();
 
         let (logs, _receiver) = tokio::sync::mpsc::channel(4);
+        let logs = DeploymentDiagnostics::new(
+            DeploymentId::from_u128(1),
+            MachineName::new("test").unwrap(),
+            logs,
+        );
         assert!(ImageAcquisitionStore::new()
             .acquire(
                 &ImageSource::Opened(std::sync::Arc::new(compressed)),

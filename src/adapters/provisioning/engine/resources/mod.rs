@@ -1,55 +1,9 @@
-use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
-use crate::adapters::error::{NspawnError, Result};
-use crate::adapters::platform::nvidia::NvidiaStateStore;
-use crate::adapters::process::CommandRunner;
-use crate::adapters::rootfs::RootfsStore;
-use crate::adapters::system_operation::SystemOperationStore;
-use crate::adapters::trusted_state::TrustedStateRoot;
+//! Resource ownership and cleanup blockers recorded during one deployment.
+
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::application::provisioning::{
-    DeploymentCancellation, DeploymentEvent as DeployLogEvent, DeploymentJobContext,
-    DeploymentResource, DeploymentStage, ResourceApplyStatus, ResourceDisposition, ResourceLedger,
+    DeploymentResource, ResourceApplyStatus, ResourceDisposition, ResourceLedger,
 };
-
-/// Direct host capabilities used by the provisioning implementation.
-///
-/// The elevated route submits the complete deployment to the daemon, whose
-/// worker constructs this same direct bundle. Keeping this type route-specific
-/// prevents a deployment stage from selecting a daemon transport internally.
-#[derive(Clone)]
-pub(crate) struct DirectProvisioningCapabilities {
-    pub(super) system_operations: SystemOperationStore,
-    pub(super) nspawn: NspawnConfigStore,
-    pub(super) systemd_unit: SystemdUnitStore,
-    pub(super) rootfs: RootfsStore,
-    pub(super) nvidia_state: NvidiaStateStore,
-}
-
-impl DirectProvisioningCapabilities {
-    pub(crate) fn from_direct(
-        command_runner: std::sync::Arc<dyn CommandRunner>,
-        state_root: TrustedStateRoot,
-    ) -> Self {
-        Self {
-            system_operations: SystemOperationStore::direct(command_runner),
-            nspawn: NspawnConfigStore::direct(),
-            systemd_unit: SystemdUnitStore::direct(),
-            rootfs: RootfsStore::direct(),
-            nvidia_state: NvidiaStateStore::direct(state_root),
-        }
-    }
-
-    pub(crate) fn system_operations(&self) -> &SystemOperationStore {
-        &self.system_operations
-    }
-
-    pub(crate) fn nspawn(&self) -> &NspawnConfigStore {
-        &self.nspawn
-    }
-
-    pub(crate) fn systemd_unit(&self) -> &SystemdUnitStore {
-        &self.systemd_unit
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AppliedResource {
@@ -113,7 +67,7 @@ impl ApplyReport {
         &mut self,
         resource: AppliedResource,
         status: ResourceApplyStatus,
-    ) -> Result<()> {
+    ) -> OperationResult<()> {
         match status {
             ResourceApplyStatus::Created => {
                 self.ledger
@@ -135,7 +89,7 @@ impl ApplyReport {
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("a replaced .nspawn configuration cannot be restored".into());
-                    return Err(NspawnError::Runtime(format!(
+                    return Err(OperationFailure::ResourceConflict(format!(
                         "Deployment cannot roll back replaced {} without its previous content",
                         resource.label()
                     )));
@@ -151,7 +105,7 @@ impl ApplyReport {
                 if resource == AppliedResource::NspawnConfig {
                     self.external_image_blockers
                         .push("an existing .nspawn configuration has unknown ownership".into());
-                    return Err(NspawnError::Validation(format!(
+                    return Err(OperationFailure::ResourceConflict(format!(
                         "Refusing to replace existing {} with unknown ownership",
                         resource.label()
                     )));
@@ -258,98 +212,5 @@ impl ApplyReport {
     }
 }
 
-pub(crate) async fn persist_applying(
-    job: &DeploymentJobContext,
-    stage: DeploymentStage,
-    intended_resources: Vec<DeploymentResource>,
-    report: &ApplyReport,
-) -> Result<()> {
-    if let Some(state) = job.state_session() {
-        state
-            .applying(stage, intended_resources, report.application_ledger())
-            .await
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn persist_committed(
-    job: &DeploymentJobContext,
-    stage: DeploymentStage,
-    report: &ApplyReport,
-) -> Result<()> {
-    if let Some(state) = job.state_session() {
-        state
-            .committed(stage, report.application_ledger())
-            .await
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn persist_cleanup_pending(
-    job: &DeploymentJobContext,
-    report: &ApplyReport,
-) -> Result<()> {
-    if let Some(state) = job.state_session() {
-        state
-            .cleanup_pending(report.application_ledger())
-            .await
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn finish_manifest(job: &DeploymentJobContext) -> Result<()> {
-    if let Some(state) = job.state_session() {
-        state
-            .finish()
-            .await
-            .map_err(|error| NspawnError::Runtime(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn capture_uncommitted_effects(
-    job: &DeploymentJobContext,
-    report: &mut ApplyReport,
-) {
-    let Some(state) = job.state_session() else {
-        return;
-    };
-    for resource in state.current_applying_resources().await {
-        if matches!(resource, DeploymentResource::RawConfigurationMount(_))
-            && report.ledger.disposition(&resource).is_none()
-        {
-            report.block_storage_removal(
-                "raw image configuration mount outcome requires reconciliation",
-            );
-        }
-        report.record_outcome_unknown_if_unclassified(resource);
-    }
-}
-
-#[async_trait::async_trait]
-pub(crate) trait Deployer: Send + Sync {
-    /// Performs the actual deployment (bootstrapping / cloning) of the container.
-    async fn deploy(
-        &self,
-        name: &str,
-        rootfs: &std::path::Path,
-        logs: tokio::sync::mpsc::Sender<DeployLogEvent>,
-        cancellation: &DeploymentCancellation,
-        report: &mut ApplyReport,
-    ) -> super::failure::OperationResult<()>;
-
-    /// Resources whose outcome may change while the source stage is running.
-    ///
-    /// This list is persisted before dispatch. It may conservatively include
-    /// optional effects, but it must include every effect the deployer can
-    /// create before it returns an authoritative result.
-    fn source_stage_resources(
-        &self,
-        target: &crate::domain::machine::MachineName,
-    ) -> Vec<DeploymentResource> {
-        vec![DeploymentResource::LocalStorage(target.clone())]
-    }
-}
+#[cfg(test)]
+mod tests;

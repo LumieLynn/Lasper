@@ -95,11 +95,14 @@ impl DirectStartPreparation {
 
     /// The selected systemd backend supplies the lazy reload operation. It is
     /// polled only after NVIDIA synchronization reports that a reload is needed.
-    pub(crate) async fn prepare(
+    pub(crate) async fn prepare<E>(
         &self,
         machine: &MachineName,
-        reload: impl Future<Output = Result<(), NspawnError>>,
-    ) -> Result<(), MachinePreparationError> {
+        reload: impl Future<Output = Result<(), E>>,
+    ) -> Result<(), MachinePreparationError>
+    where
+        E: Into<NspawnError>,
+    {
         self.nvidia_cdi_source
             .validate()
             .map_err(MachinePreparationError::invalid_configuration)?;
@@ -116,15 +119,20 @@ impl DirectStartPreparation {
     }
 }
 
-async fn reload_after_nvidia_preparation(
+async fn reload_after_nvidia_preparation<E>(
     result: Result<NvidiaPreparationOutcome, NspawnError>,
     machine: &MachineName,
-    reload: impl Future<Output = Result<(), NspawnError>>,
+    reload: impl Future<Output = Result<(), E>>,
     skip_permission_denied: bool,
-) -> Result<(), MachinePreparationError> {
+) -> Result<(), MachinePreparationError>
+where
+    E: Into<NspawnError>,
+{
     match result {
         Ok(NvidiaPreparationOutcome::NotConfigured) => Ok(()),
-        Ok(NvidiaPreparationOutcome::Synchronized) => reload.await.map_err(map_preparation_error),
+        Ok(NvidiaPreparationOutcome::Synchronized) => reload
+            .await
+            .map_err(|error| map_preparation_error(error.into())),
         Err(NspawnError::PermissionDenied) if skip_permission_denied => {
             log::warn!(
                 "skipping NVIDIA pre-start synchronization for {}: NVIDIA state could not be read without elevated privileges",

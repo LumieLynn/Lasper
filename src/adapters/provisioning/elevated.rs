@@ -136,11 +136,13 @@ impl ElevatedProvisioningExecutor {
                 .deployment_status(deployment_id)
                 .await
                 .map_err(|error| {
+                    log::error!("[DEPLOY {deployment_id}] Daemon status query failed: {error}");
                     DeploymentError::reconciliation_required(format!(
                         "Could not resolve deployment {deployment_id} after its event stream closed: {error}"
                     ))
                 })?
                 .ok_or_else(|| {
+                    log::error!("[DEPLOY {deployment_id}] Accepted deployment record is missing from daemon");
                     DeploymentError::reconciliation_required(format!(
                         "Daemon lost the accepted deployment record for {deployment_id}"
                     ))
@@ -292,7 +294,9 @@ impl DeploymentExecutor for ElevatedProvisioningExecutor {
         let deployment_id = context.id();
         let request_id = DeploymentRequestId::new();
         let request = plan.into_spec();
-        let artifact_source = Self::open_artifact(&request).await?;
+        let artifact_source = Self::open_artifact(&request).await.inspect_err(|error| {
+            log::error!("[DEPLOY {deployment_id}] Local artifact admission failed: {error}");
+        })?;
         let params = SubmitDeploymentParams {
             request_id,
             deployment_id,
@@ -304,10 +308,12 @@ impl DeploymentExecutor for ElevatedProvisioningExecutor {
                 self.acknowledge_submission(request_id).await;
                 Some(stream_fd)
             }
-            Err(error) => {
-                self.resolve_submission(request_id, deployment_id, error)
-                    .await?
-            }
+            Err(error) => self
+                .resolve_submission(request_id, deployment_id, error)
+                .await
+                .inspect_err(|error| {
+                    log::error!("[DEPLOY {deployment_id}] Submission failed: {error}");
+                })?,
         };
 
         let cancellation = context.cancellation();
