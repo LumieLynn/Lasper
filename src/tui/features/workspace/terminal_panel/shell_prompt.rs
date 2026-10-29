@@ -91,12 +91,13 @@ pub(super) async fn run_builtin_shell_prompt(
                                             continue;
                                         }
                                     };
-                                    if matches!(user.as_str(), "root" | "0")
+                                    if matches!(&mode, BuiltinShellMode::HostX11(_))
+                                        && matches!(user.as_str(), "root" | "0")
                                         && root_confirmation.as_ref() != Some(&user)
                                     {
                                         root_confirmation = Some(user);
                                         let message = format!(
-                                            "\r\nRoot grants full control inside this guest. Enter the account again to confirm.\r\n{prompt}"
+                                            "\r\nOpen a root shell with Host X11 access? Enter the account again to confirm.\r\n{prompt}"
                                         );
                                         let _ = send_output(&output, message.into_bytes()).await;
                                         continue;
